@@ -1,0 +1,132 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator db {
+  provider      = "go run github.com/steebchen/prisma-client-go"
+  binaryTargets = ["darwin-arm64", "linux-static-x64"]
+}
+
+// Uncomment to generate Prisma Client JS (required for the studio)
+// (https://github.com/steebchen/prisma-client-go/issues/455)
+// generator js {
+//   provider = "prisma-client-js"
+// }
+
+model Iap {
+  // Fields
+
+  receiptId       String @id
+  platform        Int    @default(0) @db.SmallInt // Platform enum: Unknown: 0, Apple: 1, Google: 2
+  userId          String
+  product         Int    @default(0) @db.SmallInt // Product enum: Unknown: 0, CreateAccount: 1, CreateAccountWithWelcomeBonus: 2
+  paymentAmount   Float
+  paymentCurrency String
+  state           Int    @default(0) @db.SmallInt // State enum: Unknown: 0, WaitingForPayment: 1, WaitingForFulfillment: 2, Fulfilled: 3
+
+  createdAt DateTime @default(now())
+
+  // Relations
+
+  // Constraints
+
+  @@map("flipcash_iap")
+}
+
+model PublicKey {
+  // Fields
+
+  key    String @id
+  userId String @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("flipcash_publickeys")
+}
+
+model PushToken {
+  // Fields
+
+  userId       String
+  appInstallId String
+  token        String
+  type         Int    @default(0) // PushTokenType enum: Unknown: 0, FCMAndroid: 1, FCMApns: 2
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+
+  // Constraints
+
+  @@id([userId, appInstallId])
+  @@map("flipcash_pushtokens")
+}
+
+model Rendezvous {
+  // Fields
+
+  key     String @id
+  address String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  expiresAt DateTime
+
+  // Relations
+
+  // Constraints
+
+  @@map("flipcash_rendezvous")
+}
+
+model User {
+  // Fields
+
+  id           String      @id
+  displayName  String?
+  phoneNumber  String?
+  emailAddress String?
+  isStaff      Boolean     @default(false)
+  isRegistered Boolean     @default(false)
+  publicKeys   PublicKey[]
+  xProfile     XProfile?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  // - none -
+
+  @@map("flipcash_users")
+}
+
+model XProfile {
+  // Fields
+
+  id            String @id
+  username      String @unique
+  name          String
+  description   String
+  profilePicUrl String
+  followerCount Int    @default(0)
+  verifiedType  Int    @default(0) @db.SmallInt
+  accessToken   String
+
+  userId String @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("flipcash_x_profiles")
+}

@@ -5,15 +5,15 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	accountpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/account/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
-	ocpdata "github.com/code-payments/ocp-server/pkg/code/data"
-	ocptestutil "github.com/code-payments/ocp-server/pkg/testutil"
+	ocpdata "github.com/code-payments/ocp-server/ocp/data"
+	ocptestutil "github.com/code-payments/ocp-server/testutil"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
@@ -32,18 +32,17 @@ func RunServerTests(t *testing.T, s account.Store, teardown func()) {
 }
 
 func testServer(t *testing.T, store account.Store) {
-	log, err := zap.NewDevelopment()
-	require.NoError(t, err)
+	log := zaptest.NewLogger(t)
 
 	codeStores := ocpdata.NewTestDataProvider()
 
 	server := account.NewServer(
 		log,
 		store,
-		auth.NewKeyPairAuthenticator(),
+		auth.NewKeyPairAuthenticator(log),
 	)
 
-	cc := testutil.RunGRPCServer(t, testutil.WithService(func(s *grpc.Server) {
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		accountpb.RegisterAccountServer(s, server)
 	}))
 

@@ -3,9 +3,9 @@ package activity
 import (
 	"context"
 
-	ocpbalance "github.com/code-payments/ocp-server/pkg/code/balance"
-	ocpcommon "github.com/code-payments/ocp-server/pkg/code/common"
-	ocpdata "github.com/code-payments/ocp-server/pkg/code/data"
+	ocpbalance "github.com/code-payments/ocp-server/ocp/balance"
+	ocpcommon "github.com/code-payments/ocp-server/ocp/common"
+	ocpdata "github.com/code-payments/ocp-server/ocp/data"
 )
 
 func isGiftCardClaimed(ctx context.Context, ocpData ocpdata.Provider, giftCardVaultAccount *ocpcommon.Account) (bool, error) {

@@ -7,9 +7,9 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/push"
-	ocpswap "github.com/code-payments/ocp-server/pkg/code/async/swap"
-	ocpcommon "github.com/code-payments/ocp-server/pkg/code/common"
-	ocpcurrency "github.com/code-payments/ocp-server/pkg/currency"
+	ocpswap "github.com/code-payments/ocp-server/ocp/worker/swap"
+	ocpcommon "github.com/code-payments/ocp-server/ocp/common"
+	ocpcurrency "github.com/code-payments/ocp-server/currency"
 )
 
 type Integration struct {

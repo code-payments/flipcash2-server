@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -30,9 +30,8 @@ func RunServerTests(t *testing.T, accounts account.Store, iaps iap.Store, verife
 }
 
 func testOnPurchaseCompleted(t *testing.T, accounts account.Store, iaps iap.Store, verifer iap.Verifier, validReceiptFunc func(msg string) (string, string)) {
-	log, err := zap.NewDevelopment()
-	require.NoError(t, err)
-	authn := auth.NewKeyPairAuthenticator()
+	log := zaptest.NewLogger(t)
+	authn := auth.NewKeyPairAuthenticator(log)
 	authz := account.NewAuthorizer(log, accounts, authn)
 	server := iap.NewServer(log, authz, accounts, iaps, verifer, verifer)
 

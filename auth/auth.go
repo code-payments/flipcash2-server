@@ -3,16 +3,17 @@ package auth
 import (
 	"context"
 
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	codecommonpb "github.com/code-payments/ocp-protobuf-api/generated/go/common/v1"
+	ocpcommonpb "github.com/code-payments/ocp-protobuf-api/generated/go/common/v1"
 
 	"github.com/code-payments/flipcash2-server/model"
-	auth2 "github.com/code-payments/ocp-server/pkg/code/auth"
-	ocpcommon "github.com/code-payments/ocp-server/pkg/code/common"
+	auth2 "github.com/code-payments/ocp-server/ocp/auth"
+	ocpcommon "github.com/code-payments/ocp-server/ocp/common"
 )
 
 // Authorizer authorizes an action for a UserId with the given auth.
@@ -29,9 +30,9 @@ type StaticAuthorizer struct {
 	keyPairs map[string]string
 }
 
-func NewStaticAuthorizer() *StaticAuthorizer {
+func NewStaticAuthorizer(log *zap.Logger) *StaticAuthorizer {
 	return &StaticAuthorizer{
-		auth:     NewKeyPairAuthenticator(),
+		auth:     NewKeyPairAuthenticator(log),
 		keyPairs: make(map[string]string),
 	}
 }
@@ -73,9 +74,9 @@ type Authenticator interface {
 }
 
 // NewKeyPairAuthenticator authenticates pub key based auth.
-func NewKeyPairAuthenticator() Authenticator {
+func NewKeyPairAuthenticator(log *zap.Logger) Authenticator {
 	return &authenticator{
-		auth: auth2.NewRPCSignatureVerifier(nil),
+		auth: auth2.NewRPCSignatureVerifier(log, nil),
 	}
 }
 
@@ -98,5 +99,5 @@ func (v *authenticator) Verify(ctx context.Context, m proto.Message, auth *commo
 		return status.Error(codes.InvalidArgument, "invalid pubkey")
 	}
 
-	return v.auth.Authenticate(ctx, account, m, &codecommonpb.Signature{Value: keyPair.Signature.Value})
+	return v.auth.Authenticate(ctx, account, m, &ocpcommonpb.Signature{Value: keyPair.Signature.Value})
 }

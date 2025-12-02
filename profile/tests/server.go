@@ -36,10 +36,10 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
-	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator())
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	serv := profile.NewServer(log, authz, accounts, profiles, x.NewClient())
-	cc := testutil.RunGRPCServer(t, testutil.WithService(func(s *grpc.Server) {
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
 

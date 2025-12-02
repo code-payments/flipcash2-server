@@ -4,11 +4,11 @@ import (
 	"context"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	ocptransactionpb "github.com/code-payments/ocp-protobuf-api/generated/go/transaction/v2"
+	ocptransactionpb "github.com/code-payments/ocp-protobuf-api/generated/go/transaction/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
-	ocpantispam "github.com/code-payments/ocp-server/pkg/code/antispam"
-	ocpcommon "github.com/code-payments/ocp-server/pkg/code/common"
+	ocpantispam "github.com/code-payments/ocp-server/ocp/antispam"
+	ocpcommon "github.com/code-payments/ocp-server/ocp/common"
 )
 
 type Integration struct {

@@ -4,14 +4,15 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 
-	ocpheaders "github.com/code-payments/ocp-server/pkg/grpc/headers"
-	ocpvalidation "github.com/code-payments/ocp-server/pkg/grpc/protobuf/validation"
+	ocpheaders "github.com/code-payments/ocp-server/grpc/headers"
+	ocpvalidation "github.com/code-payments/ocp-server/grpc/protobuf/validation"
 )
 
 // todo: Generic utility for handling gRPC connections like this
@@ -27,7 +28,7 @@ func init() {
 	go periodicallyCleanupConns()
 }
 
-func getForwardingRpcClient(address string) (eventpb.EventStreamingClient, error) {
+func getForwardingRpcClient(log *zap.Logger, address string) (eventpb.EventStreamingClient, error) {
 	forwardingClientConnsMu.RLock()
 	existing, ok := forwardingClientConns[address]
 	if ok {
@@ -49,10 +50,10 @@ func getForwardingRpcClient(address string) (eventpb.EventStreamingClient, error
 
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 
-		grpc.WithUnaryInterceptor(ocpvalidation.UnaryClientInterceptor()),
+		grpc.WithUnaryInterceptor(ocpvalidation.UnaryClientInterceptor(log)),
 		grpc.WithUnaryInterceptor(ocpheaders.UnaryClientInterceptor()),
 
-		grpc.WithStreamInterceptor(ocpvalidation.StreamClientInterceptor()),
+		grpc.WithStreamInterceptor(ocpvalidation.StreamClientInterceptor(log)),
 		grpc.WithStreamInterceptor(ocpheaders.StreamClientInterceptor()),
 	)
 	if err != nil {

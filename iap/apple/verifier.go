@@ -6,7 +6,7 @@ import (
 	"github.com/devsisters/go-applereceipt"
 	"github.com/devsisters/go-applereceipt/applepki"
 
-	"github.com/code-payments/ocp-server/pkg/metrics"
+	"github.com/code-payments/ocp-server/metrics"
 
 	"github.com/code-payments/flipcash2-server/iap"
 )

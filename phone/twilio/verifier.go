@@ -13,7 +13,7 @@ import (
 	lookupsv1 "github.com/twilio/twilio-go/rest/lookups/v1"
 	verifyv2 "github.com/twilio/twilio-go/rest/verify/v2"
 
-	"github.com/code-payments/ocp-server/pkg/metrics"
+	"github.com/code-payments/ocp-server/metrics"
 	"github.com/code-payments/flipcash2-server/phone"
 )
 

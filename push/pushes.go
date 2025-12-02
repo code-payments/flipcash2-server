@@ -10,7 +10,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
 	"github.com/code-payments/flipcash2-server/localization"
-	ocpcurrency "github.com/code-payments/ocp-server/pkg/currency"
+	ocpcurrency "github.com/code-payments/ocp-server/currency"
 )
 
 var (

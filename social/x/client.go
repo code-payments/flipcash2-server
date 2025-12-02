@@ -11,7 +11,7 @@ import (
 
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
-	"github.com/code-payments/ocp-server/pkg/metrics"
+	"github.com/code-payments/ocp-server/metrics"
 )
 
 const (

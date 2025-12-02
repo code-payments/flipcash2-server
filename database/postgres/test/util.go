@@ -12,8 +12,8 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/code-payments/ocp-server/pkg/retry"
-	"github.com/code-payments/ocp-server/pkg/retry/backoff"
+	"github.com/code-payments/ocp-server/retry"
+	"github.com/code-payments/ocp-server/retry/backoff"
 )
 
 const (

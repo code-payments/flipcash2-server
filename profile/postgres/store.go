@@ -10,7 +10,7 @@ import (
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
-	"github.com/code-payments/ocp-server/pkg/pointer"
+	"github.com/code-payments/ocp-server/pointer"
 	"github.com/code-payments/flipcash2-server/profile"
 )
 

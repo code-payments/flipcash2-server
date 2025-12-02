@@ -15,13 +15,13 @@ import (
 
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/model"
-	ocpcommon "github.com/code-payments/ocp-server/pkg/code/common"
-	ocpdata "github.com/code-payments/ocp-server/pkg/code/data"
-	ocpintent "github.com/code-payments/ocp-server/pkg/code/data/intent"
-	ocptransaction "github.com/code-payments/ocp-server/pkg/code/server/transaction"
-	ocpcurrency "github.com/code-payments/ocp-server/pkg/currency"
-	ocpquery "github.com/code-payments/ocp-server/pkg/database/query"
-	"github.com/code-payments/ocp-server/pkg/pointer"
+	ocpcommon "github.com/code-payments/ocp-server/ocp/common"
+	ocpdata "github.com/code-payments/ocp-server/ocp/data"
+	ocpintent "github.com/code-payments/ocp-server/ocp/data/intent"
+	ocptransaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
+	ocpcurrency "github.com/code-payments/ocp-server/currency"
+	ocpquery "github.com/code-payments/ocp-server/database/query"
+	"github.com/code-payments/ocp-server/pointer"
 )
 
 const (

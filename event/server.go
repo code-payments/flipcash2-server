@@ -22,9 +22,9 @@ import (
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/protoutil"
-	ocpheaders "github.com/code-payments/ocp-server/pkg/grpc/headers"
-	ocpretry "github.com/code-payments/ocp-server/pkg/retry"
-	ocpbackoff "github.com/code-payments/ocp-server/pkg/retry/backoff"
+	ocpheaders "github.com/code-payments/ocp-server/grpc/headers"
+	ocpretry "github.com/code-payments/ocp-server/retry"
+	ocpbackoff "github.com/code-payments/ocp-server/retry/backoff"
 )
 
 const (
@@ -435,7 +435,7 @@ func (s *Server) forwardUserEvent(ctx context.Context, event *eventpb.UserEvent)
 		}
 
 		// Otherwise, forward it to the server hosting the user's stream
-		forwardingRpcClient, err := getForwardingRpcClient(rendezvous.Address)
+		forwardingRpcClient, err := getForwardingRpcClient(s.log, rendezvous.Address)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure creating forwarding RPC client")
 			return err

@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -29,9 +29,8 @@ func RunAuthorizerTests(t *testing.T, s account.Store, teardown func()) {
 }
 
 func testAuthorizer(t *testing.T, store account.Store) {
-	log, err := zap.NewDevelopment()
-	require.NoError(t, err)
-	authn := auth.NewKeyPairAuthenticator()
+	log := zaptest.NewLogger(t)
+	authn := auth.NewKeyPairAuthenticator(log)
 
 	authz := account.NewAuthorizer(log, store, authn)
 

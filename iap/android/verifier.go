@@ -7,7 +7,7 @@ import (
 	"google.golang.org/api/androidpublisher/v3"
 	"google.golang.org/api/option"
 
-	"github.com/code-payments/ocp-server/pkg/metrics"
+	"github.com/code-payments/ocp-server/metrics"
 
 	"github.com/code-payments/flipcash2-server/iap"
 )

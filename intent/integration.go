@@ -3,11 +3,11 @@ package intent
 import (
 	"context"
 
-	ocptransactionpb "github.com/code-payments/ocp-protobuf-api/generated/go/transaction/v2"
+	ocptransactionpb "github.com/code-payments/ocp-protobuf-api/generated/go/transaction/v1"
 
-	ocpdata "github.com/code-payments/ocp-server/pkg/code/data"
-	ocpintent "github.com/code-payments/ocp-server/pkg/code/data/intent"
-	ocptransaction "github.com/code-payments/ocp-server/pkg/code/server/transaction"
+	ocpdata "github.com/code-payments/ocp-server/ocp/data"
+	ocpintent "github.com/code-payments/ocp-server/ocp/data/intent"
+	ocptransaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
 )
 
 type Integration struct {

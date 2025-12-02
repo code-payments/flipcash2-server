@@ -13,11 +13,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/code-payments/ocp-server/pkg/grpc/headers"
-	"github.com/code-payments/ocp-server/pkg/grpc/protobuf/validation"
+	"github.com/code-payments/ocp-server/grpc/headers"
+	"github.com/code-payments/ocp-server/grpc/protobuf/validation"
 )
 
-func RunGRPCServer(t *testing.T, opts ...ServerOption) grpc.ClientConnInterface {
+func RunGRPCServer(t *testing.T, log *zap.Logger, opts ...ServerOption) grpc.ClientConnInterface {
 	lis := bufconn.Listen(1024 * 1024)
 
 	cc, err := grpc.NewClient(
@@ -32,17 +32,17 @@ func RunGRPCServer(t *testing.T, opts ...ServerOption) grpc.ClientConnInterface 
 	o := serverOpts{
 		unaryServerInterceptors: []grpc.UnaryServerInterceptor{
 			headers.UnaryServerInterceptor(),
-			validation.UnaryServerInterceptor(),
+			validation.UnaryServerInterceptor(log),
 		},
 		streamServerInterceptors: []grpc.StreamServerInterceptor{
 			headers.StreamServerInterceptor(),
-			validation.StreamServerInterceptor(),
+			validation.StreamServerInterceptor(log),
 		},
 		unaryClientInterceptors: []grpc.UnaryClientInterceptor{
-			validation.UnaryClientInterceptor(),
+			validation.UnaryClientInterceptor(log),
 		},
 		streamClientInterceptors: []grpc.StreamClientInterceptor{
-			validation.StreamClientInterceptor(),
+			validation.StreamClientInterceptor(log),
 		},
 	}
 
@@ -55,8 +55,6 @@ func RunGRPCServer(t *testing.T, opts ...ServerOption) grpc.ClientConnInterface 
 		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(o.streamServerInterceptors...)),
 	)
 
-	log, err := zap.NewDevelopment()
-	require.NoError(t, err)
 	for _, r := range o.registrants {
 		r(serv)
 	}

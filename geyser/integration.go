@@ -7,8 +7,8 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/push"
-	ocpgeyser "github.com/code-payments/ocp-server/pkg/code/async/geyser"
-	ocpcommon "github.com/code-payments/ocp-server/pkg/code/common"
+	ocpgeyser "github.com/code-payments/ocp-server/ocp/worker/geyser"
+	ocpcommon "github.com/code-payments/ocp-server/ocp/common"
 )
 
 type Integration struct {

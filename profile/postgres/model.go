@@ -11,7 +11,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
-	"github.com/code-payments/ocp-server/pkg/pointer"
+	"github.com/code-payments/ocp-server/pointer"
 	pg "github.com/code-payments/flipcash2-server/database/postgres"
 	"github.com/code-payments/flipcash2-server/profile"
 )

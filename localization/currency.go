@@ -5,7 +5,7 @@ import (
 	"golang.org/x/text/message"
 	"golang.org/x/text/number"
 
-	ocpcurrency "github.com/code-payments/ocp-server/pkg/currency"
+	ocpcurrency "github.com/code-payments/ocp-server/currency"
 )
 
 var symbolByCurrency = map[ocpcurrency.Code]string{

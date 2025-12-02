@@ -6,8 +6,8 @@ import (
 
 	activitypb "github.com/code-payments/flipcash2-protobuf-api/generated/go/activity/v1"
 
-	ocpcommon "github.com/code-payments/ocp-server/pkg/code/common"
-	ocpdata "github.com/code-payments/ocp-server/pkg/code/data"
+	ocpcommon "github.com/code-payments/ocp-server/ocp/common"
+	ocpdata "github.com/code-payments/ocp-server/ocp/data"
 )
 
 func InjectLocalizedText(ctx context.Context, ocpData ocpdata.Provider, userOwnerAccount *ocpcommon.Account, notification *activitypb.Notification) error {

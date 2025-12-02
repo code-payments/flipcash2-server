@@ -31,7 +31,7 @@ func testServer_AddToken(t *testing.T, store push.TokenStore) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
-	authz := auth.NewStaticAuthorizer()
+	authz := auth.NewStaticAuthorizer(log)
 	server := push.NewServer(log, authz, store)
 
 	userID := &commonpb.UserId{Value: []byte("test-user")}
@@ -100,7 +100,7 @@ func testServer_DeleteTokens(t *testing.T, store push.TokenStore) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
-	authz := auth.NewStaticAuthorizer()
+	authz := auth.NewStaticAuthorizer(log)
 	server := push.NewServer(log, authz, store)
 
 	userID := &commonpb.UserId{Value: []byte("test-user")}

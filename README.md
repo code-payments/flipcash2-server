@@ -9,7 +9,7 @@ Flipcash server monolith containing the gRPC/web services and workers that power
 
 ## What is Flipcash?
 
-[Flipcash](https://flipcash.com) is a mobile wallet app leveraging self-custodial blockchain technology to provide an instant, global, and private payments experience. We are currently working on a currency launchpad.
+[Flipcash](https://flipcash.com) is a self-custodial mobile wallet app leveraging the Open Code Protocol to provide a seamless multi-currency payments experience.
 
 ## Quick Start
 

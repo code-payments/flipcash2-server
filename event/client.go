@@ -11,8 +11,8 @@ import (
 
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 
-	ocpheaders "github.com/code-payments/ocp-server/grpc/headers"
-	ocpvalidation "github.com/code-payments/ocp-server/grpc/protobuf/validation"
+	ocp_headers "github.com/code-payments/ocp-server/grpc/headers"
+	ocp_validation "github.com/code-payments/ocp-server/grpc/protobuf/validation"
 )
 
 // todo: Generic utility for handling gRPC connections like this
@@ -50,11 +50,11 @@ func getForwardingRpcClient(log *zap.Logger, address string) (eventpb.EventStrea
 
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 
-		grpc.WithUnaryInterceptor(ocpvalidation.UnaryClientInterceptor(log)),
-		grpc.WithUnaryInterceptor(ocpheaders.UnaryClientInterceptor()),
+		grpc.WithUnaryInterceptor(ocp_validation.UnaryClientInterceptor(log)),
+		grpc.WithUnaryInterceptor(ocp_headers.UnaryClientInterceptor()),
 
-		grpc.WithStreamInterceptor(ocpvalidation.StreamClientInterceptor(log)),
-		grpc.WithStreamInterceptor(ocpheaders.StreamClientInterceptor()),
+		grpc.WithStreamInterceptor(ocp_validation.StreamClientInterceptor(log)),
+		grpc.WithStreamInterceptor(ocp_headers.StreamClientInterceptor()),
 	)
 	if err != nil {
 		return nil, err

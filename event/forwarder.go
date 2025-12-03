@@ -10,9 +10,9 @@ import (
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 
 	"github.com/code-payments/flipcash2-server/model"
-	ocpheaders "github.com/code-payments/ocp-server/grpc/headers"
-	ocpretry "github.com/code-payments/ocp-server/retry"
-	ocpbackoff "github.com/code-payments/ocp-server/retry/backoff"
+	ocp_headers "github.com/code-payments/ocp-server/grpc/headers"
+	ocp_retry "github.com/code-payments/ocp-server/retry"
+	ocp_backoff "github.com/code-payments/ocp-server/retry/backoff"
 )
 
 type Forwarder interface {
@@ -40,15 +40,15 @@ func NewForwardingClient(log *zap.Logger, events Store, currentRpcApiKey string)
 // todo: duplicated code with ForwardingClient
 func (c *ForwardingClient) ForwardUserEvents(ctx context.Context, events ...*eventpb.UserEvent) error {
 	var err error
-	if !ocpheaders.AreHeadersInitialized(ctx) {
-		ctx, err = ocpheaders.ContextWithHeaders(ctx)
+	if !ocp_headers.AreHeadersInitialized(ctx) {
+		ctx, err = ocp_headers.ContextWithHeaders(ctx)
 		if err != nil {
 			c.log.With(zap.Error(err)).Warn("Failure initializing headers")
 			return err
 		}
 	}
 
-	err = ocpheaders.SetASCIIHeader(ctx, internalRpcApiKeyHeaderName, c.currentRpcApiKey)
+	err = ocp_headers.SetASCIIHeader(ctx, internalRpcApiKeyHeaderName, c.currentRpcApiKey)
 	if err != nil {
 		c.log.With(zap.Error(err)).Warn("Failure setting RPC API key header")
 		return err
@@ -56,12 +56,12 @@ func (c *ForwardingClient) ForwardUserEvents(ctx context.Context, events ...*eve
 
 	for _, event := range events {
 		go func() {
-			ocpretry.Retry(
+			ocp_retry.Retry(
 				func() error {
 					return c.forwardUserEvent(ctx, event)
 				},
-				ocpretry.Limit(3),
-				ocpretry.Backoff(ocpbackoff.BinaryExponential(100*time.Millisecond), 500*time.Millisecond),
+				ocp_retry.Limit(3),
+				ocp_retry.Backoff(ocp_backoff.BinaryExponential(100*time.Millisecond), 500*time.Millisecond),
 			)
 		}()
 	}

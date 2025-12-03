@@ -23,7 +23,7 @@ import (
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/protoutil"
-	ocptestutil "github.com/code-payments/ocp-server/testutil"
+	ocp_testutil "github.com/code-payments/ocp-server/testutil"
 )
 
 func RunServerTests(t *testing.T, accounts account.Store, events event.Store, teardown func()) {
@@ -193,10 +193,10 @@ type cancellableStream struct {
 func setupTest(t *testing.T, accounts account.Store, events event.Store, enableMultiServer bool) (env testEnv, cleanup func()) {
 	log := zaptest.NewLogger(t)
 
-	conn1, serv1, err := ocptestutil.NewServer(log)
+	conn1, serv1, err := ocp_testutil.NewServer(log)
 	require.NoError(t, err)
 
-	conn2, serv2, err := ocptestutil.NewServer(log)
+	conn2, serv2, err := ocp_testutil.NewServer(log)
 	require.NoError(t, err)
 
 	env.client1 = &clientTestEnv{

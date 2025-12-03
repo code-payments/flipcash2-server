@@ -15,12 +15,12 @@ import (
 
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/model"
-	ocpcommon "github.com/code-payments/ocp-server/ocp/common"
-	ocpdata "github.com/code-payments/ocp-server/ocp/data"
-	ocpintent "github.com/code-payments/ocp-server/ocp/data/intent"
-	ocptransaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
-	ocpcurrency "github.com/code-payments/ocp-server/currency"
-	ocpquery "github.com/code-payments/ocp-server/database/query"
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
+	ocp_data "github.com/code-payments/ocp-server/ocp/data"
+	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
+	ocp_transaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
+	ocp_currency "github.com/code-payments/ocp-server/currency"
+	ocp_query "github.com/code-payments/ocp-server/database/query"
 	"github.com/code-payments/ocp-server/pointer"
 )
 
@@ -38,7 +38,7 @@ type Server struct {
 
 	authz auth.Authorizer
 
-	ocpData ocpdata.Provider
+	ocpData ocp_data.Provider
 
 	activitypb.UnimplementedActivityFeedServer
 }
@@ -46,7 +46,7 @@ type Server struct {
 func NewServer(
 	log *zap.Logger,
 	authz auth.Authorizer,
-	ocpData ocpdata.Provider,
+	ocpData ocp_data.Provider,
 ) *Server {
 	return &Server{
 		log: log,
@@ -126,9 +126,9 @@ func (s *Server) getPagedNotifications(ctx context.Context, log *zap.Logger, use
 		limit = int(queryOptions.PageSize)
 	}
 
-	direction := ocpquery.Ascending
+	direction := ocp_query.Ascending
 	if queryOptions.Order == commonpb.QueryOptions_DESC {
-		direction = ocpquery.Descending
+		direction = ocp_query.Descending
 	}
 
 	var pagingToken *string
@@ -144,22 +144,22 @@ func (s *Server) getPagedNotifications(ctx context.Context, log *zap.Logger, use
 	return notifications, nil
 }
 
-func (s *Server) getNotificationsFromPagedIntents(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, pubKey *commonpb.PublicKey, pagingToken *string, direction ocpquery.Ordering, limit int) ([]*activitypb.Notification, error) {
-	userOwnerAccount, err := ocpcommon.NewAccountFromPublicKeyBytes(pubKey.Value)
+func (s *Server) getNotificationsFromPagedIntents(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, pubKey *commonpb.PublicKey, pagingToken *string, direction ocp_query.Ordering, limit int) ([]*activitypb.Notification, error) {
+	userOwnerAccount, err := ocp_common.NewAccountFromPublicKeyBytes(pubKey.Value)
 	if err != nil {
 		return nil, err
 	}
 
-	queryOptions := []ocpquery.Option{
-		ocpquery.WithDirection(direction),
-		ocpquery.WithLimit(uint64(limit)),
+	queryOptions := []ocp_query.Option{
+		ocp_query.WithDirection(direction),
+		ocp_query.WithLimit(uint64(limit)),
 	}
 	if pagingToken != nil {
 		intentRecord, err := s.ocpData.GetIntent(ctx, *pagingToken)
 		if err != nil {
 			return nil, err
 		}
-		queryOptions = append(queryOptions, ocpquery.WithCursor(ocpquery.ToCursor(uint64(intentRecord.Id))))
+		queryOptions = append(queryOptions, ocp_query.WithCursor(ocp_query.ToCursor(uint64(intentRecord.Id))))
 	}
 
 	intentRecords, err := s.ocpData.GetAllIntentsByOwner(
@@ -167,7 +167,7 @@ func (s *Server) getNotificationsFromPagedIntents(ctx context.Context, log *zap.
 		userOwnerAccount.PublicKey().ToBase58(),
 		queryOptions...,
 	)
-	if err == ocpintent.ErrIntentNotFound {
+	if err == ocp_intent.ErrIntentNotFound {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
@@ -185,13 +185,13 @@ func (s *Server) getBatchNotifications(ctx context.Context, log *zap.Logger, use
 }
 
 func (s *Server) getNotificationsFromBatchIntents(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, pubKey *commonpb.PublicKey, ids []*activitypb.NotificationId) ([]*activitypb.Notification, error) {
-	userOwnerAccount, err := ocpcommon.NewAccountFromPublicKeyBytes(pubKey.Value)
+	userOwnerAccount, err := ocp_common.NewAccountFromPublicKeyBytes(pubKey.Value)
 	if err != nil {
 		return nil, status.Error(codes.Internal, "")
 	}
 
 	// todo: fetch via a batched DB called
-	var intentRecords []*ocpintent.Record
+	var intentRecords []*ocp_intent.Record
 	for _, id := range ids {
 		intentID := base58.Encode(id.Value)
 
@@ -200,7 +200,7 @@ func (s *Server) getNotificationsFromBatchIntents(ctx context.Context, log *zap.
 		intentRecord, err := s.ocpData.GetIntent(ctx, intentID)
 		switch err {
 		case nil:
-		case ocpintent.ErrIntentNotFound:
+		case ocp_intent.ErrIntentNotFound:
 			return nil, errNotificationNotFound
 		default:
 			log.Warn("Failed to get intent", zap.Error(err))
@@ -209,10 +209,10 @@ func (s *Server) getNotificationsFromBatchIntents(ctx context.Context, log *zap.
 
 		var destinationOwner string
 		switch intentRecord.IntentType {
-		case ocpintent.SendPublicPayment:
+		case ocp_intent.SendPublicPayment:
 			destinationOwner = intentRecord.SendPublicPaymentMetadata.DestinationOwnerAccount
-		case ocpintent.ReceivePaymentsPublicly:
-		case ocpintent.ExternalDeposit:
+		case ocp_intent.ReceivePaymentsPublicly:
+		case ocp_intent.ExternalDeposit:
 		default:
 			return nil, errNotificationNotFound
 		}
@@ -225,8 +225,8 @@ func (s *Server) getNotificationsFromBatchIntents(ctx context.Context, log *zap.
 	return s.toLocalizedNotifications(ctx, log, userID, userOwnerAccount, intentRecords)
 }
 
-func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, userOwnerAccount *ocpcommon.Account, intentRecords []*ocpintent.Record) ([]*activitypb.Notification, error) {
-	welcomeBonusIntentID := ocptransaction.GetAirdropIntentId(ocptransaction.AirdropTypeWelcomeBonus, userOwnerAccount.PublicKey().ToBase58())
+func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, userOwnerAccount *ocp_common.Account, intentRecords []*ocp_intent.Record) ([]*activitypb.Notification, error) {
+	welcomeBonusIntentID := ocp_transaction.GetAirdropIntentId(ocp_transaction.AirdropTypeWelcomeBonus, userOwnerAccount.PublicKey().ToBase58())
 
 	var notifications []*activitypb.Notification
 	for _, intentRecord := range intentRecords {
@@ -242,13 +242,13 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 			State:         activitypb.NotificationState_NOTIFICATION_STATE_COMPLETED,
 		}
 
-		mintAccount, err := ocpcommon.NewAccountFromPublicKeyString(intentRecord.MintAccount)
+		mintAccount, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.MintAccount)
 		if err != nil {
 			return nil, err
 		}
 
 		switch intentRecord.IntentType {
-		case ocpintent.SendPublicPayment:
+		case ocp_intent.SendPublicPayment:
 			intentMetadata := intentRecord.SendPublicPaymentMetadata
 			notification.PaymentAmount = &commonpb.CryptoPaymentAmount{
 				Currency:     string(intentMetadata.ExchangeCurrency),
@@ -256,7 +256,7 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 				Quarks:       intentMetadata.Quantity,
 			}
 
-			destinationAccount, err := ocpcommon.NewAccountFromPublicKeyString(intentMetadata.DestinationTokenAccount)
+			destinationAccount, err := ocp_common.NewAccountFromPublicKeyString(intentMetadata.DestinationTokenAccount)
 			if err != nil {
 				return nil, err
 			}
@@ -290,7 +290,7 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 				}
 			}
 
-		case ocpintent.ReceivePaymentsPublicly:
+		case ocp_intent.ReceivePaymentsPublicly:
 			intentMetadata := intentRecord.ReceivePaymentsPubliclyMetadata
 
 			if intentMetadata.IsIssuerVoidingGiftCard || intentMetadata.IsReturned {
@@ -304,7 +304,7 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 			}
 			notification.AdditionalMetadata = &activitypb.Notification_ReceivedCrypto{ReceivedCrypto: &activitypb.ReceivedCryptoNotificationMetadata{}}
 
-		case ocpintent.ExternalDeposit:
+		case ocp_intent.ExternalDeposit:
 			intentMetadata := intentRecord.ExternalDepositMetadata
 
 			// Hide small, potentially spam deposits
@@ -313,7 +313,7 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 			}
 
 			notification.PaymentAmount = &commonpb.CryptoPaymentAmount{
-				Currency:     string(ocpcurrency.USD),
+				Currency:     string(ocp_currency.USD),
 				NativeAmount: intentMetadata.UsdMarketValue,
 				Quarks:       intentMetadata.Quantity,
 			}

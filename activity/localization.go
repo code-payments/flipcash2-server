@@ -6,11 +6,11 @@ import (
 
 	activitypb "github.com/code-payments/flipcash2-protobuf-api/generated/go/activity/v1"
 
-	ocpcommon "github.com/code-payments/ocp-server/ocp/common"
-	ocpdata "github.com/code-payments/ocp-server/ocp/data"
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
+	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 )
 
-func InjectLocalizedText(ctx context.Context, ocpData ocpdata.Provider, userOwnerAccount *ocpcommon.Account, notification *activitypb.Notification) error {
+func InjectLocalizedText(ctx context.Context, ocpData ocp_data.Provider, userOwnerAccount *ocp_common.Account, notification *activitypb.Notification) error {
 	var localizedText string
 	switch typed := notification.AdditionalMetadata.(type) {
 	case *activitypb.Notification_WelcomeBonus:
@@ -34,7 +34,7 @@ func InjectLocalizedText(ctx context.Context, ocpData ocpdata.Provider, userOwne
 		} else {
 			localizedText = "Sent"
 
-			giftCardVaultAccount, err := ocpcommon.NewAccountFromPublicKeyBytes(typed.SentCrypto.Vault.Value)
+			giftCardVaultAccount, err := ocp_common.NewAccountFromPublicKeyBytes(typed.SentCrypto.Vault.Value)
 			if err != nil {
 				return err
 			}

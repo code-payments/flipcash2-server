@@ -10,7 +10,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
 	"github.com/code-payments/flipcash2-server/localization"
-	ocpcurrency "github.com/code-payments/ocp-server/currency"
+	ocp_currency "github.com/code-payments/ocp-server/currency"
 )
 
 var (
@@ -37,7 +37,7 @@ func SendFlipcashCurrencyReceivedFromDepositPush(ctx context.Context, pusher Pus
 	return pusher.SendBasicPushes(ctx, title, body, user)
 }
 
-func SendUsdcReceivedFromSwapPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, region ocpcurrency.Code, nativeAmount float64) error {
+func SendUsdcReceivedFromSwapPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, region ocp_currency.Code, nativeAmount float64) error {
 	title := "Cash Now Available"
 	body := usdcAmountPrinter.Sprintf(
 		"%s was added to your Flipcash wallet",
@@ -46,7 +46,7 @@ func SendUsdcReceivedFromSwapPush(ctx context.Context, pusher Pusher, user *comm
 	return pusher.SendBasicPushes(ctx, title, body, user)
 }
 
-func SendFlipcashCurrencyReceivedFromSwapPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, currencyName string, region ocpcurrency.Code, nativeAmount float64) error {
+func SendFlipcashCurrencyReceivedFromSwapPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, currencyName string, region ocp_currency.Code, nativeAmount float64) error {
 	title := fmt.Sprintf("%s Now Available", currencyName)
 	body := usdcAmountPrinter.Sprintf(
 		"%s of %s was added to your Flipcash wallet",

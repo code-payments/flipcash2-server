@@ -12,8 +12,8 @@ import (
 	accountpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/account/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
-	ocpdata "github.com/code-payments/ocp-server/ocp/data"
-	ocptestutil "github.com/code-payments/ocp-server/testutil"
+	ocp_data "github.com/code-payments/ocp-server/ocp/data"
+	ocp_testutil "github.com/code-payments/ocp-server/testutil"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
@@ -34,7 +34,7 @@ func RunServerTests(t *testing.T, s account.Store, teardown func()) {
 func testServer(t *testing.T, store account.Store) {
 	log := zaptest.NewLogger(t)
 
-	codeStores := ocpdata.NewTestDataProvider()
+	ocpData := ocp_data.NewTestDataProvider()
 
 	server := account.NewServer(
 		log,
@@ -49,7 +49,7 @@ func testServer(t *testing.T, store account.Store) {
 	ctx := context.Background()
 	client := accountpb.NewAccountClient(cc)
 
-	ocptestutil.SetupRandomSubsidizer(t, codeStores)
+	ocp_testutil.SetupRandomSubsidizer(t, ocpData)
 
 	var keys []model.KeyPair
 	var userId *commonpb.UserId

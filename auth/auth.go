@@ -9,11 +9,11 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	ocpcommonpb "github.com/code-payments/ocp-protobuf-api/generated/go/common/v1"
+	ocp_commonpb "github.com/code-payments/ocp-protobuf-api/generated/go/common/v1"
 
 	"github.com/code-payments/flipcash2-server/model"
 	auth2 "github.com/code-payments/ocp-server/ocp/auth"
-	ocpcommon "github.com/code-payments/ocp-server/ocp/common"
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 )
 
 // Authorizer authorizes an action for a UserId with the given auth.
@@ -94,10 +94,10 @@ func (v *authenticator) Verify(ctx context.Context, m proto.Message, auth *commo
 		return status.Error(codes.InvalidArgument, "invalid auth")
 	}
 
-	account, err := ocpcommon.NewAccountFromPublicKeyBytes(keyPair.PubKey.Value)
+	account, err := ocp_common.NewAccountFromPublicKeyBytes(keyPair.PubKey.Value)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, "invalid pubkey")
 	}
 
-	return v.auth.Authenticate(ctx, account, m, &ocpcommonpb.Signature{Value: keyPair.Signature.Value})
+	return v.auth.Authenticate(ctx, account, m, &ocp_commonpb.Signature{Value: keyPair.Signature.Value})
 }

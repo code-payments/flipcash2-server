@@ -7,9 +7,9 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/push"
-	ocpswap "github.com/code-payments/ocp-server/ocp/worker/swap"
-	ocpcommon "github.com/code-payments/ocp-server/ocp/common"
-	ocpcurrency "github.com/code-payments/ocp-server/currency"
+	ocp_swap "github.com/code-payments/ocp-server/ocp/worker/swap"
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
+	ocp_currency "github.com/code-payments/ocp-server/currency"
 )
 
 type Integration struct {
@@ -17,20 +17,20 @@ type Integration struct {
 	pusher   push.Pusher
 }
 
-func NewIntegration(accounts account.Store, pusher push.Pusher) ocpswap.Integration {
+func NewIntegration(accounts account.Store, pusher push.Pusher) ocp_swap.Integration {
 	return &Integration{
 		accounts: accounts,
 		pusher:   pusher,
 	}
 }
 
-func (i *Integration) OnSwapFinalized(ctx context.Context, owner, mint *ocpcommon.Account, currencyName string, region ocpcurrency.Code, nativeAmount float64) error {
+func (i *Integration) OnSwapFinalized(ctx context.Context, owner, mint *ocp_common.Account, currencyName string, region ocp_currency.Code, nativeAmount float64) error {
 	userID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: owner.PublicKey().ToBytes()})
 	if err != nil {
 		return err
 	}
 
-	if ocpcommon.IsCoreMint(mint) {
+	if ocp_common.IsCoreMint(mint) {
 		return push.SendUsdcReceivedFromSwapPush(ctx, i.pusher, userID, region, nativeAmount)
 	}
 	return push.SendFlipcashCurrencyReceivedFromSwapPush(ctx, i.pusher, userID, currencyName, region, nativeAmount)

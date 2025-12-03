@@ -22,9 +22,9 @@ import (
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/protoutil"
-	ocpheaders "github.com/code-payments/ocp-server/grpc/headers"
-	ocpretry "github.com/code-payments/ocp-server/retry"
-	ocpbackoff "github.com/code-payments/ocp-server/retry/backoff"
+	ocp_headers "github.com/code-payments/ocp-server/grpc/headers"
+	ocp_retry "github.com/code-payments/ocp-server/retry"
+	ocp_backoff "github.com/code-payments/ocp-server/retry/backoff"
 )
 
 const (
@@ -337,7 +337,7 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 }
 
 func (s *Server) ForwardEvents(ctx context.Context, req *eventpb.ForwardEventsRequest) (*eventpb.ForwardEventsResponse, error) {
-	headerValue, err := ocpheaders.GetASCIIHeaderByName(ctx, internalRpcApiKeyHeaderName)
+	headerValue, err := ocp_headers.GetASCIIHeaderByName(ctx, internalRpcApiKeyHeaderName)
 	if err != nil {
 		s.log.Warn("Failure getting RPC API key header")
 		return nil, status.Error(codes.Internal, "")
@@ -369,15 +369,15 @@ func (s *Server) ForwardEvents(ctx context.Context, req *eventpb.ForwardEventsRe
 // todo: utilize batching by receiver to optimize internal forwarding RPC calls
 func (s *Server) ForwardUserEvents(ctx context.Context, events ...*eventpb.UserEvent) error {
 	var err error
-	if !ocpheaders.AreHeadersInitialized(ctx) {
-		ctx, err = ocpheaders.ContextWithHeaders(ctx)
+	if !ocp_headers.AreHeadersInitialized(ctx) {
+		ctx, err = ocp_headers.ContextWithHeaders(ctx)
 		if err != nil {
 			s.log.With(zap.Error(err)).Warn("Failure initializing headers")
 			return err
 		}
 	}
 
-	err = ocpheaders.SetASCIIHeader(ctx, internalRpcApiKeyHeaderName, s.currentRpcApiKey)
+	err = ocp_headers.SetASCIIHeader(ctx, internalRpcApiKeyHeaderName, s.currentRpcApiKey)
 	if err != nil {
 		s.log.With(zap.Error(err)).Warn("Failure setting RPC API key header")
 		return err
@@ -385,12 +385,12 @@ func (s *Server) ForwardUserEvents(ctx context.Context, events ...*eventpb.UserE
 
 	for _, event := range events {
 		go func() {
-			ocpretry.Retry(
+			ocp_retry.Retry(
 				func() error {
 					return s.forwardUserEvent(ctx, event)
 				},
-				ocpretry.Limit(3),
-				ocpretry.Backoff(ocpbackoff.BinaryExponential(100*time.Millisecond), 500*time.Millisecond),
+				ocp_retry.Limit(3),
+				ocp_retry.Backoff(ocp_backoff.BinaryExponential(100*time.Millisecond), 500*time.Millisecond),
 			)
 		}()
 	}

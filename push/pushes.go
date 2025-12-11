@@ -14,14 +14,14 @@ import (
 )
 
 var (
-	defaultLocale     = language.English
-	usdcAmountPrinter = message.NewPrinter(defaultLocale)
+	defaultLocale = language.English
+	amountPrinter = message.NewPrinter(defaultLocale)
 )
 
-func SendUsdcReceivedFromDepositPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, usdMarketValue float64) error {
-	title := "Cash Now Available"
-	body := usdcAmountPrinter.Sprintf(
-		"$%.2f was added to your Flipcash wallet",
+func SendUsdfReceivedFromDepositPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, usdMarketValue float64) error {
+	title := "Cash Reserves Now Available"
+	body := amountPrinter.Sprintf(
+		"$%.2f of Cash Reserves was added to your Flipcash wallet",
 		usdMarketValue,
 	)
 	return pusher.SendBasicPushes(ctx, title, body, user)
@@ -29,7 +29,7 @@ func SendUsdcReceivedFromDepositPush(ctx context.Context, pusher Pusher, user *c
 
 func SendFlipcashCurrencyReceivedFromDepositPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, currencyName string, usdMarketValue float64) error {
 	title := fmt.Sprintf("%s Now Available", currencyName)
-	body := usdcAmountPrinter.Sprintf(
+	body := amountPrinter.Sprintf(
 		"$%.2f of %s was added to your Flipcash wallet",
 		usdMarketValue,
 		currencyName,
@@ -37,10 +37,10 @@ func SendFlipcashCurrencyReceivedFromDepositPush(ctx context.Context, pusher Pus
 	return pusher.SendBasicPushes(ctx, title, body, user)
 }
 
-func SendUsdcReceivedFromSwapPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, region ocp_currency.Code, nativeAmount float64) error {
-	title := "Cash Now Available"
-	body := usdcAmountPrinter.Sprintf(
-		"%s was added to your Flipcash wallet",
+func SendUsdfReceivedFromSwapPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, region ocp_currency.Code, nativeAmount float64) error {
+	title := "Cash Reserves Now Available"
+	body := amountPrinter.Sprintf(
+		"%s of Cash Reserves was added to your Flipcash wallet",
 		localization.FormatFiat(defaultLocale, region, nativeAmount),
 	)
 	return pusher.SendBasicPushes(ctx, title, body, user)
@@ -48,7 +48,7 @@ func SendUsdcReceivedFromSwapPush(ctx context.Context, pusher Pusher, user *comm
 
 func SendFlipcashCurrencyReceivedFromSwapPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, currencyName string, region ocp_currency.Code, nativeAmount float64) error {
 	title := fmt.Sprintf("%s Now Available", currencyName)
-	body := usdcAmountPrinter.Sprintf(
+	body := amountPrinter.Sprintf(
 		"%s of %s was added to your Flipcash wallet",
 		localization.FormatFiat(defaultLocale, region, nativeAmount),
 		currencyName,

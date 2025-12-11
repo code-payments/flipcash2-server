@@ -7,9 +7,9 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/push"
-	ocp_swap "github.com/code-payments/ocp-server/ocp/worker/swap"
-	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_currency "github.com/code-payments/ocp-server/currency"
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
+	ocp_swap "github.com/code-payments/ocp-server/ocp/worker/swap"
 )
 
 type Integration struct {
@@ -31,7 +31,7 @@ func (i *Integration) OnSwapFinalized(ctx context.Context, owner, mint *ocp_comm
 	}
 
 	if ocp_common.IsCoreMint(mint) {
-		return push.SendUsdcReceivedFromSwapPush(ctx, i.pusher, userID, region, nativeAmount)
+		return push.SendUsdfReceivedFromSwapPush(ctx, i.pusher, userID, region, nativeAmount)
 	}
 	return push.SendFlipcashCurrencyReceivedFromSwapPush(ctx, i.pusher, userID, currencyName, region, nativeAmount)
 }

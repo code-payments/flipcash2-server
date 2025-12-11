@@ -7,8 +7,8 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/push"
-	ocp_geyser "github.com/code-payments/ocp-server/ocp/worker/geyser"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
+	ocp_geyser "github.com/code-payments/ocp-server/ocp/worker/geyser"
 )
 
 type Integration struct {
@@ -35,7 +35,7 @@ func (i *Integration) OnDepositReceived(ctx context.Context, owner, mint *ocp_co
 	}
 
 	if ocp_common.IsCoreMint(mint) {
-		return push.SendUsdcReceivedFromDepositPush(ctx, i.pusher, userID, usdMarketValue)
+		return push.SendUsdfReceivedFromDepositPush(ctx, i.pusher, userID, usdMarketValue)
 	}
 	return push.SendFlipcashCurrencyReceivedFromDepositPush(ctx, i.pusher, userID, currencyName, usdMarketValue)
 }

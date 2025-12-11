@@ -42,10 +42,10 @@ github.com/code-payments/code-vm-indexer v1.2.0 h1:rSHpBMiT9BKgmKcXg/VIoi/h0t7jN
 github.com/code-payments/code-vm-indexer v1.2.0/go.mod h1:vn91YN2qNqb+gGJeZe2+l+TNxVmEEiRHXXnIn2Y40h8=
 github.com/code-payments/flipcash2-protobuf-api v0.1.0 h1:SJ8beRISJzLiwYdLEDFrMibb2SSCzyTFhFwv7N2+Itw=
 github.com/code-payments/flipcash2-protobuf-api v0.1.0/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
-github.com/code-payments/ocp-protobuf-api v0.2.0 h1:XLDeVdPDjy+Y0xnvcu1KHf6JelWc4IgDQ4SOCRBJvzE=
-github.com/code-payments/ocp-protobuf-api v0.2.0/go.mod h1:tw6BooY5a8l6CtSZnKOruyKII0W04n89pcM4BizrgG8=
-github.com/code-payments/ocp-server v0.3.0 h1:i2hhh+DbVLW+Rmr2LnIDDDYw6SPSb26/T1IHRDDtoP4=
-github.com/code-payments/ocp-server v0.3.0/go.mod h1:CbwFT6DHfeoXS0Ii7Ant/DW4FgFX0D/In7UXjfgca/4=
+github.com/code-payments/ocp-protobuf-api v0.3.0 h1:44o1+BMFz1eq5H7tsivp8p/rleuHMeetxEL3tUIRV0I=
+github.com/code-payments/ocp-protobuf-api v0.3.0/go.mod h1:tw6BooY5a8l6CtSZnKOruyKII0W04n89pcM4BizrgG8=
+github.com/code-payments/ocp-server v0.9.0 h1:coT8zE4TkAI8iE14O9pIjvCQi2mm2PYwYHJ3Uv3FnX8=
+github.com/code-payments/ocp-server v0.9.0/go.mod h1:uDe+EfK/tB8pV7qZOpKiHg8ueJLQIE0U3O/wCMW34uQ=
 github.com/containerd/continuity v0.4.3 h1:6HVkalIp+2u1ZLH1J/pYX2oBVXlJZvh1X1A7bEZ9Su8=
 github.com/containerd/continuity v0.4.3/go.mod h1:F6PTNCKepoxEaXLQp3wDAjygEnImnZ/7o4JzpodfroQ=
 github.com/coreos/go-systemd v0.0.0-20190321100706-95778dfbb74e/go.mod h1:F5haX7vjVVG0kc13fIWeqUViNPyEJxv/OmvnBo0Yme4=
@@ -238,8 +238,8 @@ github.com/moby/term v0.5.0/go.mod h1:8FzsFHVUBGZdbDsJw/ot+X+d5HLUbvklYLJ9uGfcI3
 github.com/mr-tron/base58 v1.2.0 h1:T/HDJBh4ZCPbU39/+c3rRvE0uKBQlU27+QI8LJ4t64o=
 github.com/mr-tron/base58 v1.2.0/go.mod h1:BinMc/sQntlIE1frQmRFPUoPA1Zkr8VRgBdjWI2mNwc=
 github.com/newrelic/go-agent/v3 v3.3.0/go.mod h1:H28zDNUC0U/b7kLoY4EFOhuth10Xu/9dchozUiOseQQ=
-github.com/newrelic/go-agent/v3 v3.20.1 h1:xxhPjE/j4z7n82FQV4izRjIkd4E10q4flqgzMj+DlLM=
-github.com/newrelic/go-agent/v3 v3.20.1/go.mod h1:rT6ZUxJc5rQbWLyCtjqQCOcfb01lKRFbc1yMQkcboWM=
+github.com/newrelic/go-agent/v3 v3.40.1 h1:8nb4R252Fpuc3oySvlHpDwqySqaPWL5nf7ZVEhqtUeA=
+github.com/newrelic/go-agent/v3 v3.40.1/go.mod h1:X0TLXDo+ttefTIue1V96Y5seb8H6wqf6uUq4UpPsYj8=
 github.com/newrelic/go-agent/v3/integrations/nrpgx v1.0.0 h1:5pj3uXyWB0fpgbeK1yW51go6Y57uRG8F7w5Nu6kIiCQ=
 github.com/newrelic/go-agent/v3/integrations/nrpgx v1.0.0/go.mod h1:G4vsr8xgPwFxxwJSbE982D7rswRFEfoCaXPQWWWQyQo=
 github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e/go.mod h1:zD1mROLANZcx1PVRCS0qkT7pwLkGfwJo4zjcN/Tysno=

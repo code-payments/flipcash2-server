@@ -9,6 +9,7 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	ocp_antispam "github.com/code-payments/ocp-server/ocp/antispam"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
+	"github.com/code-payments/ocp-server/ocp/data/swap"
 )
 
 type Integration struct {
@@ -73,6 +74,6 @@ func (i *Integration) AllowDistribution(ctx context.Context, owner *ocp_common.A
 	return true, "", nil
 }
 
-func (i *Integration) AllowSwap(_ context.Context, _, _, _ *ocp_common.Account) (bool, string, error) {
+func (i *Integration) AllowSwap(_ context.Context, _ swap.FundingSource, _, _, _ *ocp_common.Account) (bool, string, error) {
 	return true, "", nil
 }

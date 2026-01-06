@@ -42,10 +42,10 @@ github.com/code-payments/code-vm-indexer v1.2.0 h1:rSHpBMiT9BKgmKcXg/VIoi/h0t7jN
 github.com/code-payments/code-vm-indexer v1.2.0/go.mod h1:vn91YN2qNqb+gGJeZe2+l+TNxVmEEiRHXXnIn2Y40h8=
 github.com/code-payments/flipcash2-protobuf-api v0.1.0 h1:SJ8beRISJzLiwYdLEDFrMibb2SSCzyTFhFwv7N2+Itw=
 github.com/code-payments/flipcash2-protobuf-api v0.1.0/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
-github.com/code-payments/ocp-protobuf-api v0.3.0 h1:44o1+BMFz1eq5H7tsivp8p/rleuHMeetxEL3tUIRV0I=
-github.com/code-payments/ocp-protobuf-api v0.3.0/go.mod h1:tw6BooY5a8l6CtSZnKOruyKII0W04n89pcM4BizrgG8=
-github.com/code-payments/ocp-server v0.9.0 h1:coT8zE4TkAI8iE14O9pIjvCQi2mm2PYwYHJ3Uv3FnX8=
-github.com/code-payments/ocp-server v0.9.0/go.mod h1:uDe+EfK/tB8pV7qZOpKiHg8ueJLQIE0U3O/wCMW34uQ=
+github.com/code-payments/ocp-protobuf-api v0.7.0 h1:pHIVYXmDus32LEzaj92qDWKYrPawuzBIJ+Xlzzf9udg=
+github.com/code-payments/ocp-protobuf-api v0.7.0/go.mod h1:tw6BooY5a8l6CtSZnKOruyKII0W04n89pcM4BizrgG8=
+github.com/code-payments/ocp-server v0.12.0 h1:KxPcFGwPLZ2KRgu+cQ6Jrr+UOKxGzHUHBI5UWx7FIEU=
+github.com/code-payments/ocp-server v0.12.0/go.mod h1:UWdvoBiMc8Ltp1QedZFy+XPsLTAxIOCnTqALJfXfKi8=
 github.com/containerd/continuity v0.4.3 h1:6HVkalIp+2u1ZLH1J/pYX2oBVXlJZvh1X1A7bEZ9Su8=
 github.com/containerd/continuity v0.4.3/go.mod h1:F6PTNCKepoxEaXLQp3wDAjygEnImnZ/7o4JzpodfroQ=
 github.com/coreos/go-systemd v0.0.0-20190321100706-95778dfbb74e/go.mod h1:F5haX7vjVVG0kc13fIWeqUViNPyEJxv/OmvnBo0Yme4=

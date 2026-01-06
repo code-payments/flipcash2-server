@@ -35,7 +35,7 @@ func (i *Integration) OnDepositReceived(ctx context.Context, owner, mint *ocp_co
 	}
 
 	if ocp_common.IsCoreMint(mint) {
-		return push.SendUsdfReceivedFromDepositPush(ctx, i.pusher, userID, usdMarketValue)
+		return push.SendUsdfDepositedPush(ctx, i.pusher, userID, usdMarketValue)
 	}
-	return push.SendFlipcashCurrencyReceivedFromDepositPush(ctx, i.pusher, userID, currencyName, usdMarketValue)
+	return push.SendFlipcashCurrencyDepositedPush(ctx, i.pusher, userID, currencyName, usdMarketValue)
 }

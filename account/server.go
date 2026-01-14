@@ -32,8 +32,6 @@ const (
 var (
 	defaultOnRampProviders = []accountpb.UserFlags_OnRampProvider{
 		accountpb.UserFlags_PHANTOM,
-		accountpb.UserFlags_SOLFLARE,
-		accountpb.UserFlags_BACKPACK,
 		accountpb.UserFlags_MANUAL_DEPOSIT,
 	}
 	onRampProvidersByCountryAndPlatform = map[string]map[commonpb.Platform][]accountpb.UserFlags_OnRampProvider{

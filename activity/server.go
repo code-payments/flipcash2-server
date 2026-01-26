@@ -15,12 +15,11 @@ import (
 
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/model"
+	ocp_query "github.com/code-payments/ocp-server/database/query"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_transaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
-	ocp_currency "github.com/code-payments/ocp-server/currency"
-	ocp_query "github.com/code-payments/ocp-server/database/query"
 	"github.com/code-payments/ocp-server/pointer"
 )
 
@@ -275,6 +274,8 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 					if !isClaimed {
 						notification.State = activitypb.NotificationState_NOTIFICATION_STATE_PENDING
 					}
+				} else if intentMetadata.IsSwapSell {
+					notification.AdditionalMetadata = &activitypb.Notification_SoldCrypto{SoldCrypto: &activitypb.SoldCryptoNotificationMetadata{}}
 				} else if intentMetadata.IsWithdrawal {
 					notification.AdditionalMetadata = &activitypb.Notification_WithdrewCrypto{WithdrewCrypto: &activitypb.WithdrewCryptoNotificationMetadata{}}
 				} else {
@@ -308,16 +309,21 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 			intentMetadata := intentRecord.ExternalDepositMetadata
 
 			// Hide small, potentially spam deposits
-			if intentMetadata.UsdMarketValue < 0.01 {
+			if !intentMetadata.IsSwapBuy && intentMetadata.UsdMarketValue < 0.01 {
 				continue
 			}
 
 			notification.PaymentAmount = &commonpb.CryptoPaymentAmount{
-				Currency:     string(ocp_currency.USD),
-				NativeAmount: intentMetadata.UsdMarketValue,
+				Currency:     string(intentMetadata.ExchangeCurrency),
+				NativeAmount: intentMetadata.NativeAmount,
 				Quarks:       intentMetadata.Quantity,
 			}
-			notification.AdditionalMetadata = &activitypb.Notification_DepositedCrypto{DepositedCrypto: &activitypb.DepositedCryptoNotificationMetadata{}}
+
+			if intentMetadata.IsSwapBuy {
+				notification.AdditionalMetadata = &activitypb.Notification_BoughtCrypto{BoughtCrypto: &activitypb.BoughtCryptoNotificationMetadata{}}
+			} else {
+				notification.AdditionalMetadata = &activitypb.Notification_DepositedCrypto{DepositedCrypto: &activitypb.DepositedCryptoNotificationMetadata{}}
+			}
 
 		default:
 			continue

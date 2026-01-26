@@ -54,6 +54,12 @@ func InjectLocalizedText(ctx context.Context, ocpData ocp_data.Provider, userOwn
 			}
 		}
 
+	case *activitypb.Notification_BoughtCrypto:
+		localizedText = "Purchased"
+
+	case *activitypb.Notification_SoldCrypto:
+		localizedText = "Sold"
+
 	default:
 		return errors.New("unsupported notification type")
 	}

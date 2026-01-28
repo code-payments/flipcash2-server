@@ -72,6 +72,11 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 		customPayload = &pushpb.Payload{}
 	}
 
+	err = customPayload.Validate()
+	if err != nil {
+		return err
+	}
+
 	marshalledCustomPayload, err := proto.Marshal(customPayload)
 	if err != nil {
 		return err

@@ -2,12 +2,14 @@ package tests
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"testing"
 
 	"firebase.google.com/go/v4/messaging"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
@@ -58,7 +60,19 @@ func testFCMPusher_SendBasicPushes(t *testing.T, store push.TokenStore) {
 
 	targetUsers := users[:3]
 
-	require.NoError(t, pusher.SendBasicPushes(ctx, "title", "body", targetUsers...))
+	customPayload := &pushpb.Payload{
+		Navigation: &pushpb.Navigation{
+			Type: &pushpb.Navigation_CurrencyInfo{
+				CurrencyInfo: &commonpb.PublicKey{Value: make([]byte, 32)},
+			},
+		},
+	}
+
+	marshalledCustomPayload, err := proto.Marshal(customPayload)
+	require.NoError(t, err)
+	expectedEncodedCustomPayload := base64.StdEncoding.EncodeToString(marshalledCustomPayload)
+
+	require.NoError(t, pusher.SendPushes(ctx, "title", "body", customPayload, targetUsers...))
 
 	require.NotNil(t, fcmClient.sentMessage)
 
@@ -71,5 +85,7 @@ func testFCMPusher_SendBasicPushes(t *testing.T, store push.TokenStore) {
 		"token2_1", "token2_2",
 	}
 	require.ElementsMatch(t, expectedTokens, fcmClient.sentMessage.Tokens)
-	require.Empty(t, fcmClient.sentMessage.Data)
+	require.Len(t, fcmClient.sentMessage.Data, 2)
+	require.Equal(t, expectedEncodedCustomPayload, fcmClient.sentMessage.Data["flipcash_payload"])
+	require.Equal(t, "https://app.flipcash.com/token/11111111111111111111111111111111", fcmClient.sentMessage.Data["target_url"])
 }

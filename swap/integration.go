@@ -24,14 +24,15 @@ func NewIntegration(accounts account.Store, pusher push.Pusher) ocp_swap.Integra
 	}
 }
 
-func (i *Integration) OnSwapFinalized(ctx context.Context, owner *ocp_common.Account, isBuy bool, currencyName string, region ocp_currency.Code, amountReceived float64) error {
+func (i *Integration) OnSwapFinalized(ctx context.Context, owner *ocp_common.Account, isBuy bool, mint *ocp_common.Account, currencyName string, region ocp_currency.Code, amountReceived float64) error {
 	userID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: owner.PublicKey().ToBytes()})
 	if err != nil {
 		return err
 	}
 
+	protoMint := &commonpb.PublicKey{Value: mint.PublicKey().ToBytes()}
 	if isBuy {
-		return push.SendFlipcashCurrencyBoughtPush(ctx, i.pusher, userID, currencyName, region, amountReceived)
+		return push.SendFlipcashCurrencyBoughtPush(ctx, i.pusher, userID, protoMint, currencyName, region, amountReceived)
 	}
-	return push.SendFlipcashCurrencySoldPush(ctx, i.pusher, userID, currencyName, region, amountReceived)
+	return push.SendFlipcashCurrencySoldPush(ctx, i.pusher, userID, protoMint, currencyName, region, amountReceived)
 }

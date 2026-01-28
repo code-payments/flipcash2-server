@@ -2,20 +2,25 @@ package push
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
 
 	"firebase.google.com/go/v4/messaging"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
+	"github.com/mr-tron/base58"
 )
 
 type Pusher interface {
-	SendBasicPushes(ctx context.Context, title, body string, users ...*commonpb.UserId) error
+	SendPushes(ctx context.Context, title, body string, customPayload *pushpb.Payload, users ...*commonpb.UserId) error
 }
 
 type NoOpPusher struct{}
 
-func (n *NoOpPusher) SendBasicPushes(_ context.Context, _, _ string, _ ...*commonpb.UserId) error {
+func (n *NoOpPusher) SendPushes(_ context.Context, _, _ string, _ *pushpb.Payload, _ ...*commonpb.UserId) error {
 	return nil
 }
 
@@ -41,8 +46,7 @@ func NewFCMPusher(log *zap.Logger, tokens TokenStore, client FCMClient) *FCMPush
 	}
 }
 
-// todo: Some duplicated code, but the existing push per message flow is likely going away anyways. We'll refactor when we get to that.
-func (p *FCMPusher) SendBasicPushes(ctx context.Context, title, body string, users ...*commonpb.UserId) error {
+func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPayload *pushpb.Payload, users ...*commonpb.UserId) error {
 	if len(users) == 0 {
 		return nil
 	}
@@ -64,12 +68,38 @@ func (p *FCMPusher) SendBasicPushes(ctx context.Context, title, body string, use
 
 	tokens := extractTokens(pushTokens)
 
+	if customPayload == nil {
+		customPayload = &pushpb.Payload{}
+	}
+
+	marshalledCustomPayload, err := proto.Marshal(customPayload)
+	if err != nil {
+		return err
+	}
+	encodedCustomPayload := base64.StdEncoding.EncodeToString(marshalledCustomPayload)
+
+	customData := map[string]string{
+		"flipcash_payload": encodedCustomPayload,
+	}
+	if customPayload.Navigation != nil {
+		var targetUrl string
+		switch typed := customPayload.Navigation.Type.(type) {
+		case *pushpb.Navigation_CurrencyInfo:
+			targetUrl = fmt.Sprintf("https://app.flipcash.com/token/%s", base58.Encode(typed.CurrencyInfo.Value))
+		}
+		if len(targetUrl) > 0 {
+			customData["target_url"] = targetUrl
+		}
+	}
+
 	message := &messaging.MulticastMessage{
 		Tokens: tokens,
 		Notification: &messaging.Notification{
 			Title: title,
 			Body:  body,
 		},
+
+		Data: customData,
 	}
 
 	response, err := p.client.SendEachForMulticast(ctx, message)

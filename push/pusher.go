@@ -84,7 +84,9 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 	encodedCustomPayload := base64.StdEncoding.EncodeToString(marshalledCustomPayload)
 
 	customData := map[string]string{
-		"flipcash_payload": encodedCustomPayload,
+		"push_notification_title": title,
+		"push_notification_body":  body,
+		"flipcash_payload":        encodedCustomPayload,
 	}
 	if customPayload.Navigation != nil {
 		var targetUrl string
@@ -99,11 +101,16 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 
 	message := &messaging.MulticastMessage{
 		Tokens: tokens,
-		Notification: &messaging.Notification{
-			Title: title,
-			Body:  body,
+		APNS: &messaging.APNSConfig{
+			Payload: &messaging.APNSPayload{
+				Aps: &messaging.Aps{
+					Alert: &messaging.ApsAlert{
+						Title: title,
+						Body:  body,
+					},
+				},
+			},
 		},
-
 		Data: customData,
 	}
 

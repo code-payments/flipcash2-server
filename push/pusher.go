@@ -83,7 +83,7 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 	}
 	encodedCustomPayload := base64.StdEncoding.EncodeToString(marshalledCustomPayload)
 
-	customData := map[string]string{
+	customDataAndroid := map[string]string{
 		"push_notification_title": title,
 		"push_notification_body":  body,
 		"flipcash_payload":        encodedCustomPayload,
@@ -95,12 +95,19 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 			targetUrl = fmt.Sprintf("https://app.flipcash.com/token/%s", base58.Encode(typed.CurrencyInfo.Value))
 		}
 		if len(targetUrl) > 0 {
-			customData["target_url"] = targetUrl
+			customDataAndroid["target_url"] = targetUrl
 		}
+	}
+	customDataApns := make(map[string]interface{})
+	for k, v := range customDataAndroid {
+		customDataApns[k] = v
 	}
 
 	message := &messaging.MulticastMessage{
 		Tokens: tokens,
+		Android: &messaging.AndroidConfig{
+			Data: customDataAndroid,
+		},
 		APNS: &messaging.APNSConfig{
 			Payload: &messaging.APNSPayload{
 				Aps: &messaging.Aps{
@@ -108,10 +115,10 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 						Title: title,
 						Body:  body,
 					},
+					CustomData: customDataApns,
 				},
 			},
 		},
-		Data: customData,
 	}
 
 	response, err := p.client.SendEachForMulticast(ctx, message)

@@ -83,12 +83,20 @@ func testFCMPusher_SendBasicPushes(t *testing.T, store push.TokenStore) {
 		"token2_1", "token2_2",
 	}
 	require.ElementsMatch(t, expectedTokens, fcmClient.sentMessage.Tokens)
+
+	require.NotNil(t, fcmClient.sentMessage.Android)
+	require.Len(t, fcmClient.sentMessage.Android.Data, 4)
+	require.Equal(t, "title", fcmClient.sentMessage.Android.Data["push_notification_title"])
+	require.Equal(t, "body", fcmClient.sentMessage.Android.Data["push_notification_body"])
+	require.Equal(t, expectedEncodedCustomPayload, fcmClient.sentMessage.Android.Data["flipcash_payload"])
+	require.Equal(t, "https://app.flipcash.com/token/11111111111111111111111111111111", fcmClient.sentMessage.Android.Data["target_url"])
+
 	require.NotNil(t, fcmClient.sentMessage.APNS)
 	require.Equal(t, "title", fcmClient.sentMessage.APNS.Payload.Aps.Alert.Title)
 	require.Equal(t, "body", fcmClient.sentMessage.APNS.Payload.Aps.Alert.Body)
-	require.Len(t, fcmClient.sentMessage.Data, 4)
-	require.Equal(t, "title", fcmClient.sentMessage.Data["push_notification_title"])
-	require.Equal(t, "body", fcmClient.sentMessage.Data["push_notification_body"])
-	require.Equal(t, expectedEncodedCustomPayload, fcmClient.sentMessage.Data["flipcash_payload"])
-	require.Equal(t, "https://app.flipcash.com/token/11111111111111111111111111111111", fcmClient.sentMessage.Data["target_url"])
+	require.Len(t, fcmClient.sentMessage.APNS.Payload.Aps.CustomData, 4)
+	require.Equal(t, "title", fcmClient.sentMessage.APNS.Payload.Aps.CustomData["push_notification_title"])
+	require.Equal(t, "body", fcmClient.sentMessage.APNS.Payload.Aps.CustomData["push_notification_body"])
+	require.Equal(t, expectedEncodedCustomPayload, fcmClient.sentMessage.APNS.Payload.Aps.CustomData["flipcash_payload"])
+	require.Equal(t, "https://app.flipcash.com/token/11111111111111111111111111111111", fcmClient.sentMessage.APNS.Payload.Aps.CustomData["target_url"])
 }

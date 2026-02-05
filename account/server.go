@@ -35,11 +35,11 @@ var (
 		accountpb.UserFlags_MANUAL_DEPOSIT,
 	}
 	onRampProvidersByCountryAndPlatform = map[string]map[commonpb.Platform][]accountpb.UserFlags_OnRampProvider{
-		"us": {
+		/*"us": {
 			commonpb.Platform_APPLE: {
 				accountpb.UserFlags_COINBASE_VIRTUAL,
 			},
-		},
+		},*/
 	}
 
 	staffAppleOnRampProviders = []accountpb.UserFlags_OnRampProvider{

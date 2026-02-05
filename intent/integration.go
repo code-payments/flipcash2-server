@@ -5,6 +5,7 @@ import (
 
 	ocp_transactionpb "github.com/code-payments/ocp-protobuf-api/generated/go/transaction/v1"
 
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_transaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
@@ -33,6 +34,10 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 		return nil
 
 	case ocp_intent.SendPublicPayment:
+		if intentRecord.MintAccount == ocp_common.CoreMintAccount.PublicKey().ToBase58() && !intentRecord.SendPublicPaymentMetadata.IsWithdrawal {
+			return ocp_transaction.NewIntentDeniedError("core mint account is restricted to withdrawals and swap fundings")
+		}
+
 		return nil
 
 	case ocp_intent.ReceivePaymentsPublicly:

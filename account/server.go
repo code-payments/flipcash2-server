@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	accountpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/account/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -27,6 +28,8 @@ const (
 
 	minIosBuildNumber     = 256
 	minAndroidBuildNumber = 2790
+
+	defaultBillExchangeDataTimeout = 5 * time.Minute
 )
 
 var (
@@ -219,6 +222,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			SupportedOnRampProviders:   supportedOnRampProvidersForUser,
 			PreferredOnRampProvider:    preferredOnRampProviderForUser,
 			MinBuildNumber:             uint32(minBuildNumber),
+			BillExchangeDataTimeout:    durationpb.New(defaultBillExchangeDataTimeout),
 		},
 	}, nil
 }

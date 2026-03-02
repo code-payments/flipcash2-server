@@ -1,13 +1,13 @@
 module github.com/code-payments/flipcash2-server
 
-go 1.25.0
+go 1.26.0
 
 require (
 	firebase.google.com/go/v4 v4.18.0
 	github.com/ReneKroon/ttlcache v1.7.0
-	github.com/code-payments/flipcash2-protobuf-api v0.4.0
-	github.com/code-payments/ocp-protobuf-api v0.11.0
-	github.com/code-payments/ocp-server v0.26.0
+	github.com/code-payments/flipcash2-protobuf-api v1.0.0
+	github.com/code-payments/ocp-protobuf-api v1.0.0
+	github.com/code-payments/ocp-server v0.35.1-0.20260302201224-4b90d40e4189
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2
 	github.com/georgysavva/scany/v2 v2.1.4
 	github.com/google/uuid v1.6.0

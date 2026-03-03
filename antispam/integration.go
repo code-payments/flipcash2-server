@@ -8,6 +8,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	ocp_antispam "github.com/code-payments/ocp-server/ocp/antispam"
+	"github.com/code-payments/ocp-server/ocp/common"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	"github.com/code-payments/ocp-server/ocp/data/swap"
 )
@@ -48,7 +49,7 @@ func (i *Integration) AllowOpenAccounts(ctx context.Context, owner *ocp_common.A
 	}
 }
 
-func (i *Integration) AllowWelcomeBonus(ctx context.Context, owner *ocp_common.Account) (bool, string, error) {
+func (i *Integration) AllowWelcomeBonus(_ context.Context, _ *ocp_common.Account) (bool, string, error) {
 	// Always allow since we properly gate everything required in AllowOpenAccounts
 	return true, "", nil
 }
@@ -60,14 +61,14 @@ func (i *Integration) AllowSendPayment(_ context.Context, _, _ *ocp_common.Accou
 	return true, "", nil
 }
 
-func (i *Integration) AllowReceivePayments(ctx context.Context, owner *ocp_common.Account, isPublic bool) (bool, string, error) {
+func (i *Integration) AllowReceivePayments(_ context.Context, _ *ocp_common.Account, isPublic bool) (bool, string, error) {
 	if !isPublic {
 		return false, "flipcash payments must be public", nil
 	}
 	return true, "", nil
 }
 
-func (i *Integration) AllowDistribution(ctx context.Context, owner *ocp_common.Account, isPublic bool) (bool, string, error) {
+func (i *Integration) AllowDistribution(_ context.Context, _ *ocp_common.Account, isPublic bool) (bool, string, error) {
 	if !isPublic {
 		return false, "flipcash distributions must be public", nil
 	}
@@ -75,5 +76,9 @@ func (i *Integration) AllowDistribution(ctx context.Context, owner *ocp_common.A
 }
 
 func (i *Integration) AllowSwap(_ context.Context, _ swap.FundingSource, _, _, _ *ocp_common.Account) (bool, string, error) {
+	return true, "", nil
+}
+
+func (i *Integration) AllowCurrencyLaunch(_ context.Context, _ *common.Account, _, _ string) (bool, string, error) {
 	return true, "", nil
 }

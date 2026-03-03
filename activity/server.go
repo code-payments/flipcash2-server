@@ -19,7 +19,6 @@ import (
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
-	ocp_transaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
 	"github.com/code-payments/ocp-server/pointer"
 )
 
@@ -225,8 +224,6 @@ func (s *Server) getNotificationsFromBatchIntents(ctx context.Context, log *zap.
 }
 
 func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, userOwnerAccount *ocp_common.Account, intentRecords []*ocp_intent.Record) ([]*activitypb.Notification, error) {
-	welcomeBonusIntentID := ocp_transaction.GetAirdropIntentId(ocp_transaction.AirdropTypeWelcomeBonus, userOwnerAccount.PublicKey().ToBase58())
-
 	var notifications []*activitypb.Notification
 	for _, intentRecord := range intentRecords {
 		rawNotificationID, err := base58.Decode(intentRecord.IntentId)
@@ -282,9 +279,7 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 					notification.AdditionalMetadata = &activitypb.Notification_GaveCrypto{GaveCrypto: &activitypb.GaveCryptoNotificationMetadata{}}
 				}
 			} else {
-				if intentRecord.IntentId == welcomeBonusIntentID {
-					notification.AdditionalMetadata = &activitypb.Notification_WelcomeBonus{WelcomeBonus: &activitypb.WelcomeBonusNotificationMetadata{}}
-				} else if intentMetadata.IsWithdrawal {
+				if intentMetadata.IsWithdrawal {
 					notification.AdditionalMetadata = &activitypb.Notification_DepositedCrypto{DepositedCrypto: &activitypb.DepositedCryptoNotificationMetadata{}}
 				} else {
 					notification.AdditionalMetadata = &activitypb.Notification_ReceivedCrypto{ReceivedCrypto: &activitypb.ReceivedCryptoNotificationMetadata{}}

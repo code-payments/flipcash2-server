@@ -13,8 +13,6 @@ import (
 func InjectLocalizedText(ctx context.Context, ocpData ocp_data.Provider, userOwnerAccount *ocp_common.Account, notification *activitypb.Notification) error {
 	var localizedText string
 	switch typed := notification.AdditionalMetadata.(type) {
-	case *activitypb.Notification_WelcomeBonus:
-		localizedText = "Welcome Bonus"
 
 	case *activitypb.Notification_GaveCrypto:
 		localizedText = "Gave"

@@ -54,6 +54,7 @@ var (
 		accountpb.UserFlags_MANUAL_DEPOSIT,
 	}
 	staffGoogleOnRampProviders = []accountpb.UserFlags_OnRampProvider{
+		accountpb.UserFlags_COINBASE_VIRTUAL,
 		accountpb.UserFlags_PHANTOM,
 		accountpb.UserFlags_BASE,
 		accountpb.UserFlags_SOLFLARE,

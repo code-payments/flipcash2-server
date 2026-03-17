@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"go.uber.org/zap"
+	"golang.org/x/text/language"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -39,7 +40,7 @@ func (s *Server) UpdateSettings(ctx context.Context, req *settingspb.UpdateSetti
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
 	if req.Locale != nil {
-		if len(req.Locale.Value) == 0 {
+		if _, err := language.Parse(req.Locale.Value); err != nil {
 			return &settingspb.UpdateSettingsResponse{Result: settingspb.UpdateSettingsResponse_INVALID_LOCALE}, nil
 		}
 

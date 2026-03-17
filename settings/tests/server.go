@@ -104,6 +104,18 @@ func testServer(t *testing.T, accounts account.Store, store settings.Store) {
 			require.Equal(t, "gbp", s.Region.Value)
 		})
 
+		t.Run("Invalid locale", func(t *testing.T) {
+			for _, invalid := range []string{"xx", "zzz", "zz-ZZ"} {
+				req := &settingspb.UpdateSettingsRequest{
+					Locale: &commonpb.Locale{Value: invalid},
+				}
+				require.NoError(t, keyPair.Auth(req, &req.Auth))
+				resp, err := client.UpdateSettings(ctx, req)
+				require.NoError(t, err)
+				require.Equal(t, settingspb.UpdateSettingsResponse_INVALID_LOCALE, resp.Result)
+			}
+		})
+
 		t.Run("No fields to update", func(t *testing.T) {
 			req := &settingspb.UpdateSettingsRequest{}
 			require.NoError(t, keyPair.Auth(req, &req.Auth))

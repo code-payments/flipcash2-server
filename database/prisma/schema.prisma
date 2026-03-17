@@ -95,6 +95,8 @@ model User {
   emailAddress String?
   isStaff      Boolean     @default(false)
   isRegistered Boolean     @default(false)
+  region       String      @default("usd")
+  locale       String      @default("en")
   publicKeys   PublicKey[]
   xProfile     XProfile?
 

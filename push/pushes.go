@@ -85,3 +85,16 @@ func SendFlipcashCurrencySoldPush(ctx context.Context, pusher Pusher, user *comm
 	}
 	return pusher.SendPushes(ctx, title, body, customPayload, user)
 }
+
+func SendFlipcashCurrencyGainPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string, gainInUsd float64) error {
+	title := amountPrinter.Sprintf("Your %s balance is up +$%.2f", currencyName, gainInUsd)
+	body := amountPrinter.Sprintf("Someone just bought %s", currencyName)
+	customPayload := &pushpb.Payload{
+		Navigation: &pushpb.Navigation{
+			Type: &pushpb.Navigation_CurrencyInfo{
+				CurrencyInfo: mint,
+			},
+		},
+	}
+	return pusher.SendPushes(ctx, title, body, customPayload, user)
+}

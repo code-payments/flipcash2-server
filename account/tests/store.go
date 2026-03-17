@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
@@ -16,6 +17,7 @@ import (
 func RunStoreTests(t *testing.T, s account.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, s account.Store){
 		testStore_keyManagement,
+		testStore_batchGetUserIds,
 		testStore_registrationStatus,
 	} {
 		tf(t, s)
@@ -64,6 +66,37 @@ func testStore_keyManagement(t *testing.T, s account.Store) {
 	require.NoError(t, err)
 	require.NoError(t, protoutil.SetEqualError([]*commonpb.PublicKey{keyPair}, actualKeyPairs))
 
+}
+
+func testStore_batchGetUserIds(t *testing.T, s account.Store) {
+	ctx := context.Background()
+
+	// Create several users with bound keys
+	user1 := model.MustGenerateUserID()
+	key1 := model.MustGenerateKeyPair().Proto()
+	_, err := s.Bind(ctx, user1, key1)
+	require.NoError(t, err)
+
+	user2 := model.MustGenerateUserID()
+	key2 := model.MustGenerateKeyPair().Proto()
+	_, err = s.Bind(ctx, user2, key2)
+	require.NoError(t, err)
+
+	unknownKey := model.MustGenerateKeyPair().Proto()
+
+	// Empty input returns empty map
+	res, err := s.GetUserIds(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, res)
+
+	// Batch lookup with a mix of known and unknown keys
+	res, err = s.GetUserIds(ctx, []*commonpb.PublicKey{key1, key2, unknownKey})
+	require.NoError(t, err)
+	require.Len(t, res, 2)
+	require.True(t, proto.Equal(user1, res[base58.Encode(key1.Value)]))
+	require.True(t, proto.Equal(user2, res[base58.Encode(key2.Value)]))
+	_, exists := res[base58.Encode(unknownKey.Value)]
+	require.False(t, exists)
 }
 
 func testStore_registrationStatus(t *testing.T, s account.Store) {

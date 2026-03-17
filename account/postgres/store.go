@@ -40,6 +40,10 @@ func (s *store) GetUserId(ctx context.Context, pubKey *commonpb.PublicKey) (*com
 	return dbGetUserId(ctx, s.pool, pubKey)
 }
 
+func (s *store) GetUserIds(ctx context.Context, pubKeys []*commonpb.PublicKey) (map[string]*commonpb.UserId, error) {
+	return dbGetUserIds(ctx, s.pool, pubKeys)
+}
+
 func (s *store) GetPubKeys(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.PublicKey, error) {
 	return dbGetPubKeys(ctx, s.pool, userID)
 }

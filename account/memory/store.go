@@ -5,6 +5,8 @@ import (
 	"context"
 	"sync"
 
+	"github.com/mr-tron/base58"
+
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
@@ -71,6 +73,20 @@ func (m *memory) GetUserId(_ context.Context, pubKey *commonpb.PublicKey) (*comm
 	}
 
 	return &commonpb.UserId{Value: []byte(userID)}, nil
+}
+
+func (m *memory) GetUserIds(_ context.Context, pubKeys []*commonpb.PublicKey) (map[string]*commonpb.UserId, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	res := make(map[string]*commonpb.UserId)
+	for _, pk := range pubKeys {
+		userID, ok := m.keys[string(pk.Value)]
+		if ok {
+			res[base58.Encode(pk.Value)] = &commonpb.UserId{Value: []byte(userID)}
+		}
+	}
+	return res, nil
 }
 
 func (m *memory) GetPubKeys(_ context.Context, userID *commonpb.UserId) ([]*commonpb.PublicKey, error) {

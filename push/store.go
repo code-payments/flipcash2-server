@@ -30,4 +30,7 @@ type TokenStore interface {
 
 	// DeleteToken deletes a token for a user.
 	DeleteToken(ctx context.Context, tokenType pushpb.TokenType, token string) error
+
+	// FilterUsersWithTokens returns the subset of user IDs that have at least one push token.
+	FilterUsersWithTokens(ctx context.Context, userIDs ...*commonpb.UserId) ([]*commonpb.UserId, error)
 }

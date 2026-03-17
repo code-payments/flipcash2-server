@@ -92,6 +92,48 @@ func dbGetTokensBatch(ctx context.Context, pool *pgxpool.Pool, userIDs ...*commo
 	return res, nil
 }
 
+func dbFilterUsersWithTokens(ctx context.Context, pool *pgxpool.Pool, userIDs ...*commonpb.UserId) ([]*commonpb.UserId, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+
+	queryParameters := make([]any, len(userIDs))
+	query := `SELECT DISTINCT "userId" FROM ` + pushTokensTableName + ` WHERE "userId" IN (`
+	for i, userID := range userIDs {
+		queryParameters[i] = pg.Encode(userID.Value)
+		if i > 0 {
+			query += fmt.Sprintf(",$%d", i+1)
+		} else {
+			query += fmt.Sprintf("$%d", i+1)
+		}
+	}
+	query += ")"
+
+	var encodedUserIDs []string
+	err := pgxscan.Select(ctx, pool, &encodedUserIDs, query, queryParameters...)
+	if err != nil {
+		if pgxscan.NotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	// Build a set of matched encoded user IDs for fast lookup
+	matched := make(map[string]struct{}, len(encodedUserIDs))
+	for _, id := range encodedUserIDs {
+		matched[id] = struct{}{}
+	}
+
+	// Return the original proto objects for matched users
+	var result []*commonpb.UserId
+	for _, userID := range userIDs {
+		if _, ok := matched[pg.Encode(userID.Value)]; ok {
+			result = append(result, userID)
+		}
+	}
+	return result, nil
+}
+
 func dbDeleteToken(ctx context.Context, pool *pgxpool.Pool, tokenType pushpb.TokenType, token string) error {
 	query := `DELETE FROM ` + pushTokensTableName + ` WHERE "token" = $1 and "type" = $2`
 	_, err := pool.Exec(ctx, query, token, tokenType)

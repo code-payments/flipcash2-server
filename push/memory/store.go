@@ -85,6 +85,19 @@ func (m *memory) AddToken(_ context.Context, userID *commonpb.UserId, appInstall
 	return nil
 }
 
+func (m *memory) FilterUsersWithTokens(_ context.Context, userIDs ...*commonpb.UserId) ([]*commonpb.UserId, error) {
+	m.RLock()
+	defer m.RUnlock()
+
+	var result []*commonpb.UserId
+	for _, userID := range userIDs {
+		if tokens, ok := m.tokens[string(userID.Value)]; ok && len(tokens) > 0 {
+			result = append(result, userID)
+		}
+	}
+	return result, nil
+}
+
 func (m *memory) DeleteToken(_ context.Context, tokenType pushpb.TokenType, token string) error {
 	m.Lock()
 	defer m.Unlock()

@@ -21,6 +21,10 @@ type Store interface {
 	/// ErrNotFound is returned if no binding exists.
 	GetUserId(ctx context.Context, pubKey *commonpb.PublicKey) (*commonpb.UserId, error)
 
+	// GetUserIds returns a mapping of base58-encoded public key to UserId for a
+	// batch of public keys. Keys that have no binding are omitted from the result.
+	GetUserIds(ctx context.Context, pubKeys []*commonpb.PublicKey) (map[string]*commonpb.UserId, error)
+
 	// GetPubKeys returns the set of public keys associated with an account.
 	GetPubKeys(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.PublicKey, error)
 

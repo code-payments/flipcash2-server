@@ -66,6 +66,14 @@ func (s *store) AddToken(ctx context.Context, userID *commonpb.UserId, appInstal
 	return model.dbAdd(ctx, s.pool)
 }
 
+func (s *store) FilterUsersWithTokens(ctx context.Context, userIDs ...*commonpb.UserId) ([]*commonpb.UserId, error) {
+	matched, err := dbFilterUsersWithTokens(ctx, s.pool, userIDs...)
+	if err != nil {
+		return nil, err
+	}
+	return matched, nil
+}
+
 func (s *store) DeleteToken(ctx context.Context, tokenType pushpb.TokenType, token string) error {
 	return dbDeleteToken(ctx, s.pool, tokenType, token)
 }

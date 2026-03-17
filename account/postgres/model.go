@@ -2,11 +2,13 @@ package postgres
 
 import (
 	"context"
+	"strconv"
 	"strings"
 
 	"github.com/georgysavva/scany/v2/pgxscan"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/mr-tron/base58"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
@@ -61,6 +63,46 @@ func dbGetUserId(ctx context.Context, pool *pgxpool.Pool, pubKey *commonpb.Publi
 		return nil, err
 	}
 	return &commonpb.UserId{Value: decoded}, err
+}
+
+func dbGetUserIds(ctx context.Context, pool *pgxpool.Pool, pubKeys []*commonpb.PublicKey) (map[string]*commonpb.UserId, error) {
+	type pubKeyUserIdRow struct {
+		Key    string `db:"key"`
+		UserId string `db:"userId"`
+	}
+
+	if len(pubKeys) == 0 {
+		return make(map[string]*commonpb.UserId), nil
+	}
+
+	args := make([]any, len(pubKeys))
+	placeholders := make([]string, len(pubKeys))
+	for i, pk := range pubKeys {
+		args[i] = pg.Encode(pk.Value, pg.Base58)
+		placeholders[i] = "$" + strconv.Itoa(i+1)
+	}
+
+	query := `SELECT "key", "userId" FROM ` + publicKeysTableName + ` WHERE "key" IN (` + strings.Join(placeholders, ",") + `)`
+
+	var rows []pubKeyUserIdRow
+	err := pgxscan.Select(ctx, pool, &rows, query, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	res := make(map[string]*commonpb.UserId, len(rows))
+	for _, row := range rows {
+		decodedKey, err := pg.Decode(row.Key)
+		if err != nil {
+			return nil, err
+		}
+		decodedUserID, err := pg.Decode(row.UserId)
+		if err != nil {
+			return nil, err
+		}
+		res[base58.Encode(decodedKey)] = &commonpb.UserId{Value: decodedUserID}
+	}
+	return res, nil
 }
 
 func dbGetPubKeys(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) ([]*commonpb.PublicKey, error) {

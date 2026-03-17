@@ -19,6 +19,7 @@ func RunStoreTests(t *testing.T, s push.TokenStore, teardown func()) {
 		testUpdateExistingToken,
 		testDeleteToken,
 		testMultipleUsers,
+		testFilterUsersWithTokens,
 	} {
 		tf(t, s)
 		teardown()
@@ -141,4 +142,42 @@ func testMultipleUsers(t *testing.T, store push.TokenStore) {
 
 	assert.Equal(t, tokens1[0], tokenMap["token1"])
 	assert.Equal(t, tokens2[0], tokenMap["token2"])
+}
+
+func testFilterUsersWithTokens(t *testing.T, store push.TokenStore) {
+	ctx := context.Background()
+
+	user1 := &commonpb.UserId{Value: []byte("user1")}
+	user2 := &commonpb.UserId{Value: []byte("user2")}
+	user3 := &commonpb.UserId{Value: []byte("user3")}
+	appInstallID := &commonpb.AppInstallId{Value: "device1"}
+
+	// No users have tokens yet
+	filtered, err := store.FilterUsersWithTokens(ctx, user1, user2, user3)
+	require.NoError(t, err)
+	assert.Empty(t, filtered)
+
+	// Add tokens for user1 and user3 only
+	err = store.AddToken(ctx, user1, appInstallID, pushpb.TokenType_FCM_APNS, "token1")
+	require.NoError(t, err)
+	err = store.AddToken(ctx, user3, appInstallID, pushpb.TokenType_FCM_APNS, "token3")
+	require.NoError(t, err)
+
+	// Filter should return only user1 and user3
+	filtered, err = store.FilterUsersWithTokens(ctx, user1, user2, user3)
+	require.NoError(t, err)
+	assert.Len(t, filtered, 2)
+
+	filteredValues := make(map[string]struct{})
+	for _, u := range filtered {
+		filteredValues[string(u.Value)] = struct{}{}
+	}
+	assert.Contains(t, filteredValues, string(user1.Value))
+	assert.Contains(t, filteredValues, string(user3.Value))
+	assert.NotContains(t, filteredValues, string(user2.Value))
+
+	// Empty input returns nil
+	filtered, err = store.FilterUsersWithTokens(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, filtered)
 }

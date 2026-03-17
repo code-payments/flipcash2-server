@@ -46,6 +46,10 @@ func (c *Cache) GetUserId(ctx context.Context, pubKey *commonpb.PublicKey) (*com
 	return cloned, nil
 }
 
+func (c *Cache) GetUserIds(ctx context.Context, pubKeys []*commonpb.PublicKey) (map[string]*commonpb.UserId, error) {
+	return c.db.GetUserIds(ctx, pubKeys)
+}
+
 func (c *Cache) GetPubKeys(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.PublicKey, error) {
 	return c.db.GetPubKeys(ctx, userID)
 }

@@ -87,12 +87,11 @@ func SendFlipcashCurrencySoldPush(ctx context.Context, pusher Pusher, user *comm
 }
 
 func SendFlipcashCurrencyGainPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string, gainRegion ocp_currency.Code, gainAmount float64) error {
-	title := amountPrinter.Sprintf(
-		"Your %s balance is up +%s",
-		currencyName,
+	title := fmt.Sprintf("Someone just bought %s", currencyName)
+	body := amountPrinter.Sprintf(
+		"You're now up +%s",
 		localization.FormatFiat(defaultLocale, gainRegion, gainAmount),
 	)
-	body := amountPrinter.Sprintf("Someone just bought %s", currencyName)
 	customPayload := &pushpb.Payload{
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{

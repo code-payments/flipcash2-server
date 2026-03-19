@@ -16,6 +16,7 @@ import (
 	"github.com/code-payments/flipcash2-server/settings"
 	ocp_currency_lib "github.com/code-payments/ocp-server/currency"
 	ocp_balance_util "github.com/code-payments/ocp-server/ocp/balance"
+	"github.com/code-payments/ocp-server/ocp/common"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_currency_util "github.com/code-payments/ocp-server/ocp/currency"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
@@ -73,7 +74,7 @@ func NewIntegration(
 func (i *Integration) OnSwapFinalized(ctx context.Context, owner *ocp_common.Account, isBuy bool, mint *ocp_common.Account, currencyName string, region ocp_currency_lib.Code, amountReceived float64) error {
 	i.notifyCurrencyBoughtOrSold(ctx, owner, isBuy, mint, currencyName, region, amountReceived)
 	if isBuy && i.enableGainPushes {
-		i.notifyHoldersOfGain(ctx, mint, currencyName)
+		i.notifyHoldersOfGain(ctx, mint, currencyName, owner)
 	}
 	return nil
 }
@@ -100,7 +101,7 @@ func (i *Integration) notifyCurrencyBoughtOrSold(ctx context.Context, owner *ocp
 	}
 }
 
-func (i *Integration) notifyHoldersOfGain(ctx context.Context, mint *ocp_common.Account, currencyName string) {
+func (i *Integration) notifyHoldersOfGain(ctx context.Context, mint *ocp_common.Account, currencyName string, buyer *common.Account) {
 	mintBase58 := mint.PublicKey().ToBase58()
 	log := i.log.With(zap.String("mint", mintBase58))
 
@@ -151,13 +152,13 @@ func (i *Integration) notifyHoldersOfGain(ctx context.Context, mint *ocp_common.
 		wg.Add(1)
 		go func(batch []*ocp_account.Record) {
 			defer wg.Done()
-			i.notifyHoldersOfGainBatch(ctx, log, mint, currencyName, exchangeRates, batch)
+			i.notifyHoldersOfGainBatch(ctx, log, mint, currencyName, exchangeRates, batch, buyer)
 		}(accountInfos[start:end])
 	}
 	wg.Wait()
 }
 
-func (i *Integration) notifyHoldersOfGainBatch(ctx context.Context, log *zap.Logger, mint *ocp_common.Account, currencyName string, exchangeRates *ocp_currency.MultiRateRecord, accountInfos []*ocp_account.Record) {
+func (i *Integration) notifyHoldersOfGainBatch(ctx context.Context, log *zap.Logger, mint *ocp_common.Account, currencyName string, exchangeRates *ocp_currency.MultiRateRecord, accountInfos []*ocp_account.Record, buyer *common.Account) {
 	mintBase58 := mint.PublicKey().ToBase58()
 	protoMint := &commonpb.PublicKey{Value: mint.PublicKey().ToBytes()}
 
@@ -298,6 +299,8 @@ func (i *Integration) notifyHoldersOfGainBatch(ctx context.Context, log *zap.Log
 		}
 		gain := exchangeRate * usdGain
 
-		push.SendFlipcashCurrencyGainPush(ctx, i.pusher, userID, protoMint, currencyName, userRegionSetting, gain)
+		if owner != buyer.PublicKey().ToBase58() {
+			push.SendFlipcashCurrencyGainPush(ctx, i.pusher, userID, protoMint, currencyName, userRegionSetting, gain)
+		}
 	}
 }

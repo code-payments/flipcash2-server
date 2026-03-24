@@ -229,6 +229,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			PreferredOnRampProvider:    preferredOnRampProviderForUser,
 			MinBuildNumber:             uint32(minBuildNumber),
 			BillExchangeDataTimeout:    durationpb.New(defaultBillExchangeDataTimeout),
+			NewCurrencyPurchaseAmount:  defaultNewCurrencyPurchaseAmount,
 		},
 	}, nil
 }

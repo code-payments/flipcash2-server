@@ -19,6 +19,7 @@ import (
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/model"
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 )
 
 // todo: env configs
@@ -30,6 +31,10 @@ const (
 	minAndroidBuildNumber = 2790
 
 	defaultBillExchangeDataTimeout = 5 * time.Minute
+)
+
+var (
+	defaultNewCurrencyPurchaseAmount = ocp_common.ToCoreMintQuarks(20)
 )
 
 var (
@@ -253,6 +258,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			SupportedOnRampProviders:   supportedOnRampProvidersForUser,
 			PreferredOnRampProvider:    preferredOnRampProviderForUser,
 			MinBuildNumber:             uint32(minBuildNumber),
+			NewCurrencyPurchaseAmount:  defaultNewCurrencyPurchaseAmount,
 		},
 	}, nil
 }

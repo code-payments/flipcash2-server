@@ -79,6 +79,21 @@ func (i *Integration) AllowSwap(_ context.Context, _ swap.FundingSource, _, _, _
 	return true, "", nil
 }
 
-func (i *Integration) AllowCurrencyLaunch(_ context.Context, _ *common.Account, _, _ string) (bool, string, error) {
+func (i *Integration) AllowCurrencyLaunch(ctx context.Context, owner *common.Account, _, _ string) (bool, string, error) {
+	userID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: owner.PublicKey().ToBytes()})
+	if err == account.ErrNotFound {
+		return false, "public key not associated with a flipcash user", nil
+	} else if err != nil {
+		return false, "", err
+	}
+
+	isRegistered, err := i.accounts.IsRegistered(ctx, userID)
+	if err != nil {
+		return false, "", err
+	}
+
+	if !isRegistered {
+		return false, "flipcash user has not completed iap", nil
+	}
 	return true, "", nil
 }

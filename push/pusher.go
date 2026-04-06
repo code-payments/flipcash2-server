@@ -6,12 +6,12 @@ import (
 	"fmt"
 
 	"firebase.google.com/go/v4/messaging"
+	"github.com/mr-tron/base58"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
-	"github.com/mr-tron/base58"
 )
 
 type Pusher interface {
@@ -106,7 +106,8 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 	message := &messaging.MulticastMessage{
 		Tokens: tokens,
 		Android: &messaging.AndroidConfig{
-			Data: customDataAndroid,
+			Priority: "high",
+			Data:     customDataAndroid,
 		},
 		APNS: &messaging.APNSConfig{
 			Payload: &messaging.APNSPayload{

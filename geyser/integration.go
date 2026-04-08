@@ -8,7 +8,7 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/push"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
-	ocp_geyser "github.com/code-payments/ocp-server/ocp/worker/geyser"
+	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
 )
 
 type Integration struct {
@@ -16,7 +16,7 @@ type Integration struct {
 	pusher   push.Pusher
 }
 
-func NewIntegration(accounts account.Store, pusher push.Pusher) ocp_geyser.Integration {
+func NewIntegration(accounts account.Store, pusher push.Pusher) ocp_integration.Geyser {
 	return &Integration{
 		accounts: accounts,
 		pusher:   pusher,

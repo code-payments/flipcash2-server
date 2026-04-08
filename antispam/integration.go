@@ -7,17 +7,17 @@ import (
 	ocp_transactionpb "github.com/code-payments/ocp-protobuf-api/generated/go/transaction/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
-	ocp_antispam "github.com/code-payments/ocp-server/ocp/antispam"
 	"github.com/code-payments/ocp-server/ocp/common"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	"github.com/code-payments/ocp-server/ocp/data/swap"
+	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
 )
 
 type Integration struct {
 	accounts account.Store
 }
 
-func NewIntegration(accounts account.Store) ocp_antispam.Integration {
+func NewIntegration(accounts account.Store) ocp_integration.Antispam {
 	return &Integration{
 		accounts: accounts,
 	}

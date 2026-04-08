@@ -34,3 +34,7 @@ node_modules/
 
 # Environment / Config files
 .env
+
+# Executable Golang code
+cmd*/
+main.go

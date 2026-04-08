@@ -22,7 +22,7 @@ import (
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 	ocp_account "github.com/code-payments/ocp-server/ocp/data/account"
 	ocp_currency "github.com/code-payments/ocp-server/ocp/data/currency"
-	ocp_swap_worker "github.com/code-payments/ocp-server/ocp/worker/swap"
+	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
 )
 
 const gainProcessingBatchSize = 256
@@ -53,7 +53,7 @@ func NewIntegration(
 	pusher push.Pusher,
 	enableGainPushes bool,
 	gainPushCooldown time.Duration,
-) ocp_swap_worker.Integration {
+) ocp_integration.Swap {
 	return &Integration{
 		log: log,
 

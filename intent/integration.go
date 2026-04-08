@@ -8,6 +8,7 @@ import (
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
+	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
 	ocp_transaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
 )
 
@@ -15,7 +16,7 @@ type Integration struct {
 	ocpData ocp_data.Provider
 }
 
-func NewIntegration(ocpData ocp_data.Provider) ocp_transaction.SubmitIntentIntegration {
+func NewIntegration(ocpData ocp_data.Provider) ocp_integration.SubmitIntent {
 	return &Integration{
 		ocpData: ocpData,
 	}

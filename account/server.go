@@ -27,8 +27,10 @@ const (
 	loginWindow                 = 2 * time.Minute
 	requireIapOnAccountCreation = false
 
-	minIosBuildNumber     = 256
-	minAndroidBuildNumber = 2790
+	minIosBuildNumber          = 256
+	staffMinIosBuildNumber     = 256
+	minAndroidBuildNumber      = 2790
+	staffMinAndroidBuildNumber = 2790
 
 	defaultBillExchangeDataTimeout = 5 * time.Minute
 )
@@ -215,8 +217,14 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 	switch req.Platform {
 	case commonpb.Platform_APPLE:
 		minBuildNumber = minIosBuildNumber
+		if isStaff {
+			minBuildNumber = staffMinIosBuildNumber
+		}
 	case commonpb.Platform_GOOGLE:
 		minBuildNumber = minAndroidBuildNumber
+		if isStaff {
+			minBuildNumber = staffMinAndroidBuildNumber
+		}
 	}
 
 	return &accountpb.GetUserFlagsResponse{

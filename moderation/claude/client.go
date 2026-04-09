@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -47,26 +48,22 @@ Respond with only a JSON object mapping each category to its score. No other tex
 type client struct {
 	apiKey     string
 	httpClient *http.Client
-	inner      moderation.Client
 }
 
-// NewClient creates a moderation client that delegates text and image
-// classification to inner (typically the Hive client) and uses Claude
-// Haiku for currency name classification.
-func NewClient(apiKey string, inner moderation.Client) moderation.Client {
+// NewClient creates a moderation client uses Claude Haiku for currency name classification.
+func NewClient(apiKey string) moderation.Client {
 	return &client{
 		apiKey:     apiKey,
 		httpClient: http.DefaultClient,
-		inner:      inner,
 	}
 }
 
 func (c *client) ClassifyText(ctx context.Context, text string) (*moderation.Result, error) {
-	return c.inner.ClassifyText(ctx, text)
+	return nil, errors.New("not implemented")
 }
 
 func (c *client) ClassifyImage(ctx context.Context, data []byte) (*moderation.Result, error) {
-	return c.inner.ClassifyImage(ctx, data)
+	return nil, errors.New("not implemented")
 }
 
 func (c *client) ClassifyCurrencyName(ctx context.Context, name string) (*moderation.Result, error) {

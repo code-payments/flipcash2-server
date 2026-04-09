@@ -23,6 +23,11 @@ var blockedCurrencyNames = []string{
 	"usdf",
 }
 
+var (
+	jpegMagic = []byte{0xFF, 0xD8, 0xFF}
+	pngMagic  = []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
+)
+
 type Server struct {
 	log      *zap.Logger
 	authz    auth.Authorizer
@@ -98,6 +103,13 @@ func (s *Server) ModerateImage(ctx context.Context, req *moderationpb.ModerateIm
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
+	if !isJPEG(req.ImageData) && !isPNG(req.ImageData) {
+		return &moderationpb.ModerateImageResponse{
+			Result:    moderationpb.ModerateImageResponse_OK,
+			IsAllowed: false,
+		}, nil
+	}
+
 	result, err := s.client.ClassifyImage(ctx, req.ImageData)
 	if err != nil {
 		log.Warn("Failed to classify image", zap.Error(err))
@@ -142,6 +154,14 @@ func (s *Server) signAttestation(log *zap.Logger, content any, userID *commonpb.
 	}
 
 	return attestation
+}
+
+func isJPEG(data []byte) bool {
+	return len(data) >= len(jpegMagic) && string(data[:len(jpegMagic)]) == string(jpegMagic)
+}
+
+func isPNG(data []byte) bool {
+	return len(data) >= len(pngMagic) && string(data[:len(pngMagic)]) == string(pngMagic)
 }
 
 func isBlockedCurrencyName(name string) bool {

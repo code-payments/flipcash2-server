@@ -208,7 +208,7 @@ func TestModerateImage_Allowed(t *testing.T) {
 	keyPair := model.MustGenerateKeyPair()
 	authz.Add(userID, keyPair)
 
-	imageData := []byte("fake-image-data")
+	imageData := append([]byte{0xFF, 0xD8, 0xFF}, []byte("fake-image-data")...)
 	req := &moderationpb.ModerateImageRequest{
 		ImageData: imageData,
 	}
@@ -249,9 +249,35 @@ func TestModerateImage_Flagged(t *testing.T) {
 	keyPair := model.MustGenerateKeyPair()
 	authz.Add(userID, keyPair)
 
-	imageData := []byte("fake-nsfw-image")
+	imageData := append([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, []byte("fake-nsfw-image")...)
 	req := &moderationpb.ModerateImageRequest{
 		ImageData: imageData,
+	}
+	require.NoError(t, keyPair.Auth(req, &req.Auth))
+
+	resp, err := server.ModerateImage(ctx, req)
+	require.NoError(t, err)
+
+	assert.Equal(t, moderationpb.ModerateImageResponse_OK, resp.Result)
+	assert.False(t, resp.IsAllowed)
+	assert.Nil(t, resp.Attestation)
+}
+
+func TestModerateImage_InvalidFormat(t *testing.T) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := auth.NewStaticAuthorizer(log)
+	attestor := model.MustGenerateKeyPair()
+	client := &mockClient{imageResult: &Result{Flagged: false}}
+	server := NewServer(log, authz, client, attestor)
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	authz.Add(userID, keyPair)
+
+	req := &moderationpb.ModerateImageRequest{
+		ImageData: []byte("not-an-image"),
 	}
 	require.NoError(t, keyPair.Auth(req, &req.Auth))
 

@@ -284,7 +284,7 @@ func TestModerateImage_InvalidFormat(t *testing.T) {
 	resp, err := server.ModerateImage(ctx, req)
 	require.NoError(t, err)
 
-	assert.Equal(t, moderationpb.ModerateImageResponse_OK, resp.Result)
+	assert.Equal(t, moderationpb.ModerateImageResponse_UNSUPPORTED_FORMAT, resp.Result)
 	assert.False(t, resp.IsAllowed)
 	assert.Nil(t, resp.Attestation)
 }

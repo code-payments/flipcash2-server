@@ -106,8 +106,7 @@ func (s *Server) ModerateImage(ctx context.Context, req *moderationpb.ModerateIm
 
 	if !isJPEG(req.ImageData) && !isPNG(req.ImageData) {
 		return &moderationpb.ModerateImageResponse{
-			Result:    moderationpb.ModerateImageResponse_OK,
-			IsAllowed: false,
+			Result: moderationpb.ModerateImageResponse_UNSUPPORTED_FORMAT,
 		}, nil
 	}
 
@@ -255,7 +254,7 @@ func mapFlaggedCategory(flaggedCategory string) moderationpb.FlaggedCategory {
 		"yes_child_present",
 		"yes_child_safety",
 		"yes_cleavage",
-		"yes_confederate",
+		"yes_confederate_flag",
 		"yes_drinking_alcohol",
 		"yes_emaciated_body",
 		"yes_female_nudity",

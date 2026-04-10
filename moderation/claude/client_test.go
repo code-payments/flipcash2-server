@@ -1,3 +1,5 @@
+//go:build claude
+
 package claude
 
 import (

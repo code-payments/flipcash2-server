@@ -2,6 +2,7 @@ package model
 
 import (
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -41,6 +42,13 @@ func UserIDString(userID *commonpb.UserId) string {
 
 type KeyPair struct {
 	priv ed25519.PrivateKey
+}
+
+func FromPrivateKey(priv ed25519.PrivateKey) (KeyPair, error) {
+	if len(priv) != ed25519.PrivateKeySize {
+		return KeyPair{}, errors.New("invalid private key")
+	}
+	return KeyPair{priv: priv}, nil
 }
 
 func GenerateKeyPair() (KeyPair, error) {

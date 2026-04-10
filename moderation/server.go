@@ -90,6 +90,7 @@ func (s *Server) ModerateText(ctx context.Context, req *moderationpb.ModerateTex
 		resp.Attestation = s.signAttestation(log, req.Text, userID)
 	} else {
 		log.Info("Text is flagged", zap.Strings("categories", result.FlaggedCategories))
+		resp.FlaggedCategory = getHighestFlaggedCategory(result)
 	}
 
 	return resp, nil
@@ -127,6 +128,7 @@ func (s *Server) ModerateImage(ctx context.Context, req *moderationpb.ModerateIm
 		resp.Attestation = s.signAttestation(log, req.ImageData, userID)
 	} else {
 		log.Info("Image is flagged", zap.Strings("categories", result.FlaggedCategories))
+		resp.FlaggedCategory = getHighestFlaggedCategory(result)
 	}
 
 	return resp, nil
@@ -172,4 +174,127 @@ func isBlockedCurrencyName(name string) bool {
 		}
 	}
 	return false
+}
+
+func getHighestFlaggedCategory(result *Result) moderationpb.FlaggedCategory {
+	var highestScore float64
+	highestFlaggedCategory := moderationpb.FlaggedCategory_OTHER
+	for _, flaggedCategory := range result.FlaggedCategories {
+		mapped := mapFlaggedCategory(flaggedCategory)
+		if mapped == moderationpb.FlaggedCategory_OTHER {
+			continue
+		}
+		score := result.CategoryScores[flaggedCategory]
+		if score > highestScore {
+			highestScore = score
+			highestFlaggedCategory = mapped
+		}
+	}
+	return highestFlaggedCategory
+}
+
+func mapFlaggedCategory(flaggedCategory string) moderationpb.FlaggedCategory {
+	switch flaggedCategory {
+	case
+		"cryptocurrency",
+		"exchange_platform",
+		"fiat_currency",
+		"financial_service",
+		"general_trademark",
+		"government_affiliation",
+		"impersonation",
+		"platform_impersonation",
+		"public_figure",
+		"stablecoin",
+		"tech_company":
+		return moderationpb.FlaggedCategory_IMPERSONATION
+
+	case
+		"misleading_backing":
+		return moderationpb.FlaggedCategory_MISLEADING
+
+	case
+		"a_little_bloody",
+		"animal_genitalia_and_human",
+		"animal_genitalia_only",
+		"animated_alcohol",
+		"animated_animal_genitalia",
+		"animated_corpse",
+		"animated_gun",
+		"bullying",
+		"child_exploitation",
+		"culinary_knife_in_hand",
+		"culinary_knife_not_in_hand",
+		"drugs",
+		"general_nsfw",
+		"general_suggestive",
+		"gun_in_hand",
+		"gun_not_in_hand",
+		"hanging",
+		"hate",
+		"human_corpse",
+		"illicit_injectables",
+		"kissing",
+		"knife_in_hand",
+		"knife_not_in_hand",
+		"licking",
+		"medical_injectables",
+		"noose",
+		"other_blood",
+		"recreational_pills",
+		"sexual",
+		"very_bloody",
+		"violence",
+		"yes_alcohol",
+		"yes_animal_abuse",
+		"yes_bodysuit",
+		"yes_bra",
+		"yes_breast",
+		"yes_bulge",
+		"yes_butt",
+		"yes_child_present",
+		"yes_child_safety",
+		"yes_cleavage",
+		"yes_confederate",
+		"yes_drinking_alcohol",
+		"yes_emaciated_body",
+		"yes_female_nudity",
+		"yes_female_swimwear",
+		"yes_female_underwear",
+		"yes_fight",
+		"yes_gambling",
+		"yes_genitals",
+		"yes_kkk",
+		"yes_male_nudity",
+		"yes_male_shirtless",
+		"yes_male_underwear",
+		"yes_marijuana",
+		"yes_middle_finger",
+		"yes_miniskirt",
+		"yes_nazi",
+		"yes_negligee",
+		"yes_panties",
+		"yes_pills",
+		"yes_realistic_nsfw",
+		"yes_self_harm",
+		"yes_sex_toy",
+		"yes_sexual_activity",
+		"yes_sexual_intent",
+		"yes_smoking",
+		"yes_sports_bra",
+		"yes_sportswear_bottoms",
+		"yes_terrorist",
+		"yes_undressed":
+		return moderationpb.FlaggedCategory_NSFW
+
+	case
+		"gibberish",
+		"phone_number",
+		"promotions",
+		"spam",
+		"yes_qr_code":
+		return moderationpb.FlaggedCategory_SPAM
+	}
+
+	return moderationpb.FlaggedCategory_OTHER
 }

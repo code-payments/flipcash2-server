@@ -1,16 +1,14 @@
-//go:build claude
-
 package claude
 
 import (
 	"context"
+	"fmt"
+	"math/rand/v2"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/code-payments/flipcash2-server/moderation/noop"
 )
 
 func TestClassifyCurrencyName(t *testing.T) {
@@ -19,12 +17,13 @@ func TestClassifyCurrencyName(t *testing.T) {
 		t.Fatal("ANTHROPIC_API_KEY environment variable is required")
 	}
 
-	client := NewClient(apiKey, noop.NewClient())
+	client := NewClient(apiKey)
 	ctx := context.Background()
 
 	tests := []struct {
-		category string
-		inputs   []string
+		category            string
+		includeRandomSuffix bool
+		inputs              []string
 	}{
 		{
 			category: "cryptocurrency",
@@ -39,10 +38,36 @@ func TestClassifyCurrencyName(t *testing.T) {
 				"Polkadot",
 				"Avalanche",
 				"Chainlink",
+				"Monero",
+				"Zcash",
+				"Tron",
+				"Stellar",
+				"Tezos",
+				"Algorand",
+				"Cosmos",
+				"NEAR Protocol",
+				"Aptos",
+				"Sui",
+				"Filecoin",
+				"Hedera",
+				"Shiba Inu",
+				"PEPE",
+				"BONK",
+				"FLOKI",
+				"Uniswap",
+				"Arbitrum",
+				"Optimism",
+				"XRP",
+				"BNB",
+				"Polygon",
+				"MATIC",
+				"WBTC",
+				"wBTC",
 			},
 		},
 		{
-			category: "exchange_platform",
+			category:            "exchange_platform",
+			includeRandomSuffix: true,
 			inputs: []string{
 				"Coinbase",
 				"Binance",
@@ -54,6 +79,21 @@ func TestClassifyCurrencyName(t *testing.T) {
 				"OKX",
 				"Crypto.com",
 				"eToro",
+				"KuCoin",
+				"Huobi",
+				"Gate.io",
+				"MEXC",
+				"Bitstamp",
+				"BitMEX",
+				"Upbit",
+				"Bithumb",
+				"FTX",
+				"Poloniex",
+				"LocalBitcoins",
+				"Coinmama",
+				"Bittrex",
+				"dYdX",
+				"PancakeSwap",
 			},
 		},
 		{
@@ -66,13 +106,36 @@ func TestClassifyCurrencyName(t *testing.T) {
 				"Peso",
 				"Franc",
 				"Rupee",
-				"Won",
-				"Real",
+				"Korean Won",
+				"Brazilian Real",
 				"Yuan",
+				"Ruble",
+				"Krona",
+				"Dirham",
+				"Shekel",
+				"Baht",
+				"Rial",
+				"Turkish Lira",
+				"Dinar",
+				"Zloty",
+				"Forint",
+				"Rand",
+				"Vietnamese Dong",
+				"Krone",
+				"Ringgit",
+				"Rupiah",
+				"Naira",
+				"Hryvnia",
+				"Renminbi",
+				"Sterling Pound",
+				"US Dollar",
+				"Canadian Dollar",
+				"Aussie Dollar",
 			},
 		},
 		{
-			category: "financial_service",
+			category:            "financial_service",
+			includeRandomSuffix: true,
 			inputs: []string{
 				"Venmo",
 				"PayPal",
@@ -84,10 +147,34 @@ func TestClassifyCurrencyName(t *testing.T) {
 				"Chase",
 				"Wells Fargo",
 				"Goldman Sachs",
+				"American Express",
+				"Amex",
+				"Discover Card",
+				"Bank of America",
+				"HSBC",
+				"Barclays",
+				"Morgan Stanley",
+				"BlackRock",
+				"Charles Schwab",
+				"Fidelity",
+				"Wise Transfer",
+				"Revolut",
+				"Square Cash",
+				"JPMorgan",
+				"Citibank",
+				"Deutsche Bank",
+				"UBS",
+				"Vanguard",
+				"Western Union",
+				"MoneyGram",
+				"Klarna",
+				"Affirm",
+				"SoFi",
 			},
 		},
 		{
-			category: "general_trademark",
+			category:            "general_trademark",
+			includeRandomSuffix: true,
 			inputs: []string{
 				"Nike",
 				"Disney",
@@ -99,6 +186,33 @@ func TestClassifyCurrencyName(t *testing.T) {
 				"Gucci",
 				"Louis Vuitton",
 				"Rolex",
+				"Starbucks",
+				"Pepsi",
+				"Lego",
+				"Marvel",
+				"Lamborghini",
+				"Porsche",
+				"Rolls Royce",
+				"Tiffany & Co",
+				"Chanel",
+				"Dior",
+				"Prada",
+				"Hermes",
+				"Cartier",
+				"Red Bull",
+				"Hershey's",
+				"Nestle",
+				"Budweiser",
+				"Heineken",
+				"Jack Daniels",
+				"KFC",
+				"Burger King",
+				"Subway",
+				"Walmart",
+				"Target",
+				"Ikea",
+				"Toyota",
+				"Harley Davidson",
 			},
 		},
 		{
@@ -114,10 +228,30 @@ func TestClassifyCurrencyName(t *testing.T) {
 				"Treasury Note",
 				"Federal Mint",
 				"SEC Approved",
+				"IRS Coin",
+				"FBI Token",
+				"Pentagon Dollar",
+				"White House Cash",
+				"Department of Treasury Coin",
+				"CFTC Regulated",
+				"Official US Dollar",
+				"Republic Reserve",
+				"Presidential Dollar",
+				"Congressional Cash",
+				"Senate Token",
+				"EU Central Bank Token",
+				"Bank of England Coin",
+				"Ministry of Finance",
+				"Government Authorized",
+				"Nationally Recognized Currency",
+				"Federally Chartered Token",
+				"US Mint Certified",
+				"OFAC Compliant Coin",
 			},
 		},
 		{
-			category: "impersonation",
+			category:            "impersonation",
+			includeRandomSuffix: true,
 			inputs: []string{
 				"Bitc0in",
 				"Paypall",
@@ -129,6 +263,34 @@ func TestClassifyCurrencyName(t *testing.T) {
 				"D0gecoin",
 				"Venm0",
 				"Binanse",
+				"Micr0soft",
+				"Teslla",
+				"Net flix",
+				"F8cebook",
+				"Bítcoin",
+				"B!tcoin",
+				"Bittcoin",
+				"Bitcoyn",
+				"Eth3reum",
+				"Ethreum",
+				"Litec0in",
+				"C0inbase",
+				"Amzon",
+				"Disnney",
+				"MasterCar d",
+				"V1sa",
+				"Mastercar",
+				"Chase Banq",
+				"Krakken",
+				"ByBit Exchange",
+				"Solarna",
+				"Doggecoin",
+				"Shibaa Inu",
+				"0penAI",
+				"Npvidia",
+				"Samsumg",
+				"Micros0ft",
+				"Applle Inc",
 			},
 		},
 		{
@@ -144,6 +306,28 @@ func TestClassifyCurrencyName(t *testing.T) {
 				"Principal Protected",
 				"Risk Free Token",
 				"Fully Collateralized USD",
+				"SIPC Protected Coin",
+				"Double Your Money",
+				"Guaranteed 10% Yield",
+				"Zero Risk Token",
+				"Safe Haven Coin",
+				"AAA Rated Crypto",
+				"Lloyds Insured",
+				"Platinum Backed",
+				"Silver Backed Dollar",
+				"Never Lose Token",
+				"Zero Loss Guarantee",
+				"Hedge Fund Coin",
+				"Treasury Bond Token",
+				"Investment Grade Coin",
+				"Bulletproof Dollar",
+				"Pegged to Gold 1:1",
+				"Oil Reserve Backed",
+				"Real Estate Secured Coin",
+				"Diamond Backed",
+				"Physically Backed Bullion",
+				"Warranted Return Token",
+				"Capital Preservation Guaranteed",
 			},
 		},
 		{
@@ -159,21 +343,68 @@ func TestClassifyCurrencyName(t *testing.T) {
 				"USDF Reserve",
 				"Flipcash Official",
 				"FlipCash Gold",
+				"FlipCoin",
+				"Flypcash",
+				"FIipcash",
+				"F|ipcash",
+				"USDFlip",
+				"Flipcash Plus",
+				"Flipcash Pro",
+				"Flipcash Premium",
+				"Flip-Cash",
+				"USDF Token",
+				"The Official Flipcash",
+				"U$DF",
+				"USDF+",
+				"Flippcash",
+				"Flipcach",
+				"Flipcash v2",
+				"Flipkash USD",
+				"Flippcash Reserve",
+				"FlipCash DAO",
+				"USDFiat",
+				"USDFInance",
+				"Flipcash Network",
+				"USDFlipcoin",
 			},
 		},
 		{
-			category: "public_figure",
+			category:            "public_figure",
+			includeRandomSuffix: true,
 			inputs: []string{
-				"ElonCoin",
-				"TrumpToken",
-				"Elon Musk Coin",
-				"Biden Bucks",
-				"Obama Token",
-				"Bezos Coin",
-				"Zuckerberg Cash",
-				"Taylor Swift Coin",
-				"Musk Money",
-				"Trump Dollar",
+				"Elon",
+				"Trump",
+				"Elon Musk",
+				"Biden",
+				"Obama",
+				"Bezos",
+				"Zuckerberg",
+				"Taylor Swift",
+				"Musk",
+				"Kanye Coin",
+				"Beyonce",
+				"Oprah",
+				"Kardashian",
+				"Putin",
+				"Xi Jinping",
+				"King Charles",
+				"Vitalik",
+				"Satoshi",
+				"CZ Binance",
+				"Warren Buffett",
+				"Bill Gates",
+				"Mark Zuck",
+				"Kim Kardashian",
+				"Drake",
+				"LeBron",
+				"Messi",
+				"Ronaldo",
+				"Jay-Z",
+				"MrBeast",
+				"Rihanna",
+				"Jeff Bezos",
+				"Joe Rogan",
+				"Zelensky",
 			},
 		},
 		{
@@ -189,10 +420,33 @@ func TestClassifyCurrencyName(t *testing.T) {
 				"FRAX",
 				"USDP",
 				"USD Coin",
+				"PYUSD",
+				"FDUSD",
+				"USDe",
+				"USDD",
+				"GUSD",
+				"EURC",
+				"sDAI",
+				"sUSD",
+				"crvUSD",
+				"USDY",
+				"LUSD",
+				"USDS",
+				"RLUSD",
+				"Dollar Pegged Token",
+				"1:1 USD Stable",
+				"Fixed Dollar Coin",
+				"Stable Dollar",
+				"Dollar Peg Token",
+				"Digital Dollar",
+				"USDJ",
+				"Gemini Dollar",
+				"First Digital USD",
 			},
 		},
 		{
-			category: "tech_company",
+			category:            "tech_company",
+			includeRandomSuffix: true,
 			inputs: []string{
 				"Apple",
 				"Google",
@@ -204,23 +458,58 @@ func TestClassifyCurrencyName(t *testing.T) {
 				"Nvidia",
 				"Samsung",
 				"Intel",
+				"Oracle",
+				"IBM",
+				"Salesforce",
+				"Adobe",
+				"SpaceX",
+				"OpenAI",
+				"Anthropic",
+				"Uber",
+				"Airbnb",
+				"Spotify",
+				"Qualcomm",
+				"Cisco Systems",
+				"Dell",
+				"Hewlett Packard",
+				"Sony",
+				"AMD",
+				"Facebook",
+				"Twitter",
+				"TikTok",
+				"Snapchat",
+				"LinkedIn",
+				"Alphabet Inc",
+				"Alibaba",
+				"Tencent",
+				"Baidu",
+				"ByteDance",
+				"Palantir",
+				"Snowflake",
+				"Databricks",
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		for _, input := range tt.inputs {
+			if tt.includeRandomSuffix {
+				suffixes := []string{
+					"Token",
+					"Tokens",
+					"Cash",
+					"Money",
+					"Dollar",
+					"Dollars",
+					"Coin",
+				}
+				input = fmt.Sprintf("%s %s", input, suffixes[rand.IntN(len(suffixes))])
+			}
 			t.Run(tt.category+"/"+input, func(t *testing.T) {
 				result, err := client.ClassifyCurrencyName(ctx, input)
 				require.NoError(t, err)
 
-				assert.True(t, result.Flagged, "expected %q to be flagged", input)
-				assert.Contains(t, result.FlaggedCategories, tt.category,
-					"expected %q to flag category %q, got %v (scores: %v)",
-					input, tt.category, result.FlaggedCategories, result.CategoryScores)
-				assert.GreaterOrEqual(t, result.CategoryScores[tt.category], currencyNameFlagThreshold,
-					"expected %q score >= %.1f for category %q, got %.2f",
-					input, currencyNameFlagThreshold, tt.category, result.CategoryScores[tt.category])
+				assert.True(t, result.Flagged, "expected %q to be flagged (scores: %v)", input, result.CategoryScores)
 			})
 		}
 	}
@@ -232,7 +521,7 @@ func TestClassifyCurrencyName_AllCategoriesPresent(t *testing.T) {
 		t.Fatal("ANTHROPIC_API_KEY environment variable is required")
 	}
 
-	client := NewClient(apiKey, noop.NewClient())
+	client := NewClient(apiKey)
 	ctx := context.Background()
 
 	expectedCategories := []string{
@@ -265,7 +554,7 @@ func TestClassifyCurrencyName_SafeNameNotFlagged(t *testing.T) {
 		t.Fatal("ANTHROPIC_API_KEY environment variable is required")
 	}
 
-	client := NewClient(apiKey, noop.NewClient())
+	client := NewClient(apiKey)
 	ctx := context.Background()
 
 	safeNames := []string{

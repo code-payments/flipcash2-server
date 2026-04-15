@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+	<meta charset="utf-8">
+	<title>Verify your email</title>
+	<meta name="x-apple-disable-message-reformatting">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+  </head>
+  <body style="margin:0; padding:0; background:#19191A;">
+	<!-- Preheader (hidden) -->
+	<div style="display:none; font-size:1px; line-height:1px; max-height:0; max-width:0; opacity:0; overflow:hidden; mso-hide:all;">
+	  Verify your email to continue.
+	</div>
+
+	<center style="width:100%; background:#19191A;">
+	  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="max-width:500px; margin:0 auto;">
+		<tr>
+		  <td style="padding:32px 20px;">
+			<!-- Card -->
+			<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#242425; border-radius:16px;">
+			  <tr>
+				<td style="padding:20px 20px;">
+				  <!-- Logo -->
+				  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+					<tr>
+					  <td style="padding-bottom:90px;">
+						<img src="http://cdn.mcauto-images-production.sendgrid.net/3633395ba5a93b85/55621fc3-52be-44e7-9310-c2e03c96616f/110x110.png" width="54" height="54" alt="App logo" style="display:block; border-radius:6px;">
+					  </td>
+					</tr>
+				  </table>
+
+				  <!-- Heading & copy -->
+				  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+					<tr>
+					  <td style='font-family:"Avenir Next LT Pro",-apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#ffffff; font-size:28px; line-height:1.25; font-weight:600; padding-bottom:20px;'>
+						Flipcash Email Verification
+					  </td>
+					</tr>
+					<tr>
+					  <td style='font-family:"Avenir Next LT Pro",-apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#B0B0B4; font-size:16px; line-height:22px; padding-bottom:20px;'>
+						Tap the button to confirm your email.<br>
+						This link expires in 10 minutes.
+					  </td>
+					</tr>
+				  </table>
+
+				  <!-- Button (bulletproof) -->
+				  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 20px 0;">
+					<tr>
+					  <td align="center">
+						<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:separate; border-radius:6px; background:#ffffff;">
+						  <tr>
+							<td align="center"
+								style='mso-line-height-rule:exactly; line-height:24px; padding:14px 16px;'>
+							  <a clicktracking="off" href="{{{verification_url}}}?email={{{url_safe_recipient_email}}}&code={{{twilio_code}}}&client_data={{{client_data}}}"
+								 style='display:block; text-decoration:none; font-weight:600; font-size:16px; font-family:"Avenir Next LT Pro",-apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#001a0c;'>
+								Verify Email
+							  </a>
+							</td>
+						  </tr>
+						</table>
+					  </td>
+					</tr>
+				  </table>
+
+				  <!-- Fallback link -->
+				  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+					<tr>
+					  <td style='font-family:"Avenir Next LT Pro",-apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#A0A0A5; font-size:14px; line-height:20px; padding-bottom:24px;'>
+						If the button doesn’t work, you can copy and paste this link into your browser:<br>
+						<span style="word-break:break-all; color:#ffffff;"><a clicktracking="off" href="{{{verification_url}}}?email={{{url_safe_recipient_email}}}&code={{{twilio_code}}}&client_data={{{client_data}}}" style="color:#ffffff;">{{{verification_url}}}?email={{{url_safe_recipient_email}}}&code={{{twilio_code}}}&client_data={{{client_data}}}</a></span>
+					  </td>
+					</tr>
+				  </table>
+
+				  <!-- Reason box -->
+				  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#2E2E30; border-radius:6px;">
+					<tr>
+					  <td style='padding:16px; font-family:"Avenir Next LT Pro",-apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#9A9A9F; font-size:14px; line-height:20px;'>
+						You received this email because a verification was requested in the Flipcash app. If you didn’t request this, you can ignore this message.
+					  </td>
+					</tr>
+				  </table>
+
+				</td>
+			  </tr>
+			</table>
+			<!-- /Card -->
+		  </td>
+		</tr>
+	  </table>
+	</center>
+  </body>
+</html>

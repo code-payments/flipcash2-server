@@ -252,6 +252,30 @@ func (i *Integration) notifyHoldersOfGainBatch(ctx context.Context, log *zap.Log
 		return
 	}
 
+	// Filter out owners whose Timelock account is not in the locked state. The
+	// token account of a PRIMARY account is the Timelock vault address.
+	vaultAddresses := make([]string, len(tokenAccounts))
+	for i, tokenAccount := range tokenAccounts {
+		vaultAddresses[i] = tokenAccount.PublicKey().ToBase58()
+	}
+	timelockRecordsByVault, err := i.ocpData.GetTimelockByVaultBatch(ctx, vaultAddresses...)
+	if err != nil {
+		log.Warn("failed to batch get timelock records", zap.Error(err))
+		return
+	}
+	lockedTokenAccounts := make([]*ocp_common.Account, 0)
+	for _, tokenAccount := range tokenAccounts {
+		record, ok := timelockRecordsByVault[tokenAccount.PublicKey().ToBase58()]
+		if !ok || !record.IsLocked() {
+			continue
+		}
+		lockedTokenAccounts = append(lockedTokenAccounts, tokenAccount)
+	}
+	tokenAccounts = lockedTokenAccounts
+	if len(tokenAccounts) == 0 {
+		return
+	}
+
 	// Batch calculate balances using the default cache-based calculator
 	balances, err := ocp_balance_util.BatchCalculateFromCacheWithTokenAccounts(ctx, i.ocpData, tokenAccounts...)
 	if err != nil {

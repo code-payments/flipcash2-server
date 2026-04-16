@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/code-payments/ocp-server/metrics"
@@ -29,6 +30,22 @@ const (
 	// imageFlagThreshold is the minimum confidence score for an image
 	// category to be considered flagged, per Hive's recommendation.
 	imageFlagThreshold = 0.9
+
+	// iwfDetectedScore is the synthetic CategoryScores value used when any IWF
+	// text filter matches. IWF filters are pattern-matching results without a
+	// confidence score, so we surface them at the most-severe text moderation
+	// level (3).
+	iwfDetectedScore = 3.0
+
+	// iwfMultiMatchThreshold is the minimum number of
+	// iwf_keyword_list_multi_match hits required to flag, per IWF's guidance.
+	iwfMultiMatchThreshold = 2
+
+	iwfURLListMatch           = "iwf_url_list_match"
+	iwfKeywordListSingleMatch = "iwf_keyword_list_single_match"
+	iwfKeywordListMultiMatch  = "iwf_keyword_list_multi_match"
+
+	childExploitationCategory = "child_exploitation"
 )
 
 type client struct {
@@ -64,12 +81,14 @@ func (c *client) classifyText(ctx context.Context, text string) (*moderation.Res
 	req.Header.Set("Authorization", "Token "+c.apiKey)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	result, err := c.doClassify(req, textFlagThreshold, func(_ string) bool {
+	result, hiveResp, err := c.doClassify(req, textFlagThreshold, func(_ string) bool {
 		return true
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	applyIWFTextFilters(hiveResp, result)
 
 	if result.Flagged {
 		return result, nil
@@ -123,42 +142,47 @@ func (c *client) classifyImage(ctx context.Context, data []byte) (*moderation.Re
 	req.Header.Set("Authorization", "Token "+c.apiKey)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 
-	return c.doClassify(req, imageFlagThreshold, func(category string) bool {
+	result, _, err := c.doClassify(req, imageFlagThreshold, func(category string) bool {
 		_, ok := imageFlaggedCategories[strings.ToLower(category)]
 		return ok
 	})
+	return result, err
 }
 
-func (c *client) doClassify(req *http.Request, flagThreshold float64, categoryInclusionFunc func(category string) bool) (*moderation.Result, error) {
+func (c *client) doClassify(req *http.Request, flagThreshold float64, categoryInclusionFunc func(category string) bool) (*moderation.Result, *response, error) {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected http status code: %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("unexpected http status code: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var hiveResp response
 	if err := json.Unmarshal(body, &hiveResp); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if len(hiveResp.Status) == 0 {
-		return nil, fmt.Errorf("empty response from hive")
+		return nil, nil, fmt.Errorf("empty response from hive")
 	}
 
 	if hiveResp.Status[0].Response.Code != 0 {
-		return nil, fmt.Errorf("hive returned error code: %d", hiveResp.Status[0].Response.Code)
+		return nil, nil, fmt.Errorf("hive returned error code: %d", hiveResp.Status[0].Response.Code)
 	}
 
-	return hiveResp.toResult(flagThreshold, categoryInclusionFunc)
+	result, err := hiveResp.toResult(flagThreshold, categoryInclusionFunc)
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, &hiveResp, nil
 }
 
 func (c *client) ClassifyCurrencyName(ctx context.Context, name string) (*moderation.Result, error) {
@@ -179,7 +203,12 @@ type taskResponse struct {
 }
 
 type taskOutput struct {
-	Classes []classResult `json:"classes"`
+	Classes     []classResult `json:"classes"`
+	TextFilters []textFilter  `json:"text_filters"`
+}
+
+type textFilter struct {
+	Type string `json:"type"`
 }
 
 // classResult is a Hive moderation class score.
@@ -227,6 +256,35 @@ func (r *response) toResult(flagThreshold float64, categoryInclusionFunc func(ca
 	}
 
 	return result, nil
+}
+
+// applyIWFTextFilters folds Hive's IWF text_filters matches into the result.
+// Any IWF hit collapses to a single child_exploitation category at the highest
+// severity score. iwf_keyword_list_multi_match requires >= 2 hits to flag, per
+// IWF guidance; the URL and single-match lists flag on a single hit.
+func applyIWFTextFilters(resp *response, result *moderation.Result) {
+	if resp == nil || len(resp.Status) == 0 {
+		return
+	}
+
+	counts := make(map[string]int)
+	for _, output := range resp.Status[0].Response.Output {
+		for _, filter := range output.TextFilters {
+			counts[filter.Type]++
+		}
+	}
+
+	if counts[iwfURLListMatch] < 1 &&
+		counts[iwfKeywordListSingleMatch] < 1 &&
+		counts[iwfKeywordListMultiMatch] < iwfMultiMatchThreshold {
+		return
+	}
+
+	result.Flagged = true
+	result.CategoryScores[childExploitationCategory] = iwfDetectedScore
+	if !slices.Contains(result.FlaggedCategories, childExploitationCategory) {
+		result.FlaggedCategories = append(result.FlaggedCategories, childExploitationCategory)
+	}
 }
 
 var imageFlaggedCategories = map[string]struct{}{

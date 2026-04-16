@@ -243,6 +243,7 @@ func mapFlaggedCategory(flaggedCategory string) moderationpb.FlaggedCategory {
 		"minor_implicitly_mentioned",
 		"noose",
 		"other_blood",
+		"profanity",
 		"recreational_pills",
 		"self_harm",
 		"self_harm_intent",

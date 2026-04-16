@@ -31,11 +31,11 @@ const (
 	// category to be considered flagged, per Hive's recommendation.
 	imageFlagThreshold = 0.9
 
-	// iwfDetectedScore is the synthetic CategoryScores value used when any IWF
-	// text filter matches. IWF filters are pattern-matching results without a
-	// confidence score, so we surface them at the most-severe text moderation
-	// level (3).
-	iwfDetectedScore = 3.0
+	// filterDetectedScore is the synthetic CategoryScores value used for
+	// pattern-matching hits (IWF text filters, profanity, PII). These are
+	// boolean matches without a confidence score, so we surface them at the
+	// most-severe text moderation level (3).
+	filterDetectedScore = 3.0
 
 	// iwfMultiMatchThreshold is the minimum number of
 	// iwf_keyword_list_multi_match hits required to flag, per IWF's guidance.
@@ -45,7 +45,11 @@ const (
 	iwfKeywordListSingleMatch = "iwf_keyword_list_single_match"
 	iwfKeywordListMultiMatch  = "iwf_keyword_list_multi_match"
 
+	profanityFilterType = "profanity"
+
 	childExploitationCategory = "child_exploitation"
+	profanityCategory         = "profanity"
+	piiCategory               = "pii"
 )
 
 type client struct {
@@ -89,6 +93,8 @@ func (c *client) classifyText(ctx context.Context, text string) (*moderation.Res
 	}
 
 	applyIWFTextFilters(hiveResp, result)
+	applyProfanityTextFilters(hiveResp, result)
+	applyPIIEntities(hiveResp, result)
 
 	if result.Flagged {
 		return result, nil
@@ -165,10 +171,14 @@ func (c *client) doClassify(req *http.Request, flagThreshold float64, categoryIn
 		return nil, nil, err
 	}
 
+	fmt.Println(string(body))
+
 	var hiveResp response
 	if err := json.Unmarshal(body, &hiveResp); err != nil {
 		return nil, nil, err
 	}
+
+	fmt.Println(hiveResp)
 
 	if len(hiveResp.Status) == 0 {
 		return nil, nil, fmt.Errorf("empty response from hive")
@@ -201,6 +211,7 @@ type taskResponse struct {
 	Code        int          `json:"code"`
 	Output      []taskOutput `json:"output"`
 	TextFilters []textFilter `json:"text_filters"`
+	PIIEntities []piiEntity  `json:"pii_entities"`
 }
 
 type taskOutput struct {
@@ -208,6 +219,11 @@ type taskOutput struct {
 }
 
 type textFilter struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
+}
+
+type piiEntity struct {
 	Type  string `json:"type"`
 	Value string `json:"value"`
 }
@@ -280,9 +296,48 @@ func applyIWFTextFilters(resp *response, result *moderation.Result) {
 	}
 
 	result.Flagged = true
-	result.CategoryScores[childExploitationCategory] = iwfDetectedScore
+	result.CategoryScores[childExploitationCategory] = filterDetectedScore
 	if !slices.Contains(result.FlaggedCategories, childExploitationCategory) {
 		result.FlaggedCategories = append(result.FlaggedCategories, childExploitationCategory)
+	}
+}
+
+// applyProfanityTextFilters flags the result when Hive's profanity
+// pattern-matcher returns any hits.
+func applyProfanityTextFilters(resp *response, result *moderation.Result) {
+	if resp == nil || len(resp.Status) == 0 {
+		return
+	}
+
+	for _, filter := range resp.Status[0].Response.TextFilters {
+		if filter.Type != profanityFilterType {
+			continue
+		}
+
+		result.Flagged = true
+		result.CategoryScores[profanityCategory] = filterDetectedScore
+		if !slices.Contains(result.FlaggedCategories, profanityCategory) {
+			result.FlaggedCategories = append(result.FlaggedCategories, profanityCategory)
+		}
+		return
+	}
+}
+
+// applyPIIEntities flags the result when Hive detects any PII entities
+// (emails, phone numbers, addresses).
+func applyPIIEntities(resp *response, result *moderation.Result) {
+	if resp == nil || len(resp.Status) == 0 {
+		return
+	}
+
+	if len(resp.Status[0].Response.PIIEntities) == 0 {
+		return
+	}
+
+	result.Flagged = true
+	result.CategoryScores[piiCategory] = filterDetectedScore
+	if !slices.Contains(result.FlaggedCategories, piiCategory) {
+		result.FlaggedCategories = append(result.FlaggedCategories, piiCategory)
 	}
 }
 

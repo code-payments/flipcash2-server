@@ -171,14 +171,10 @@ func (c *client) doClassify(req *http.Request, flagThreshold float64, categoryIn
 		return nil, nil, err
 	}
 
-	fmt.Println(string(body))
-
 	var hiveResp response
 	if err := json.Unmarshal(body, &hiveResp); err != nil {
 		return nil, nil, err
 	}
-
-	fmt.Println(hiveResp)
 
 	if len(hiveResp.Status) == 0 {
 		return nil, nil, fmt.Errorf("empty response from hive")

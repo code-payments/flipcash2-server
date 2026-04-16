@@ -198,17 +198,18 @@ type taskStatus struct {
 }
 
 type taskResponse struct {
-	Code   int          `json:"code"`
-	Output []taskOutput `json:"output"`
+	Code        int          `json:"code"`
+	Output      []taskOutput `json:"output"`
+	TextFilters []textFilter `json:"text_filters"`
 }
 
 type taskOutput struct {
-	Classes     []classResult `json:"classes"`
-	TextFilters []textFilter  `json:"text_filters"`
+	Classes []classResult `json:"classes"`
 }
 
 type textFilter struct {
-	Type string `json:"type"`
+	Type  string `json:"type"`
+	Value string `json:"value"`
 }
 
 // classResult is a Hive moderation class score.
@@ -268,10 +269,8 @@ func applyIWFTextFilters(resp *response, result *moderation.Result) {
 	}
 
 	counts := make(map[string]int)
-	for _, output := range resp.Status[0].Response.Output {
-		for _, filter := range output.TextFilters {
-			counts[filter.Type]++
-		}
+	for _, filter := range resp.Status[0].Response.TextFilters {
+		counts[filter.Type]++
 	}
 
 	if counts[iwfURLListMatch] < 1 &&

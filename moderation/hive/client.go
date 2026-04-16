@@ -64,9 +64,31 @@ func (c *client) classifyText(ctx context.Context, text string) (*moderation.Res
 	req.Header.Set("Authorization", "Token "+c.apiKey)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	return c.doClassify(req, textFlagThreshold, func(_ string) bool {
+	result, err := c.doClassify(req, textFlagThreshold, func(_ string) bool {
 		return true
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	if result.Flagged {
+		return result, nil
+	}
+
+	// Required core categories that have good coverage across many languages
+	for _, category := range []string{
+		"sexual",
+		"hate",
+		"violence",
+		"bullying",
+		"spam",
+	} {
+		if _, ok := result.CategoryScores[category]; !ok {
+			return nil, moderation.ErrUnsupportedLanguage
+		}
+	}
+
+	return result, nil
 }
 
 func (c *client) ClassifyImage(ctx context.Context, data []byte) (*moderation.Result, error) {
@@ -132,8 +154,6 @@ func (c *client) doClassify(req *http.Request, flagThreshold float64, categoryIn
 		return nil, fmt.Errorf("empty response from hive")
 	}
 
-	fmt.Println(string(body))
-
 	if hiveResp.Status[0].Response.Code != 0 {
 		return nil, fmt.Errorf("hive returned error code: %d", hiveResp.Status[0].Response.Code)
 	}
@@ -172,9 +192,6 @@ type taskOutput struct {
 //	 2 = moderately severe
 //	 3 = most severe
 //
-// Text categories include: sexual, hate, violence, bullying, spam, and
-// promotions. Spam and promotions are binary (0 or 3 only).
-//
 // Image moderation scores use a 0-1 confidence scale.
 type classResult struct {
 	Class string  `json:"class"`
@@ -197,7 +214,7 @@ func (r *response) toResult(flagThreshold float64, categoryInclusionFunc func(ca
 			}
 
 			if class.Score == -1 {
-				return nil, moderation.ErrUnsupportedLanguage
+				continue
 			}
 
 			result.CategoryScores[class.Class] = class.Score

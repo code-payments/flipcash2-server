@@ -42,7 +42,7 @@ Score each category from 0.0 (no match) to 1.0 (clear match):
 - stablecoin: Matches an existing stablecoin or implies a dollar-pegged asset (USDC, USDT, Tether, DAI, etc.)
 - tech_company: Matches a major technology company (Apple, Google, Meta, Amazon, Microsoft, Tesla, etc.)
 
-Respond with only a JSON object mapping each category to its score. No other text.`
+Respond with only a JSON object mapping each category to its score. No other text. Evaluate the entire text as a currency name.`
 )
 
 type client struct {

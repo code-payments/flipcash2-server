@@ -24,12 +24,15 @@ const (
 	metricsStructName = "moderation.hive.client"
 
 	// textFlagThreshold is the minimum score for a text category to be
-	// considered flagged. Any score above 0 (benign) is flagged.
-	textFlagThreshold = 0.0
+	// considered flagged. Any score above 1.0 is flagged.
+	textFlagThreshold = 1.0
 
 	// imageFlagThreshold is the minimum confidence score for an image
-	// category to be considered flagged, per Hive's recommendation.
-	imageFlagThreshold = 0.9
+	// category to be considered flagged.
+	//
+	// Hive's recommendation is 0.9, but we're using a more conservative
+	// value to start.
+	imageFlagThreshold = 0.7
 
 	// filterDetectedScore is the synthetic CategoryScores value used for
 	// pattern-matching hits (IWF text filters, profanity, PII). These are

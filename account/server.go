@@ -36,7 +36,8 @@ const (
 )
 
 var (
-	DefaultNewCurrencyPurchaseAmount = ocp_common.ToCoreMintQuarks(20)
+	DefaultNewCurrencyPurchaseAmount = ocp_common.ToCoreMintQuarks(5)
+	DefaultNewCurrencyFeeAmount      = ocp_common.ToCoreMintQuarks(15)
 )
 
 var (
@@ -238,6 +239,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			MinBuildNumber:             uint32(minBuildNumber),
 			BillExchangeDataTimeout:    durationpb.New(defaultBillExchangeDataTimeout),
 			NewCurrencyPurchaseAmount:  DefaultNewCurrencyPurchaseAmount,
+			NewCurrencyFeeAmount:       DefaultNewCurrencyFeeAmount,
 		},
 	}, nil
 }
@@ -268,6 +270,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			PreferredOnRampProvider:    preferredOnRampProviderForUser,
 			MinBuildNumber:             uint32(minBuildNumber),
 			NewCurrencyPurchaseAmount:  DefaultNewCurrencyPurchaseAmount,
+			NewCurrencyFeeAmount:       DefaultNewCurrencyFeeAmount,
 		},
 	}, nil
 }

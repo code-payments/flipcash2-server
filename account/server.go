@@ -36,8 +36,8 @@ const (
 )
 
 var (
-	DefaultNewCurrencyPurchaseAmount = ocp_common.ToCoreMintQuarks(20)
-	DefaultNewCurrencyFeeAmount      = ocp_common.ToCoreMintQuarks(0)
+	DefaultNewCurrencyPurchaseAmount = ocp_common.ToCoreMintQuarks(5)
+	DefaultNewCurrencyFeeAmount      = ocp_common.ToCoreMintQuarks(15)
 )
 
 var (

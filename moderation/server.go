@@ -55,14 +55,22 @@ func (s *Server) ModerateText(ctx context.Context, req *moderationpb.ModerateTex
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
 	result, err := s.client.ClassifyText(ctx, req.Text)
-	if err != nil {
+	switch err {
+	case nil:
+	case ErrUnsupportedLanguage:
+		return &moderationpb.ModerateTextResponse{Result: moderationpb.ModerateTextResponse_UNSUPPORTED_LANGUAGE}, nil
+	default:
 		log.Warn("Failed to classify text", zap.Error(err))
 		return nil, status.Error(codes.Internal, "")
 	}
 
 	if !result.Flagged && len(req.Text) <= currencycreator.MaxCurrencyConfigAccountNameLength {
 		currencyNameResult, err := s.client.ClassifyCurrencyName(ctx, req.Text)
-		if err != nil {
+		switch err {
+		case nil:
+		case ErrUnsupportedLanguage:
+			return &moderationpb.ModerateTextResponse{Result: moderationpb.ModerateTextResponse_UNSUPPORTED_LANGUAGE}, nil
+		default:
 			log.Warn("Failed to classify currency name", zap.Error(err))
 			return nil, status.Error(codes.Internal, "")
 		}

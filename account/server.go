@@ -19,6 +19,8 @@ import (
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/rpc"
+	ocp_client "github.com/code-payments/ocp-server/grpc/client"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 )
 
@@ -40,17 +42,34 @@ var (
 	DefaultNewCurrencyFeeAmount      = ocp_common.ToCoreMintQuarks(15)
 )
 
+type onRampProviderConfig struct {
+	Provider accountpb.UserFlags_OnRampProvider
+	// MinVersion, when non-nil, gates this provider behind a minimum client
+	// version. Clients on older versions (or without a parseable user-agent)
+	// will not have this provider included.
+	MinVersion *ocp_client.Version
+}
+
 var (
 	defaultOnRampProviders = []accountpb.UserFlags_OnRampProvider{
 		accountpb.UserFlags_PHANTOM,
 		accountpb.UserFlags_MANUAL_DEPOSIT,
 	}
-	onRampProvidersByCountryAndPlatform = map[string]map[commonpb.Platform][]accountpb.UserFlags_OnRampProvider{
-		/*"us": {
+	onRampProvidersByCountryAndPlatform = map[string]map[commonpb.Platform][]onRampProviderConfig{
+		"us": {
 			commonpb.Platform_APPLE: {
-				accountpb.UserFlags_COINBASE_VIRTUAL,
+				{
+					Provider:   accountpb.UserFlags_COINBASE_VIRTUAL,
+					MinVersion: &ocp_client.Version{Major: 1, Minor: 6, Patch: 0},
+				},
 			},
-		},*/
+			/*commonpb.Platform_GOOGLE: {
+				{
+					Provider:   accountpb.UserFlags_COINBASE_VIRTUAL,
+					MinVersion: &ocp_client.Version{Major: 0, Minor: 0, Patch: 0}, // todo
+				},
+			},*/
+		},
 	}
 
 	staffAppleOnRampProviders = []accountpb.UserFlags_OnRampProvider{
@@ -208,7 +227,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			supportedOnRampProvidersForUser = staffGoogleOnRampProviders
 		}
 	} else {
-		supportedOnRampProvidersForUser = getSupportedOnRampProviders(req.CountryCode, req.Platform)
+		supportedOnRampProvidersForUser = getSupportedOnRampProviders(ctx, req.CountryCode, req.Platform)
 	}
 	if slices.Contains(supportedOnRampProvidersForUser, accountpb.UserFlags_COINBASE_VIRTUAL) {
 		preferredOnRampProviderForUser = accountpb.UserFlags_COINBASE_VIRTUAL
@@ -245,7 +264,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 }
 
 func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb.GetUnauthenticatedUserFlagsRequest) (*accountpb.GetUnauthenticatedUserFlagsResponse, error) {
-	supportedOnRampProvidersForUser := getSupportedOnRampProviders(req.CountryCode, req.Platform)
+	supportedOnRampProvidersForUser := getSupportedOnRampProviders(ctx, req.CountryCode, req.Platform)
 
 	var preferredOnRampProviderForUser accountpb.UserFlags_OnRampProvider
 	if slices.Contains(supportedOnRampProvidersForUser, accountpb.UserFlags_COINBASE_VIRTUAL) {
@@ -275,7 +294,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 	}, nil
 }
 
-func getSupportedOnRampProviders(countryCode *commonpb.CountryCode, platform commonpb.Platform) []accountpb.UserFlags_OnRampProvider {
+func getSupportedOnRampProviders(ctx context.Context, countryCode *commonpb.CountryCode, platform commonpb.Platform) []accountpb.UserFlags_OnRampProvider {
 	defaultSupported := make([]accountpb.UserFlags_OnRampProvider, len(defaultOnRampProviders))
 	copy(defaultSupported, defaultOnRampProviders)
 
@@ -297,8 +316,23 @@ func getSupportedOnRampProviders(countryCode *commonpb.CountryCode, platform com
 		return defaultSupported
 	}
 
-	allSupported := make([]accountpb.UserFlags_OnRampProvider, len(byPlatform)+len(defaultSupported))
-	copy(allSupported, byPlatform)                         // Country and platform specific providers take priority
-	copy(allSupported[len(byPlatform):], defaultSupported) // Followed by default global providers
+	var clientVersion *ocp_client.Version
+	if userAgent, err := ocp_client.GetUserAgent(ctx, rpc.UserAgentName); err == nil {
+		clientVersion = &userAgent.Version
+	}
+
+	filtered := make([]accountpb.UserFlags_OnRampProvider, 0, len(byPlatform))
+	for _, entry := range byPlatform {
+		if entry.MinVersion != nil {
+			if clientVersion == nil || clientVersion.Before(entry.MinVersion) {
+				continue
+			}
+		}
+		filtered = append(filtered, entry.Provider)
+	}
+
+	allSupported := make([]accountpb.UserFlags_OnRampProvider, 0, len(filtered)+len(defaultSupported))
+	allSupported = append(allSupported, filtered...)         // Country and platform specific providers take priority
+	allSupported = append(allSupported, defaultSupported...) // Followed by default global providers
 	return allSupported
 }

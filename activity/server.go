@@ -322,6 +322,11 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 		case ocp_intent.ExternalDeposit:
 			intentMetadata := intentRecord.ExternalDepositMetadata
 
+			// Skip internal return of funds
+			if intentMetadata.IsReturned {
+				continue
+			}
+
 			// Hide small, potentially spam deposits
 			if !intentMetadata.IsSwapBuy && intentMetadata.UsdMarketValue < 0.01 {
 				continue

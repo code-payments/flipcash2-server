@@ -75,7 +75,7 @@ func (i *Integration) AllowDistribution(_ context.Context, _ *ocp_common.Account
 	return true, "", nil
 }
 
-func (i *Integration) AllowSwap(_ context.Context, _ swap.FundingSource, _, _, _ *ocp_common.Account, swapAmount, feeAmount uint64, initializesMint bool) (bool, string, error) {
+func (i *Integration) AllowSwap(_ context.Context, _ swap.Kind, _ swap.FundingSource, _, _, _ *ocp_common.Account, swapAmount, feeAmount uint64, initializesMint bool) (bool, string, error) {
 	if !initializesMint {
 		return true, "", nil
 	}

@@ -53,10 +53,28 @@ func InjectLocalizedText(ctx context.Context, ocpData ocp_data.Provider, userOwn
 		}
 
 	case *activitypb.Notification_BoughtCrypto:
-		localizedText = "Purchased"
+		switch typed.BoughtCrypto.SwapState {
+		case activitypb.SwapState_SWAP_STATE_SUCCEEDED:
+			localizedText = "Purchased"
+		case activitypb.SwapState_SWAP_STATE_FAILED:
+			localizedText = "Purchase Failed"
+		case activitypb.SwapState_SWAP_STATE_PENDING:
+			localizedText = "Purchasing"
+		default:
+			return errors.New("unsupported swap state")
+		}
 
 	case *activitypb.Notification_SoldCrypto:
-		localizedText = "Sold"
+		switch typed.SoldCrypto.SwapState {
+		case activitypb.SwapState_SWAP_STATE_SUCCEEDED:
+			localizedText = "Sold"
+		case activitypb.SwapState_SWAP_STATE_FAILED:
+			localizedText = "Sell Failed"
+		case activitypb.SwapState_SWAP_STATE_PENDING:
+			localizedText = "Selling"
+		default:
+			return errors.New("unsupported swap state")
+		}
 
 	default:
 		return errors.New("unsupported notification type")

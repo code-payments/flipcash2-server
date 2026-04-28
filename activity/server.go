@@ -19,6 +19,7 @@ import (
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
+	ocp_swap "github.com/code-payments/ocp-server/ocp/data/swap"
 	"github.com/code-payments/ocp-server/pointer"
 )
 
@@ -272,7 +273,25 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 						notification.State = activitypb.NotificationState_NOTIFICATION_STATE_PENDING
 					}
 				} else if intentMetadata.IsSwapSell {
-					notification.AdditionalMetadata = &activitypb.Notification_SoldCrypto{SoldCrypto: &activitypb.SoldCryptoNotificationMetadata{}}
+					swapRecord, err := s.ocpData.GetSwapByFundingId(ctx, intentRecord.IntentId)
+					if err != nil {
+						return nil, err
+					}
+
+					var swapState activitypb.SwapState
+					switch swapRecord.State {
+					case ocp_swap.StateFinalized:
+						swapState = activitypb.SwapState_SWAP_STATE_SUCCEEDED
+					case ocp_swap.StateFailed, ocp_swap.StateCancelled:
+						swapState = activitypb.SwapState_SWAP_STATE_FAILED
+					default:
+						swapState = activitypb.SwapState_SWAP_STATE_PENDING
+						notification.State = activitypb.NotificationState_NOTIFICATION_STATE_PENDING
+					}
+
+					notification.AdditionalMetadata = &activitypb.Notification_SoldCrypto{SoldCrypto: &activitypb.SoldCryptoNotificationMetadata{
+						SwapState: swapState,
+					}}
 				} else if intentMetadata.IsWithdrawal {
 					notification.AdditionalMetadata = &activitypb.Notification_WithdrewCrypto{WithdrewCrypto: &activitypb.WithdrewCryptoNotificationMetadata{}}
 				} else {
@@ -315,7 +334,9 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 			}
 
 			if intentMetadata.IsSwapBuy {
-				notification.AdditionalMetadata = &activitypb.Notification_BoughtCrypto{BoughtCrypto: &activitypb.BoughtCryptoNotificationMetadata{}}
+				notification.AdditionalMetadata = &activitypb.Notification_BoughtCrypto{BoughtCrypto: &activitypb.BoughtCryptoNotificationMetadata{
+					SwapState: activitypb.SwapState_SWAP_STATE_SUCCEEDED,
+				}}
 			} else {
 				notification.AdditionalMetadata = &activitypb.Notification_DepositedCrypto{DepositedCrypto: &activitypb.DepositedCryptoNotificationMetadata{}}
 			}

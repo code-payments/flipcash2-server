@@ -57,12 +57,12 @@ var (
 	}
 	onRampProvidersByCountryAndPlatform = map[string]map[commonpb.Platform][]onRampProviderConfig{
 		"us": {
-			commonpb.Platform_APPLE: {
+			/*commonpb.Platform_APPLE: {
 				{
 					Provider:   accountpb.UserFlags_COINBASE_VIRTUAL,
 					MinVersion: &ocp_client.Version{Major: 1, Minor: 6, Patch: 0},
 				},
-			},
+			},*/
 			/*commonpb.Platform_GOOGLE: {
 				{
 					Provider:   accountpb.UserFlags_COINBASE_VIRTUAL,

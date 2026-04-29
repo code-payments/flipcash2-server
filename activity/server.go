@@ -21,6 +21,7 @@ import (
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_swap "github.com/code-payments/ocp-server/ocp/data/swap"
 	"github.com/code-payments/ocp-server/pointer"
+	"github.com/code-payments/ocp-server/usdc"
 )
 
 const (
@@ -289,11 +290,19 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 						notification.State = activitypb.NotificationState_NOTIFICATION_STATE_PENDING
 					}
 
-					notification.AdditionalMetadata = &activitypb.Notification_SoldCrypto{SoldCrypto: &activitypb.SoldCryptoNotificationMetadata{
-						SwapState: swapState,
-					}}
+					if swapRecord.ToMint == usdc.Mint {
+						notification.AdditionalMetadata = &activitypb.Notification_WithdrewCrypto{WithdrewCrypto: &activitypb.WithdrewCryptoNotificationMetadata{
+							SwapState: swapState,
+						}}
+					} else {
+						notification.AdditionalMetadata = &activitypb.Notification_SoldCrypto{SoldCrypto: &activitypb.SoldCryptoNotificationMetadata{
+							SwapState: swapState,
+						}}
+					}
 				} else if intentMetadata.IsWithdrawal {
-					notification.AdditionalMetadata = &activitypb.Notification_WithdrewCrypto{WithdrewCrypto: &activitypb.WithdrewCryptoNotificationMetadata{}}
+					notification.AdditionalMetadata = &activitypb.Notification_WithdrewCrypto{WithdrewCrypto: &activitypb.WithdrewCryptoNotificationMetadata{
+						SwapState: activitypb.SwapState_SWAP_STATE_NONE,
+					}}
 				} else {
 					notification.AdditionalMetadata = &activitypb.Notification_GaveCrypto{GaveCrypto: &activitypb.GaveCryptoNotificationMetadata{}}
 				}

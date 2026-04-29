@@ -5,9 +5,9 @@ go 1.26.0
 require (
 	firebase.google.com/go/v4 v4.18.0
 	github.com/ReneKroon/ttlcache v1.7.0
-	github.com/code-payments/flipcash2-protobuf-api v1.4.1-0.20260429155359-7b31c1a41cf0
+	github.com/code-payments/flipcash2-protobuf-api v1.5.0
 	github.com/code-payments/ocp-protobuf-api v1.10.0
-	github.com/code-payments/ocp-server v1.11.1-0.20260428231936-0d49436103e3
+	github.com/code-payments/ocp-server v1.12.0
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2
 	github.com/georgysavva/scany/v2 v2.1.4
 	github.com/google/uuid v1.6.0

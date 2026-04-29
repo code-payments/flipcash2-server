@@ -251,16 +251,17 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 	return &accountpb.GetUserFlagsResponse{
 		Result: accountpb.GetUserFlagsResponse_OK,
 		UserFlags: &accountpb.UserFlags{
-			IsStaff:                    isStaff,
-			IsRegisteredAccount:        isRegistered,
-			RequiresIapForRegistration: requireIapOnAccountCreation,
-			SupportedOnRampProviders:   supportedOnRampProvidersForUser,
-			PreferredOnRampProvider:    preferredOnRampProviderForUser,
-			MinBuildNumber:             uint32(minBuildNumber),
-			BillExchangeDataTimeout:    durationpb.New(defaultBillExchangeDataTimeout),
-			NewCurrencyPurchaseAmount:  DefaultNewCurrencyPurchaseAmount,
-			NewCurrencyFeeAmount:       DefaultNewCurrencyFeeAmount,
-			UsdcWithdrawalFeeAmount:    DefaulUsdcWithdrawalFeeAmount,
+			IsStaff:                          isStaff,
+			IsRegisteredAccount:              isRegistered,
+			RequiresIapForRegistration:       requireIapOnAccountCreation,
+			SupportedOnRampProviders:         supportedOnRampProvidersForUser,
+			PreferredOnRampProvider:          preferredOnRampProviderForUser,
+			MinBuildNumber:                   uint32(minBuildNumber),
+			BillExchangeDataTimeout:          durationpb.New(defaultBillExchangeDataTimeout),
+			NewCurrencyPurchaseAmount:        DefaultNewCurrencyPurchaseAmount,
+			NewCurrencyFeeAmount:             DefaultNewCurrencyFeeAmount,
+			UsdcWithdrawalFeeAmount:          DefaulUsdcWithdrawalFeeAmount,
+			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 		},
 	}, nil
 }
@@ -284,15 +285,16 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 	return &accountpb.GetUnauthenticatedUserFlagsResponse{
 		Result: accountpb.GetUnauthenticatedUserFlagsResponse_OK,
 		UserFlags: &accountpb.UserFlags{
-			IsStaff:                    false,
-			IsRegisteredAccount:        false,
-			RequiresIapForRegistration: requireIapOnAccountCreation,
-			SupportedOnRampProviders:   supportedOnRampProvidersForUser,
-			PreferredOnRampProvider:    preferredOnRampProviderForUser,
-			MinBuildNumber:             uint32(minBuildNumber),
-			NewCurrencyPurchaseAmount:  DefaultNewCurrencyPurchaseAmount,
-			NewCurrencyFeeAmount:       DefaultNewCurrencyFeeAmount,
-			UsdcWithdrawalFeeAmount:    DefaulUsdcWithdrawalFeeAmount,
+			IsStaff:                          false,
+			IsRegisteredAccount:              false,
+			RequiresIapForRegistration:       requireIapOnAccountCreation,
+			SupportedOnRampProviders:         supportedOnRampProvidersForUser,
+			PreferredOnRampProvider:          preferredOnRampProviderForUser,
+			MinBuildNumber:                   uint32(minBuildNumber),
+			NewCurrencyPurchaseAmount:        DefaultNewCurrencyPurchaseAmount,
+			NewCurrencyFeeAmount:             DefaultNewCurrencyFeeAmount,
+			UsdcWithdrawalFeeAmount:          DefaulUsdcWithdrawalFeeAmount,
+			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 		},
 	}, nil
 }

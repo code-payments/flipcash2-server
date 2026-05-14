@@ -40,7 +40,7 @@ const (
 var (
 	DefaultNewCurrencyPurchaseAmount = ocp_common.ToCoreMintQuarks(5)
 	DefaultNewCurrencyFeeAmount      = ocp_common.ToCoreMintQuarks(15)
-	DefaulUsdcWithdrawalFeeAmount    = ocp_common.ToCoreMintQuarks(5) / 10
+	DefaulWithdrawalFeeAmount        = ocp_common.ToCoreMintQuarks(5) / 10
 )
 
 type onRampProviderConfig struct {
@@ -260,7 +260,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			BillExchangeDataTimeout:          durationpb.New(defaultBillExchangeDataTimeout),
 			NewCurrencyPurchaseAmount:        DefaultNewCurrencyPurchaseAmount,
 			NewCurrencyFeeAmount:             DefaultNewCurrencyFeeAmount,
-			UsdcWithdrawalFeeAmount:          DefaulUsdcWithdrawalFeeAmount,
+			UsdcWithdrawalFeeAmount:          DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 		},
 	}, nil
@@ -293,7 +293,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			MinBuildNumber:                   uint32(minBuildNumber),
 			NewCurrencyPurchaseAmount:        DefaultNewCurrencyPurchaseAmount,
 			NewCurrencyFeeAmount:             DefaultNewCurrencyFeeAmount,
-			UsdcWithdrawalFeeAmount:          DefaulUsdcWithdrawalFeeAmount,
+			UsdcWithdrawalFeeAmount:          DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 		},
 	}, nil

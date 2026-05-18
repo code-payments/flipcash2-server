@@ -325,6 +325,9 @@ func getSupportedOnRampProviders(ctx context.Context, countryCode *commonpb.Coun
 	if userAgent, err := ocp_client.GetUserAgent(ctx, rpc.UserAgentName); err == nil {
 		clientVersion = &userAgent.Version
 	}
+	if userAgent, err := ocp_client.GetUserAgent(ctx, rpc.UserAgentName+"/Core"); err == nil {
+		clientVersion = &userAgent.Version
+	}
 
 	filtered := make([]accountpb.UserFlags_OnRampProvider, 0, len(byPlatform))
 	for _, entry := range byPlatform {

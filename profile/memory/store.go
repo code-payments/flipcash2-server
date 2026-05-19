@@ -18,14 +18,16 @@ import (
 type InMemoryStore struct {
 	sync.Mutex
 
-	profiles        map[string]*profilepb.UserProfile
-	xProfilesByUser map[string]*profilepb.XProfile
+	profiles          map[string]*profilepb.UserProfile
+	phoneHashesByUser map[string][]byte
+	xProfilesByUser   map[string]*profilepb.XProfile
 }
 
 func NewInMemory() profile.Store {
 	return &InMemoryStore{
-		profiles:        make(map[string]*profilepb.UserProfile),
-		xProfilesByUser: make(map[string]*profilepb.XProfile),
+		profiles:          make(map[string]*profilepb.UserProfile),
+		phoneHashesByUser: make(map[string][]byte),
+		xProfilesByUser:   make(map[string]*profilepb.XProfile),
 	}
 }
 
@@ -78,18 +80,30 @@ func (m *InMemoryStore) SetDisplayName(_ context.Context, id *commonpb.UserId, d
 	return nil
 }
 
-func (m *InMemoryStore) SetPhoneNumber(_ context.Context, id *commonpb.UserId, phoneNumber string) error {
+func (m *InMemoryStore) LinkPhoneNumber(_ context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash []byte) error {
 	m.Lock()
 	defer m.Unlock()
 
-	profile, ok := m.profiles[userIDCacheKey(id)]
+	targetKey := userIDCacheKey(id)
+	for key, p := range m.profiles {
+		if key == targetKey {
+			continue
+		}
+		if p.PhoneNumber != nil && p.PhoneNumber.Value == phoneNumber {
+			p.PhoneNumber = nil
+			delete(m.phoneHashesByUser, key)
+		}
+	}
+
+	profile, ok := m.profiles[targetKey]
 	if !ok {
 		profile = &profilepb.UserProfile{}
 	}
 
 	profile.PhoneNumber = &phonepb.PhoneNumber{Value: phoneNumber}
 
-	m.profiles[userIDCacheKey(id)] = profile
+	m.profiles[targetKey] = profile
+	m.phoneHashesByUser[targetKey] = phoneNumberHash
 
 	return nil
 }
@@ -98,30 +112,42 @@ func (m *InMemoryStore) UnlinkPhoneNumber(ctx context.Context, userID *commonpb.
 	m.Lock()
 	defer m.Unlock()
 
-	profile, ok := m.profiles[userIDCacheKey(userID)]
+	key := userIDCacheKey(userID)
+	profile, ok := m.profiles[key]
 	if !ok {
 		return nil
 	}
 
 	if profile.PhoneNumber != nil && profile.PhoneNumber.Value == phoneNumber {
 		profile.PhoneNumber = nil
+		delete(m.phoneHashesByUser, key)
 	}
 
 	return nil
 }
 
-func (m *InMemoryStore) SetEmailAddress(_ context.Context, id *commonpb.UserId, emailAddress string) error {
+func (m *InMemoryStore) LinkEmailAddress(_ context.Context, id *commonpb.UserId, emailAddress string) error {
 	m.Lock()
 	defer m.Unlock()
 
-	profile, ok := m.profiles[userIDCacheKey(id)]
+	targetKey := userIDCacheKey(id)
+	for key, p := range m.profiles {
+		if key == targetKey {
+			continue
+		}
+		if p.EmailAddress != nil && p.EmailAddress.Value == emailAddress {
+			p.EmailAddress = nil
+		}
+	}
+
+	profile, ok := m.profiles[targetKey]
 	if !ok {
 		profile = &profilepb.UserProfile{}
 	}
 
 	profile.EmailAddress = &emailpb.EmailAddress{Value: emailAddress}
 
-	m.profiles[userIDCacheKey(id)] = profile
+	m.profiles[targetKey] = profile
 
 	return nil
 }
@@ -209,6 +235,7 @@ func (m *InMemoryStore) reset() {
 	defer m.Unlock()
 
 	m.profiles = make(map[string]*profilepb.UserProfile)
+	m.phoneHashesByUser = make(map[string][]byte)
 	m.xProfilesByUser = make(map[string]*profilepb.XProfile)
 }
 

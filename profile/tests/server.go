@@ -134,8 +134,8 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 		require.NoError(t, protoutil.ProtoEqualError(expected, getResp.UserProfile))
 
 		t.Run("Private profile", func(t *testing.T) {
-			require.NoError(t, profiles.SetPhoneNumber(ctx, userID, "+12223334444"))
-			require.NoError(t, profiles.SetEmailAddress(ctx, userID, "someone@gmail.com"))
+			require.NoError(t, profiles.LinkPhoneNumber(ctx, userID, "+12223334444", []byte("phone-hash")))
+			require.NoError(t, profiles.LinkEmailAddress(ctx, userID, "someone@gmail.com"))
 
 			get := &profilepb.GetProfileRequest{
 				UserId: userID,

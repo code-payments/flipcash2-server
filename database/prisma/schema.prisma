@@ -89,10 +89,11 @@ model Rendezvous {
 model User {
   // Fields
 
-  id           String      @id
-  displayName  String?
-  phoneNumber  String?
-  emailAddress String?
+  id              String      @id
+  displayName     String?
+  phoneNumber     String?     @unique
+  phoneNumberHash String?     @unique
+  emailAddress    String?     @unique
   isStaff      Boolean     @default(false)
   isRegistered Boolean     @default(false)
   region       String      @default("usd")

@@ -21,14 +21,17 @@ type Store interface {
 	// ErrInvalidDisplayName is returned if there is an issue with the display name.
 	SetDisplayName(ctx context.Context, id *commonpb.UserId, displayName string) error
 
-	// SetPhoneNumber sets the phone number for a user, provided they exist.
-	SetPhoneNumber(ctx context.Context, id *commonpb.UserId, phoneNumber string) error
+	// LinkPhoneNumber links the phone number and its precomputed hash to a user, provided
+	// they exist. Any other user previously holding the same phone number has both fields
+	// cleared.
+	LinkPhoneNumber(ctx context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash []byte) error
 
 	// UnlinkPhoneNumber removes the link for the phone number
 	UnlinkPhoneNumber(ctx context.Context, userID *commonpb.UserId, phoneNumber string) error
 
-	// SetEmailAddress sets the email address for a user, provided they exist.
-	SetEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string) error
+	// LinkEmailAddress links the email address to a user, provided they exist. Any other
+	// user previously holding the same email address has it cleared.
+	LinkEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string) error
 
 	// UnlinkPhoneNumber removes the link for the email address
 	UnlinkEmailAddress(ctx context.Context, userID *commonpb.UserId, emailAddress string) error

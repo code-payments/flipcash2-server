@@ -17,6 +17,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, s profile.Store){
 		testStore,
 		testXProfiles,
+		testPhoneEmailTransfer,
 	} {
 		tf(t, s)
 		teardown()
@@ -35,8 +36,8 @@ func testStore(t *testing.T, s profile.Store) {
 	require.NoError(t, s.UnlinkEmailAddress(ctx, userID, "someone@gmail.com"))
 
 	require.NoError(t, s.SetDisplayName(ctx, userID, "my name"))
-	require.NoError(t, s.SetPhoneNumber(ctx, userID, "+12223334444"))
-	require.NoError(t, s.SetEmailAddress(ctx, userID, "someone@gmail.com"))
+	require.NoError(t, s.LinkPhoneNumber(ctx, userID, "+12223334444", []byte("phone-hash")))
+	require.NoError(t, s.LinkEmailAddress(ctx, userID, "someone@gmail.com"))
 
 	profile, err := s.GetProfile(ctx, userID, false)
 	require.NoError(t, err)
@@ -79,6 +80,51 @@ func testStore(t *testing.T, s profile.Store) {
 	require.Nil(t, profile.PhoneNumber)
 	require.Nil(t, profile.EmailAddress)
 
+}
+
+func testPhoneEmailTransfer(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	userID1 := model.MustGenerateUserID()
+	userID2 := model.MustGenerateUserID()
+
+	const phone = "+12223334444"
+	const email = "someone@gmail.com"
+	phoneHash := []byte("phone-hash")
+
+	require.NoError(t, s.SetDisplayName(ctx, userID1, "user1"))
+	require.NoError(t, s.SetDisplayName(ctx, userID2, "user2"))
+
+	require.NoError(t, s.LinkPhoneNumber(ctx, userID1, phone, phoneHash))
+	require.NoError(t, s.LinkEmailAddress(ctx, userID1, email))
+
+	p, err := s.GetProfile(ctx, userID1, true)
+	require.NoError(t, err)
+	require.Equal(t, phone, p.PhoneNumber.Value)
+	require.Equal(t, email, p.EmailAddress.Value)
+
+	// Re-claim both on user2; user1 should lose them.
+	require.NoError(t, s.LinkPhoneNumber(ctx, userID2, phone, phoneHash))
+	require.NoError(t, s.LinkEmailAddress(ctx, userID2, email))
+
+	p, err = s.GetProfile(ctx, userID1, true)
+	require.NoError(t, err)
+	require.Nil(t, p.PhoneNumber)
+	require.Nil(t, p.EmailAddress)
+
+	p, err = s.GetProfile(ctx, userID2, true)
+	require.NoError(t, err)
+	require.Equal(t, phone, p.PhoneNumber.Value)
+	require.Equal(t, email, p.EmailAddress.Value)
+
+	// Setting the same value on the same user is a no-op (no spurious clear).
+	require.NoError(t, s.LinkPhoneNumber(ctx, userID2, phone, phoneHash))
+	require.NoError(t, s.LinkEmailAddress(ctx, userID2, email))
+
+	p, err = s.GetProfile(ctx, userID2, true)
+	require.NoError(t, err)
+	require.Equal(t, phone, p.PhoneNumber.Value)
+	require.Equal(t, email, p.EmailAddress.Value)
 }
 
 func testXProfiles(t *testing.T, s profile.Store) {

@@ -129,26 +129,36 @@ func dbGetEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonpb
 	return res, nil
 }
 
-func dbSetPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumber string) error {
+func dbLinkPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumber string, phoneNumberHash []byte) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `UPDATE ` + usersTableName + ` SET "phoneNumber" = $2 WHERE "id" = $1`
-		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), phoneNumber)
+		clearQuery := `UPDATE ` + usersTableName + ` SET "phoneNumber" = NULL, "phoneNumberHash" = NULL WHERE "phoneNumber" = $1 AND "id" != $2`
+		if _, err := tx.Exec(ctx, clearQuery, phoneNumber, pg.Encode(userID.Value)); err != nil {
+			return err
+		}
+
+		setQuery := `UPDATE ` + usersTableName + ` SET "phoneNumber" = $2, "phoneNumberHash" = $3 WHERE "id" = $1`
+		_, err := tx.Exec(ctx, setQuery, pg.Encode(userID.Value), phoneNumber, pg.Encode(phoneNumberHash, pg.Hex))
 		return err
 	})
 }
 
 func dbUnlinkPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumber string) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `UPDATE ` + usersTableName + ` SET "phoneNumber" = NULL WHERE "id" = $1 AND "phoneNumber" = $2`
+		query := `UPDATE ` + usersTableName + ` SET "phoneNumber" = NULL, "phoneNumberHash" = NULL WHERE "id" = $1 AND "phoneNumber" = $2`
 		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), phoneNumber)
 		return err
 	})
 }
 
-func dbSetEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, emailAddress string) error {
+func dbLinkEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, emailAddress string) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `UPDATE ` + usersTableName + ` SET "emailAddress" = $2 WHERE "id" = $1`
-		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), emailAddress)
+		clearQuery := `UPDATE ` + usersTableName + ` SET "emailAddress" = NULL WHERE "emailAddress" = $1 AND "id" != $2`
+		if _, err := tx.Exec(ctx, clearQuery, emailAddress, pg.Encode(userID.Value)); err != nil {
+			return err
+		}
+
+		setQuery := `UPDATE ` + usersTableName + ` SET "emailAddress" = $2 WHERE "id" = $1`
+		_, err := tx.Exec(ctx, setQuery, pg.Encode(userID.Value), emailAddress)
 		return err
 	})
 }

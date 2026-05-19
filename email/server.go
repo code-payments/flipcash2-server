@@ -110,7 +110,7 @@ func (s *Server) CheckVerificationCode(ctx context.Context, req *emailpb.CheckVe
 	case nil:
 		result = emailpb.CheckVerificationCodeResponse_OK
 
-		err = s.profiles.SetEmailAddress(ctx, userID, req.EmailAddress.Value)
+		err = s.profiles.LinkEmailAddress(ctx, userID, req.EmailAddress.Value)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure linking email address")
 			return nil, status.Error(codes.Internal, "failure linking email address")

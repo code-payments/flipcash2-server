@@ -2,6 +2,8 @@ package phone
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -29,6 +31,8 @@ type Server struct {
 
 	verifier Verifier
 
+	hashPepper []byte
+
 	phonepb.UnimplementedPhoneVerificationServer
 }
 
@@ -38,6 +42,7 @@ func NewServer(
 	accounts account.Store,
 	profiles profile.Store,
 	verifier Verifier,
+	hashPepper []byte,
 ) *Server {
 	return &Server{
 		log: log,
@@ -48,6 +53,8 @@ func NewServer(
 		profiles: profiles,
 
 		verifier: verifier,
+
+		hashPepper: hashPepper,
 	}
 }
 
@@ -117,7 +124,7 @@ func (s *Server) CheckVerificationCode(ctx context.Context, req *phonepb.CheckVe
 	case nil:
 		result = phonepb.CheckVerificationCodeResponse_OK
 
-		err = s.profiles.SetPhoneNumber(ctx, userID, req.PhoneNumber.Value)
+		err = s.profiles.LinkPhoneNumber(ctx, userID, req.PhoneNumber.Value, s.hashPhoneNumber(req.PhoneNumber.Value))
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure linking phone number")
 			return nil, status.Error(codes.Internal, "failure linking phone number")
@@ -163,4 +170,10 @@ func (s *Server) Unlink(ctx context.Context, req *phonepb.UnlinkRequest) (*phone
 	}
 
 	return &phonepb.UnlinkResponse{}, nil
+}
+
+func (s *Server) hashPhoneNumber(phoneNumber string) []byte {
+	mac := hmac.New(sha256.New, s.hashPepper)
+	mac.Write([]byte(phoneNumber))
+	return mac.Sum(nil)
 }

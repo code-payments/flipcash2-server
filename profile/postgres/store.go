@@ -78,16 +78,16 @@ func (s *store) SetDisplayName(ctx context.Context, id *commonpb.UserId, display
 	return dbSetDisplayName(ctx, s.pool, id, displayName)
 }
 
-func (s *store) SetPhoneNumber(ctx context.Context, id *commonpb.UserId, phoneNumber string) error {
-	return dbSetPhoneNumber(ctx, s.pool, id, phoneNumber)
+func (s *store) LinkPhoneNumber(ctx context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash []byte) error {
+	return dbLinkPhoneNumber(ctx, s.pool, id, phoneNumber, phoneNumberHash)
 }
 
 func (s *store) UnlinkPhoneNumber(ctx context.Context, userID *commonpb.UserId, phoneNumber string) error {
 	return dbUnlinkPhoneNumber(ctx, s.pool, userID, phoneNumber)
 }
 
-func (s *store) SetEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string) error {
-	return dbSetEmailAddress(ctx, s.pool, id, emailAddress)
+func (s *store) LinkEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string) error {
+	return dbLinkEmailAddress(ctx, s.pool, id, emailAddress)
 }
 
 func (s *store) UnlinkEmailAddress(ctx context.Context, userID *commonpb.UserId, emailAddress string) error {
@@ -125,7 +125,7 @@ func (s *store) GetXProfile(ctx context.Context, userID *commonpb.UserId) (*prof
 }
 
 func (s *store) reset() {
-	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "phoneNumber" = NULL, "emailAddress" = NULL`)
+	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL`)
 	if err != nil {
 		panic(err)
 	}

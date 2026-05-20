@@ -260,7 +260,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			BillExchangeDataTimeout:          durationpb.New(defaultBillExchangeDataTimeout),
 			NewCurrencyPurchaseAmount:        DefaultNewCurrencyPurchaseAmount,
 			NewCurrencyFeeAmount:             DefaultNewCurrencyFeeAmount,
-			UsdcWithdrawalFeeAmount:          DefaulWithdrawalFeeAmount,
+			WithdrawalFeeAmount:              DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 		},
 	}, nil
@@ -293,7 +293,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			MinBuildNumber:                   uint32(minBuildNumber),
 			NewCurrencyPurchaseAmount:        DefaultNewCurrencyPurchaseAmount,
 			NewCurrencyFeeAmount:             DefaultNewCurrencyFeeAmount,
-			UsdcWithdrawalFeeAmount:          DefaulWithdrawalFeeAmount,
+			WithdrawalFeeAmount:              DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 		},
 	}, nil

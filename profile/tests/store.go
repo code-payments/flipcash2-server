@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/model"
@@ -18,6 +20,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testStore,
 		testXProfiles,
 		testPhoneEmailTransfer,
+		testGetPhonesByHashes,
 	} {
 		tf(t, s)
 		teardown()
@@ -36,7 +39,7 @@ func testStore(t *testing.T, s profile.Store) {
 	require.NoError(t, s.UnlinkEmailAddress(ctx, userID, "someone@gmail.com"))
 
 	require.NoError(t, s.SetDisplayName(ctx, userID, "my name"))
-	require.NoError(t, s.LinkPhoneNumber(ctx, userID, "+12223334444", []byte("phone-hash")))
+	require.NoError(t, s.LinkPhoneNumber(ctx, userID, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
 	require.NoError(t, s.LinkEmailAddress(ctx, userID, "someone@gmail.com"))
 
 	profile, err := s.GetProfile(ctx, userID, false)
@@ -90,7 +93,7 @@ func testPhoneEmailTransfer(t *testing.T, s profile.Store) {
 
 	const phone = "+12223334444"
 	const email = "someone@gmail.com"
-	phoneHash := []byte("phone-hash")
+	phoneHash := &commonpb.Hash{Value: []byte("phone-hash")}
 
 	require.NoError(t, s.SetDisplayName(ctx, userID1, "user1"))
 	require.NoError(t, s.SetDisplayName(ctx, userID2, "user2"))
@@ -223,4 +226,51 @@ func testXProfiles(t *testing.T, s profile.Store) {
 	fullProfile, err = s.GetProfile(ctx, userID2, false)
 	require.NoError(t, err)
 	require.Empty(t, fullProfile.SocialProfiles)
+}
+
+func testGetPhonesByHashes(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	user1 := model.MustGenerateUserID()
+	user2 := model.MustGenerateUserID()
+	user3 := model.MustGenerateUserID()
+
+	hash1 := &commonpb.Hash{Value: []byte("hash1")}
+	hash2 := &commonpb.Hash{Value: []byte("hash2")}
+	hash3 := &commonpb.Hash{Value: []byte("hash3")}
+	missing := &commonpb.Hash{Value: []byte("hash-miss")}
+
+	require.NoError(t, s.SetDisplayName(ctx, user1, "u1"))
+	require.NoError(t, s.SetDisplayName(ctx, user2, "u2"))
+	require.NoError(t, s.SetDisplayName(ctx, user3, "u3"))
+
+	require.NoError(t, s.LinkPhoneNumber(ctx, user1, "+11111111111", hash1))
+	require.NoError(t, s.LinkPhoneNumber(ctx, user2, "+12222222222", hash2))
+	require.NoError(t, s.LinkPhoneNumber(ctx, user3, "+13333333333", hash3))
+
+	// Subset hit + one miss.
+	got, err := s.GetPhonesByHashes(ctx, []*commonpb.Hash{hash1, hash3, missing})
+	require.NoError(t, err)
+	require.ElementsMatch(t,
+		[]string{"+11111111111", "+13333333333"},
+		phoneValues(got),
+	)
+
+	// Empty input.
+	got, err = s.GetPhonesByHashes(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// All misses.
+	got, err = s.GetPhonesByHashes(ctx, []*commonpb.Hash{missing})
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+func phoneValues(phones []*phonepb.PhoneNumber) []string {
+	out := make([]string, len(phones))
+	for i, p := range phones {
+		out[i] = p.Value
+	}
+	return out
 }

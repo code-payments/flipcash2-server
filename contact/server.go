@@ -250,20 +250,34 @@ func (s *Server) GetFlipcashContacts(req *contactpb.GetFlipcashContactsRequest, 
 	}
 
 	hashes, err := s.contacts.GetHashes(ctx, userID)
-	if err != nil {
+	if errors.Is(err, ErrNotFound) {
+		return stream.Send(&contactpb.GetFlipcashContactsResponse{
+			Result: contactpb.GetFlipcashContactsResponse_NOT_FOUND,
+		})
+	} else if err != nil {
 		log.With(zap.Error(err)).Warn("Failure getting contact list hashes")
 		return status.Error(codes.Internal, "")
 	}
 
+	if len(hashes) == 0 {
+		return stream.Send(&contactpb.GetFlipcashContactsResponse{
+			Result: contactpb.GetFlipcashContactsResponse_NOT_FOUND,
+		})
+	}
+
 	phones, err := s.profiles.GetPhonesByHashes(ctx, hashes)
-	if err != nil {
+	if errors.Is(err, profile.ErrNotFound) {
+		return stream.Send(&contactpb.GetFlipcashContactsResponse{
+			Result: contactpb.GetFlipcashContactsResponse_NOT_FOUND,
+		})
+	} else if err != nil {
 		log.With(zap.Error(err)).Warn("Failure looking up phones by hash")
 		return status.Error(codes.Internal, "")
 	}
 
 	if len(phones) == 0 {
 		return stream.Send(&contactpb.GetFlipcashContactsResponse{
-			Result: contactpb.GetFlipcashContactsResponse_OK,
+			Result: contactpb.GetFlipcashContactsResponse_NOT_FOUND,
 		})
 	}
 

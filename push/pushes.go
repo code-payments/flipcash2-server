@@ -20,12 +20,9 @@ var (
 	amountPrinter = message.NewPrinter(defaultLocale)
 )
 
-func SendUsdfDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, usdMarketValue float64) error {
-	title := "USD Reserves Now Available"
-	body := amountPrinter.Sprintf(
-		"$%.2f of USDF was added to your Flipcash wallet",
-		usdMarketValue,
-	)
+func SendUsdfDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId) error {
+	title := "Deposit Now Available"
+	body := "You can now spend it in Flipcash"
 	customPayload := &pushpb.Payload{
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{
@@ -36,13 +33,22 @@ func SendUsdfDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.Us
 	return pusher.SendPushes(ctx, title, body, customPayload, user)
 }
 
-func SendFlipcashCurrencyDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string, usdMarketValue float64) error {
-	title := fmt.Sprintf("%s Now Available", currencyName)
-	body := amountPrinter.Sprintf(
-		"$%.2f of %s was added to your Flipcash wallet",
-		usdMarketValue,
-		currencyName,
-	)
+func SendUsdfDepositProcessingPush(ctx context.Context, pusher Pusher, user *commonpb.UserId) error {
+	title := "Deposit Processing"
+	body := "Deposits take about a minute"
+	customPayload := &pushpb.Payload{
+		Navigation: &pushpb.Navigation{
+			Type: &pushpb.Navigation_CurrencyInfo{
+				CurrencyInfo: &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
+			},
+		},
+	}
+	return pusher.SendPushes(ctx, title, body, customPayload, user)
+}
+
+func SendFlipcashCurrencyDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string) error {
+	title := "Deposit Now Available"
+	body := "You can now spend it in Flipcash"
 	customPayload := &pushpb.Payload{
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{

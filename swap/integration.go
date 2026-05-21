@@ -23,6 +23,7 @@ import (
 	ocp_account "github.com/code-payments/ocp-server/ocp/data/account"
 	ocp_currency "github.com/code-payments/ocp-server/ocp/data/currency"
 	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
+	"github.com/code-payments/ocp-server/usdc"
 )
 
 const gainProcessingBatchSize = 256
@@ -69,6 +70,19 @@ func NewIntegration(
 		mintsProcessingForGain: make(map[string]struct{}),
 		mintLastGainPushAt:     make(map[string]time.Time),
 	}
+}
+
+func (i *Integration) OnSwapSubmitted(ctx context.Context, owner *common.Account, fromMint, toMint *ocp_common.Account) error {
+	if fromMint.PublicKey().ToBase58() == usdc.Mint && ocp_common.IsCoreMint(toMint) {
+		userID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: owner.PublicKey().ToBytes()})
+		if err != nil {
+			return err
+		}
+
+		return push.SendUsdfDepositProcessingPush(ctx, i.pusher, userID)
+	}
+
+	return nil
 }
 
 func (i *Integration) OnSwapFinalized(ctx context.Context, owner *ocp_common.Account, isBuy bool, mint *ocp_common.Account, currencyName string, region ocp_currency_lib.Code, amountReceived float64, isMintInit bool) error {

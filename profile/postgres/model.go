@@ -197,6 +197,29 @@ func dbGetPhonesByHashes(ctx context.Context, pool *pgxpool.Pool, hashes []*comm
 	return out, nil
 }
 
+func dbGetUserIdByPhoneNumber(ctx context.Context, pool *pgxpool.Pool, phoneNumber string) (*commonpb.UserId, error) {
+	var encoded string
+	query := `SELECT "id" FROM ` + usersTableName + ` WHERE "phoneNumber" = $1`
+	err := pgxscan.Get(
+		ctx,
+		pool,
+		&encoded,
+		query,
+		phoneNumber,
+	)
+	if err != nil {
+		if pgxscan.NotFound(err) {
+			return nil, profile.ErrNotFound
+		}
+		return nil, err
+	}
+	decoded, err := pg.Decode(encoded)
+	if err != nil {
+		return nil, err
+	}
+	return &commonpb.UserId{Value: decoded}, nil
+}
+
 func dbUnlinkEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, emailAddress string) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
 		query := `UPDATE ` + usersTableName + ` SET "emailAddress" = NULL WHERE "id" = $1 AND "emailAddress" = $2`

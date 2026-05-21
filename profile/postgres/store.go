@@ -90,6 +90,10 @@ func (s *store) GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) 
 	return dbGetPhonesByHashes(ctx, s.pool, hashes)
 }
 
+func (s *store) GetUserIdByPhoneNumber(ctx context.Context, phoneNumber string) (*commonpb.UserId, error) {
+	return dbGetUserIdByPhoneNumber(ctx, s.pool, phoneNumber)
+}
+
 func (s *store) LinkEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string) error {
 	return dbLinkEmailAddress(ctx, s.pool, id, emailAddress)
 }

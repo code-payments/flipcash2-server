@@ -21,6 +21,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testXProfiles,
 		testPhoneEmailTransfer,
 		testGetPhonesByHashes,
+		testGetUserIdByPhoneNumber,
 	} {
 		tf(t, s)
 		teardown()
@@ -265,6 +266,45 @@ func testGetPhonesByHashes(t *testing.T, s profile.Store) {
 	got, err = s.GetPhonesByHashes(ctx, []*commonpb.Hash{missing})
 	require.NoError(t, err)
 	require.Empty(t, got)
+}
+
+func testGetUserIdByPhoneNumber(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	_, err := s.GetUserIdByPhoneNumber(ctx, "+19998887777")
+	require.ErrorIs(t, err, profile.ErrNotFound)
+
+	user1 := model.MustGenerateUserID()
+	user2 := model.MustGenerateUserID()
+
+	require.NoError(t, s.SetDisplayName(ctx, user1, "u1"))
+	require.NoError(t, s.SetDisplayName(ctx, user2, "u2"))
+
+	require.NoError(t, s.LinkPhoneNumber(ctx, user1, "+11111111111", &commonpb.Hash{Value: []byte("hash1")}))
+	require.NoError(t, s.LinkPhoneNumber(ctx, user2, "+12222222222", &commonpb.Hash{Value: []byte("hash2")}))
+
+	got, err := s.GetUserIdByPhoneNumber(ctx, "+11111111111")
+	require.NoError(t, err)
+	require.Equal(t, user1.Value, got.Value)
+
+	got, err = s.GetUserIdByPhoneNumber(ctx, "+12222222222")
+	require.NoError(t, err)
+	require.Equal(t, user2.Value, got.Value)
+
+	_, err = s.GetUserIdByPhoneNumber(ctx, "+19998887777")
+	require.ErrorIs(t, err, profile.ErrNotFound)
+
+	// Transfer the number to a different user — old user no longer resolves.
+	require.NoError(t, s.LinkPhoneNumber(ctx, user2, "+11111111111", &commonpb.Hash{Value: []byte("hash1")}))
+
+	got, err = s.GetUserIdByPhoneNumber(ctx, "+11111111111")
+	require.NoError(t, err)
+	require.Equal(t, user2.Value, got.Value)
+
+	// Unlink leaves the number unresolvable.
+	require.NoError(t, s.UnlinkPhoneNumber(ctx, user2, "+11111111111"))
+	_, err = s.GetUserIdByPhoneNumber(ctx, "+11111111111")
+	require.ErrorIs(t, err, profile.ErrNotFound)
 }
 
 func phoneValues(phones []*phonepb.PhoneNumber) []string {

@@ -34,6 +34,10 @@ type Store interface {
 	// phoneNumberHash matches any of the provided hashes. Order is unspecified.
 	GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error)
 
+	// GetUserIdByPhoneNumber returns the UserId currently linked to the given
+	// phone number. Returns ErrNotFound when no user holds the number.
+	GetUserIdByPhoneNumber(ctx context.Context, phoneNumber string) (*commonpb.UserId, error)
+
 	// LinkEmailAddress links the email address to a user, provided they exist. Any other
 	// user previously holding the same email address has it cleared.
 	LinkEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string) error

@@ -35,8 +35,8 @@ func (i *Integration) OnDepositReceived(ctx context.Context, owner, mint *ocp_co
 	}
 
 	if ocp_common.IsCoreMint(mint) {
-		return push.SendUsdfDepositedPush(ctx, i.pusher, userID, usdMarketValue)
+		return push.SendUsdfDepositedPush(ctx, i.pusher, userID)
 	}
 	protoMint := &commonpb.PublicKey{Value: mint.PublicKey().ToBytes()}
-	return push.SendFlipcashCurrencyDepositedPush(ctx, i.pusher, userID, protoMint, currencyName, usdMarketValue)
+	return push.SendFlipcashCurrencyDepositedPush(ctx, i.pusher, userID, protoMint, currencyName)
 }

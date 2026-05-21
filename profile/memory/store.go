@@ -153,6 +153,23 @@ func (m *InMemoryStore) GetPhonesByHashes(_ context.Context, hashes []*commonpb.
 	return out, nil
 }
 
+func (m *InMemoryStore) GetUserIdByPhoneNumber(_ context.Context, phoneNumber string) (*commonpb.UserId, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	for key, p := range m.profiles {
+		if p.PhoneNumber == nil || p.PhoneNumber.Value != phoneNumber {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(key)
+		if err != nil {
+			return nil, err
+		}
+		return &commonpb.UserId{Value: decoded}, nil
+	}
+	return nil, profile.ErrNotFound
+}
+
 func (m *InMemoryStore) LinkEmailAddress(_ context.Context, id *commonpb.UserId, emailAddress string) error {
 	m.Lock()
 	defer m.Unlock()

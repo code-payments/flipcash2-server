@@ -22,7 +22,7 @@ var (
 
 func SendUsdfDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId) error {
 	title := "Deposit Now Available"
-	body := "You can now spend it in Flipcash"
+	body := "You can now spend your deposit in Flipcash"
 	customPayload := &pushpb.Payload{
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{
@@ -48,7 +48,7 @@ func SendUsdfDepositProcessingPush(ctx context.Context, pusher Pusher, user *com
 
 func SendFlipcashCurrencyDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string) error {
 	title := "Deposit Now Available"
-	body := "You can now spend it in Flipcash"
+	body := "You can now spend your deposit in Flipcash"
 	customPayload := &pushpb.Payload{
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{

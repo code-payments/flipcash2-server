@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 )
 
@@ -24,10 +25,14 @@ type Store interface {
 	// LinkPhoneNumber links the phone number and its precomputed hash to a user, provided
 	// they exist. Any other user previously holding the same phone number has both fields
 	// cleared.
-	LinkPhoneNumber(ctx context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash []byte) error
+	LinkPhoneNumber(ctx context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash *commonpb.Hash) error
 
 	// UnlinkPhoneNumber removes the link for the phone number
 	UnlinkPhoneNumber(ctx context.Context, userID *commonpb.UserId, phoneNumber string) error
+
+	// GetPhonesByHashes returns the phone numbers for users whose stored
+	// phoneNumberHash matches any of the provided hashes. Order is unspecified.
+	GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error)
 
 	// LinkEmailAddress links the email address to a user, provided they exist. Any other
 	// user previously holding the same email address has it cleared.

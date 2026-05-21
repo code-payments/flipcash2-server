@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/ocp-server/pointer"
@@ -129,7 +130,7 @@ func dbGetEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonpb
 	return res, nil
 }
 
-func dbLinkPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumber string, phoneNumberHash []byte) error {
+func dbLinkPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumber string, phoneNumberHash *commonpb.Hash) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
 		clearQuery := `UPDATE ` + usersTableName + ` SET "phoneNumber" = NULL, "phoneNumberHash" = NULL WHERE "phoneNumber" = $1 AND "id" != $2`
 		if _, err := tx.Exec(ctx, clearQuery, phoneNumber, pg.Encode(userID.Value)); err != nil {
@@ -137,7 +138,7 @@ func dbLinkPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb
 		}
 
 		setQuery := `UPDATE ` + usersTableName + ` SET "phoneNumber" = $2, "phoneNumberHash" = $3 WHERE "id" = $1`
-		_, err := tx.Exec(ctx, setQuery, pg.Encode(userID.Value), phoneNumber, pg.Encode(phoneNumberHash, pg.Hex))
+		_, err := tx.Exec(ctx, setQuery, pg.Encode(userID.Value), phoneNumber, pg.Encode(phoneNumberHash.Value, pg.Hex))
 		return err
 	})
 }
@@ -161,6 +162,39 @@ func dbLinkEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 		_, err := tx.Exec(ctx, setQuery, pg.Encode(userID.Value), emailAddress)
 		return err
 	})
+}
+
+func dbGetPhonesByHashes(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+	if len(hashes) == 0 {
+		return nil, nil
+	}
+
+	encoded := make([]string, 0, len(hashes))
+	seen := make(map[string]struct{}, len(hashes))
+	for _, h := range hashes {
+		e := pg.Encode(h.Value, pg.Hex)
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		encoded = append(encoded, e)
+	}
+
+	var phones []string
+	query := `SELECT "phoneNumber" FROM ` + usersTableName + ` WHERE "phoneNumber" IS NOT NULL AND "phoneNumberHash" = ANY($1::text[])`
+	err := pgxscan.Select(ctx, pool, &phones, query, encoded)
+	if err != nil {
+		if pgxscan.NotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	out := make([]*phonepb.PhoneNumber, 0, len(phones))
+	for _, p := range phones {
+		out = append(out, &phonepb.PhoneNumber{Value: p})
+	}
+	return out, nil
 }
 
 func dbUnlinkEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, emailAddress string) error {

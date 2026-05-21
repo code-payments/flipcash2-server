@@ -2,13 +2,12 @@ package phone
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
@@ -124,7 +123,7 @@ func (s *Server) CheckVerificationCode(ctx context.Context, req *phonepb.CheckVe
 	case nil:
 		result = phonepb.CheckVerificationCodeResponse_OK
 
-		err = s.profiles.LinkPhoneNumber(ctx, userID, req.PhoneNumber.Value, s.hashPhoneNumber(req.PhoneNumber.Value))
+		err = s.profiles.LinkPhoneNumber(ctx, userID, req.PhoneNumber.Value, s.hashPhoneNumber(req.PhoneNumber))
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure linking phone number")
 			return nil, status.Error(codes.Internal, "failure linking phone number")
@@ -172,8 +171,6 @@ func (s *Server) Unlink(ctx context.Context, req *phonepb.UnlinkRequest) (*phone
 	return &phonepb.UnlinkResponse{}, nil
 }
 
-func (s *Server) hashPhoneNumber(phoneNumber string) []byte {
-	mac := hmac.New(sha256.New, s.hashPepper)
-	mac.Write([]byte(phoneNumber))
-	return mac.Sum(nil)
+func (s *Server) hashPhoneNumber(phoneNumber *phonepb.PhoneNumber) *commonpb.Hash {
+	return SecureHash(phoneNumber, s.hashPepper)
 }

@@ -78,12 +78,16 @@ func (s *store) SetDisplayName(ctx context.Context, id *commonpb.UserId, display
 	return dbSetDisplayName(ctx, s.pool, id, displayName)
 }
 
-func (s *store) LinkPhoneNumber(ctx context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash []byte) error {
+func (s *store) LinkPhoneNumber(ctx context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash *commonpb.Hash) error {
 	return dbLinkPhoneNumber(ctx, s.pool, id, phoneNumber, phoneNumberHash)
 }
 
 func (s *store) UnlinkPhoneNumber(ctx context.Context, userID *commonpb.UserId, phoneNumber string) error {
 	return dbUnlinkPhoneNumber(ctx, s.pool, userID, phoneNumber)
+}
+
+func (s *store) GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+	return dbGetPhonesByHashes(ctx, s.pool, hashes)
 }
 
 func (s *store) LinkEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string) error {

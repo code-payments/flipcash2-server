@@ -80,7 +80,7 @@ func (m *InMemoryStore) SetDisplayName(_ context.Context, id *commonpb.UserId, d
 	return nil
 }
 
-func (m *InMemoryStore) LinkPhoneNumber(_ context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash []byte) error {
+func (m *InMemoryStore) LinkPhoneNumber(_ context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash *commonpb.Hash) error {
 	m.Lock()
 	defer m.Unlock()
 
@@ -103,7 +103,7 @@ func (m *InMemoryStore) LinkPhoneNumber(_ context.Context, id *commonpb.UserId, 
 	profile.PhoneNumber = &phonepb.PhoneNumber{Value: phoneNumber}
 
 	m.profiles[targetKey] = profile
-	m.phoneHashesByUser[targetKey] = phoneNumberHash
+	m.phoneHashesByUser[targetKey] = phoneNumberHash.Value
 
 	return nil
 }
@@ -124,6 +124,33 @@ func (m *InMemoryStore) UnlinkPhoneNumber(ctx context.Context, userID *commonpb.
 	}
 
 	return nil
+}
+
+func (m *InMemoryStore) GetPhonesByHashes(_ context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+	if len(hashes) == 0 {
+		return nil, nil
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	wanted := make(map[string]struct{}, len(hashes))
+	for _, h := range hashes {
+		wanted[string(h.Value)] = struct{}{}
+	}
+
+	var out []*phonepb.PhoneNumber
+	for key, hash := range m.phoneHashesByUser {
+		if _, ok := wanted[string(hash)]; !ok {
+			continue
+		}
+		p, ok := m.profiles[key]
+		if !ok || p.PhoneNumber == nil {
+			continue
+		}
+		out = append(out, &phonepb.PhoneNumber{Value: p.PhoneNumber.Value})
+	}
+	return out, nil
 }
 
 func (m *InMemoryStore) LinkEmailAddress(_ context.Context, id *commonpb.UserId, emailAddress string) error {

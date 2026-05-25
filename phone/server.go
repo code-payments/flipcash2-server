@@ -1,7 +1,9 @@
 package phone
 
 import (
+	"bytes"
 	"context"
+	"errors"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -12,8 +14,10 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/contact"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
+	"github.com/code-payments/flipcash2-server/push"
 )
 
 const (
@@ -27,8 +31,10 @@ type Server struct {
 
 	accounts account.Store
 	profiles profile.Store
+	contacts contact.Store
 
 	verifier Verifier
+	pusher   push.Pusher
 
 	hashPepper []byte
 
@@ -40,7 +46,9 @@ func NewServer(
 	authz auth.Authorizer,
 	accounts account.Store,
 	profiles profile.Store,
+	contacts contact.Store,
 	verifier Verifier,
+	pusher push.Pusher,
 	hashPepper []byte,
 ) *Server {
 	return &Server{
@@ -50,8 +58,10 @@ func NewServer(
 
 		accounts: accounts,
 		profiles: profiles,
+		contacts: contacts,
 
 		verifier: verifier,
+		pusher:   pusher,
 
 		hashPepper: hashPepper,
 	}
@@ -123,10 +133,21 @@ func (s *Server) CheckVerificationCode(ctx context.Context, req *phonepb.CheckVe
 	case nil:
 		result = phonepb.CheckVerificationCodeResponse_OK
 
-		err = s.profiles.LinkPhoneNumber(ctx, userID, req.PhoneNumber.Value, s.hashPhoneNumber(req.PhoneNumber))
+		isFirstJoin, err := s.isFirstJoin(ctx, req.PhoneNumber)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure checking existing phone link")
+			return nil, status.Error(codes.Internal, "failure linking phone number")
+		}
+
+		phoneHash := s.hashPhoneNumber(req.PhoneNumber)
+		err = s.profiles.LinkPhoneNumber(ctx, userID, req.PhoneNumber.Value, phoneHash)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure linking phone number")
 			return nil, status.Error(codes.Internal, "failure linking phone number")
+		}
+
+		if isFirstJoin {
+			go s.notifyContactsOfJoin(context.Background(), log, userID, req.PhoneNumber, phoneHash)
 		}
 	case ErrInvalidVerificationCode:
 		result = phonepb.CheckVerificationCodeResponse_INVALID_CODE
@@ -162,6 +183,15 @@ func (s *Server) Unlink(ctx context.Context, req *phonepb.UnlinkRequest) (*phone
 		return &phonepb.UnlinkResponse{Result: phonepb.UnlinkResponse_DENIED}, nil
 	}
 
+	isStaff, err := s.accounts.IsStaff(ctx, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure getting user staff status")
+		return nil, status.Error(codes.Internal, "failure getting user staff status")
+	}
+	if !isStaff {
+		return &phonepb.UnlinkResponse{Result: phonepb.UnlinkResponse_DENIED}, nil
+	}
+
 	err = s.profiles.UnlinkPhoneNumber(ctx, userID, req.PhoneNumber.Value)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure unlinking email address")
@@ -173,4 +203,48 @@ func (s *Server) Unlink(ctx context.Context, req *phonepb.UnlinkRequest) (*phone
 
 func (s *Server) hashPhoneNumber(phoneNumber *phonepb.PhoneNumber) *commonpb.Hash {
 	return SecureHash(phoneNumber, s.hashPepper)
+}
+
+func (s *Server) isFirstJoin(ctx context.Context, phoneNumber *phonepb.PhoneNumber) (bool, error) {
+	_, err := s.profiles.GetUserIdByPhoneNumber(ctx, phoneNumber.Value)
+	if errors.Is(err, profile.ErrNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func (s *Server) notifyContactsOfJoin(
+	ctx context.Context,
+	log *zap.Logger,
+	joiningUserID *commonpb.UserId,
+	phoneNumber *phonepb.PhoneNumber,
+	phoneHash *commonpb.Hash,
+) {
+	recipients, err := s.contacts.GetUserIdsByPhoneHash(ctx, phoneHash)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure looking up contact list owners for join notification")
+		return
+	}
+
+	var filtered []*commonpb.UserId
+	for _, r := range recipients {
+		if bytes.Equal(r.Value, joiningUserID.Value) {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	if len(filtered) == 0 {
+		return
+	}
+
+	const batchSize = 1000
+	for i := 0; i < len(filtered); i += batchSize {
+		end := min(i+batchSize, len(filtered))
+		if err := push.SendContactJoinedFlipcashPush(ctx, s.pusher, phoneNumber, filtered[i:end]...); err != nil {
+			log.With(zap.Error(err)).Warn("Failure sending contact joined Flipcash push")
+		}
+	}
 }

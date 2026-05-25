@@ -28,6 +28,7 @@ func RunStoreTests(t *testing.T, s contact.Store, createUser CreateUserFunc, tea
 		testStore_GetHashes_AfterReplace,
 		testStore_GetHashes_EmptyReplaceKeepsRow,
 		testStore_GetHashes_AfterDelta,
+		testStore_GetUserIdsByPhoneHash,
 	} {
 		tf(t, s, createUser)
 		teardown()
@@ -267,6 +268,64 @@ func testStore_GetHashes_AfterDelta(t *testing.T, s contact.Store, createUser Cr
 	got, err = s.GetHashes(ctx, userID)
 	require.NoError(t, err)
 	require.ElementsMatch(t, hashValues(h2, h3, h4), hashValues(got...))
+}
+
+func testStore_GetUserIdsByPhoneHash(t *testing.T, s contact.Store, createUser CreateUserFunc) {
+	ctx := context.Background()
+
+	h1 := hash("a")
+	h2 := hash("b")
+	h3 := hash("c")
+
+	// Unknown hash and empty store returns nothing.
+	got, err := s.GetUserIdsByPhoneHash(ctx, h1)
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	userA := createUser(t)
+	userB := createUser(t)
+	userC := createUser(t)
+
+	// userA has {h1, h2}, userB has {h1, h3}, userC has {h2} only.
+	require.NoError(t, s.Replace(ctx, userA, []*commonpb.Hash{h1, h2}, xor(contact.ZeroChecksum(), h1, h2)))
+	require.NoError(t, s.Replace(ctx, userB, []*commonpb.Hash{h1, h3}, xor(contact.ZeroChecksum(), h1, h3)))
+	require.NoError(t, s.Replace(ctx, userC, []*commonpb.Hash{h2}, xor(contact.ZeroChecksum(), h2)))
+
+	got, err = s.GetUserIdsByPhoneHash(ctx, h1)
+	require.NoError(t, err)
+	require.ElementsMatch(t, [][]byte{userA.Value, userB.Value}, userIdValues(got))
+
+	got, err = s.GetUserIdsByPhoneHash(ctx, h2)
+	require.NoError(t, err)
+	require.ElementsMatch(t, [][]byte{userA.Value, userC.Value}, userIdValues(got))
+
+	got, err = s.GetUserIdsByPhoneHash(ctx, h3)
+	require.NoError(t, err)
+	require.ElementsMatch(t, [][]byte{userB.Value}, userIdValues(got))
+
+	got, err = s.GetUserIdsByPhoneHash(ctx, hash("unknown"))
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// Removing h1 from userA via delta should leave only userB matching h1.
+	newChecksum := xor(xor(contact.ZeroChecksum(), h1, h2), h1)
+	require.NoError(t, s.ApplyDelta(
+		ctx, userA,
+		nil, []*commonpb.Hash{h1},
+		xor(contact.ZeroChecksum(), h1, h2), newChecksum,
+	))
+
+	got, err = s.GetUserIdsByPhoneHash(ctx, h1)
+	require.NoError(t, err)
+	require.ElementsMatch(t, [][]byte{userB.Value}, userIdValues(got))
+}
+
+func userIdValues(ids []*commonpb.UserId) [][]byte {
+	out := make([][]byte, len(ids))
+	for i, id := range ids {
+		out[i] = id.Value
+	}
+	return out
 }
 
 func hashValues(hashes ...*commonpb.Hash) [][]byte {

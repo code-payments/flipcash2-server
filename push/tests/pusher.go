@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 
 	"github.com/code-payments/flipcash2-server/push"
@@ -33,6 +34,7 @@ func (c *testFCMClient) SendEachForMulticast(_ context.Context, message *messagi
 func RunPusherTests(t *testing.T, s push.TokenStore, teardown func()) {
 	for _, tf := range []func(t *testing.T, s push.TokenStore){
 		testFCMPusher_SendBasicPushes,
+		testFCMPusher_SendPushesWithSubstitutions,
 	} {
 		tf(t, s)
 		teardown()
@@ -94,9 +96,85 @@ func testFCMPusher_SendBasicPushes(t *testing.T, store push.TokenStore) {
 	require.NotNil(t, fcmClient.sentMessage.APNS)
 	require.Equal(t, "title", fcmClient.sentMessage.APNS.Payload.Aps.Alert.Title)
 	require.Equal(t, "body", fcmClient.sentMessage.APNS.Payload.Aps.Alert.Body)
+	require.False(t, fcmClient.sentMessage.APNS.Payload.Aps.MutableContent)
 	require.Len(t, fcmClient.sentMessage.APNS.Payload.Aps.CustomData, 4)
 	require.Equal(t, "title", fcmClient.sentMessage.APNS.Payload.Aps.CustomData["push_notification_title"])
 	require.Equal(t, "body", fcmClient.sentMessage.APNS.Payload.Aps.CustomData["push_notification_body"])
 	require.Equal(t, expectedEncodedCustomPayload, fcmClient.sentMessage.APNS.Payload.Aps.CustomData["flipcash_payload"])
 	require.Equal(t, "https://app.flipcash.com/token/11111111111111111111111111111111", fcmClient.sentMessage.APNS.Payload.Aps.CustomData["target_url"])
+}
+
+func testFCMPusher_SendPushesWithSubstitutions(t *testing.T, store push.TokenStore) {
+	ctx := context.Background()
+
+	user := &commonpb.UserId{Value: []byte("user_subs")}
+	installId := &commonpb.AppInstallId{Value: "install_subs"}
+	require.NoError(t, store.AddToken(ctx, user, installId, pushpb.TokenType_FCM_APNS, "token_subs"))
+
+	titleSub := &pushpb.Substitution{
+		Fallback: "Alice",
+		Kind: &pushpb.Substitution_Contact{
+			Contact: &phonepb.PhoneNumber{Value: "+14155551111"},
+		},
+	}
+	bodySub := &pushpb.Substitution{
+		Fallback: "Bob",
+		Kind: &pushpb.Substitution_Contact{
+			Contact: &phonepb.PhoneNumber{Value: "+14155552222"},
+		},
+	}
+
+	for _, tc := range []struct {
+		name        string
+		payload     *pushpb.Payload
+		wantMutable bool
+	}{
+		{
+			name:        "no substitutions",
+			payload:     &pushpb.Payload{},
+			wantMutable: false,
+		},
+		{
+			name: "title substitutions only",
+			payload: &pushpb.Payload{
+				TitleSubstitutions: []*pushpb.Substitution{titleSub},
+			},
+			wantMutable: true,
+		},
+		{
+			name: "body substitutions only",
+			payload: &pushpb.Payload{
+				BodySubstitutions: []*pushpb.Substitution{bodySub},
+			},
+			wantMutable: true,
+		},
+		{
+			name: "title and body substitutions",
+			payload: &pushpb.Payload{
+				TitleSubstitutions: []*pushpb.Substitution{titleSub},
+				BodySubstitutions:  []*pushpb.Substitution{bodySub, bodySub},
+			},
+			wantMutable: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fcmClient := &testFCMClient{}
+			pusher := push.NewFCMPusher(zap.NewNop(), store, fcmClient)
+
+			require.NoError(t, pusher.SendPushes(ctx, "title", "body", tc.payload, user))
+
+			marshalled, err := proto.Marshal(tc.payload)
+			require.NoError(t, err)
+			expectedEncoded := base64.StdEncoding.EncodeToString(marshalled)
+
+			require.NotNil(t, fcmClient.sentMessage)
+
+			require.NotNil(t, fcmClient.sentMessage.APNS)
+			require.Equal(t, tc.wantMutable, fcmClient.sentMessage.APNS.Payload.Aps.MutableContent)
+			require.Equal(t, expectedEncoded, fcmClient.sentMessage.APNS.Payload.Aps.CustomData["flipcash_payload"])
+
+			require.NotNil(t, fcmClient.sentMessage.Android)
+			require.Equal(t, expectedEncoded, fcmClient.sentMessage.Android.Data["flipcash_payload"])
+		})
+	}
 }

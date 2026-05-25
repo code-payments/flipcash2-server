@@ -18,7 +18,7 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/model"
-	"github.com/code-payments/flipcash2-server/phone"
+	phone_hash "github.com/code-payments/flipcash2-server/phone/hash"
 	"github.com/code-payments/flipcash2-server/profile"
 )
 
@@ -321,7 +321,7 @@ func (s *Server) secureHashPhones(phones []*phonepb.PhoneNumber) []*commonpb.Has
 	}
 	out := make([]*commonpb.Hash, len(phones))
 	for i, p := range phones {
-		out[i] = phone.SecureHash(p, s.hashPepper)
+		out[i] = phone_hash.Secure(p, s.hashPepper)
 	}
 	return out
 }

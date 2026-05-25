@@ -49,6 +49,11 @@ type Store interface {
 	// row exists but the contact list is empty.
 	GetHashes(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.Hash, error)
 
+	// GetUserIdsByPhoneHash returns every user whose contact list contains
+	// phoneNumberHash. Returns an empty slice (no error) when no users have
+	// the hash. Order is unspecified.
+	GetUserIdsByPhoneHash(ctx context.Context, phoneNumberHash *commonpb.Hash) ([]*commonpb.UserId, error)
+
 	// ApplyDelta applies adds and removes to the user's contact set under
 	// compare-and-swap on the checksum:
 	//

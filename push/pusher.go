@@ -103,6 +103,8 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 		customDataApns[k] = v
 	}
 
+	hasSubstitutions := len(customPayload.TitleSubstitutions) > 0 || len(customPayload.BodySubstitutions) > 0
+
 	message := &messaging.MulticastMessage{
 		Tokens: tokens,
 		Android: &messaging.AndroidConfig{
@@ -116,7 +118,8 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 						Title: title,
 						Body:  body,
 					},
-					CustomData: customDataApns,
+					MutableContent: hasSubstitutions,
+					CustomData:     customDataApns,
 				},
 			},
 		},

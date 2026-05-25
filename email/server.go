@@ -149,6 +149,15 @@ func (s *Server) Unlink(ctx context.Context, req *emailpb.UnlinkRequest) (*email
 		return &emailpb.UnlinkResponse{Result: emailpb.UnlinkResponse_DENIED}, nil
 	}
 
+	isStaff, err := s.accounts.IsStaff(ctx, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure getting user staff status")
+		return nil, status.Error(codes.Internal, "failure getting user staff status")
+	}
+	if !isStaff {
+		return &emailpb.UnlinkResponse{Result: emailpb.UnlinkResponse_DENIED}, nil
+	}
+
 	err = s.profiles.UnlinkEmailAddress(ctx, userID, req.EmailAddress.Value)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure unlinking email address")

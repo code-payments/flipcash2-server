@@ -107,6 +107,31 @@ func dbGetHashes(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserI
 	return out, nil
 }
 
+// dbGetUserIdsByPhoneHash returns every userId whose contact list contains
+// phoneNumberHash. Returns an empty slice (no error) when no users have the
+// hash.
+func dbGetUserIdsByPhoneHash(ctx context.Context, pool *pgxpool.Pool, phoneNumberHash *commonpb.Hash) ([]*commonpb.UserId, error) {
+	var encoded []string
+	err := pgxscan.Select(
+		ctx, pool, &encoded,
+		`SELECT "userId" FROM `+contactListEntriesTableName+` WHERE "phoneNumberHash" = $1`,
+		encodeHash(phoneNumberHash),
+	)
+	if err != nil && !pgxscan.NotFound(err) {
+		return nil, err
+	}
+
+	out := make([]*commonpb.UserId, 0, len(encoded))
+	for _, e := range encoded {
+		raw, err := pg.Decode(e)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, &commonpb.UserId{Value: raw})
+	}
+	return out, nil
+}
+
 // dbApplyDelta atomically applies adds/removes under compare-and-swap on the
 // checksum. Returns contact.ErrChecksumDrift, contact.ErrTooManyContacts, or
 // nil (which includes the idempotent retry case where the stored checksum

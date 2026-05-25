@@ -61,6 +61,20 @@ func (m *memory) GetHashes(_ context.Context, userID *commonpb.UserId) ([]*commo
 	return out, nil
 }
 
+func (m *memory) GetUserIdsByPhoneHash(_ context.Context, phoneNumberHash *commonpb.Hash) ([]*commonpb.UserId, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	target := string(phoneNumberHash.Value)
+	var out []*commonpb.UserId
+	for userID, state := range m.users {
+		if _, ok := state.hashes[target]; ok {
+			out = append(out, &commonpb.UserId{Value: []byte(userID)})
+		}
+	}
+	return out, nil
+}
+
 func (m *memory) ApplyDelta(
 	_ context.Context,
 	userID *commonpb.UserId,

@@ -46,9 +46,13 @@ func SendUsdfDepositProcessingPush(ctx context.Context, pusher Pusher, user *com
 	return pusher.SendPushes(ctx, title, body, customPayload, user)
 }
 
-func SendFlipcashCurrencyDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string) error {
+func SendFlipcashCurrencyDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string, usdMarketValue float64) error {
 	title := fmt.Sprintf("%s Now Available", currencyName)
-	body := fmt.Sprintf("You can now spend your %s in Flipcash", currencyName)
+	body := amountPrinter.Sprintf(
+		"$%.2f of %s was added to your Flipcash wallet",
+		usdMarketValue,
+		currencyName,
+	)
 	customPayload := &pushpb.Payload{
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{

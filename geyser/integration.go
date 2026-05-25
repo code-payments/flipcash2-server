@@ -38,5 +38,5 @@ func (i *Integration) OnDepositReceived(ctx context.Context, owner, mint *ocp_co
 		return push.SendUsdfDepositedPush(ctx, i.pusher, userID)
 	}
 	protoMint := &commonpb.PublicKey{Value: mint.PublicKey().ToBytes()}
-	return push.SendFlipcashCurrencyDepositedPush(ctx, i.pusher, userID, protoMint, currencyName)
+	return push.SendFlipcashCurrencyDepositedPush(ctx, i.pusher, userID, protoMint, currencyName, usdMarketValue)
 }

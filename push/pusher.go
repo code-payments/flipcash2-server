@@ -103,6 +103,7 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 		customDataApns[k] = v
 	}
 
+	categoryString := customPayload.Category.String()
 	hasSubstitutions := len(customPayload.TitleSubstitutions) > 0 || len(customPayload.BodySubstitutions) > 0
 
 	message := &messaging.MulticastMessage{
@@ -118,6 +119,8 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 						Title: title,
 						Body:  body,
 					},
+					Category:       categoryString,
+					ThreadID:       customPayload.GroupKey,
 					MutableContent: hasSubstitutions,
 					CustomData:     customDataApns,
 				},

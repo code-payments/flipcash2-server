@@ -63,6 +63,8 @@ func testFCMPusher_SendBasicPushes(t *testing.T, store push.TokenStore) {
 	targetUsers := users[:3]
 
 	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_BUY_SELL,
+		GroupKey: "Jeffy",
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{
 				CurrencyInfo: &commonpb.PublicKey{Value: make([]byte, 32)},
@@ -96,6 +98,8 @@ func testFCMPusher_SendBasicPushes(t *testing.T, store push.TokenStore) {
 	require.NotNil(t, fcmClient.sentMessage.APNS)
 	require.Equal(t, "title", fcmClient.sentMessage.APNS.Payload.Aps.Alert.Title)
 	require.Equal(t, "body", fcmClient.sentMessage.APNS.Payload.Aps.Alert.Body)
+	require.Equal(t, pushpb.Payload_BUY_SELL.String(), fcmClient.sentMessage.APNS.Payload.Aps.Category)
+	require.Equal(t, "Jeffy", fcmClient.sentMessage.APNS.Payload.Aps.ThreadID)
 	require.False(t, fcmClient.sentMessage.APNS.Payload.Aps.MutableContent)
 	require.Len(t, fcmClient.sentMessage.APNS.Payload.Aps.CustomData, 4)
 	require.Equal(t, "title", fcmClient.sentMessage.APNS.Payload.Aps.CustomData["push_notification_title"])

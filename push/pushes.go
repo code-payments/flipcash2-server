@@ -25,6 +25,8 @@ func SendUsdfDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.Us
 	title := "Deposit Now Available"
 	body := "You can now spend your deposit in Flipcash"
 	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_DEPOSIT_WITHDRAWAL,
+		GroupKey: pushpb.Payload_DEPOSIT_WITHDRAWAL.String(),
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{
 				CurrencyInfo: &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
@@ -38,6 +40,8 @@ func SendUsdfDepositProcessingPush(ctx context.Context, pusher Pusher, user *com
 	title := "Deposit Processing"
 	body := "Deposits take about a minute"
 	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_DEPOSIT_WITHDRAWAL,
+		GroupKey: pushpb.Payload_DEPOSIT_WITHDRAWAL.String(),
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{
 				CurrencyInfo: &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
@@ -55,6 +59,8 @@ func SendFlipcashCurrencyDepositedPush(ctx context.Context, pusher Pusher, user 
 		currencyName,
 	)
 	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_DEPOSIT_WITHDRAWAL,
+		GroupKey: pushpb.Payload_DEPOSIT_WITHDRAWAL.String(),
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{
 				CurrencyInfo: mint,
@@ -72,6 +78,8 @@ func SendFlipcashCurrencyBoughtPush(ctx context.Context, pusher Pusher, user *co
 		currencyName,
 	)
 	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_BUY_SELL,
+		GroupKey: pushpb.Payload_BUY_SELL.String(),
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{
 				CurrencyInfo: mint,
@@ -88,6 +96,8 @@ func SendFlipcashCurrencySoldPush(ctx context.Context, pusher Pusher, user *comm
 		localization.FormatFiat(defaultLocale, region, nativeAmount),
 	)
 	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_BUY_SELL,
+		GroupKey: pushpb.Payload_BUY_SELL.String(),
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{
 				CurrencyInfo: mint,
@@ -104,6 +114,8 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 	title := "{0} joined Flipcash"
 	body := "Send them cash"
 	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_CONTACT_JOIN,
+		GroupKey: pushpb.Payload_CONTACT_JOIN.String(),
 		TitleSubstitutions: []*pushpb.Substitution{
 			{
 				Fallback: joinedPhone.Value,
@@ -123,6 +135,8 @@ func SendFlipcashCurrencyGainPush(ctx context.Context, pusher Pusher, user *comm
 		localization.FormatFiat(defaultLocale, gainRegion, gainAmount),
 	)
 	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_GAIN,
+		GroupKey: pushpb.Payload_GAIN.String(),
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_CurrencyInfo{
 				CurrencyInfo: mint,

@@ -54,6 +54,11 @@ type Store interface {
 	// the hash. Order is unspecified.
 	GetUserIdsByPhoneHash(ctx context.Context, phoneNumberHash *commonpb.Hash) ([]*commonpb.UserId, error)
 
+	// IsContact reports whether phoneNumberHash appears in userID's contact
+	// list. Returns false (no error) when the user has no stored contact list
+	// row or the hash is not present.
+	IsContact(ctx context.Context, userID *commonpb.UserId, phoneNumberHash *commonpb.Hash) (bool, error)
+
 	// ApplyDelta applies adds and removes to the user's contact set under
 	// compare-and-swap on the checksum:
 	//

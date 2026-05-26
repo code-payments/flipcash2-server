@@ -32,6 +32,10 @@ func (s *store) GetUserIdsByPhoneHash(ctx context.Context, phoneNumberHash *comm
 	return dbGetUserIdsByPhoneHash(ctx, s.pool, phoneNumberHash)
 }
 
+func (s *store) IsContact(ctx context.Context, userID *commonpb.UserId, phoneNumberHash *commonpb.Hash) (bool, error) {
+	return dbIsContact(ctx, s.pool, userID, phoneNumberHash)
+}
+
 func (s *store) ApplyDelta(
 	ctx context.Context,
 	userID *commonpb.UserId,

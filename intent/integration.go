@@ -2,22 +2,56 @@ package intent
 
 import (
 	"context"
+	"errors"
 
+	"go.uber.org/zap"
+
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	ocp_transactionpb "github.com/code-payments/ocp-protobuf-api/generated/go/transaction/v1"
 
+	"github.com/code-payments/flipcash2-server/account"
+	"github.com/code-payments/flipcash2-server/contact"
+	"github.com/code-payments/flipcash2-server/phone"
+	"github.com/code-payments/flipcash2-server/profile"
+	"github.com/code-payments/flipcash2-server/push"
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
+	"github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
 	ocp_transaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
 )
 
 type Integration struct {
-	ocpData ocp_data.Provider
+	log *zap.Logger
+
+	ocpData  ocp_data.Provider
+	accounts account.Store
+	profiles profile.Store
+	contacts contact.Store
+
+	pusher push.Pusher
+
+	phoneHashPepper []byte
 }
 
-func NewIntegration(ocpData ocp_data.Provider) ocp_integration.SubmitIntent {
+func NewIntegration(
+	log *zap.Logger,
+	ocpData ocp_data.Provider,
+	accounts account.Store,
+	profiles profile.Store,
+	contacts contact.Store,
+	pusher push.Pusher,
+	phoneHashPepper []byte,
+) ocp_integration.SubmitIntent {
 	return &Integration{
-		ocpData: ocpData,
+		log:             log,
+		ocpData:         ocpData,
+		accounts:        accounts,
+		profiles:        profiles,
+		contacts:        contacts,
+		pusher:          pusher,
+		phoneHashPepper: phoneHashPepper,
 	}
 }
 
@@ -45,5 +79,110 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 }
 
 func (i *Integration) OnSuccess(ctx context.Context, intentRecord *ocp_intent.Record) error {
+	i.maybeSendContactPaymentPush(ctx, intentRecord)
+
 	return nil
+}
+
+func (i *Integration) maybeSendContactPaymentPush(ctx context.Context, intentRecord *ocp_intent.Record) {
+	if intentRecord.IntentType != intent.SendPublicPayment {
+		return
+	}
+
+	metadata := intentRecord.SendPublicPaymentMetadata
+	if metadata.IsWithdrawal || metadata.IsRemoteSend || metadata.IsSwapSell {
+		return
+	}
+
+	if len(metadata.DestinationOwnerAccount) == 0 {
+		return
+	}
+
+	log := i.log.With(
+		zap.String("intent_id", intentRecord.IntentId),
+		zap.String("initiator_owner", intentRecord.InitiatorOwnerAccount),
+		zap.String("destination_owner", metadata.DestinationOwnerAccount),
+	)
+
+	senderOwner, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
+	if err != nil {
+		log.Warn("Invalid initiator owner account", zap.Error(err))
+		return
+	}
+	recipientOwner, err := ocp_common.NewAccountFromPublicKeyString(metadata.DestinationOwnerAccount)
+	if err != nil {
+		log.Warn("Invalid destination owner account", zap.Error(err))
+		return
+	}
+	mintAccount, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.MintAccount)
+	if err != nil {
+		log.Warn("Invalid mint account", zap.Error(err))
+		return
+	}
+
+	senderUserID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: senderOwner.PublicKey().ToBytes()})
+	if errors.Is(err, account.ErrNotFound) {
+		return
+	} else if err != nil {
+		log.Warn("Failed to get sender user id", zap.Error(err))
+		return
+	}
+
+	recipientUserID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: recipientOwner.PublicKey().ToBytes()})
+	if errors.Is(err, account.ErrNotFound) {
+		return
+	} else if err != nil {
+		log.Warn("Failed to get recipient user id", zap.Error(err))
+		return
+	}
+
+	senderProfile, err := i.profiles.GetProfile(ctx, senderUserID, true)
+	if errors.Is(err, profile.ErrNotFound) {
+		return
+	} else if err != nil {
+		log.Warn("Failed to get sender profile", zap.Error(err))
+		return
+	}
+	if senderProfile.PhoneNumber == nil {
+		return
+	}
+
+	senderPhoneHash := phone.SecureHash(senderProfile.PhoneNumber, i.phoneHashPepper)
+	isContact, err := i.contacts.IsContact(ctx, recipientUserID, senderPhoneHash)
+	if err != nil {
+		log.Warn("Failed to check if sender is in recipient's contacts", zap.Error(err))
+		return
+	}
+	if !isContact {
+		return
+	}
+
+	currencyName, err := i.getCurrencyName(ctx, mintAccount)
+	if err != nil {
+		log.Warn("Failed to resolve currency name", zap.Error(err))
+		return
+	}
+
+	if err := push.SendContactPaymentPush(
+		ctx,
+		i.pusher,
+		recipientUserID,
+		senderProfile.PhoneNumber,
+		currencyName,
+		metadata.ExchangeCurrency,
+		metadata.NativeAmount,
+	); err != nil {
+		log.Warn("Failed to send contact payment push", zap.Error(err))
+	}
+}
+
+func (i *Integration) getCurrencyName(ctx context.Context, mint *ocp_common.Account) (string, error) {
+	if ocp_common.IsCoreMint(mint) {
+		return ocp_common.CoreMintName, nil
+	}
+	metadata, err := i.ocpData.GetCurrencyMetadata(ctx, mint.PublicKey().ToBase58())
+	if err != nil {
+		return "", err
+	}
+	return metadata.Name, nil
 }

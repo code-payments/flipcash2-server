@@ -128,6 +128,27 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 	return pusher.SendPushes(ctx, title, body, customPayload, users...)
 }
 
+func SendContactPaymentPush(ctx context.Context, pusher Pusher, recipient *commonpb.UserId, contact *phonepb.PhoneNumber, currencyName string, region ocp_currency.Code, nativeAmount float64) error {
+	title := fmt.Sprintf(
+		"{0} sent you %s",
+		localization.FormatFiat(defaultLocale, region, nativeAmount),
+	)
+	body := fmt.Sprintf("Of %s", currencyName)
+	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_CHAT,
+		GroupKey: contact.Value, // todo: Chat ID when we implement chat
+		TitleSubstitutions: []*pushpb.Substitution{
+			{
+				Fallback: contact.Value,
+				Kind: &pushpb.Substitution_Contact{
+					Contact: contact,
+				},
+			},
+		},
+	}
+	return pusher.SendPushes(ctx, title, body, customPayload, recipient)
+}
+
 func SendFlipcashCurrencyGainPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string, gainRegion ocp_currency.Code, gainAmount float64) error {
 	title := fmt.Sprintf("Someone just bought %s", currencyName)
 	body := amountPrinter.Sprintf(

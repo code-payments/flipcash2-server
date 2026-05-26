@@ -132,6 +132,22 @@ func dbGetUserIdsByPhoneHash(ctx context.Context, pool *pgxpool.Pool, phoneNumbe
 	return out, nil
 }
 
+// dbIsContact reports whether phoneNumberHash appears in userID's contact
+// list. Returns false (no error) when the user has no entry for the hash,
+// including the case where the user has no contact_lists row at all.
+func dbIsContact(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumberHash *commonpb.Hash) (bool, error) {
+	var exists bool
+	err := pgxscan.Get(
+		ctx, pool, &exists,
+		`SELECT EXISTS(SELECT 1 FROM `+contactListEntriesTableName+` WHERE "userId" = $1 AND "phoneNumberHash" = $2)`,
+		pg.Encode(userID.Value), encodeHash(phoneNumberHash),
+	)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
 // dbApplyDelta atomically applies adds/removes under compare-and-swap on the
 // checksum. Returns contact.ErrChecksumDrift, contact.ErrTooManyContacts, or
 // nil (which includes the idempotent retry case where the stored checksum

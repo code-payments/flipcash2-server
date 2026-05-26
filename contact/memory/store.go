@@ -75,6 +75,18 @@ func (m *memory) GetUserIdsByPhoneHash(_ context.Context, phoneNumberHash *commo
 	return out, nil
 }
 
+func (m *memory) IsContact(_ context.Context, userID *commonpb.UserId, phoneNumberHash *commonpb.Hash) (bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	state, ok := m.users[string(userID.Value)]
+	if !ok {
+		return false, nil
+	}
+	_, ok = state.hashes[string(phoneNumberHash.Value)]
+	return ok, nil
+}
+
 func (m *memory) ApplyDelta(
 	_ context.Context,
 	userID *commonpb.UserId,

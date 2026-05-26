@@ -29,6 +29,7 @@ func RunStoreTests(t *testing.T, s contact.Store, createUser CreateUserFunc, tea
 		testStore_GetHashes_EmptyReplaceKeepsRow,
 		testStore_GetHashes_AfterDelta,
 		testStore_GetUserIdsByPhoneHash,
+		testStore_IsContact,
 	} {
 		tf(t, s, createUser)
 		teardown()
@@ -318,6 +319,69 @@ func testStore_GetUserIdsByPhoneHash(t *testing.T, s contact.Store, createUser C
 	got, err = s.GetUserIdsByPhoneHash(ctx, h1)
 	require.NoError(t, err)
 	require.ElementsMatch(t, [][]byte{userB.Value}, userIdValues(got))
+}
+
+func testStore_IsContact(t *testing.T, s contact.Store, createUser CreateUserFunc) {
+	ctx := context.Background()
+
+	h1 := hash("a")
+	h2 := hash("b")
+	h3 := hash("c")
+
+	// User with no stored row returns false, no error.
+	stranger := createUser(t)
+	got, err := s.IsContact(ctx, stranger, h1)
+	require.NoError(t, err)
+	require.False(t, got)
+
+	userA := createUser(t)
+	userB := createUser(t)
+
+	require.NoError(t, s.Replace(ctx, userA, []*commonpb.Hash{h1, h2}, xor(contact.ZeroChecksum(), h1, h2)))
+	require.NoError(t, s.Replace(ctx, userB, []*commonpb.Hash{h3}, xor(contact.ZeroChecksum(), h3)))
+
+	got, err = s.IsContact(ctx, userA, h1)
+	require.NoError(t, err)
+	require.True(t, got)
+
+	got, err = s.IsContact(ctx, userA, h2)
+	require.NoError(t, err)
+	require.True(t, got)
+
+	got, err = s.IsContact(ctx, userA, h3)
+	require.NoError(t, err)
+	require.False(t, got)
+
+	got, err = s.IsContact(ctx, userB, h3)
+	require.NoError(t, err)
+	require.True(t, got)
+
+	got, err = s.IsContact(ctx, userB, h1)
+	require.NoError(t, err)
+	require.False(t, got)
+
+	// Removing h1 from userA via delta flips the answer.
+	newChecksum := xor(xor(contact.ZeroChecksum(), h1, h2), h1)
+	require.NoError(t, s.ApplyDelta(
+		ctx, userA,
+		nil, []*commonpb.Hash{h1},
+		xor(contact.ZeroChecksum(), h1, h2), newChecksum,
+	))
+
+	got, err = s.IsContact(ctx, userA, h1)
+	require.NoError(t, err)
+	require.False(t, got)
+
+	got, err = s.IsContact(ctx, userA, h2)
+	require.NoError(t, err)
+	require.True(t, got)
+
+	// A user with an empty contact list row still returns false.
+	emptyUser := createUser(t)
+	require.NoError(t, s.Replace(ctx, emptyUser, nil, contact.ZeroChecksum()))
+	got, err = s.IsContact(ctx, emptyUser, h1)
+	require.NoError(t, err)
+	require.False(t, got)
 }
 
 func userIdValues(ids []*commonpb.UserId) [][]byte {

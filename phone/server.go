@@ -22,7 +22,7 @@ import (
 
 const (
 	androidAppHash  = "todo"
-	mockPhoneNumber = "+10000000000"
+	mockPhoneNumber = "+15005550000"
 )
 
 type Server struct {

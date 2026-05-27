@@ -21,7 +21,8 @@ import (
 )
 
 const (
-	androidAppHash = "todo"
+	androidAppHash  = "todo"
+	mockPhoneNumber = "+10000000000"
 )
 
 type Server struct {
@@ -88,6 +89,10 @@ func (s *Server) SendVerificationCode(ctx context.Context, req *phonepb.SendVeri
 		return &phonepb.SendVerificationCodeResponse{Result: phonepb.SendVerificationCodeResponse_DENIED}, nil
 	}
 
+	if req.PhoneNumber.Value == mockPhoneNumber {
+		return &phonepb.SendVerificationCodeResponse{Result: phonepb.SendVerificationCodeResponse_OK}, nil
+	}
+
 	var result phonepb.SendVerificationCodeResponse_Result
 	_, _, err = s.verifier.SendCode(ctx, req.PhoneNumber.Value, nil) // todo: Send app hash when platform is GOOGLE
 	switch err {
@@ -125,6 +130,10 @@ func (s *Server) CheckVerificationCode(ctx context.Context, req *phonepb.CheckVe
 	}
 	if !isRegistered {
 		return &phonepb.CheckVerificationCodeResponse{Result: phonepb.CheckVerificationCodeResponse_DENIED}, nil
+	}
+
+	if req.PhoneNumber.Value == mockPhoneNumber {
+		return &phonepb.CheckVerificationCodeResponse{Result: phonepb.CheckVerificationCodeResponse_OK}, nil
 	}
 
 	var result phonepb.CheckVerificationCodeResponse_Result

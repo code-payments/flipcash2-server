@@ -41,6 +41,7 @@ var (
 	DefaultNewCurrencyPurchaseAmount = ocp_common.ToCoreMintQuarks(10)
 	DefaultNewCurrencyFeeAmount      = ocp_common.ToCoreMintQuarks(10)
 	DefaulWithdrawalFeeAmount        = ocp_common.ToCoreMintQuarks(5) / 10
+	MinHolderValue                   = ocp_common.ToCoreMintQuarks(10)
 )
 
 type onRampProviderConfig struct {
@@ -262,6 +263,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			NewCurrencyFeeAmount:             DefaultNewCurrencyFeeAmount,
 			WithdrawalFeeAmount:              DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
+			MinimumHolderValue:               MinHolderValue,
 		},
 	}, nil
 }
@@ -295,6 +297,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			NewCurrencyFeeAmount:             DefaultNewCurrencyFeeAmount,
 			WithdrawalFeeAmount:              DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
+			MinimumHolderValue:               MinHolderValue,
 		},
 	}, nil
 }

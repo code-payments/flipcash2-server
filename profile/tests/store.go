@@ -22,6 +22,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testPhoneEmailTransfer,
 		testGetPhonesByHashes,
 		testGetUserIdByPhoneNumber,
+		testLinkPhoneNumberForPayment,
 	} {
 		tf(t, s)
 		teardown()
@@ -266,6 +267,32 @@ func testGetPhonesByHashes(t *testing.T, s profile.Store) {
 	got, err = s.GetPhonesByHashes(ctx, []*commonpb.Hash{missing})
 	require.NoError(t, err)
 	require.Empty(t, got)
+
+	// The payment-only variant excludes users that have not enabled their number
+	// for payment.
+	got, err = s.GetPhonesByHashesForPayment(ctx, []*commonpb.Hash{hash1, hash2, hash3})
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	flipped, err := s.LinkPhoneNumberForPayment(ctx, user1, "+11111111111")
+	require.NoError(t, err)
+	require.True(t, flipped)
+	flipped, err = s.LinkPhoneNumberForPayment(ctx, user3, "+13333333333")
+	require.NoError(t, err)
+	require.True(t, flipped)
+
+	// Only the enabled numbers are returned (user2 is still excluded).
+	got, err = s.GetPhonesByHashesForPayment(ctx, []*commonpb.Hash{hash1, hash2, hash3, missing})
+	require.NoError(t, err)
+	require.ElementsMatch(t,
+		[]string{"+11111111111", "+13333333333"},
+		phoneValues(got),
+	)
+
+	// Empty input is still handled.
+	got, err = s.GetPhonesByHashesForPayment(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
 }
 
 func testGetUserIdByPhoneNumber(t *testing.T, s profile.Store) {
@@ -305,6 +332,100 @@ func testGetUserIdByPhoneNumber(t *testing.T, s profile.Store) {
 	require.NoError(t, s.UnlinkPhoneNumber(ctx, user2, "+11111111111"))
 	_, err = s.GetUserIdByPhoneNumber(ctx, "+11111111111")
 	require.ErrorIs(t, err, profile.ErrNotFound)
+}
+
+func testLinkPhoneNumberForPayment(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	const phone = "+11111111111"
+	phoneHash := &commonpb.Hash{Value: []byte("hash1")}
+
+	user1 := model.MustGenerateUserID()
+	user2 := model.MustGenerateUserID()
+
+	require.NoError(t, s.SetDisplayName(ctx, user1, "u1"))
+	require.NoError(t, s.SetDisplayName(ctx, user2, "u2"))
+
+	// Enabling for payment without a linked number is not associated.
+	flipped, err := s.LinkPhoneNumberForPayment(ctx, user1, phone)
+	require.ErrorIs(t, err, profile.ErrNotFound)
+	require.False(t, flipped)
+
+	require.NoError(t, s.LinkPhoneNumber(ctx, user1, phone, phoneHash))
+
+	// A linked number that has not been enabled for payment does not resolve.
+	_, err = s.GetUserIdByPhoneNumberForPayment(ctx, phone)
+	require.ErrorIs(t, err, profile.ErrNotFound)
+	linked, err := s.IsPhoneNumberLinkedForPayment(ctx, user1, phone)
+	require.NoError(t, err)
+	require.False(t, linked)
+
+	// Enabling a number not linked to the user is not associated.
+	flipped, err = s.LinkPhoneNumberForPayment(ctx, user1, "+19998887777")
+	require.ErrorIs(t, err, profile.ErrNotFound)
+	require.False(t, flipped)
+
+	// First enable flips the flag from false to true.
+	flipped, err = s.LinkPhoneNumberForPayment(ctx, user1, phone)
+	require.NoError(t, err)
+	require.True(t, flipped)
+
+	// The number now resolves for payment to its owner.
+	got, err := s.GetUserIdByPhoneNumberForPayment(ctx, phone)
+	require.NoError(t, err)
+	require.Equal(t, user1.Value, got.Value)
+
+	// IsPhoneNumberLinkedForPayment is true only for the exact (user, phone) pair.
+	linked, err = s.IsPhoneNumberLinkedForPayment(ctx, user1, phone)
+	require.NoError(t, err)
+	require.True(t, linked)
+	linked, err = s.IsPhoneNumberLinkedForPayment(ctx, user1, "+19998887777")
+	require.NoError(t, err)
+	require.False(t, linked)
+	linked, err = s.IsPhoneNumberLinkedForPayment(ctx, user2, phone)
+	require.NoError(t, err)
+	require.False(t, linked)
+
+	// Enabling again is idempotent and does not report a flip.
+	flipped, err = s.LinkPhoneNumberForPayment(ctx, user1, phone)
+	require.NoError(t, err)
+	require.False(t, flipped)
+
+	// Unlinking the number clears the payment flag.
+	require.NoError(t, s.UnlinkPhoneNumber(ctx, user1, phone))
+	_, err = s.GetUserIdByPhoneNumberForPayment(ctx, phone)
+	require.ErrorIs(t, err, profile.ErrNotFound)
+	linked, err = s.IsPhoneNumberLinkedForPayment(ctx, user1, phone)
+	require.NoError(t, err)
+	require.False(t, linked)
+
+	// Re-linking starts from a disabled state (the flag was reset on unlink).
+	require.NoError(t, s.LinkPhoneNumber(ctx, user1, phone, phoneHash))
+	_, err = s.GetUserIdByPhoneNumberForPayment(ctx, phone)
+	require.ErrorIs(t, err, profile.ErrNotFound)
+	flipped, err = s.LinkPhoneNumberForPayment(ctx, user1, phone)
+	require.NoError(t, err)
+	require.True(t, flipped)
+
+	// Transferring the number to another user clears the original owner's flag,
+	// so it no longer resolves for payment until the new owner enables it.
+	require.NoError(t, s.LinkPhoneNumber(ctx, user2, phone, phoneHash))
+	_, err = s.GetUserIdByPhoneNumberForPayment(ctx, phone)
+	require.ErrorIs(t, err, profile.ErrNotFound)
+	linked, err = s.IsPhoneNumberLinkedForPayment(ctx, user1, phone)
+	require.NoError(t, err)
+	require.False(t, linked)
+
+	flipped, err = s.LinkPhoneNumberForPayment(ctx, user2, phone)
+	require.NoError(t, err)
+	require.True(t, flipped)
+
+	got, err = s.GetUserIdByPhoneNumberForPayment(ctx, phone)
+	require.NoError(t, err)
+	require.Equal(t, user2.Value, got.Value)
+	linked, err = s.IsPhoneNumberLinkedForPayment(ctx, user2, phone)
+	require.NoError(t, err)
+	require.True(t, linked)
 }
 
 func phoneValues(phones []*phonepb.PhoneNumber) []string {

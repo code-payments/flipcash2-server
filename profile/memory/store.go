@@ -18,16 +18,18 @@ import (
 type InMemoryStore struct {
 	sync.Mutex
 
-	profiles          map[string]*profilepb.UserProfile
-	phoneHashesByUser map[string][]byte
-	xProfilesByUser   map[string]*profilepb.XProfile
+	profiles               map[string]*profilepb.UserProfile
+	phoneHashesByUser      map[string][]byte
+	linkedForPaymentByUser map[string]bool
+	xProfilesByUser        map[string]*profilepb.XProfile
 }
 
 func NewInMemory() profile.Store {
 	return &InMemoryStore{
-		profiles:          make(map[string]*profilepb.UserProfile),
-		phoneHashesByUser: make(map[string][]byte),
-		xProfilesByUser:   make(map[string]*profilepb.XProfile),
+		profiles:               make(map[string]*profilepb.UserProfile),
+		phoneHashesByUser:      make(map[string][]byte),
+		linkedForPaymentByUser: make(map[string]bool),
+		xProfilesByUser:        make(map[string]*profilepb.XProfile),
 	}
 }
 
@@ -92,6 +94,7 @@ func (m *InMemoryStore) LinkPhoneNumber(_ context.Context, id *commonpb.UserId, 
 		if p.PhoneNumber != nil && p.PhoneNumber.Value == phoneNumber {
 			p.PhoneNumber = nil
 			delete(m.phoneHashesByUser, key)
+			delete(m.linkedForPaymentByUser, key)
 		}
 	}
 
@@ -121,12 +124,49 @@ func (m *InMemoryStore) UnlinkPhoneNumber(ctx context.Context, userID *commonpb.
 	if profile.PhoneNumber != nil && profile.PhoneNumber.Value == phoneNumber {
 		profile.PhoneNumber = nil
 		delete(m.phoneHashesByUser, key)
+		delete(m.linkedForPaymentByUser, key)
 	}
 
 	return nil
 }
 
+func (m *InMemoryStore) LinkPhoneNumberForPayment(_ context.Context, id *commonpb.UserId, phoneNumber string) (bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	key := userIDCacheKey(id)
+	p, ok := m.profiles[key]
+	if !ok || p.PhoneNumber == nil || p.PhoneNumber.Value != phoneNumber {
+		return false, profile.ErrNotFound
+	}
+
+	wasLinked := m.linkedForPaymentByUser[key]
+	m.linkedForPaymentByUser[key] = true
+
+	return !wasLinked, nil
+}
+
+func (m *InMemoryStore) IsPhoneNumberLinkedForPayment(_ context.Context, id *commonpb.UserId, phoneNumber string) (bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	key := userIDCacheKey(id)
+	p, ok := m.profiles[key]
+	if !ok || p.PhoneNumber == nil || p.PhoneNumber.Value != phoneNumber {
+		return false, nil
+	}
+	return m.linkedForPaymentByUser[key], nil
+}
+
 func (m *InMemoryStore) GetPhonesByHashes(_ context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+	return m.getPhonesByHashes(hashes, false)
+}
+
+func (m *InMemoryStore) GetPhonesByHashesForPayment(_ context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+	return m.getPhonesByHashes(hashes, true)
+}
+
+func (m *InMemoryStore) getPhonesByHashes(hashes []*commonpb.Hash, forPaymentOnly bool) ([]*phonepb.PhoneNumber, error) {
 	if len(hashes) == 0 {
 		return nil, nil
 	}
@@ -144,6 +184,9 @@ func (m *InMemoryStore) GetPhonesByHashes(_ context.Context, hashes []*commonpb.
 		if _, ok := wanted[string(hash)]; !ok {
 			continue
 		}
+		if forPaymentOnly && !m.linkedForPaymentByUser[key] {
+			continue
+		}
 		p, ok := m.profiles[key]
 		if !ok || p.PhoneNumber == nil {
 			continue
@@ -159,6 +202,26 @@ func (m *InMemoryStore) GetUserIdByPhoneNumber(_ context.Context, phoneNumber st
 
 	for key, p := range m.profiles {
 		if p.PhoneNumber == nil || p.PhoneNumber.Value != phoneNumber {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(key)
+		if err != nil {
+			return nil, err
+		}
+		return &commonpb.UserId{Value: decoded}, nil
+	}
+	return nil, profile.ErrNotFound
+}
+
+func (m *InMemoryStore) GetUserIdByPhoneNumberForPayment(_ context.Context, phoneNumber string) (*commonpb.UserId, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	for key, p := range m.profiles {
+		if p.PhoneNumber == nil || p.PhoneNumber.Value != phoneNumber {
+			continue
+		}
+		if !m.linkedForPaymentByUser[key] {
 			continue
 		}
 		decoded, err := base64.StdEncoding.DecodeString(key)
@@ -280,6 +343,7 @@ func (m *InMemoryStore) reset() {
 
 	m.profiles = make(map[string]*profilepb.UserProfile)
 	m.phoneHashesByUser = make(map[string][]byte)
+	m.linkedForPaymentByUser = make(map[string]bool)
 	m.xProfilesByUser = make(map[string]*profilepb.XProfile)
 }
 

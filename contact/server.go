@@ -265,7 +265,7 @@ func (s *Server) GetFlipcashContacts(req *contactpb.GetFlipcashContactsRequest, 
 		})
 	}
 
-	phones, err := s.profiles.GetPhonesByHashes(ctx, hashes)
+	phones, err := s.profiles.GetPhonesByHashesForPayment(ctx, hashes)
 	if errors.Is(err, profile.ErrNotFound) {
 		return stream.Send(&contactpb.GetFlipcashContactsResponse{
 			Result: contactpb.GetFlipcashContactsResponse_NOT_FOUND,

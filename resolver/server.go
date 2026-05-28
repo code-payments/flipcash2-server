@@ -64,7 +64,7 @@ func (s *Server) Resolve(ctx context.Context, req *resolverpb.ResolveRequest) (*
 		return nil, status.Error(codes.InvalidArgument, "unsupported identifier")
 	}
 
-	targetUserID, err := s.profiles.GetUserIdByPhoneNumber(ctx, phone.Value)
+	targetUserID, err := s.profiles.GetUserIdByPhoneNumberForPayment(ctx, phone.Value)
 	if errors.Is(err, profile.ErrNotFound) {
 		return &resolverpb.ResolveResponse{Result: resolverpb.ResolveResponse_NOT_FOUND}, nil
 	} else if err != nil {

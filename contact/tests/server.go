@@ -386,7 +386,8 @@ func testServer_GetFlipcashContacts_OK(t *testing.T, accounts account.Store, pro
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 
-	// Set up: 3 contacts in caller's list; 2 of them are Flipcash users.
+	// Set up: 3 contacts in caller's list; 2 of them are Flipcash users, but only
+	// one of those has linked their phone number for payment.
 	phoneA := "+11111111111"
 	phoneB := "+12222222222"
 	phoneC := "+13333333333"
@@ -412,6 +413,14 @@ func testServer_GetFlipcashContacts_OK(t *testing.T, accounts account.Store, pro
 	require.NoError(t, profiles.LinkPhoneNumber(ctx, flipcashUserA, phoneA, hashA))
 	require.NoError(t, profiles.LinkPhoneNumber(ctx, flipcashUserB, phoneB, hashB))
 	require.NoError(t, profiles.LinkPhoneNumber(ctx, flipcashUserD, phoneD, hmacHash(phoneD)))
+
+	// Only A (and D, who isn't a contact) has enabled their number for payment.
+	// B is on Flipcash but has not, so it must be excluded.
+	flipped, err := profiles.LinkPhoneNumberForPayment(ctx, flipcashUserA, phoneA)
+	require.NoError(t, err)
+	require.True(t, flipped)
+	_, err = profiles.LinkPhoneNumberForPayment(ctx, flipcashUserD, phoneD)
+	require.NoError(t, err)
 
 	// Caller's contact list = [A, B, C]. C is not on Flipcash.
 	checksum := xorChecksums(
@@ -439,7 +448,7 @@ func testServer_GetFlipcashContacts_OK(t *testing.T, accounts account.Store, pro
 		}
 	}
 
-	require.ElementsMatch(t, []string{phoneA, phoneB}, got)
+	require.ElementsMatch(t, []string{phoneA}, got)
 }
 
 func zeroChecksum() []byte {

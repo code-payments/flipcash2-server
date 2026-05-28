@@ -86,12 +86,28 @@ func (s *store) UnlinkPhoneNumber(ctx context.Context, userID *commonpb.UserId, 
 	return dbUnlinkPhoneNumber(ctx, s.pool, userID, phoneNumber)
 }
 
+func (s *store) LinkPhoneNumberForPayment(ctx context.Context, userID *commonpb.UserId, phoneNumber string) (bool, error) {
+	return dbLinkPhoneNumberForPayment(ctx, s.pool, userID, phoneNumber)
+}
+
+func (s *store) IsPhoneNumberLinkedForPayment(ctx context.Context, userID *commonpb.UserId, phoneNumber string) (bool, error) {
+	return dbIsPhoneNumberLinkedForPayment(ctx, s.pool, userID, phoneNumber)
+}
+
 func (s *store) GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
 	return dbGetPhonesByHashes(ctx, s.pool, hashes)
 }
 
+func (s *store) GetPhonesByHashesForPayment(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+	return dbGetPhonesByHashesForPayment(ctx, s.pool, hashes)
+}
+
 func (s *store) GetUserIdByPhoneNumber(ctx context.Context, phoneNumber string) (*commonpb.UserId, error) {
 	return dbGetUserIdByPhoneNumber(ctx, s.pool, phoneNumber)
+}
+
+func (s *store) GetUserIdByPhoneNumberForPayment(ctx context.Context, phoneNumber string) (*commonpb.UserId, error) {
+	return dbGetUserIdByPhoneNumberForPayment(ctx, s.pool, phoneNumber)
 }
 
 func (s *store) LinkEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string) error {
@@ -133,7 +149,7 @@ func (s *store) GetXProfile(ctx context.Context, userID *commonpb.UserId) (*prof
 }
 
 func (s *store) reset() {
-	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL`)
+	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL, "isPhoneNumberLinkedForPayment" = FALSE`)
 	if err != nil {
 		panic(err)
 	}

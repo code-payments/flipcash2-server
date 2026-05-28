@@ -89,19 +89,20 @@ model Rendezvous {
 model User {
   // Fields
 
-  id                 String             @id
-  displayName        String?
-  phoneNumber        String?            @unique
-  phoneNumberHash    String?            @unique
-  emailAddress       String?            @unique
-  isStaff            Boolean            @default(false)
-  isRegistered       Boolean            @default(false)
-  region             String             @default("usd")
-  locale             String             @default("en")
-  publicKeys         PublicKey[]
-  xProfile           XProfile?
-  contactList        ContactList?
-  contactListEntries ContactListEntry[]
+  id                            String             @id
+  displayName                   String?
+  phoneNumber                   String?            @unique
+  phoneNumberHash               String?            @unique
+  emailAddress                  String?            @unique
+  isStaff                       Boolean            @default(false)
+  isRegistered                  Boolean            @default(false)
+  isPhoneNumberLinkedForPayment Boolean            @default(false)
+  region                        String             @default("usd")
+  locale                        String             @default("en")
+  publicKeys                    PublicKey[]
+  xProfile                      XProfile?
+  contactList                   ContactList?
+  contactListEntries            ContactListEntry[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

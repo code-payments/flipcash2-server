@@ -30,13 +30,36 @@ type Store interface {
 	// UnlinkPhoneNumber removes the link for the phone number
 	UnlinkPhoneNumber(ctx context.Context, userID *commonpb.UserId, phoneNumber string) error
 
+	// LinkPhoneNumberForPayment marks the user's linked phone number as enabled for
+	// payment, provided the given phone number is currently linked to the user. It
+	// reports whether the flag transitioned from false to true (false if it was
+	// already enabled).
+	//
+	// ErrNotFound is returned when the phone number is not associated with the user.
+	LinkPhoneNumberForPayment(ctx context.Context, userID *commonpb.UserId, phoneNumber string) (bool, error)
+
+	// IsPhoneNumberLinkedForPayment reports whether the given phone number is
+	// currently linked to the user and enabled for payment.
+	IsPhoneNumberLinkedForPayment(ctx context.Context, userID *commonpb.UserId, phoneNumber string) (bool, error)
+
 	// GetPhonesByHashes returns the phone numbers for users whose stored
 	// phoneNumberHash matches any of the provided hashes. Order is unspecified.
 	GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error)
 
+	// GetPhonesByHashesForPayment returns the phone numbers for users whose stored
+	// phoneNumberHash matches any of the provided hashes and who have enabled their
+	// phone number for payment. Order is unspecified.
+	GetPhonesByHashesForPayment(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error)
+
 	// GetUserIdByPhoneNumber returns the UserId currently linked to the given
 	// phone number. Returns ErrNotFound when no user holds the number.
 	GetUserIdByPhoneNumber(ctx context.Context, phoneNumber string) (*commonpb.UserId, error)
+
+	// GetUserIdByPhoneNumberForPayment returns the UserId currently linked to the
+	// given phone number, but only when that user has enabled the phone number for
+	// payment. Returns ErrNotFound when no user holds the number or the number is
+	// not enabled for payment.
+	GetUserIdByPhoneNumberForPayment(ctx context.Context, phoneNumber string) (*commonpb.UserId, error)
 
 	// LinkEmailAddress links the email address to a user, provided they exist. Any other
 	// user previously holding the same email address has it cleared.

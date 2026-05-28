@@ -142,21 +142,11 @@ func (s *Server) CheckVerificationCode(ctx context.Context, req *phonepb.CheckVe
 	case nil:
 		result = phonepb.CheckVerificationCodeResponse_OK
 
-		isFirstJoin, err := s.isFirstJoin(ctx, req.PhoneNumber)
-		if err != nil {
-			log.With(zap.Error(err)).Warn("Failure checking existing phone link")
-			return nil, status.Error(codes.Internal, "failure linking phone number")
-		}
-
 		phoneHash := s.hashPhoneNumber(req.PhoneNumber)
 		err = s.profiles.LinkPhoneNumber(ctx, userID, req.PhoneNumber.Value, phoneHash)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure linking phone number")
 			return nil, status.Error(codes.Internal, "failure linking phone number")
-		}
-
-		if isFirstJoin {
-			go s.notifyContactsOfJoin(context.Background(), log, userID, req.PhoneNumber, phoneHash)
 		}
 	case ErrInvalidVerificationCode:
 		result = phonepb.CheckVerificationCodeResponse_INVALID_CODE
@@ -210,19 +200,44 @@ func (s *Server) Unlink(ctx context.Context, req *phonepb.UnlinkRequest) (*phone
 	return &phonepb.UnlinkResponse{}, nil
 }
 
-func (s *Server) hashPhoneNumber(phoneNumber *phonepb.PhoneNumber) *commonpb.Hash {
-	return SecureHash(phoneNumber, s.hashPepper)
+func (s *Server) LinkForPayment(ctx context.Context, req *phonepb.LinkForPaymentRequest) (*phonepb.LinkForPaymentResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.String("phone_number", req.PhoneNumber.Value),
+	)
+
+	isRegistered, err := s.accounts.IsRegistered(ctx, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure getting user registration status")
+		return nil, status.Error(codes.Internal, "failure getting user registration status")
+	}
+	if !isRegistered {
+		return &phonepb.LinkForPaymentResponse{Result: phonepb.LinkForPaymentResponse_DENIED}, nil
+	}
+
+	flipped, err := s.profiles.LinkPhoneNumberForPayment(ctx, userID, req.PhoneNumber.Value)
+	switch {
+	case err == nil:
+		if flipped {
+			phoneHash := s.hashPhoneNumber(req.PhoneNumber)
+			go s.notifyContactsOfJoin(context.Background(), log, userID, req.PhoneNumber, phoneHash)
+		}
+		return &phonepb.LinkForPaymentResponse{Result: phonepb.LinkForPaymentResponse_OK}, nil
+	case errors.Is(err, profile.ErrNotFound):
+		return &phonepb.LinkForPaymentResponse{Result: phonepb.LinkForPaymentResponse_NOT_ASSOCIATED}, nil
+	default:
+		log.With(zap.Error(err)).Warn("Failure linking phone number for payment")
+		return nil, status.Error(codes.Internal, "failure linking phone number for payment")
+	}
 }
 
-func (s *Server) isFirstJoin(ctx context.Context, phoneNumber *phonepb.PhoneNumber) (bool, error) {
-	_, err := s.profiles.GetUserIdByPhoneNumber(ctx, phoneNumber.Value)
-	if errors.Is(err, profile.ErrNotFound) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return false, nil
+func (s *Server) hashPhoneNumber(phoneNumber *phonepb.PhoneNumber) *commonpb.Hash {
+	return SecureHash(phoneNumber, s.hashPepper)
 }
 
 func (s *Server) notifyContactsOfJoin(

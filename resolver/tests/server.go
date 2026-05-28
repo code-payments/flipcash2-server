@@ -26,6 +26,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 	for _, tf := range []func(t *testing.T, accounts account.Store, profiles profile.Store){
 		testServer_Resolve_OK,
 		testServer_Resolve_NotFound,
+		testServer_Resolve_NotEnabledForPayment,
 		testServer_Resolve_Denied_Unregistered,
 		testServer_Resolve_Unauthorized,
 	} {
@@ -82,6 +83,9 @@ func testServer_Resolve_OK(t *testing.T, accounts account.Store, profiles profil
 	require.NoError(t, err)
 	require.NoError(t, accounts.SetRegistrationFlag(ctx, targetID, true))
 	require.NoError(t, profiles.LinkPhoneNumber(ctx, targetID, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash-ok")}))
+	flipped, err := profiles.LinkPhoneNumberForPayment(ctx, targetID, "+12223334444")
+	require.NoError(t, err)
+	require.True(t, flipped)
 
 	req := &resolverpb.ResolveRequest{
 		Identifier: &resolverpb.Identifier{
@@ -97,6 +101,33 @@ func testServer_Resolve_OK(t *testing.T, accounts account.Store, profiles profil
 	require.Equal(t, resolverpb.ResolveResponse_OK, resp.Result)
 	require.NotNil(t, resp.Resolution)
 	require.Equal(t, targetKeys.Proto().Value, resp.Resolution.GetAddress().Value)
+}
+
+func testServer_Resolve_NotEnabledForPayment(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	f := newServerFixture(t, accounts, profiles)
+
+	// Seed a user with a linked phone number, but without enabling it for payment.
+	targetID := model.MustGenerateUserID()
+	targetKeys := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, targetID, targetKeys.Proto())
+	require.NoError(t, err)
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, targetID, true))
+	require.NoError(t, profiles.LinkPhoneNumber(ctx, targetID, "+12223335555", &commonpb.Hash{Value: []byte("phone-hash-no-pay")}))
+
+	req := &resolverpb.ResolveRequest{
+		Identifier: &resolverpb.Identifier{
+			Kind: &resolverpb.Identifier_Phone{
+				Phone: &phonepb.PhoneNumber{Value: "+12223335555"},
+			},
+		},
+	}
+	require.NoError(t, f.keys.Auth(req, &req.Auth))
+
+	resp, err := f.client.Resolve(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, resolverpb.ResolveResponse_NOT_FOUND, resp.Result)
+	require.Nil(t, resp.Resolution)
 }
 
 func testServer_Resolve_NotFound(t *testing.T, accounts account.Store, profiles profile.Store) {

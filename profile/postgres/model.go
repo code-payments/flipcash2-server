@@ -19,7 +19,7 @@ import (
 
 const (
 	usersTableName = "flipcash_users"
-	allUserFields  = `"id", "displayName", "phoneNumber", "emailAddress", "isStaff", "isRegistered", "region", "locale", "createdAt", "updatedAt"`
+	allUserFields  = `"id", "displayName", "phoneNumber", "emailAddress", "isStaff", "isRegistered", "isPhoneNumberLinkedForPayment", "region", "locale", "createdAt", "updatedAt"`
 
 	xProfilesTableName = "flipcash_x_profiles"
 	allXUserFields     = `"id", "username", "name", "description", "profilePicUrl", "followerCount", "verifiedType",  "accessToken", "userId", "createdAt", "updatedAt"`
@@ -86,7 +86,7 @@ func dbGetDisplayName(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.
 
 func dbSetDisplayName(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, displayName string) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, $2, NULL, NULL, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "displayName" = $2 WHERE ` + usersTableName + `."id" = $1`
+		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, $2, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "displayName" = $2 WHERE ` + usersTableName + `."id" = $1`
 		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), displayName)
 		return err
 	})
@@ -132,7 +132,7 @@ func dbGetEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonpb
 
 func dbLinkPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumber string, phoneNumberHash *commonpb.Hash) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		clearQuery := `UPDATE ` + usersTableName + ` SET "phoneNumber" = NULL, "phoneNumberHash" = NULL WHERE "phoneNumber" = $1 AND "id" != $2`
+		clearQuery := `UPDATE ` + usersTableName + ` SET "phoneNumber" = NULL, "phoneNumberHash" = NULL, "isPhoneNumberLinkedForPayment" = FALSE WHERE "phoneNumber" = $1 AND "id" != $2`
 		if _, err := tx.Exec(ctx, clearQuery, phoneNumber, pg.Encode(userID.Value)); err != nil {
 			return err
 		}
@@ -145,10 +145,49 @@ func dbLinkPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb
 
 func dbUnlinkPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumber string) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `UPDATE ` + usersTableName + ` SET "phoneNumber" = NULL, "phoneNumberHash" = NULL WHERE "id" = $1 AND "phoneNumber" = $2`
+		query := `UPDATE ` + usersTableName + ` SET "phoneNumber" = NULL, "phoneNumberHash" = NULL, "isPhoneNumberLinkedForPayment" = FALSE WHERE "id" = $1 AND "phoneNumber" = $2`
 		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), phoneNumber)
 		return err
 	})
+}
+
+func dbLinkPhoneNumberForPayment(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumber string) (bool, error) {
+	var flipped bool
+	err := pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
+		var wasLinked bool
+		selectQuery := `SELECT "isPhoneNumberLinkedForPayment" FROM ` + usersTableName + ` WHERE "id" = $1 AND "phoneNumber" = $2`
+		err := pgxscan.Get(ctx, tx, &wasLinked, selectQuery, pg.Encode(userID.Value), phoneNumber)
+		if err != nil {
+			if pgxscan.NotFound(err) {
+				return profile.ErrNotFound
+			}
+			return err
+		}
+
+		if !wasLinked {
+			updateQuery := `UPDATE ` + usersTableName + ` SET "isPhoneNumberLinkedForPayment" = TRUE WHERE "id" = $1 AND "phoneNumber" = $2`
+			if _, err := tx.Exec(ctx, updateQuery, pg.Encode(userID.Value), phoneNumber); err != nil {
+				return err
+			}
+		}
+
+		flipped = !wasLinked
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return flipped, nil
+}
+
+func dbIsPhoneNumberLinkedForPayment(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumber string) (bool, error) {
+	var res bool
+	query := `SELECT EXISTS (SELECT 1 FROM ` + usersTableName + ` WHERE "id" = $1 AND "phoneNumber" = $2 AND "isPhoneNumberLinkedForPayment" = TRUE)`
+	err := pgxscan.Get(ctx, pool, &res, query, pg.Encode(userID.Value), phoneNumber)
+	if err != nil {
+		return false, err
+	}
+	return res, nil
 }
 
 func dbLinkEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, emailAddress string) error {
@@ -165,6 +204,14 @@ func dbLinkEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 }
 
 func dbGetPhonesByHashes(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+	return dbGetPhonesByHashesInternal(ctx, pool, hashes, false)
+}
+
+func dbGetPhonesByHashesForPayment(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+	return dbGetPhonesByHashesInternal(ctx, pool, hashes, true)
+}
+
+func dbGetPhonesByHashesInternal(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash, forPaymentOnly bool) ([]*phonepb.PhoneNumber, error) {
 	if len(hashes) == 0 {
 		return nil, nil
 	}
@@ -182,6 +229,9 @@ func dbGetPhonesByHashes(ctx context.Context, pool *pgxpool.Pool, hashes []*comm
 
 	var phones []string
 	query := `SELECT "phoneNumber" FROM ` + usersTableName + ` WHERE "phoneNumber" IS NOT NULL AND "phoneNumberHash" = ANY($1::text[])`
+	if forPaymentOnly {
+		query += ` AND "isPhoneNumberLinkedForPayment" = TRUE`
+	}
 	err := pgxscan.Select(ctx, pool, &phones, query, encoded)
 	if err != nil {
 		if pgxscan.NotFound(err) {
@@ -200,6 +250,29 @@ func dbGetPhonesByHashes(ctx context.Context, pool *pgxpool.Pool, hashes []*comm
 func dbGetUserIdByPhoneNumber(ctx context.Context, pool *pgxpool.Pool, phoneNumber string) (*commonpb.UserId, error) {
 	var encoded string
 	query := `SELECT "id" FROM ` + usersTableName + ` WHERE "phoneNumber" = $1`
+	err := pgxscan.Get(
+		ctx,
+		pool,
+		&encoded,
+		query,
+		phoneNumber,
+	)
+	if err != nil {
+		if pgxscan.NotFound(err) {
+			return nil, profile.ErrNotFound
+		}
+		return nil, err
+	}
+	decoded, err := pg.Decode(encoded)
+	if err != nil {
+		return nil, err
+	}
+	return &commonpb.UserId{Value: decoded}, nil
+}
+
+func dbGetUserIdByPhoneNumberForPayment(ctx context.Context, pool *pgxpool.Pool, phoneNumber string) (*commonpb.UserId, error) {
+	var encoded string
+	query := `SELECT "id" FROM ` + usersTableName + ` WHERE "phoneNumber" = $1 AND "isPhoneNumberLinkedForPayment" = TRUE`
 	err := pgxscan.Get(
 		ctx,
 		pool,

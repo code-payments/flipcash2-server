@@ -147,6 +147,17 @@ func (i *Integration) maybeSendContactPaymentPush(ctx context.Context, intentRec
 		return
 	}
 
+	// Only surface the sender's phone number to the recipient if the sender has
+	// linked it for payment, consistent with contact resolution and discovery.
+	isLinkedForPayment, err := i.profiles.IsPhoneNumberLinkedForPayment(ctx, senderUserID, senderProfile.PhoneNumber.Value)
+	if err != nil {
+		log.Warn("Failed to check sender payment link status", zap.Error(err))
+		return
+	}
+	if !isLinkedForPayment {
+		return
+	}
+
 	senderPhoneHash := phone.SecureHash(senderProfile.PhoneNumber, i.phoneHashPepper)
 	isContact, err := i.contacts.IsContact(ctx, recipientUserID, senderPhoneHash)
 	if err != nil {

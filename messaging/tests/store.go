@@ -3,7 +3,9 @@ package tests
 import (
 	"context"
 	"crypto/rand"
+	"sort"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +25,9 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, s messaging.Store){
 		testStore_PutMessage_AssignsGaplessIDs,
 		testStore_PutMessage_Idempotent,
+		testStore_PutMessage_PerChatIsolation,
+		testStore_PutMessage_ConcurrentDistinct,
+		testStore_PutMessage_ConcurrentIdempotent,
 		testStore_PutMessage_UnreadSeq,
 		testStore_PutMessage_SystemMessage,
 		testStore_GetMessage_NotFound,
@@ -69,6 +74,128 @@ func testStore_PutMessage_Idempotent(t *testing.T, s messaging.Store) {
 	next, err := s.PutMessage(ctx, chatID, sender, textContent("world"), at(3), generateClientID(), true)
 	require.NoError(t, err)
 	require.Equal(t, first.ID.Value+1, next.ID.Value)
+}
+
+func testStore_PutMessage_PerChatIsolation(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatA := generateChatID()
+	chatB := generateChatID()
+	sender := model.MustGenerateUserID()
+	clientID := generateClientID() // deliberately reused across chats
+
+	// Each chat owns an independent ID sequence, so the first message in each
+	// chat is ID 1 even though they share a client message ID.
+	a, err := s.PutMessage(ctx, chatA, sender, textContent("a"), at(1), clientID, true)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), a.ID.Value)
+
+	// The same client message ID in a different chat is NOT a replay; it gets
+	// its own ID 1 and its own content. Idempotency is scoped per chat.
+	b, err := s.PutMessage(ctx, chatB, sender, textContent("b"), at(1), clientID, true)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), b.ID.Value)
+
+	gotA, err := s.GetMessage(ctx, chatA, a.ID)
+	require.NoError(t, err)
+	require.Equal(t, "a", messageText(gotA))
+	gotB, err := s.GetMessage(ctx, chatB, b.ID)
+	require.NoError(t, err)
+	require.Equal(t, "b", messageText(gotB))
+
+	// Replaying the client message ID within chatA still returns the original
+	// message and content, not the new payload.
+	replay, err := s.PutMessage(ctx, chatA, sender, textContent("a2"), at(2), clientID, true)
+	require.NoError(t, err)
+	require.Equal(t, a.ID.Value, replay.ID.Value)
+	require.Equal(t, "a", messageText(replay))
+}
+
+func testStore_PutMessage_ConcurrentDistinct(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// Concurrent sends with distinct client message IDs must each receive a
+	// distinct, gapless ID. This exercises the store's contention handling (a
+	// mutex for memory, an optimistic-lock transaction with retries for DynamoDB).
+	const n = 25
+	var wg sync.WaitGroup
+	got := make([]uint64, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			msg, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i+1)), generateClientID(), true)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			got[i] = msg.ID.Value
+		}(i)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+
+	// The IDs returned to callers are exactly the gapless set 1..n.
+	sort.Slice(got, func(a, b int) bool { return got[a] < got[b] })
+	want := make([]uint64, n)
+	for i := 0; i < n; i++ {
+		want[i] = uint64(i + 1)
+	}
+	require.Equal(t, want, got)
+
+	// The persisted IDs match the IDs handed back: exactly n messages, 1..n.
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending())
+	require.NoError(t, err)
+	require.Equal(t, want, messageIDs(all))
+	require.Equal(t, uint64(n), all[len(all)-1].UnreadSeq) // all counted toward unread
+}
+
+func testStore_PutMessage_ConcurrentIdempotent(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+	clientID := generateClientID() // shared by every goroutine
+
+	// Concurrent sends that share a client message ID must collapse to a single
+	// message: idempotency holds even when the racing sends interleave.
+	const n = 25
+	var wg sync.WaitGroup
+	got := make([]uint64, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			msg, err := s.PutMessage(ctx, chatID, sender, textContent("dup"), at(1), clientID, true)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			got[i] = msg.ID.Value
+		}(i)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+
+	// Every send returned the same message ID, and it is the chat's first (1).
+	for i := 0; i < n; i++ {
+		require.Equal(t, uint64(1), got[i])
+	}
+
+	// The sequence advanced exactly once, and the persisted message carries the
+	// ID that was returned to callers.
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending())
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1}, messageIDs(all))
+	require.Equal(t, got[0], all[0].ID.Value)
 }
 
 func testStore_PutMessage_UnreadSeq(t *testing.T, s messaging.Store) {
@@ -270,6 +397,10 @@ func textContent(text string) []*messagingpb.Content {
 			Text: &messagingpb.TextContent{Text: text},
 		},
 	}}
+}
+
+func messageText(m *messaging.Message) string {
+	return m.Content[0].GetText().Text
 }
 
 func ids(vals ...uint64) []*messagingpb.MessageId {

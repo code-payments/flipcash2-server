@@ -132,18 +132,19 @@ func (m *memory) IsMember(_ context.Context, chatID *commonpb.ChatId, userID *co
 	return c.HasMember(userID), nil
 }
 
-func (m *memory) AdvanceLastActivity(_ context.Context, chatID *commonpb.ChatId, ts time.Time) error {
+func (m *memory) AdvanceLastActivity(_ context.Context, chatID *commonpb.ChatId, ts time.Time) (bool, error) {
 	m.Lock()
 	defer m.Unlock()
 
 	c, ok := m.chats[string(chatID.Value)]
 	if !ok {
-		return chat.ErrChatNotFound
+		return false, chat.ErrChatNotFound
 	}
 	if ts.After(c.LastActivity) {
 		c.LastActivity = ts
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 // lessByActivity orders chats by last_activity ascending, breaking ties by chat

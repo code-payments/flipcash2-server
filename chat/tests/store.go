@@ -136,20 +136,25 @@ func testStore_AdvanceLastActivity(t *testing.T, s chat.Store) {
 	}
 	require.NoError(t, s.PutChat(ctx, c))
 
-	// Forward moves.
-	require.NoError(t, s.AdvanceLastActivity(ctx, c.ID, at(200)))
+	// Forward moves and reports advanced.
+	advanced, err := s.AdvanceLastActivity(ctx, c.ID, at(200))
+	require.NoError(t, err)
+	require.True(t, advanced)
 	got, err := s.GetChatByID(ctx, c.ID)
 	require.NoError(t, err)
 	require.True(t, got.LastActivity.Equal(at(200)))
 
-	// Backward is a no-op.
-	require.NoError(t, s.AdvanceLastActivity(ctx, c.ID, at(150)))
+	// Backward is a no-op and reports not advanced.
+	advanced, err = s.AdvanceLastActivity(ctx, c.ID, at(150))
+	require.NoError(t, err)
+	require.False(t, advanced)
 	got, err = s.GetChatByID(ctx, c.ID)
 	require.NoError(t, err)
 	require.True(t, got.LastActivity.Equal(at(200)))
 
 	// Unknown chat → ErrChatNotFound.
-	require.ErrorIs(t, s.AdvanceLastActivity(ctx, generateChatID(), at(1)), chat.ErrChatNotFound)
+	_, err = s.AdvanceLastActivity(ctx, generateChatID(), at(1))
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
 }
 
 func testStore_GetDmsForUserByLastActivity_Order(t *testing.T, s chat.Store) {

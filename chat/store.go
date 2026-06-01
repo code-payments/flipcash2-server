@@ -58,8 +58,9 @@ type Store interface {
 	// (no error) when the chat does not exist.
 	IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error)
 
-	// AdvanceLastActivity moves chatID's last_activity forward to ts. If the
-	// stored value is already at or after ts, the call is a no-op. It returns
-	// ErrChatNotFound if the chat does not exist.
-	AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId, ts time.Time) error
+	// AdvanceLastActivity moves chatID's last_activity forward to ts and reports
+	// whether it advanced. If the stored value is already at or after ts, it is a
+	// no-op and returns false. It returns ErrChatNotFound if the chat does not
+	// exist.
+	AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId, ts time.Time) (bool, error)
 }

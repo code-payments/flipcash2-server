@@ -174,7 +174,7 @@ func (s *store) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *c
 	return len(out.Item) > 0, nil
 }
 
-func (s *store) AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId, ts time.Time) error {
+func (s *store) AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId, ts time.Time) (bool, error) {
 	// Load the canonical record for the current value and the member set to
 	// fan out to.
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
@@ -183,17 +183,17 @@ func (s *store) AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId
 		ConsistentRead: aws.Bool(true),
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(out.Item) == 0 {
-		return chat.ErrChatNotFound
+		return false, chat.ErrChatNotFound
 	}
 	cur, err := parseInt(out.Item[attrLastActivity])
 	if err != nil {
-		return err
+		return false, err
 	}
 	if ts.UnixNano() <= cur {
-		return nil // No-op: stored value is already at or after ts.
+		return false, nil // No-op: stored value is already at or after ts.
 	}
 	members := membersFromItem(out.Item)
 
@@ -216,6 +216,10 @@ func (s *store) AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId
 				TableName:        aws.String(s.dmInboxTable),
 				Key:              map[string]types.AttributeValue{attrPK: avS(userPK(member)), attrSK: avS(chatSK(chatID))},
 				UpdateExpression: aws.String(fmt.Sprintf("SET %s = :ts", attrLastActivity)),
+				// Each inbox row advances only if the new value is strictly
+				// newer. Also guards against upserting a malformed row if the
+				// member's row were somehow missing.
+				ConditionExpression: aws.String(fmt.Sprintf("%s < :ts", attrLastActivity)),
 				ExpressionAttributeValues: map[string]types.AttributeValue{
 					":ts": avN(uint64(ts.UnixNano())),
 				},
@@ -228,11 +232,11 @@ func (s *store) AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId
 		// A concurrent advance moved last_activity to/past ts; treat as no-op.
 		// last_activity is a derived value that self-heals on the next bump.
 		if isTransactionCanceled(err) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
-	return nil
+	return true, nil
 }
 
 // inboxRowKey returns the GSI ExclusiveStartKey for the user's inbox row for

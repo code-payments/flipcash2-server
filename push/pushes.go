@@ -129,9 +129,9 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 }
 
 func SendContactPaymentPush(ctx context.Context, pusher Pusher, recipient *commonpb.UserId, contact *phonepb.PhoneNumber, currencyName string, region ocp_currency.Code, nativeAmount float64) error {
-	title := "{0} Sent You Cash"
+	title := "{0}"
 	body := fmt.Sprintf(
-		"%s of %s is now in your wallet",
+		"Sent you %s of %s",
 		localization.FormatFiat(defaultLocale, region, nativeAmount),
 		currencyName,
 	)

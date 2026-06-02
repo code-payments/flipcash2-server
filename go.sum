@@ -60,6 +60,8 @@ github.com/code-payments/flipcash2-protobuf-api v1.8.1-0.20260602131012-22dcd923
 github.com/code-payments/flipcash2-protobuf-api v1.8.1-0.20260602131012-22dcd9237223/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
 github.com/code-payments/ocp-protobuf-api v1.12.0 h1:Gm+DMGJXvV4PIdM609BfcxoRrAwJHDAC12mRc6SL+Jc=
 github.com/code-payments/ocp-protobuf-api v1.12.0/go.mod h1:tw6BooY5a8l6CtSZnKOruyKII0W04n89pcM4BizrgG8=
+github.com/code-payments/ocp-server v1.16.1-0.20260602150419-e3cf1fb688cc h1:lBGqljLIuCvVme54Q1gmlIzJgcz88vQslchYxDeTNpk=
+github.com/code-payments/ocp-server v1.16.1-0.20260602150419-e3cf1fb688cc/go.mod h1:yqqej+uYJSc4j6KZKyKbD+HHnOUCe55vlSYroX6x83U=
 github.com/containerd/continuity v0.4.3 h1:6HVkalIp+2u1ZLH1J/pYX2oBVXlJZvh1X1A7bEZ9Su8=
 github.com/containerd/continuity v0.4.3/go.mod h1:F6PTNCKepoxEaXLQp3wDAjygEnImnZ/7o4JzpodfroQ=
 github.com/coreos/go-systemd v0.0.0-20190321100706-95778dfbb74e/go.mod h1:F5haX7vjVVG0kc13fIWeqUViNPyEJxv/OmvnBo0Yme4=
@@ -292,8 +294,6 @@ github.com/smartystreets/assertions v1.13.1 h1:Ef7KhSmjZcK6AVf9YbJdvPYG9avaF0Zxu
 github.com/smartystreets/assertions v1.13.1/go.mod h1:cXr/IwVfSo/RbCSPhoAPv73p3hlSdrBH/b3SdnW/LMY=
 github.com/smartystreets/goconvey v1.8.0 h1:Oi49ha/2MURE0WexF052Z0m+BNSGirfjg5RL+JXWq3w=
 github.com/smartystreets/goconvey v1.8.0/go.mod h1:EdX8jtrTIj26jmjCOVNMVSIYAtgexqXKHOXW2Dx9JLg=
-github.com/steebchen/prisma-client-go v0.47.0 h1:mKelgkcGPcIardjTP5diGq6hvnueQc/DYEyQ+6uZ0/E=
-github.com/steebchen/prisma-client-go v0.47.0/go.mod h1:i1B0PEaE+BUcBUiwvd9drWpyMG/zNYMRrD5MancMf2I=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/objx v0.1.1/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/objx v0.2.0/go.mod h1:qt09Ya8vawLte6SNmTgCsAVtYtaKzEcn8ATUoHMkEqE=

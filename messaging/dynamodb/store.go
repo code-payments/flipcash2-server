@@ -62,7 +62,7 @@ const (
 	codeConditionalCheckFailed = "ConditionalCheckFailed"
 	codeTransactionConflict    = "TransactionConflict"
 
-	maxPutMessageAttempts = 16
+	maxPutMessageAttempts = 32
 	maxBatchGetKeys       = 100
 )
 
@@ -97,16 +97,15 @@ func (s *store) PutMessage(
 	}
 
 	for attempt := 0; attempt < maxPutMessageAttempts; attempt++ {
-		// Fast idempotent path: a prior send with this client message ID wins.
-		if existing, err := s.messageByClientID(ctx, chatID, clientMessageID); err != nil {
-			return nil, err
-		} else if existing != nil {
-			return existing, nil
-		}
-
-		lastSeq, lastUnread, err := s.readCounter(ctx, chatID)
+		// The idempotency marker and the sequence counter live in the same
+		// partition (pk = chat#<id>), so one consistent batch read fetches both.
+		markerSeq, lastSeq, lastUnread, err := s.readSendState(ctx, chatID, clientMessageID)
 		if err != nil {
 			return nil, err
+		}
+		// Fast idempotent path: a prior send with this client message ID wins.
+		if markerSeq != nil {
+			return s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: *markerSeq})
 		}
 
 		nextSeq := lastSeq + 1
@@ -434,51 +433,61 @@ func (s *store) AdvancePointer(
 	return true, nil
 }
 
-// messageByClientID returns the message previously persisted for clientMessageID
-// in the chat, or nil if none exists.
-func (s *store) messageByClientID(ctx context.Context, chatID *commonpb.ChatId, clientMessageID *messagingpb.ClientMessageId) (*messaging.Message, error) {
-	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(s.messagesTable),
-		Key: map[string]types.AttributeValue{
-			attrPK: avS(chatPK(chatID)),
-			attrSK: avS(cmidSK(clientMessageID)),
+// readSendState fetches, in a single consistent batch read, the two partition
+// items PutMessage needs before assigning a sequence number: the idempotency
+// marker for clientMessageID and the chat's sequence counter. Both share the
+// chat's partition (pk = chat#<id>), so one BatchGetItem covers them.
+//
+// markerSeq is non-nil when a prior send with this client message ID already
+// persisted, carrying that message's sequence number; the caller then returns
+// the existing message rather than assigning a new one. lastSeq and lastUnread
+// are zero when the counter does not yet exist (the chat's first send).
+func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clientMessageID *messagingpb.ClientMessageId) (markerSeq *uint64, lastSeq, lastUnread uint64, err error) {
+	cmidSKVal := cmidSK(clientMessageID)
+	req := map[string]types.KeysAndAttributes{
+		s.messagesTable: {
+			Keys: []map[string]types.AttributeValue{
+				{attrPK: avS(chatPK(chatID)), attrSK: avS(cmidSKVal)},
+				{attrPK: avS(chatPK(chatID)), attrSK: avS(skCounter)},
+			},
+			ConsistentRead: aws.Bool(true),
 		},
-		ConsistentRead: aws.Bool(true),
-	})
-	if err != nil {
-		return nil, err
 	}
-	if len(out.Item) == 0 {
-		return nil, nil
-	}
-	seq, err := parseN(out.Item[attrSeq])
-	if err != nil {
-		return nil, err
-	}
-	return s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: seq})
-}
 
-func (s *store) readCounter(ctx context.Context, chatID *commonpb.ChatId) (lastSeq, lastUnread uint64, err error) {
-	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName:      aws.String(s.messagesTable),
-		Key:            map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skCounter)},
-		ConsistentRead: aws.Bool(true),
-	})
-	if err != nil {
-		return 0, 0, err
+	// Drain UnprocessedKeys; values accumulate across iterations, so an item
+	// resolved early is retained while a throttled one is retried.
+	for len(req[s.messagesTable].Keys) > 0 {
+		resp, batchErr := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+		if batchErr != nil {
+			return nil, 0, 0, batchErr
+		}
+		for _, item := range resp.Responses[s.messagesTable] {
+			switch asS(item[attrSK]) {
+			case cmidSKVal:
+				seq, perr := parseN(item[attrSeq])
+				if perr != nil {
+					return nil, 0, 0, perr
+				}
+				markerSeq = &seq
+			case skCounter:
+				ls, perr := parseN(item[attrLastSeq])
+				if perr != nil {
+					return nil, 0, 0, perr
+				}
+				lu, perr := parseN(item[attrLastUnreadSeq])
+				if perr != nil {
+					return nil, 0, 0, perr
+				}
+				lastSeq, lastUnread = ls, lu
+			}
+		}
+		if unprocessed, ok := resp.UnprocessedKeys[s.messagesTable]; ok && len(unprocessed.Keys) > 0 {
+			req = map[string]types.KeysAndAttributes{s.messagesTable: unprocessed}
+		} else {
+			break
+		}
 	}
-	if len(out.Item) == 0 {
-		return 0, 0, nil
-	}
-	lastSeq, err = parseN(out.Item[attrLastSeq])
-	if err != nil {
-		return 0, 0, err
-	}
-	lastUnread, err = parseN(out.Item[attrLastUnreadSeq])
-	if err != nil {
-		return 0, 0, err
-	}
-	return lastSeq, lastUnread, nil
+	return markerSeq, lastSeq, lastUnread, nil
 }
 
 func (s *store) messageItem(msg *messaging.Message, clientMessageID *messagingpb.ClientMessageId, contentBlobs []types.AttributeValue) map[string]types.AttributeValue {

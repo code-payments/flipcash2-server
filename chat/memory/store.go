@@ -8,9 +8,9 @@ import (
 	"time"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
-	"github.com/code-payments/flipcash2-server/database"
 )
 
 type memory struct {
@@ -56,49 +56,37 @@ func (m *memory) GetChatByID(_ context.Context, chatID *commonpb.ChatId) (*chat.
 	return c.Clone(), nil
 }
 
-func (m *memory) GetDmsForUserByLastActivity(_ context.Context, userID *commonpb.UserId, opts ...database.QueryOption) ([]*chat.Chat, error) {
-	q := database.ApplyQueryOptions(opts...)
-
+func (m *memory) GetDmFeedPage(_ context.Context, userID *commonpb.UserId, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
 	m.Lock()
 	defer m.Unlock()
 
-	// Collect the chats this user is a member of.
+	// Collect the user's chats within the snapshot window (last_activity at or
+	// before the watermark). A chat that became active after the snapshot has
+	// moved above the watermark and is excluded from the read.
 	var chats []*chat.Chat
 	for _, c := range m.chats {
-		if c.HasMember(userID) {
+		if c.HasMember(userID) && !c.LastActivity.After(snapshot) {
 			chats = append(chats, c.Clone())
 		}
 	}
 
-	// Order by (last_activity, chat_id) ascending, then reverse for descending.
+	// Order by (last_activity, chat_id) descending: most recent first.
 	sort.Slice(chats, func(i, j int) bool {
-		return lessByActivity(chats[i], chats[j])
+		return lessByActivity(chats[j], chats[i])
 	})
-	if q.Order == commonpb.QueryOptions_DESC {
-		reverse(chats)
-	}
 
-	// Resolve the paging cursor: the token value is the chat ID of the last
-	// chat from the previous page, so resume strictly after it. A token that
-	// does not match any chat in the user's list yields an empty page.
+	// Resume strictly after the cursor. In descending order every chat past the
+	// cursor position is strictly below it, so advance to the first such chat.
 	start := 0
-	if q.PagingToken != nil {
-		found := false
-		for idx, c := range chats {
-			if bytes.Equal(c.ID.Value, q.PagingToken.Value) {
-				start = idx + 1
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, nil
+	if cursor != nil {
+		for start < len(chats) && !afterCursorDesc(chats[start], cursor) {
+			start++
 		}
 	}
 
 	end := len(chats)
-	if q.Limit > 0 && start+q.Limit < end {
-		end = start + q.Limit
+	if limit > 0 && start+limit < end {
+		end = start + limit
 	}
 	if start >= end {
 		return nil, nil
@@ -132,7 +120,7 @@ func (m *memory) IsMember(_ context.Context, chatID *commonpb.ChatId, userID *co
 	return c.HasMember(userID), nil
 }
 
-func (m *memory) AdvanceLastActivity(_ context.Context, chatID *commonpb.ChatId, ts time.Time) (bool, error) {
+func (m *memory) AdvanceLastMessage(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, error) {
 	m.Lock()
 	defer m.Unlock()
 
@@ -142,6 +130,7 @@ func (m *memory) AdvanceLastActivity(_ context.Context, chatID *commonpb.ChatId,
 	}
 	if ts.After(c.LastActivity) {
 		c.LastActivity = ts
+		c.LastMessageID = &messagingpb.MessageId{Value: messageID.Value}
 		return true, nil
 	}
 	return false, nil
@@ -156,8 +145,11 @@ func lessByActivity(a, b *chat.Chat) bool {
 	return bytes.Compare(a.ID.Value, b.ID.Value) < 0
 }
 
-func reverse(chats []*chat.Chat) {
-	for i, j := 0, len(chats)-1; i < j; i, j = i+1, j-1 {
-		chats[i], chats[j] = chats[j], chats[i]
+// afterCursorDesc reports whether c falls strictly after the cursor in the
+// feed's descending (last_activity, chat_id) order.
+func afterCursorDesc(c *chat.Chat, cursor *chat.DmFeedCursor) bool {
+	if !c.LastActivity.Equal(cursor.LastActivity) {
+		return c.LastActivity.Before(cursor.LastActivity)
 	}
+	return bytes.Compare(c.ID.Value, cursor.ChatID.Value) < 0
 }

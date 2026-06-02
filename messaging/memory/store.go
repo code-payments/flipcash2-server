@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"sort"
 	"strconv"
@@ -163,29 +164,58 @@ func (m *memory) GetMessages(_ context.Context, chatID *commonpb.ChatId, opts ..
 	return ordered, nil
 }
 
-func (m *memory) GetMessagesByIDs(_ context.Context, chatID *commonpb.ChatId, messageIDs []*messagingpb.MessageId) ([]*messaging.Message, error) {
+func (m *memory) GetMessagesByRefs(_ context.Context, refs []messaging.MessageRef) ([]*messaging.Message, error) {
 	m.Lock()
 	defer m.Unlock()
 
-	cs := m.chats[string(chatID.Value)]
-	if cs == nil {
-		return nil, nil
+	type dedupKey struct {
+		chat string
+		id   uint64
 	}
-
-	seen := make(map[uint64]struct{}, len(messageIDs))
+	seen := make(map[dedupKey]struct{}, len(refs))
 	var out []*messaging.Message
-	for _, id := range messageIDs {
-		if _, dup := seen[id.Value]; dup {
+	for _, ref := range refs {
+		k := dedupKey{chat: string(ref.ChatID.Value), id: ref.MessageID.Value}
+		if _, dup := seen[k]; dup {
 			continue
 		}
-		seen[id.Value] = struct{}{}
-		if msg, ok := cs.messages[id.Value]; ok {
+		seen[k] = struct{}{}
+		cs := m.chats[k.chat]
+		if cs == nil {
+			continue
+		}
+		if msg, ok := cs.messages[ref.MessageID.Value]; ok {
 			out = append(out, msg.Clone())
 		}
 	}
+	// Order by (chatID, message ID): deterministic, and ascending by ID within a
+	// single chat to match the single-chat batch contract.
 	sort.Slice(out, func(i, j int) bool {
+		if c := bytes.Compare(out[i].ChatID.Value, out[j].ChatID.Value); c != 0 {
+			return c < 0
+		}
 		return out[i].ID.Value < out[j].ID.Value
 	})
+	return out, nil
+}
+
+func (m *memory) GetPointersForChats(_ context.Context, chatIDs []*commonpb.ChatId) (map[string][]*messagingpb.Pointer, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	out := make(map[string][]*messagingpb.Pointer)
+	for _, chatID := range chatIDs {
+		key := string(chatID.Value)
+		cs := m.chats[key]
+		if cs == nil || len(cs.pointers) == 0 {
+			continue
+		}
+		pointers := make([]*messagingpb.Pointer, 0, len(cs.pointers))
+		for _, p := range cs.pointers {
+			pointers = append(pointers, proto.Clone(p).(*messagingpb.Pointer))
+		}
+		out[key] = pointers
+	}
 	return out, nil
 }
 

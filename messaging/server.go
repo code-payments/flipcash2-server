@@ -97,7 +97,11 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 
 	var msgs []*Message
 	if batch := req.GetMessageIds(); batch != nil {
-		msgs, err = s.messages.GetMessagesByIDs(ctx, req.ChatId, batch.MessageIds)
+		refs := make([]MessageRef, len(batch.MessageIds))
+		for i, id := range batch.MessageIds {
+			refs[i] = MessageRef{ChatID: req.ChatId, MessageID: id}
+		}
+		msgs, err = s.messages.GetMessagesByRefs(ctx, refs)
 	} else {
 		opts := database.FromProtoQueryOptions(req.GetOptions())
 		msgs, err = s.messages.GetMessages(ctx, req.ChatId, opts...)
@@ -153,11 +157,13 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 		log.With(zap.Error(err)).Warn("Failure advancing sender read pointer")
 	}
 
-	// Bump the chat's last activity so it sorts to the top of members' inboxes.
-	// Decoupled from persistence: a lagging bump self-heals on the next message.
-	activityAdvanced, err := s.chats.AdvanceLastActivity(ctx, req.ChatId, msg.Timestamp)
+	// Record this message as the chat's most recent: bumps last_activity so the
+	// chat sorts to the top of members' inboxes and denormalizes last_message_id
+	// for the feed. Decoupled from persistence: a lagging bump self-heals on the
+	// next message.
+	lastMessageAdvanced, err := s.chats.AdvanceLastMessage(ctx, req.ChatId, msg.ID, msg.Timestamp)
 	if err != nil && !errors.Is(err, chat.ErrChatNotFound) {
-		log.With(zap.Error(err)).Warn("Failure advancing chat last activity")
+		log.With(zap.Error(err)).Warn("Failure advancing chat last message")
 	}
 
 	// Notify all members (including the sender's other devices) of the new
@@ -174,7 +180,7 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 			Value:  msg.ID,
 		}}}
 	}
-	if activityAdvanced {
+	if lastMessageAdvanced {
 		update.MetadataUpdates = []*chatpb.MetadataUpdate{{
 			Kind: &chatpb.MetadataUpdate_LastActivityChanged_{
 				LastActivityChanged: &chatpb.MetadataUpdate_LastActivityChanged{

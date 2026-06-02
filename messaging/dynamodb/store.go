@@ -1,6 +1,7 @@
 package dynamodb
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -234,18 +235,24 @@ func (s *store) GetMessages(ctx context.Context, chatID *commonpb.ChatId, opts .
 	return messages, nil
 }
 
-func (s *store) GetMessagesByIDs(ctx context.Context, chatID *commonpb.ChatId, messageIDs []*messagingpb.MessageId) ([]*messaging.Message, error) {
-	// Dedup and build the batch keys.
-	seen := make(map[uint64]struct{}, len(messageIDs))
+func (s *store) GetMessagesByRefs(ctx context.Context, refs []messaging.MessageRef) ([]*messaging.Message, error) {
+	// Dedup and build the batch keys. Keys may span partitions (chats);
+	// BatchGetItem handles a mixed set in one request.
+	type dedupKey struct {
+		chat string
+		id   uint64
+	}
+	seen := make(map[dedupKey]struct{}, len(refs))
 	var keys []map[string]types.AttributeValue
-	for _, id := range messageIDs {
-		if _, dup := seen[id.Value]; dup {
+	for _, ref := range refs {
+		k := dedupKey{chat: string(ref.ChatID.Value), id: ref.MessageID.Value}
+		if _, dup := seen[k]; dup {
 			continue
 		}
-		seen[id.Value] = struct{}{}
+		seen[k] = struct{}{}
 		keys = append(keys, map[string]types.AttributeValue{
-			attrPK: avS(chatPK(chatID)),
-			attrSK: avS(msgSK(id.Value)),
+			attrPK: avS(chatPK(ref.ChatID)),
+			attrSK: avS(msgSK(ref.MessageID.Value)),
 		})
 	}
 
@@ -266,7 +273,9 @@ func (s *store) GetMessagesByIDs(ctx context.Context, chatID *commonpb.ChatId, m
 				return nil, err
 			}
 			for _, item := range resp.Responses[s.messagesTable] {
-				msg, err := messageFromItem(chatID, item)
+				// Items come back unordered and intermixed across chats, so the
+				// owning chat is taken from the item rather than a single param.
+				msg, err := messageFromItem(chatIDFromItem(item), item)
 				if err != nil {
 					return nil, err
 				}
@@ -280,7 +289,14 @@ func (s *store) GetMessagesByIDs(ctx context.Context, chatID *commonpb.ChatId, m
 		}
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].ID.Value < out[j].ID.Value })
+	// Order by (chatID, message ID): deterministic, and ascending by ID within a
+	// single chat to match the single-chat batch contract.
+	sort.Slice(out, func(i, j int) bool {
+		if c := bytes.Compare(out[i].ChatID.Value, out[j].ChatID.Value); c != 0 {
+			return c < 0
+		}
+		return out[i].ID.Value < out[j].ID.Value
+	})
 	return out, nil
 }
 
@@ -308,6 +324,26 @@ func (s *store) GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*me
 		startKey = out.LastEvaluatedKey
 	}
 	return pointers, nil
+}
+
+func (s *store) GetPointersForChats(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string][]*messagingpb.Pointer, error) {
+	// message_pointers has no cross-chat index, so this issues one query per
+	// distinct chat. Bounded by the feed page size; parallelize if it gets hot.
+	out := make(map[string][]*messagingpb.Pointer)
+	for _, chatID := range chatIDs {
+		key := string(chatID.Value)
+		if _, done := out[key]; done {
+			continue
+		}
+		pointers, err := s.GetPointers(ctx, chatID)
+		if err != nil {
+			return nil, err
+		}
+		if len(pointers) > 0 {
+			out[key] = pointers
+		}
+	}
+	return out, nil
 }
 
 func (s *store) AdvancePointer(
@@ -484,6 +520,10 @@ func unmarshalContent(av types.AttributeValue) ([]*messagingpb.Content, error) {
 		content[i] = c
 	}
 	return content, nil
+}
+
+func chatIDFromItem(item map[string]types.AttributeValue) *commonpb.ChatId {
+	return &commonpb.ChatId{Value: append([]byte(nil), asB(item[attrChatID])...)}
 }
 
 func chatPK(chatID *commonpb.ChatId) string { return "chat#" + hex.EncodeToString(chatID.Value) }

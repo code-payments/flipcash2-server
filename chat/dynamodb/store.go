@@ -14,9 +14,9 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
-	"github.com/code-payments/flipcash2-server/database"
 )
 
 // The chat store spans two tables:
@@ -36,12 +36,13 @@ import (
 const (
 	gsiByActivity = "by_activity"
 
-	attrPK           = "pk"
-	attrSK           = "sk"
-	attrChatID       = "chat_id"
-	attrType         = "type"
-	attrMembers      = "members"
-	attrLastActivity = "last_activity"
+	attrPK            = "pk"
+	attrSK            = "sk"
+	attrChatID        = "chat_id"
+	attrType          = "type"
+	attrMembers       = "members"
+	attrLastActivity  = "last_activity"
+	attrLastMessageID = "last_message_id"
 )
 
 type store struct {
@@ -110,33 +111,33 @@ func (s *store) GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*chat
 	return chatFromItem(out.Item)
 }
 
-func (s *store) GetDmsForUserByLastActivity(ctx context.Context, userID *commonpb.UserId, opts ...database.QueryOption) ([]*chat.Chat, error) {
-	q := database.ApplyQueryOptions(opts...)
-
+func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
+	// Constrain the GSI range key to the snapshot window: only inbox rows whose
+	// last_activity is at or before the watermark. Descending order (most recent
+	// first) is fixed for the feed.
 	input := &dynamodb.QueryInput{
 		TableName:              aws.String(s.dmInboxTable),
 		IndexName:              aws.String(gsiByActivity),
-		KeyConditionExpression: aws.String(fmt.Sprintf("%s = :u", attrPK)),
+		KeyConditionExpression: aws.String(fmt.Sprintf("%s = :u AND %s <= :snap", attrPK, attrLastActivity)),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":u": avS(userPK(userID)),
+			":u":    avS(userPK(userID)),
+			":snap": avN(uint64(snapshot.UnixNano())),
 		},
-		ScanIndexForward: aws.Bool(q.Order != commonpb.QueryOptions_DESC),
+		ScanIndexForward: aws.Bool(false),
 	}
-	if q.Limit > 0 {
-		input.Limit = aws.Int32(int32(q.Limit))
+	if limit > 0 {
+		input.Limit = aws.Int32(int32(limit))
 	}
 
-	// Resolve the paging cursor: the token value is the chat ID of the last chat
-	// from the previous page. Resume strictly after that dm_inbox row.
-	if q.PagingToken != nil {
-		startKey, err := s.inboxRowKey(ctx, userID, &commonpb.ChatId{Value: q.PagingToken.Value})
-		if err != nil {
-			return nil, err
+	// The cursor carries (last_activity, chat_id) explicitly, so the GSI start
+	// key is built directly without a lookup. A GSI start key must also include
+	// the base table key (pk, sk), hence all three attributes.
+	if cursor != nil {
+		input.ExclusiveStartKey = map[string]types.AttributeValue{
+			attrPK:           avS(userPK(userID)),
+			attrSK:           avS(chatSK(cursor.ChatID)),
+			attrLastActivity: avN(uint64(cursor.LastActivity.UnixNano())),
 		}
-		if startKey == nil {
-			return nil, nil // Token references a chat the user is not in.
-		}
-		input.ExclusiveStartKey = startKey
 	}
 
 	out, err := s.client.Query(ctx, input)
@@ -174,7 +175,7 @@ func (s *store) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *c
 	return len(out.Item) > 0, nil
 }
 
-func (s *store) AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId, ts time.Time) (bool, error) {
+func (s *store) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, error) {
 	// Load the canonical record for the current value and the member set to
 	// fan out to.
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
@@ -197,17 +198,24 @@ func (s *store) AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId
 	}
 	members := membersFromItem(out.Item)
 
-	// Bump the canonical value (conditioned so it only moves forward) and
-	// mirror it onto each member's inbox row so the GSI re-sorts.
+	// Bump the canonical value (conditioned so it only moves forward) and mirror
+	// it onto each member's inbox row so the GSI re-sorts. last_activity and
+	// last_message_id move together: both describe the same newest message.
+	setExpr := fmt.Sprintf("SET %s = :ts, %s = :mid", attrLastActivity, attrLastMessageID)
+	condExpr := fmt.Sprintf("%s < :ts", attrLastActivity)
+	values := func() map[string]types.AttributeValue {
+		return map[string]types.AttributeValue{
+			":ts":  avN(uint64(ts.UnixNano())),
+			":mid": avN(messageID.Value),
+		}
+	}
 	transactItems := []types.TransactWriteItem{
 		{Update: &types.Update{
-			TableName:           aws.String(s.chatsTable),
-			Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
-			UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :ts", attrLastActivity)),
-			ConditionExpression: aws.String(fmt.Sprintf("%s < :ts", attrLastActivity)),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":ts": avN(uint64(ts.UnixNano())),
-			},
+			TableName:                 aws.String(s.chatsTable),
+			Key:                       map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
+			UpdateExpression:          aws.String(setExpr),
+			ConditionExpression:       aws.String(condExpr),
+			ExpressionAttributeValues: values(),
 		}},
 	}
 	for _, member := range members {
@@ -215,14 +223,12 @@ func (s *store) AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId
 			Update: &types.Update{
 				TableName:        aws.String(s.dmInboxTable),
 				Key:              map[string]types.AttributeValue{attrPK: avS(userPK(member)), attrSK: avS(chatSK(chatID))},
-				UpdateExpression: aws.String(fmt.Sprintf("SET %s = :ts", attrLastActivity)),
+				UpdateExpression: aws.String(setExpr),
 				// Each inbox row advances only if the new value is strictly
 				// newer. Also guards against upserting a malformed row if the
 				// member's row were somehow missing.
-				ConditionExpression: aws.String(fmt.Sprintf("%s < :ts", attrLastActivity)),
-				ExpressionAttributeValues: map[string]types.AttributeValue{
-					":ts": avN(uint64(ts.UnixNano())),
-				},
+				ConditionExpression:       aws.String(condExpr),
+				ExpressionAttributeValues: values(),
 			},
 		})
 	}
@@ -239,39 +245,22 @@ func (s *store) AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId
 	return true, nil
 }
 
-// inboxRowKey returns the GSI ExclusiveStartKey for the user's inbox row for
-// chatID, or nil if the user has no such row.
-func (s *store) inboxRowKey(ctx context.Context, userID *commonpb.UserId, chatID *commonpb.ChatId) (map[string]types.AttributeValue, error) {
-	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName:            aws.String(s.dmInboxTable),
-		Key:                  map[string]types.AttributeValue{attrPK: avS(userPK(userID)), attrSK: avS(chatSK(chatID))},
-		ProjectionExpression: aws.String(fmt.Sprintf("%s, %s, %s", attrPK, attrSK, attrLastActivity)),
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(out.Item) == 0 {
-		return nil, nil
-	}
-	return map[string]types.AttributeValue{
-		attrPK:           out.Item[attrPK],
-		attrSK:           out.Item[attrSK],
-		attrLastActivity: out.Item[attrLastActivity],
-	}, nil
-}
-
 func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
-	return map[string]types.AttributeValue{
+	item := map[string]types.AttributeValue{
 		attrPK:           avS(chatPK(c.ID)),
 		attrChatID:       avB(c.ID.Value),
 		attrType:         avN(uint64(c.Type)),
 		attrMembers:      membersAttr(c.Members),
 		attrLastActivity: avN(uint64(c.LastActivity.UnixNano())),
 	}
+	if c.LastMessageID != nil {
+		item[attrLastMessageID] = avN(c.LastMessageID.Value)
+	}
+	return item
 }
 
 func (s *store) dmInboxItem(c *chat.Chat, member *commonpb.UserId) map[string]types.AttributeValue {
-	return map[string]types.AttributeValue{
+	item := map[string]types.AttributeValue{
 		attrPK:           avS(userPK(member)),
 		attrSK:           avS(chatSK(c.ID)),
 		attrChatID:       avB(c.ID.Value),
@@ -279,6 +268,10 @@ func (s *store) dmInboxItem(c *chat.Chat, member *commonpb.UserId) map[string]ty
 		attrMembers:      membersAttr(c.Members),
 		attrLastActivity: avN(uint64(c.LastActivity.UnixNano())),
 	}
+	if c.LastMessageID != nil {
+		item[attrLastMessageID] = avN(c.LastMessageID.Value)
+	}
+	return item
 }
 
 func chatFromItem(item map[string]types.AttributeValue) (*chat.Chat, error) {
@@ -290,12 +283,21 @@ func chatFromItem(item map[string]types.AttributeValue) (*chat.Chat, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &chat.Chat{
+	c := &chat.Chat{
 		ID:           &commonpb.ChatId{Value: append([]byte(nil), asB(item[attrChatID])...)},
 		Type:         protoChatType(uint64(typeVal)),
 		Members:      membersFromItem(item),
 		LastActivity: time.Unix(0, nanos).UTC(),
-	}, nil
+	}
+	// last_message_id is absent until the chat's first message.
+	if _, ok := item[attrLastMessageID]; ok {
+		id, err := parseN(item[attrLastMessageID])
+		if err != nil {
+			return nil, err
+		}
+		c.LastMessageID = &messagingpb.MessageId{Value: id}
+	}
+	return c, nil
 }
 
 func membersFromItem(item map[string]types.AttributeValue) []*commonpb.UserId {

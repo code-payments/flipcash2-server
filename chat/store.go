@@ -6,8 +6,7 @@ import (
 	"time"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-
-	"github.com/code-payments/flipcash2-server/database"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 )
 
 var (
@@ -17,6 +16,14 @@ var (
 	// ErrChatExists indicates that a chat with the given ID already exists.
 	ErrChatExists = errors.New("chat already exists")
 )
+
+// DmFeedCursor marks a position within a DM feed snapshot read. The next page
+// resumes at the chat immediately after (LastActivity, ChatID) in the feed's
+// descending (last_activity, chat_id) order.
+type DmFeedCursor struct {
+	LastActivity time.Time
+	ChatID       *commonpb.ChatId
+}
 
 // Store persists chats and their membership.
 //
@@ -32,24 +39,24 @@ type Store interface {
 	// GetChatByID returns the chat with the given ID, or ErrChatNotFound.
 	GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*Chat, error)
 
-	// GetDmsForUserByLastActivity returns the DMs userID is a member of, ordered
-	// by last_activity (descending by default), paged via the provided query
-	// options. An empty result (no error) is returned when the user is in no DMs.
+	// GetDmFeedPage returns one page of userID's DM feed pinned to a snapshot:
+	// the DMs userID is a member of whose last_activity is at or before snapshot,
+	// ordered by (last_activity, chat_id) descending (most recent first), at most
+	// limit chats (limit <= 0 means unbounded). When cursor is nil the page starts
+	// at the most recent chat in the snapshot; otherwise it resumes strictly after
+	// cursor. An empty result (no error) is returned when no chats remain.
+	//
+	// Pinning to a fixed watermark makes a multi-page read internally consistent.
+	// last_activity only ever advances to a wall-clock send time, so any chat that
+	// becomes active after the snapshot moves strictly above the watermark and
+	// leaves the window — it can be neither duplicated onto nor skipped within a
+	// later page. Those freshly-active chats are surfaced through the live
+	// MetadataUpdate event stream instead (see the Chat service's GetDmChatFeed).
 	//
 	// It is scoped to DMs because the per-user inbox is split by chat type (see
 	// the dynamodb store). Group chats will have a parallel accessor, and the
-	// server merges the two last_activity-ordered streams into one chat list.
-	//
-	// Paging follows the repo convention (see activity/server.go): the paging
-	// token's value is the chat ID of the last chat from the previous page. The
-	// store resolves it to that chat's last_activity and resumes from there. A
-	// token referencing a chat the user is not a member of yields an empty page.
-	//
-	// Because last_activity is mutable, pagination is a best-effort snapshot: a
-	// chat whose activity changes mid-pagination may be missed or duplicated
-	// across pages. Clients reconcile against the live MetadataUpdate event
-	// stream, so a transient gap self-heals.
-	GetDmsForUserByLastActivity(ctx context.Context, userID *commonpb.UserId, opts ...database.QueryOption) ([]*Chat, error)
+	// server merges the two descending streams into one feed.
+	GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, snapshot time.Time, cursor *DmFeedCursor, limit int) ([]*Chat, error)
 
 	// GetMembers returns the member user IDs of a chat, or ErrChatNotFound.
 	GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*commonpb.UserId, error)
@@ -58,9 +65,11 @@ type Store interface {
 	// (no error) when the chat does not exist.
 	IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error)
 
-	// AdvanceLastActivity moves chatID's last_activity forward to ts and reports
-	// whether it advanced. If the stored value is already at or after ts, it is a
-	// no-op and returns false. It returns ErrChatNotFound if the chat does not
-	// exist.
-	AdvanceLastActivity(ctx context.Context, chatID *commonpb.ChatId, ts time.Time) (bool, error)
+	// AdvanceLastMessage records messageID as the chat's most recent message,
+	// moving last_activity forward to ts and last_message_id to messageID, and
+	// reports whether it advanced. The two fields are two views of the same event
+	// (the newest message) and are updated together. If the stored last_activity
+	// is already at or after ts, it is a no-op and returns false. It returns
+	// ErrChatNotFound if the chat does not exist.
+	AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, error)
 }

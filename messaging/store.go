@@ -16,6 +16,14 @@ import (
 // message ID.
 var ErrMessageNotFound = errors.New("message not found")
 
+// MessageRef identifies a single message within a chat. It is the unit of a
+// cross-chat batch read (see Store.GetMessagesByRefs) — e.g. one ref per chat to
+// fetch every chat's last message for the feed.
+type MessageRef struct {
+	ChatID    *commonpb.ChatId
+	MessageID *messagingpb.MessageId
+}
+
 // Store persists chat messages and message-history pointers.
 //
 // Each chat has its own gapless message ID sequence. Sends are made idempotent
@@ -55,13 +63,27 @@ type Store interface {
 	// chat has no messages.
 	GetMessages(ctx context.Context, chatID *commonpb.ChatId, opts ...database.QueryOption) ([]*Message, error)
 
-	// GetMessagesByIDs returns the messages with the given IDs that exist,
-	// ordered by message ID ascending. IDs without a message are omitted.
-	GetMessagesByIDs(ctx context.Context, chatID *commonpb.ChatId, messageIDs []*messagingpb.MessageId) ([]*Message, error)
+	// GetMessagesByRefs returns the messages identified by the given refs that
+	// exist, across any number of chats. Refs without a matching message are
+	// omitted and duplicate refs collapse. Results are ordered by
+	// (chatID, message ID), so refs within a single chat come back ascending by
+	// ID. It returns an empty result (no error) when refs is empty.
+	//
+	// It is the batch read behind the DM feed, where it fetches every chat's last
+	// message in one call (one ref per chat). For the single-chat case the caller
+	// builds refs from a shared chat ID.
+	GetMessagesByRefs(ctx context.Context, refs []MessageRef) ([]*Message, error)
 
 	// GetPointers returns all delivered/read pointers for a chat. Returns an
 	// empty result (no error) when the chat has no pointers.
 	GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*messagingpb.Pointer, error)
+
+	// GetPointersForChats returns the delivered/read pointers for each of the
+	// given chats, keyed by string(chatID.Value). It is the cross-chat batch
+	// counterpart to GetPointers, used to hydrate member pointers for the DM
+	// feed. Chats with no pointers are absent from the map and duplicate chat IDs
+	// collapse. Returns an empty map (no error) when chatIDs is empty.
+	GetPointersForChats(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string][]*messagingpb.Pointer, error)
 
 	// AdvancePointer moves a member's pointer of the given type forward to
 	// newValue. Pointers are monotonic: a request to move a pointer to a value

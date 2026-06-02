@@ -32,8 +32,9 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_PutMessage_SystemMessage,
 		testStore_GetMessage_NotFound,
 		testStore_GetMessages_OrderAndPaging,
-		testStore_GetMessagesByIDs,
+		testStore_GetMessagesByRefs,
 		testStore_Pointers,
+		testStore_GetPointersForChats,
 		testStore_AdvancePointer_MessageNotFound,
 	} {
 		tf(t, s)
@@ -295,21 +296,82 @@ func testStore_GetMessages_OrderAndPaging(t *testing.T, s messaging.Store) {
 	require.Empty(t, empty)
 }
 
-func testStore_GetMessagesByIDs(t *testing.T, s messaging.Store) {
+func testStore_GetMessagesByRefs(t *testing.T, s messaging.Store) {
 	ctx := context.Background()
-	chatID := generateChatID()
+	chatA := generateChatID()
+	chatB := generateChatID()
 	sender := model.MustGenerateUserID()
 
 	for i := 1; i <= 5; i++ {
-		_, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i)), generateClientID(), true)
+		_, err := s.PutMessage(ctx, chatA, sender, textContent("a"), at(int64(i)), generateClientID(), true)
+		require.NoError(t, err)
+	}
+	for i := 1; i <= 3; i++ {
+		_, err := s.PutMessage(ctx, chatB, sender, textContent("b"), at(int64(i)), generateClientID(), true)
 		require.NoError(t, err)
 	}
 
-	got, err := s.GetMessagesByIDs(ctx, chatID, ids(4, 2, 99, 2))
+	// Single chat: existing only, deduped, ascending by ID.
+	got, err := s.GetMessagesByRefs(ctx, refs(chatA, 4, 2, 99, 2))
 	require.NoError(t, err)
-	require.Equal(t, []uint64{2, 4}, messageIDs(got)) // existing only, deduped, sorted
+	require.Equal(t, []uint64{2, 4}, messageIDs(got))
 
-	empty, err := s.GetMessagesByIDs(ctx, chatID, ids(100, 200))
+	// Cross-chat batch: one message from each of two chats comes back in one
+	// call, each carrying its owning chat ID.
+	mixed, err := s.GetMessagesByRefs(ctx, []messaging.MessageRef{
+		{ChatID: chatA, MessageID: &messagingpb.MessageId{Value: 5}},
+		{ChatID: chatB, MessageID: &messagingpb.MessageId{Value: 2}},
+		{ChatID: chatB, MessageID: &messagingpb.MessageId{Value: 99}}, // missing → omitted
+	})
+	require.NoError(t, err)
+	require.Len(t, mixed, 2)
+	byChat := make(map[string]*messaging.Message)
+	for _, m := range mixed {
+		byChat[string(m.ChatID.Value)] = m
+	}
+	require.Equal(t, uint64(5), byChat[string(chatA.Value)].ID.Value)
+	require.Equal(t, uint64(2), byChat[string(chatB.Value)].ID.Value)
+
+	empty, err := s.GetMessagesByRefs(ctx, refs(chatA, 100, 200))
+	require.NoError(t, err)
+	require.Empty(t, empty)
+
+	none, err := s.GetMessagesByRefs(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, none)
+}
+
+func testStore_GetPointersForChats(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatA := generateChatID()
+	chatB := generateChatID()
+	chatC := generateChatID() // no pointers
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+
+	for _, c := range []*commonpb.ChatId{chatA, chatB, chatC} {
+		_, err := s.PutMessage(ctx, c, userA, textContent("m"), at(1), generateClientID(), true)
+		require.NoError(t, err)
+	}
+
+	_, err := s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	require.NoError(t, err)
+	_, err = s.AdvancePointer(ctx, chatB, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1})
+	require.NoError(t, err)
+
+	// Batch across chats: A and B return their pointers; C (no pointers) is
+	// absent from the map.
+	got, err := s.GetPointersForChats(ctx, []*commonpb.ChatId{chatA, chatB, chatC})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.Len(t, got[string(chatA.Value)], 1)
+	require.Equal(t, messagingpb.Pointer_READ, got[string(chatA.Value)][0].Type)
+	require.Len(t, got[string(chatB.Value)], 1)
+	require.Equal(t, messagingpb.Pointer_DELIVERED, got[string(chatB.Value)][0].Type)
+	_, ok := got[string(chatC.Value)]
+	require.False(t, ok)
+
+	empty, err := s.GetPointersForChats(ctx, nil)
 	require.NoError(t, err)
 	require.Empty(t, empty)
 }
@@ -407,6 +469,14 @@ func ids(vals ...uint64) []*messagingpb.MessageId {
 	out := make([]*messagingpb.MessageId, len(vals))
 	for i, v := range vals {
 		out[i] = &messagingpb.MessageId{Value: v}
+	}
+	return out
+}
+
+func refs(chatID *commonpb.ChatId, vals ...uint64) []messaging.MessageRef {
+	out := make([]messaging.MessageRef, len(vals))
+	for i, v := range vals {
+		out[i] = messaging.MessageRef{ChatID: chatID, MessageID: &messagingpb.MessageId{Value: v}}
 	}
 	return out
 }

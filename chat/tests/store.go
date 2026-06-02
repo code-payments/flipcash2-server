@@ -10,9 +10,9 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
-	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/model"
 )
 
@@ -25,10 +25,12 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_GetChatByID_NotFound,
 		testStore_Members,
 		testStore_IsMember,
-		testStore_AdvanceLastActivity,
-		testStore_GetDmsForUserByLastActivity_Order,
-		testStore_GetDmsForUserByLastActivity_Paging,
-		testStore_GetDmsForUserByLastActivity_Empty,
+		testStore_AdvanceLastMessage,
+		testStore_GetDmFeedPage_Order,
+		testStore_GetDmFeedPage_Watermark,
+		testStore_GetDmFeedPage_Paging,
+		testStore_GetDmFeedPage_SnapshotPinned,
+		testStore_GetDmFeedPage_Empty,
 	} {
 		tf(t, s)
 		teardown()
@@ -125,7 +127,7 @@ func testStore_IsMember(t *testing.T, s chat.Store) {
 	require.False(t, ok)
 }
 
-func testStore_AdvanceLastActivity(t *testing.T, s chat.Store) {
+func testStore_AdvanceLastMessage(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
 	c := &chat.Chat{
@@ -136,28 +138,36 @@ func testStore_AdvanceLastActivity(t *testing.T, s chat.Store) {
 	}
 	require.NoError(t, s.PutChat(ctx, c))
 
-	// Forward moves and reports advanced.
-	advanced, err := s.AdvanceLastActivity(ctx, c.ID, at(200))
-	require.NoError(t, err)
-	require.True(t, advanced)
+	// A new chat has no last message.
 	got, err := s.GetChatByID(ctx, c.ID)
 	require.NoError(t, err)
-	require.True(t, got.LastActivity.Equal(at(200)))
+	require.Nil(t, got.LastMessageID)
 
-	// Backward is a no-op and reports not advanced.
-	advanced, err = s.AdvanceLastActivity(ctx, c.ID, at(150))
+	// Forward moves both last_activity and last_message_id, and reports advanced.
+	advanced, err := s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: 5}, at(200))
+	require.NoError(t, err)
+	require.True(t, advanced)
+	got, err = s.GetChatByID(ctx, c.ID)
+	require.NoError(t, err)
+	require.True(t, got.LastActivity.Equal(at(200)))
+	require.NotNil(t, got.LastMessageID)
+	require.Equal(t, uint64(5), got.LastMessageID.Value)
+
+	// Backward is a no-op and reports not advanced; neither field changes.
+	advanced, err = s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: 3}, at(150))
 	require.NoError(t, err)
 	require.False(t, advanced)
 	got, err = s.GetChatByID(ctx, c.ID)
 	require.NoError(t, err)
 	require.True(t, got.LastActivity.Equal(at(200)))
+	require.Equal(t, uint64(5), got.LastMessageID.Value)
 
 	// Unknown chat → ErrChatNotFound.
-	_, err = s.AdvanceLastActivity(ctx, generateChatID(), at(1))
+	_, err = s.AdvanceLastMessage(ctx, generateChatID(), &messagingpb.MessageId{Value: 1}, at(1))
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 }
 
-func testStore_GetDmsForUserByLastActivity_Order(t *testing.T, s chat.Store) {
+func testStore_GetDmFeedPage_Order(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
 	user := model.MustGenerateUserID()
@@ -169,18 +179,28 @@ func testStore_GetDmsForUserByLastActivity_Order(t *testing.T, s chat.Store) {
 	c3 := putChat(t, s, user, other, at(200))
 	_ = putChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(999))
 
-	// Descending by last_activity (most recent first).
-	got, err := s.GetDmsForUserByLastActivity(ctx, user, database.WithDescending())
+	// A watermark above every chat includes them all, most recent first.
+	got, err := s.GetDmFeedPage(ctx, user, at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c2.ID.Value, c3.ID.Value, c1.ID.Value}, chatIDValues(got))
-
-	// Ascending.
-	got, err = s.GetDmsForUserByLastActivity(ctx, user, database.WithAscending())
-	require.NoError(t, err)
-	require.Equal(t, [][]byte{c1.ID.Value, c3.ID.Value, c2.ID.Value}, chatIDValues(got))
 }
 
-func testStore_GetDmsForUserByLastActivity_Paging(t *testing.T, s chat.Store) {
+func testStore_GetDmFeedPage_Watermark(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	user := model.MustGenerateUserID()
+	other := model.MustGenerateUserID()
+	c1 := putChat(t, s, user, other, at(100))
+	_ = putChat(t, s, user, other, at(300)) // Above the watermark; excluded.
+	c3 := putChat(t, s, user, other, at(200))
+
+	// A watermark of 250 pins out the chat last active at 300.
+	got, err := s.GetDmFeedPage(ctx, user, at(250), nil, 0)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{c3.ID.Value, c1.ID.Value}, chatIDValues(got))
+}
+
+func testStore_GetDmFeedPage_Paging(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
 	user := model.MustGenerateUserID()
@@ -189,30 +209,66 @@ func testStore_GetDmsForUserByLastActivity_Paging(t *testing.T, s chat.Store) {
 	c2 := putChat(t, s, user, other, at(300))
 	c3 := putChat(t, s, user, other, at(200))
 
+	snapshot := at(1000)
+
 	// Page 1: most recent, limit 2 → [c2, c3].
-	page1, err := s.GetDmsForUserByLastActivity(ctx, user, database.WithDescending(), database.WithLimit(2))
+	page1, err := s.GetDmFeedPage(ctx, user, snapshot, nil, 2)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c2.ID.Value, c3.ID.Value}, chatIDValues(page1))
 
 	// Page 2: resume after the last chat of page 1 (c3) → [c1].
-	token := &commonpb.PagingToken{Value: page1[len(page1)-1].ID.Value}
-	page2, err := s.GetDmsForUserByLastActivity(ctx, user, database.WithDescending(), database.WithLimit(2), database.WithPagingToken(token))
+	page2, err := s.GetDmFeedPage(ctx, user, snapshot, cursorOf(page1[len(page1)-1]), 2)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c1.ID.Value}, chatIDValues(page2))
 
 	// Resuming after the final chat yields an empty page.
-	token = &commonpb.PagingToken{Value: c1.ID.Value}
-	page3, err := s.GetDmsForUserByLastActivity(ctx, user, database.WithDescending(), database.WithPagingToken(token))
+	page3, err := s.GetDmFeedPage(ctx, user, snapshot, cursorOf(c1), 2)
 	require.NoError(t, err)
 	require.Empty(t, page3)
 }
 
-func testStore_GetDmsForUserByLastActivity_Empty(t *testing.T, s chat.Store) {
+// testStore_GetDmFeedPage_SnapshotPinned verifies that a chat which becomes
+// active after the snapshot leaves the pinned window and is not paginated, so
+// the multi-page read stays internally consistent.
+func testStore_GetDmFeedPage_SnapshotPinned(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
-	got, err := s.GetDmsForUserByLastActivity(ctx, model.MustGenerateUserID(), database.WithDescending())
+	user := model.MustGenerateUserID()
+	other := model.MustGenerateUserID()
+	c1 := putChat(t, s, user, other, at(100))
+	c2 := putChat(t, s, user, other, at(200))
+	c3 := putChat(t, s, user, other, at(300))
+
+	snapshot := at(350) // All three are within the window.
+
+	// Page 1: the most recent chat.
+	page1, err := s.GetDmFeedPage(ctx, user, snapshot, nil, 1)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{c3.ID.Value}, chatIDValues(page1))
+
+	// c1, not yet paged, becomes active after the snapshot, moving above the
+	// watermark.
+	advanced, err := s.AdvanceLastMessage(ctx, c1.ID, &messagingpb.MessageId{Value: 1}, at(999))
+	require.NoError(t, err)
+	require.True(t, advanced)
+
+	// Page 2 sees only c2: c1 has left the snapshot window, so it is neither
+	// duplicated nor reordered into the read. Its freshness is the stream's job.
+	page2, err := s.GetDmFeedPage(ctx, user, snapshot, cursorOf(page1[len(page1)-1]), 10)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{c2.ID.Value}, chatIDValues(page2))
+}
+
+func testStore_GetDmFeedPage_Empty(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	got, err := s.GetDmFeedPage(ctx, model.MustGenerateUserID(), at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Empty(t, got)
+}
+
+func cursorOf(c *chat.Chat) *chat.DmFeedCursor {
+	return &chat.DmFeedCursor{LastActivity: c.LastActivity, ChatID: c.ID}
 }
 
 func putChat(t *testing.T, s chat.Store, a, b *commonpb.UserId, lastActivity time.Time) *chat.Chat {

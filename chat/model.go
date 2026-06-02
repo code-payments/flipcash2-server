@@ -7,6 +7,7 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 )
 
 // ChatIDSize is the length, in bytes, of a chat ID.
@@ -20,10 +21,11 @@ const ChatIDSize = 32
 // profiles, per-member message pointers, and the last message — live in other
 // domains (profile, messaging) and are hydrated by the server layer.
 type Chat struct {
-	ID           *commonpb.ChatId
-	Type         chatpb.Metadata_ChatType
-	Members      []*commonpb.UserId
-	LastActivity time.Time
+	ID            *commonpb.ChatId
+	Type          chatpb.Metadata_ChatType
+	Members       []*commonpb.UserId
+	LastActivity  time.Time
+	LastMessageID *messagingpb.MessageId
 }
 
 // Clone returns a deep copy of the chat.
@@ -32,11 +34,16 @@ func (c *Chat) Clone() *Chat {
 	for i, m := range c.Members {
 		members[i] = &commonpb.UserId{Value: append([]byte(nil), m.Value...)}
 	}
+	var lastMessageID *messagingpb.MessageId
+	if c.LastMessageID != nil {
+		lastMessageID = &messagingpb.MessageId{Value: c.LastMessageID.Value}
+	}
 	return &Chat{
-		ID:           &commonpb.ChatId{Value: append([]byte(nil), c.ID.Value...)},
-		Type:         c.Type,
-		Members:      members,
-		LastActivity: c.LastActivity,
+		ID:            &commonpb.ChatId{Value: append([]byte(nil), c.ID.Value...)},
+		Type:          c.Type,
+		Members:       members,
+		LastActivity:  c.LastActivity,
+		LastMessageID: lastMessageID,
 	}
 }
 

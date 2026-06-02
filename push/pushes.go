@@ -111,8 +111,8 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 	if len(users) == 0 {
 		return nil
 	}
-	title := "{0} joined Flipcash"
-	body := "Send them cash"
+	title := "{0} Joined Flipcash"
+	body := "You can now send them cash"
 	customPayload := &pushpb.Payload{
 		Category: pushpb.Payload_CONTACT_JOIN,
 		GroupKey: pushpb.Payload_CONTACT_JOIN.String(),
@@ -129,11 +129,12 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 }
 
 func SendContactPaymentPush(ctx context.Context, pusher Pusher, recipient *commonpb.UserId, contact *phonepb.PhoneNumber, currencyName string, region ocp_currency.Code, nativeAmount float64) error {
-	title := fmt.Sprintf(
-		"{0} sent you %s",
+	title := "{0}"
+	body := fmt.Sprintf(
+		"Sent you %s of %s",
 		localization.FormatFiat(defaultLocale, region, nativeAmount),
+		currencyName,
 	)
-	body := fmt.Sprintf("Of %s", currencyName)
 	customPayload := &pushpb.Payload{
 		Category: pushpb.Payload_CHAT,
 		GroupKey: contact.Value, // todo: Chat ID when we implement chat

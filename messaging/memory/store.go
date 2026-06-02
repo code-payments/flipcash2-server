@@ -199,22 +199,32 @@ func (m *memory) GetMessagesByRefs(_ context.Context, refs []messaging.MessageRe
 	return out, nil
 }
 
-func (m *memory) GetPointersForChats(_ context.Context, chatIDs []*commonpb.ChatId) (map[string][]*messagingpb.Pointer, error) {
+func (m *memory) GetPointersForChats(_ context.Context, refs []messaging.PointerRef) (map[string][]*messagingpb.Pointer, error) {
 	m.Lock()
 	defer m.Unlock()
 
+	// Mirror the DynamoDB store: return each named member's stored pointers,
+	// addressed by exact key rather than returning the whole chat.
 	out := make(map[string][]*messagingpb.Pointer)
-	for _, chatID := range chatIDs {
-		key := string(chatID.Value)
-		cs := m.chats[key]
-		if cs == nil || len(cs.pointers) == 0 {
+	seen := make(map[string]struct{})
+	for _, ref := range refs {
+		chatKey := string(ref.ChatID.Value)
+		cs := m.chats[chatKey]
+		if cs == nil {
 			continue
 		}
-		pointers := make([]*messagingpb.Pointer, 0, len(cs.pointers))
-		for _, p := range cs.pointers {
-			pointers = append(pointers, proto.Clone(p).(*messagingpb.Pointer))
+		for _, member := range ref.Members {
+			dedup := chatKey + "\x00" + string(member.Value)
+			if _, dup := seen[dedup]; dup {
+				continue
+			}
+			seen[dedup] = struct{}{}
+			for _, t := range messaging.StoredPointerTypes {
+				if p, ok := cs.pointers[pointerKey(t, member)]; ok {
+					out[chatKey] = append(out[chatKey], proto.Clone(p).(*messagingpb.Pointer))
+				}
+			}
 		}
-		out[key] = pointers
 	}
 	return out, nil
 }

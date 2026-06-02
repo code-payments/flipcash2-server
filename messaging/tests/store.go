@@ -359,9 +359,14 @@ func testStore_GetPointersForChats(t *testing.T, s messaging.Store) {
 	_, err = s.AdvancePointer(ctx, chatB, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
 
-	// Batch across chats: A and B return their pointers; C (no pointers) is
-	// absent from the map.
-	got, err := s.GetPointersForChats(ctx, []*commonpb.ChatId{chatA, chatB, chatC})
+	// Batch across chats: A and B return the named members' pointers; C (no
+	// pointers) is absent from the map.
+	members := []*commonpb.UserId{userA, userB}
+	got, err := s.GetPointersForChats(ctx, []messaging.PointerRef{
+		{ChatID: chatA, Members: members},
+		{ChatID: chatB, Members: members},
+		{ChatID: chatC, Members: members},
+	})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	require.Len(t, got[string(chatA.Value)], 1)

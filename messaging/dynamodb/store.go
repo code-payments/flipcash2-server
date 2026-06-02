@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -326,21 +327,62 @@ func (s *store) GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*me
 	return pointers, nil
 }
 
-func (s *store) GetPointersForChats(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string][]*messagingpb.Pointer, error) {
-	// message_pointers has no cross-chat index, so this issues one query per
-	// distinct chat. Bounded by the feed page size; parallelize if it gets hot.
+func (s *store) GetPointersForChats(ctx context.Context, refs []messaging.PointerRef) (map[string][]*messagingpb.Pointer, error) {
+	// DELIVERED and READ are the only pointer types ever stored (StoredPointerTypes),
+	// and the refs name the members, so the exact (chat, member, type) keys are
+	// known up front. Enumerate them and batch-read in one path, mirroring
+	// GetMessagesByRefs — no per-chat partition scan. Dedup so a repeated
+	// (chat, member) pair collapses.
+	type dedupKey struct {
+		chat string
+		user string
+	}
+	seen := make(map[dedupKey]struct{})
+	var keys []map[string]types.AttributeValue
+	for _, ref := range refs {
+		for _, member := range ref.Members {
+			dk := dedupKey{chat: string(ref.ChatID.Value), user: string(member.Value)}
+			if _, dup := seen[dk]; dup {
+				continue
+			}
+			seen[dk] = struct{}{}
+			for _, t := range messaging.StoredPointerTypes {
+				keys = append(keys, map[string]types.AttributeValue{
+					attrPK: avS(chatPK(ref.ChatID)),
+					attrSK: avS(pointerSK(t, member)),
+				})
+			}
+		}
+	}
+
 	out := make(map[string][]*messagingpb.Pointer)
-	for _, chatID := range chatIDs {
-		key := string(chatID.Value)
-		if _, done := out[key]; done {
-			continue
+	for start := 0; start < len(keys); start += maxBatchGetKeys {
+		end := start + maxBatchGetKeys
+		if end > len(keys) {
+			end = len(keys)
 		}
-		pointers, err := s.GetPointers(ctx, chatID)
-		if err != nil {
-			return nil, err
+
+		// Retry UnprocessedKeys until the batch drains.
+		req := map[string]types.KeysAndAttributes{
+			s.pointersTable: {Keys: keys[start:end]},
 		}
-		if len(pointers) > 0 {
-			out[key] = pointers
+		for len(req[s.pointersTable].Keys) > 0 {
+			resp, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range resp.Responses[s.pointersTable] {
+				// Items come back unordered and intermixed across chats; the owning
+				// chat is recovered from the item's pk (the pointers table stores no
+				// chat_id attribute of its own).
+				key := string(chatIDFromPK(item).Value)
+				out[key] = append(out[key], pointerFromItem(item))
+			}
+			if unprocessed, ok := resp.UnprocessedKeys[s.pointersTable]; ok && len(unprocessed.Keys) > 0 {
+				req = map[string]types.KeysAndAttributes{s.pointersTable: unprocessed}
+			} else {
+				break
+			}
 		}
 	}
 	return out, nil
@@ -526,6 +568,13 @@ func chatIDFromItem(item map[string]types.AttributeValue) *commonpb.ChatId {
 	return &commonpb.ChatId{Value: append([]byte(nil), asB(item[attrChatID])...)}
 }
 
+// chatIDFromPK recovers a chat ID from an item's pk ("chat#<hex>"), the inverse
+// of chatPK. Used for items (like pointers) that carry no chat_id attribute.
+func chatIDFromPK(item map[string]types.AttributeValue) *commonpb.ChatId {
+	id, _ := hex.DecodeString(strings.TrimPrefix(asS(item[attrPK]), "chat#"))
+	return &commonpb.ChatId{Value: id}
+}
+
 func chatPK(chatID *commonpb.ChatId) string { return "chat#" + hex.EncodeToString(chatID.Value) }
 
 func msgSK(seq uint64) string { return fmt.Sprintf("%s%0*d", msgPrefix, seqPadWidth, seq) }
@@ -544,6 +593,13 @@ func avB(v []byte) types.AttributeValue {
 }
 func avN(v uint64) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.FormatUint(v, 10)}
+}
+
+func asS(av types.AttributeValue) string {
+	if s, ok := av.(*types.AttributeValueMemberS); ok {
+		return s.Value
+	}
+	return ""
 }
 
 func asB(av types.AttributeValue) []byte {

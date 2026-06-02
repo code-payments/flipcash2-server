@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -36,9 +37,13 @@ import (
 const (
 	gsiByActivity = "by_activity"
 
+	// chatKeyPrefix prefixes a chat ID in the chats table pk and the dm_inbox
+	// sk. The chat ID is recovered from the key, so it is not stored as its own
+	// attribute.
+	chatKeyPrefix = "chat#"
+
 	attrPK            = "pk"
 	attrSK            = "sk"
-	attrChatID        = "chat_id"
 	attrType          = "type"
 	attrMembers       = "members"
 	attrLastActivity  = "last_activity"
@@ -108,7 +113,7 @@ func (s *store) GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*chat
 	if len(out.Item) == 0 {
 		return nil, chat.ErrChatNotFound
 	}
-	return chatFromItem(out.Item)
+	return chatFromItem(chatID, out.Item)
 }
 
 func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
@@ -146,7 +151,11 @@ func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, snap
 	}
 	chats := make([]*chat.Chat, 0, len(out.Items))
 	for _, item := range out.Items {
-		c, err := chatFromItem(item)
+		chatID, err := chatIDFromSK(item)
+		if err != nil {
+			return nil, err
+		}
+		c, err := chatFromItem(chatID, item)
 		if err != nil {
 			return nil, err
 		}
@@ -248,7 +257,6 @@ func (s *store) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId,
 func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 	item := map[string]types.AttributeValue{
 		attrPK:           avS(chatPK(c.ID)),
-		attrChatID:       avB(c.ID.Value),
 		attrType:         avN(uint64(c.Type)),
 		attrMembers:      membersAttr(c.Members),
 		attrLastActivity: avN(uint64(c.LastActivity.UnixNano())),
@@ -263,7 +271,6 @@ func (s *store) dmInboxItem(c *chat.Chat, member *commonpb.UserId) map[string]ty
 	item := map[string]types.AttributeValue{
 		attrPK:           avS(userPK(member)),
 		attrSK:           avS(chatSK(c.ID)),
-		attrChatID:       avB(c.ID.Value),
 		attrType:         avN(uint64(c.Type)),
 		attrMembers:      membersAttr(c.Members),
 		attrLastActivity: avN(uint64(c.LastActivity.UnixNano())),
@@ -274,7 +281,10 @@ func (s *store) dmInboxItem(c *chat.Chat, member *commonpb.UserId) map[string]ty
 	return item
 }
 
-func chatFromItem(item map[string]types.AttributeValue) (*chat.Chat, error) {
+// chatFromItem builds a Chat from a chats or dm_inbox item. The chat ID is not
+// stored on the item; it is recovered from the item's key by the caller and
+// passed in.
+func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue) (*chat.Chat, error) {
 	typeVal, err := parseN(item[attrType])
 	if err != nil {
 		return nil, err
@@ -284,7 +294,7 @@ func chatFromItem(item map[string]types.AttributeValue) (*chat.Chat, error) {
 		return nil, err
 	}
 	c := &chat.Chat{
-		ID:           &commonpb.ChatId{Value: append([]byte(nil), asB(item[attrChatID])...)},
+		ID:           &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
 		Type:         protoChatType(uint64(typeVal)),
 		Members:      membersFromItem(item),
 		LastActivity: time.Unix(0, nanos).UTC(),
@@ -317,9 +327,24 @@ func membersAttr(members []*commonpb.UserId) types.AttributeValue {
 	return &types.AttributeValueMemberL{Value: values}
 }
 
-func chatPK(chatID *commonpb.ChatId) string { return "chat#" + hex.EncodeToString(chatID.Value) }
-func chatSK(chatID *commonpb.ChatId) string { return "chat#" + hex.EncodeToString(chatID.Value) }
+func chatPK(chatID *commonpb.ChatId) string { return chatKeyPrefix + hex.EncodeToString(chatID.Value) }
+func chatSK(chatID *commonpb.ChatId) string { return chatKeyPrefix + hex.EncodeToString(chatID.Value) }
 func userPK(userID *commonpb.UserId) string { return "user#" + hex.EncodeToString(userID.Value) }
+
+// chatIDFromSK recovers a chat ID from a dm_inbox item's sk ("chat#<hex>"),
+// the inverse of chatSK.
+func chatIDFromSK(item map[string]types.AttributeValue) (*commonpb.ChatId, error) {
+	sk := asS(item[attrSK])
+	encoded, ok := strings.CutPrefix(sk, chatKeyPrefix)
+	if !ok {
+		return nil, fmt.Errorf("unexpected sk %q", sk)
+	}
+	id, err := hex.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("decoding chat id from sk %q: %w", sk, err)
+	}
+	return &commonpb.ChatId{Value: id}, nil
+}
 
 func avS(v string) types.AttributeValue { return &types.AttributeValueMemberS{Value: v} }
 func avB(v []byte) types.AttributeValue {
@@ -327,6 +352,13 @@ func avB(v []byte) types.AttributeValue {
 }
 func avN(v uint64) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.FormatUint(v, 10)}
+}
+
+func asS(av types.AttributeValue) string {
+	if s, ok := av.(*types.AttributeValueMemberS); ok {
+		return s.Value
+	}
+	return ""
 }
 
 func asB(av types.AttributeValue) []byte {

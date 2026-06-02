@@ -1,6 +1,10 @@
 package chat
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
+	"sort"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -8,10 +12,58 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+
+	"github.com/code-payments/flipcash2-server/model"
 )
 
 // ChatIDSize is the length, in bytes, of a chat ID.
 const ChatIDSize = 32
+
+// dmChatIDDomain namespaces the DM chat ID hash so it can never collide with an
+// ID derived for another purpose, even if that purpose hashes the same members.
+var dmChatIDDomain = []byte("flipcash:chat:dm")
+
+// MustDeriveDmChatID returns the deterministic chat ID for a DM between two
+// users.
+//
+// The ID is derived purely from the participants, so it is stable across calls
+// and independent of who initiates the chat: MustDeriveDmChatID(a, b) always
+// equals MustDeriveDmChatID(b, a). This lets either user open the canonical DM
+// without a prior lookup, and makes creation idempotent.
+//
+// Derivation hashes the byte-sorted, de-duplicated set of user IDs (a DM with
+// oneself collapses to a single member) under a domain-separation prefix. Since
+// the input is a sorted set, member ordering and duplicates do not affect the
+// result. The SHA-256 digest is ChatIDSize bytes wide by construction.
+//
+// It panics if either user ID is not the expected fixed width, which would be a
+// programming error: all user IDs in the system are UUIDs. Fixed-width members
+// also make the sorted concatenation unambiguous without length prefixing.
+func MustDeriveDmChatID(a, b *commonpb.UserId) *commonpb.ChatId {
+	for _, u := range []*commonpb.UserId{a, b} {
+		if len(u.Value) != model.UserIDSize {
+			panic(fmt.Sprintf("user id must be %d bytes, got %d", model.UserIDSize, len(u.Value)))
+		}
+	}
+
+	// Sorted set of the participants' raw ID bytes: sort, then drop the
+	// duplicate so a self-DM hashes a single member.
+	members := [][]byte{a.Value, b.Value}
+	sort.Slice(members, func(i, j int) bool {
+		return bytes.Compare(members[i], members[j]) < 0
+	})
+	if bytes.Equal(members[0], members[1]) {
+		members = members[:1]
+	}
+
+	h := sha256.New()
+	h.Write(dmChatIDDomain)
+	for _, m := range members {
+		h.Write(m)
+	}
+
+	return &commonpb.ChatId{Value: h.Sum(nil)}
+}
 
 // Chat is the stored metadata for a chat.
 //

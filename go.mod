@@ -5,9 +5,12 @@ go 1.26.0
 require (
 	firebase.google.com/go/v4 v4.18.0
 	github.com/ReneKroon/ttlcache v1.7.0
-	github.com/code-payments/flipcash2-protobuf-api v1.7.1-0.20260528171729-f73422056712
+	github.com/aws/aws-sdk-go-v2 v1.41.9
+	github.com/aws/aws-sdk-go-v2/credentials v1.19.19
+	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.57.6
+	github.com/code-payments/flipcash2-protobuf-api v1.8.1-0.20260602131012-22dcd9237223
 	github.com/code-payments/ocp-protobuf-api v1.12.0
-	github.com/code-payments/ocp-server v1.15.0
+	github.com/code-payments/ocp-server v1.16.1-0.20260602150419-e3cf1fb688cc
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2
 	github.com/georgysavva/scany/v2 v2.1.4
 	github.com/google/uuid v1.6.0
@@ -36,7 +39,12 @@ require (
 	github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5 // indirect
-	github.com/aws/aws-sdk-go-v2 v0.17.0 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/rds/auth v1.6.25 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.25 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.25 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.10 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/endpoint-discovery v1.12.2 // indirect
+	github.com/aws/smithy-go v1.26.0 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/code-payments/code-vm-indexer v1.2.0 // indirect
 	github.com/containerd/continuity v0.4.3 // indirect
@@ -69,7 +77,6 @@ require (
 	github.com/jackc/pgx/v4 v4.18.3 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jdgcs/ed25519 v0.0.0-20200408034030-96c10d46cdc3 // indirect
-	github.com/jmespath/go-jmespath v0.0.0-20180206201540-c2b33e8439af // indirect
 	github.com/jmoiron/sqlx v1.4.0 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect

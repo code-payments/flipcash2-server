@@ -11,6 +11,10 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 )
 
+// UserIDSize is the length, in bytes, of a user ID. User IDs are UUIDs (see
+// GenerateUserId), so they are fixed-width.
+const UserIDSize = 16
+
 func MustGenerateUserID() *commonpb.UserId {
 	id, err := GenerateUserId()
 	if err != nil {

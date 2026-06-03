@@ -262,16 +262,47 @@ func (m *memory) AdvancePointer(
 		return false, messaging.ErrMessageNotFound
 	}
 
+	return m.advancePointerLocked(cs, userID, pointerType, newValue), nil
+}
+
+func (m *memory) AdvancePointerUnchecked(
+	_ context.Context,
+	chatID *commonpb.ChatId,
+	userID *commonpb.UserId,
+	pointerType messagingpb.Pointer_Type,
+	newValue *messagingpb.MessageId,
+) (bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	cs := m.chats[string(chatID.Value)]
+	if cs == nil {
+		// The caller guarantees the message (hence the chat) exists; a missing
+		// chat is treated as not-advanced rather than a panic.
+		return false, nil
+	}
+	return m.advancePointerLocked(cs, userID, pointerType, newValue), nil
+}
+
+// advancePointerLocked applies the monotonic forward-only pointer update and
+// reports whether it advanced. The caller must hold m's lock. It is the shared
+// core of AdvancePointer and AdvancePointerUnchecked, past their existence checks.
+func (m *memory) advancePointerLocked(
+	cs *chatState,
+	userID *commonpb.UserId,
+	pointerType messagingpb.Pointer_Type,
+	newValue *messagingpb.MessageId,
+) bool {
 	key := pointerKey(pointerType, userID)
 	if cur, ok := cs.pointers[key]; ok && newValue.Value <= cur.Value.Value {
-		return false, nil
+		return false
 	}
 	cs.pointers[key] = &messagingpb.Pointer{
 		Type:   pointerType,
 		UserId: &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
 		Value:  &messagingpb.MessageId{Value: newValue.Value},
 	}
-	return true, nil
+	return true
 }
 
 func pointerKey(pointerType messagingpb.Pointer_Type, userID *commonpb.UserId) string {

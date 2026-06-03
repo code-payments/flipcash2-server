@@ -36,6 +36,7 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_Pointers,
 		testStore_GetPointersForChats,
 		testStore_AdvancePointer_MessageNotFound,
+		testStore_AdvancePointerUnchecked,
 	} {
 		tf(t, s)
 		teardown()
@@ -456,6 +457,39 @@ func testStore_AdvancePointer_MessageNotFound(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	_, err = s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
 	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
+}
+
+func testStore_AdvancePointerUnchecked(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	user := model.MustGenerateUserID()
+
+	for i := 1; i <= 3; i++ {
+		_, err := s.PutMessage(ctx, chatID, user, textContent("m"), at(int64(i)), generateClientID(), true)
+		require.NoError(t, err)
+	}
+
+	// Forward advances, with the same monotonic semantics as AdvancePointer.
+	advanced, err := s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
+	require.NoError(t, err)
+	require.True(t, advanced)
+
+	// Backward is a no-op.
+	advanced, err = s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	require.NoError(t, err)
+	require.False(t, advanced)
+
+	// Unlike AdvancePointer, the target's existence is not verified: advancing to
+	// a message ID with no backing message succeeds rather than erroring. (The
+	// caller is responsible for only passing a known-existing ID.)
+	advanced, err = s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 999})
+	require.NoError(t, err)
+	require.True(t, advanced)
+
+	pointers, err := s.GetPointers(ctx, chatID)
+	require.NoError(t, err)
+	require.Len(t, pointers, 1)
+	require.Equal(t, uint64(999), pointers[0].Value.Value)
 }
 
 func textContent(text string) []*messagingpb.Content {

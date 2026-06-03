@@ -120,6 +120,21 @@ type Store interface {
 		pointerType messagingpb.Pointer_Type,
 		newValue *messagingpb.MessageId,
 	) (bool, error)
+
+	// AdvancePointerUnchecked is AdvancePointer for a newValue the caller already
+	// knows references an existing message — e.g. the sender's own READ pointer
+	// right after PutMessage returns the message it just wrote. It skips the
+	// existence check (and the read backing it), saving a round trip; the
+	// monotonic forward-only behavior is otherwise identical to AdvancePointer.
+	// It must not be used with a caller-supplied newValue, whose existence is not
+	// guaranteed.
+	AdvancePointerUnchecked(
+		ctx context.Context,
+		chatID *commonpb.ChatId,
+		userID *commonpb.UserId,
+		pointerType messagingpb.Pointer_Type,
+		newValue *messagingpb.MessageId,
+	) (bool, error)
 }
 
 // PageTokenFromID encodes a message ID as a paging token. The token is the

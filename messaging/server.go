@@ -151,8 +151,10 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 	}
 
 	// The sender has implicitly read their own message, so advance their READ
-	// pointer past it. Best-effort: it's reconstructable and self-heals.
-	pointerAdvanced, err := s.messages.AdvancePointer(ctx, req.ChatId, userID, messagingpb.Pointer_READ, msg.ID)
+	// pointer past it. The target is the message we just persisted, so its
+	// existence is guaranteed — use the unchecked path to skip the existence read.
+	// Best-effort: it's reconstructable and self-heals.
+	pointerAdvanced, err := s.messages.AdvancePointerUnchecked(ctx, req.ChatId, userID, messagingpb.Pointer_READ, msg.ID)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure advancing sender read pointer")
 	}

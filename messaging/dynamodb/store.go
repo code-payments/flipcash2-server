@@ -407,7 +407,31 @@ func (s *store) AdvancePointer(
 		return false, messaging.ErrMessageNotFound
 	}
 
-	_, err = s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+	return s.advancePointer(ctx, chatID, userID, pointerType, newValue)
+}
+
+func (s *store) AdvancePointerUnchecked(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	userID *commonpb.UserId,
+	pointerType messagingpb.Pointer_Type,
+	newValue *messagingpb.MessageId,
+) (bool, error) {
+	// Caller guarantees newValue exists, so the existence read is skipped.
+	return s.advancePointer(ctx, chatID, userID, pointerType, newValue)
+}
+
+// advancePointer performs the monotonic forward-only pointer update, the shared
+// core of AdvancePointer and AdvancePointerUnchecked. It does not verify that
+// newValue references an existing message.
+func (s *store) advancePointer(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	userID *commonpb.UserId,
+	pointerType messagingpb.Pointer_Type,
+	newValue *messagingpb.MessageId,
+) (bool, error) {
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.pointersTable),
 		Key: map[string]types.AttributeValue{
 			attrPK: avS(chatPK(chatID)),

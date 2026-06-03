@@ -101,11 +101,11 @@ func (f *fakeMessagingReader) LastMessages(_ context.Context, refs []chat.Messag
 	return out, nil
 }
 
-func (f *fakeMessagingReader) Pointers(_ context.Context, chatIDs []*commonpb.ChatId) (map[string][]*messagingpb.Pointer, error) {
+func (f *fakeMessagingReader) Pointers(_ context.Context, refs []chat.PointerRef) (map[string][]*messagingpb.Pointer, error) {
 	out := make(map[string][]*messagingpb.Pointer)
-	for _, id := range chatIDs {
-		if p, ok := f.pointers[string(id.Value)]; ok {
-			out[string(id.Value)] = p
+	for _, ref := range refs {
+		if p, ok := f.pointers[string(ref.ChatID.Value)]; ok {
+			out[string(ref.ChatID.Value)] = p
 		}
 	}
 	return out, nil

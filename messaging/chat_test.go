@@ -52,7 +52,10 @@ func TestChatMessagingReader(t *testing.T) {
 	// Pointers: delegated, keyed by chat; a chat with none is absent.
 	_, err = store.AdvancePointer(ctx, chatA, sender, messagingpb.Pointer_READ, a2.ID)
 	require.NoError(t, err)
-	pointers, err := reader.Pointers(ctx, []*commonpb.ChatId{chatA, chatB})
+	pointers, err := reader.Pointers(ctx, []chat.PointerRef{
+		{ChatID: chatA, Members: []*commonpb.UserId{sender}},
+		{ChatID: chatB, Members: []*commonpb.UserId{sender}},
+	})
 	require.NoError(t, err)
 	require.Len(t, pointers[string(chatA.Value)], 1)
 	require.Equal(t, messagingpb.Pointer_READ, pointers[string(chatA.Value)][0].Type)

@@ -199,22 +199,32 @@ func (m *memory) GetMessagesByRefs(_ context.Context, refs []messaging.MessageRe
 	return out, nil
 }
 
-func (m *memory) GetPointersForChats(_ context.Context, chatIDs []*commonpb.ChatId) (map[string][]*messagingpb.Pointer, error) {
+func (m *memory) GetPointersForChats(_ context.Context, refs []messaging.PointerRef) (map[string][]*messagingpb.Pointer, error) {
 	m.Lock()
 	defer m.Unlock()
 
+	// Mirror the DynamoDB store: return each named member's stored pointers,
+	// addressed by exact key rather than returning the whole chat.
 	out := make(map[string][]*messagingpb.Pointer)
-	for _, chatID := range chatIDs {
-		key := string(chatID.Value)
-		cs := m.chats[key]
-		if cs == nil || len(cs.pointers) == 0 {
+	seen := make(map[string]struct{})
+	for _, ref := range refs {
+		chatKey := string(ref.ChatID.Value)
+		cs := m.chats[chatKey]
+		if cs == nil {
 			continue
 		}
-		pointers := make([]*messagingpb.Pointer, 0, len(cs.pointers))
-		for _, p := range cs.pointers {
-			pointers = append(pointers, proto.Clone(p).(*messagingpb.Pointer))
+		for _, member := range ref.Members {
+			dedup := chatKey + "\x00" + string(member.Value)
+			if _, dup := seen[dedup]; dup {
+				continue
+			}
+			seen[dedup] = struct{}{}
+			for _, t := range messaging.StoredPointerTypes {
+				if p, ok := cs.pointers[pointerKey(t, member)]; ok {
+					out[chatKey] = append(out[chatKey], proto.Clone(p).(*messagingpb.Pointer))
+				}
+			}
 		}
-		out[key] = pointers
 	}
 	return out, nil
 }
@@ -252,16 +262,47 @@ func (m *memory) AdvancePointer(
 		return false, messaging.ErrMessageNotFound
 	}
 
+	return m.advancePointerLocked(cs, userID, pointerType, newValue), nil
+}
+
+func (m *memory) AdvancePointerUnchecked(
+	_ context.Context,
+	chatID *commonpb.ChatId,
+	userID *commonpb.UserId,
+	pointerType messagingpb.Pointer_Type,
+	newValue *messagingpb.MessageId,
+) (bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	cs := m.chats[string(chatID.Value)]
+	if cs == nil {
+		// The caller guarantees the message (hence the chat) exists; a missing
+		// chat is treated as not-advanced rather than a panic.
+		return false, nil
+	}
+	return m.advancePointerLocked(cs, userID, pointerType, newValue), nil
+}
+
+// advancePointerLocked applies the monotonic forward-only pointer update and
+// reports whether it advanced. The caller must hold m's lock. It is the shared
+// core of AdvancePointer and AdvancePointerUnchecked, past their existence checks.
+func (m *memory) advancePointerLocked(
+	cs *chatState,
+	userID *commonpb.UserId,
+	pointerType messagingpb.Pointer_Type,
+	newValue *messagingpb.MessageId,
+) bool {
 	key := pointerKey(pointerType, userID)
 	if cur, ok := cs.pointers[key]; ok && newValue.Value <= cur.Value.Value {
-		return false, nil
+		return false
 	}
 	cs.pointers[key] = &messagingpb.Pointer{
 		Type:   pointerType,
 		UserId: &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
 		Value:  &messagingpb.MessageId{Value: newValue.Value},
 	}
-	return true, nil
+	return true
 }
 
 func pointerKey(pointerType messagingpb.Pointer_Type, userID *commonpb.UserId) string {

@@ -184,7 +184,7 @@ func (s *store) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *c
 	return len(out.Item) > 0, nil
 }
 
-func (s *store) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, error) {
+func (s *store) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, []*commonpb.UserId, error) {
 	// Load the canonical record for the current value and the member set to
 	// fan out to.
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
@@ -193,19 +193,21 @@ func (s *store) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId,
 		ConsistentRead: aws.Bool(true),
 	})
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if len(out.Item) == 0 {
-		return false, chat.ErrChatNotFound
+		return false, nil, chat.ErrChatNotFound
 	}
 	cur, err := parseInt(out.Item[attrLastActivity])
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
-	if ts.UnixNano() <= cur {
-		return false, nil // No-op: stored value is already at or after ts.
-	}
+	// Members are returned to the caller regardless of whether the activity
+	// advances, so parse them before the no-op short-circuit.
 	members := membersFromItem(out.Item)
+	if ts.UnixNano() <= cur {
+		return false, members, nil // No-op: stored value is already at or after ts.
+	}
 
 	// Bump the canonical value (conditioned so it only moves forward) and mirror
 	// it onto each member's inbox row so the GSI re-sorts. last_activity and
@@ -247,11 +249,11 @@ func (s *store) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId,
 		// A concurrent advance moved last_activity to/past ts; treat as no-op.
 		// last_activity is a derived value that self-heals on the next bump.
 		if isTransactionCanceled(err) {
-			return false, nil
+			return false, members, nil
 		}
-		return false, err
+		return false, nil, err
 	}
-	return true, nil
+	return true, members, nil
 }
 
 func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {

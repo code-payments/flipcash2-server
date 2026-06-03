@@ -69,7 +69,13 @@ type Store interface {
 	// moving last_activity forward to ts and last_message_id to messageID, and
 	// reports whether it advanced. The two fields are two views of the same event
 	// (the newest message) and are updated together. If the stored last_activity
-	// is already at or after ts, it is a no-op and returns false. It returns
-	// ErrChatNotFound if the chat does not exist.
-	AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, error)
+	// is already at or after ts, it is a no-op and reports advanced=false. It
+	// returns ErrChatNotFound if the chat does not exist.
+	//
+	// It also returns the chat's members — the set the new activity is fanned out
+	// to, which it must load regardless. A caller that goes on to broadcast the
+	// same activity can reuse this set instead of issuing a separate GetMembers.
+	// Members are returned on both the advanced and no-op paths; they are nil on
+	// error (including ErrChatNotFound).
+	AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (advanced bool, members []*commonpb.UserId, err error)
 }

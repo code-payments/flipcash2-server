@@ -31,6 +31,14 @@ type MessageRef struct {
 	MessageID *messagingpb.MessageId
 }
 
+// PointerRef names a chat and the members whose pointers to hydrate. The feed
+// builds one ref per chat (with that chat's members) to batch the pointer lookup
+// across the page.
+type PointerRef struct {
+	ChatID  *commonpb.ChatId
+	Members []*commonpb.UserId
+}
+
 // MessagingReader is the read slice of the messaging domain the Chat service
 // needs to hydrate feed metadata. It is declared here (consumer side) so the
 // chat package need not import messaging, keeping the messaging→chat dependency
@@ -40,9 +48,10 @@ type MessagingReader interface {
 	// string(chatID.Value). Refs without a message are absent from the map.
 	LastMessages(ctx context.Context, refs []MessageRef) (map[string]*messagingpb.Message, error)
 
-	// Pointers returns the delivered/read pointers for each chat, keyed by
-	// string(chatID.Value). Chats with no pointers are absent from the map.
-	Pointers(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string][]*messagingpb.Pointer, error)
+	// Pointers returns the delivered/read pointers for the members named in each
+	// ref, keyed by string(chatID.Value). Chats with no matching pointers are
+	// absent from the map.
+	Pointers(ctx context.Context, refs []PointerRef) (map[string][]*messagingpb.Pointer, error)
 }
 
 type Server struct {
@@ -195,20 +204,20 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, cursor 
 // chat's pointers in one call. Member profiles are not populated yet and carry
 // an empty placeholder (UserProfile is a required field).
 func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata, error) {
-	chatIDs := make([]*commonpb.ChatId, len(chats))
-	var refs []MessageRef
+	var msgRefs []MessageRef
+	pointerRefs := make([]PointerRef, len(chats))
 	for i, c := range chats {
-		chatIDs[i] = c.ID
+		pointerRefs[i] = PointerRef{ChatID: c.ID, Members: c.Members}
 		if c.LastMessageID != nil {
-			refs = append(refs, MessageRef{ChatID: c.ID, MessageID: c.LastMessageID})
+			msgRefs = append(msgRefs, MessageRef{ChatID: c.ID, MessageID: c.LastMessageID})
 		}
 	}
 
-	lastMessages, err := s.messaging.LastMessages(ctx, refs)
+	lastMessages, err := s.messaging.LastMessages(ctx, msgRefs)
 	if err != nil {
 		return nil, err
 	}
-	pointers, err := s.messaging.Pointers(ctx, chatIDs)
+	pointers, err := s.messaging.Pointers(ctx, pointerRefs)
 	if err != nil {
 		return nil, err
 	}

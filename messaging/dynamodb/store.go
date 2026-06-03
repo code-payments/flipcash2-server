@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -39,18 +40,23 @@ const (
 	cmidPrefix  = "cmid#"
 	seqPadWidth = 20
 
+	// cmidTTL is how long a cmid# idempotency marker is retained before DynamoDB
+	// TTL reaps it. Markers only guard against retried sends, which happen within
+	// seconds, so a month of retention is ample; a (wildly implausible) retry past
+	// this window would persist a duplicate message rather than dedup.
+	cmidTTL = 30 * 24 * time.Hour
+
 	// messages table attributes
-	attrPK              = "pk"
-	attrSK              = "sk"
-	attrChatID          = "chat_id"
-	attrSeq             = "seq"
-	attrLastSeq         = "last_seq"
-	attrLastUnreadSeq   = "last_unread_seq"
-	attrSenderID        = "sender_id"
-	attrContent         = "content"
-	attrTS              = "ts"
-	attrUnreadSeq       = "unread_seq"
-	attrClientMessageID = "client_message_id"
+	attrPK            = "pk"
+	attrSK            = "sk"
+	attrSeq           = "seq"
+	attrLastSeq       = "last_seq"
+	attrLastUnreadSeq = "last_unread_seq"
+	attrSenderID      = "sender_id"
+	attrContent       = "content"
+	attrTS            = "ts"
+	attrUnreadSeq     = "unread_seq"
+	attrExpiresAt     = "expires_at" // DynamoDB TTL attribute (epoch seconds)
 
 	// message_pointers table attributes
 	attrUserID     = "user_id"
@@ -61,7 +67,7 @@ const (
 	codeConditionalCheckFailed = "ConditionalCheckFailed"
 	codeTransactionConflict    = "TransactionConflict"
 
-	maxPutMessageAttempts = 16
+	maxPutMessageAttempts = 32
 	maxBatchGetKeys       = 100
 )
 
@@ -96,16 +102,15 @@ func (s *store) PutMessage(
 	}
 
 	for attempt := 0; attempt < maxPutMessageAttempts; attempt++ {
-		// Fast idempotent path: a prior send with this client message ID wins.
-		if existing, err := s.messageByClientID(ctx, chatID, clientMessageID); err != nil {
-			return nil, err
-		} else if existing != nil {
-			return existing, nil
-		}
-
-		lastSeq, lastUnread, err := s.readCounter(ctx, chatID)
+		// The idempotency marker and the sequence counter live in the same
+		// partition (pk = chat#<id>), so one consistent batch read fetches both.
+		markerSeq, lastSeq, lastUnread, err := s.readSendState(ctx, chatID, clientMessageID)
 		if err != nil {
 			return nil, err
+		}
+		// Fast idempotent path: a prior send with this client message ID wins.
+		if markerSeq != nil {
+			return s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: *markerSeq})
 		}
 
 		nextSeq := lastSeq + 1
@@ -144,16 +149,18 @@ func (s *store) PutMessage(
 				// [1] the message itself.
 				{Put: &types.Put{
 					TableName:           aws.String(s.messagesTable),
-					Item:                s.messageItem(msg, clientMessageID, contentBlobs),
+					Item:                s.messageItem(msg, contentBlobs),
 					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 				}},
-				// [2] the idempotency marker.
+				// [2] the idempotency marker. It is transient — only the message
+				// and counter are permanent — so it carries a TTL for auto-reaping.
 				{Put: &types.Put{
 					TableName: aws.String(s.messagesTable),
 					Item: map[string]types.AttributeValue{
-						attrPK:  avS(chatPK(chatID)),
-						attrSK:  avS(cmidSK(clientMessageID)),
-						attrSeq: avN(nextSeq),
+						attrPK:        avS(chatPK(chatID)),
+						attrSK:        avS(cmidSK(clientMessageID)),
+						attrSeq:       avN(nextSeq),
+						attrExpiresAt: avN(uint64(ts.Add(cmidTTL).Unix())),
 					},
 					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 				}},
@@ -274,8 +281,8 @@ func (s *store) GetMessagesByRefs(ctx context.Context, refs []messaging.MessageR
 			}
 			for _, item := range resp.Responses[s.messagesTable] {
 				// Items come back unordered and intermixed across chats, so the
-				// owning chat is taken from the item rather than a single param.
-				msg, err := messageFromItem(chatIDFromItem(item), item)
+				// owning chat is recovered from each item's pk rather than a param.
+				msg, err := messageFromItem(chatIDFromPK(item), item)
 				if err != nil {
 					return nil, err
 				}
@@ -326,21 +333,62 @@ func (s *store) GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*me
 	return pointers, nil
 }
 
-func (s *store) GetPointersForChats(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string][]*messagingpb.Pointer, error) {
-	// message_pointers has no cross-chat index, so this issues one query per
-	// distinct chat. Bounded by the feed page size; parallelize if it gets hot.
+func (s *store) GetPointersForChats(ctx context.Context, refs []messaging.PointerRef) (map[string][]*messagingpb.Pointer, error) {
+	// DELIVERED and READ are the only pointer types ever stored (StoredPointerTypes),
+	// and the refs name the members, so the exact (chat, member, type) keys are
+	// known up front. Enumerate them and batch-read in one path, mirroring
+	// GetMessagesByRefs — no per-chat partition scan. Dedup so a repeated
+	// (chat, member) pair collapses.
+	type dedupKey struct {
+		chat string
+		user string
+	}
+	seen := make(map[dedupKey]struct{})
+	var keys []map[string]types.AttributeValue
+	for _, ref := range refs {
+		for _, member := range ref.Members {
+			dk := dedupKey{chat: string(ref.ChatID.Value), user: string(member.Value)}
+			if _, dup := seen[dk]; dup {
+				continue
+			}
+			seen[dk] = struct{}{}
+			for _, t := range messaging.StoredPointerTypes {
+				keys = append(keys, map[string]types.AttributeValue{
+					attrPK: avS(chatPK(ref.ChatID)),
+					attrSK: avS(pointerSK(t, member)),
+				})
+			}
+		}
+	}
+
 	out := make(map[string][]*messagingpb.Pointer)
-	for _, chatID := range chatIDs {
-		key := string(chatID.Value)
-		if _, done := out[key]; done {
-			continue
+	for start := 0; start < len(keys); start += maxBatchGetKeys {
+		end := start + maxBatchGetKeys
+		if end > len(keys) {
+			end = len(keys)
 		}
-		pointers, err := s.GetPointers(ctx, chatID)
-		if err != nil {
-			return nil, err
+
+		// Retry UnprocessedKeys until the batch drains.
+		req := map[string]types.KeysAndAttributes{
+			s.pointersTable: {Keys: keys[start:end]},
 		}
-		if len(pointers) > 0 {
-			out[key] = pointers
+		for len(req[s.pointersTable].Keys) > 0 {
+			resp, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range resp.Responses[s.pointersTable] {
+				// Items come back unordered and intermixed across chats; the owning
+				// chat is recovered from the item's pk (the pointers table stores no
+				// chat_id attribute of its own).
+				key := string(chatIDFromPK(item).Value)
+				out[key] = append(out[key], pointerFromItem(item))
+			}
+			if unprocessed, ok := resp.UnprocessedKeys[s.pointersTable]; ok && len(unprocessed.Keys) > 0 {
+				req = map[string]types.KeysAndAttributes{s.pointersTable: unprocessed}
+			} else {
+				break
+			}
 		}
 	}
 	return out, nil
@@ -366,7 +414,31 @@ func (s *store) AdvancePointer(
 		return false, messaging.ErrMessageNotFound
 	}
 
-	_, err = s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+	return s.advancePointer(ctx, chatID, userID, pointerType, newValue)
+}
+
+func (s *store) AdvancePointerUnchecked(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	userID *commonpb.UserId,
+	pointerType messagingpb.Pointer_Type,
+	newValue *messagingpb.MessageId,
+) (bool, error) {
+	// Caller guarantees newValue exists, so the existence read is skipped.
+	return s.advancePointer(ctx, chatID, userID, pointerType, newValue)
+}
+
+// advancePointer performs the monotonic forward-only pointer update, the shared
+// core of AdvancePointer and AdvancePointerUnchecked. It does not verify that
+// newValue references an existing message.
+func (s *store) advancePointer(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	userID *commonpb.UserId,
+	pointerType messagingpb.Pointer_Type,
+	newValue *messagingpb.MessageId,
+) (bool, error) {
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.pointersTable),
 		Key: map[string]types.AttributeValue{
 			attrPK: avS(chatPK(chatID)),
@@ -392,63 +464,74 @@ func (s *store) AdvancePointer(
 	return true, nil
 }
 
-// messageByClientID returns the message previously persisted for clientMessageID
-// in the chat, or nil if none exists.
-func (s *store) messageByClientID(ctx context.Context, chatID *commonpb.ChatId, clientMessageID *messagingpb.ClientMessageId) (*messaging.Message, error) {
-	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(s.messagesTable),
-		Key: map[string]types.AttributeValue{
-			attrPK: avS(chatPK(chatID)),
-			attrSK: avS(cmidSK(clientMessageID)),
+// readSendState fetches, in a single consistent batch read, the two partition
+// items PutMessage needs before assigning a sequence number: the idempotency
+// marker for clientMessageID and the chat's sequence counter. Both share the
+// chat's partition (pk = chat#<id>), so one BatchGetItem covers them.
+//
+// markerSeq is non-nil when a prior send with this client message ID already
+// persisted, carrying that message's sequence number; the caller then returns
+// the existing message rather than assigning a new one. lastSeq and lastUnread
+// are zero when the counter does not yet exist (the chat's first send).
+func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clientMessageID *messagingpb.ClientMessageId) (markerSeq *uint64, lastSeq, lastUnread uint64, err error) {
+	cmidSKVal := cmidSK(clientMessageID)
+	req := map[string]types.KeysAndAttributes{
+		s.messagesTable: {
+			Keys: []map[string]types.AttributeValue{
+				{attrPK: avS(chatPK(chatID)), attrSK: avS(cmidSKVal)},
+				{attrPK: avS(chatPK(chatID)), attrSK: avS(skCounter)},
+			},
+			ConsistentRead: aws.Bool(true),
 		},
-		ConsistentRead: aws.Bool(true),
-	})
-	if err != nil {
-		return nil, err
 	}
-	if len(out.Item) == 0 {
-		return nil, nil
+
+	// Drain UnprocessedKeys; values accumulate across iterations, so an item
+	// resolved early is retained while a throttled one is retried.
+	for len(req[s.messagesTable].Keys) > 0 {
+		resp, batchErr := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+		if batchErr != nil {
+			return nil, 0, 0, batchErr
+		}
+		for _, item := range resp.Responses[s.messagesTable] {
+			switch asS(item[attrSK]) {
+			case cmidSKVal:
+				seq, perr := parseN(item[attrSeq])
+				if perr != nil {
+					return nil, 0, 0, perr
+				}
+				markerSeq = &seq
+			case skCounter:
+				ls, perr := parseN(item[attrLastSeq])
+				if perr != nil {
+					return nil, 0, 0, perr
+				}
+				lu, perr := parseN(item[attrLastUnreadSeq])
+				if perr != nil {
+					return nil, 0, 0, perr
+				}
+				lastSeq, lastUnread = ls, lu
+			}
+		}
+		if unprocessed, ok := resp.UnprocessedKeys[s.messagesTable]; ok && len(unprocessed.Keys) > 0 {
+			req = map[string]types.KeysAndAttributes{s.messagesTable: unprocessed}
+		} else {
+			break
+		}
 	}
-	seq, err := parseN(out.Item[attrSeq])
-	if err != nil {
-		return nil, err
-	}
-	return s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: seq})
+	return markerSeq, lastSeq, lastUnread, nil
 }
 
-func (s *store) readCounter(ctx context.Context, chatID *commonpb.ChatId) (lastSeq, lastUnread uint64, err error) {
-	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName:      aws.String(s.messagesTable),
-		Key:            map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skCounter)},
-		ConsistentRead: aws.Bool(true),
-	})
-	if err != nil {
-		return 0, 0, err
-	}
-	if len(out.Item) == 0 {
-		return 0, 0, nil
-	}
-	lastSeq, err = parseN(out.Item[attrLastSeq])
-	if err != nil {
-		return 0, 0, err
-	}
-	lastUnread, err = parseN(out.Item[attrLastUnreadSeq])
-	if err != nil {
-		return 0, 0, err
-	}
-	return lastSeq, lastUnread, nil
-}
-
-func (s *store) messageItem(msg *messaging.Message, clientMessageID *messagingpb.ClientMessageId, contentBlobs []types.AttributeValue) map[string]types.AttributeValue {
+func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.AttributeValue) map[string]types.AttributeValue {
+	// The message ID is encoded in the sk (msg#<padded seq>, see seqFromMsgSK),
+	// the chat ID is recovered from the pk (see chatIDFromPK), and the client
+	// message ID lives on the separate cmid# idempotency marker — so none of the
+	// three is duplicated onto the message item.
 	item := map[string]types.AttributeValue{
-		attrPK:              avS(chatPK(msg.ChatID)),
-		attrSK:              avS(msgSK(msg.ID.Value)),
-		attrChatID:          avB(msg.ChatID.Value),
-		attrSeq:             avN(msg.ID.Value),
-		attrContent:         &types.AttributeValueMemberL{Value: contentBlobs},
-		attrTS:              avN(uint64(msg.Timestamp.UnixNano())),
-		attrUnreadSeq:       avN(msg.UnreadSeq),
-		attrClientMessageID: avB(clientMessageID.Value),
+		attrPK:        avS(chatPK(msg.ChatID)),
+		attrSK:        avS(msgSK(msg.ID.Value)),
+		attrContent:   &types.AttributeValueMemberL{Value: contentBlobs},
+		attrTS:        avN(uint64(msg.Timestamp.UnixNano())),
+		attrUnreadSeq: avN(msg.UnreadSeq),
 	}
 	if msg.SenderID != nil {
 		item[attrSenderID] = avB(msg.SenderID.Value)
@@ -457,7 +540,7 @@ func (s *store) messageItem(msg *messaging.Message, clientMessageID *messagingpb
 }
 
 func messageFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue) (*messaging.Message, error) {
-	seq, err := parseN(item[attrSeq])
+	seq, err := seqFromMsgSK(asS(item[attrSK]))
 	if err != nil {
 		return nil, err
 	}
@@ -522,13 +605,28 @@ func unmarshalContent(av types.AttributeValue) ([]*messagingpb.Content, error) {
 	return content, nil
 }
 
-func chatIDFromItem(item map[string]types.AttributeValue) *commonpb.ChatId {
-	return &commonpb.ChatId{Value: append([]byte(nil), asB(item[attrChatID])...)}
+// chatIDFromPK recovers a chat ID from an item's pk ("chat#<hex>"), the inverse
+// of chatPK. Used for items that carry no chat_id attribute (messages fetched
+// across partitions, pointers).
+func chatIDFromPK(item map[string]types.AttributeValue) *commonpb.ChatId {
+	id, _ := hex.DecodeString(strings.TrimPrefix(asS(item[attrPK]), "chat#"))
+	return &commonpb.ChatId{Value: id}
 }
 
 func chatPK(chatID *commonpb.ChatId) string { return "chat#" + hex.EncodeToString(chatID.Value) }
 
 func msgSK(seq uint64) string { return fmt.Sprintf("%s%0*d", msgPrefix, seqPadWidth, seq) }
+
+// seqFromMsgSK recovers a message's sequence number from its sk
+// ("msg#<padded seq>"), the inverse of msgSK. The zero-padding parses cleanly as
+// a base-10 integer.
+func seqFromMsgSK(sk string) (uint64, error) {
+	padded, ok := strings.CutPrefix(sk, msgPrefix)
+	if !ok {
+		return 0, fmt.Errorf("unexpected message sk %q", sk)
+	}
+	return strconv.ParseUint(padded, 10, 64)
+}
 
 func cmidSK(clientMessageID *messagingpb.ClientMessageId) string {
 	return cmidPrefix + hex.EncodeToString(clientMessageID.Value)
@@ -544,6 +642,13 @@ func avB(v []byte) types.AttributeValue {
 }
 func avN(v uint64) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.FormatUint(v, 10)}
+}
+
+func asS(av types.AttributeValue) string {
+	if s, ok := av.(*types.AttributeValueMemberS); ok {
+		return s.Value
+	}
+	return ""
 }
 
 func asB(av types.AttributeValue) []byte {

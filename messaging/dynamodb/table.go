@@ -12,8 +12,9 @@ import (
 
 // CreateTables provisions the messages and message_pointers tables. Both use a
 // composite (pk, sk) string key with no secondary indexes and on-demand
-// billing. It is idempotent: tables that already exist are left as-is. The call
-// blocks until both tables are ACTIVE.
+// billing. The messages table has TTL enabled on attrExpiresAt so the transient
+// cmid# idempotency markers are auto-reaped. It is idempotent: tables that
+// already exist are left as-is. The call blocks until both tables are ACTIVE.
 func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, pointersTable string) error {
 	for _, table := range []string{messagesTable, pointersTable} {
 		_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
@@ -30,10 +31,10 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, p
 		})
 		if err != nil {
 			var inUse *types.ResourceInUseException
-			if errors.As(err, &inUse) {
-				continue // Already exists.
+			if !errors.As(err, &inUse) {
+				return err
 			}
-			return err
+			// Already exists; still ensure it is ACTIVE before configuring TTL.
 		}
 		if err := dynamodb.NewTableExistsWaiter(client).Wait(ctx, &dynamodb.DescribeTableInput{
 			TableName: aws.String(table),
@@ -41,7 +42,35 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, p
 			return err
 		}
 	}
-	return nil
+
+	return ensureTTL(ctx, client, messagesTable, attrExpiresAt)
+}
+
+// ensureTTL idempotently enables DynamoDB TTL on table's attr. Enabling TTL when
+// it is already enabled (or enabling) is a no-op, so re-running CreateTables is
+// safe.
+func ensureTTL(ctx context.Context, client *dynamodb.Client, table, attr string) error {
+	desc, err := client.DescribeTimeToLive(ctx, &dynamodb.DescribeTimeToLiveInput{
+		TableName: aws.String(table),
+	})
+	if err != nil {
+		return err
+	}
+	if d := desc.TimeToLiveDescription; d != nil {
+		switch d.TimeToLiveStatus {
+		case types.TimeToLiveStatusEnabled, types.TimeToLiveStatusEnabling:
+			return nil
+		}
+	}
+
+	_, err = client.UpdateTimeToLive(ctx, &dynamodb.UpdateTimeToLiveInput{
+		TableName: aws.String(table),
+		TimeToLiveSpecification: &types.TimeToLiveSpecification{
+			Enabled:       aws.Bool(true),
+			AttributeName: aws.String(attr),
+		},
+	})
+	return err
 }
 
 // reset deletes every item from both tables, for tests.

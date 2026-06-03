@@ -162,8 +162,9 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 	// Record this message as the chat's most recent: bumps last_activity so the
 	// chat sorts to the top of members' inboxes and denormalizes last_message_id
 	// for the feed. Decoupled from persistence: a lagging bump self-heals on the
-	// next message.
-	lastMessageAdvanced, err := s.chats.AdvanceLastMessage(ctx, req.ChatId, msg.ID, msg.Timestamp)
+	// next message. It also hands back the chat members, which the broadcast below
+	// reuses to avoid a second membership read.
+	lastMessageAdvanced, members, err := s.chats.AdvanceLastMessage(ctx, req.ChatId, msg.ID, msg.Timestamp)
 	if err != nil && !errors.Is(err, chat.ErrChatNotFound) {
 		log.With(zap.Error(err)).Warn("Failure advancing chat last message")
 	}
@@ -191,7 +192,9 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 			},
 		}}
 	}
-	s.publishChatUpdate(ctx, log, req.ChatId, update, nil)
+	// Reuse the members AdvanceLastMessage already loaded (nil if it failed, in
+	// which case publishChatUpdate loads them itself).
+	s.publishChatUpdate(ctx, log, req.ChatId, update, nil, members)
 
 	return &messagingpb.SendMessageResponse{
 		Result:  messagingpb.SendMessageResponse_OK,
@@ -229,7 +232,7 @@ func (s *Server) AdvancePointer(ctx context.Context, req *messagingpb.AdvancePoi
 				UserId: userID,
 				Value:  req.NewValue,
 			}}},
-		}, nil)
+		}, nil, nil)
 	}
 
 	return &messagingpb.AdvancePointerResponse{Result: messagingpb.AdvancePointerResponse_OK}, nil
@@ -257,7 +260,7 @@ func (s *Server) NotifyIsTyping(ctx context.Context, req *messagingpb.NotifyIsTy
 				State:  req.State,
 			}},
 		},
-	}, userID)
+	}, userID, nil)
 
 	return &messagingpb.NotifyIsTypingResponse{Result: messagingpb.NotifyIsTypingResponse_OK}, nil
 }
@@ -275,11 +278,18 @@ func (s *Server) isMember(ctx context.Context, log *zap.Logger, chatID *commonpb
 // event bus, optionally excluding one user (e.g. the originator of a typing
 // notification). It is best-effort: a failure to load members is logged, not
 // surfaced, so it never fails the originating RPC.
-func (s *Server) publishChatUpdate(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, update *eventpb.ChatUpdate, exclude *commonpb.UserId) {
-	members, err := s.chats.GetMembers(ctx, chatID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure loading members for chat update broadcast")
-		return
+//
+// members may be supplied by a caller that already has the set in hand (e.g.
+// from AdvanceLastMessage), avoiding a redundant read; when nil, the members are
+// loaded here.
+func (s *Server) publishChatUpdate(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, update *eventpb.ChatUpdate, exclude *commonpb.UserId, members []*commonpb.UserId) {
+	if len(members) == 0 {
+		var err error
+		members, err = s.chats.GetMembers(ctx, chatID)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure loading members for chat update broadcast")
+			return
+		}
 	}
 
 	update.Chat = chatID

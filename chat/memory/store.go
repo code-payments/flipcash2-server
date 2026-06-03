@@ -120,20 +120,25 @@ func (m *memory) IsMember(_ context.Context, chatID *commonpb.ChatId, userID *co
 	return c.HasMember(userID), nil
 }
 
-func (m *memory) AdvanceLastMessage(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, error) {
+func (m *memory) AdvanceLastMessage(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, []*commonpb.UserId, error) {
 	m.Lock()
 	defer m.Unlock()
 
 	c, ok := m.chats[string(chatID.Value)]
 	if !ok {
-		return false, chat.ErrChatNotFound
+		return false, nil, chat.ErrChatNotFound
+	}
+	// Members are returned regardless of whether the activity advances.
+	members := make([]*commonpb.UserId, len(c.Members))
+	for i, member := range c.Members {
+		members[i] = &commonpb.UserId{Value: append([]byte(nil), member.Value...)}
 	}
 	if ts.After(c.LastActivity) {
 		c.LastActivity = ts
 		c.LastMessageID = &messagingpb.MessageId{Value: messageID.Value}
-		return true, nil
+		return true, members, nil
 	}
-	return false, nil
+	return false, members, nil
 }
 
 // lessByActivity orders chats by last_activity ascending, breaking ties by chat

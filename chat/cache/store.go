@@ -60,7 +60,7 @@ func (c *Cache) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *c
 	return isMember, err
 }
 
-func (c *Cache) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, error) {
+func (c *Cache) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, []*commonpb.UserId, error) {
 	return c.db.AdvanceLastMessage(ctx, chatID, messageID, ts)
 }
 

@@ -130,10 +130,11 @@ func testStore_IsMember(t *testing.T, s chat.Store) {
 func testStore_AdvanceLastMessage(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
+	member := model.MustGenerateUserID()
 	c := &chat.Chat{
 		ID:           generateChatID(),
 		Type:         chatpb.Metadata_DM,
-		Members:      []*commonpb.UserId{model.MustGenerateUserID()},
+		Members:      []*commonpb.UserId{member},
 		LastActivity: at(100),
 	}
 	require.NoError(t, s.PutChat(ctx, c))
@@ -143,28 +144,33 @@ func testStore_AdvanceLastMessage(t *testing.T, s chat.Store) {
 	require.NoError(t, err)
 	require.Nil(t, got.LastMessageID)
 
-	// Forward moves both last_activity and last_message_id, and reports advanced.
-	advanced, err := s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: 5}, at(200))
+	// Forward moves both last_activity and last_message_id, reports advanced, and
+	// returns the chat members for the caller to reuse.
+	advanced, members, err := s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: 5}, at(200))
 	require.NoError(t, err)
 	require.True(t, advanced)
+	require.Equal(t, [][]byte{member.Value}, userIDValues(members))
 	got, err = s.GetChatByID(ctx, c.ID)
 	require.NoError(t, err)
 	require.True(t, got.LastActivity.Equal(at(200)))
 	require.NotNil(t, got.LastMessageID)
 	require.Equal(t, uint64(5), got.LastMessageID.Value)
 
-	// Backward is a no-op and reports not advanced; neither field changes.
-	advanced, err = s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: 3}, at(150))
+	// Backward is a no-op and reports not advanced; neither field changes. Members
+	// are still returned on the no-op path.
+	advanced, members, err = s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: 3}, at(150))
 	require.NoError(t, err)
 	require.False(t, advanced)
+	require.Equal(t, [][]byte{member.Value}, userIDValues(members))
 	got, err = s.GetChatByID(ctx, c.ID)
 	require.NoError(t, err)
 	require.True(t, got.LastActivity.Equal(at(200)))
 	require.Equal(t, uint64(5), got.LastMessageID.Value)
 
-	// Unknown chat → ErrChatNotFound.
-	_, err = s.AdvanceLastMessage(ctx, generateChatID(), &messagingpb.MessageId{Value: 1}, at(1))
+	// Unknown chat → ErrChatNotFound, with nil members.
+	_, members, err = s.AdvanceLastMessage(ctx, generateChatID(), &messagingpb.MessageId{Value: 1}, at(1))
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
+	require.Nil(t, members)
 }
 
 func testStore_GetDmFeedPage_Order(t *testing.T, s chat.Store) {
@@ -248,7 +254,7 @@ func testStore_GetDmFeedPage_SnapshotPinned(t *testing.T, s chat.Store) {
 
 	// c1, not yet paged, becomes active after the snapshot, moving above the
 	// watermark.
-	advanced, err := s.AdvanceLastMessage(ctx, c1.ID, &messagingpb.MessageId{Value: 1}, at(999))
+	advanced, _, err := s.AdvanceLastMessage(ctx, c1.ID, &messagingpb.MessageId{Value: 1}, at(999))
 	require.NoError(t, err)
 	require.True(t, advanced)
 

@@ -41,17 +41,15 @@ const (
 	seqPadWidth = 20
 
 	// messages table attributes
-	attrPK              = "pk"
-	attrSK              = "sk"
-	attrChatID          = "chat_id"
-	attrSeq             = "seq"
-	attrLastSeq         = "last_seq"
-	attrLastUnreadSeq   = "last_unread_seq"
-	attrSenderID        = "sender_id"
-	attrContent         = "content"
-	attrTS              = "ts"
-	attrUnreadSeq       = "unread_seq"
-	attrClientMessageID = "client_message_id"
+	attrPK            = "pk"
+	attrSK            = "sk"
+	attrSeq           = "seq"
+	attrLastSeq       = "last_seq"
+	attrLastUnreadSeq = "last_unread_seq"
+	attrSenderID      = "sender_id"
+	attrContent       = "content"
+	attrTS            = "ts"
+	attrUnreadSeq     = "unread_seq"
 
 	// message_pointers table attributes
 	attrUserID     = "user_id"
@@ -144,7 +142,7 @@ func (s *store) PutMessage(
 				// [1] the message itself.
 				{Put: &types.Put{
 					TableName:           aws.String(s.messagesTable),
-					Item:                s.messageItem(msg, clientMessageID, contentBlobs),
+					Item:                s.messageItem(msg, contentBlobs),
 					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 				}},
 				// [2] the idempotency marker.
@@ -274,8 +272,8 @@ func (s *store) GetMessagesByRefs(ctx context.Context, refs []messaging.MessageR
 			}
 			for _, item := range resp.Responses[s.messagesTable] {
 				// Items come back unordered and intermixed across chats, so the
-				// owning chat is taken from the item rather than a single param.
-				msg, err := messageFromItem(chatIDFromItem(item), item)
+				// owning chat is recovered from each item's pk rather than a param.
+				msg, err := messageFromItem(chatIDFromPK(item), item)
 				if err != nil {
 					return nil, err
 				}
@@ -514,16 +512,17 @@ func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clie
 	return markerSeq, lastSeq, lastUnread, nil
 }
 
-func (s *store) messageItem(msg *messaging.Message, clientMessageID *messagingpb.ClientMessageId, contentBlobs []types.AttributeValue) map[string]types.AttributeValue {
+func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.AttributeValue) map[string]types.AttributeValue {
+	// The message ID is encoded in the sk (msg#<padded seq>, see seqFromMsgSK),
+	// the chat ID is recovered from the pk (see chatIDFromPK), and the client
+	// message ID lives on the separate cmid# idempotency marker — so none of the
+	// three is duplicated onto the message item.
 	item := map[string]types.AttributeValue{
-		attrPK:              avS(chatPK(msg.ChatID)),
-		attrSK:              avS(msgSK(msg.ID.Value)),
-		attrChatID:          avB(msg.ChatID.Value),
-		attrSeq:             avN(msg.ID.Value),
-		attrContent:         &types.AttributeValueMemberL{Value: contentBlobs},
-		attrTS:              avN(uint64(msg.Timestamp.UnixNano())),
-		attrUnreadSeq:       avN(msg.UnreadSeq),
-		attrClientMessageID: avB(clientMessageID.Value),
+		attrPK:        avS(chatPK(msg.ChatID)),
+		attrSK:        avS(msgSK(msg.ID.Value)),
+		attrContent:   &types.AttributeValueMemberL{Value: contentBlobs},
+		attrTS:        avN(uint64(msg.Timestamp.UnixNano())),
+		attrUnreadSeq: avN(msg.UnreadSeq),
 	}
 	if msg.SenderID != nil {
 		item[attrSenderID] = avB(msg.SenderID.Value)
@@ -532,7 +531,7 @@ func (s *store) messageItem(msg *messaging.Message, clientMessageID *messagingpb
 }
 
 func messageFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue) (*messaging.Message, error) {
-	seq, err := parseN(item[attrSeq])
+	seq, err := seqFromMsgSK(asS(item[attrSK]))
 	if err != nil {
 		return nil, err
 	}
@@ -597,12 +596,9 @@ func unmarshalContent(av types.AttributeValue) ([]*messagingpb.Content, error) {
 	return content, nil
 }
 
-func chatIDFromItem(item map[string]types.AttributeValue) *commonpb.ChatId {
-	return &commonpb.ChatId{Value: append([]byte(nil), asB(item[attrChatID])...)}
-}
-
 // chatIDFromPK recovers a chat ID from an item's pk ("chat#<hex>"), the inverse
-// of chatPK. Used for items (like pointers) that carry no chat_id attribute.
+// of chatPK. Used for items that carry no chat_id attribute (messages fetched
+// across partitions, pointers).
 func chatIDFromPK(item map[string]types.AttributeValue) *commonpb.ChatId {
 	id, _ := hex.DecodeString(strings.TrimPrefix(asS(item[attrPK]), "chat#"))
 	return &commonpb.ChatId{Value: id}
@@ -611,6 +607,17 @@ func chatIDFromPK(item map[string]types.AttributeValue) *commonpb.ChatId {
 func chatPK(chatID *commonpb.ChatId) string { return "chat#" + hex.EncodeToString(chatID.Value) }
 
 func msgSK(seq uint64) string { return fmt.Sprintf("%s%0*d", msgPrefix, seqPadWidth, seq) }
+
+// seqFromMsgSK recovers a message's sequence number from its sk
+// ("msg#<padded seq>"), the inverse of msgSK. The zero-padding parses cleanly as
+// a base-10 integer.
+func seqFromMsgSK(sk string) (uint64, error) {
+	padded, ok := strings.CutPrefix(sk, msgPrefix)
+	if !ok {
+		return 0, fmt.Errorf("unexpected message sk %q", sk)
+	}
+	return strconv.ParseUint(padded, 10, 64)
+}
 
 func cmidSK(clientMessageID *messagingpb.ClientMessageId) string {
 	return cmidPrefix + hex.EncodeToString(clientMessageID.Value)

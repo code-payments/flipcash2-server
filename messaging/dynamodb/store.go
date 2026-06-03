@@ -40,6 +40,12 @@ const (
 	cmidPrefix  = "cmid#"
 	seqPadWidth = 20
 
+	// cmidTTL is how long a cmid# idempotency marker is retained before DynamoDB
+	// TTL reaps it. Markers only guard against retried sends, which happen within
+	// seconds, so a month of retention is ample; a (wildly implausible) retry past
+	// this window would persist a duplicate message rather than dedup.
+	cmidTTL = 30 * 24 * time.Hour
+
 	// messages table attributes
 	attrPK            = "pk"
 	attrSK            = "sk"
@@ -50,6 +56,7 @@ const (
 	attrContent       = "content"
 	attrTS            = "ts"
 	attrUnreadSeq     = "unread_seq"
+	attrExpiresAt     = "expires_at" // DynamoDB TTL attribute (epoch seconds)
 
 	// message_pointers table attributes
 	attrUserID     = "user_id"
@@ -145,13 +152,15 @@ func (s *store) PutMessage(
 					Item:                s.messageItem(msg, contentBlobs),
 					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 				}},
-				// [2] the idempotency marker.
+				// [2] the idempotency marker. It is transient — only the message
+				// and counter are permanent — so it carries a TTL for auto-reaping.
 				{Put: &types.Put{
 					TableName: aws.String(s.messagesTable),
 					Item: map[string]types.AttributeValue{
-						attrPK:  avS(chatPK(chatID)),
-						attrSK:  avS(cmidSK(clientMessageID)),
-						attrSeq: avN(nextSeq),
+						attrPK:        avS(chatPK(chatID)),
+						attrSK:        avS(cmidSK(clientMessageID)),
+						attrSeq:       avN(nextSeq),
+						attrExpiresAt: avN(uint64(ts.Add(cmidTTL).Unix())),
 					},
 					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 				}},

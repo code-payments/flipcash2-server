@@ -2,12 +2,14 @@ package push
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 
@@ -148,6 +150,35 @@ func SendContactPaymentPush(ctx context.Context, pusher Pusher, recipient *commo
 		},
 	}
 	return pusher.SendPushes(ctx, title, body, customPayload, recipient)
+}
+
+func SendContactDmPush(ctx context.Context, pusher Pusher, chatId *commonpb.ChatId, message *messagingpb.Message, senderContact *phonepb.PhoneNumber, recipients ...*commonpb.UserId) error {
+	if message.Content[0].GetText() == nil {
+		return nil
+	}
+
+	title := "{0}"
+	body := message.Content[0].GetText().Text
+
+	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_CHAT,
+		GroupKey: base64.StdEncoding.EncodeToString(chatId.Value),
+		TitleSubstitutions: []*pushpb.Substitution{
+			{
+				Fallback: senderContact.Value,
+				Kind: &pushpb.Substitution_Contact{
+					Contact: senderContact,
+				},
+			},
+		},
+		Navigation: &pushpb.Navigation{
+			Type: &pushpb.Navigation_ChatId{
+				ChatId: chatId,
+			},
+		},
+	}
+
+	return pusher.SendPushes(ctx, title, body, customPayload, recipients...)
 }
 
 func SendFlipcashCurrencyGainPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string, gainRegion ocp_currency.Code, gainAmount float64) error {

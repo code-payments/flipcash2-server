@@ -21,6 +21,8 @@ import (
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/profile"
+	"github.com/code-payments/flipcash2-server/push"
 )
 
 type Server struct {
@@ -30,6 +32,9 @@ type Server struct {
 
 	chats    chat.Store
 	messages Store
+	profiles profile.Store
+
+	pusher push.Pusher
 
 	eventBus *event.Bus[*commonpb.UserId, *eventpb.Event]
 
@@ -41,6 +46,8 @@ func NewServer(
 	authz auth.Authorizer,
 	chats chat.Store,
 	messages Store,
+	profiles profile.Store,
+	pusher push.Pusher,
 	eventBus *event.Bus[*commonpb.UserId, *eventpb.Event],
 ) *Server {
 	return &Server{
@@ -48,6 +55,8 @@ func NewServer(
 		authz:    authz,
 		chats:    chats,
 		messages: messages,
+		profiles: profiles,
+		pusher:   pusher,
 		eventBus: eventBus,
 	}
 }
@@ -303,5 +312,40 @@ func (s *Server) publishChatUpdate(ctx context.Context, log *zap.Logger, chatID 
 			continue
 		}
 		s.eventBus.OnEvent(m, e)
+	}
+
+	// todo: Tie in push to the event bus?
+	// todo: Assumes a contact-based DM chat
+	if update.NewMessages == nil {
+		return
+	}
+	for _, message := range update.NewMessages.Messages {
+		if message.SenderId == nil {
+			continue
+		}
+
+		senderProfile, err := s.profiles.GetProfile(ctx, message.SenderId, true)
+		if err == profile.ErrNotFound {
+			continue
+		} else if err != nil {
+			log.With(zap.Error(err)).Warn("Failure getting sender profile for push")
+			continue
+		}
+		if senderProfile.PhoneNumber != nil {
+			continue
+		}
+
+		var membersForPush []*commonpb.UserId
+		for _, member := range members {
+			if !bytes.Equal(member.Value, message.SenderId.Value) {
+				membersForPush = append(membersForPush, member)
+			}
+		}
+
+		err = push.SendContactDmPush(ctx, s.pusher, update.Chat, message, senderProfile.PhoneNumber, membersForPush...)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure sending message push")
+			continue
+		}
 	}
 }

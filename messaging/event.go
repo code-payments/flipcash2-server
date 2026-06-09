@@ -81,7 +81,7 @@ func publishChatUpdate(
 			log.With(zap.Error(err)).Warn("Failure getting sender profile for push")
 			continue
 		}
-		if senderProfile.PhoneNumber != nil {
+		if senderProfile.PhoneNumber == nil {
 			continue
 		}
 

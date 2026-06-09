@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"crypto/sha256"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -65,4 +66,16 @@ func (m *Message) ToProto() *messagingpb.Message {
 		out.SenderId = &commonpb.UserId{Value: append([]byte(nil), m.SenderID.Value...)}
 	}
 	return out
+}
+
+// IntentIdToClientMessageId derives a ClientMessageId deterministically from an
+// intent ID. It lets a server-authored send tied to a payment (e.g. the cash
+// message posted after an intent settles) be idempotent on (chatID,
+// clientMessageID): re-deriving from the same intent yields the same ID, so a
+// retried send returns the originally persisted message instead of duplicating
+// it. The intent ID is hashed because a ClientMessageId must be exactly
+// ClientMessageIDSize bytes, narrower than an intent ID.
+func IntentIdToClientMessageId(intentID *commonpb.IntentId) *messagingpb.ClientMessageId {
+	hash := sha256.Sum256(intentID.Value)
+	return &messagingpb.ClientMessageId{Value: hash[:ClientMessageIDSize]}
 }

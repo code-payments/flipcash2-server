@@ -17,6 +17,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/model"
 	phone_hash "github.com/code-payments/flipcash2-server/phone/hash"
 	"github.com/code-payments/flipcash2-server/profile"
@@ -265,7 +266,7 @@ func (s *Server) GetFlipcashContacts(req *contactpb.GetFlipcashContactsRequest, 
 		})
 	}
 
-	phones, err := s.profiles.GetPhonesByHashesForPayment(ctx, hashes)
+	matches, err := s.profiles.GetPhonesByHashesForPayment(ctx, hashes)
 	if errors.Is(err, profile.ErrNotFound) {
 		return stream.Send(&contactpb.GetFlipcashContactsResponse{
 			Result: contactpb.GetFlipcashContactsResponse_NOT_FOUND,
@@ -275,23 +276,24 @@ func (s *Server) GetFlipcashContacts(req *contactpb.GetFlipcashContactsRequest, 
 		return status.Error(codes.Internal, "")
 	}
 
-	if len(phones) == 0 {
+	if len(matches) == 0 {
 		return stream.Send(&contactpb.GetFlipcashContactsResponse{
 			Result: contactpb.GetFlipcashContactsResponse_NOT_FOUND,
 		})
 	}
 
-	for start := 0; start < len(phones); start += GetFlipcashContactsBatchSize {
+	for start := 0; start < len(matches); start += GetFlipcashContactsBatchSize {
 		end := start + GetFlipcashContactsBatchSize
-		if end > len(phones) {
-			end = len(phones)
+		if end > len(matches) {
+			end = len(matches)
 		}
-		batch := phones[start:end]
+		batch := matches[start:end]
 
 		contacts := make([]*contactpb.FlipcashContact, len(batch))
-		for i, p := range batch {
+		for i, m := range batch {
 			contacts[i] = &contactpb.FlipcashContact{
-				Phone: p,
+				Phone:    m.PhoneNumber,
+				DmChatId: chat.MustDeriveDmChatID(userID, m.UserID),
 			}
 		}
 

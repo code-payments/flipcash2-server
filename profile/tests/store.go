@@ -270,9 +270,9 @@ func testGetPhonesByHashes(t *testing.T, s profile.Store) {
 
 	// The payment-only variant excludes users that have not enabled their number
 	// for payment.
-	got, err = s.GetPhonesByHashesForPayment(ctx, []*commonpb.Hash{hash1, hash2, hash3})
+	gotPay, err := s.GetPhonesByHashesForPayment(ctx, []*commonpb.Hash{hash1, hash2, hash3})
 	require.NoError(t, err)
-	require.Empty(t, got)
+	require.Empty(t, gotPay)
 
 	flipped, err := s.LinkPhoneNumberForPayment(ctx, user1, "+11111111111")
 	require.NoError(t, err)
@@ -281,18 +281,25 @@ func testGetPhonesByHashes(t *testing.T, s profile.Store) {
 	require.NoError(t, err)
 	require.True(t, flipped)
 
-	// Only the enabled numbers are returned (user2 is still excluded).
-	got, err = s.GetPhonesByHashesForPayment(ctx, []*commonpb.Hash{hash1, hash2, hash3, missing})
+	// Only the enabled numbers are returned (user2 is still excluded), each
+	// paired with the user that owns it.
+	gotPay, err = s.GetPhonesByHashesForPayment(ctx, []*commonpb.Hash{hash1, hash2, hash3, missing})
 	require.NoError(t, err)
 	require.ElementsMatch(t,
 		[]string{"+11111111111", "+13333333333"},
-		phoneValues(got),
+		paymentPhoneValues(gotPay),
 	)
+	ownerByPhone := make(map[string][]byte, len(gotPay))
+	for _, p := range gotPay {
+		ownerByPhone[p.PhoneNumber.Value] = p.UserID.Value
+	}
+	require.Equal(t, user1.Value, ownerByPhone["+11111111111"])
+	require.Equal(t, user3.Value, ownerByPhone["+13333333333"])
 
 	// Empty input is still handled.
-	got, err = s.GetPhonesByHashesForPayment(ctx, nil)
+	gotPay, err = s.GetPhonesByHashesForPayment(ctx, nil)
 	require.NoError(t, err)
-	require.Empty(t, got)
+	require.Empty(t, gotPay)
 }
 
 func testGetUserIdByPhoneNumber(t *testing.T, s profile.Store) {
@@ -432,6 +439,14 @@ func phoneValues(phones []*phonepb.PhoneNumber) []string {
 	out := make([]string, len(phones))
 	for i, p := range phones {
 		out[i] = p.Value
+	}
+	return out
+}
+
+func paymentPhoneValues(phones []*profile.PhoneForPayment) []string {
+	out := make([]string, len(phones))
+	for i, p := range phones {
+		out[i] = p.PhoneNumber.Value
 	}
 	return out
 }

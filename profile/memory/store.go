@@ -159,14 +159,22 @@ func (m *InMemoryStore) IsPhoneNumberLinkedForPayment(_ context.Context, id *com
 }
 
 func (m *InMemoryStore) GetPhonesByHashes(_ context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
-	return m.getPhonesByHashes(hashes, false)
+	matches, err := m.getPhonesByHashes(hashes, false)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*phonepb.PhoneNumber, len(matches))
+	for i, match := range matches {
+		out[i] = match.PhoneNumber
+	}
+	return out, nil
 }
 
-func (m *InMemoryStore) GetPhonesByHashesForPayment(_ context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+func (m *InMemoryStore) GetPhonesByHashesForPayment(_ context.Context, hashes []*commonpb.Hash) ([]*profile.PhoneForPayment, error) {
 	return m.getPhonesByHashes(hashes, true)
 }
 
-func (m *InMemoryStore) getPhonesByHashes(hashes []*commonpb.Hash, forPaymentOnly bool) ([]*phonepb.PhoneNumber, error) {
+func (m *InMemoryStore) getPhonesByHashes(hashes []*commonpb.Hash, forPaymentOnly bool) ([]*profile.PhoneForPayment, error) {
 	if len(hashes) == 0 {
 		return nil, nil
 	}
@@ -179,7 +187,7 @@ func (m *InMemoryStore) getPhonesByHashes(hashes []*commonpb.Hash, forPaymentOnl
 		wanted[string(h.Value)] = struct{}{}
 	}
 
-	var out []*phonepb.PhoneNumber
+	var out []*profile.PhoneForPayment
 	for key, hash := range m.phoneHashesByUser {
 		if _, ok := wanted[string(hash)]; !ok {
 			continue
@@ -191,7 +199,14 @@ func (m *InMemoryStore) getPhonesByHashes(hashes []*commonpb.Hash, forPaymentOnl
 		if !ok || p.PhoneNumber == nil {
 			continue
 		}
-		out = append(out, &phonepb.PhoneNumber{Value: p.PhoneNumber.Value})
+		userID, err := base64.StdEncoding.DecodeString(key)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, &profile.PhoneForPayment{
+			PhoneNumber: &phonepb.PhoneNumber{Value: p.PhoneNumber.Value},
+			UserID:      &commonpb.UserId{Value: userID},
+		})
 	}
 	return out, nil
 }

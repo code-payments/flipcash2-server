@@ -23,6 +23,7 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/push"
+	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 )
 
 type Server struct {
@@ -33,6 +34,8 @@ type Server struct {
 	chats    chat.Store
 	messages Store
 	profiles profile.Store
+
+	ocpData ocp_data.Provider
 
 	pusher push.Pusher
 
@@ -47,6 +50,7 @@ func NewServer(
 	chats chat.Store,
 	messages Store,
 	profiles profile.Store,
+	ocpData ocp_data.Provider,
 	pusher push.Pusher,
 	eventBus *event.Bus[*commonpb.UserId, *eventpb.Event],
 ) *Server {
@@ -56,6 +60,7 @@ func NewServer(
 		chats:    chats,
 		messages: messages,
 		profiles: profiles,
+		ocpData:  ocpData,
 		pusher:   pusher,
 		eventBus: eventBus,
 	}
@@ -342,7 +347,7 @@ func (s *Server) publishChatUpdate(ctx context.Context, log *zap.Logger, chatID 
 			}
 		}
 
-		err = push.SendContactDmPush(ctx, s.pusher, update.Chat, message, senderProfile.PhoneNumber, membersForPush...)
+		err = push.SendContactDmPush(ctx, s.pusher, s.ocpData, update.Chat, message, senderProfile.PhoneNumber, membersForPush...)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure sending message push")
 			continue

@@ -16,6 +16,7 @@ import (
 	"github.com/code-payments/flipcash2-server/localization"
 	ocp_currency "github.com/code-payments/ocp-server/currency"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
+	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 )
 
 var (
@@ -130,35 +131,30 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 	return pusher.SendPushes(ctx, title, body, customPayload, users...)
 }
 
-func SendContactPaymentPush(ctx context.Context, pusher Pusher, recipient *commonpb.UserId, contact *phonepb.PhoneNumber, currencyName string, region ocp_currency.Code, nativeAmount float64) error {
+func SendContactDmPush(ctx context.Context, pusher Pusher, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderContact *phonepb.PhoneNumber, recipients ...*commonpb.UserId) error {
 	title := "{0}"
-	body := fmt.Sprintf(
-		"Sent you %s of %s",
-		localization.FormatFiat(defaultLocale, region, nativeAmount),
-		currencyName,
-	)
-	customPayload := &pushpb.Payload{
-		Category: pushpb.Payload_CHAT,
-		GroupKey: contact.Value, // todo: Chat ID when we implement chat
-		TitleSubstitutions: []*pushpb.Substitution{
-			{
-				Fallback: contact.Value,
-				Kind: &pushpb.Substitution_Contact{
-					Contact: contact,
-				},
-			},
-		},
-	}
-	return pusher.SendPushes(ctx, title, body, customPayload, recipient)
-}
 
-func SendContactDmPush(ctx context.Context, pusher Pusher, chatId *commonpb.ChatId, message *messagingpb.Message, senderContact *phonepb.PhoneNumber, recipients ...*commonpb.UserId) error {
-	if message.Content[0].GetText() == nil {
+	var body string
+	switch content := message.Content[0].Type.(type) {
+	case *messagingpb.Content_Text:
+		body = content.Text.Text
+	case *messagingpb.Content_Cash:
+		currencyName, err := resolveCurrencyName(ctx, ocpData, content.Cash.Amount.Mint)
+		if err != nil {
+			return err
+		}
+		body = fmt.Sprintf(
+			"Sent you %s of %s",
+			localization.FormatFiat(
+				defaultLocale,
+				ocp_currency.Code(content.Cash.Amount.Currency),
+				content.Cash.Amount.NativeAmount,
+			),
+			currencyName,
+		)
+	default:
 		return nil
 	}
-
-	title := "{0}"
-	body := message.Content[0].GetText().Text
 
 	customPayload := &pushpb.Payload{
 		Category: pushpb.Payload_CHAT,
@@ -197,4 +193,20 @@ func SendFlipcashCurrencyGainPush(ctx context.Context, pusher Pusher, user *comm
 		},
 	}
 	return pusher.SendPushes(ctx, title, body, customPayload, user)
+}
+
+// todo: refactor push more broadly to use this with caching
+func resolveCurrencyName(ctx context.Context, ocpData ocp_data.Provider, mint *commonpb.PublicKey) (string, error) {
+	mintAccount, err := ocp_common.NewAccountFromPublicKeyBytes(mint.Value)
+	if err != nil {
+		return "", err
+	}
+	if ocp_common.IsCoreMint(mintAccount) {
+		return ocp_common.CoreMintName, nil
+	}
+	metadata, err := ocpData.GetCurrencyMetadata(ctx, mintAccount.PublicKey().ToBase58())
+	if err != nil {
+		return "", err
+	}
+	return metadata.Name, nil
 }

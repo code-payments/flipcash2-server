@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 
+	"github.com/mr-tron/base58"
 	"go.uber.org/zap"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	ocp_transactionpb "github.com/code-payments/ocp-protobuf-api/generated/go/transaction/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/contact"
 	"github.com/code-payments/flipcash2-server/phone"
 	"github.com/code-payments/flipcash2-server/profile"
@@ -168,32 +171,38 @@ func (i *Integration) maybeSendContactPaymentPush(ctx context.Context, intentRec
 		return
 	}
 
-	currencyName, err := i.getCurrencyName(ctx, mintAccount)
+	rawIntentID, err := base58.Decode(intentRecord.IntentId)
 	if err != nil {
-		log.Warn("Failed to resolve currency name", zap.Error(err))
+		log.Warn("Invalid intent id", zap.Error(err))
 		return
 	}
 
-	if err := push.SendContactPaymentPush(
+	chatID := chat.MustDeriveDmChatID(senderUserID, recipientUserID)
+	message := &messagingpb.Message{
+		Content: []*messagingpb.Content{{
+			Type: &messagingpb.Content_Cash{
+				Cash: &messagingpb.CashContent{
+					IntentId: &commonpb.IntentId{Value: rawIntentID},
+					Amount: &commonpb.CryptoPaymentAmount{
+						Currency:     string(metadata.ExchangeCurrency),
+						NativeAmount: metadata.NativeAmount,
+						Quarks:       metadata.Quantity,
+						Mint:         &commonpb.PublicKey{Value: mintAccount.PublicKey().ToBytes()},
+					},
+				},
+			},
+		}},
+	}
+
+	if err := push.SendContactDmPush(
 		ctx,
 		i.pusher,
-		recipientUserID,
+		i.ocpData,
+		chatID,
+		message,
 		senderProfile.PhoneNumber,
-		currencyName,
-		metadata.ExchangeCurrency,
-		metadata.NativeAmount,
+		recipientUserID,
 	); err != nil {
 		log.Warn("Failed to send contact payment push", zap.Error(err))
 	}
-}
-
-func (i *Integration) getCurrencyName(ctx context.Context, mint *ocp_common.Account) (string, error) {
-	if ocp_common.IsCoreMint(mint) {
-		return ocp_common.CoreMintName, nil
-	}
-	metadata, err := i.ocpData.GetCurrencyMetadata(ctx, mint.PublicKey().ToBase58())
-	if err != nil {
-		return "", err
-	}
-	return metadata.Name, nil
 }

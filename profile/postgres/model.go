@@ -204,14 +204,22 @@ func dbLinkEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 }
 
 func dbGetPhonesByHashes(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
-	return dbGetPhonesByHashesInternal(ctx, pool, hashes, false)
+	matches, err := dbGetPhonesByHashesInternal(ctx, pool, hashes, false)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*phonepb.PhoneNumber, len(matches))
+	for i, match := range matches {
+		out[i] = match.PhoneNumber
+	}
+	return out, nil
 }
 
-func dbGetPhonesByHashesForPayment(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+func dbGetPhonesByHashesForPayment(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash) ([]*profile.PhoneForPayment, error) {
 	return dbGetPhonesByHashesInternal(ctx, pool, hashes, true)
 }
 
-func dbGetPhonesByHashesInternal(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash, forPaymentOnly bool) ([]*phonepb.PhoneNumber, error) {
+func dbGetPhonesByHashesInternal(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash, forPaymentOnly bool) ([]*profile.PhoneForPayment, error) {
 	if len(hashes) == 0 {
 		return nil, nil
 	}
@@ -227,12 +235,15 @@ func dbGetPhonesByHashesInternal(ctx context.Context, pool *pgxpool.Pool, hashes
 		encoded = append(encoded, e)
 	}
 
-	var phones []string
-	query := `SELECT "phoneNumber" FROM ` + usersTableName + ` WHERE "phoneNumber" IS NOT NULL AND "phoneNumberHash" = ANY($1::text[])`
+	var rows []struct {
+		ID    string `db:"id"`
+		Phone string `db:"phoneNumber"`
+	}
+	query := `SELECT "id", "phoneNumber" FROM ` + usersTableName + ` WHERE "phoneNumber" IS NOT NULL AND "phoneNumberHash" = ANY($1::text[])`
 	if forPaymentOnly {
 		query += ` AND "isPhoneNumberLinkedForPayment" = TRUE`
 	}
-	err := pgxscan.Select(ctx, pool, &phones, query, encoded)
+	err := pgxscan.Select(ctx, pool, &rows, query, encoded)
 	if err != nil {
 		if pgxscan.NotFound(err) {
 			return nil, nil
@@ -240,9 +251,16 @@ func dbGetPhonesByHashesInternal(ctx context.Context, pool *pgxpool.Pool, hashes
 		return nil, err
 	}
 
-	out := make([]*phonepb.PhoneNumber, 0, len(phones))
-	for _, p := range phones {
-		out = append(out, &phonepb.PhoneNumber{Value: p})
+	out := make([]*profile.PhoneForPayment, 0, len(rows))
+	for _, r := range rows {
+		rawID, err := pg.Decode(r.ID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, &profile.PhoneForPayment{
+			PhoneNumber: &phonepb.PhoneNumber{Value: r.Phone},
+			UserID:      &commonpb.UserId{Value: rawID},
+		})
 	}
 	return out, nil
 }

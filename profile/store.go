@@ -13,6 +13,13 @@ var ErrNotFound = errors.New("not found")
 var ErrInvalidDisplayName = errors.New("invalid display name")
 var ErrExistingSocialLink = errors.New("existing social link")
 
+// PhoneForPayment is a payment-enabled phone number together with the user that
+// owns it.
+type PhoneForPayment struct {
+	PhoneNumber *phonepb.PhoneNumber
+	UserID      *commonpb.UserId
+}
+
 type Store interface {
 	// GetProfile returns the user profile for a user, or ErrNotFound.
 	GetProfile(ctx context.Context, id *commonpb.UserId, includePrivateProfile bool) (*profilepb.UserProfile, error)
@@ -46,10 +53,11 @@ type Store interface {
 	// phoneNumberHash matches any of the provided hashes. Order is unspecified.
 	GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error)
 
-	// GetPhonesByHashesForPayment returns the phone numbers for users whose stored
-	// phoneNumberHash matches any of the provided hashes and who have enabled their
-	// phone number for payment. Order is unspecified.
-	GetPhonesByHashesForPayment(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error)
+	// GetPhonesByHashesForPayment returns the payment-enabled phone numbers,
+	// each paired with the user that owns it, for users whose stored
+	// phoneNumberHash matches any of the provided hashes and who have enabled
+	// their phone number for payment. Order is unspecified.
+	GetPhonesByHashesForPayment(ctx context.Context, hashes []*commonpb.Hash) ([]*PhoneForPayment, error)
 
 	// GetUserIdByPhoneNumber returns the UserId currently linked to the given
 	// phone number. Returns ErrNotFound when no user holds the number.

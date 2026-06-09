@@ -98,7 +98,7 @@ func (s *store) GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) 
 	return dbGetPhonesByHashes(ctx, s.pool, hashes)
 }
 
-func (s *store) GetPhonesByHashesForPayment(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+func (s *store) GetPhonesByHashesForPayment(ctx context.Context, hashes []*commonpb.Hash) ([]*profile.PhoneForPayment, error) {
 	return dbGetPhonesByHashesForPayment(ctx, s.pool, hashes)
 }
 

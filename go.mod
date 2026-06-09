@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.21
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.20
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.57.6
-	github.com/code-payments/flipcash2-protobuf-api v1.9.1-0.20260605165737-58f03580f746
+	github.com/code-payments/flipcash2-protobuf-api v1.9.1-0.20260609131309-2abeca2461f1
 	github.com/code-payments/ocp-protobuf-api v1.12.0
 	github.com/code-payments/ocp-server v1.16.1-0.20260602150419-e3cf1fb688cc
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2
@@ -95,7 +95,6 @@ require (
 	github.com/opencontainers/runc v1.1.13 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
-	github.com/steebchen/prisma-client-go v0.47.0 // indirect
 	github.com/xeipuuv/gojsonpointer v0.0.0-20190905194746-02993c407bfb // indirect
 	github.com/xeipuuv/gojsonreference v0.0.0-20180127040603-bd5ef7bd5415 // indirect
 	github.com/xeipuuv/gojsonschema v1.2.0 // indirect

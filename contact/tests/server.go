@@ -19,6 +19,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/contact"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
@@ -436,6 +437,7 @@ func testServer_GetFlipcashContacts_OK(t *testing.T, accounts account.Store, pro
 	require.NoError(t, err)
 
 	var got []string
+	dmChatIDByPhone := make(map[string]*commonpb.ChatId)
 	for {
 		resp, err := stream.Recv()
 		if err == io.EOF {
@@ -445,10 +447,17 @@ func testServer_GetFlipcashContacts_OK(t *testing.T, accounts account.Store, pro
 		require.Equal(t, contactpb.GetFlipcashContactsResponse_OK, resp.Result)
 		for _, c := range resp.Contacts {
 			got = append(got, c.Phone.Value)
+			dmChatIDByPhone[c.Phone.Value] = c.DmChatId
 		}
 	}
 
 	require.ElementsMatch(t, []string{phoneA}, got)
+
+	// The DM chat ID is derived from the caller and the contact's Flipcash user.
+	require.Equal(t,
+		chat.MustDeriveDmChatID(f.userID, flipcashUserA).Value,
+		dmChatIDByPhone[phoneA].Value,
+	)
 }
 
 func zeroChecksum() []byte {

@@ -30,10 +30,6 @@ import (
 // to render the DM and route the recipient's push (see maybeSendContactPaymentPush),
 // so it must be consistent with the payment it accompanies and cannot be trusted
 // from the client alone.
-//
-// The proto's own required-field rules (chat_id, the payment type oneof, the
-// contact phone number) are already enforced by appMetadata.Validate() in
-// AllowCreation before this is reached.
 func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
 	chatMetadata := appMetadata.GetChat()
 	contactPayment := chatMetadata.GetContactDmPayment()
@@ -54,6 +50,10 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 		return ocp_transaction.NewIntentDeniedError("contact dm payment recipient is not a flipcash user")
 	}
 
+	if contactPayment.GetSource().GetValue() == contactPayment.GetDestination().GetValue() {
+		return ocp_transaction.NewIntentDeniedError("payment is a no-op between the same phone number")
+	}
+
 	senderOwner, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
 	if err != nil {
 		return errors.New("invalid initiator owner account")
@@ -69,6 +69,18 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 	} else if err != nil {
 		return err
 	}
+
+	// Validate the sender actually owns the source phone number
+	actualSenderUserID, err := i.profiles.GetUserIdByPhoneNumberForPayment(ctx, contactPayment.GetSource().GetValue())
+	if errors.Is(err, profile.ErrNotFound) {
+		return ocp_transaction.NewIntentDeniedError("source phone number is not linked for payment")
+	} else if err != nil {
+		return err
+	}
+	if !bytes.Equal(actualSenderUserID.Value, senderUserID.Value) {
+		return ocp_transaction.NewIntentDeniedError("sender is not linked to the source phone number")
+	}
+
 	recipientUserID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: recipientOwner.PublicKey().ToBytes()})
 	if errors.Is(err, account.ErrNotFound) {
 		return ocp_transaction.NewIntentDeniedError("recipient is not a flipcash user")
@@ -76,38 +88,15 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 		return err
 	}
 
-	// The sender must have a phone number linked for payment. The recipient
-	// surfaces this number as the DM's identity so a contact DM payment without
-	// one has no contact to attribute it to.
-	senderProfile, err := i.profiles.GetProfile(ctx, senderUserID, true)
+	// Validate the recipient actually owns the destination phone number
+	actualRecipientUserID, err := i.profiles.GetUserIdByPhoneNumberForPayment(ctx, contactPayment.GetDestination().GetValue())
 	if errors.Is(err, profile.ErrNotFound) {
-		return ocp_transaction.NewIntentDeniedError("sender has no phone number linked for payment")
+		return ocp_transaction.NewIntentDeniedError("destination phone number is not linked for payment")
 	} else if err != nil {
 		return err
 	}
-	if senderProfile.PhoneNumber == nil {
-		return ocp_transaction.NewIntentDeniedError("sender has no phone number linked for payment")
-	}
-	isLinkedForPayment, err := i.profiles.IsPhoneNumberLinkedForPayment(ctx, senderUserID, senderProfile.PhoneNumber.Value)
-	if err != nil {
-		return err
-	}
-	if !isLinkedForPayment {
-		return ocp_transaction.NewIntentDeniedError("sender has no phone number linked for payment")
-	}
-
-	// The contact being paid must be the payment's actual recipient: the supplied
-	// phone number must be linked for payment to the destination owner. This keeps
-	// the metadata honest about who is being paid, consistent with how contact
-	// payments are routed by phone-number lookup.
-	contactUserID, err := i.profiles.GetUserIdByPhoneNumberForPayment(ctx, contactPayment.GetContact().GetValue())
-	if errors.Is(err, profile.ErrNotFound) {
-		return ocp_transaction.NewIntentDeniedError("contact phone number is not linked for payment")
-	} else if err != nil {
-		return err
-	}
-	if !bytes.Equal(contactUserID.Value, recipientUserID.Value) {
-		return ocp_transaction.NewIntentDeniedError("contact does not match payment recipient")
+	if !bytes.Equal(actualRecipientUserID.Value, recipientUserID.Value) {
+		return ocp_transaction.NewIntentDeniedError("recipient is not linked to the destination phone number")
 	}
 
 	// The chat must be the canonical DM between the sender and recipient.

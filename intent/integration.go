@@ -11,7 +11,6 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/chat"
-	"github.com/code-payments/flipcash2-server/contact"
 	"github.com/code-payments/flipcash2-server/messaging"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/ocp-server/ocp/data/intent"
@@ -25,31 +24,24 @@ type Integration struct {
 
 	accounts account.Store
 	profiles profile.Store
-	contacts contact.Store
 	chats    chat.Store
 
 	sender *messaging.Sender
-
-	phoneHashPepper []byte
 }
 
 func NewIntegration(
 	log *zap.Logger,
 	accounts account.Store,
 	profiles profile.Store,
-	contacts contact.Store,
 	chats chat.Store,
 	sender *messaging.Sender,
-	phoneHashPepper []byte,
 ) ocp_integration.SubmitIntent {
 	return &Integration{
-		log:             log,
-		accounts:        accounts,
-		profiles:        profiles,
-		contacts:        contacts,
-		chats:           chats,
-		sender:          sender,
-		phoneHashPepper: phoneHashPepper,
+		log:      log,
+		accounts: accounts,
+		profiles: profiles,
+		chats:    chats,
+		sender:   sender,
 	}
 }
 

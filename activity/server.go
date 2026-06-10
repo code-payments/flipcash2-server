@@ -14,6 +14,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/intent"
 	"github.com/code-payments/flipcash2-server/model"
 	ocp_query "github.com/code-payments/ocp-server/database/query"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
@@ -260,13 +261,13 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 			}
 
 			if intentRecord.InitiatorOwnerAccount == userOwnerAccount.PublicKey().ToBase58() {
-				if intentMetadata.IsRemoteSend {
+				if intentMetadata.IsIndirectSend {
 					isClaimed, err := isGiftCardClaimed(ctx, s.ocpData, destinationAccount)
 					if err != nil {
 						return nil, err
 					}
 
-					notification.AdditionalMetadata = &activitypb.Notification_SentCrypto{SentCrypto: &activitypb.SentCryptoNotificationMetadata{
+					notification.AdditionalMetadata = &activitypb.Notification_IndirectlySentCrypto{IndirectlySentCrypto: &activitypb.IndirectlySentCryptoNotificationMetadata{
 						Vault:                   &commonpb.PublicKey{Value: destinationAccount.ToProto().Value},
 						CanInitiateCancelAction: !isClaimed,
 					}}
@@ -304,13 +305,25 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 						SwapState: activitypb.SwapState_SWAP_STATE_NONE,
 					}}
 				} else {
-					notification.AdditionalMetadata = &activitypb.Notification_GaveCrypto{GaveCrypto: &activitypb.GaveCryptoNotificationMetadata{}}
+					directlySentMetadata := &activitypb.DirectlySentCryptoNotificationMetadata{}
+					if contactPayment := intent.GetContactDmPayment(intentRecord); contactPayment.GetDestination() != nil {
+						directlySentMetadata.DestinationIdentifier = &activitypb.DirectlySentCryptoNotificationMetadata_Phone{
+							Phone: contactPayment.GetDestination(),
+						}
+					}
+					notification.AdditionalMetadata = &activitypb.Notification_DirectlySentCrypto{DirectlySentCrypto: directlySentMetadata}
 				}
 			} else {
 				if intentMetadata.IsWithdrawal {
 					notification.AdditionalMetadata = &activitypb.Notification_DepositedCrypto{DepositedCrypto: &activitypb.DepositedCryptoNotificationMetadata{}}
 				} else {
-					notification.AdditionalMetadata = &activitypb.Notification_ReceivedCrypto{ReceivedCrypto: &activitypb.ReceivedCryptoNotificationMetadata{}}
+					receivedMetadata := &activitypb.ReceivedCryptoNotificationMetadata{}
+					if contactPayment := intent.GetContactDmPayment(intentRecord); contactPayment.GetSource() != nil {
+						receivedMetadata.SourceIdentifier = &activitypb.ReceivedCryptoNotificationMetadata_Phone{
+							Phone: contactPayment.GetSource(),
+						}
+					}
+					notification.AdditionalMetadata = &activitypb.Notification_ReceivedCrypto{ReceivedCrypto: receivedMetadata}
 				}
 			}
 

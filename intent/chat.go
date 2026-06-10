@@ -25,6 +25,22 @@ import (
 	ocp_transaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
 )
 
+// GetContactDmPayment extracts the contact DM payment from the intent record's
+// additional app metadata, if present. It returns nil when the intent carries no
+// app metadata, the metadata fails to decode, or it is not a contact DM payment.
+func GetContactDmPayment(intentRecord *ocp_intent.Record) *intentpb.ChatMetadata_ContactDmPayment {
+	if len(intentRecord.AppMetadata) == 0 {
+		return nil
+	}
+
+	var appMetadata intentpb.AppMetadata
+	if err := proto.Unmarshal(intentRecord.AppMetadata, &appMetadata); err != nil {
+		return nil
+	}
+
+	return appMetadata.GetChat().GetContactDmPayment()
+}
+
 // validateContactDmAppMetadata enforces that a SendPublicPayment carrying chat
 // app metadata is a well-formed contact DM payment. The metadata is later used
 // to render the DM and route the recipient's push (see maybeSendContactPaymentPush),
@@ -40,7 +56,7 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 	// A contact DM payment is a direct user-to-user payment. Withdrawals, remote
 	// sends, and swap sells are routed elsewhere and never carry this metadata.
 	paymentMetadata := intentRecord.SendPublicPaymentMetadata
-	if paymentMetadata.IsWithdrawal || paymentMetadata.IsRemoteSend || paymentMetadata.IsSwapSell {
+	if paymentMetadata.IsWithdrawal || paymentMetadata.IsIndirectSend || paymentMetadata.IsSwapSell {
 		return ocp_transaction.NewIntentDeniedError("contact dm payment must be a direct payment")
 	}
 
@@ -114,7 +130,7 @@ func (i *Integration) maybeSendContactPaymentMessage(ctx context.Context, intent
 	}
 
 	metadata := intentRecord.SendPublicPaymentMetadata
-	if metadata.IsWithdrawal || metadata.IsRemoteSend || metadata.IsSwapSell {
+	if metadata.IsWithdrawal || metadata.IsIndirectSend || metadata.IsSwapSell {
 		return
 	}
 
@@ -122,14 +138,7 @@ func (i *Integration) maybeSendContactPaymentMessage(ctx context.Context, intent
 		return
 	}
 
-	var appMetadata intentpb.AppMetadata
-	if len(intentRecord.AppMetadata) == 0 {
-		return
-	}
-	if err := proto.Unmarshal(intentRecord.AppMetadata, &appMetadata); err != nil {
-		return
-	}
-	if appMetadata.GetChat().GetContactDmPayment() == nil {
+	if GetContactDmPayment(intentRecord) == nil {
 		return
 	}
 

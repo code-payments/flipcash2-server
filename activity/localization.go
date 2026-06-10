@@ -14,8 +14,12 @@ func InjectLocalizedText(ctx context.Context, ocpData ocp_data.Provider, userOwn
 	var localizedText string
 	switch typed := notification.AdditionalMetadata.(type) {
 
-	case *activitypb.Notification_GaveCrypto:
+	case *activitypb.Notification_DirectlySentCrypto:
 		localizedText = "Gave"
+
+		if typed.DirectlySentCrypto.GetDestinationIdentifier() != nil {
+			localizedText = "Sent"
+		}
 
 	case *activitypb.Notification_ReceivedCrypto:
 		localizedText = "Received"
@@ -37,13 +41,13 @@ func InjectLocalizedText(ctx context.Context, ocpData ocp_data.Provider, userOwn
 	case *activitypb.Notification_DepositedCrypto:
 		localizedText = "Added"
 
-	case *activitypb.Notification_SentCrypto:
-		if typed.SentCrypto.CanInitiateCancelAction {
+	case *activitypb.Notification_IndirectlySentCrypto:
+		if typed.IndirectlySentCrypto.CanInitiateCancelAction {
 			localizedText = "Sending"
 		} else {
 			localizedText = "Sent"
 
-			giftCardVaultAccount, err := ocp_common.NewAccountFromPublicKeyBytes(typed.SentCrypto.Vault.Value)
+			giftCardVaultAccount, err := ocp_common.NewAccountFromPublicKeyBytes(typed.IndirectlySentCrypto.Vault.Value)
 			if err != nil {
 				return err
 			}

@@ -1,17 +1,13 @@
 package messaging
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"time"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
-	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -19,10 +15,7 @@ import (
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/database"
-	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/model"
-	"github.com/code-payments/flipcash2-server/profile"
-	"github.com/code-payments/flipcash2-server/push"
 )
 
 type Server struct {
@@ -32,11 +25,8 @@ type Server struct {
 
 	chats    chat.Store
 	messages Store
-	profiles profile.Store
 
-	pusher push.Pusher
-
-	eventBus *event.Bus[*commonpb.UserId, *eventpb.Event]
+	sender *Sender
 
 	messagingpb.UnimplementedMessagingServer
 }
@@ -46,18 +36,14 @@ func NewServer(
 	authz auth.Authorizer,
 	chats chat.Store,
 	messages Store,
-	profiles profile.Store,
-	pusher push.Pusher,
-	eventBus *event.Bus[*commonpb.UserId, *eventpb.Event],
+	sender *Sender,
 ) *Server {
 	return &Server{
 		log:      log,
 		authz:    authz,
 		chats:    chats,
 		messages: messages,
-		profiles: profiles,
-		pusher:   pusher,
-		eventBus: eventBus,
+		sender:   sender,
 	}
 }
 
@@ -153,57 +139,10 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
 	}
 
-	msg, err := s.messages.PutMessage(ctx, req.ChatId, userID, req.Content, time.Now().UTC(), req.ClientMessageId, true)
+	msg, err := s.sender.Send(ctx, req.ChatId, userID, req.Content, req.ClientMessageId, true)
 	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure persisting message")
-		return nil, status.Error(codes.Internal, "")
+		return nil, err
 	}
-
-	// The sender has implicitly read their own message, so advance their READ
-	// pointer past it. The target is the message we just persisted, so its
-	// existence is guaranteed — use the unchecked path to skip the existence read.
-	// Best-effort: it's reconstructable and self-heals.
-	pointerAdvanced, err := s.messages.AdvancePointerUnchecked(ctx, req.ChatId, userID, messagingpb.Pointer_READ, msg.ID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure advancing sender read pointer")
-	}
-
-	// Record this message as the chat's most recent: bumps last_activity so the
-	// chat sorts to the top of members' inboxes and denormalizes last_message_id
-	// for the feed. Decoupled from persistence: a lagging bump self-heals on the
-	// next message. It also hands back the chat members, which the broadcast below
-	// reuses to avoid a second membership read.
-	lastMessageAdvanced, members, err := s.chats.AdvanceLastMessage(ctx, req.ChatId, msg.ID, msg.Timestamp)
-	if err != nil && !errors.Is(err, chat.ErrChatNotFound) {
-		log.With(zap.Error(err)).Warn("Failure advancing chat last message")
-	}
-
-	// Notify all members (including the sender's other devices) of the new
-	// message. The sender's read pointer and the new last activity are only
-	// included when they actually advanced — a no-op must not broadcast a stale
-	// pointer or timestamp.
-	update := &eventpb.ChatUpdate{
-		NewMessages: &messagingpb.MessageBatch{Messages: []*messagingpb.Message{msg.ToProto()}},
-	}
-	if pointerAdvanced {
-		update.PointerUpdates = &messagingpb.PointerBatch{Pointers: []*messagingpb.Pointer{{
-			Type:   messagingpb.Pointer_READ,
-			UserId: userID,
-			Value:  msg.ID,
-		}}}
-	}
-	if lastMessageAdvanced {
-		update.MetadataUpdates = []*chatpb.MetadataUpdate{{
-			Kind: &chatpb.MetadataUpdate_LastActivityChanged_{
-				LastActivityChanged: &chatpb.MetadataUpdate_LastActivityChanged{
-					NewLastActivity: timestamppb.New(msg.Timestamp),
-				},
-			},
-		}}
-	}
-	// Reuse the members AdvanceLastMessage already loaded (nil if it failed, in
-	// which case publishChatUpdate loads them itself).
-	s.publishChatUpdate(ctx, log, req.ChatId, update, nil, members)
 
 	return &messagingpb.SendMessageResponse{
 		Result:  messagingpb.SendMessageResponse_OK,
@@ -235,7 +174,7 @@ func (s *Server) AdvancePointer(ctx context.Context, req *messagingpb.AdvancePoi
 	}
 
 	if advanced {
-		s.publishChatUpdate(ctx, log, req.ChatId, &eventpb.ChatUpdate{
+		publishChatUpdate(ctx, log, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
 			PointerUpdates: &messagingpb.PointerBatch{Pointers: []*messagingpb.Pointer{{
 				Type:   req.PointerType,
 				UserId: userID,
@@ -262,7 +201,7 @@ func (s *Server) NotifyIsTyping(ctx context.Context, req *messagingpb.NotifyIsTy
 	}
 
 	// Typing notifications are transient and only meaningful to other members.
-	s.publishChatUpdate(ctx, log, req.ChatId, &eventpb.ChatUpdate{
+	publishChatUpdate(ctx, log, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
 		IsTypingNotifications: &messagingpb.IsTypingNotificationBatch{
 			IsTypingNotifications: []*messagingpb.IsTypingNotification{{
 				UserId: userID,
@@ -281,71 +220,4 @@ func (s *Server) isMember(ctx context.Context, log *zap.Logger, chatID *commonpb
 		return false, status.Error(codes.Internal, "")
 	}
 	return isMember, nil
-}
-
-// publishChatUpdate fans a ChatUpdate out to each member of the chat over the
-// event bus, optionally excluding one user (e.g. the originator of a typing
-// notification). It is best-effort: a failure to load members is logged, not
-// surfaced, so it never fails the originating RPC.
-//
-// members may be supplied by a caller that already has the set in hand (e.g.
-// from AdvanceLastMessage), avoiding a redundant read; when nil, the members are
-// loaded here.
-func (s *Server) publishChatUpdate(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, update *eventpb.ChatUpdate, exclude *commonpb.UserId, members []*commonpb.UserId) {
-	if len(members) == 0 {
-		var err error
-		members, err = s.chats.GetMembers(ctx, chatID)
-		if err != nil {
-			log.With(zap.Error(err)).Warn("Failure loading members for chat update broadcast")
-			return
-		}
-	}
-
-	update.Chat = chatID
-	e := &eventpb.Event{
-		Id:   event.MustGenerateEventID(),
-		Ts:   timestamppb.Now(),
-		Type: &eventpb.Event_ChatUpdate{ChatUpdate: update},
-	}
-	for _, m := range members {
-		if exclude != nil && bytes.Equal(m.Value, exclude.Value) {
-			continue
-		}
-		s.eventBus.OnEvent(m, e)
-	}
-
-	// todo: Tie in push to the event bus?
-	// todo: Assumes a contact-based DM chat
-	if update.NewMessages == nil {
-		return
-	}
-	for _, message := range update.NewMessages.Messages {
-		if message.SenderId == nil {
-			continue
-		}
-
-		senderProfile, err := s.profiles.GetProfile(ctx, message.SenderId, true)
-		if err == profile.ErrNotFound {
-			continue
-		} else if err != nil {
-			log.With(zap.Error(err)).Warn("Failure getting sender profile for push")
-			continue
-		}
-		if senderProfile.PhoneNumber != nil {
-			continue
-		}
-
-		var membersForPush []*commonpb.UserId
-		for _, member := range members {
-			if !bytes.Equal(member.Value, message.SenderId.Value) {
-				membersForPush = append(membersForPush, member)
-			}
-		}
-
-		err = push.SendContactDmPush(ctx, s.pusher, update.Chat, message, senderProfile.PhoneNumber, membersForPush...)
-		if err != nil {
-			log.With(zap.Error(err)).Warn("Failure sending message push")
-			continue
-		}
-	}
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/push"
 	"github.com/code-payments/flipcash2-server/testutil"
+	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 )
 
 // RunServerTests runs the shared messaging.Server test suite. chats and messages
@@ -85,7 +86,8 @@ func newServerEnv(t *testing.T, chats chat.Store, messages messaging.Store, prof
 		LastActivity: at(1),
 	}))
 
-	server := messaging.NewServer(log, authz, chats, messages, profiles, push.NewNoOpPusher(), bus)
+	sender := messaging.NewSender(log, chats, messages, profiles, ocp_data.NewTestDataProvider(), push.NewNoOpPusher(), bus)
+	server := messaging.NewServer(log, authz, chats, messages, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
 	}))

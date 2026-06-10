@@ -59,7 +59,7 @@ type Store interface {
 	//
 	// countsTowardUnread controls the unread sequence: when true the message's
 	// unread_seq is the previous value + 1; when false it carries the previous
-	// value forward (e.g. for the sender's own or system messages).
+	// value forward (for messages that shouldn't bump anyone's unread count).
 	//
 	// senderID may be nil to denote a system message.
 	PutMessage(

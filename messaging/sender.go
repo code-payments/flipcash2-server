@@ -71,8 +71,10 @@ func NewSender(
 // membership checks (e.g. injecting a cash message after a payment settles).
 //
 // senderID may be nil to denote a system message, in which case no read pointer
-// is advanced. countsTowardUnread controls whether the send advances recipients'
-// unread sequence (false for the sender's own or system messages). Sends are
+// is advanced. countsTowardUnread controls whether the message advances the
+// chat's unread sequence: true for user-authored messages (the sender doesn't
+// see their own message as unread because their read pointer is advanced past
+// it), false for messages that shouldn't bump anyone's unread count. Sends are
 // idempotent on (chatID, clientMessageID).
 func (s *Sender) Send(
 	ctx context.Context,

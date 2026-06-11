@@ -165,6 +165,28 @@ func testServer_SendMessage_Idempotent(t *testing.T, chats chat.Store, messages 
 	next, err := e.send(e.keysA, "hi again", generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, first.Message.MessageId.Value+1, next.Message.MessageId.Value)
+
+	// The retried send must not re-run side effects (most importantly pushes,
+	// which ride the same broadcast). Wait for the follow-up message to reach
+	// userB, then check the first message was broadcast to them exactly once.
+	countBroadcasts := func(messageID uint64) (n int) {
+		for _, ev := range e.observer.GetEvents(func(k *commonpb.UserId) bool { return bytes.Equal(k.Value, e.userB.Value) }) {
+			update := ev.Event.GetChatUpdate()
+			if update == nil || update.NewMessages == nil {
+				continue
+			}
+			for _, m := range update.NewMessages.Messages {
+				if m.MessageId.Value == messageID {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	e.observer.WaitFor(t, func([]*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
+		return countBroadcasts(next.Message.MessageId.Value) > 0
+	})
+	require.Equal(t, 1, countBroadcasts(first.Message.MessageId.Value))
 }
 
 func testServer_GetMessages_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) {

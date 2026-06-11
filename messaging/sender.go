@@ -23,6 +23,11 @@ import (
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 )
 
+// sideEffectTimeout bounds the post-persistence side effects of a send
+// (pointer advance, last-message bump, broadcast, pushes) once they have been
+// detached from the caller's cancellation.
+const sideEffectTimeout = 10 * time.Second
+
 // Sender is the engine behind a message send: it persists the message and
 // performs every side effect — advancing the sender's read pointer, bumping the
 // chat's last message, and broadcasting (with pushes) to members. It carries no
@@ -75,7 +80,9 @@ func NewSender(
 // chat's unread sequence: true for user-authored messages (the sender doesn't
 // see their own message as unread because their read pointer is advanced past
 // it), false for messages that shouldn't bump anyone's unread count. Sends are
-// idempotent on (chatID, clientMessageID).
+// idempotent on (chatID, clientMessageID): a retry returns the originally
+// persisted message and skips the side effects, which already ran on the first
+// send — re-running them would duplicate pushes to members.
 func (s *Sender) Send(
 	ctx context.Context,
 	chatID *commonpb.ChatId,
@@ -89,11 +96,28 @@ func (s *Sender) Send(
 		log = log.With(zap.String("user_id", model.UserIDString(senderID)))
 	}
 
-	msg, err := s.messages.PutMessage(ctx, chatID, senderID, content, time.Now().UTC(), clientMessageID, countsTowardUnread)
+	msg, created, err := s.messages.PutMessage(ctx, chatID, senderID, content, time.Now().UTC(), clientMessageID, countsTowardUnread)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure persisting message")
 		return nil, status.Error(codes.Internal, "")
 	}
+
+	// A retried send (same client message ID) already ran every side effect when
+	// the message was first persisted — most importantly the push to members.
+	// Re-running them would duplicate notifications, so return the original
+	// message and stop here.
+	if !created {
+		return msg, nil
+	}
+
+	// The message is now durable, and a retry skips the side effects below — so
+	// one lost here (most importantly the push) is never re-run. Detach from the
+	// caller's cancellation so a client disconnect or RPC deadline can't abort
+	// them, keeping context values (auth/trace metadata) intact. The timeout
+	// bounds the work, since the side effects run synchronously in the handler
+	// and a never-canceled context would let a wedged call hold it forever.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sideEffectTimeout)
+	defer cancel()
 
 	// The sender has implicitly read their own message, so advance their READ
 	// pointer past it. The target is the message we just persisted, so its

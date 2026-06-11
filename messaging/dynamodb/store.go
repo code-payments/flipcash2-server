@@ -95,10 +95,10 @@ func (s *store) PutMessage(
 	ts time.Time,
 	clientMessageID *messagingpb.ClientMessageId,
 	countsTowardUnread bool,
-) (*messaging.Message, error) {
+) (*messaging.Message, bool, error) {
 	contentBlobs, err := marshalContent(content)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	for attempt := 0; attempt < maxPutMessageAttempts; attempt++ {
@@ -106,11 +106,12 @@ func (s *store) PutMessage(
 		// partition (pk = chat#<id>), so one consistent batch read fetches both.
 		markerSeq, lastSeq, lastUnread, err := s.readSendState(ctx, chatID, clientMessageID)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		// Fast idempotent path: a prior send with this client message ID wins.
 		if markerSeq != nil {
-			return s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: *markerSeq})
+			msg, err := s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: *markerSeq})
+			return msg, false, err
 		}
 
 		nextSeq := lastSeq + 1
@@ -167,12 +168,12 @@ func (s *store) PutMessage(
 			},
 		})
 		if err == nil {
-			return msg, nil
+			return msg, true, nil
 		}
 
 		reasons, ok := cancellationReasons(err)
 		if !ok {
-			return nil, err
+			return nil, false, err
 		}
 		// reasons index matches TransactItems order: [0]=counter, [1]=message,
 		// [2]=idempotency marker.
@@ -183,9 +184,9 @@ func (s *store) PutMessage(
 		if isRetryable(reasons) {
 			continue
 		}
-		return nil, err
+		return nil, false, err
 	}
-	return nil, fmt.Errorf("put message exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
+	return nil, false, fmt.Errorf("put message exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
 }
 
 func (s *store) GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {

@@ -26,11 +26,11 @@ func TestChatMessagingReader(t *testing.T) {
 	chatB := randomChatID()
 	sender := model.MustGenerateUserID()
 
-	_, err := store.PutMessage(ctx, chatA, sender, textContent("a1"), time.Unix(1, 0), randomClientID(), true)
+	_, _, err := store.PutMessage(ctx, chatA, sender, textContent("a1"), time.Unix(1, 0), randomClientID(), true)
 	require.NoError(t, err)
-	a2, err := store.PutMessage(ctx, chatA, sender, textContent("a2"), time.Unix(2, 0), randomClientID(), true)
+	a2, _, err := store.PutMessage(ctx, chatA, sender, textContent("a2"), time.Unix(2, 0), randomClientID(), true)
 	require.NoError(t, err)
-	b1, err := store.PutMessage(ctx, chatB, sender, textContent("b1"), time.Unix(1, 0), randomClientID(), true)
+	b1, _, err := store.PutMessage(ctx, chatB, sender, textContent("b1"), time.Unix(1, 0), randomClientID(), true)
 	require.NoError(t, err)
 
 	// LastMessages: one ref per chat comes back keyed by chat ID, as proto.

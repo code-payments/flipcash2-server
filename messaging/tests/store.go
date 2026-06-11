@@ -49,8 +49,9 @@ func testStore_PutMessage_AssignsGaplessIDs(t *testing.T, s messaging.Store) {
 	sender := model.MustGenerateUserID()
 
 	for i := uint64(1); i <= 5; i++ {
-		msg, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i)), generateClientID(), true)
+		msg, created, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i)), generateClientID(), true)
 		require.NoError(t, err)
+		require.True(t, created)
 		require.Equal(t, i, msg.ID.Value)
 		require.True(t, msg.Timestamp.Equal(at(int64(i))))
 	}
@@ -62,19 +63,23 @@ func testStore_PutMessage_Idempotent(t *testing.T, s messaging.Store) {
 	sender := model.MustGenerateUserID()
 	clientID := generateClientID()
 
-	first, err := s.PutMessage(ctx, chatID, sender, textContent("hello"), at(1), clientID, true)
+	first, created, err := s.PutMessage(ctx, chatID, sender, textContent("hello"), at(1), clientID, true)
 	require.NoError(t, err)
+	require.True(t, created)
 
 	// Replaying the same client message ID returns the original message,
-	// without advancing the sequence.
-	again, err := s.PutMessage(ctx, chatID, sender, textContent("hello"), at(2), clientID, true)
+	// without advancing the sequence, and reports that nothing was created so
+	// callers know to skip one-time side effects (e.g. pushes).
+	again, created, err := s.PutMessage(ctx, chatID, sender, textContent("hello"), at(2), clientID, true)
 	require.NoError(t, err)
+	require.False(t, created)
 	require.Equal(t, first.ID.Value, again.ID.Value)
 	require.True(t, again.Timestamp.Equal(first.Timestamp))
 
 	// A different client message ID advances to the next ID.
-	next, err := s.PutMessage(ctx, chatID, sender, textContent("world"), at(3), generateClientID(), true)
+	next, created, err := s.PutMessage(ctx, chatID, sender, textContent("world"), at(3), generateClientID(), true)
 	require.NoError(t, err)
+	require.True(t, created)
 	require.Equal(t, first.ID.Value+1, next.ID.Value)
 }
 
@@ -87,14 +92,16 @@ func testStore_PutMessage_PerChatIsolation(t *testing.T, s messaging.Store) {
 
 	// Each chat owns an independent ID sequence, so the first message in each
 	// chat is ID 1 even though they share a client message ID.
-	a, err := s.PutMessage(ctx, chatA, sender, textContent("a"), at(1), clientID, true)
+	a, created, err := s.PutMessage(ctx, chatA, sender, textContent("a"), at(1), clientID, true)
 	require.NoError(t, err)
+	require.True(t, created)
 	require.Equal(t, uint64(1), a.ID.Value)
 
 	// The same client message ID in a different chat is NOT a replay; it gets
 	// its own ID 1 and its own content. Idempotency is scoped per chat.
-	b, err := s.PutMessage(ctx, chatB, sender, textContent("b"), at(1), clientID, true)
+	b, created, err := s.PutMessage(ctx, chatB, sender, textContent("b"), at(1), clientID, true)
 	require.NoError(t, err)
+	require.True(t, created)
 	require.Equal(t, uint64(1), b.ID.Value)
 
 	gotA, err := s.GetMessage(ctx, chatA, a.ID)
@@ -106,8 +113,9 @@ func testStore_PutMessage_PerChatIsolation(t *testing.T, s messaging.Store) {
 
 	// Replaying the client message ID within chatA still returns the original
 	// message and content, not the new payload.
-	replay, err := s.PutMessage(ctx, chatA, sender, textContent("a2"), at(2), clientID, true)
+	replay, created, err := s.PutMessage(ctx, chatA, sender, textContent("a2"), at(2), clientID, true)
 	require.NoError(t, err)
+	require.False(t, created)
 	require.Equal(t, a.ID.Value, replay.ID.Value)
 	require.Equal(t, "a", messageText(replay))
 }
@@ -128,7 +136,7 @@ func testStore_PutMessage_ConcurrentDistinct(t *testing.T, s messaging.Store) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			msg, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i+1)), generateClientID(), true)
+			msg, _, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i+1)), generateClientID(), true)
 			if err != nil {
 				errs[i] = err
 				return
@@ -168,17 +176,19 @@ func testStore_PutMessage_ConcurrentIdempotent(t *testing.T, s messaging.Store) 
 	const n = 25
 	var wg sync.WaitGroup
 	got := make([]uint64, n)
+	createds := make([]bool, n)
 	errs := make([]error, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			msg, err := s.PutMessage(ctx, chatID, sender, textContent("dup"), at(1), clientID, true)
+			msg, created, err := s.PutMessage(ctx, chatID, sender, textContent("dup"), at(1), clientID, true)
 			if err != nil {
 				errs[i] = err
 				return
 			}
 			got[i] = msg.ID.Value
+			createds[i] = created
 		}(i)
 	}
 	wg.Wait()
@@ -191,6 +201,16 @@ func testStore_PutMessage_ConcurrentIdempotent(t *testing.T, s messaging.Store) 
 	for i := 0; i < n; i++ {
 		require.Equal(t, uint64(1), got[i])
 	}
+
+	// Exactly one of the racing sends created the message; the rest were
+	// replays, so only one would trigger side effects like pushes.
+	var createdCount int
+	for _, created := range createds {
+		if created {
+			createdCount++
+		}
+	}
+	require.Equal(t, 1, createdCount)
 
 	// The sequence advanced exactly once, and the persisted message carries the
 	// ID that was returned to callers.
@@ -206,20 +226,20 @@ func testStore_PutMessage_UnreadSeq(t *testing.T, s messaging.Store) {
 	sender := model.MustGenerateUserID()
 
 	// counts, counts, not-counts, counts → unread_seq: 1, 2, 2, 3.
-	m1, err := s.PutMessage(ctx, chatID, sender, textContent("a"), at(1), generateClientID(), true)
+	m1, _, err := s.PutMessage(ctx, chatID, sender, textContent("a"), at(1), generateClientID(), true)
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), m1.UnreadSeq)
 
-	m2, err := s.PutMessage(ctx, chatID, sender, textContent("b"), at(2), generateClientID(), true)
+	m2, _, err := s.PutMessage(ctx, chatID, sender, textContent("b"), at(2), generateClientID(), true)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), m2.UnreadSeq)
 
-	m3, err := s.PutMessage(ctx, chatID, sender, textContent("c"), at(3), generateClientID(), false)
+	m3, _, err := s.PutMessage(ctx, chatID, sender, textContent("c"), at(3), generateClientID(), false)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), m3.UnreadSeq)
 	require.Equal(t, m2.ID.Value+1, m3.ID.Value) // ID still advances
 
-	m4, err := s.PutMessage(ctx, chatID, sender, textContent("d"), at(4), generateClientID(), true)
+	m4, _, err := s.PutMessage(ctx, chatID, sender, textContent("d"), at(4), generateClientID(), true)
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), m4.UnreadSeq)
 }
@@ -228,7 +248,7 @@ func testStore_PutMessage_SystemMessage(t *testing.T, s messaging.Store) {
 	ctx := context.Background()
 	chatID := generateChatID()
 
-	msg, err := s.PutMessage(ctx, chatID, nil, textContent("system"), at(1), generateClientID(), false)
+	msg, _, err := s.PutMessage(ctx, chatID, nil, textContent("system"), at(1), generateClientID(), false)
 	require.NoError(t, err)
 	require.Nil(t, msg.SenderID)
 
@@ -246,7 +266,7 @@ func testStore_GetMessage_NotFound(t *testing.T, s messaging.Store) {
 
 	// Known chat, unknown message.
 	chatID := generateChatID()
-	_, err = s.PutMessage(ctx, chatID, model.MustGenerateUserID(), textContent("a"), at(1), generateClientID(), true)
+	_, _, err = s.PutMessage(ctx, chatID, model.MustGenerateUserID(), textContent("a"), at(1), generateClientID(), true)
 	require.NoError(t, err)
 	_, err = s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: 999})
 	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
@@ -258,7 +278,7 @@ func testStore_GetMessages_OrderAndPaging(t *testing.T, s messaging.Store) {
 	sender := model.MustGenerateUserID()
 
 	for i := 1; i <= 5; i++ {
-		_, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i)), generateClientID(), true)
+		_, _, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i)), generateClientID(), true)
 		require.NoError(t, err)
 	}
 
@@ -304,11 +324,11 @@ func testStore_GetMessagesByRefs(t *testing.T, s messaging.Store) {
 	sender := model.MustGenerateUserID()
 
 	for i := 1; i <= 5; i++ {
-		_, err := s.PutMessage(ctx, chatA, sender, textContent("a"), at(int64(i)), generateClientID(), true)
+		_, _, err := s.PutMessage(ctx, chatA, sender, textContent("a"), at(int64(i)), generateClientID(), true)
 		require.NoError(t, err)
 	}
 	for i := 1; i <= 3; i++ {
-		_, err := s.PutMessage(ctx, chatB, sender, textContent("b"), at(int64(i)), generateClientID(), true)
+		_, _, err := s.PutMessage(ctx, chatB, sender, textContent("b"), at(int64(i)), generateClientID(), true)
 		require.NoError(t, err)
 	}
 
@@ -351,7 +371,7 @@ func testStore_GetPointersForChats(t *testing.T, s messaging.Store) {
 	userB := model.MustGenerateUserID()
 
 	for _, c := range []*commonpb.ChatId{chatA, chatB, chatC} {
-		_, err := s.PutMessage(ctx, c, userA, textContent("m"), at(1), generateClientID(), true)
+		_, _, err := s.PutMessage(ctx, c, userA, textContent("m"), at(1), generateClientID(), true)
 		require.NoError(t, err)
 	}
 
@@ -389,7 +409,7 @@ func testStore_Pointers(t *testing.T, s messaging.Store) {
 	userB := model.MustGenerateUserID()
 
 	for i := 1; i <= 5; i++ {
-		_, err := s.PutMessage(ctx, chatID, userA, textContent("m"), at(int64(i)), generateClientID(), true)
+		_, _, err := s.PutMessage(ctx, chatID, userA, textContent("m"), at(int64(i)), generateClientID(), true)
 		require.NoError(t, err)
 	}
 
@@ -453,7 +473,7 @@ func testStore_AdvancePointer_MessageNotFound(t *testing.T, s messaging.Store) {
 
 	// Known chat, pointer past the last message → ErrMessageNotFound.
 	chatID := generateChatID()
-	_, err = s.PutMessage(ctx, chatID, user, textContent("a"), at(1), generateClientID(), true)
+	_, _, err = s.PutMessage(ctx, chatID, user, textContent("a"), at(1), generateClientID(), true)
 	require.NoError(t, err)
 	_, err = s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
 	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
@@ -465,7 +485,7 @@ func testStore_AdvancePointerUnchecked(t *testing.T, s messaging.Store) {
 	user := model.MustGenerateUserID()
 
 	for i := 1; i <= 3; i++ {
-		_, err := s.PutMessage(ctx, chatID, user, textContent("m"), at(int64(i)), generateClientID(), true)
+		_, _, err := s.PutMessage(ctx, chatID, user, textContent("m"), at(int64(i)), generateClientID(), true)
 		require.NoError(t, err)
 	}
 

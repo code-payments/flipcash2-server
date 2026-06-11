@@ -61,7 +61,7 @@ func (m *memory) PutMessage(
 	ts time.Time,
 	clientMessageID *messagingpb.ClientMessageId,
 	countsTowardUnread bool,
-) (*messaging.Message, error) {
+) (*messaging.Message, bool, error) {
 	m.Lock()
 	defer m.Unlock()
 
@@ -74,7 +74,7 @@ func (m *memory) PutMessage(
 	// Idempotency: a retried send with the same client message ID returns the
 	// originally persisted message.
 	if seq, ok := cs.byClient[string(clientMessageID.Value)]; ok {
-		return cs.messages[seq].Clone(), nil
+		return cs.messages[seq].Clone(), false, nil
 	}
 
 	seq := cs.lastSeq + 1
@@ -101,7 +101,7 @@ func (m *memory) PutMessage(
 	cs.lastSeq = seq
 	cs.lastUnread = unreadSeq
 
-	return msg.Clone(), nil
+	return msg.Clone(), true, nil
 }
 
 func (m *memory) GetMessage(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {

@@ -55,7 +55,9 @@ type Store interface {
 	//
 	// It is idempotent on (chatID, clientMessageID): a retried send with the
 	// same client message ID returns the originally persisted message without
-	// assigning a new ID.
+	// assigning a new ID. created reports whether this call persisted the
+	// message (false on a retry), so callers can skip one-time side effects
+	// like pushes.
 	//
 	// countsTowardUnread controls the unread sequence: when true the message's
 	// unread_seq is the previous value + 1; when false it carries the previous
@@ -70,7 +72,7 @@ type Store interface {
 		ts time.Time,
 		clientMessageID *messagingpb.ClientMessageId,
 		countsTowardUnread bool,
-	) (*Message, error)
+	) (msg *Message, created bool, err error)
 
 	// GetMessage returns a single message by ID, or ErrMessageNotFound.
 	GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*Message, error)

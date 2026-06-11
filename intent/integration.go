@@ -3,45 +3,32 @@ package intent
 import (
 	"context"
 
-	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
 	ocp_transactionpb "github.com/code-payments/ocp-protobuf-api/generated/go/transaction/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
-	"github.com/code-payments/flipcash2-server/chat"
-	"github.com/code-payments/flipcash2-server/messaging"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
+	ocp_task "github.com/code-payments/ocp-server/ocp/data/task"
 	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
 	ocp_transaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
 )
 
 type Integration struct {
-	log *zap.Logger
-
 	accounts account.Store
 	profiles profile.Store
-	chats    chat.Store
-
-	sender *messaging.Sender
 }
 
 func NewIntegration(
-	log *zap.Logger,
 	accounts account.Store,
 	profiles profile.Store,
-	chats chat.Store,
-	sender *messaging.Sender,
 ) ocp_integration.SubmitIntent {
 	return &Integration{
-		log:      log,
 		accounts: accounts,
 		profiles: profiles,
-		chats:    chats,
-		sender:   sender,
 	}
 }
 
@@ -95,8 +82,17 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 	}
 }
 
-func (i *Integration) OnSuccess(ctx context.Context, intentRecord *ocp_intent.Record) error {
-	i.maybeSendContactPaymentMessage(ctx, intentRecord)
+// GetTasksToSchedule returns the guaranteed work derived from a submitted
+// intent. A contact DM payment schedules the cash message injected into the
+// DM between the sender and recipient; execution is handled by task.Executor.
+func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_intent.Record) ([]*ocp_task.Record, error) {
+	if intentRecord.IntentType == ocp_intent.SendPublicPayment && GetContactDmPayment(intentRecord) != nil {
+		return []*ocp_task.Record{NewSendContactDmPaymentMessageTask(intentRecord)}, nil
+	}
 
+	return nil, nil
+}
+
+func (i *Integration) OnSuccess(ctx context.Context, intentRecord *ocp_intent.Record) error {
 	return nil
 }

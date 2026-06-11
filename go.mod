@@ -11,7 +11,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.57.6
 	github.com/code-payments/flipcash2-protobuf-api v1.11.1-0.20260610174304-5e2233b1523d
 	github.com/code-payments/ocp-protobuf-api v1.13.2-0.20260610171241-de46af911053
-	github.com/code-payments/ocp-server v1.17.1-0.20260610172717-79f16efad371
+	github.com/code-payments/ocp-server v1.17.1-0.20260611140945-7bb53991b54e
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2
 	github.com/georgysavva/scany/v2 v2.1.4
 	github.com/google/uuid v1.6.0

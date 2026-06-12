@@ -93,6 +93,8 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 		switch typed := customPayload.Navigation.Type.(type) {
 		case *pushpb.Navigation_CurrencyInfo:
 			targetUrl = fmt.Sprintf("https://app.flipcash.com/token/%s", base58.Encode(typed.CurrencyInfo.Value))
+		case *pushpb.Navigation_ChatId:
+			targetUrl = fmt.Sprintf("https://app.flipcash.com/chat/%s", base64.URLEncoding.EncodeToString(typed.ChatId.Value))
 		}
 		if len(targetUrl) > 0 {
 			customDataAndroid["target_url"] = targetUrl

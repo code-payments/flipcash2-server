@@ -2,9 +2,9 @@ package messaging
 
 import (
 	"context"
-	"errors"
 	"time"
 
+	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -94,6 +94,22 @@ func (s *Sender) Send(
 	log := s.log
 	if senderID != nil {
 		log = log.With(zap.String("user_id", model.UserIDString(senderID)))
+	}
+
+	if err := chatID.Validate(); err != nil {
+		return nil, errors.Wrap(err, "chat id failed validation")
+	}
+	if err := senderID.Validate(); err != nil {
+		return nil, errors.Wrap(err, "sender id failed validation")
+	}
+	if len(content) != 1 {
+		return nil, errors.New("expected one piece of content")
+	}
+	if err := content[0].Validate(); err != nil {
+		return nil, errors.Wrap(err, "content failed validation")
+	}
+	if err := clientMessageID.Validate(); err != nil {
+		return nil, errors.Wrap(err, "client message id failed validation")
 	}
 
 	msg, created, err := s.messages.PutMessage(ctx, chatID, senderID, content, time.Now().UTC(), clientMessageID, countsTowardUnread)

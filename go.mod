@@ -9,16 +9,16 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.21
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.20
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.57.6
-	github.com/code-payments/flipcash2-protobuf-api v1.11.1-0.20260610174304-5e2233b1523d
+	github.com/code-payments/flipcash2-protobuf-api v1.12.0
 	github.com/code-payments/ocp-protobuf-api v1.13.2-0.20260610171241-de46af911053
-	github.com/code-payments/ocp-server v1.17.1-0.20260610172717-79f16efad371
+	github.com/code-payments/ocp-server v1.18.0
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2
 	github.com/georgysavva/scany/v2 v2.1.4
 	github.com/google/uuid v1.6.0
 	github.com/grpc-ecosystem/go-grpc-middleware v1.2.2
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mr-tron/base58 v1.2.0
-	github.com/newrelic/go-agent/v3/integrations/nrpgx v1.0.0
+	github.com/newrelic/go-agent/v3/integrations/nrpgx v1.0.1
 	github.com/ory/dockertest/v3 v3.11.0
 	github.com/pkg/errors v0.9.1
 	github.com/sirupsen/logrus v1.9.3
@@ -91,7 +91,7 @@ require (
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/term v0.5.0 // indirect
-	github.com/newrelic/go-agent/v3 v3.40.1 // indirect
+	github.com/newrelic/go-agent/v3 v3.43.3 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.0 // indirect
 	github.com/opencontainers/runc v1.1.13 // indirect

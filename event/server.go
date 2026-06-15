@@ -158,7 +158,7 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 		delete(s.streams, streamKey)
 		existing.Close()
 
-		log.Info("Closed previous stream")
+		log.Debug("Closed previous stream")
 	}
 
 	log.Debug("Initializing stream")
@@ -263,7 +263,7 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 	}
 	err = s.events.CreateRendezvous(ctx, rendezvous)
 	if err == ErrRendezvousExists {
-		log.Warn("Existing stream detected on another server aborting")
+		log.Debug("Existing stream detected on another server aborting")
 		return status.Error(codes.Aborted, "stream already exists")
 	} else if err != nil {
 		log.With(zap.Error(err)).Warn("Failure saving rendezvous record")
@@ -301,7 +301,7 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 
 			err = s.events.ExtendRendezvousExpiry(ctx, streamKey, s.broadcastAddress, expiry)
 			if err == ErrRendezvousNotFound {
-				log.Warn("Existing stream detected on another server aborting")
+				log.Debug("Existing stream detected on another server aborting")
 				return status.Error(codes.Aborted, "stream already exists")
 			} else if err != nil {
 				log.With(zap.Error(err)).Warn("Failure extending rendezvous record expiry")

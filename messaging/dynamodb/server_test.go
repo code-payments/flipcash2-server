@@ -27,15 +27,15 @@ func TestMessaging_DynamoDBServer(t *testing.T) {
 	require.NoError(t, CreateTables(ctx, testEnv.Client, messagesTable, pointersTable))
 	require.NoError(t, badge_dynamodb.CreateTables(ctx, testEnv.Client, badgesTable))
 
+	badges := badge_dynamodb.NewInDynamoDB(testEnv.Client, badgesTable)
 	chats := chat_dynamodb.NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable)
 	profiles := profile_memory.NewInMemory()
 	messages := NewInDynamoDB(testEnv.Client, messagesTable, pointersTable)
-	badges := badge_dynamodb.NewInDynamoDB(testEnv.Client, badgesTable)
 	teardown := func() {
 		// Each subtest's serverEnv uses a freshly generated chatID and user IDs,
 		// so leftover chat rows can't collide; only the messages store (whose IDs
 		// and idempotency keys are scoped per chat) needs clearing between runs.
 		messages.(*store).reset()
 	}
-	tests.RunServerTests(t, chats, messages, profiles, badges, teardown)
+	tests.RunServerTests(t, badges, chats, messages, profiles, teardown)
 }

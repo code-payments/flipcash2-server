@@ -375,9 +375,9 @@ func testStore_GetPointersForChats(t *testing.T, s messaging.Store) {
 		require.NoError(t, err)
 	}
 
-	_, err := s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	_, _, err := s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
-	_, err = s.AdvancePointer(ctx, chatB, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1})
+	_, _, err = s.AdvancePointer(ctx, chatB, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
 
 	// Batch across chats: A and B return the named members' pointers; C (no
@@ -418,31 +418,38 @@ func testStore_Pointers(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	require.Empty(t, pointers)
 
-	// Advance userB's DELIVERED to 3.
-	advanced, err := s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 3})
+	// Advance userB's DELIVERED to 3. The advanced pointer is returned, carrying
+	// the value it was moved to and its last-advanced timestamp.
+	pointer, advanced, err := s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 3})
 	require.NoError(t, err)
 	require.True(t, advanced)
+	require.EqualValues(t, 3, pointer.Value.Value)
+	require.NotNil(t, pointer.Ts)
 
-	// Moving backward is a no-op.
-	advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 2})
+	// Moving backward is a no-op, but the current pointer (still at 3) is returned.
+	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 2})
 	require.NoError(t, err)
 	require.False(t, advanced)
+	require.EqualValues(t, 3, pointer.Value.Value)
+	require.NotNil(t, pointer.Ts)
 
 	// Moving to the same value is a no-op.
-	advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 3})
+	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 3})
 	require.NoError(t, err)
 	require.False(t, advanced)
+	require.EqualValues(t, 3, pointer.Value.Value)
 
 	// Forward advances.
-	advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 5})
+	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 5})
 	require.NoError(t, err)
 	require.True(t, advanced)
+	require.EqualValues(t, 5, pointer.Value.Value)
 
 	// READ is a distinct pointer type; advance it for userB and a pointer for userA.
-	advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 4})
+	_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 4})
 	require.NoError(t, err)
 	require.True(t, advanced)
-	advanced, err = s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 5})
+	_, advanced, err = s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 5})
 	require.NoError(t, err)
 	require.True(t, advanced)
 
@@ -468,14 +475,14 @@ func testStore_AdvancePointer_MessageNotFound(t *testing.T, s messaging.Store) {
 	user := model.MustGenerateUserID()
 
 	// Unknown chat (no messages) → ErrMessageNotFound.
-	_, err := s.AdvancePointer(ctx, generateChatID(), user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	_, _, err := s.AdvancePointer(ctx, generateChatID(), user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
 	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
 
 	// Known chat, pointer past the last message → ErrMessageNotFound.
 	chatID := generateChatID()
 	_, _, err = s.PutMessage(ctx, chatID, user, textContent("a"), at(1), generateClientID(), true)
 	require.NoError(t, err)
-	_, err = s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
+	_, _, err = s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
 	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
 }
 
@@ -489,20 +496,24 @@ func testStore_AdvancePointerUnchecked(t *testing.T, s messaging.Store) {
 		require.NoError(t, err)
 	}
 
-	// Forward advances, with the same monotonic semantics as AdvancePointer.
-	advanced, err := s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
+	// Forward advances, with the same monotonic semantics as AdvancePointer. The
+	// advanced pointer is returned, carrying its last-advanced timestamp.
+	pointer, advanced, err := s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
 	require.NoError(t, err)
 	require.True(t, advanced)
+	require.EqualValues(t, 2, pointer.Value.Value)
+	require.NotNil(t, pointer.Ts)
 
-	// Backward is a no-op.
-	advanced, err = s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	// Backward is a no-op, but the current pointer (still at 2) is returned.
+	pointer, advanced, err = s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
 	require.False(t, advanced)
+	require.EqualValues(t, 2, pointer.Value.Value)
 
 	// Unlike AdvancePointer, the target's existence is not verified: advancing to
 	// a message ID with no backing message succeeds rather than erroring. (The
 	// caller is responsible for only passing a known-existing ID.)
-	advanced, err = s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 999})
+	_, advanced, err = s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 999})
 	require.NoError(t, err)
 	require.True(t, advanced)
 

@@ -144,9 +144,10 @@ func (s *Sender) Send(
 	// existence is guaranteed — use the unchecked path to skip the existence read.
 	// Best-effort: it's reconstructable and self-heals. A system message (no
 	// sender) has no pointer to advance.
+	var senderPointer *messagingpb.Pointer
 	var pointerAdvanced bool
 	if senderID != nil {
-		pointerAdvanced, err = s.messages.AdvancePointerUnchecked(ctx, chatID, senderID, messagingpb.Pointer_READ, msg.ID)
+		senderPointer, pointerAdvanced, err = s.messages.AdvancePointerUnchecked(ctx, chatID, senderID, messagingpb.Pointer_READ, msg.ID)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure advancing sender read pointer")
 		}
@@ -170,11 +171,7 @@ func (s *Sender) Send(
 		NewMessages: &messagingpb.MessageBatch{Messages: []*messagingpb.Message{msg.ToProto()}},
 	}
 	if pointerAdvanced {
-		update.PointerUpdates = &messagingpb.PointerBatch{Pointers: []*messagingpb.Pointer{{
-			Type:   messagingpb.Pointer_READ,
-			UserId: senderID,
-			Value:  msg.ID,
-		}}}
+		update.PointerUpdates = &messagingpb.PointerBatch{Pointers: []*messagingpb.Pointer{senderPointer}}
 	}
 	if lastMessageAdvanced {
 		update.MetadataUpdates = []*chatpb.MetadataUpdate{{

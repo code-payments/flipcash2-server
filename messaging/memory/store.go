@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -250,19 +251,20 @@ func (m *memory) AdvancePointer(
 	userID *commonpb.UserId,
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
-) (bool, error) {
+) (*messagingpb.Pointer, bool, error) {
 	m.Lock()
 	defer m.Unlock()
 
 	cs := m.chats[string(chatID.Value)]
 	if cs == nil {
-		return false, messaging.ErrMessageNotFound
+		return nil, false, messaging.ErrMessageNotFound
 	}
 	if _, ok := cs.messages[newValue.Value]; !ok {
-		return false, messaging.ErrMessageNotFound
+		return nil, false, messaging.ErrMessageNotFound
 	}
 
-	return m.advancePointerLocked(cs, userID, pointerType, newValue), nil
+	pointer, advanced := m.advancePointerLocked(cs, userID, pointerType, newValue)
+	return pointer, advanced, nil
 }
 
 func (m *memory) AdvancePointerUnchecked(
@@ -271,7 +273,7 @@ func (m *memory) AdvancePointerUnchecked(
 	userID *commonpb.UserId,
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
-) (bool, error) {
+) (*messagingpb.Pointer, bool, error) {
 	m.Lock()
 	defer m.Unlock()
 
@@ -279,30 +281,35 @@ func (m *memory) AdvancePointerUnchecked(
 	if cs == nil {
 		// The caller guarantees the message (hence the chat) exists; a missing
 		// chat is treated as not-advanced rather than a panic.
-		return false, nil
+		return nil, false, nil
 	}
-	return m.advancePointerLocked(cs, userID, pointerType, newValue), nil
+	pointer, advanced := m.advancePointerLocked(cs, userID, pointerType, newValue)
+	return pointer, advanced, nil
 }
 
 // advancePointerLocked applies the monotonic forward-only pointer update and
 // reports whether it advanced. The caller must hold m's lock. It is the shared
 // core of AdvancePointer and AdvancePointerUnchecked, past their existence checks.
+// It always returns the pointer's current state: the freshly advanced pointer,
+// or the existing one when the call was a no-op.
 func (m *memory) advancePointerLocked(
 	cs *chatState,
 	userID *commonpb.UserId,
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
-) bool {
+) (*messagingpb.Pointer, bool) {
 	key := pointerKey(pointerType, userID)
 	if cur, ok := cs.pointers[key]; ok && newValue.Value <= cur.Value.Value {
-		return false
+		return cur, false
 	}
-	cs.pointers[key] = &messagingpb.Pointer{
+	pointer := &messagingpb.Pointer{
 		Type:   pointerType,
 		UserId: &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
 		Value:  &messagingpb.MessageId{Value: newValue.Value},
+		Ts:     timestamppb.New(time.Now()),
 	}
-	return true
+	cs.pointers[key] = pointer
+	return pointer, true
 }
 
 func pointerKey(pointerType messagingpb.Pointer_Type, userID *commonpb.UserId) string {

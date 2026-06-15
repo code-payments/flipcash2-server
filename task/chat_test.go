@@ -17,6 +17,7 @@ import (
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 
 	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
+	badgememory "github.com/code-payments/flipcash2-server/badge/memory"
 	"github.com/code-payments/flipcash2-server/chat"
 	chatmemory "github.com/code-payments/flipcash2-server/chat/memory"
 	"github.com/code-payments/flipcash2-server/event"
@@ -36,13 +37,14 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	log := zaptest.NewLogger(t)
 
 	accounts := accountmemory.NewInMemory()
+	badges := badgememory.NewInMemory()
 	chats := chatmemory.NewInMemory()
 	messages := messagingmemory.NewInMemory()
 	profiles := profilememory.NewInMemory()
 	ocpData := ocp_data.NewTestDataProvider()
 	bus := event.NewBus[*commonpb.UserId, *eventpb.Event]()
 
-	sender := messaging.NewSender(log, chats, messages, profiles, ocpData, push.NewNoOpPusher(), bus)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, ocpData, push.NewNoOpPusher(), bus)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
 	integration := intent.NewIntegration(accounts, profiles)
 

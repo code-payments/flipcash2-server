@@ -174,7 +174,7 @@ func (s *Server) AdvancePointer(ctx context.Context, req *messagingpb.AdvancePoi
 	}
 
 	if advanced {
-		publishChatUpdate(ctx, log, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
+		publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
 			PointerUpdates: &messagingpb.PointerBatch{Pointers: []*messagingpb.Pointer{{
 				Type:   req.PointerType,
 				UserId: userID,
@@ -201,7 +201,7 @@ func (s *Server) NotifyIsTyping(ctx context.Context, req *messagingpb.NotifyIsTy
 	}
 
 	// Typing notifications are transient and only meaningful to other members.
-	publishChatUpdate(ctx, log, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
+	publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
 		IsTypingNotifications: &messagingpb.IsTypingNotificationBatch{
 			IsTypingNotifications: []*messagingpb.IsTypingNotification{{
 				UserId: userID,

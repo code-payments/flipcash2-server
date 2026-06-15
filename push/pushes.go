@@ -3,6 +3,7 @@ package push
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 
 	"golang.org/x/text/language"
@@ -13,6 +14,7 @@ import (
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 
+	"github.com/code-payments/flipcash2-server/badge"
 	"github.com/code-payments/flipcash2-server/localization"
 	ocp_currency "github.com/code-payments/ocp-server/currency"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
@@ -131,7 +133,7 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 	return pusher.SendPushes(ctx, title, body, customPayload, users...)
 }
 
-func SendContactDmPush(ctx context.Context, pusher Pusher, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderContact *phonepb.PhoneNumber, recipients ...*commonpb.UserId) error {
+func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderContact *phonepb.PhoneNumber, recipients ...*commonpb.UserId) error {
 	title := "{0}"
 
 	var body string
@@ -174,7 +176,26 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, ocpData ocp_data.Prov
 		},
 	}
 
-	return pusher.SendPushes(ctx, title, body, customPayload, recipients...)
+	if err := pusher.SendPushes(ctx, title, body, customPayload, recipients...); err != nil {
+		return err
+	}
+
+	// Each recipient now has one more unread message. Bump their badge count and
+	// push the new total to their iOS devices (a no-op for non-iOS recipients).
+	// Best-effort per recipient: one failure must not skip the others, and a
+	// missed bump self-heals on the next message.
+	var errs error
+	for _, recipient := range recipients {
+		newCount, err := badges.Increment(ctx, recipient, 1)
+		if err != nil {
+			errs = errors.Join(errs, err)
+			continue
+		}
+		if err := pusher.SendBadgeCountPush(ctx, recipient, newCount); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+	return errs
 }
 
 func SendFlipcashCurrencyGainPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string, gainRegion ocp_currency.Code, gainAmount float64) error {

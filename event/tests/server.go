@@ -20,6 +20,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	badgememory "github.com/code-payments/flipcash2-server/badge/memory"
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/protoutil"
@@ -218,6 +219,10 @@ func setupTest(t *testing.T, accounts account.Store, events event.Store, enableM
 	eventBus1 := event.NewBus[*commonpb.UserId, *eventpb.Event]()
 	eventBus2 := event.NewBus[*commonpb.UserId, *eventpb.Event]()
 
+	// A shared badge store, mirroring the shared events backend; both server
+	// instances reset the same user's badge on stream open.
+	badges := badgememory.NewInMemory()
+
 	env.server1 = &serverTestEnv{
 		address:  conn1.Target(),
 		eventBus: eventBus1,
@@ -227,6 +232,7 @@ func setupTest(t *testing.T, accounts account.Store, events event.Store, enableM
 			authz,
 			accounts,
 			events,
+			badges,
 			eventBus1,
 			nil,
 			conn1.Target(),
@@ -242,6 +248,7 @@ func setupTest(t *testing.T, accounts account.Store, events event.Store, enableM
 			authz,
 			accounts,
 			events,
+			badges,
 			eventBus2,
 			nil,
 			conn2.Target(),

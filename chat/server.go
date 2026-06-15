@@ -13,6 +13,7 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/auth"
@@ -54,6 +55,17 @@ type MessagingReader interface {
 	Pointers(ctx context.Context, refs []PointerRef) (map[string][]*messagingpb.Pointer, error)
 }
 
+// ProfileReader is the read slice of the profile domain the Chat service needs
+// to hydrate member profiles. Like MessagingReader it is declared here (consumer
+// side) so the chat package need not import profile; the profile package
+// supplies the concrete adapter.
+type ProfileReader interface {
+	// GetPhoneNumbers returns the linked phone number for each of the given
+	// users that has one, keyed by string(userID.Value). Users without a linked
+	// phone number are absent from the map.
+	GetPhoneNumbers(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error)
+}
+
 type Server struct {
 	log *zap.Logger
 
@@ -61,16 +73,18 @@ type Server struct {
 
 	chats     Store
 	messaging MessagingReader
+	profiles  ProfileReader
 
 	chatpb.UnimplementedChatServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, chats Store, messaging MessagingReader) *Server {
+func NewServer(log *zap.Logger, authz auth.Authorizer, chats Store, messaging MessagingReader, profiles ProfileReader) *Server {
 	return &Server{
 		log:       log,
 		authz:     authz,
 		chats:     chats,
 		messaging: messaging,
+		profiles:  profiles,
 	}
 }
 
@@ -199,18 +213,33 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, cursor 
 	return snapshot, cursor, true
 }
 
-// hydrate builds the proto metadata for a set of chats, batching the messaging
-// reads across the whole set: every chat's last message in one call and every
-// chat's pointers in one call. Member profiles are not populated yet and carry
-// an empty placeholder (UserProfile is a required field).
+// hydrate builds the proto metadata for a set of chats, batching the reads
+// across the whole set: every chat's last message in one call, every chat's
+// pointers in one call, and every DM member's phone number in one call. Member
+// profiles otherwise carry an empty placeholder (UserProfile is a required
+// field).
+//
+// Phone numbers are populated only for members of DM chats, so each party can
+// resolve the other to a contact. Group chats deliberately do not expose member
+// phone numbers.
 func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	pointerRefs := make([]PointerRef, len(chats))
+	uniqueDmUserIds := make(map[string]*commonpb.UserId)
 	for i, c := range chats {
 		pointerRefs[i] = PointerRef{ChatID: c.ID, Members: c.Members}
 		if c.LastMessageID != nil {
 			msgRefs = append(msgRefs, MessageRef{ChatID: c.ID, MessageID: c.LastMessageID})
 		}
+		if c.Type == chatpb.Metadata_DM {
+			for _, m := range c.Members {
+				uniqueDmUserIds[string(m.Value)] = m
+			}
+		}
+	}
+	dmUserIDs := make([]*commonpb.UserId, 0, len(uniqueDmUserIds))
+	for _, u := range uniqueDmUserIds {
+		dmUserIDs = append(dmUserIDs, u)
 	}
 
 	lastMessages, err := s.messaging.LastMessages(ctx, msgRefs)
@@ -218,6 +247,10 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 		return nil, err
 	}
 	pointers, err := s.messaging.Pointers(ctx, pointerRefs)
+	if err != nil {
+		return nil, err
+	}
+	phoneNumbersByUserId, err := s.profiles.GetPhoneNumbers(ctx, dmUserIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +262,11 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 		md.LastMessage = lastMessages[key]
 		assignPointers(md, pointers[key])
 		for _, m := range md.Members {
-			m.UserProfile = &profilepb.UserProfile{}
+			profile := &profilepb.UserProfile{}
+			if md.Type == chatpb.Metadata_DM {
+				profile.PhoneNumber = phoneNumbersByUserId[string(m.UserId.Value)]
+			}
+			m.UserProfile = profile
 		}
 		metadata[i] = md
 	}

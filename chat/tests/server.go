@@ -13,6 +13,7 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/chat"
@@ -45,6 +46,7 @@ type serverEnv struct {
 	authz     *auth.StaticAuthorizer
 	store     chat.Store
 	messaging *fakeMessagingReader
+	profiles  *fakeProfileReader
 
 	userID *commonpb.UserId
 	keys   model.KeyPair
@@ -60,7 +62,8 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 	authz.Add(userID, keys)
 
 	messaging := newFakeMessagingReader()
-	server := chat.NewServer(log, authz, s, messaging)
+	profiles := newFakeProfileReader()
+	server := chat.NewServer(log, authz, s, messaging, profiles)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
@@ -72,6 +75,7 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 		authz:     authz,
 		store:     s,
 		messaging: messaging,
+		profiles:  profiles,
 		userID:    userID,
 		keys:      keys,
 	}
@@ -106,6 +110,26 @@ func (f *fakeMessagingReader) Pointers(_ context.Context, refs []chat.PointerRef
 	for _, ref := range refs {
 		if p, ok := f.pointers[string(ref.ChatID.Value)]; ok {
 			out[string(ref.ChatID.Value)] = p
+		}
+	}
+	return out, nil
+}
+
+// fakeProfileReader is a canned chat.ProfileReader for server tests: it returns
+// whatever phone number a test registers per user ID.
+type fakeProfileReader struct {
+	phoneNumbers map[string]*phonepb.PhoneNumber
+}
+
+func newFakeProfileReader() *fakeProfileReader {
+	return &fakeProfileReader{phoneNumbers: make(map[string]*phonepb.PhoneNumber)}
+}
+
+func (f *fakeProfileReader) GetPhoneNumbers(_ context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error) {
+	out := make(map[string]*phonepb.PhoneNumber)
+	for _, userID := range userIDs {
+		if p, ok := f.phoneNumbers[string(userID.Value)]; ok {
+			out[string(userID.Value)] = p
 		}
 	}
 	return out, nil
@@ -258,9 +282,10 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 
 	e.messaging.lastMessages[string(chatID.Value)] = textMessage(7, peer, "hi")
 	e.messaging.pointers[string(chatID.Value)] = []*messagingpb.Pointer{
-		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 7}},
-		{Type: messagingpb.Pointer_DELIVERED, UserId: peer, Value: &messagingpb.MessageId{Value: 7}},
+		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 7}, Ts: timestamppb.New(at(7))},
+		{Type: messagingpb.Pointer_DELIVERED, UserId: peer, Value: &messagingpb.MessageId{Value: 7}, Ts: timestamppb.New(at(7))},
 	}
+	e.profiles.phoneNumbers[string(peer.Value)] = &phonepb.PhoneNumber{Value: "+15551234567"}
 
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
@@ -276,6 +301,14 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	require.Equal(t, messagingpb.Pointer_READ, members[string(e.userID.Value)].Pointers[0].Type)
 	require.Len(t, members[string(peer.Value)].Pointers, 1)
 	require.Equal(t, messagingpb.Pointer_DELIVERED, members[string(peer.Value)].Pointers[0].Type)
+
+	// The other DM member's phone number is hydrated onto their profile.
+	require.NotNil(t, members[string(peer.Value)].UserProfile)
+	require.NotNil(t, members[string(peer.Value)].UserProfile.PhoneNumber)
+	require.Equal(t, "+15551234567", members[string(peer.Value)].UserProfile.PhoneNumber.Value)
+	// The env user registered no phone, so theirs stays unset.
+	require.NotNil(t, members[string(e.userID.Value)].UserProfile)
+	require.Nil(t, members[string(e.userID.Value)].UserProfile.PhoneNumber)
 }
 
 func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {

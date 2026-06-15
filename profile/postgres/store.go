@@ -102,6 +102,10 @@ func (s *store) GetPhonesByHashesForPayment(ctx context.Context, hashes []*commo
 	return dbGetPhonesByHashesForPayment(ctx, s.pool, hashes)
 }
 
+func (s *store) GetPhoneNumbersForPayment(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error) {
+	return dbGetPhoneNumbersForPayment(ctx, s.pool, userIDs)
+}
+
 func (s *store) GetUserIdByPhoneNumber(ctx context.Context, phoneNumber string) (*commonpb.UserId, error) {
 	return dbGetUserIdByPhoneNumber(ctx, s.pool, phoneNumber)
 }

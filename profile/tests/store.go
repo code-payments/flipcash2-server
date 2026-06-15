@@ -21,6 +21,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testXProfiles,
 		testPhoneEmailTransfer,
 		testGetPhonesByHashes,
+		testGetPhoneNumbersForPayment,
 		testGetUserIdByPhoneNumber,
 		testLinkPhoneNumberForPayment,
 	} {
@@ -300,6 +301,51 @@ func testGetPhonesByHashes(t *testing.T, s profile.Store) {
 	gotPay, err = s.GetPhonesByHashesForPayment(ctx, nil)
 	require.NoError(t, err)
 	require.Empty(t, gotPay)
+}
+
+func testGetPhoneNumbersForPayment(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	user1 := model.MustGenerateUserID()
+	user2 := model.MustGenerateUserID()
+	user3 := model.MustGenerateUserID()
+	noPhone := model.MustGenerateUserID()
+
+	require.NoError(t, s.SetDisplayName(ctx, user1, "u1"))
+	require.NoError(t, s.SetDisplayName(ctx, user2, "u2"))
+	require.NoError(t, s.SetDisplayName(ctx, user3, "u3"))
+
+	require.NoError(t, s.LinkPhoneNumber(ctx, user1, "+11111111111", &commonpb.Hash{Value: []byte("hash1")}))
+	require.NoError(t, s.LinkPhoneNumber(ctx, user2, "+12222222222", &commonpb.Hash{Value: []byte("hash2")}))
+	require.NoError(t, s.LinkPhoneNumber(ctx, user3, "+13333333333", &commonpb.Hash{Value: []byte("hash3")}))
+
+	// Empty input.
+	got, err := s.GetPhoneNumbersForPayment(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// Nobody is linked for payment yet.
+	got, err = s.GetPhoneNumbersForPayment(ctx, []*commonpb.UserId{user1, user2, user3})
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// Enable two of the three for payment.
+	_, err = s.LinkPhoneNumberForPayment(ctx, user1, "+11111111111")
+	require.NoError(t, err)
+	_, err = s.LinkPhoneNumberForPayment(ctx, user3, "+13333333333")
+	require.NoError(t, err)
+
+	// Only the payment-enabled users are returned, keyed by user ID. user2 is
+	// excluded (linked but not for payment), and noPhone has no number at all.
+	got, err = s.GetPhoneNumbersForPayment(ctx, []*commonpb.UserId{user1, user2, user3, noPhone})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.Equal(t, "+11111111111", got[string(user1.Value)].Value)
+	require.Equal(t, "+13333333333", got[string(user3.Value)].Value)
+	_, ok := got[string(user2.Value)]
+	require.False(t, ok)
+	_, ok = got[string(noPhone.Value)]
+	require.False(t, ok)
 }
 
 func testGetUserIdByPhoneNumber(t *testing.T, s profile.Store) {

@@ -12,9 +12,9 @@ import (
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
-	"github.com/code-payments/ocp-server/pointer"
 	pg "github.com/code-payments/flipcash2-server/database/postgres"
 	"github.com/code-payments/flipcash2-server/profile"
+	"github.com/code-payments/ocp-server/pointer"
 )
 
 const (
@@ -261,6 +261,46 @@ func dbGetPhonesByHashesInternal(ctx context.Context, pool *pgxpool.Pool, hashes
 			PhoneNumber: &phonepb.PhoneNumber{Value: r.Phone},
 			UserID:      &commonpb.UserId{Value: rawID},
 		})
+	}
+	return out, nil
+}
+
+func dbGetPhoneNumbersForPayment(ctx context.Context, pool *pgxpool.Pool, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error) {
+	out := make(map[string]*phonepb.PhoneNumber)
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+
+	encoded := make([]string, 0, len(userIDs))
+	seen := make(map[string]struct{}, len(userIDs))
+	for _, id := range userIDs {
+		e := pg.Encode(id.Value)
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		encoded = append(encoded, e)
+	}
+
+	var rows []struct {
+		ID    string `db:"id"`
+		Phone string `db:"phoneNumber"`
+	}
+	query := `SELECT "id", "phoneNumber" FROM ` + usersTableName + ` WHERE "id" = ANY($1::text[]) AND "phoneNumber" IS NOT NULL AND "isPhoneNumberLinkedForPayment" = TRUE`
+	err := pgxscan.Select(ctx, pool, &rows, query, encoded)
+	if err != nil {
+		if pgxscan.NotFound(err) {
+			return out, nil
+		}
+		return nil, err
+	}
+
+	for _, r := range rows {
+		rawID, err := pg.Decode(r.ID)
+		if err != nil {
+			return nil, err
+		}
+		out[string(rawID)] = &phonepb.PhoneNumber{Value: r.Phone}
 	}
 	return out, nil
 }

@@ -59,6 +59,12 @@ type Store interface {
 	// their phone number for payment. Order is unspecified.
 	GetPhonesByHashesForPayment(ctx context.Context, hashes []*commonpb.Hash) ([]*PhoneForPayment, error)
 
+	// GetPhoneNumbersForPayment returns, for each of the given users that has a
+	// phone number enabled for payment, that phone number keyed by
+	// string(userID.Value). Users without a payment-enabled phone number are
+	// absent from the map. It resolves the whole set in a single lookup.
+	GetPhoneNumbersForPayment(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error)
+
 	// GetUserIdByPhoneNumber returns the UserId currently linked to the given
 	// phone number. Returns ErrNotFound when no user holds the number.
 	GetUserIdByPhoneNumber(ctx context.Context, phoneNumber string) (*commonpb.UserId, error)

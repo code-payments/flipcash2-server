@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -401,7 +402,7 @@ func (s *store) AdvancePointer(
 	userID *commonpb.UserId,
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
-) (bool, error) {
+) (*messagingpb.Pointer, bool, error) {
 	// The pointer's target must reference an existing message (in the other table).
 	exists, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:            aws.String(s.messagesTable),
@@ -409,10 +410,10 @@ func (s *store) AdvancePointer(
 		ProjectionExpression: aws.String(attrPK),
 	})
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if len(exists.Item) == 0 {
-		return false, messaging.ErrMessageNotFound
+		return nil, false, messaging.ErrMessageNotFound
 	}
 
 	return s.advancePointer(ctx, chatID, userID, pointerType, newValue)
@@ -424,45 +425,61 @@ func (s *store) AdvancePointerUnchecked(
 	userID *commonpb.UserId,
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
-) (bool, error) {
+) (*messagingpb.Pointer, bool, error) {
 	// Caller guarantees newValue exists, so the existence read is skipped.
 	return s.advancePointer(ctx, chatID, userID, pointerType, newValue)
 }
 
 // advancePointer performs the monotonic forward-only pointer update, the shared
 // core of AdvancePointer and AdvancePointerUnchecked. It does not verify that
-// newValue references an existing message.
+// newValue references an existing message. It always returns the pointer's
+// current state: the freshly advanced pointer, or — when the update is a no-op —
+// the existing pointer recovered from the failed condition check.
 func (s *store) advancePointer(
 	ctx context.Context,
 	chatID *commonpb.ChatId,
 	userID *commonpb.UserId,
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
-) (bool, error) {
+) (*messagingpb.Pointer, bool, error) {
+	now := time.Now().UTC()
 	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.pointersTable),
 		Key: map[string]types.AttributeValue{
 			attrPK: avS(chatPK(chatID)),
 			attrSK: avS(pointerSK(pointerType, userID)),
 		},
-		UpdateExpression:    aws.String(fmt.Sprintf("SET #t = :t, %s = :u, %s = :v", attrUserID, attrPointerVal)),
+		UpdateExpression:    aws.String(fmt.Sprintf("SET #t = :t, %s = :u, %s = :v, %s = :ts", attrUserID, attrPointerVal, attrTS)),
 		ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s) OR %s < :v", attrPK, attrPointerVal)),
 		ExpressionAttributeNames: map[string]string{
 			"#t": attrType,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":t": avN(uint64(pointerType)),
-			":u": avB(userID.Value),
-			":v": avN(newValue.Value),
+			":t":  avN(uint64(pointerType)),
+			":u":  avB(userID.Value),
+			":v":  avN(newValue.Value),
+			":ts": avN(uint64(now.UnixNano())),
 		},
+		// On a no-op (the pointer is already at/past newValue) return the existing
+		// item so the caller still gets the current pointer state without a second
+		// read.
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 	})
 	if err != nil {
-		if isConditionalCheckFailed(err) {
-			return false, nil // Not advanced (already at or past newValue).
+		var ccf *types.ConditionalCheckFailedException
+		if errors.As(err, &ccf) {
+			// Not advanced (already at or past newValue); reconstruct from the
+			// item that failed the condition.
+			return pointerFromItem(ccf.Item), false, nil
 		}
-		return false, err
+		return nil, false, err
 	}
-	return true, nil
+	return &messagingpb.Pointer{
+		Type:   pointerType,
+		UserId: &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
+		Value:  &messagingpb.MessageId{Value: newValue.Value},
+		Ts:     timestamppb.New(now),
+	}, true, nil
 }
 
 // readSendState fetches, in a single consistent batch read, the two partition
@@ -574,10 +591,17 @@ func messageFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeVal
 func pointerFromItem(item map[string]types.AttributeValue) *messagingpb.Pointer {
 	typeVal, _ := parseN(item[attrType])
 	value, _ := parseN(item[attrPointerVal])
+	// Pointers written before ts existed have no timestamp; default to now() so
+	// the required proto field is always populated rather than backfilling.
+	ts := time.Now()
+	if nanos, err := parseInt(item[attrTS]); err == nil {
+		ts = time.Unix(0, nanos).UTC()
+	}
 	return &messagingpb.Pointer{
 		Type:   messagingpb.Pointer_Type(typeVal),
 		UserId: &commonpb.UserId{Value: append([]byte(nil), asB(item[attrUserID])...)},
 		Value:  &messagingpb.MessageId{Value: value},
+		Ts:     timestamppb.New(ts),
 	}
 }
 
@@ -703,9 +727,4 @@ func isRetryable(reasons []string) bool {
 		}
 	}
 	return false
-}
-
-func isConditionalCheckFailed(err error) bool {
-	var ccf *types.ConditionalCheckFailedException
-	return errors.As(err, &ccf)
 }

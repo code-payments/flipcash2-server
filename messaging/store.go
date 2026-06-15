@@ -113,15 +113,17 @@ type Store interface {
 	// AdvancePointer moves a member's pointer of the given type forward to
 	// newValue. Pointers are monotonic: a request to move a pointer to a value
 	// at or before its current value is a no-op. It returns ErrMessageNotFound
-	// if newValue does not reference an existing message in the chat. The bool
-	// return reports whether the pointer advanced.
+	// if newValue does not reference an existing message in the chat. It always
+	// returns the pointer's current state (carrying its last-advanced ts), whether
+	// or not this call moved it; the bool reports whether it advanced. The pointer
+	// is nil only alongside a non-nil error.
 	AdvancePointer(
 		ctx context.Context,
 		chatID *commonpb.ChatId,
 		userID *commonpb.UserId,
 		pointerType messagingpb.Pointer_Type,
 		newValue *messagingpb.MessageId,
-	) (bool, error)
+	) (*messagingpb.Pointer, bool, error)
 
 	// AdvancePointerUnchecked is AdvancePointer for a newValue the caller already
 	// knows references an existing message — e.g. the sender's own READ pointer
@@ -136,7 +138,7 @@ type Store interface {
 		userID *commonpb.UserId,
 		pointerType messagingpb.Pointer_Type,
 		newValue *messagingpb.MessageId,
-	) (bool, error)
+	) (*messagingpb.Pointer, bool, error)
 }
 
 // PageTokenFromID encodes a message ID as a paging token. The token is the

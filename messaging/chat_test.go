@@ -50,7 +50,7 @@ func TestChatMessagingReader(t *testing.T) {
 	require.Empty(t, none)
 
 	// Pointers: delegated, keyed by chat; a chat with none is absent.
-	_, err = store.AdvancePointer(ctx, chatA, sender, messagingpb.Pointer_READ, a2.ID)
+	_, _, err = store.AdvancePointer(ctx, chatA, sender, messagingpb.Pointer_READ, a2.ID)
 	require.NoError(t, err)
 	pointers, err := reader.Pointers(ctx, []chat.PointerRef{
 		{ChatID: chatA, Members: []*commonpb.UserId{sender}},

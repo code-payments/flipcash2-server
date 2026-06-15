@@ -211,6 +211,29 @@ func (m *InMemoryStore) getPhonesByHashes(hashes []*commonpb.Hash, forPaymentOnl
 	return out, nil
 }
 
+func (m *InMemoryStore) GetPhoneNumbersForPayment(_ context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error) {
+	out := make(map[string]*phonepb.PhoneNumber)
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	for _, userID := range userIDs {
+		key := userIDCacheKey(userID)
+		if !m.linkedForPaymentByUser[key] {
+			continue
+		}
+		p, ok := m.profiles[key]
+		if !ok || p.PhoneNumber == nil {
+			continue
+		}
+		out[string(userID.Value)] = &phonepb.PhoneNumber{Value: p.PhoneNumber.Value}
+	}
+	return out, nil
+}
+
 func (m *InMemoryStore) GetUserIdByPhoneNumber(_ context.Context, phoneNumber string) (*commonpb.UserId, error) {
 	m.Lock()
 	defer m.Unlock()

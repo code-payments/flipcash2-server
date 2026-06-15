@@ -9,6 +9,7 @@ import (
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/badge"
 	"github.com/code-payments/flipcash2-server/chat"
@@ -76,28 +77,30 @@ func publishChatUpdate(
 			continue
 		}
 
-		senderProfile, err := profiles.GetProfile(ctx, message.SenderId, true)
-		if err == profile.ErrNotFound {
-			continue
-		} else if err != nil {
-			log.With(zap.Error(err)).Warn("Failure getting sender profile for push")
-			continue
-		}
-		if senderProfile.PhoneNumber == nil {
-			continue
-		}
-
-		var membersForPush []*commonpb.UserId
-		for _, member := range members {
-			if !bytes.Equal(member.Value, message.SenderId.Value) {
-				membersForPush = append(membersForPush, member)
+		go func(message *messagingpb.Message) {
+			senderProfile, err := profiles.GetProfile(ctx, message.SenderId, true)
+			if err == profile.ErrNotFound {
+				return
+			} else if err != nil {
+				log.With(zap.Error(err)).Warn("Failure getting sender profile for push")
+				return
 			}
-		}
+			if senderProfile.PhoneNumber == nil {
+				return
+			}
 
-		err = push.SendContactDmPush(ctx, pusher, badges, ocpData, update.Chat, message, senderProfile.PhoneNumber, membersForPush...)
-		if err != nil {
-			log.With(zap.Error(err)).Warn("Failure sending message push")
-			continue
-		}
+			var membersForPush []*commonpb.UserId
+			for _, member := range members {
+				if !bytes.Equal(member.Value, message.SenderId.Value) {
+					membersForPush = append(membersForPush, member)
+				}
+			}
+
+			err = push.SendContactDmPush(ctx, pusher, badges, ocpData, update.Chat, message, senderProfile.PhoneNumber, membersForPush...)
+			if err != nil {
+				log.With(zap.Error(err)).Warn("Failure sending message push")
+				return
+			}
+		}(message)
 	}
 }

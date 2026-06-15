@@ -35,6 +35,8 @@ func RunPusherTests(t *testing.T, s push.TokenStore, teardown func()) {
 	for _, tf := range []func(t *testing.T, s push.TokenStore){
 		testFCMPusher_SendBasicPushes,
 		testFCMPusher_SendPushesWithSubstitutions,
+		testFCMPusher_SendBadgeCountPush,
+		testFCMPusher_SendBadgeCountPush_NoIOSTokens,
 	} {
 		tf(t, s)
 		teardown()
@@ -181,4 +183,48 @@ func testFCMPusher_SendPushesWithSubstitutions(t *testing.T, store push.TokenSto
 			require.Equal(t, expectedEncoded, fcmClient.sentMessage.Android.Data["flipcash_payload"])
 		})
 	}
+}
+
+func testFCMPusher_SendBadgeCountPush(t *testing.T, store push.TokenStore) {
+	ctx := context.Background()
+
+	fcmClient := &testFCMClient{}
+	pusher := push.NewFCMPusher(zap.NewNop(), store, fcmClient)
+
+	user := &commonpb.UserId{Value: []byte("badge_user")}
+
+	// The user has both an iOS and an Android device; only the iOS token must
+	// receive the badge push.
+	require.NoError(t, store.AddToken(ctx, user, &commonpb.AppInstallId{Value: "ios"}, pushpb.TokenType_FCM_APNS, "apns_token"))
+	require.NoError(t, store.AddToken(ctx, user, &commonpb.AppInstallId{Value: "android"}, pushpb.TokenType_FCM_ANDROID, "android_token"))
+
+	require.NoError(t, pusher.SendBadgeCountPush(ctx, user, 7))
+
+	require.NotNil(t, fcmClient.sentMessage)
+
+	// iOS only: the Android token is filtered out.
+	require.Equal(t, []string{"apns_token"}, fcmClient.sentMessage.Tokens)
+
+	// Badge-only APNs payload: the count is set, with no alert and no Android
+	// config so nothing is displayed.
+	require.Nil(t, fcmClient.sentMessage.Android)
+	require.NotNil(t, fcmClient.sentMessage.APNS)
+	require.NotNil(t, fcmClient.sentMessage.APNS.Payload.Aps.Badge)
+	require.Equal(t, 7, *fcmClient.sentMessage.APNS.Payload.Aps.Badge)
+	require.Nil(t, fcmClient.sentMessage.APNS.Payload.Aps.Alert)
+	require.Empty(t, fcmClient.sentMessage.APNS.Payload.Aps.CustomData)
+}
+
+func testFCMPusher_SendBadgeCountPush_NoIOSTokens(t *testing.T, store push.TokenStore) {
+	ctx := context.Background()
+
+	fcmClient := &testFCMClient{}
+	pusher := push.NewFCMPusher(zap.NewNop(), store, fcmClient)
+
+	user := &commonpb.UserId{Value: []byte("android_only")}
+	require.NoError(t, store.AddToken(ctx, user, &commonpb.AppInstallId{Value: "android"}, pushpb.TokenType_FCM_ANDROID, "android_token"))
+
+	// No iOS tokens: nothing is sent.
+	require.NoError(t, pusher.SendBadgeCountPush(ctx, user, 3))
+	require.Nil(t, fcmClient.sentMessage)
 }

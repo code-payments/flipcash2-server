@@ -10,6 +10,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 
+	"github.com/code-payments/flipcash2-server/badge"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/profile"
@@ -30,6 +31,7 @@ func publishChatUpdate(
 
 	log *zap.Logger,
 
+	badges badge.Store,
 	chats chat.Store,
 	profiles profile.Store,
 	ocpData ocp_data.Provider,
@@ -92,7 +94,7 @@ func publishChatUpdate(
 			}
 		}
 
-		err = push.SendContactDmPush(ctx, pusher, ocpData, update.Chat, message, senderProfile.PhoneNumber, membersForPush...)
+		err = push.SendContactDmPush(ctx, pusher, badges, ocpData, update.Chat, message, senderProfile.PhoneNumber, membersForPush...)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure sending message push")
 			continue

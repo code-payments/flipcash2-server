@@ -15,6 +15,7 @@ import (
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
+	"github.com/code-payments/flipcash2-server/badge"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/model"
@@ -37,6 +38,7 @@ const sideEffectTimeout = 10 * time.Second
 type Sender struct {
 	log *zap.Logger
 
+	badges   badge.Store
 	chats    chat.Store
 	messages Store
 	profiles profile.Store
@@ -50,6 +52,7 @@ type Sender struct {
 
 func NewSender(
 	log *zap.Logger,
+	badges badge.Store,
 	chats chat.Store,
 	messages Store,
 	profiles profile.Store,
@@ -59,6 +62,7 @@ func NewSender(
 ) *Sender {
 	return &Sender{
 		log:      log,
+		badges:   badges,
 		chats:    chats,
 		messages: messages,
 		profiles: profiles,
@@ -183,7 +187,7 @@ func (s *Sender) Send(
 	}
 	// Reuse the members AdvanceLastMessage already loaded (nil if it failed, in
 	// which case publishChatUpdate loads them itself).
-	publishChatUpdate(ctx, log, s.chats, s.profiles, s.ocpData, s.pusher, s.eventBus, chatID, update, nil, members)
+	publishChatUpdate(ctx, log, s.badges, s.chats, s.profiles, s.ocpData, s.pusher, s.eventBus, chatID, update, nil, members)
 
 	return msg, nil
 }

@@ -16,11 +16,17 @@ import (
 
 type Pusher interface {
 	SendPushes(ctx context.Context, title, body string, customPayload *pushpb.Payload, users ...*commonpb.UserId) error
+
+	SendBadgeCountPush(ctx context.Context, user *commonpb.UserId, count uint64) error
 }
 
 type NoOpPusher struct{}
 
 func (n *NoOpPusher) SendPushes(_ context.Context, _, _ string, _ *pushpb.Payload, _ ...*commonpb.UserId) error {
+	return nil
+}
+
+func (n *NoOpPusher) SendBadgeCountPush(_ context.Context, _ *commonpb.UserId, _ uint64) error {
 	return nil
 }
 
@@ -150,6 +156,64 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 	return nil
 }
 
+// SendBadgeCountPush updates the app-icon badge to count on a user's iOS
+// devices only. It sends a badge-only APNs notification — no alert, sound, or
+// payload — so the icon updates without showing a banner.
+//
+// It targets iOS exclusively: APNs is the only platform with a server-settable
+// numeric badge, so FCM_ANDROID tokens are skipped. Android badges are driven
+// by notification state, not a pushed number.
+func (p *FCMPusher) SendBadgeCountPush(ctx context.Context, user *commonpb.UserId, count uint64) error {
+	pushTokens, err := p.getTokenList(ctx, []*commonpb.UserId{user})
+	if err != nil {
+		return err
+	}
+
+	apnsTokens := filterTokensByType(pushTokens, pushpb.TokenType_FCM_APNS)
+	if len(apnsTokens) == 0 {
+		p.log.Debug("Dropping badge push, no iOS tokens for user")
+		return nil
+	}
+	// A single MulticastMessage may contain up to 500 registration tokens.
+	if len(apnsTokens) > 500 {
+		p.log.Warn("Dropping badge push, too many tokens", zap.Int("num_tokens", len(apnsTokens)))
+		return nil
+	}
+
+	tokens := extractTokens(apnsTokens)
+	badge := int(count)
+
+	message := &messaging.MulticastMessage{
+		Tokens: tokens,
+		APNS: &messaging.APNSConfig{
+			Payload: &messaging.APNSPayload{
+				Aps: &messaging.Aps{
+					Badge: &badge,
+				},
+			},
+		},
+	}
+
+	response, err := p.client.SendEachForMulticast(ctx, message)
+	if err != nil {
+		return err
+	}
+
+	if response == nil {
+		p.log.Debug("No response from FCM")
+		return nil
+	}
+
+	p.log.Debug("Sent badge push", zap.Int("success", response.SuccessCount), zap.Int("failed", response.FailureCount))
+	if response.FailureCount == 0 {
+		return nil
+	}
+
+	p.processResponse(response, apnsTokens, tokens)
+
+	return nil
+}
+
 func (p *FCMPusher) processResponse(response *messaging.BatchResponse, pushTokens []Token, tokens []string) {
 	var invalidTokens []Token
 
@@ -193,4 +257,14 @@ func extractTokens(pushTokens []Token) []string {
 		tokens[i] = token.Token
 	}
 	return tokens
+}
+
+func filterTokensByType(pushTokens []Token, tokenType pushpb.TokenType) []Token {
+	filtered := make([]Token, 0, len(pushTokens))
+	for _, token := range pushTokens {
+		if token.Type == tokenType {
+			filtered = append(filtered, token)
+		}
+	}
+	return filtered
 }

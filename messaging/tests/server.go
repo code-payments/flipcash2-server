@@ -16,6 +16,7 @@ import (
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/badge"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/messaging"
@@ -28,8 +29,8 @@ import (
 
 // RunServerTests runs the shared messaging.Server test suite. chats and messages
 // are the backing stores; teardown resets both between tests.
-func RunServerTests(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, teardown func()) {
-	for _, tf := range []func(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store){
+func RunServerTests(t *testing.T, badges badge.Store, chats chat.Store, messages messaging.Store, profiles profile.Store, teardown func()) {
+	for _, tf := range []func(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store){
 		testServer_SendAndGet,
 		testServer_SendMessage_Idempotent,
 		testServer_GetMessages_NotFound,
@@ -41,7 +42,7 @@ func RunServerTests(t *testing.T, chats chat.Store, messages messaging.Store, pr
 		testServer_SendMessage_Broadcast,
 		testServer_NotifyIsTyping,
 	} {
-		tf(t, chats, messages, profiles)
+		tf(t, chats, messages, profiles, badges)
 		teardown()
 	}
 }
@@ -60,7 +61,7 @@ type serverEnv struct {
 	keysB  model.KeyPair
 }
 
-func newServerEnv(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) *serverEnv {
+func newServerEnv(t *testing.T, badges badge.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) *serverEnv {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
@@ -86,7 +87,7 @@ func newServerEnv(t *testing.T, chats chat.Store, messages messaging.Store, prof
 		LastActivity: at(1),
 	}))
 
-	sender := messaging.NewSender(log, chats, messages, profiles, ocp_data.NewTestDataProvider(), push.NewNoOpPusher(), bus)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, ocp_data.NewTestDataProvider(), push.NewNoOpPusher(), bus)
 	server := messaging.NewServer(log, authz, chats, messages, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
@@ -125,8 +126,8 @@ func (e *serverEnv) send(keys model.KeyPair, text string, clientID *messagingpb.
 	return e.client.SendMessage(e.ctx, req)
 }
 
-func testServer_SendAndGet(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	e := newServerEnv(t, chats, messages, profiles)
+func testServer_SendAndGet(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
 
 	resp, err := e.send(e.keysA, "hello", generateClientID())
 	require.NoError(t, err)
@@ -152,8 +153,8 @@ func testServer_SendAndGet(t *testing.T, chats chat.Store, messages messaging.St
 	require.Len(t, listResp.Messages.Messages, 1)
 }
 
-func testServer_SendMessage_Idempotent(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	e := newServerEnv(t, chats, messages, profiles)
+func testServer_SendMessage_Idempotent(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
 
 	clientID := generateClientID()
 	first, err := e.send(e.keysA, "hi", clientID)
@@ -189,8 +190,8 @@ func testServer_SendMessage_Idempotent(t *testing.T, chats chat.Store, messages 
 	require.Equal(t, 1, countBroadcasts(first.Message.MessageId.Value))
 }
 
-func testServer_GetMessages_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	e := newServerEnv(t, chats, messages, profiles)
+func testServer_GetMessages_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
 
 	req := &messagingpb.GetMessagesRequest{
 		ChatId: e.chatID,
@@ -202,8 +203,8 @@ func testServer_GetMessages_NotFound(t *testing.T, chats chat.Store, messages me
 	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, resp.Result)
 }
 
-func testServer_GetMessages_Paging(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	e := newServerEnv(t, chats, messages, profiles)
+func testServer_GetMessages_Paging(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
 
 	// Seed 5 messages, assigned gapless IDs 1..5.
 	for i := 0; i < 5; i++ {
@@ -256,8 +257,8 @@ func testServer_GetMessages_Paging(t *testing.T, chats chat.Store, messages mess
 	require.Equal(t, []uint64{5, 4}, protoMessageIDs(desc.Messages.Messages))
 }
 
-func testServer_GetMessages_ByIDs(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	e := newServerEnv(t, chats, messages, profiles)
+func testServer_GetMessages_ByIDs(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
 
 	for i := 0; i < 5; i++ {
 		_, err := e.send(e.keysA, "m", generateClientID())
@@ -288,8 +289,8 @@ func testServer_GetMessages_ByIDs(t *testing.T, chats chat.Store, messages messa
 	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, none.Result)
 }
 
-func testServer_GetMessage_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	e := newServerEnv(t, chats, messages, profiles)
+func testServer_GetMessage_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
 
 	req := &messagingpb.GetMessageRequest{ChatId: e.chatID, MessageId: &messagingpb.MessageId{Value: 99}}
 	require.NoError(t, e.keysA.Auth(req, &req.Auth))
@@ -298,8 +299,8 @@ func testServer_GetMessage_NotFound(t *testing.T, chats chat.Store, messages mes
 	require.Equal(t, messagingpb.GetMessageResponse_NOT_FOUND, resp.Result)
 }
 
-func testServer_NonMember_Denied(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	e := newServerEnv(t, chats, messages, profiles)
+func testServer_NonMember_Denied(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
 	_, strangerKeys := e.addUser()
 
 	sendReq := &messagingpb.SendMessageRequest{
@@ -347,8 +348,8 @@ func testServer_NonMember_Denied(t *testing.T, chats chat.Store, messages messag
 	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
 }
 
-func testServer_AdvancePointer(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	e := newServerEnv(t, chats, messages, profiles)
+func testServer_AdvancePointer(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
 
 	m1, err := e.send(e.keysA, "first", generateClientID())
 	require.NoError(t, err)
@@ -436,8 +437,8 @@ func testServer_AdvancePointer(t *testing.T, chats chat.Store, messages messagin
 	require.Equal(t, messagingpb.AdvancePointerResponse_MESSAGE_NOT_FOUND, missResp.Result)
 }
 
-func testServer_SendMessage_Broadcast(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	e := newServerEnv(t, chats, messages, profiles)
+func testServer_SendMessage_Broadcast(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
 
 	resp, err := e.send(e.keysA, "broadcast me", generateClientID())
 	require.NoError(t, err)
@@ -478,8 +479,8 @@ func testServer_SendMessage_Broadcast(t *testing.T, chats chat.Store, messages m
 	})
 }
 
-func testServer_NotifyIsTyping(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	e := newServerEnv(t, chats, messages, profiles)
+func testServer_NotifyIsTyping(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
 
 	req := &messagingpb.NotifyIsTypingRequest{
 		ChatId: e.chatID,

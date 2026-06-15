@@ -20,6 +20,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/badge"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/protoutil"
 	ocp_headers "github.com/code-payments/ocp-server/grpc/headers"
@@ -56,6 +57,7 @@ type Server struct {
 
 	accounts account.Store
 	events   Store
+	badges   badge.Store
 
 	eventBus *Bus[*commonpb.UserId, *eventpb.Event]
 
@@ -76,6 +78,7 @@ func NewServer(
 	authz auth.Authorizer,
 	accounts account.Store,
 	events Store,
+	badges badge.Store,
 	eventBus *Bus[*commonpb.UserId, *eventpb.Event],
 	staleEventDetectorCtors []StaleEventDetectorCtor[*eventpb.Event],
 	broadcastAddress string,
@@ -88,6 +91,7 @@ func NewServer(
 
 		accounts: accounts,
 		events:   events,
+		badges:   badges,
 
 		eventBus: eventBus,
 
@@ -146,6 +150,13 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 		return stream.Send(&eventpb.StreamEventsResponse{Type: &eventpb.StreamEventsResponse_Error{
 			Error: &eventpb.StreamEventsResponse_StreamError{Code: eventpb.StreamEventsResponse_StreamError_DENIED},
 		}})
+	}
+
+	// A stream open is the client coming to the foreground (guaranteed on app
+	// open), which is when the badge resets to zero. Best-effort: a failure here
+	// must not block streaming.
+	if err := s.badges.Reset(ctx, userID); err != nil {
+		log.With(zap.Error(err)).Warn("Failed to reset badge count on stream open")
 	}
 
 	streamID := uuid.New()

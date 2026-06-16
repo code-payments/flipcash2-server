@@ -34,6 +34,8 @@ const (
 	streamBufferSize   = 64
 	streamPingDelay    = 5 * time.Second
 	streamTimeout      = time.Second
+	streamSendTimeout  = 5 * time.Second
+	streamPongTimeout  = 2 * streamPingDelay
 	streamInitTsWindow = 2 * time.Minute
 
 	rendezvousExpiryTime      = 3 * time.Second
@@ -281,11 +283,42 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 		return status.Error(codes.Internal, "failure saving rendezvous record")
 	}
 
-	updateRendezvousCh := time.After(rendezvousRefreshInterval)
 	sendPingCh := time.After(0)
-	streamHealthCh := protoutil.MonitorStreamHealth(ctx, log, stream, func(t *eventpb.StreamEventsRequest) bool {
-		return t.GetPong() != nil
+	streamHealthCh := protoutil.MonitorStreamHealth(ctx, log, stream, streamPongTimeout, func(t *eventpb.StreamEventsRequest) bool {
+		pong := t.GetPong()
+		if pong == nil {
+			return false
+		}
+
+		if ts := pong.GetTimestamp(); ts != nil {
+			log.Debug("Received pong from client", zap.Duration("upstream_latency", time.Since(ts.AsTime())))
+		}
+
+		return true
 	})
+
+	rendezvousErrCh := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(rendezvousRefreshInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				expiry := time.Now().Add(rendezvousExpiryTime)
+				if err := s.events.ExtendRendezvousExpiry(ctx, streamKey, s.broadcastAddress, expiry); err != nil {
+					if ctx.Err() == nil {
+						rendezvousErrCh <- err
+					}
+					return
+				}
+
+				log.Debug("Refreshed rendezvous record")
+			}
+		}
+	}()
 
 	for {
 		select {
@@ -296,43 +329,36 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 			}
 
 			log.Debug("Sending events to client stream")
-			err = stream.Send(&eventpb.StreamEventsResponse{
+			err = protoutil.BoundedSend(ctx, stream, &eventpb.StreamEventsResponse{
 				Type: &eventpb.StreamEventsResponse_Events{
 					Events: batch,
 				},
-			})
+			}, streamSendTimeout)
 			if err != nil {
 				log.Info("Failed to send events to client stream", zap.Error(err))
 				return err
 			}
-		case <-updateRendezvousCh:
-			log.Debug("Refreshing rendezvous record")
-
-			expiry := time.Now().Add(rendezvousExpiryTime)
-
-			err = s.events.ExtendRendezvousExpiry(ctx, streamKey, s.broadcastAddress, expiry)
+		case err := <-rendezvousErrCh:
 			if err == ErrRendezvousNotFound {
 				log.Debug("Existing stream detected on another server aborting")
 				return status.Error(codes.Aborted, "stream already exists")
-			} else if err != nil {
-				log.With(zap.Error(err)).Warn("Failure extending rendezvous record expiry")
-				return status.Error(codes.Internal, "failure extending rendezvous record expiry")
 			}
 
-			updateRendezvousCh = time.After(rendezvousRefreshInterval)
+			log.With(zap.Error(err)).Warn("Failure extending rendezvous record expiry")
+			return status.Error(codes.Internal, "")
 		case <-sendPingCh:
 			log.Debug("Sending ping to client")
 
 			sendPingCh = time.After(streamPingDelay)
 
-			err := stream.Send(&eventpb.StreamEventsResponse{
+			err := protoutil.BoundedSend(ctx, stream, &eventpb.StreamEventsResponse{
 				Type: &eventpb.StreamEventsResponse_Ping{
 					Ping: &eventpb.ServerPing{
 						Timestamp: timestamppb.Now(),
 						PingDelay: durationpb.New(streamPingDelay),
 					},
 				},
-			})
+			}, streamSendTimeout)
 			if err != nil {
 				log.Debug("Stream is unhealthy; aborting")
 				return status.Error(codes.Aborted, "terminating unhealthy stream")

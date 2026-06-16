@@ -3,6 +3,7 @@ package messaging
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -18,6 +19,8 @@ import (
 	"github.com/code-payments/flipcash2-server/push"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 )
+
+const pushTimeout = 3 * time.Second
 
 // publishChatUpdate fans a ChatUpdate out to each member of the chat over the
 // event bus, optionally excluding one user (e.g. the originator of a typing
@@ -78,6 +81,9 @@ func publishChatUpdate(
 		}
 
 		go func(message *messagingpb.Message) {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pushTimeout)
+			defer cancel()
+
 			senderProfile, err := profiles.GetProfile(ctx, message.SenderId, true)
 			if err == profile.ErrNotFound {
 				return

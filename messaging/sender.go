@@ -27,7 +27,7 @@ import (
 // sideEffectTimeout bounds the post-persistence side effects of a send
 // (pointer advance, last-message bump, broadcast, pushes) once they have been
 // detached from the caller's cancellation.
-const sideEffectTimeout = 10 * time.Second
+const sideEffectTimeout = 5 * time.Second
 
 // Sender is the engine behind a message send: it persists the message and
 // performs every side effect — advancing the sender's read pointer, bumping the

@@ -11,8 +11,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const streamKeepAliveRecvTimeout = 10 * time.Second
-
 type Ptr[T any] interface {
 	proto.Message
 	*T
@@ -23,22 +21,46 @@ func BoundedReceive[Req any](
 	stream grpc.ServerStream,
 	timeout time.Duration,
 ) (*Req, error) {
-	var err error
-	var req = new(Req)
-	doneCh := make(chan struct{})
+	type result struct {
+		req *Req
+		err error
+	}
 
+	doneCh := make(chan result, 1)
 	go func() {
-		err = stream.RecvMsg(req)
-		close(doneCh)
+		req := new(Req)
+		err := stream.RecvMsg(req)
+		doneCh <- result{req, err}
 	}()
 
 	select {
-	case <-doneCh:
-		return req, err
+	case r := <-doneCh:
+		return r.req, r.err
 	case <-ctx.Done():
-		return req, status.Error(codes.Canceled, "")
+		return nil, status.Error(codes.Canceled, "")
 	case <-time.After(timeout):
-		return req, status.Error(codes.DeadlineExceeded, "timeout receiving message")
+		return nil, status.Error(codes.DeadlineExceeded, "timeout receiving message")
+	}
+}
+
+func BoundedSend[Resp any](
+	ctx context.Context,
+	stream grpc.ServerStream,
+	msg *Resp,
+	timeout time.Duration,
+) error {
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- stream.SendMsg(msg)
+	}()
+
+	select {
+	case err := <-doneCh:
+		return err
+	case <-ctx.Done():
+		return status.Error(codes.Canceled, "")
+	case <-time.After(timeout):
+		return status.Error(codes.DeadlineExceeded, "timeout sending message")
 	}
 }
 
@@ -46,6 +68,7 @@ func MonitorStreamHealth[Req any](
 	ctx context.Context,
 	log *zap.Logger,
 	streamer grpc.ServerStream,
+	recvTimeout time.Duration,
 	validFn func(*Req) bool,
 ) <-chan struct{} {
 	healthCh := make(chan struct{})
@@ -53,7 +76,7 @@ func MonitorStreamHealth[Req any](
 		defer close(healthCh)
 
 		for {
-			req, err := BoundedReceive[Req](ctx, streamer, streamKeepAliveRecvTimeout)
+			req, err := BoundedReceive[Req](ctx, streamer, recvTimeout)
 			if err != nil {
 				return
 			}
@@ -61,8 +84,6 @@ func MonitorStreamHealth[Req any](
 			if !validFn(req) {
 				return
 			}
-
-			log.Debug("receiving pong from client")
 		}
 	}()
 	return healthCh

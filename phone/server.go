@@ -18,10 +18,11 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/push"
+	"github.com/code-payments/ocp-server/pointer"
 )
 
 const (
-	androidAppHash  = "todo"
+	androidAppHash  = "fFo497KeDSw"
 	mockPhoneNumber = "+15005550000"
 )
 
@@ -94,7 +95,11 @@ func (s *Server) SendVerificationCode(ctx context.Context, req *phonepb.SendVeri
 	}
 
 	var result phonepb.SendVerificationCodeResponse_Result
-	_, _, err = s.verifier.SendCode(ctx, req.PhoneNumber.Value, nil) // todo: Send app hash when platform is GOOGLE
+	var appHash *string
+	if req.Platform == commonpb.Platform_GOOGLE {
+		appHash = pointer.String(androidAppHash)
+	}
+	_, _, err = s.verifier.SendCode(ctx, req.PhoneNumber.Value, appHash)
 	switch err {
 	case nil:
 		result = phonepb.SendVerificationCodeResponse_OK

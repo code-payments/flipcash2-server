@@ -22,6 +22,8 @@ import (
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 	ocp_account "github.com/code-payments/ocp-server/ocp/data/account"
 	ocp_currency "github.com/code-payments/ocp-server/ocp/data/currency"
+	ocp_currency_exchange "github.com/code-payments/ocp-server/ocp/data/currency/exchange"
+	ocp_currency_reserve "github.com/code-payments/ocp-server/ocp/data/currency/reserve"
 	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
 	"github.com/code-payments/ocp-server/usdc"
 )
@@ -31,10 +33,12 @@ const gainProcessingBatchSize = 256
 type Integration struct {
 	log *zap.Logger
 
-	accounts   account.Store
-	pushTokens push.TokenStore
-	settings   settings.Store
-	ocpData    ocp_data.Provider
+	accounts         account.Store
+	pushTokens       push.TokenStore
+	settings         settings.Store
+	ocpData          ocp_data.Provider
+	ocpExchangeRates ocp_currency_exchange.Store
+	ocpReserveStates ocp_currency_reserve.Store
 
 	pusher push.Pusher
 
@@ -51,6 +55,8 @@ func NewIntegration(
 	pushTokens push.TokenStore,
 	settings settings.Store,
 	ocpData ocp_data.Provider,
+	ocpExchangeRates ocp_currency_exchange.Store,
+	ocpReserveStates ocp_currency_reserve.Store,
 	pusher push.Pusher,
 	enableGainPushes bool,
 	gainPushCooldown time.Duration,
@@ -58,10 +64,12 @@ func NewIntegration(
 	return &Integration{
 		log: log,
 
-		accounts:   accounts,
-		pushTokens: pushTokens,
-		settings:   settings,
-		ocpData:    ocpData,
+		accounts:         accounts,
+		pushTokens:       pushTokens,
+		settings:         settings,
+		ocpData:          ocpData,
+		ocpExchangeRates: ocpExchangeRates,
+		ocpReserveStates: ocpReserveStates,
 
 		pusher: pusher,
 
@@ -142,7 +150,7 @@ func (i *Integration) notifyHoldersOfGain(ctx context.Context, mint *ocp_common.
 	}()
 
 	// Get all exchange rates for computing gains in each user's preferred region
-	exchangeRates, err := i.ocpData.GetAllExchangeRates(ctx, time.Now())
+	exchangeRates, err := i.ocpExchangeRates.GetAllExchangeRates(ctx, time.Now())
 	if err != nil {
 		log.Warn("failed to get all exchange rates", zap.Error(err))
 		return
@@ -311,7 +319,7 @@ func (i *Integration) notifyHoldersOfGainBatch(ctx context.Context, log *zap.Log
 		log := log.With(zap.String("owner", owner))
 
 		// Calculate current USD market value of the balance
-		usdValue, err := ocp_currency_util.CalculateUsdMarketValueFromTokenAmount(ctx, i.ocpData, mint, quarks, now)
+		usdValue, err := ocp_currency_util.CalculateUsdMarketValueFromTokenAmount(ctx, i.ocpData, i.ocpExchangeRates, i.ocpReserveStates, mint, quarks, now)
 		if err != nil {
 			log.Warn("failed to calculate usd market value", zap.Error(err))
 			continue

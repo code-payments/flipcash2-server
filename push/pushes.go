@@ -158,6 +158,10 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 		return nil
 	}
 
+	if len(body) > 1024 {
+		body = fmt.Sprintf("%s...", body[:1024])
+	}
+
 	customPayload := &pushpb.Payload{
 		Category: pushpb.Payload_CHAT,
 		GroupKey: base64.StdEncoding.EncodeToString(chatId.Value),

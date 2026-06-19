@@ -56,10 +56,11 @@ func (m *Message) ToProto() *messagingpb.Message {
 		content[i] = proto.Clone(c).(*messagingpb.Content)
 	}
 	out := &messagingpb.Message{
-		MessageId: &messagingpb.MessageId{Value: m.ID.Value},
-		Content:   content,
-		Ts:        timestamppb.New(m.Timestamp),
-		UnreadSeq: m.UnreadSeq,
+		MessageId:     &messagingpb.MessageId{Value: m.ID.Value},
+		Content:       content,
+		Ts:            timestamppb.New(m.Timestamp),
+		UnreadSeq:     m.UnreadSeq,
+		EventSequence: m.ID.Value,
 	}
 	if m.SenderID != nil {
 		out.SenderId = &commonpb.UserId{Value: append([]byte(nil), m.SenderID.Value...)}

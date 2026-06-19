@@ -349,7 +349,8 @@ func textMessage(id uint64, sender *commonpb.UserId, text string) *messagingpb.M
 		Content: []*messagingpb.Content{{
 			Type: &messagingpb.Content_Text{Text: &messagingpb.TextContent{Text: text}},
 		}},
-		Ts: timestamppb.New(at(int64(id))),
+		Ts:            timestamppb.New(at(int64(id))),
+		EventSequence: id,
 	}
 }
 

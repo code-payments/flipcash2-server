@@ -531,6 +531,25 @@ func textContent(text string) []*messagingpb.Content {
 	}}
 }
 
+func systemContent(text string) []*messagingpb.Content {
+	return []*messagingpb.Content{{
+		Type: &messagingpb.Content_System{
+			System: &messagingpb.SystemContent{FallbackText: text},
+		},
+	}}
+}
+
+func replyContent(repliedMessageID uint64, text string) []*messagingpb.Content {
+	return []*messagingpb.Content{{
+		Type: &messagingpb.Content_Reply{
+			Reply: &messagingpb.ReplyContent{
+				RepliedMessageId: &messagingpb.MessageId{Value: repliedMessageID},
+				Content:          textContent(text),
+			},
+		},
+	}}
+}
+
 func messageText(m *messaging.Message) string {
 	return m.Content[0].GetText().Text
 }

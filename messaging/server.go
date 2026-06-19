@@ -127,8 +127,16 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	switch req.Content[0].Type.(type) {
+	var repliedMessageID *messagingpb.MessageId
+	switch content := req.Content[0].Type.(type) {
 	case *messagingpb.Content_Text:
+	case *messagingpb.Content_Reply:
+		switch content.Reply.Content[0].Type.(type) {
+		case *messagingpb.Content_Text:
+		default:
+			return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
+		}
+		repliedMessageID = content.Reply.RepliedMessageId
 	default:
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
 	}
@@ -137,6 +145,22 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 		return nil, err
 	} else if !member {
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
+	}
+
+	// The replied-to message must exist in this chat and be repliable. Checked
+	// after membership so non-members can't probe which message IDs exist.
+	if repliedMessageID != nil {
+		repliedMessage, err := s.messages.GetMessage(ctx, req.ChatId, repliedMessageID)
+		switch {
+		case errors.Is(err, ErrMessageNotFound):
+			return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
+		case err != nil:
+			log.With(zap.Error(err)).Warn("Failure getting replied-to message")
+			return nil, status.Error(codes.Internal, "")
+		}
+		if !repliedMessage.IsReplyable() {
+			return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
+		}
 	}
 
 	msg, err := s.sender.Send(ctx, req.ChatId, userID, req.Content, req.ClientMessageId, true)

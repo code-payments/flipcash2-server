@@ -40,6 +40,7 @@ func RunServerTests(t *testing.T, badges badge.Store, chats chat.Store, messages
 		testServer_NonMember_Denied,
 		testServer_AdvancePointer,
 		testServer_SendMessage_Broadcast,
+		testServer_SendReply,
 		testServer_NotifyIsTyping,
 	} {
 		tf(t, chats, messages, profiles, badges)
@@ -151,6 +152,72 @@ func testServer_SendAndGet(t *testing.T, chats chat.Store, messages messaging.St
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessagesResponse_OK, listResp.Result)
 	require.Len(t, listResp.Messages.Messages, 1)
+}
+
+func testServer_SendReply(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	// Seed a message to reply to.
+	original, err := e.send(e.keysA, "original", generateClientID())
+	require.NoError(t, err)
+
+	// A text reply to that message is accepted and round-trips its content.
+	replyReq := &messagingpb.SendMessageRequest{
+		ChatId:          e.chatID,
+		Content:         replyContent(original.Message.MessageId.Value, "replying"),
+		ClientMessageId: generateClientID(),
+	}
+	require.NoError(t, e.keysB.Auth(replyReq, &replyReq.Auth))
+	replyResp, err := e.client.SendMessage(e.ctx, replyReq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, replyResp.Result)
+
+	reply := replyResp.Message.Content[0].GetReply()
+	require.NotNil(t, reply)
+	require.Equal(t, original.Message.MessageId.Value, reply.RepliedMessageId.Value)
+	require.Equal(t, "replying", reply.Content[0].GetText().Text)
+
+	// A reply wrapping unsupported content (e.g. a nested reply) is denied.
+	deniedReq := &messagingpb.SendMessageRequest{
+		ChatId: e.chatID,
+		Content: []*messagingpb.Content{{
+			Type: &messagingpb.Content_Reply{
+				Reply: &messagingpb.ReplyContent{
+					RepliedMessageId: original.Message.MessageId,
+					Content:          replyContent(original.Message.MessageId.Value, "nested"),
+				},
+			},
+		}},
+		ClientMessageId: generateClientID(),
+	}
+	require.NoError(t, e.keysB.Auth(deniedReq, &deniedReq.Auth))
+	deniedResp, err := e.client.SendMessage(e.ctx, deniedReq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, deniedResp.Result)
+
+	// Replying to a message that does not exist is denied.
+	missingReq := &messagingpb.SendMessageRequest{
+		ChatId:          e.chatID,
+		Content:         replyContent(original.Message.MessageId.Value+999, "ghost"),
+		ClientMessageId: generateClientID(),
+	}
+	require.NoError(t, e.keysB.Auth(missingReq, &missingReq.Auth))
+	missingResp, err := e.client.SendMessage(e.ctx, missingReq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, missingResp.Result)
+
+	// Replying to a non-replyable (system) message is denied.
+	systemMsg, _, err := messages.PutMessage(e.ctx, e.chatID, nil, systemContent("joined"), at(100), generateClientID(), false)
+	require.NoError(t, err)
+	systemReplyReq := &messagingpb.SendMessageRequest{
+		ChatId:          e.chatID,
+		Content:         replyContent(systemMsg.ID.Value, "to a system message"),
+		ClientMessageId: generateClientID(),
+	}
+	require.NoError(t, e.keysB.Auth(systemReplyReq, &systemReplyReq.Auth))
+	systemReplyResp, err := e.client.SendMessage(e.ctx, systemReplyReq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, systemReplyResp.Result)
 }
 
 func testServer_SendMessage_Idempotent(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {

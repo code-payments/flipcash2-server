@@ -140,6 +140,16 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 	switch content := message.Content[0].Type.(type) {
 	case *messagingpb.Content_Text:
 		body = content.Text.Text
+	case *messagingpb.Content_Reply:
+		// Push the reply's wrapped content. Only text replies are supported today.
+		if len(content.Reply.Content) == 0 {
+			return nil
+		}
+		textContent, ok := content.Reply.Content[0].Type.(*messagingpb.Content_Text)
+		if !ok {
+			return nil
+		}
+		body = textContent.Text.Text
 	case *messagingpb.Content_Cash:
 		currencyName, err := resolveCurrencyName(ctx, ocpData, content.Cash.Amount.Mint)
 		if err != nil {

@@ -49,6 +49,27 @@ func (m *Message) Clone() *Message {
 	}
 }
 
+// IsReplyable reports whether this message may be the target of a reply. Only
+// user-facing messages are replyable; this is a whitelist so that content types
+// added later (and non-conversational ones like system messages) are treated as
+// non-replyable until explicitly allowed. Deleted messages remain replyable —
+// the tombstone is still a real message in the thread.
+func (m *Message) IsReplyable() bool {
+	if len(m.Content) == 0 {
+		return false
+	}
+	switch m.Content[0].Type.(type) {
+	case *messagingpb.Content_Text,
+		*messagingpb.Content_Cash,
+		*messagingpb.Content_Media,
+		*messagingpb.Content_Reply,
+		*messagingpb.Content_Deleted:
+		return true
+	default:
+		return false
+	}
+}
+
 // ToProto projects the stored message onto a messagingpb.Message.
 func (m *Message) ToProto() *messagingpb.Message {
 	content := make([]*messagingpb.Content, len(m.Content))

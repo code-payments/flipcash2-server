@@ -32,21 +32,29 @@ import (
 // are the backing stores; teardown resets both between tests.
 func RunServerTests(t *testing.T, badges badge.Store, chats chat.Store, messages messaging.Store, profiles profile.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store){
+		// Messaging
 		testServer_SendAndGet,
 		testServer_SendMessage_Idempotent,
+		testServer_SendReply,
+		testServer_SendMessage_DisallowedContent,
+		testServer_SendMessage_Broadcast,
+		testServer_GetMessage_NotFound,
 		testServer_GetMessages_NotFound,
 		testServer_GetMessages_Paging,
 		testServer_GetMessages_ByIDs,
-		testServer_GetMessage_NotFound,
-		testServer_NonMember_Denied,
+		// Pointers
 		testServer_AdvancePointer,
-		testServer_SendMessage_Broadcast,
-		testServer_SendReply,
-		testServer_NotifyIsTyping,
+		testServer_AdvancePointer_PointerTypes,
+		// Reactions
 		testServer_Reactions,
 		testServer_Reactions_Reactors,
 		testServer_Reactions_Summaries,
 		testServer_Reactions_Errors,
+		// Typing
+		testServer_NotifyIsTyping,
+		// Cross-cutting
+		testServer_NonMember_Denied,
+		testServer_Broadcast_IncludesActor,
 	} {
 		tf(t, chats, messages, profiles, badges)
 		teardown()
@@ -102,19 +110,6 @@ func newServerEnv(t *testing.T, badges badge.Store, chats chat.Store, messages m
 	return env
 }
 
-func protoMessageIDs(msgs []*messagingpb.Message) []uint64 {
-	out := make([]uint64, len(msgs))
-	for i, m := range msgs {
-		out[i] = m.MessageId.Value
-	}
-	return out
-}
-
-func lastMessageID(resp *messagingpb.GetMessagesResponse) *messagingpb.MessageId {
-	msgs := resp.Messages.Messages
-	return msgs[len(msgs)-1].MessageId
-}
-
 func (e *serverEnv) addUser() (*commonpb.UserId, model.KeyPair) {
 	userID := model.MustGenerateUserID()
 	keys := model.MustGenerateKeyPair()
@@ -122,434 +117,60 @@ func (e *serverEnv) addUser() (*commonpb.UserId, model.KeyPair) {
 	return userID, keys
 }
 
+// ============================================================================
+// Request helpers
+//
+// One per RPC, each stamping the chat ID and signing as the given caller so a
+// test expresses only what differs (who calls, with what payload). Every RPC —
+// messaging, pointers, reactions, typing — is invoked through these, so the
+// call sites read uniformly across the suite.
+// ============================================================================
+
+// --- messaging ---
+
 func (e *serverEnv) send(keys model.KeyPair, text string, clientID *messagingpb.ClientMessageId) (*messagingpb.SendMessageResponse, error) {
-	req := &messagingpb.SendMessageRequest{
-		ChatId:          e.chatID,
-		Content:         textContent(text),
-		ClientMessageId: clientID,
-	}
+	return e.sendContent(keys, textContent(text), clientID)
+}
+
+func (e *serverEnv) sendContent(keys model.KeyPair, content []*messagingpb.Content, clientID *messagingpb.ClientMessageId) (*messagingpb.SendMessageResponse, error) {
+	req := &messagingpb.SendMessageRequest{ChatId: e.chatID, Content: content, ClientMessageId: clientID}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.SendMessage(e.ctx, req)
 }
 
-func testServer_SendAndGet(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
-
-	resp, err := e.send(e.keysA, "hello", generateClientID())
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
-	require.Equal(t, uint64(1), resp.Message.MessageId.Value)
-	require.Equal(t, e.userA.Value, resp.Message.SenderId.Value)
-
-	getReq := &messagingpb.GetMessageRequest{ChatId: e.chatID, MessageId: resp.Message.MessageId}
-	require.NoError(t, e.keysB.Auth(getReq, &getReq.Auth))
-	getResp, err := e.client.GetMessage(e.ctx, getReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
-	require.Equal(t, "hello", getResp.Message.Content[0].GetText().Text)
-
-	listReq := &messagingpb.GetMessagesRequest{
-		ChatId: e.chatID,
-		Query:  &messagingpb.GetMessagesRequest_Options{Options: &commonpb.QueryOptions{}},
-	}
-	require.NoError(t, e.keysB.Auth(listReq, &listReq.Auth))
-	listResp, err := e.client.GetMessages(e.ctx, listReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetMessagesResponse_OK, listResp.Result)
-	require.Len(t, listResp.Messages.Messages, 1)
+func (e *serverEnv) getMessage(keys model.KeyPair, msgID *messagingpb.MessageId) (*messagingpb.GetMessageResponse, error) {
+	req := &messagingpb.GetMessageRequest{ChatId: e.chatID, MessageId: msgID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.GetMessage(e.ctx, req)
 }
 
-func testServer_SendReply(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
-
-	// Seed a message to reply to.
-	original, err := e.send(e.keysA, "original", generateClientID())
-	require.NoError(t, err)
-
-	// A text reply to that message is accepted and round-trips its content.
-	replyReq := &messagingpb.SendMessageRequest{
-		ChatId:          e.chatID,
-		Content:         replyContent(original.Message.MessageId.Value, "replying"),
-		ClientMessageId: generateClientID(),
-	}
-	require.NoError(t, e.keysB.Auth(replyReq, &replyReq.Auth))
-	replyResp, err := e.client.SendMessage(e.ctx, replyReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.SendMessageResponse_OK, replyResp.Result)
-
-	reply := replyResp.Message.Content[0].GetReply()
-	require.NotNil(t, reply)
-	require.Equal(t, original.Message.MessageId.Value, reply.RepliedMessageId.Value)
-	require.Equal(t, "replying", reply.Content[0].GetText().Text)
-
-	// A reply wrapping unsupported content (e.g. a nested reply) is denied.
-	deniedReq := &messagingpb.SendMessageRequest{
-		ChatId: e.chatID,
-		Content: []*messagingpb.Content{{
-			Type: &messagingpb.Content_Reply{
-				Reply: &messagingpb.ReplyContent{
-					RepliedMessageId: original.Message.MessageId,
-					Content:          replyContent(original.Message.MessageId.Value, "nested"),
-				},
-			},
-		}},
-		ClientMessageId: generateClientID(),
-	}
-	require.NoError(t, e.keysB.Auth(deniedReq, &deniedReq.Auth))
-	deniedResp, err := e.client.SendMessage(e.ctx, deniedReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.SendMessageResponse_DENIED, deniedResp.Result)
-
-	// Replying to a message that does not exist is denied.
-	missingReq := &messagingpb.SendMessageRequest{
-		ChatId:          e.chatID,
-		Content:         replyContent(original.Message.MessageId.Value+999, "ghost"),
-		ClientMessageId: generateClientID(),
-	}
-	require.NoError(t, e.keysB.Auth(missingReq, &missingReq.Auth))
-	missingResp, err := e.client.SendMessage(e.ctx, missingReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.SendMessageResponse_DENIED, missingResp.Result)
-
-	// Replying to a non-replyable (system) message is denied.
-	systemMsg, _, err := messages.PutMessage(e.ctx, e.chatID, nil, systemContent("joined"), at(100), generateClientID(), false)
-	require.NoError(t, err)
-	systemReplyReq := &messagingpb.SendMessageRequest{
-		ChatId:          e.chatID,
-		Content:         replyContent(systemMsg.ID.Value, "to a system message"),
-		ClientMessageId: generateClientID(),
-	}
-	require.NoError(t, e.keysB.Auth(systemReplyReq, &systemReplyReq.Auth))
-	systemReplyResp, err := e.client.SendMessage(e.ctx, systemReplyReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.SendMessageResponse_DENIED, systemReplyResp.Result)
-}
-
-func testServer_SendMessage_Idempotent(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
-
-	clientID := generateClientID()
-	first, err := e.send(e.keysA, "hi", clientID)
-	require.NoError(t, err)
-	again, err := e.send(e.keysA, "hi", clientID)
-	require.NoError(t, err)
-	require.Equal(t, first.Message.MessageId.Value, again.Message.MessageId.Value)
-
-	next, err := e.send(e.keysA, "hi again", generateClientID())
-	require.NoError(t, err)
-	require.Equal(t, first.Message.MessageId.Value+1, next.Message.MessageId.Value)
-
-	// The retried send must not re-run side effects (most importantly pushes,
-	// which ride the same broadcast). Wait for the follow-up message to reach
-	// userB, then check the first message was broadcast to them exactly once.
-	countBroadcasts := func(messageID uint64) (n int) {
-		for _, ev := range e.observer.GetEvents(func(k *commonpb.UserId) bool { return bytes.Equal(k.Value, e.userB.Value) }) {
-			update := ev.Event.GetChatUpdate()
-			if update == nil || update.NewMessages == nil {
-				continue
-			}
-			for _, m := range update.NewMessages.Messages {
-				if m.MessageId.Value == messageID {
-					n++
-				}
-			}
-		}
-		return n
-	}
-	e.observer.WaitFor(t, func([]*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
-		return countBroadcasts(next.Message.MessageId.Value) > 0
-	})
-	require.Equal(t, 1, countBroadcasts(first.Message.MessageId.Value))
-}
-
-func testServer_GetMessages_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
-
+func (e *serverEnv) getMessagesByOptions(keys model.KeyPair, opts *commonpb.QueryOptions) (*messagingpb.GetMessagesResponse, error) {
 	req := &messagingpb.GetMessagesRequest{
 		ChatId: e.chatID,
-		Query:  &messagingpb.GetMessagesRequest_Options{Options: &commonpb.QueryOptions{}},
+		Query:  &messagingpb.GetMessagesRequest_Options{Options: opts},
 	}
-	require.NoError(t, e.keysA.Auth(req, &req.Auth))
-	resp, err := e.client.GetMessages(e.ctx, req)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, resp.Result)
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.GetMessages(e.ctx, req)
 }
 
-func testServer_GetMessages_Paging(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
-
-	// Seed 5 messages, assigned gapless IDs 1..5.
-	for i := 0; i < 5; i++ {
-		_, err := e.send(e.keysA, "m", generateClientID())
-		require.NoError(t, err)
-	}
-
-	getPage := func(opts *commonpb.QueryOptions) *messagingpb.GetMessagesResponse {
-		req := &messagingpb.GetMessagesRequest{
-			ChatId: e.chatID,
-			Query:  &messagingpb.GetMessagesRequest_Options{Options: opts},
-		}
-		require.NoError(t, e.keysB.Auth(req, &req.Auth))
-		resp, err := e.client.GetMessages(e.ctx, req)
-		require.NoError(t, err)
-		return resp
-	}
-
-	// Page ascending in chunks of 2: [1,2], [3,4], [5], then empty → NOT_FOUND.
-	page1 := getPage(&commonpb.QueryOptions{PageSize: 2, Order: commonpb.QueryOptions_ASC})
-	require.Equal(t, messagingpb.GetMessagesResponse_OK, page1.Result)
-	require.Equal(t, []uint64{1, 2}, protoMessageIDs(page1.Messages.Messages))
-
-	page2 := getPage(&commonpb.QueryOptions{
-		PageSize:    2,
-		Order:       commonpb.QueryOptions_ASC,
-		PagingToken: messaging.PageTokenFromID(lastMessageID(page1)),
-	})
-	require.Equal(t, messagingpb.GetMessagesResponse_OK, page2.Result)
-	require.Equal(t, []uint64{3, 4}, protoMessageIDs(page2.Messages.Messages))
-
-	page3 := getPage(&commonpb.QueryOptions{
-		PageSize:    2,
-		Order:       commonpb.QueryOptions_ASC,
-		PagingToken: messaging.PageTokenFromID(lastMessageID(page2)),
-	})
-	require.Equal(t, messagingpb.GetMessagesResponse_OK, page3.Result)
-	require.Equal(t, []uint64{5}, protoMessageIDs(page3.Messages.Messages))
-
-	page4 := getPage(&commonpb.QueryOptions{
-		PageSize:    2,
-		Order:       commonpb.QueryOptions_ASC,
-		PagingToken: messaging.PageTokenFromID(lastMessageID(page3)),
-	})
-	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, page4.Result)
-
-	// Descending first page returns the newest messages.
-	desc := getPage(&commonpb.QueryOptions{PageSize: 2, Order: commonpb.QueryOptions_DESC})
-	require.Equal(t, messagingpb.GetMessagesResponse_OK, desc.Result)
-	require.Equal(t, []uint64{5, 4}, protoMessageIDs(desc.Messages.Messages))
-}
-
-func testServer_GetMessages_ByIDs(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
-
-	for i := 0; i < 5; i++ {
-		_, err := e.send(e.keysA, "m", generateClientID())
-		require.NoError(t, err)
-	}
-
-	getByIDs := func(vals ...uint64) *messagingpb.GetMessagesResponse {
-		req := &messagingpb.GetMessagesRequest{
-			ChatId: e.chatID,
-			Query: &messagingpb.GetMessagesRequest_MessageIds{
-				MessageIds: &messagingpb.MessageIdBatch{MessageIds: ids(vals...)},
-			},
-		}
-		require.NoError(t, e.keysB.Auth(req, &req.Auth))
-		resp, err := e.client.GetMessages(e.ctx, req)
-		require.NoError(t, err)
-		return resp
-	}
-
-	// A mix of existing and missing IDs returns only the existing ones, sorted
-	// ascending; the missing 99 is omitted and duplicates collapse.
-	resp := getByIDs(4, 2, 99, 2)
-	require.Equal(t, messagingpb.GetMessagesResponse_OK, resp.Result)
-	require.Equal(t, []uint64{2, 4}, protoMessageIDs(resp.Messages.Messages))
-
-	// All IDs missing → NOT_FOUND.
-	none := getByIDs(100, 200)
-	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, none.Result)
-}
-
-func testServer_GetMessage_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
-
-	req := &messagingpb.GetMessageRequest{ChatId: e.chatID, MessageId: &messagingpb.MessageId{Value: 99}}
-	require.NoError(t, e.keysA.Auth(req, &req.Auth))
-	resp, err := e.client.GetMessage(e.ctx, req)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetMessageResponse_NOT_FOUND, resp.Result)
-}
-
-func testServer_NonMember_Denied(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
-	_, strangerKeys := e.addUser()
-
-	sendReq := &messagingpb.SendMessageRequest{
-		ChatId:          e.chatID,
-		Content:         textContent("intruder"),
-		ClientMessageId: generateClientID(),
-	}
-	require.NoError(t, strangerKeys.Auth(sendReq, &sendReq.Auth))
-	sendResp, err := e.client.SendMessage(e.ctx, sendReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
-
-	listReq := &messagingpb.GetMessagesRequest{
+func (e *serverEnv) getMessagesByIDs(keys model.KeyPair, vals ...uint64) (*messagingpb.GetMessagesResponse, error) {
+	req := &messagingpb.GetMessagesRequest{
 		ChatId: e.chatID,
-		Query:  &messagingpb.GetMessagesRequest_Options{Options: &commonpb.QueryOptions{}},
+		Query:  &messagingpb.GetMessagesRequest_MessageIds{MessageIds: &messagingpb.MessageIdBatch{MessageIds: ids(vals...)}},
 	}
-	require.NoError(t, strangerKeys.Auth(listReq, &listReq.Auth))
-	listResp, err := e.client.GetMessages(e.ctx, listReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetMessagesResponse_DENIED, listResp.Result)
-
-	getReq := &messagingpb.GetMessageRequest{ChatId: e.chatID, MessageId: &messagingpb.MessageId{Value: 1}}
-	require.NoError(t, strangerKeys.Auth(getReq, &getReq.Auth))
-	getResp, err := e.client.GetMessage(e.ctx, getReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result)
-
-	advReq := &messagingpb.AdvancePointerRequest{
-		ChatId:      e.chatID,
-		PointerType: messagingpb.Pointer_READ,
-		NewValue:    &messagingpb.MessageId{Value: 1},
-	}
-	require.NoError(t, strangerKeys.Auth(advReq, &advReq.Auth))
-	advResp, err := e.client.AdvancePointer(e.ctx, advReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.AdvancePointerResponse_DENIED, advResp.Result)
-
-	typingReq := &messagingpb.NotifyIsTypingRequest{
-		ChatId: e.chatID,
-		State:  messagingpb.IsTypingNotification_STARTED_TYPING,
-	}
-	require.NoError(t, strangerKeys.Auth(typingReq, &typingReq.Auth))
-	typingResp, err := e.client.NotifyIsTyping(e.ctx, typingReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.GetMessages(e.ctx, req)
 }
 
-func testServer_AdvancePointer(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+// --- pointers ---
 
-	m1, err := e.send(e.keysA, "first", generateClientID())
-	require.NoError(t, err)
-	m2, err := e.send(e.keysA, "second", generateClientID())
-	require.NoError(t, err)
-
-	// Counts userB READ pointer updates broadcast to the other member (userA).
-	// Filtering on the pointer's own UserId discriminates these from the sender's
-	// auto-advanced READ pointers that ride along with each SendMessage above.
-	countUserBRead := func() int {
-		n := 0
-		for _, ev := range e.observer.GetEvents(func(k *commonpb.UserId) bool { return bytes.Equal(k.Value, e.userA.Value) }) {
-			u := ev.Event.GetChatUpdate()
-			if u == nil || u.PointerUpdates == nil {
-				continue
-			}
-			for _, p := range u.PointerUpdates.Pointers {
-				if p.Type == messagingpb.Pointer_READ && bytes.Equal(p.UserId.Value, e.userB.Value) {
-					n++
-				}
-			}
-		}
-		return n
-	}
-
-	// A forward advance succeeds and broadcasts userB's new READ pointer to the
-	// other member.
-	okReq := &messagingpb.AdvancePointerRequest{
-		ChatId:      e.chatID,
-		PointerType: messagingpb.Pointer_READ,
-		NewValue:    m2.Message.MessageId,
-	}
-	require.NoError(t, e.keysB.Auth(okReq, &okReq.Auth))
-	okResp, err := e.client.AdvancePointer(e.ctx, okReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.AdvancePointerResponse_OK, okResp.Result)
-
-	e.observer.WaitFor(t, func(events []*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
-		for _, ev := range events {
-			if !bytes.Equal(ev.Key.Value, e.userA.Value) {
-				continue
-			}
-			u := ev.Event.GetChatUpdate()
-			if u == nil || u.PointerUpdates == nil {
-				continue
-			}
-			for _, p := range u.PointerUpdates.Pointers {
-				if p.Type == messagingpb.Pointer_READ &&
-					bytes.Equal(p.UserId.Value, e.userB.Value) &&
-					p.Value.Value == m2.Message.MessageId.Value {
-					return true
-				}
-			}
-		}
-		return false
-	})
-
-	before := countUserBRead()
-
-	// Moving the pointer backward is a monotonic no-op: the result is still OK,
-	// but nothing must be broadcast.
-	backReq := &messagingpb.AdvancePointerRequest{
-		ChatId:      e.chatID,
-		PointerType: messagingpb.Pointer_READ,
-		NewValue:    m1.Message.MessageId,
-	}
-	require.NoError(t, e.keysB.Auth(backReq, &backReq.Auth))
-	backResp, err := e.client.AdvancePointer(e.ctx, backReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.AdvancePointerResponse_OK, backResp.Result)
-
-	// Give any erroneous broadcast a moment to land, then assert none did.
-	time.Sleep(50 * time.Millisecond)
-	require.Equal(t, before, countUserBRead(), "a no-op pointer move must not broadcast")
-
-	// A pointer past the last message is rejected.
-	missReq := &messagingpb.AdvancePointerRequest{
-		ChatId:      e.chatID,
-		PointerType: messagingpb.Pointer_READ,
-		NewValue:    &messagingpb.MessageId{Value: 999},
-	}
-	require.NoError(t, e.keysB.Auth(missReq, &missReq.Auth))
-	missResp, err := e.client.AdvancePointer(e.ctx, missReq)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.AdvancePointerResponse_MESSAGE_NOT_FOUND, missResp.Result)
+func (e *serverEnv) advancePointer(keys model.KeyPair, pointerType messagingpb.Pointer_Type, newValue *messagingpb.MessageId) (*messagingpb.AdvancePointerResponse, error) {
+	req := &messagingpb.AdvancePointerRequest{ChatId: e.chatID, PointerType: pointerType, NewValue: newValue}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.AdvancePointer(e.ctx, req)
 }
 
-func testServer_SendMessage_Broadcast(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
-
-	resp, err := e.send(e.keysA, "broadcast me", generateClientID())
-	require.NoError(t, err)
-
-	// userB receives a single ChatUpdate carrying the new message, a last-activity
-	// metadata update, and the sender's auto-advanced READ pointer (the sender has
-	// implicitly read their own message).
-	e.observer.WaitFor(t, func(events []*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
-		for _, ev := range events {
-			if !bytes.Equal(ev.Key.Value, e.userB.Value) {
-				continue
-			}
-			update := ev.Event.GetChatUpdate()
-			if update == nil || update.NewMessages == nil {
-				continue
-			}
-			carriesMessage := false
-			for _, m := range update.NewMessages.Messages {
-				if m.MessageId.Value == resp.Message.MessageId.Value {
-					carriesMessage = true
-				}
-			}
-			if !carriesMessage || len(update.MetadataUpdates) == 0 {
-				continue
-			}
-			if update.PointerUpdates == nil {
-				continue
-			}
-			for _, p := range update.PointerUpdates.Pointers {
-				if p.Type == messagingpb.Pointer_READ &&
-					bytes.Equal(p.UserId.Value, e.userA.Value) &&
-					p.Value.Value == resp.Message.MessageId.Value {
-					return true
-				}
-			}
-		}
-		return false
-	})
-}
+// --- reactions ---
 
 func (e *serverEnv) addReaction(keys model.KeyPair, msgID *messagingpb.MessageId, emoji string) (*messagingpb.AddReactionResponse, error) {
 	req := &messagingpb.AddReactionRequest{ChatId: e.chatID, MessageId: msgID, Emoji: &messagingpb.Emoji{Value: emoji}}
@@ -569,10 +190,20 @@ func (e *serverEnv) getReactionSummary(keys model.KeyPair, msgID *messagingpb.Me
 	return e.client.GetReactionSummary(e.ctx, req)
 }
 
-// getReactionSummaries sends req after stamping in the chat ID and auth, so
-// callers only supply the query branch (options vs message IDs).
-func (e *serverEnv) getReactionSummaries(keys model.KeyPair, req *messagingpb.GetReactionSummariesRequest) (*messagingpb.GetReactionSummariesResponse, error) {
-	req.ChatId = e.chatID
+func (e *serverEnv) getReactionSummariesByOptions(keys model.KeyPair, opts *commonpb.QueryOptions) (*messagingpb.GetReactionSummariesResponse, error) {
+	req := &messagingpb.GetReactionSummariesRequest{
+		ChatId: e.chatID,
+		Query:  &messagingpb.GetReactionSummariesRequest_Options{Options: opts},
+	}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.GetReactionSummaries(e.ctx, req)
+}
+
+func (e *serverEnv) getReactionSummariesByIDs(keys model.KeyPair, vals ...uint64) (*messagingpb.GetReactionSummariesResponse, error) {
+	req := &messagingpb.GetReactionSummariesRequest{
+		ChatId: e.chatID,
+		Query:  &messagingpb.GetReactionSummariesRequest_MessageIds{MessageIds: &messagingpb.MessageIdBatch{MessageIds: ids(vals...)}},
+	}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.GetReactionSummaries(e.ctx, req)
 }
@@ -583,31 +214,414 @@ func (e *serverEnv) getReactors(keys model.KeyPair, msgID *messagingpb.MessageId
 	return e.client.GetReactors(e.ctx, req)
 }
 
-// waitForReactionUpdate blocks until recipient observes a ReactionUpdate matching
-// the given action, message, emoji, and actor — the reaction-broadcast analogue
-// of the message/pointer WaitFor blocks elsewhere in this suite.
-func (e *serverEnv) waitForReactionUpdate(recipient *commonpb.UserId, action messagingpb.ReactionUpdate_Action, msgID uint64, emoji string, actor *commonpb.UserId) {
+// --- typing ---
+
+func (e *serverEnv) notifyIsTyping(keys model.KeyPair, state messagingpb.IsTypingNotification_State) (*messagingpb.NotifyIsTypingResponse, error) {
+	req := &messagingpb.NotifyIsTypingRequest{ChatId: e.chatID, State: state}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.NotifyIsTyping(e.ctx, req)
+}
+
+// ============================================================================
+// Event-observation helpers
+//
+// Every broadcast a server RPC emits arrives as a ChatUpdate delivered to a
+// member. The whole suite asserts on those updates through this one pair —
+// chatUpdatesFor for synchronous counts, waitForChatUpdate for async arrival —
+// so a new-message, pointer, reaction, or typing broadcast is checked the same
+// way. The typed waiters/counters below are thin wrappers expressing the per-
+// kind predicate.
+// ============================================================================
+
+// chatUpdatesFor returns every ChatUpdate observed for recipient so far, in
+// observation order.
+func (e *serverEnv) chatUpdatesFor(recipient *commonpb.UserId) []*eventpb.ChatUpdate {
+	var out []*eventpb.ChatUpdate
+	for _, ev := range e.observer.GetEvents(func(k *commonpb.UserId) bool { return bytes.Equal(k.Value, recipient.Value) }) {
+		if u := ev.Event.GetChatUpdate(); u != nil {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// waitForChatUpdate blocks until some ChatUpdate observed for recipient matches.
+func (e *serverEnv) waitForChatUpdate(recipient *commonpb.UserId, match func(*eventpb.ChatUpdate) bool) {
 	e.observer.WaitFor(e.t, func(events []*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
 		for _, ev := range events {
 			if !bytes.Equal(ev.Key.Value, recipient.Value) {
 				continue
 			}
-			u := ev.Event.GetChatUpdate()
-			if u == nil || u.ReactionUpdates == nil {
-				continue
-			}
-			for _, ru := range u.ReactionUpdates.ReactionUpdates {
-				if ru.Action == action &&
-					ru.MessageId.Value == msgID &&
-					ru.Emoji.Value == emoji &&
-					bytes.Equal(ru.Actor.Value, actor.Value) {
-					return true
-				}
+			if u := ev.Event.GetChatUpdate(); u != nil && match(u) {
+				return true
 			}
 		}
 		return false
 	})
 }
+
+// waitForNewMessage blocks until recipient observes a broadcast carrying msgID.
+func (e *serverEnv) waitForNewMessage(recipient *commonpb.UserId, msgID uint64) {
+	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
+		return u.NewMessages != nil && containsMessage(u.NewMessages.Messages, msgID)
+	})
+}
+
+// countNewMessages returns how many observed broadcasts carried msgID to
+// recipient — used to assert a retried send doesn't re-broadcast.
+func (e *serverEnv) countNewMessages(recipient *commonpb.UserId, msgID uint64) (n int) {
+	for _, u := range e.chatUpdatesFor(recipient) {
+		if u.NewMessages != nil && containsMessage(u.NewMessages.Messages, msgID) {
+			n++
+		}
+	}
+	return n
+}
+
+// waitForPointerUpdate blocks until recipient observes actor's pointer of the
+// given type advanced to value.
+func (e *serverEnv) waitForPointerUpdate(recipient *commonpb.UserId, pointerType messagingpb.Pointer_Type, actor *commonpb.UserId, value uint64) {
+	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
+		return u.PointerUpdates != nil && hasPointer(u.PointerUpdates.Pointers, pointerType, actor, value)
+	})
+}
+
+// countPointerUpdates returns how many observed broadcasts carried actor's
+// pointer of the given type to recipient. Filtering on the pointer's own actor
+// discriminates a member's explicit advances from the sender's auto-advanced
+// READ pointers that ride along with each send.
+func (e *serverEnv) countPointerUpdates(recipient *commonpb.UserId, pointerType messagingpb.Pointer_Type, actor *commonpb.UserId) (n int) {
+	for _, u := range e.chatUpdatesFor(recipient) {
+		if u.PointerUpdates == nil {
+			continue
+		}
+		for _, p := range u.PointerUpdates.Pointers {
+			if p.Type == pointerType && bytes.Equal(p.UserId.Value, actor.Value) {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// waitForReactionUpdate blocks until recipient observes a ReactionUpdate matching
+// the given action, message, emoji, and actor.
+func (e *serverEnv) waitForReactionUpdate(recipient *commonpb.UserId, action messagingpb.ReactionUpdate_Action, msgID uint64, emoji string, actor *commonpb.UserId) {
+	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
+		if u.ReactionUpdates == nil {
+			return false
+		}
+		for _, ru := range u.ReactionUpdates.ReactionUpdates {
+			if ru.Action == action &&
+				ru.MessageId.Value == msgID &&
+				ru.Emoji.Value == emoji &&
+				bytes.Equal(ru.Actor.Value, actor.Value) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// waitForTyping blocks until recipient observes a typing notification.
+func (e *serverEnv) waitForTyping(recipient *commonpb.UserId) {
+	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
+		return u.IsTypingNotifications != nil
+	})
+}
+
+func containsMessage(msgs []*messagingpb.Message, msgID uint64) bool {
+	for _, m := range msgs {
+		if m.MessageId.Value == msgID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPointer(pointers []*messagingpb.Pointer, pointerType messagingpb.Pointer_Type, actor *commonpb.UserId, value uint64) bool {
+	for _, p := range pointers {
+		if p.Type == pointerType && bytes.Equal(p.UserId.Value, actor.Value) && p.Value.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+func protoMessageIDs(msgs []*messagingpb.Message) []uint64 {
+	out := make([]uint64, len(msgs))
+	for i, m := range msgs {
+		out[i] = m.MessageId.Value
+	}
+	return out
+}
+
+func lastMessageID(resp *messagingpb.GetMessagesResponse) *messagingpb.MessageId {
+	msgs := resp.Messages.Messages
+	return msgs[len(msgs)-1].MessageId
+}
+
+// ============================================================================
+// Messaging
+// ============================================================================
+
+func testServer_SendAndGet(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	resp, err := e.send(e.keysA, "hello", generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+	require.Equal(t, uint64(1), resp.Message.MessageId.Value)
+	require.Equal(t, e.userA.Value, resp.Message.SenderId.Value)
+
+	getResp, err := e.getMessage(e.keysB, resp.Message.MessageId)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+	require.Equal(t, "hello", getResp.Message.Content[0].GetText().Text)
+
+	listResp, err := e.getMessagesByOptions(e.keysB, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_OK, listResp.Result)
+	require.Len(t, listResp.Messages.Messages, 1)
+}
+
+func testServer_SendMessage_Idempotent(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	clientID := generateClientID()
+	first, err := e.send(e.keysA, "hi", clientID)
+	require.NoError(t, err)
+	again, err := e.send(e.keysA, "hi", clientID)
+	require.NoError(t, err)
+	require.Equal(t, first.Message.MessageId.Value, again.Message.MessageId.Value)
+
+	next, err := e.send(e.keysA, "hi again", generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, first.Message.MessageId.Value+1, next.Message.MessageId.Value)
+
+	// The retried send must not re-run side effects (most importantly pushes, which
+	// ride the same broadcast). Wait for the follow-up message to reach userB, then
+	// check the first message was broadcast to them exactly once.
+	e.waitForNewMessage(e.userB, next.Message.MessageId.Value)
+	require.Equal(t, 1, e.countNewMessages(e.userB, first.Message.MessageId.Value))
+}
+
+func testServer_SendReply(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	// Seed a message to reply to.
+	original, err := e.send(e.keysA, "original", generateClientID())
+	require.NoError(t, err)
+
+	// A text reply to that message is accepted and round-trips its content.
+	replyResp, err := e.sendContent(e.keysB, replyContent(original.Message.MessageId.Value, "replying"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, replyResp.Result)
+
+	reply := replyResp.Message.Content[0].GetReply()
+	require.NotNil(t, reply)
+	require.Equal(t, original.Message.MessageId.Value, reply.RepliedMessageId.Value)
+	require.Equal(t, "replying", reply.Content[0].GetText().Text)
+
+	// A reply wrapping unsupported content (e.g. a nested reply) is denied.
+	nested := []*messagingpb.Content{{
+		Type: &messagingpb.Content_Reply{
+			Reply: &messagingpb.ReplyContent{
+				RepliedMessageId: original.Message.MessageId,
+				Content:          replyContent(original.Message.MessageId.Value, "nested"),
+			},
+		},
+	}}
+	deniedResp, err := e.sendContent(e.keysB, nested, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, deniedResp.Result)
+
+	// Replying to a message that does not exist is denied.
+	missingResp, err := e.sendContent(e.keysB, replyContent(original.Message.MessageId.Value+999, "ghost"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, missingResp.Result)
+
+	// Replying to a non-replyable (system) message is denied.
+	systemMsg, _, err := messages.PutMessage(e.ctx, e.chatID, nil, systemContent("joined"), at(100), generateClientID(), false)
+	require.NoError(t, err)
+	systemReplyResp, err := e.sendContent(e.keysB, replyContent(systemMsg.ID.Value, "to a system message"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, systemReplyResp.Result)
+}
+
+func testServer_SendMessage_DisallowedContent(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	systemResp, err := e.sendContent(e.keysA, systemContent("i joined"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, systemResp.Result)
+}
+
+func testServer_SendMessage_Broadcast(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	resp, err := e.send(e.keysA, "broadcast me", generateClientID())
+	require.NoError(t, err)
+
+	// userB receives a single ChatUpdate carrying the new message, a last-activity
+	// metadata update, and the sender's auto-advanced READ pointer (the sender has
+	// implicitly read their own message).
+	e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
+		return u.NewMessages != nil && containsMessage(u.NewMessages.Messages, resp.Message.MessageId.Value) &&
+			len(u.MetadataUpdates) > 0 &&
+			u.PointerUpdates != nil && hasPointer(u.PointerUpdates.Pointers, messagingpb.Pointer_READ, e.userA, resp.Message.MessageId.Value)
+	})
+}
+
+func testServer_GetMessage_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	resp, err := e.getMessage(e.keysA, &messagingpb.MessageId{Value: 99})
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_NOT_FOUND, resp.Result)
+}
+
+func testServer_GetMessages_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	resp, err := e.getMessagesByOptions(e.keysA, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, resp.Result)
+}
+
+func testServer_GetMessages_Paging(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	// Seed 5 messages, assigned gapless IDs 1..5.
+	for i := 0; i < 5; i++ {
+		_, err := e.send(e.keysA, "m", generateClientID())
+		require.NoError(t, err)
+	}
+
+	asc := func(token *commonpb.PagingToken) *commonpb.QueryOptions {
+		return &commonpb.QueryOptions{PageSize: 2, Order: commonpb.QueryOptions_ASC, PagingToken: token}
+	}
+
+	// Page ascending in chunks of 2: [1,2], [3,4], [5], then empty → NOT_FOUND.
+	page1, err := e.getMessagesByOptions(e.keysB, asc(nil))
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_OK, page1.Result)
+	require.Equal(t, []uint64{1, 2}, protoMessageIDs(page1.Messages.Messages))
+
+	page2, err := e.getMessagesByOptions(e.keysB, asc(messaging.PageTokenFromID(lastMessageID(page1))))
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_OK, page2.Result)
+	require.Equal(t, []uint64{3, 4}, protoMessageIDs(page2.Messages.Messages))
+
+	page3, err := e.getMessagesByOptions(e.keysB, asc(messaging.PageTokenFromID(lastMessageID(page2))))
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_OK, page3.Result)
+	require.Equal(t, []uint64{5}, protoMessageIDs(page3.Messages.Messages))
+
+	page4, err := e.getMessagesByOptions(e.keysB, asc(messaging.PageTokenFromID(lastMessageID(page3))))
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, page4.Result)
+
+	// Descending first page returns the newest messages.
+	desc, err := e.getMessagesByOptions(e.keysB, &commonpb.QueryOptions{PageSize: 2, Order: commonpb.QueryOptions_DESC})
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_OK, desc.Result)
+	require.Equal(t, []uint64{5, 4}, protoMessageIDs(desc.Messages.Messages))
+}
+
+func testServer_GetMessages_ByIDs(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	for i := 0; i < 5; i++ {
+		_, err := e.send(e.keysA, "m", generateClientID())
+		require.NoError(t, err)
+	}
+
+	// A mix of existing and missing IDs returns only the existing ones, sorted
+	// ascending; the missing 99 is omitted and duplicates collapse.
+	resp, err := e.getMessagesByIDs(e.keysB, 4, 2, 99, 2)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_OK, resp.Result)
+	require.Equal(t, []uint64{2, 4}, protoMessageIDs(resp.Messages.Messages))
+
+	// All IDs missing → NOT_FOUND.
+	none, err := e.getMessagesByIDs(e.keysB, 100, 200)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, none.Result)
+}
+
+// ============================================================================
+// Pointers
+// ============================================================================
+
+func testServer_AdvancePointer(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	m1, err := e.send(e.keysA, "first", generateClientID())
+	require.NoError(t, err)
+	m2, err := e.send(e.keysA, "second", generateClientID())
+	require.NoError(t, err)
+
+	// A forward advance succeeds and broadcasts userB's new READ pointer to the
+	// other member.
+	okResp, err := e.advancePointer(e.keysB, messagingpb.Pointer_READ, m2.Message.MessageId)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_OK, okResp.Result)
+	e.waitForPointerUpdate(e.userA, messagingpb.Pointer_READ, e.userB, m2.Message.MessageId.Value)
+
+	// Snapshot userB's broadcast count before the no-op below.
+	before := e.countPointerUpdates(e.userA, messagingpb.Pointer_READ, e.userB)
+
+	// Moving the pointer backward is a monotonic no-op: the result is still OK, but
+	// nothing must be broadcast.
+	backResp, err := e.advancePointer(e.keysB, messagingpb.Pointer_READ, m1.Message.MessageId)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_OK, backResp.Result)
+
+	// Give any erroneous broadcast a moment to land, then assert none did.
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, before, e.countPointerUpdates(e.userA, messagingpb.Pointer_READ, e.userB), "a no-op pointer move must not broadcast")
+
+	// A pointer past the last message is rejected.
+	missResp, err := e.advancePointer(e.keysB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 999})
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_MESSAGE_NOT_FOUND, missResp.Result)
+}
+
+func testServer_AdvancePointer_PointerTypes(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	m1, err := e.send(e.keysA, "first", generateClientID())
+	require.NoError(t, err)
+	m2, err := e.send(e.keysA, "second", generateClientID())
+	require.NoError(t, err)
+
+	// Advance userB's DELIVERED pointer to m1: it broadcasts a DELIVERED update to
+	// userA and leaves userB's (distinct-typed) READ pointer untouched — no READ
+	// update is broadcast.
+	delResp, err := e.advancePointer(e.keysB, messagingpb.Pointer_DELIVERED, m1.Message.MessageId)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_OK, delResp.Result)
+	e.waitForPointerUpdate(e.userA, messagingpb.Pointer_DELIVERED, e.userB, m1.Message.MessageId.Value)
+	require.Zero(t, e.countPointerUpdates(e.userA, messagingpb.Pointer_READ, e.userB))
+
+	// Advance userB's READ pointer further, to m2: it broadcasts a READ update,
+	// while the DELIVERED pointer stays at m1.
+	readResp, err := e.advancePointer(e.keysB, messagingpb.Pointer_READ, m2.Message.MessageId)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_OK, readResp.Result)
+	e.waitForPointerUpdate(e.userA, messagingpb.Pointer_READ, e.userB, m2.Message.MessageId.Value)
+
+	// Give any stray broadcast a moment, then assert each type advanced exactly
+	// once — the READ advance did not disturb or re-broadcast DELIVERED.
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, 1, e.countPointerUpdates(e.userA, messagingpb.Pointer_DELIVERED, e.userB))
+	require.Equal(t, 1, e.countPointerUpdates(e.userA, messagingpb.Pointer_READ, e.userB))
+}
+
+// ============================================================================
+// Reactions
+// ============================================================================
 
 // testServer_Reactions covers the core add/remove lifecycle: the aggregate and
 // its per-viewer reacted_by_self bit, idempotent re-add, a second reactor, the
@@ -791,9 +805,7 @@ func testServer_Reactions_Summaries(t *testing.T, chats chat.Store, messages mes
 	// Paged, as userA: every message in the page is present — msg1's 👍 overlays as
 	// self (userA reacted), msg2's ❤️ does not, and the reactionless msg3 comes back
 	// with an empty summary rather than being omitted.
-	byOpts, err := e.getReactionSummaries(e.keysA, &messagingpb.GetReactionSummariesRequest{
-		Query: &messagingpb.GetReactionSummariesRequest_Options{Options: &commonpb.QueryOptions{Order: commonpb.QueryOptions_ASC}},
-	})
+	byOpts, err := e.getReactionSummariesByOptions(e.keysA, &commonpb.QueryOptions{Order: commonpb.QueryOptions_ASC})
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetReactionSummariesResponse_OK, byOpts.Result)
 	require.Len(t, byOpts.Summaries, 3)
@@ -809,11 +821,7 @@ func testServer_Reactions_Summaries(t *testing.T, chats chat.Store, messages mes
 
 	// By explicit IDs, as userB: both of userB's own reactions overlay as self, and
 	// the requested-but-reactionless msg3 is echoed with an empty summary.
-	byIDs, err := e.getReactionSummaries(e.keysB, &messagingpb.GetReactionSummariesRequest{
-		Query: &messagingpb.GetReactionSummariesRequest_MessageIds{
-			MessageIds: &messagingpb.MessageIdBatch{MessageIds: []*messagingpb.MessageId{msg3, msg2, msg1}},
-		},
-	})
+	byIDs, err := e.getReactionSummariesByIDs(e.keysB, msg3.Value, msg2.Value, msg1.Value)
 	require.NoError(t, err)
 	require.Len(t, byIDs.Summaries, 3)
 	_, self = selfOf(byIDs.Summaries, msg1.Value, thumbsUp)
@@ -825,10 +833,11 @@ func testServer_Reactions_Summaries(t *testing.T, chats chat.Store, messages mes
 	require.Zero(t, n)
 }
 
-// testServer_Reactions_Errors covers the rejection matrix across every reaction
-// RPC: invalid emoji, non-member denial, missing message, the idempotent no-op
-// remove, an unknown-emoji empty read, non-reactable messages, and the
-// per-message distinct-emoji cap.
+// testServer_Reactions_Errors covers the reaction-specific rejection matrix:
+// invalid emoji, missing message, the idempotent no-op remove, an unknown-emoji
+// empty read, non-reactable messages, and the per-message distinct-emoji cap.
+// Non-member denial is covered uniformly across all RPCs by
+// testServer_NonMember_Denied.
 func testServer_Reactions_Errors(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
 	e := newServerEnv(t, badges, chats, messages, profiles)
 	const emoji = "👍"
@@ -836,7 +845,6 @@ func testServer_Reactions_Errors(t *testing.T, chats chat.Store, messages messag
 	sent, err := e.send(e.keysA, "hi", generateClientID())
 	require.NoError(t, err)
 	msgID := sent.Message.MessageId
-	_, strangerKeys := e.addUser()
 	ghost := &messagingpb.MessageId{Value: msgID.Value + 999}
 
 	// A non-emoji value is rejected by the RPCs that carry one, even though it
@@ -850,25 +858,6 @@ func testServer_Reactions_Errors(t *testing.T, chats chat.Store, messages messag
 	badReactors, err := e.getReactors(e.keysB, msgID, "abc", &commonpb.QueryOptions{})
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetReactorsResponse_DENIED, badReactors.Result)
-
-	// Non-members are denied on every reaction RPC.
-	dAdd, err := e.addReaction(strangerKeys, msgID, emoji)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.AddReactionResponse_DENIED, dAdd.Result)
-	dRm, err := e.removeReaction(strangerKeys, msgID, emoji)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.RemoveReactionResponse_DENIED, dRm.Result)
-	dSum, err := e.getReactionSummary(strangerKeys, msgID)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetReactionSummaryResponse_DENIED, dSum.Result)
-	dSums, err := e.getReactionSummaries(strangerKeys, &messagingpb.GetReactionSummariesRequest{
-		Query: &messagingpb.GetReactionSummariesRequest_Options{Options: &commonpb.QueryOptions{}},
-	})
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetReactionSummariesResponse_DENIED, dSums.Result)
-	dReactors, err := e.getReactors(strangerKeys, msgID, emoji, &commonpb.QueryOptions{})
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetReactorsResponse_DENIED, dReactors.Result)
 
 	// A missing message is MESSAGE_NOT_FOUND for the RPCs that probe one — checked
 	// after membership, so a member (not the stranger) surfaces it.
@@ -915,37 +904,109 @@ func testServer_Reactions_Errors(t *testing.T, chats chat.Store, messages messag
 	require.Nil(t, over.Reaction)
 }
 
+// ============================================================================
+// Typing
+// ============================================================================
+
 func testServer_NotifyIsTyping(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
 	e := newServerEnv(t, badges, chats, messages, profiles)
 
-	req := &messagingpb.NotifyIsTypingRequest{
-		ChatId: e.chatID,
-		State:  messagingpb.IsTypingNotification_STARTED_TYPING,
-	}
-	require.NoError(t, e.keysA.Auth(req, &req.Auth))
-	resp, err := e.client.NotifyIsTyping(e.ctx, req)
+	resp, err := e.notifyIsTyping(e.keysA, messagingpb.IsTypingNotification_STARTED_TYPING)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.NotifyIsTypingResponse_OK, resp.Result)
 
 	// userB (the other member) is notified; the sender is excluded.
-	e.observer.WaitFor(t, func(events []*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
-		for _, ev := range events {
-			if !bytes.Equal(ev.Key.Value, e.userB.Value) {
-				continue
-			}
-			if u := ev.Event.GetChatUpdate(); u != nil && u.IsTypingNotifications != nil {
-				return true
-			}
-		}
-		return false
-	})
+	e.waitForTyping(e.userB)
 
 	// Give any erroneous self-notification a moment, then assert none landed for userA.
 	time.Sleep(50 * time.Millisecond)
-	selfEvents := e.observer.GetEvents(func(k *commonpb.UserId) bool { return bytes.Equal(k.Value, e.userA.Value) })
-	for _, ev := range selfEvents {
-		if u := ev.Event.GetChatUpdate(); u != nil {
-			require.Nil(t, u.IsTypingNotifications, "sender should not receive their own typing notification")
-		}
+	for _, u := range e.chatUpdatesFor(e.userA) {
+		require.Nil(t, u.IsTypingNotifications, "sender should not receive their own typing notification")
 	}
+}
+
+// ============================================================================
+// Cross-cutting
+// ============================================================================
+
+// testServer_NonMember_Denied asserts that a non-member is denied on every RPC
+// the service exposes. Membership is checked before any payload-specific
+// validation, so a valid message ID and emoji still come back DENIED.
+func testServer_NonMember_Denied(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+	_, strangerKeys := e.addUser()
+
+	msgID := &messagingpb.MessageId{Value: 1}
+	const emoji = "👍"
+
+	// Messaging.
+	sendResp, err := e.send(strangerKeys, "intruder", generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
+
+	getResp, err := e.getMessage(strangerKeys, msgID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result)
+
+	listResp, err := e.getMessagesByOptions(strangerKeys, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_DENIED, listResp.Result)
+
+	// Pointers.
+	advResp, err := e.advancePointer(strangerKeys, messagingpb.Pointer_READ, msgID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_DENIED, advResp.Result)
+
+	// Reactions.
+	addResp, err := e.addReaction(strangerKeys, msgID, emoji)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_DENIED, addResp.Result)
+
+	rmResp, err := e.removeReaction(strangerKeys, msgID, emoji)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.RemoveReactionResponse_DENIED, rmResp.Result)
+
+	sumResp, err := e.getReactionSummary(strangerKeys, msgID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactionSummaryResponse_DENIED, sumResp.Result)
+
+	sumsResp, err := e.getReactionSummariesByOptions(strangerKeys, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactionSummariesResponse_DENIED, sumsResp.Result)
+
+	reactorsResp, err := e.getReactors(strangerKeys, msgID, emoji, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactorsResponse_DENIED, reactorsResp.Result)
+
+	// Typing.
+	typingResp, err := e.notifyIsTyping(strangerKeys, messagingpb.IsTypingNotification_STARTED_TYPING)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
+}
+
+func testServer_Broadcast_IncludesActor(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+	const emoji = "👍"
+
+	sent, err := e.send(e.keysA, "react to me", generateClientID())
+	require.NoError(t, err)
+	msgID := sent.Message.MessageId
+
+	// userB advances their own READ pointer: the update is broadcast back to userB.
+	advResp, err := e.advancePointer(e.keysB, messagingpb.Pointer_READ, msgID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_OK, advResp.Result)
+	e.waitForPointerUpdate(e.userB, messagingpb.Pointer_READ, e.userB, msgID.Value)
+
+	// userB reacts: the ADDED update is broadcast back to userB.
+	addResp, err := e.addReaction(e.keysB, msgID, emoji)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, addResp.Result)
+	e.waitForReactionUpdate(e.userB, messagingpb.ReactionUpdate_ADDED, msgID.Value, emoji, e.userB)
+
+	// userB removes it: the REMOVED update is likewise broadcast back to userB.
+	rmResp, err := e.removeReaction(e.keysB, msgID, emoji)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.RemoveReactionResponse_OK, rmResp.Result)
+	e.waitForReactionUpdate(e.userB, messagingpb.ReactionUpdate_REMOVED, msgID.Value, emoji, e.userB)
 }

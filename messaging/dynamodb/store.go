@@ -30,12 +30,14 @@ import (
 //	                   "cmid#<client id>" }. All of a chat's messages, its
 //	                   sequence counter, and its idempotency markers share one
 //	                   partition so a send is one single-partition transaction.
-//	                   Each msg# row carries its event_seq, indexed by the
-//	                   messages_by_event_seq GSI (pk, event_seq) for
-//	                   event-sequence-ordered reads. While every event is a new
-//	                   message, event_seq is simply the message's own seq; an
-//	                   independent event-sequence counter arrives with edits and
-//	                   deletes (which advance event_seq without minting a seq).
+//	                   The #counter row holds last_seq (message-ID head) and
+//	                   last_event_seq (event-log head); each msg# row carries its
+//	                   event_seq, indexed by the messages_by_event_seq GSI (pk,
+//	                   event_seq) for event-sequence-ordered reads. While every
+//	                   event is a new message, event_seq is the message's own seq
+//	                   and last_event_seq mirrors last_seq; the two heads (and
+//	                   event_seq vs seq) diverge once edits and deletes advance the
+//	                   event log without minting a seq.
 //
 //	message_pointers   pk = "chat#<id>", sk = "<type>#<user>". Delivered/read
 //	                   pointers, kept out of the messages partition so heavy
@@ -73,6 +75,7 @@ const (
 	attrSeq           = "seq"
 	attrLastSeq       = "last_seq"
 	attrLastUnreadSeq = "last_unread_seq"
+	attrLastEventSeq  = "last_event_seq" // #counter row: event-log head (maintained == last_seq until edits/deletes diverge it)
 	attrSenderID      = "sender_id"
 	attrContent       = "content"
 	attrTS            = "ts"
@@ -172,13 +175,16 @@ func (s *store) PutMessage(
 			TransactItems: []types.TransactWriteItem{
 				// [0] advance the counter under an optimistic lock so the whole
 				// transaction rolls back together — no leaked sequence numbers.
+				// last_event_seq mirrors last_seq here — the fleet keeps the
+				// event-log head current (maintain-only), but nothing depends on it
+				// yet; it diverges from last_seq once edits and deletes land.
 				{Update: &types.Update{
 					TableName: aws.String(s.messagesTable),
 					Key: map[string]types.AttributeValue{
 						attrPK: avS(chatPK(chatID)),
 						attrSK: avS(skCounter),
 					},
-					UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :next, %s = :nextUnread", attrLastSeq, attrLastUnreadSeq)),
+					UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :next, %s = :nextUnread, %s = :next", attrLastSeq, attrLastUnreadSeq, attrLastEventSeq)),
 					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s) OR %s = :expected", attrPK, attrLastSeq)),
 					ExpressionAttributeValues: map[string]types.AttributeValue{
 						":next":       avN(nextSeq),

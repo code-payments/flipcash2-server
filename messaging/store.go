@@ -34,6 +34,15 @@ type PointerRef struct {
 	Members []*commonpb.UserId
 }
 
+// ReactionRef identifies one (message, emoji) reaction within a chat. It is the
+// unit of the batched self-reaction lookup (see Store.GetSelfReactions): the
+// caller derives refs from a reaction summary it already holds so the store can
+// resolve each by exact key rather than scanning.
+type ReactionRef struct {
+	MessageID *messagingpb.MessageId
+	Emoji     string
+}
+
 // StoredPointerTypes are the only pointer types persisted, for any chat type:
 // DELIVERED and READ. SENT is client-side and never stored, so enumerating these
 // per member addresses every pointer that can exist for a chat. Treat as
@@ -77,6 +86,12 @@ type Store interface {
 	// GetMessage returns a single message by ID, or ErrMessageNotFound.
 	GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*Message, error)
 
+	// MessageExists reports whether a message exists in the chat. It is a
+	// lightweight existence check that does not read or decode the message body,
+	// for callers (e.g. the reaction read paths) that only need to distinguish a
+	// missing message and don't need its content.
+	MessageExists(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (bool, error)
+
 	// GetMessages returns a page of messages for a chat ordered by message ID
 	// (ascending by default), paged via the provided query options. The paging
 	// token's value is the message ID of the last message from the previous
@@ -112,11 +127,16 @@ type Store interface {
 
 	// AdvancePointer moves a member's pointer of the given type forward to
 	// newValue. Pointers are monotonic: a request to move a pointer to a value
-	// at or before its current value is a no-op. It returns ErrMessageNotFound
-	// if newValue does not reference an existing message in the chat. It always
-	// returns the pointer's current state (carrying its last-advanced ts), whether
-	// or not this call moved it; the bool reports whether it advanced. The pointer
-	// is nil only alongside a non-nil error.
+	// at or before its current value is a no-op. It always returns the pointer's
+	// current state (carrying its last-advanced ts), whether or not this call
+	// moved it; the bool reports whether it advanced. The pointer is nil only
+	// alongside a non-nil error.
+	//
+	// It does not verify that newValue references an existing message. Callers
+	// with a caller-supplied newValue must check existence first (see
+	// MessageExists and the AdvancePointer RPC); callers that already know the
+	// message exists — e.g. the sender's own READ pointer right after PutMessage
+	// returns the message it just wrote — can advance directly.
 	AdvancePointer(
 		ctx context.Context,
 		chatID *commonpb.ChatId,
@@ -125,20 +145,111 @@ type Store interface {
 		newValue *messagingpb.MessageId,
 	) (*messagingpb.Pointer, bool, error)
 
-	// AdvancePointerUnchecked is AdvancePointer for a newValue the caller already
-	// knows references an existing message — e.g. the sender's own READ pointer
-	// right after PutMessage returns the message it just wrote. It skips the
-	// existence check (and the read backing it), saving a round trip; the
-	// monotonic forward-only behavior is otherwise identical to AdvancePointer.
-	// It must not be used with a caller-supplied newValue, whose existence is not
-	// guaranteed.
-	AdvancePointerUnchecked(
+	// AddReaction records userID's reaction with emoji on a message and returns
+	// the emoji's aggregate after the add. The aggregate is shareable, so
+	// ReactedBySelf is left false for the caller to overlay. It is
+	// idempotent on (chat, message, emoji, user): a re-add returns the current
+	// aggregate with created false and changes nothing. created reports whether
+	// this call actually added the reaction (false on a re-add), so callers can
+	// skip the broadcast.
+	//
+	// tooManyTypes is true (with a nil reaction) when adding this emoji would
+	// exceed MaxReactionTypesPerMessage distinct emoji on the message; the add is
+	// rejected. Re-adding an already-present emoji never trips the cap.
+	//
+	// It does not verify the message exists or is reactable — the caller checks
+	// that first (see Message.IsReactable).
+	AddReaction(
+		ctx context.Context,
+		chatID *commonpb.ChatId,
+		messageID *messagingpb.MessageId,
+		userID *commonpb.UserId,
+		emoji string,
+		ts time.Time,
+	) (reaction *Reaction, created bool, tooManyTypes bool, err error)
+
+	// RemoveReaction removes userID's reaction with emoji from a message. It is
+	// idempotent: removing a reaction that isn't present returns removed false and
+	// changes nothing. removed reports whether this call actually removed the
+	// reaction, so callers can skip the broadcast.
+	//
+	// reaction is the emoji's aggregate after the removal, with Count possibly 0
+	// when the last reactor left (it still carries the advanced Sequence, which
+	// the removal broadcast needs). ReactedBySelf is left false — which is also
+	// the correct overlay for the caller, who just removed their reaction. It is
+	// nil only when the emoji has no aggregate at all (a pure no-op).
+	RemoveReaction(
+		ctx context.Context,
+		chatID *commonpb.ChatId,
+		messageID *messagingpb.MessageId,
+		userID *commonpb.UserId,
+		emoji string,
+	) (reaction *Reaction, removed bool, err error)
+
+	// GetReactionSummary returns the per-emoji aggregates for a single message,
+	// one entry per distinct emoji that currently has at least one reactor. The
+	// aggregates are shareable: ReactedBySelf is left false for the caller to
+	// overlay (see GetSelfReactions). Returns an empty result (no error) when the
+	// message has no reactions.
+	GetReactionSummary(
+		ctx context.Context,
+		chatID *commonpb.ChatId,
+		messageID *messagingpb.MessageId,
+	) ([]*Reaction, error)
+
+	// GetReactionSummariesByRefs returns one summary per requested message,
+	// deduplicated and ordered by message ID. A message with no reactions (or
+	// unknown) is echoed with an empty Reactions slice rather than omitted, so the
+	// caller gets an answer for every requested ID. Aggregates are shareable
+	// (ReactedBySelf left false). Returns an empty result (no error) when messageIDs
+	// is empty.
+	GetReactionSummariesByRefs(
+		ctx context.Context,
+		chatID *commonpb.ChatId,
+		messageIDs []*messagingpb.MessageId,
+	) ([]*ReactionSummary, error)
+
+	// GetReactionSummaries returns one summary per message in a page of the chat's
+	// messages, ordered by message ID and paged via the query options (the paging
+	// token is a message ID, as in GetMessages). The page spans messages, not just
+	// reacted ones: a message with no reactions is returned with an empty Reactions
+	// slice rather than skipped. Aggregates are shareable (ReactedBySelf left
+	// false). Returns an empty result (no error) when the page is empty.
+	GetReactionSummaries(
+		ctx context.Context,
+		chatID *commonpb.ChatId,
+		opts ...database.QueryOption,
+	) ([]*ReactionSummary, error)
+
+	// GetSelfReactions returns the subset of refs that userID has reacted to — the
+	// per-viewer data behind EmojiReaction.reacted_by_self. The caller derives refs
+	// from a summary it already holds, so the store resolves them by exact key in
+	// one batched read. Returns an empty result (no error) when refs is empty.
+	GetSelfReactions(
 		ctx context.Context,
 		chatID *commonpb.ChatId,
 		userID *commonpb.UserId,
-		pointerType messagingpb.Pointer_Type,
-		newValue *messagingpb.MessageId,
-	) (*messagingpb.Pointer, bool, error)
+		refs []ReactionRef,
+	) ([]ReactionRef, error)
+
+	// GetReactors returns a page of the users who reacted to a message with emoji,
+	// most-recent-first, paged via the query options (the paging token is a
+	// ReactorPageToken). It also returns hasMore, whether further pages remain.
+	// Returns an empty result (no error) when the message has no reactors for the
+	// emoji.
+	//
+	// When consistent is true the read is strongly consistent — reflecting every
+	// preceding add/remove with no propagation lag — at the cost of scaling less
+	// well to large, deeply-paged reactor lists. The flag changes only consistency;
+	// the ordering and paging semantics are identical either way.
+	GetReactors(
+		ctx context.Context,
+		chatID *commonpb.ChatId,
+		messageID *messagingpb.MessageId,
+		emoji string,
+		consistent bool,
+		opts ...database.QueryOption,
+	) (reactors []*Reactor, hasMore bool, err error)
 }
 
 // PageTokenFromID encodes a message ID as a paging token. The token is the
@@ -157,4 +268,28 @@ func IDFromPageToken(token *commonpb.PagingToken) (messageID uint64, ok bool) {
 		return 0, false
 	}
 	return binary.BigEndian.Uint64(token.Value), true
+}
+
+// ReactorPageToken encodes a reactor as the server-issued cursor returned in
+// GetReactorsResponse.paging_token. Reactors are returned most-recent-first, so
+// the token carries the last reactor's reaction timestamp (the ordering key)
+// followed by its user ID (a tie-breaker for equal timestamps); the next request
+// resumes strictly after it. The token is opaque to the client, which echoes it
+// back in options.paging_token.
+func ReactorPageToken(reactor *Reactor) *commonpb.PagingToken {
+	buf := make([]byte, 8, 8+len(reactor.UserID.Value))
+	binary.BigEndian.PutUint64(buf, uint64(reactor.ReactedTs.UnixNano()))
+	buf = append(buf, reactor.UserID.Value...)
+	return &commonpb.PagingToken{Value: buf}
+}
+
+// ReactorFromPageToken decodes the reaction timestamp and user ID from a token
+// produced by ReactorPageToken. The ok return is false if the token is nil or
+// malformed.
+func ReactorFromPageToken(token *commonpb.PagingToken) (reactedTs time.Time, userID *commonpb.UserId, ok bool) {
+	if token == nil || len(token.Value) <= 8 {
+		return time.Time{}, nil, false
+	}
+	nanos := int64(binary.BigEndian.Uint64(token.Value[:8]))
+	return time.Unix(0, nanos).UTC(), &commonpb.UserId{Value: append([]byte(nil), token.Value[8:]...)}, true
 }

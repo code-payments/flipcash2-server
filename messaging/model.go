@@ -1,6 +1,8 @@
 package messaging
 
 import (
+	"bytes"
+	"sort"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -12,6 +14,29 @@ import (
 
 // ClientMessageIDSize is the length, in bytes, of a client message ID.
 const ClientMessageIDSize = 16
+
+// Reaction-aggregate bounds
+const (
+	// MaxReactionTypesPerMessage caps how many distinct emoji may react to a
+	// single message. The (N+1)th distinct emoji is rejected with
+	// TOO_MANY_REACTION_TYPES; a re-add of an already-present emoji is unaffected.
+	MaxReactionTypesPerMessage = 100
+
+	// MaxSampleReactors bounds the sample of reactors surfaced inline on an
+	// EmojiReaction (e.g. for rendering a few avatars). The sample is the most
+	// recent reactors by reaction time (see SampleFromReactors), so a viewer sees
+	// who reacted most recently. The full reactor list is fetched on demand via
+	// GetReactors.
+	MaxSampleReactors = 8
+
+	// MaxStoredSampleReactors bounds how many reactor entries a store retains for a
+	// reaction's sample. Once the retained set is full, a new reactor evicts the
+	// least-recent entry, keeping it the most-recent reactors. It is twice the
+	// surfaced size so that reactors leaving (the sample is not backfilled on
+	// removal) rarely depletes the retained set below MaxSampleReactors; reads still
+	// surface only the most-recent MaxSampleReactors.
+	MaxStoredSampleReactors = 2 * MaxSampleReactors
+)
 
 // Message is a stored chat message.
 //
@@ -70,6 +95,89 @@ func (m *Message) IsReplyable() bool {
 	}
 }
 
+// IsReactable reports whether this message may be the target of an emoji
+// reaction. Like IsReplyable this is a whitelist, so content types added later
+// (and non-conversational ones like system messages) are non-reactable until
+// explicitly allowed. A Deleted tombstone remains reactable — it is still a real
+// message in the thread.
+func (m *Message) IsReactable() bool {
+	if len(m.Content) == 0 {
+		return false
+	}
+	switch m.Content[0].Type.(type) {
+	case *messagingpb.Content_Text,
+		*messagingpb.Content_Cash,
+		*messagingpb.Content_Media,
+		*messagingpb.Content_Reply,
+		*messagingpb.Content_Deleted:
+		return true
+	default:
+		return false
+	}
+}
+
+// Reactor is a single user's reaction to a message, with the time they reacted.
+type Reactor struct {
+	UserID    *commonpb.UserId
+	ReactedTs time.Time
+}
+
+// ToProto projects the reactor onto a messagingpb.Reactor.
+func (r *Reactor) ToProto() *messagingpb.Reactor {
+	return &messagingpb.Reactor{
+		UserId:    &commonpb.UserId{Value: append([]byte(nil), r.UserID.Value...)},
+		ReactedTs: timestamppb.New(r.ReactedTs),
+	}
+}
+
+// Reaction is the aggregate state of a single emoji on a message: how many users
+// reacted with it, a monotonic version that advances on every change to it, and a
+// bounded sample of reactors (the most recent by reaction time, see
+// SampleFromReactors). ReactedBySelf is per-viewer and set by the read path for
+// the requesting user; the rest of the aggregate is shareable.
+type Reaction struct {
+	Emoji          string
+	Count          uint64
+	Sequence       uint64
+	ReactedBySelf  bool
+	SampleReactors []*Reactor
+}
+
+// ToProto projects the aggregate onto a messagingpb.EmojiReaction.
+func (r *Reaction) ToProto() *messagingpb.EmojiReaction {
+	sample := make([]*messagingpb.Reactor, len(r.SampleReactors))
+	for i, reactor := range r.SampleReactors {
+		sample[i] = reactor.ToProto()
+	}
+	return &messagingpb.EmojiReaction{
+		Emoji:          &messagingpb.Emoji{Value: r.Emoji},
+		Count:          r.Count,
+		ReactedBySelf:  r.ReactedBySelf,
+		SampleReactors: sample,
+		Sequence:       r.Sequence,
+	}
+}
+
+// ReactionSummary pairs a message with its non-empty reaction aggregates, the
+// unit returned by the batch reaction-summary reads. It projects onto a
+// messagingpb.ReactionSummary.
+type ReactionSummary struct {
+	MessageID *messagingpb.MessageId
+	Reactions []*Reaction
+}
+
+// ToProto projects onto a messagingpb.ReactionSummary.
+func (s *ReactionSummary) ToProto() *messagingpb.ReactionSummary {
+	reactions := make([]*messagingpb.EmojiReaction, len(s.Reactions))
+	for i, r := range s.Reactions {
+		reactions[i] = r.ToProto()
+	}
+	return &messagingpb.ReactionSummary{
+		MessageId: &messagingpb.MessageId{Value: s.MessageID.Value},
+		Reactions: reactions,
+	}
+}
+
 // ToProto projects the stored message onto a messagingpb.Message.
 func (m *Message) ToProto() *messagingpb.Message {
 	content := make([]*messagingpb.Content, len(m.Content))
@@ -87,4 +195,23 @@ func (m *Message) ToProto() *messagingpb.Message {
 		out.SenderId = &commonpb.UserId{Value: append([]byte(nil), m.SenderID.Value...)}
 	}
 	return out
+}
+
+// SampleFromReactors orders reactors by descending reaction time (ties broken by
+// ascending user ID, for a total and stable order) and returns the first
+// MaxSampleReactors — the deterministic, most-recent sample surfaced on a reaction
+// aggregate even when a store retains up to MaxStoredSampleReactors. The ordering
+// matches the most-recent-first order of GetReactors. It mutates the given slice's
+// order; callers pass a slice they own.
+func SampleFromReactors(reactors []*Reactor) []*Reactor {
+	sort.Slice(reactors, func(i, j int) bool {
+		if !reactors[i].ReactedTs.Equal(reactors[j].ReactedTs) {
+			return reactors[i].ReactedTs.After(reactors[j].ReactedTs)
+		}
+		return bytes.Compare(reactors[i].UserID.Value, reactors[j].UserID.Value) < 0
+	})
+	if len(reactors) > MaxSampleReactors {
+		reactors = reactors[:MaxSampleReactors]
+	}
+	return reactors
 }

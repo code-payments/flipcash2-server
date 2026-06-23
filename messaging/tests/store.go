@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"sort"
 	"strconv"
 	"sync"
@@ -31,12 +32,18 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_PutMessage_UnreadSeq,
 		testStore_PutMessage_SystemMessage,
 		testStore_GetMessage_NotFound,
-		testStore_GetMessages_OrderAndPaging,
+		testStore_MessageExists,
+		testStore_GetMessagesPaging,
 		testStore_GetMessagesByRefs,
 		testStore_Pointers,
 		testStore_GetPointersForChats,
-		testStore_AdvancePointer_MessageNotFound,
-		testStore_AdvancePointerUnchecked,
+		testStore_AdvancePointer_NoExistenceCheck,
+		testStore_Reactions_AddRemove,
+		testStore_Reactions_SummariesByRefs,
+		testStore_Reactions_SummariesPaging,
+		testStore_Reactions_SampleCap,
+		testStore_Reactions_TypeCap,
+		testStore_Reactions_GetReactors,
 	} {
 		tf(t, s)
 		teardown()
@@ -272,7 +279,30 @@ func testStore_GetMessage_NotFound(t *testing.T, s messaging.Store) {
 	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
 }
 
-func testStore_GetMessages_OrderAndPaging(t *testing.T, s messaging.Store) {
+func testStore_MessageExists(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+
+	// Unknown chat → false, no error.
+	exists, err := s.MessageExists(ctx, generateChatID(), &messagingpb.MessageId{Value: 1})
+	require.NoError(t, err)
+	require.False(t, exists)
+
+	msg, _, err := s.PutMessage(ctx, chatID, model.MustGenerateUserID(), textContent("a"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+
+	// Existing message → true.
+	exists, err = s.MessageExists(ctx, chatID, msg.ID)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	// Known chat, unknown message → false.
+	exists, err = s.MessageExists(ctx, chatID, &messagingpb.MessageId{Value: 999})
+	require.NoError(t, err)
+	require.False(t, exists)
+}
+
+func testStore_GetMessagesPaging(t *testing.T, s messaging.Store) {
 	ctx := context.Background()
 	chatID := generateChatID()
 	sender := model.MustGenerateUserID()
@@ -470,23 +500,7 @@ func testStore_Pointers(t *testing.T, s messaging.Store) {
 	)
 }
 
-func testStore_AdvancePointer_MessageNotFound(t *testing.T, s messaging.Store) {
-	ctx := context.Background()
-	user := model.MustGenerateUserID()
-
-	// Unknown chat (no messages) → ErrMessageNotFound.
-	_, _, err := s.AdvancePointer(ctx, generateChatID(), user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
-	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
-
-	// Known chat, pointer past the last message → ErrMessageNotFound.
-	chatID := generateChatID()
-	_, _, err = s.PutMessage(ctx, chatID, user, textContent("a"), at(1), generateClientID(), true)
-	require.NoError(t, err)
-	_, _, err = s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
-	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
-}
-
-func testStore_AdvancePointerUnchecked(t *testing.T, s messaging.Store) {
+func testStore_AdvancePointer_NoExistenceCheck(t *testing.T, s messaging.Store) {
 	ctx := context.Background()
 	chatID := generateChatID()
 	user := model.MustGenerateUserID()
@@ -496,31 +510,418 @@ func testStore_AdvancePointerUnchecked(t *testing.T, s messaging.Store) {
 		require.NoError(t, err)
 	}
 
-	// Forward advances, with the same monotonic semantics as AdvancePointer. The
-	// advanced pointer is returned, carrying its last-advanced timestamp.
-	pointer, advanced, err := s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
+	// Forward advances. The advanced pointer is returned, carrying its
+	// last-advanced timestamp.
+	pointer, advanced, err := s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
 	require.NoError(t, err)
 	require.True(t, advanced)
 	require.EqualValues(t, 2, pointer.Value.Value)
 	require.NotNil(t, pointer.Ts)
 
 	// Backward is a no-op, but the current pointer (still at 2) is returned.
-	pointer, advanced, err = s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	pointer, advanced, err = s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
 	require.False(t, advanced)
 	require.EqualValues(t, 2, pointer.Value.Value)
 
-	// Unlike AdvancePointer, the target's existence is not verified: advancing to
-	// a message ID with no backing message succeeds rather than erroring. (The
-	// caller is responsible for only passing a known-existing ID.)
-	_, advanced, err = s.AdvancePointerUnchecked(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 999})
-	require.NoError(t, err)
-	require.True(t, advanced)
-
 	pointers, err := s.GetPointers(ctx, chatID)
 	require.NoError(t, err)
 	require.Len(t, pointers, 1)
-	require.Equal(t, uint64(999), pointers[0].Value.Value)
+	require.Equal(t, uint64(2), pointers[0].Value.Value)
+}
+
+func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+	userC := model.MustGenerateUserID()
+
+	msg, _, err := s.PutMessage(ctx, chatID, userA, textContent("react to me"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	msgID := msg.ID
+	const emoji = "👍"
+
+	// First reactor: count 1, sequence 1, reacted-by-self, sampled.
+	r, created, tooMany, err := s.AddReaction(ctx, chatID, msgID, userA, emoji, at(1))
+	require.NoError(t, err)
+	require.True(t, created)
+	require.False(t, tooMany)
+	require.Equal(t, uint64(1), r.Count)
+	require.Equal(t, uint64(1), r.Sequence)
+	require.False(t, r.ReactedBySelf) // shareable aggregate; the server overlays this
+	require.Len(t, r.SampleReactors, 1)
+	require.Equal(t, userA.Value, r.SampleReactors[0].UserID.Value)
+
+	// Re-adding the same emoji is an idempotent no-op: nothing advances.
+	again, created, _, err := s.AddReaction(ctx, chatID, msgID, userA, emoji, at(2))
+	require.NoError(t, err)
+	require.False(t, created)
+	require.Equal(t, uint64(1), again.Count)
+	require.Equal(t, uint64(1), again.Sequence)
+
+	// Second reactor: count 2, sequence advances, sample ordered most-recent-first.
+	r, created, _, err = s.AddReaction(ctx, chatID, msgID, userB, emoji, at(3))
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, uint64(2), r.Count)
+	require.Equal(t, uint64(2), r.Sequence)
+	require.Len(t, r.SampleReactors, 2)
+	require.Equal(t, userB.Value, r.SampleReactors[0].UserID.Value) // most recent first
+	require.Equal(t, userA.Value, r.SampleReactors[1].UserID.Value)
+
+	// Summary reports the emoji with the shared aggregate; ReactedBySelf is left
+	// false for the server to overlay.
+	summary, err := s.GetReactionSummary(ctx, chatID, msgID)
+	require.NoError(t, err)
+	require.Len(t, summary, 1)
+	require.Equal(t, emoji, summary[0].Emoji)
+	require.Equal(t, uint64(2), summary[0].Count)
+	require.False(t, summary[0].ReactedBySelf)
+
+	// Self-reaction lookup is per-user.
+	present, err := s.GetSelfReactions(ctx, chatID, userA, []messaging.ReactionRef{{MessageID: msgID, Emoji: emoji}})
+	require.NoError(t, err)
+	require.Len(t, present, 1)
+	present, err = s.GetSelfReactions(ctx, chatID, userC, []messaging.ReactionRef{{MessageID: msgID, Emoji: emoji}})
+	require.NoError(t, err)
+	require.Empty(t, present)
+
+	// Remove A: count drops to 1, sequence advances.
+	r, removed, err := s.RemoveReaction(ctx, chatID, msgID, userA, emoji)
+	require.NoError(t, err)
+	require.True(t, removed)
+	require.Equal(t, uint64(1), r.Count)
+	require.Equal(t, uint64(3), r.Sequence)
+	require.Len(t, r.SampleReactors, 1)
+	require.Equal(t, userB.Value, r.SampleReactors[0].UserID.Value)
+
+	// Removing A again is an idempotent no-op; B's reaction still stands.
+	r, removed, err = s.RemoveReaction(ctx, chatID, msgID, userA, emoji)
+	require.NoError(t, err)
+	require.False(t, removed)
+	require.Equal(t, uint64(1), r.Count)
+	require.Equal(t, uint64(3), r.Sequence)
+
+	// Remove the last reactor: the aggregate reports count 0 but keeps advancing
+	// its sequence, and the emoji drops out of the summary.
+	r, removed, err = s.RemoveReaction(ctx, chatID, msgID, userB, emoji)
+	require.NoError(t, err)
+	require.True(t, removed)
+	require.NotNil(t, r)
+	require.Equal(t, uint64(0), r.Count)
+	require.Equal(t, uint64(4), r.Sequence)
+	require.Empty(t, r.SampleReactors)
+
+	summary, err = s.GetReactionSummary(ctx, chatID, msgID)
+	require.NoError(t, err)
+	require.Empty(t, summary)
+
+	// Re-adding resurrects the emoji but its sequence continues monotonically, so
+	// a client never mistakes the new state for stale.
+	r, created, _, err = s.AddReaction(ctx, chatID, msgID, userA, emoji, at(10))
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, uint64(1), r.Count)
+	require.Equal(t, uint64(5), r.Sequence)
+	require.Len(t, r.SampleReactors, 1)
+	require.Equal(t, userA.Value, r.SampleReactors[0].UserID.Value)
+}
+
+func testStore_Reactions_SummariesByRefs(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	user := model.MustGenerateUserID()
+
+	// Three messages (IDs 1..3); only 1 and 3 get reactions, msg1 with two emoji.
+	var ids []*messagingpb.MessageId
+	for i := 1; i <= 3; i++ {
+		msg, _, err := s.PutMessage(ctx, chatID, user, textContent("m"), at(int64(i)), generateClientID(), true)
+		require.NoError(t, err)
+		ids = append(ids, msg.ID)
+	}
+	_, _, _, err := s.AddReaction(ctx, chatID, ids[0], user, "👍", at(1))
+	require.NoError(t, err)
+	_, _, _, err = s.AddReaction(ctx, chatID, ids[0], user, "❤️", at(2))
+	require.NoError(t, err)
+	_, _, _, err = s.AddReaction(ctx, chatID, ids[2], user, "❤️", at(3))
+	require.NoError(t, err)
+
+	// Batch get by refs echoes every requested message, ordered by ID: messages
+	// with reactions carry their full emoji set together, while the reactionless
+	// message (ids[1]) and the unknown ID (999) come back with empty summaries
+	// rather than being omitted. Duplicate refs collapse.
+	byRefs, err := s.GetReactionSummariesByRefs(ctx, chatID, []*messagingpb.MessageId{ids[2], ids[0], ids[1], ids[0], {Value: 999}})
+	require.NoError(t, err)
+	require.Len(t, byRefs, 4)
+	require.Equal(t, ids[0].Value, byRefs[0].MessageID.Value)
+	require.Len(t, byRefs[0].Reactions, 2)
+	require.Equal(t, ids[1].Value, byRefs[1].MessageID.Value)
+	require.Empty(t, byRefs[1].Reactions)
+	require.Equal(t, ids[2].Value, byRefs[2].MessageID.Value)
+	require.Len(t, byRefs[2].Reactions, 1)
+	require.Equal(t, "❤️", byRefs[2].Reactions[0].Emoji)
+	require.Equal(t, uint64(999), byRefs[3].MessageID.Value)
+	require.Empty(t, byRefs[3].Reactions)
+
+	// Empty input → empty result, no error.
+	empty, err := s.GetReactionSummariesByRefs(ctx, chatID, nil)
+	require.NoError(t, err)
+	require.Empty(t, empty)
+}
+
+func testStore_Reactions_SummariesPaging(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+
+	// Five messages (IDs 1..5). Reactions land on 1, 2, and 4; 3 and 5 stay
+	// reactionless so the page is exercised across interior and trailing gaps.
+	var ids []*messagingpb.MessageId
+	for i := 1; i <= 5; i++ {
+		msg, _, err := s.PutMessage(ctx, chatID, userA, textContent("m"), at(int64(i)), generateClientID(), true)
+		require.NoError(t, err)
+		ids = append(ids, msg.ID)
+	}
+	// msg1 carries two distinct emoji; msg2 and msg4 one each.
+	_, _, _, err := s.AddReaction(ctx, chatID, ids[0], userA, "👍", at(1))
+	require.NoError(t, err)
+	_, _, _, err = s.AddReaction(ctx, chatID, ids[0], userB, "❤️", at(2))
+	require.NoError(t, err)
+	_, _, _, err = s.AddReaction(ctx, chatID, ids[1], userA, "👍", at(3))
+	require.NoError(t, err)
+	_, _, _, err = s.AddReaction(ctx, chatID, ids[3], userA, "🎉", at(4))
+	require.NoError(t, err)
+
+	// reactionCounts maps each summary to its number of distinct emoji, so the
+	// per-message aggregate can be asserted alongside the ordering.
+	reactionCounts := func(summaries []*messaging.ReactionSummary) []int {
+		out := make([]int, len(summaries))
+		for i, summary := range summaries {
+			out[i] = len(summary.Reactions)
+		}
+		return out
+	}
+
+	// Ascending, full set: every message is present in ID order — including the
+	// reactionless 3 and 5, returned with empty summaries rather than skipped.
+	asc, err := s.GetReactionSummaries(ctx, chatID, database.WithAscending())
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2, 3, 4, 5}, summaryIDs(asc))
+	require.Equal(t, []int{2, 1, 0, 1, 0}, reactionCounts(asc))
+
+	// Descending, full set: reverse ID order, gaps still present.
+	desc, err := s.GetReactionSummaries(ctx, chatID, database.WithDescending())
+	require.NoError(t, err)
+	require.Equal(t, []uint64{5, 4, 3, 2, 1}, summaryIDs(desc))
+	require.Equal(t, []int{0, 1, 0, 1, 2}, reactionCounts(desc))
+
+	// Ascending paging: the limit counts messages, not reactions, so msg1's two
+	// emoji come back together as one summary. Pages are [1,2], [3,4], [5].
+	apage1, err := s.GetReactionSummaries(ctx, chatID, database.WithAscending(), database.WithLimit(2))
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2}, summaryIDs(apage1))
+	require.Equal(t, []int{2, 1}, reactionCounts(apage1))
+
+	// Page 2 resumes strictly after the cursor: the reactionless msg3 leads with
+	// an empty summary, ahead of msg4's reaction.
+	atoken := messaging.PageTokenFromID(apage1[len(apage1)-1].MessageID)
+	apage2, err := s.GetReactionSummaries(ctx, chatID, database.WithAscending(), database.WithLimit(2), database.WithPagingToken(atoken))
+	require.NoError(t, err)
+	require.Equal(t, []uint64{3, 4}, summaryIDs(apage2))
+	require.Equal(t, []int{0, 1}, reactionCounts(apage2))
+
+	// The final page is short (one message left) and trails with the reactionless
+	// msg5.
+	atoken2 := messaging.PageTokenFromID(apage2[len(apage2)-1].MessageID)
+	apage3, err := s.GetReactionSummaries(ctx, chatID, database.WithAscending(), database.WithLimit(2), database.WithPagingToken(atoken2))
+	require.NoError(t, err)
+	require.Equal(t, []uint64{5}, summaryIDs(apage3))
+	require.Equal(t, []int{0}, reactionCounts(apage3))
+
+	// Paging past the end yields an empty page (no error).
+	atoken3 := messaging.PageTokenFromID(apage3[len(apage3)-1].MessageID)
+	apage4, err := s.GetReactionSummaries(ctx, chatID, database.WithAscending(), database.WithLimit(2), database.WithPagingToken(atoken3))
+	require.NoError(t, err)
+	require.Empty(t, apage4)
+
+	// Descending paging mirrors ascending: pages are [5,4], [3,2], [1].
+	dpage1, err := s.GetReactionSummaries(ctx, chatID, database.WithDescending(), database.WithLimit(2))
+	require.NoError(t, err)
+	require.Equal(t, []uint64{5, 4}, summaryIDs(dpage1))
+	require.Equal(t, []int{0, 1}, reactionCounts(dpage1))
+
+	dtoken := messaging.PageTokenFromID(dpage1[len(dpage1)-1].MessageID)
+	dpage2, err := s.GetReactionSummaries(ctx, chatID, database.WithDescending(), database.WithLimit(2), database.WithPagingToken(dtoken))
+	require.NoError(t, err)
+	require.Equal(t, []uint64{3, 2}, summaryIDs(dpage2))
+	require.Equal(t, []int{0, 1}, reactionCounts(dpage2))
+
+	dtoken2 := messaging.PageTokenFromID(dpage2[len(dpage2)-1].MessageID)
+	dpage3, err := s.GetReactionSummaries(ctx, chatID, database.WithDescending(), database.WithLimit(2), database.WithPagingToken(dtoken2))
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1}, summaryIDs(dpage3))
+	require.Equal(t, []int{2}, reactionCounts(dpage3))
+
+	// An unknown chat has no messages, hence no summaries.
+	empty, err := s.GetReactionSummaries(ctx, generateChatID(), database.WithAscending())
+	require.NoError(t, err)
+	require.Empty(t, empty)
+}
+
+func testStore_Reactions_SampleCap(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+
+	msg, _, err := s.PutMessage(ctx, chatID, model.MustGenerateUserID(), textContent("popular"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	msgID := msg.ID
+	const emoji = "👍"
+
+	// React with more users than the stored sample holds, at increasing times so
+	// recency order is well-defined.
+	total := messaging.MaxStoredSampleReactors + messaging.MaxSampleReactors
+	users := make([]*commonpb.UserId, total)
+	var last *messaging.Reaction
+	for i := 0; i < total; i++ {
+		users[i] = model.MustGenerateUserID()
+		last, _, _, err = s.AddReaction(ctx, chatID, msgID, users[i], emoji, at(int64(i+1)))
+		require.NoError(t, err)
+	}
+
+	// The surfaced sample is capped at MaxSampleReactors and holds the most-recent
+	// reactors (by timestamp), in descending order — even though more were stored.
+	require.Equal(t, uint64(total), last.Count)
+	require.Len(t, last.SampleReactors, messaging.MaxSampleReactors)
+	for i := 0; i < messaging.MaxSampleReactors; i++ {
+		require.Equal(t, users[total-1-i].Value, last.SampleReactors[i].UserID.Value)
+	}
+
+	// Remove every reactor retained in the stored sample (the most-recent
+	// MaxStoredSampleReactors). With no backfill, the surfaced sample empties even
+	// though earlier reactors remain — the count stays accurate.
+	for i := total - messaging.MaxStoredSampleReactors; i < total; i++ {
+		_, removed, err := s.RemoveReaction(ctx, chatID, msgID, users[i], emoji)
+		require.NoError(t, err)
+		require.True(t, removed)
+	}
+
+	summary, err := s.GetReactionSummary(ctx, chatID, msgID)
+	require.NoError(t, err)
+	require.Len(t, summary, 1)
+	require.Equal(t, uint64(messaging.MaxSampleReactors), summary[0].Count)
+	require.Empty(t, summary[0].SampleReactors)
+}
+
+func testStore_Reactions_TypeCap(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+
+	msg, _, err := s.PutMessage(ctx, chatID, userA, textContent("popular"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	msgID := msg.ID
+
+	// Fill the message to its distinct-emoji cap. (The store treats the emoji as
+	// an opaque key; real-emoji validity is enforced one layer up.)
+	for i := 0; i < messaging.MaxReactionTypesPerMessage; i++ {
+		_, created, tooMany, err := s.AddReaction(ctx, chatID, msgID, userA, fmt.Sprintf("e-%d", i), at(int64(i)))
+		require.NoError(t, err)
+		require.True(t, created)
+		require.False(t, tooMany)
+	}
+
+	// One more distinct emoji is rejected.
+	r, created, tooMany, err := s.AddReaction(ctx, chatID, msgID, userA, "e-over", at(1))
+	require.NoError(t, err)
+	require.False(t, created)
+	require.True(t, tooMany)
+	require.Nil(t, r)
+
+	// Re-adding an already-present emoji (different user) never trips the cap.
+	_, created, tooMany, err = s.AddReaction(ctx, chatID, msgID, userB, "e-0", at(1))
+	require.NoError(t, err)
+	require.True(t, created)
+	require.False(t, tooMany)
+
+	// Emptying an emoji frees a slot for a new distinct one.
+	_, _, err = s.RemoveReaction(ctx, chatID, msgID, userA, "e-1")
+	require.NoError(t, err)
+	r, created, tooMany, err = s.AddReaction(ctx, chatID, msgID, userA, "e-over", at(1))
+	require.NoError(t, err)
+	require.True(t, created)
+	require.False(t, tooMany)
+	require.NotNil(t, r)
+}
+
+func testStore_Reactions_GetReactors(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	msg, _, err := s.PutMessage(ctx, chatID, sender, textContent("react"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	msgID := msg.ID
+	const emoji = "👍"
+
+	// Five reactors at increasing timestamps, so recency order is u4..u0.
+	users := make([]*commonpb.UserId, 5)
+	for i := range users {
+		users[i] = model.MustGenerateUserID()
+		_, _, _, err := s.AddReaction(ctx, chatID, msgID, users[i], emoji, at(int64(i+1)))
+		require.NoError(t, err)
+	}
+
+	reactorIDs := func(reactors []*messaging.Reactor) [][]byte {
+		out := make([][]byte, len(reactors))
+		for i, r := range reactors {
+			out[i] = r.UserID.Value
+		}
+		return out
+	}
+
+	// The contract is identical whether the read is strongly consistent or served
+	// from an eventually consistent index, so assert it holds for both.
+	for _, consistent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("consistent=%v", consistent), func(t *testing.T) {
+			// Full list, most-recent-first.
+			all, hasMore, err := s.GetReactors(ctx, chatID, msgID, emoji, consistent)
+			require.NoError(t, err)
+			require.False(t, hasMore)
+			require.Equal(t, [][]byte{users[4].Value, users[3].Value, users[2].Value, users[1].Value, users[0].Value}, reactorIDs(all))
+
+			// Page through two at a time, carrying the cursor forward.
+			page1, hasMore, err := s.GetReactors(ctx, chatID, msgID, emoji, consistent, database.WithLimit(2))
+			require.NoError(t, err)
+			require.True(t, hasMore)
+			require.Equal(t, [][]byte{users[4].Value, users[3].Value}, reactorIDs(page1))
+
+			page2, hasMore, err := s.GetReactors(ctx, chatID, msgID, emoji, consistent, database.WithLimit(2), database.WithPagingToken(messaging.ReactorPageToken(page1[len(page1)-1])))
+			require.NoError(t, err)
+			require.True(t, hasMore)
+			require.Equal(t, [][]byte{users[2].Value, users[1].Value}, reactorIDs(page2))
+
+			page3, hasMore, err := s.GetReactors(ctx, chatID, msgID, emoji, consistent, database.WithLimit(2), database.WithPagingToken(messaging.ReactorPageToken(page2[len(page2)-1])))
+			require.NoError(t, err)
+			require.False(t, hasMore)
+			require.Equal(t, [][]byte{users[0].Value}, reactorIDs(page3))
+
+			// A page whose limit exactly equals the available count must report
+			// hasMore false — there is no next page.
+			exact, hasMore, err := s.GetReactors(ctx, chatID, msgID, emoji, consistent, database.WithLimit(5))
+			require.NoError(t, err)
+			require.False(t, hasMore)
+			require.Len(t, exact, 5)
+
+			// Unknown emoji on the message: empty, no error.
+			none, hasMore, err := s.GetReactors(ctx, chatID, msgID, "🚀", consistent)
+			require.NoError(t, err)
+			require.Empty(t, none)
+			require.False(t, hasMore)
+		})
+	}
 }
 
 func textContent(text string) []*messagingpb.Content {
@@ -574,6 +975,14 @@ func messageIDs(msgs []*messaging.Message) []uint64 {
 	out := make([]uint64, len(msgs))
 	for i, m := range msgs {
 		out[i] = m.ID.Value
+	}
+	return out
+}
+
+func summaryIDs(summaries []*messaging.ReactionSummary) []uint64 {
+	out := make([]uint64, len(summaries))
+	for i, s := range summaries {
+		out[i] = s.MessageID.Value
 	}
 	return out
 }

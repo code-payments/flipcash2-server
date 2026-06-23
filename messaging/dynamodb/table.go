@@ -10,12 +10,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// CreateTables provisions the messages and message_pointers tables. Both use a
-// composite (pk, sk) string key with no secondary indexes and on-demand
-// billing. The messages table has TTL enabled on attrExpiresAt so the transient
-// cmid# idempotency markers are auto-reaped. It is idempotent: tables that
-// already exist are left as-is. The call blocks until both tables are ACTIVE.
-func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, pointersTable string) error {
+// CreateTables provisions the messages, message_pointers, and message_reactions
+// tables. All use a composite (pk, sk) string key with on-demand billing; the
+// reactions table additionally carries the reactors_by_recency GSI for
+// most-recent-first reactor paging. The messages table has TTL enabled on
+// attrExpiresAt so the transient cmid# idempotency markers are auto-reaped. It is
+// idempotent: tables that already exist are left as-is. The call blocks until all
+// tables are ACTIVE.
+func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, pointersTable, reactionsTable string) error {
 	for _, table := range []string{messagesTable, pointersTable} {
 		_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
 			TableName:   aws.String(table),
@@ -41,6 +43,46 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, p
 		}, 2*time.Minute); err != nil {
 			return err
 		}
+	}
+
+	// The reactions table also indexes reactor rows by (reaction_key, reacted_ts)
+	// so a single emoji's reactors can be paged most-recent-first.
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String(reactionsTable),
+		BillingMode: types.BillingModePayPerRequest,
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String(attrReactionKey), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String(attrReactedTs), AttributeType: types.ScalarAttributeTypeN},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+		},
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{{
+			IndexName: aws.String(reactorsByRecencyGSI),
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrReactionKey), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrReactedTs), KeyType: types.KeyTypeRange},
+			},
+			// user_id is the only non-key attribute a reactor read needs.
+			Projection: &types.Projection{
+				ProjectionType:   types.ProjectionTypeInclude,
+				NonKeyAttributes: []string{attrUserID},
+			},
+		}},
+	})
+	if err != nil {
+		var inUse *types.ResourceInUseException
+		if !errors.As(err, &inUse) {
+			return err
+		}
+	}
+	if err := dynamodb.NewTableExistsWaiter(client).Wait(ctx, &dynamodb.DescribeTableInput{
+		TableName: aws.String(reactionsTable),
+	}, 2*time.Minute); err != nil {
+		return err
 	}
 
 	return ensureTTL(ctx, client, messagesTable, attrExpiresAt)
@@ -73,10 +115,10 @@ func ensureTTL(ctx context.Context, client *dynamodb.Client, table, attr string)
 	return err
 }
 
-// reset deletes every item from both tables, for tests.
+// reset deletes every item from all tables, for tests.
 func (s *store) reset() {
 	ctx := context.Background()
-	for _, table := range []string{s.messagesTable, s.pointersTable} {
+	for _, table := range []string{s.messagesTable, s.pointersTable, s.reactionsTable} {
 		if err := clearTable(ctx, s.client, table); err != nil {
 			panic(err)
 		}

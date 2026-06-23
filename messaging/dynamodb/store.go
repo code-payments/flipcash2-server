@@ -24,17 +24,31 @@ import (
 	"github.com/code-payments/flipcash2-server/messaging"
 )
 
-// The messaging store spans two tables:
+// The messaging store spans three tables:
 //
-//	messages          pk = "chat#<id>", sk in { "#counter", "msg#<padded seq>",
-//	                  "cmid#<client id>" }. All of a chat's messages, its
-//	                  sequence counter, and its idempotency markers share one
-//	                  partition so a send is one single-partition transaction.
+//	messages           pk = "chat#<id>", sk in { "#counter", "msg#<padded seq>",
+//	                   "cmid#<client id>" }. All of a chat's messages, its
+//	                   sequence counter, and its idempotency markers share one
+//	                   partition so a send is one single-partition transaction.
 //
-//	message_pointers  pk = "chat#<id>", sk = "<type>#<user>". Delivered/read
-//	                  pointers, kept out of the messages partition so heavy
-//	                  receipt writes don't contend with the send path (pointers
-//	                  share nothing transactional with messages).
+//	message_pointers   pk = "chat#<id>", sk = "<type>#<user>". Delivered/read
+//	                   pointers, kept out of the messages partition so heavy
+//	                   receipt writes don't contend with the send path (pointers
+//	                   share nothing transactional with messages).
+//
+//	message_reactions  pk = "chat#<id>", sk in { "agg#<padded seq>#<emoji hex>",
+//	                   "rct#<padded seq>#<emoji hex>#<user hex>" }. One agg# row
+//	                   per (message, emoji) holds the count, a monotonic sequence,
+//	                   and a bounded sample map (user hex -> reacted_ts, up to
+//	                   MaxStoredSampleReactors of the most-recent reactors, a new
+//	                   reactor evicting the least-recent once full) surfaced as the
+//	                   reaction's sample. The row is retained at
+//	                   count 0 so the sequence survives an emoji being removed and
+//	                   re-added. One rct# row per reactor backs idempotency, the
+//	                   self-reaction check, and the reactors_by_recency GSI
+//	                   (reaction_key = chat#<id>#<padded seq>#<emoji hex>,
+//	                   reacted_ts), which orders an emoji's reactors
+//	                   most-recent-first for GetReactors (the full paged list).
 const (
 	skCounter   = "#counter"
 	msgPrefix   = "msg#"
@@ -64,27 +78,43 @@ const (
 	attrPointerVal = "ptr_value" // avoids the reserved word "value"
 	attrType       = "type"      // reserved; referenced via ExpressionAttributeNames
 
+	// message_reactions table attributes
+	aggPrefix = "agg#"
+	rctPrefix = "rct#"
+
+	attrEmoji         = "emoji"
+	attrReactionCount = "r_count" // count and sequence are DynamoDB reserved words
+	attrReactionSeq   = "seq"
+	attrSample        = "sample"       // agg# row map: user hex -> reacted_ts (bounded sample)
+	attrReactedTs     = "reacted_ts"   // reactor row attr; reactors_by_recency sort key (nanos)
+	attrReactionKey   = "reaction_key" // reactors_by_recency partition key
+
+	reactorsByRecencyGSI = "reactors_by_recency"
+
 	// DynamoDB transaction cancellation / condition codes
 	codeConditionalCheckFailed = "ConditionalCheckFailed"
 	codeTransactionConflict    = "TransactionConflict"
 
-	maxPutMessageAttempts = 32
-	maxBatchGetKeys       = 100
+	maxPutMessageAttempts  = 32
+	maxAddReactionAttempts = 32
+	maxBatchGetKeys        = 100
 )
 
 type store struct {
-	client        *dynamodb.Client
-	messagesTable string
-	pointersTable string
+	client         *dynamodb.Client
+	messagesTable  string
+	pointersTable  string
+	reactionsTable string
 }
 
 // NewInDynamoDB returns a messaging.Store backed by the given DynamoDB tables.
 // Use CreateTables to provision them.
-func NewInDynamoDB(client *dynamodb.Client, messagesTable, pointersTable string) messaging.Store {
+func NewInDynamoDB(client *dynamodb.Client, messagesTable, pointersTable, reactionsTable string) messaging.Store {
 	return &store{
-		client:        client,
-		messagesTable: messagesTable,
-		pointersTable: pointersTable,
+		client:         client,
+		messagesTable:  messagesTable,
+		pointersTable:  pointersTable,
+		reactionsTable: reactionsTable,
 	}
 }
 
@@ -205,6 +235,19 @@ func (s *store) GetMessage(ctx context.Context, chatID *commonpb.ChatId, message
 		return nil, messaging.ErrMessageNotFound
 	}
 	return messageFromItem(chatID, out.Item)
+}
+
+func (s *store) MessageExists(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (bool, error) {
+	// Project to pk only so the content blobs are never read or decoded.
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:            aws.String(s.messagesTable),
+		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(msgSK(messageID.Value))},
+		ProjectionExpression: aws.String(attrPK),
+	})
+	if err != nil {
+		return false, err
+	}
+	return len(out.Item) > 0, nil
 }
 
 func (s *store) GetMessages(ctx context.Context, chatID *commonpb.ChatId, opts ...database.QueryOption) ([]*messaging.Message, error) {
@@ -397,45 +440,6 @@ func (s *store) GetPointersForChats(ctx context.Context, refs []messaging.Pointe
 }
 
 func (s *store) AdvancePointer(
-	ctx context.Context,
-	chatID *commonpb.ChatId,
-	userID *commonpb.UserId,
-	pointerType messagingpb.Pointer_Type,
-	newValue *messagingpb.MessageId,
-) (*messagingpb.Pointer, bool, error) {
-	// The pointer's target must reference an existing message (in the other table).
-	exists, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName:            aws.String(s.messagesTable),
-		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(msgSK(newValue.Value))},
-		ProjectionExpression: aws.String(attrPK),
-	})
-	if err != nil {
-		return nil, false, err
-	}
-	if len(exists.Item) == 0 {
-		return nil, false, messaging.ErrMessageNotFound
-	}
-
-	return s.advancePointer(ctx, chatID, userID, pointerType, newValue)
-}
-
-func (s *store) AdvancePointerUnchecked(
-	ctx context.Context,
-	chatID *commonpb.ChatId,
-	userID *commonpb.UserId,
-	pointerType messagingpb.Pointer_Type,
-	newValue *messagingpb.MessageId,
-) (*messagingpb.Pointer, bool, error) {
-	// Caller guarantees newValue exists, so the existence read is skipped.
-	return s.advancePointer(ctx, chatID, userID, pointerType, newValue)
-}
-
-// advancePointer performs the monotonic forward-only pointer update, the shared
-// core of AdvancePointer and AdvancePointerUnchecked. It does not verify that
-// newValue references an existing message. It always returns the pointer's
-// current state: the freshly advanced pointer, or — when the update is a no-op —
-// the existing pointer recovered from the failed condition check.
-func (s *store) advancePointer(
 	ctx context.Context,
 	chatID *commonpb.ChatId,
 	userID *commonpb.UserId,
@@ -727,4 +731,863 @@ func isRetryable(reasons []string) bool {
 		}
 	}
 	return false
+}
+
+func (s *store) AddReaction(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	userID *commonpb.UserId,
+	emoji string,
+	ts time.Time,
+) (*messaging.Reaction, bool, bool, error) {
+	seq := messageID.Value
+
+	for attempt := 0; attempt < maxAddReactionAttempts; attempt++ {
+		// One batched read fetches both the emoji aggregate and the caller's own
+		// reactor row (both share the chat's partition).
+		aggExists, count, sequence, sample, exists, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
+		if err != nil {
+			return nil, false, false, err
+		}
+
+		// Idempotent: the user already reacted with this emoji.
+		if exists {
+			return buildReaction(emoji, count, sequence, sample), false, false, nil
+		}
+
+		// Activating a (new or previously-emptied) emoji must respect the
+		// per-message distinct-type cap; re-adding never trips it.
+		//
+		// This is a soft cap: the count is read here, not enforced inside the
+		// write transaction below, so concurrent activations of distinct emoji can
+		// each pass the check and land a few over MaxReactionTypesPerMessage. The
+		// overshoot is rare (it needs simultaneous distinct-emoji adds right at the
+		// limit), bounded, self-limiting (further activations are then rejected),
+		// and harms nothing — counts and sequences stay correct. Enforcing it
+		// exactly would require a per-message counter in the transaction plus an
+		// optimistic condition on the aggregate bump; not worth the added
+		// contention for an anti-abuse limit.
+		if !aggExists || count == 0 {
+			active, err := s.countActiveAggregates(ctx, chatID, seq)
+			if err != nil {
+				return nil, false, false, err
+			}
+			if active >= messaging.MaxReactionTypesPerMessage {
+				return nil, false, true, nil
+			}
+		}
+
+		// [0] the reactor row, conditioned so a concurrent identical add (same
+		// user, same emoji) loses and is treated as idempotent.
+		items := []types.TransactWriteItem{
+			{Put: &types.Put{
+				TableName: aws.String(s.reactionsTable),
+				Item: map[string]types.AttributeValue{
+					attrPK:          avS(chatPK(chatID)),
+					attrSK:          avS(rctSK(seq, emoji, userID)),
+					attrUserID:      avB(userID.Value),
+					attrReactedTs:   avN(uint64(ts.UnixNano())),
+					attrReactionKey: avS(reactionKey(chatID, seq, emoji)),
+				},
+				ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+			}},
+		}
+		// Maintain the recent sample on the aggregate: insert this reactor while the
+		// stored set has room, otherwise evict the least-recent entry to make room —
+		// but only when this reactor is itself more recent than that entry. This keeps
+		// the stored sample the most-recent MaxStoredSampleReactors; reads surface only
+		// the most-recent MaxSampleReactors of it (see messaging.SampleFromReactors).
+		//
+		// The decision uses the sample read above, not a transactional condition, so it
+		// is soft. But every sample mutation targets this one agg# item, and DynamoDB
+		// serializes transactions on a shared item: a conflicting concurrent add is
+		// cancelled and retried against a fresh strongly-consistent read, so eviction
+		// targets the true current least-recent entry rather than a stale one.
+		newHex := hex.EncodeToString(userID.Value)
+		addToSample := false
+		evictHex := ""
+		if len(sample) < messaging.MaxStoredSampleReactors {
+			addToSample = true
+		} else if oldHex, oldTs, ok := leastRecentInSample(sample); ok && moreRecent(ts, newHex, oldTs, oldHex) {
+			addToSample = true
+			evictHex = oldHex
+		}
+
+		// [1] the emoji aggregate: bump an existing one, or create it. A create
+		// races with a concurrent first-reactor; the loser retries as a bump.
+		if aggExists {
+			update := &types.Update{
+				TableName: aws.String(s.reactionsTable),
+				Key:       map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(aggSK(seq, emoji))},
+			}
+			switch {
+			case addToSample && evictHex != "":
+				// Atomic evict-and-insert on the sample map alongside the counter bump;
+				// no read-modify-write, so it never contends on the aggregate row.
+				update.UpdateExpression = aws.String(fmt.Sprintf("SET #s.#new = :ts REMOVE #s.#old ADD %s :one, %s :one", attrReactionCount, attrReactionSeq))
+				update.ExpressionAttributeNames = map[string]string{"#s": attrSample, "#new": newHex, "#old": evictHex}
+				update.ExpressionAttributeValues = map[string]types.AttributeValue{":one": avN(1), ":ts": avN(uint64(ts.UnixNano()))}
+			case addToSample:
+				// Room in the sample: single-key map insert alongside the counter bump.
+				update.UpdateExpression = aws.String(fmt.Sprintf("SET #s.#new = :ts ADD %s :one, %s :one", attrReactionCount, attrReactionSeq))
+				update.ExpressionAttributeNames = map[string]string{"#s": attrSample, "#new": newHex}
+				update.ExpressionAttributeValues = map[string]types.AttributeValue{":one": avN(1), ":ts": avN(uint64(ts.UnixNano()))}
+			default:
+				// Not recent enough to sample: pure counter bump.
+				update.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :one, %s :one", attrReactionCount, attrReactionSeq))
+				update.ExpressionAttributeValues = map[string]types.AttributeValue{":one": avN(1)}
+			}
+			items = append(items, types.TransactWriteItem{Update: update})
+		} else {
+			items = append(items, types.TransactWriteItem{Put: &types.Put{
+				TableName: aws.String(s.reactionsTable),
+				Item: map[string]types.AttributeValue{
+					attrPK:            avS(chatPK(chatID)),
+					attrSK:            avS(aggSK(seq, emoji)),
+					attrEmoji:         avS(emoji),
+					attrReactionCount: avN(1),
+					attrReactionSeq:   avN(1),
+					// First reactor seeds the sample map (always has room).
+					attrSample: &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
+						hex.EncodeToString(userID.Value): avN(uint64(ts.UnixNano())),
+					}},
+				},
+				ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+			}})
+		}
+
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+		if err == nil {
+			// Read back the authoritative count, sequence, and sample (a concurrent
+			// add to the same emoji may have advanced them past count+1).
+			_, newCount, newSeq, newSample, err := s.getAggregate(ctx, chatID, seq, emoji)
+			if err != nil {
+				return nil, false, false, err
+			}
+			return buildReaction(emoji, newCount, newSeq, newSample), true, false, nil
+		}
+
+		reasons, ok := cancellationReasons(err)
+		if !ok {
+			return nil, false, false, err
+		}
+		// reasons index matches TransactItems order: [0]=reactor, [1]=aggregate.
+		// A failed reactor condition means a concurrent identical add won: re-read
+		// and return the idempotent result. A failed aggregate create means a
+		// concurrent first-reactor created it: retry as a bump.
+		if len(reasons) >= 1 && reasons[0] == codeConditionalCheckFailed {
+			continue
+		}
+		if isRetryable(reasons) {
+			continue
+		}
+		return nil, false, false, err
+	}
+	return nil, false, false, fmt.Errorf("add reaction exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
+}
+
+func (s *store) RemoveReaction(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	userID *commonpb.UserId,
+	emoji string,
+) (*messaging.Reaction, bool, error) {
+	seq := messageID.Value
+
+	for attempt := 0; attempt < maxAddReactionAttempts; attempt++ {
+		// One batched read fetches both the emoji aggregate and the caller's own
+		// reactor row (both share the chat's partition).
+		aggExists, count, sequence, sample, exists, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
+		if err != nil {
+			return nil, false, err
+		}
+
+		// Idempotent: the user didn't react. Reflect the current state, or report a
+		// pure no-op when there's no aggregate at all.
+		if !exists {
+			if aggExists {
+				return buildReaction(emoji, count, sequence, sample), false, nil
+			}
+			return nil, false, nil
+		}
+
+		// [0] delete the reactor (lose to a concurrent identical remove), [1]
+		// decrement the aggregate, advance its sequence, and drop the reactor from
+		// the sample map (a no-op if it wasn't sampled; never backfilled). The
+		// aggregate row is retained even at count 0 so sequence survives a re-add.
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+			{Delete: &types.Delete{
+				TableName:           aws.String(s.reactionsTable),
+				Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(rctSK(seq, emoji, userID))},
+				ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
+			}},
+			{Update: &types.Update{
+				TableName:           aws.String(s.reactionsTable),
+				Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(aggSK(seq, emoji))},
+				UpdateExpression:    aws.String(fmt.Sprintf("REMOVE #s.#u ADD %s :negone, %s :one", attrReactionCount, attrReactionSeq)),
+				ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
+				ExpressionAttributeNames: map[string]string{
+					"#s": attrSample,
+					"#u": hex.EncodeToString(userID.Value),
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":negone": &types.AttributeValueMemberN{Value: "-1"},
+					":one":    avN(1),
+				},
+			}},
+		}})
+		if err == nil {
+			// Read back the advanced count, sequence, and sample; Count may now be 0,
+			// but the aggregate still carries the sequence the removal broadcast needs.
+			_, newCount, newSeq, newSample, err := s.getAggregate(ctx, chatID, seq, emoji)
+			if err != nil {
+				return nil, false, err
+			}
+			return buildReaction(emoji, newCount, newSeq, newSample), true, nil
+		}
+
+		reasons, ok := cancellationReasons(err)
+		if !ok {
+			return nil, false, err
+		}
+		// A failed reactor delete means a concurrent identical remove won: re-read
+		// and return the idempotent result.
+		if len(reasons) >= 1 && reasons[0] == codeConditionalCheckFailed {
+			continue
+		}
+		if isRetryable(reasons) {
+			continue
+		}
+		return nil, false, err
+	}
+	return nil, false, fmt.Errorf("remove reaction exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
+}
+
+func (s *store) GetReactionSummary(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+) ([]*messaging.Reaction, error) {
+	return s.reactionsForMessage(ctx, chatID, messageID.Value)
+}
+
+func (s *store) GetReactionSummariesByRefs(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	messageIDs []*messagingpb.MessageId,
+) ([]*messaging.ReactionSummary, error) {
+	seen := make(map[uint64]struct{}, len(messageIDs))
+	var out []*messaging.ReactionSummary
+	for _, id := range messageIDs {
+		if _, dup := seen[id.Value]; dup {
+			continue
+		}
+		seen[id.Value] = struct{}{}
+		reactions, err := s.reactionsForMessage(ctx, chatID, id.Value)
+		if err != nil {
+			return nil, err
+		}
+		// Every requested message is echoed; one with no reactions (or unknown)
+		// comes back with an empty summary rather than being omitted.
+		out = append(out, &messaging.ReactionSummary{
+			MessageID: &messagingpb.MessageId{Value: id.Value},
+			Reactions: reactions,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].MessageID.Value < out[j].MessageID.Value })
+	return out, nil
+}
+
+func (s *store) GetReactionSummaries(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	opts ...database.QueryOption,
+) ([]*messaging.ReactionSummary, error) {
+	q := database.ApplyQueryOptions(opts...)
+	forward := q.Order != commonpb.QueryOptions_DESC
+
+	limit := q.Limit
+	if limit <= 0 {
+		limit = database.DefaultQueryOptions().Limit
+	}
+
+	// The page spans messages, not just reacted ones, so a message with no
+	// reactions is returned with an empty summary rather than skipped. Message IDs
+	// are a gapless per-chat sequence (1..lastSeq), so the page is a contiguous
+	// window of IDs; lastSeq (the counter row, one small read) bounds it. The
+	// alternative — paging the messages table — would read full message rows just
+	// to recover their IDs.
+	lastSeq, err := s.lastMessageSeq(ctx, chatID)
+	if err != nil {
+		return nil, err
+	}
+	if lastSeq == 0 {
+		return nil, nil // no messages in the chat
+	}
+
+	// Resolve the page to a contiguous message-ID window [lo, hi], clamped to the
+	// sequence and resuming strictly past the cursor in the requested order.
+	cursor, hasCursor := messaging.IDFromPageToken(q.PagingToken)
+	var lo, hi uint64
+	if forward {
+		lo = 1
+		if hasCursor {
+			lo = cursor + 1
+		}
+		if lo > lastSeq {
+			return nil, nil // cursor at or past the head
+		}
+		hi = lastSeq
+		if span := lo + uint64(limit) - 1; span < hi {
+			hi = span
+		}
+	} else {
+		hi = lastSeq
+		if hasCursor {
+			if cursor <= 1 {
+				return nil, nil // cursor at or before the tail
+			}
+			hi = cursor - 1
+		}
+		lo = 1
+		if hi > uint64(limit) {
+			lo = hi - uint64(limit) + 1
+		}
+	}
+
+	// One agg# range query over the window; a message with no reactions simply has
+	// no group, and is emitted below as an empty summary.
+	groups, err := s.reactionsForSeqRange(ctx, chatID, lo, hi)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*messaging.ReactionSummary, 0, hi-lo+1)
+	emit := func(seq uint64) {
+		result = append(result, &messaging.ReactionSummary{
+			MessageID: &messagingpb.MessageId{Value: seq},
+			Reactions: groups[seq], // nil/empty when the message has no reactions
+		})
+	}
+	if forward {
+		for seq := lo; seq <= hi; seq++ {
+			emit(seq)
+		}
+	} else {
+		for seq := hi; seq >= lo; seq-- {
+			emit(seq)
+		}
+	}
+	return result, nil
+}
+
+// lastMessageSeq returns the chat's highest assigned message seq from the counter
+// row, or 0 when the chat has no messages yet. Message IDs are gapless, so this
+// bounds the message-ID space at 1..lastSeq.
+func (s *store) lastMessageSeq(ctx context.Context, chatID *commonpb.ChatId) (uint64, error) {
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:            aws.String(s.messagesTable),
+		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skCounter)},
+		ProjectionExpression: aws.String(attrLastSeq),
+		ConsistentRead:       aws.Bool(true),
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(out.Item) == 0 {
+		return 0, nil
+	}
+	return parseN(out.Item[attrLastSeq])
+}
+
+// reactionsForSeqRange returns the active emoji aggregates for message seqs in
+// the contiguous window [lo, hi], grouped by seq and ordered by emoji within each
+// group, via one agg# range query. Every seq in the window is a real message (the
+// sequence is gapless), so any aggregate the query returns belongs to the page.
+// Messages with no reactions are absent from the returned map.
+func (s *store) reactionsForSeqRange(ctx context.Context, chatID *commonpb.ChatId, lo, hi uint64) (map[uint64][]*messaging.Reaction, error) {
+	groups := make(map[uint64][]*messaging.Reaction)
+	from := aggPrefix + seqPad(lo) + "#"
+	to := aggPrefix + seqPad(hi) + "#~"
+	var startKey map[string]types.AttributeValue
+	for {
+		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(s.reactionsTable),
+			KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND %s BETWEEN :from AND :to", attrPK, attrSK)),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk":   avS(chatPK(chatID)),
+				":from": avS(from),
+				":to":   avS(to),
+			},
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			count, _ := parseN(item[attrReactionCount])
+			if count == 0 {
+				continue // inactive emoji aggregate, retained only for its sequence
+			}
+			seq, err := seqFromAggSK(asS(item[attrSK]))
+			if err != nil {
+				return nil, err
+			}
+			// The sample is carried on the agg# item itself — no per-emoji query.
+			groups[seq] = append(groups[seq], reactionFromAggItem(item))
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		startKey = out.LastEvaluatedKey
+	}
+
+	for seq := range groups {
+		reactions := groups[seq]
+		sort.Slice(reactions, func(i, j int) bool { return reactions[i].Emoji < reactions[j].Emoji })
+		groups[seq] = reactions
+	}
+	return groups, nil
+}
+
+func (s *store) GetSelfReactions(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	userID *commonpb.UserId,
+	refs []messaging.ReactionRef,
+) ([]messaging.ReactionRef, error) {
+	// Dedup to exact reactor-row keys, remembering which ref each key maps back to.
+	byKey := make(map[string]messaging.ReactionRef, len(refs))
+	var keys []map[string]types.AttributeValue
+	for _, ref := range refs {
+		sk := rctSK(ref.MessageID.Value, ref.Emoji, userID)
+		if _, dup := byKey[sk]; dup {
+			continue
+		}
+		byKey[sk] = ref
+		keys = append(keys, map[string]types.AttributeValue{
+			attrPK: avS(chatPK(chatID)),
+			attrSK: avS(sk),
+		})
+	}
+
+	var present []messaging.ReactionRef
+	for start := 0; start < len(keys); start += maxBatchGetKeys {
+		end := start + maxBatchGetKeys
+		if end > len(keys) {
+			end = len(keys)
+		}
+		req := map[string]types.KeysAndAttributes{
+			s.reactionsTable: {Keys: keys[start:end], ProjectionExpression: aws.String(attrSK)},
+		}
+		for len(req[s.reactionsTable].Keys) > 0 {
+			resp, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range resp.Responses[s.reactionsTable] {
+				if ref, ok := byKey[asS(item[attrSK])]; ok {
+					present = append(present, ref)
+				}
+			}
+			if unprocessed, ok := resp.UnprocessedKeys[s.reactionsTable]; ok && len(unprocessed.Keys) > 0 {
+				req = map[string]types.KeysAndAttributes{s.reactionsTable: unprocessed}
+			} else {
+				break
+			}
+		}
+	}
+	return present, nil
+}
+
+func (s *store) GetReactors(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	emoji string,
+	consistent bool,
+	opts ...database.QueryOption,
+) ([]*messaging.Reactor, bool, error) {
+	q := database.ApplyQueryOptions(opts...)
+	if consistent {
+		return s.getReactorsConsistent(ctx, chatID, messageID.Value, emoji, q)
+	}
+	return s.getReactorsEventuallyConsistent(ctx, chatID, messageID.Value, emoji, q)
+}
+
+// getReactorsEventuallyConsistent pages an emoji's reactors most-recent-first
+// off the reactors_by_recency index. The index is eventually consistent but
+// supports deep paging without reading the whole reactor set.
+func (s *store) getReactorsEventuallyConsistent(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, q database.QueryOptions) ([]*messaging.Reactor, bool, error) {
+	input := &dynamodb.QueryInput{
+		TableName:              aws.String(s.reactionsTable),
+		IndexName:              aws.String(reactorsByRecencyGSI),
+		KeyConditionExpression: aws.String("#g = :g"),
+		ExpressionAttributeNames: map[string]string{
+			"#g": attrReactionKey,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":g": avS(reactionKey(chatID, seq, emoji)),
+		},
+		ScanIndexForward: aws.Bool(false), // most-recent-first
+	}
+	// Over-fetch one row beyond the page so hasMore can be determined exactly.
+	// DynamoDB sets LastEvaluatedKey whenever a query stops at Limit — even when it
+	// landed on the last matching row — so the key alone can't distinguish "exactly
+	// a page" from "more remain". Fetching limit+1 does: getting the extra row means
+	// a next page exists; getting fewer means the partition is exhausted.
+	if q.Limit > 0 {
+		input.Limit = aws.Int32(int32(q.Limit) + 1)
+	}
+	if ts, userID, ok := messaging.ReactorFromPageToken(q.PagingToken); ok {
+		input.ExclusiveStartKey = map[string]types.AttributeValue{
+			attrReactionKey: avS(reactionKey(chatID, seq, emoji)),
+			attrReactedTs:   avN(uint64(ts.UnixNano())),
+			attrPK:          avS(chatPK(chatID)),
+			attrSK:          avS(rctSK(seq, emoji, userID)),
+		}
+	}
+
+	out, err := s.client.Query(ctx, input)
+	if err != nil {
+		return nil, false, err
+	}
+	reactors := make([]*messaging.Reactor, 0, len(out.Items))
+	for _, item := range out.Items {
+		reactors = append(reactors, reactorFromItem(item))
+	}
+
+	// Trim the over-fetched row and report hasMore. The dropped row isn't lost: the
+	// caller resumes from the last returned reactor, so it leads the next page. When
+	// no limit was set, fall back to LastEvaluatedKey (a real 1 MB page boundary).
+	var hasMore bool
+	if q.Limit > 0 {
+		if hasMore = len(reactors) > q.Limit; hasMore {
+			reactors = reactors[:q.Limit]
+		}
+	} else {
+		hasMore = len(out.LastEvaluatedKey) > 0
+	}
+
+	return reactors, hasMore, nil
+}
+
+// getReactorsConsistent reads an emoji's reactor rows directly from the message
+// partition under one strongly consistent query, then orders and pages them in
+// memory. It reads the whole reactor set, so it suits small sets (e.g. DM
+// reactions); larger lists should page the recency index instead. Ordering and
+// paging match getReactorsEventuallyConsistent exactly.
+func (s *store) getReactorsConsistent(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, q database.QueryOptions) ([]*messaging.Reactor, bool, error) {
+	prefix := rctPrefix + seqPad(seq) + "#" + emojiHex(emoji) + "#"
+	var reactors []*messaging.Reactor
+	var startKey map[string]types.AttributeValue
+	for {
+		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(s.reactionsTable),
+			KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND begins_with(%s, :prefix)", attrPK, attrSK)),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk":     avS(chatPK(chatID)),
+				":prefix": avS(prefix),
+			},
+			ConsistentRead:    aws.Bool(true),
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return nil, false, err
+		}
+		for _, item := range out.Items {
+			reactors = append(reactors, reactorFromItem(item))
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		startKey = out.LastEvaluatedKey
+	}
+
+	// Rows come back keyed by user, so order them most-recent-first here.
+	sort.Slice(reactors, func(i, j int) bool { return reactorLess(reactors[i], reactors[j]) })
+
+	// Resume strictly after the cursor reactor, in the same order.
+	if ts, userID, ok := messaging.ReactorFromPageToken(q.PagingToken); ok {
+		cursor := &messaging.Reactor{UserID: userID, ReactedTs: ts}
+		filtered := reactors[:0]
+		for _, r := range reactors {
+			if reactorLess(cursor, r) {
+				filtered = append(filtered, r)
+			}
+		}
+		reactors = filtered
+	}
+
+	limit := q.Limit
+	if limit <= 0 {
+		limit = len(reactors)
+	}
+	hasMore := len(reactors) > limit
+	if hasMore {
+		reactors = reactors[:limit]
+	}
+	return reactors, hasMore, nil
+}
+
+// reactorLess orders reactors most-recent-first, breaking ties by ascending user
+// ID so the ordering is total and stable for paging.
+func reactorLess(a, b *messaging.Reactor) bool {
+	if !a.ReactedTs.Equal(b.ReactedTs) {
+		return a.ReactedTs.After(b.ReactedTs)
+	}
+	return bytes.Compare(a.UserID.Value, b.UserID.Value) < 0
+}
+
+// moreRecent reports whether reactor (tsA, userHexA) ranks ahead of
+// (tsB, userHexB) under the most-recent-first ordering used for samples and
+// GetReactors: later reaction time first, ties broken by smaller user ID. The keys
+// are hex, whose lexicographic order matches the raw-byte order used elsewhere
+// (see reactorLess).
+func moreRecent(tsA time.Time, userHexA string, tsB time.Time, userHexB string) bool {
+	if !tsA.Equal(tsB) {
+		return tsA.After(tsB)
+	}
+	return userHexA < userHexB
+}
+
+// leastRecentInSample returns the sample entry that ranks last under the
+// most-recent-first ordering (earliest reaction time; ties broken by larger user
+// hex) — the entry a recent-sample eviction drops. ok is false for an empty map.
+func leastRecentInSample(sample map[string]time.Time) (userHex string, ts time.Time, ok bool) {
+	for k, t := range sample {
+		if !ok || t.Before(ts) || (t.Equal(ts) && k > userHex) {
+			userHex, ts, ok = k, t, true
+		}
+	}
+	return userHex, ts, ok
+}
+
+// reactionsForMessage returns a message's active emoji aggregates, ordered by
+// emoji. ReactedBySelf is left false for the caller to overlay.
+func (s *store) reactionsForMessage(ctx context.Context, chatID *commonpb.ChatId, seq uint64) ([]*messaging.Reaction, error) {
+	var reactions []*messaging.Reaction
+	var startKey map[string]types.AttributeValue
+	prefix := aggPrefix + seqPad(seq) + "#"
+	for {
+		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(s.reactionsTable),
+			KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND begins_with(%s, :prefix)", attrPK, attrSK)),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk":     avS(chatPK(chatID)),
+				":prefix": avS(prefix),
+			},
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			count, _ := parseN(item[attrReactionCount])
+			if count == 0 {
+				continue
+			}
+			reactions = append(reactions, reactionFromAggItem(item))
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		startKey = out.LastEvaluatedKey
+	}
+	sort.Slice(reactions, func(i, j int) bool { return reactions[i].Emoji < reactions[j].Emoji })
+	return reactions, nil
+}
+
+// getAggregate reads an emoji aggregate's count, sequence, and bounded sample map
+// with a strongly consistent read. exists is false when the aggregate row is
+// absent; sample is nil in that case.
+func (s *store) getAggregate(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string) (exists bool, count, sequence uint64, sample map[string]time.Time, err error) {
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(s.reactionsTable),
+		Key:            map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(aggSK(seq, emoji))},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return false, 0, 0, nil, err
+	}
+	if len(out.Item) == 0 {
+		return false, 0, 0, nil, nil
+	}
+	count, _ = parseN(out.Item[attrReactionCount])
+	sequence, _ = parseN(out.Item[attrReactionSeq])
+	return true, count, sequence, parseSampleMap(out.Item[attrSample]), nil
+}
+
+// readReactionState fetches, in a single strongly-consistent batch read, the two
+// rows the add/remove paths inspect before writing: the emoji's aggregate (count,
+// sequence, bounded sample) and the caller's own reactor row. Both share the
+// chat's partition (pk = chat#<id>), so one BatchGetItem covers them, mirroring
+// readSendState on the message path. aggExists is false when the aggregate row is
+// absent (sample is then nil); reacted reports whether userID already has a
+// reactor row for the emoji.
+func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, userID *commonpb.UserId) (aggExists bool, count, sequence uint64, sample map[string]time.Time, reacted bool, err error) {
+	aggSKVal := aggSK(seq, emoji)
+	rctSKVal := rctSK(seq, emoji, userID)
+	req := map[string]types.KeysAndAttributes{
+		s.reactionsTable: {
+			Keys: []map[string]types.AttributeValue{
+				{attrPK: avS(chatPK(chatID)), attrSK: avS(aggSKVal)},
+				{attrPK: avS(chatPK(chatID)), attrSK: avS(rctSKVal)},
+			},
+			ConsistentRead: aws.Bool(true),
+		},
+	}
+
+	// Drain UnprocessedKeys; a resolved item is retained while a throttled one is
+	// retried (as in readSendState). Absent keys are simply omitted from the
+	// response, so a missing aggregate or reactor row leaves its flag false.
+	for len(req[s.reactionsTable].Keys) > 0 {
+		resp, batchErr := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+		if batchErr != nil {
+			return false, 0, 0, nil, false, batchErr
+		}
+		for _, item := range resp.Responses[s.reactionsTable] {
+			switch asS(item[attrSK]) {
+			case aggSKVal:
+				aggExists = true
+				count, _ = parseN(item[attrReactionCount])
+				sequence, _ = parseN(item[attrReactionSeq])
+				sample = parseSampleMap(item[attrSample])
+			case rctSKVal:
+				reacted = true
+			}
+		}
+		if unprocessed, ok := resp.UnprocessedKeys[s.reactionsTable]; ok && len(unprocessed.Keys) > 0 {
+			req = map[string]types.KeysAndAttributes{s.reactionsTable: unprocessed}
+		} else {
+			break
+		}
+	}
+	return aggExists, count, sequence, sample, reacted, nil
+}
+
+// countActiveAggregates counts the distinct emoji on a message that currently
+// have at least one reactor, for the per-message type cap.
+func (s *store) countActiveAggregates(ctx context.Context, chatID *commonpb.ChatId, seq uint64) (int, error) {
+	active := 0
+	var startKey map[string]types.AttributeValue
+	prefix := aggPrefix + seqPad(seq) + "#"
+	for {
+		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(s.reactionsTable),
+			KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND begins_with(%s, :prefix)", attrPK, attrSK)),
+			ProjectionExpression:   aws.String(attrReactionCount),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk":     avS(chatPK(chatID)),
+				":prefix": avS(prefix),
+			},
+			ConsistentRead:    aws.Bool(true),
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return 0, err
+		}
+		for _, item := range out.Items {
+			if count, _ := parseN(item[attrReactionCount]); count > 0 {
+				active++
+			}
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		startKey = out.LastEvaluatedKey
+	}
+	return active, nil
+}
+
+// reactionFromAggItem assembles a Reaction from a full agg# item — count,
+// sequence, and the bounded sample map carried on the row. No query is needed:
+// the sample lives on the aggregate itself. The per-viewer ReactedBySelf is left
+// false for the server to overlay.
+func reactionFromAggItem(item map[string]types.AttributeValue) *messaging.Reaction {
+	count, _ := parseN(item[attrReactionCount])
+	sequence, _ := parseN(item[attrReactionSeq])
+	return buildReaction(asS(item[attrEmoji]), count, sequence, parseSampleMap(item[attrSample]))
+}
+
+// buildReaction assembles a Reaction from a known count, sequence, and sample map
+// (user hex -> reacted ts). The surfaced sample is the most-recent MaxSampleReactors
+// of the retained set (see messaging.SampleFromReactors).
+func buildReaction(emoji string, count, sequence uint64, sample map[string]time.Time) *messaging.Reaction {
+	reactors := make([]*messaging.Reactor, 0, len(sample))
+	for userHex, ts := range sample {
+		uid, err := hex.DecodeString(userHex)
+		if err != nil {
+			continue // sample keys are store-written hex; skip anything malformed
+		}
+		reactors = append(reactors, &messaging.Reactor{
+			UserID:    &commonpb.UserId{Value: uid},
+			ReactedTs: ts,
+		})
+	}
+	return &messaging.Reaction{
+		Emoji:          emoji,
+		Count:          count,
+		Sequence:       sequence,
+		SampleReactors: messaging.SampleFromReactors(reactors),
+	}
+}
+
+// parseSampleMap decodes an agg# row's sample map (user hex -> reacted_ts nanos)
+// into a map of the same shape buildReaction consumes. A missing or non-map
+// attribute yields nil.
+func parseSampleMap(av types.AttributeValue) map[string]time.Time {
+	m, ok := av.(*types.AttributeValueMemberM)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]time.Time, len(m.Value))
+	for userHex, v := range m.Value {
+		nanos, _ := parseInt(v)
+		out[userHex] = time.Unix(0, nanos).UTC()
+	}
+	return out
+}
+
+func reactorFromItem(item map[string]types.AttributeValue) *messaging.Reactor {
+	nanos, _ := parseInt(item[attrReactedTs])
+	return &messaging.Reactor{
+		UserID:    &commonpb.UserId{Value: append([]byte(nil), asB(item[attrUserID])...)},
+		ReactedTs: time.Unix(0, nanos).UTC(),
+	}
+}
+
+func aggSK(seq uint64, emoji string) string {
+	return aggPrefix + seqPad(seq) + "#" + emojiHex(emoji)
+}
+
+func rctSK(seq uint64, emoji string, userID *commonpb.UserId) string {
+	return rctPrefix + seqPad(seq) + "#" + emojiHex(emoji) + "#" + hex.EncodeToString(userID.Value)
+}
+
+// reactionKey is the recency GSI partition for one (message, emoji): it includes
+// the chat so reactors of identically-keyed messages in different chats never
+// share a GSI partition.
+func reactionKey(chatID *commonpb.ChatId, seq uint64, emoji string) string {
+	return chatPK(chatID) + "#" + seqPad(seq) + "#" + emojiHex(emoji)
+}
+
+func emojiHex(emoji string) string { return hex.EncodeToString([]byte(emoji)) }
+
+func seqPad(seq uint64) string { return fmt.Sprintf("%0*d", seqPadWidth, seq) }
+
+// seqFromAggSK recovers a message's sequence number from an aggregate sk
+// ("agg#<padded seq>#<emoji hex>").
+func seqFromAggSK(sk string) (uint64, error) {
+	rest, ok := strings.CutPrefix(sk, aggPrefix)
+	if !ok {
+		return 0, fmt.Errorf("unexpected agg sk %q", sk)
+	}
+	padded, _, ok := strings.Cut(rest, "#")
+	if !ok {
+		return 0, fmt.Errorf("unexpected agg sk %q", sk)
+	}
+	return strconv.ParseUint(padded, 10, 64)
 }

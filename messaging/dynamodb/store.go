@@ -30,6 +30,12 @@ import (
 //	                   "cmid#<client id>" }. All of a chat's messages, its
 //	                   sequence counter, and its idempotency markers share one
 //	                   partition so a send is one single-partition transaction.
+//	                   Each msg# row carries its event_seq, indexed by the
+//	                   messages_by_event_seq GSI (pk, event_seq) for
+//	                   event-sequence-ordered reads. While every event is a new
+//	                   message, event_seq is simply the message's own seq; an
+//	                   independent event-sequence counter arrives with edits and
+//	                   deletes (which advance event_seq without minting a seq).
 //
 //	message_pointers   pk = "chat#<id>", sk = "<type>#<user>". Delivered/read
 //	                   pointers, kept out of the messages partition so heavy
@@ -71,6 +77,7 @@ const (
 	attrContent       = "content"
 	attrTS            = "ts"
 	attrUnreadSeq     = "unread_seq"
+	attrEventSeq      = "event_seq" // msg# row: per-message event-log sequence (== seq while every event is a new message); messages_by_event_seq GSI sort key
 	attrExpiresAt     = "expires_at" // DynamoDB TTL attribute (epoch seconds)
 
 	// message_pointers table attributes
@@ -89,7 +96,8 @@ const (
 	attrReactedTs     = "reacted_ts"   // reactor row attr; reactors_by_recency sort key (nanos)
 	attrReactionKey   = "reaction_key" // reactors_by_recency partition key
 
-	reactorsByRecencyGSI = "reactors_by_recency"
+	reactorsByRecencyGSI  = "reactors_by_recency"
+	messagesByEventSeqGSI = "messages_by_event_seq"
 
 	// DynamoDB transaction cancellation / condition codes
 	codeConditionalCheckFailed = "ConditionalCheckFailed"
@@ -560,6 +568,10 @@ func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.Attribu
 		attrContent:   &types.AttributeValueMemberL{Value: contentBlobs},
 		attrTS:        avN(uint64(msg.Timestamp.UnixNano())),
 		attrUnreadSeq: avN(msg.UnreadSeq),
+		// While every event is a new message, a message's event_seq is its own
+		// seq. Written (rather than derived on read) so the messages_by_event_seq
+		// GSI indexes the row.
+		attrEventSeq: avN(msg.ID.Value),
 	}
 	if msg.SenderID != nil {
 		item[attrSenderID] = avB(msg.SenderID.Value)

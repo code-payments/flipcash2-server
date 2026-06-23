@@ -36,6 +36,7 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_GetLatestEventSequence,
 		testStore_GetMessagesPaging,
 		testStore_GetMessagesByRefs,
+		testStore_GetMessagesByEventSequence,
 		testStore_Pointers,
 		testStore_GetPointersForChats,
 		testStore_AdvancePointer_NoExistenceCheck,
@@ -61,6 +62,7 @@ func testStore_PutMessage_AssignsGaplessIDs(t *testing.T, s messaging.Store) {
 		require.NoError(t, err)
 		require.True(t, created)
 		require.Equal(t, i, msg.ID.Value)
+		require.Equal(t, msg.ID.Value, msg.EventSequence)
 		require.True(t, msg.Timestamp.Equal(at(int64(i))))
 	}
 }
@@ -429,6 +431,52 @@ func testStore_GetMessagesByRefs(t *testing.T, s messaging.Store) {
 	none, err := s.GetMessagesByRefs(ctx, nil)
 	require.NoError(t, err)
 	require.Empty(t, none)
+}
+
+func testStore_GetMessagesByEventSequence(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// Empty chat: nothing changed past any cursor.
+	empty, err := s.GetMessagesByEventSequence(ctx, chatID, 0, 100)
+	require.NoError(t, err)
+	require.Empty(t, empty)
+
+	// Seed 5 messages; event_seq == seq == 1..5.
+	for i := uint64(1); i <= 5; i++ {
+		_, _, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i)), generateClientID(), true)
+		require.NoError(t, err)
+	}
+
+	// From the beginning: all 5, ascending by event_sequence, each EventSequence
+	// equal to its message ID.
+	all, err := s.GetMessagesByEventSequence(ctx, chatID, 0, 100)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2, 3, 4, 5}, messageIDs(all))
+	for _, m := range all {
+		require.Equal(t, m.ID.Value, m.EventSequence)
+	}
+
+	// From a mid cursor: only event_sequence > 2.
+	tail, err := s.GetMessagesByEventSequence(ctx, chatID, 2, 100)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{3, 4, 5}, messageIDs(tail))
+
+	// Limit bounds the page, still ascending from the cursor.
+	page, err := s.GetMessagesByEventSequence(ctx, chatID, 0, 2)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2}, messageIDs(page))
+
+	// A cursor at or past the head returns nothing.
+	none, err := s.GetMessagesByEventSequence(ctx, chatID, 5, 100)
+	require.NoError(t, err)
+	require.Empty(t, none)
+
+	// limit <= 0 falls back to the default page size (all 5 fit here).
+	def, err := s.GetMessagesByEventSequence(ctx, chatID, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2, 3, 4, 5}, messageIDs(def))
 }
 
 func testStore_GetPointersForChats(t *testing.T, s messaging.Store) {

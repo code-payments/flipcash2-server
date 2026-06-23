@@ -110,6 +110,15 @@ type Store interface {
 	// builds refs from a shared chat ID.
 	GetMessagesByRefs(ctx context.Context, refs []MessageRef) ([]*Message, error)
 
+	// GetMessagesByEventSequence returns up to limit messages whose current
+	// event_sequence is greater than afterEventSeq, ordered by event_sequence
+	// ascending — the page primitive behind GetDelta's state delta. Because the
+	// ordering is by CURRENT event_sequence, a message edited or deleted after
+	// afterEventSeq appears at its new (higher) position, so each message appears at
+	// most once. limit <= 0 uses the store's default page size. Returns an empty
+	// result (no error) when nothing changed past afterEventSeq.
+	GetMessagesByEventSequence(ctx context.Context, chatID *commonpb.ChatId, afterEventSeq uint64, limit int) ([]*Message, error)
+
 	// GetLatestEventSequence returns the chat's current head event sequence — the
 	// highest event_sequence assigned in the chat, or 0 when the chat has no
 	// messages. It bounds GetDelta catch-up: a client whose cursor equals this

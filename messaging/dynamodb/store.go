@@ -80,7 +80,7 @@ const (
 	attrContent       = "content"
 	attrTS            = "ts"
 	attrUnreadSeq     = "unread_seq"
-	attrEventSeq      = "event_seq" // msg# row: per-message event-log sequence (== seq while every event is a new message); messages_by_event_seq GSI sort key
+	attrEventSeq      = "event_seq"  // msg# row: per-message event-log sequence (== seq while every event is a new message); messages_by_event_seq GSI sort key
 	attrExpiresAt     = "expires_at" // DynamoDB TTL attribute (epoch seconds)
 
 	// message_pointers table attributes
@@ -146,7 +146,7 @@ func (s *store) PutMessage(
 	for attempt := 0; attempt < maxPutMessageAttempts; attempt++ {
 		// The idempotency marker and the sequence counter live in the same
 		// partition (pk = chat#<id>), so one consistent batch read fetches both.
-		markerSeq, lastSeq, lastUnread, err := s.readSendState(ctx, chatID, clientMessageID)
+		markerSeq, lastSeq, lastUnread, lastEventSeq, err := s.readSendState(ctx, chatID, clientMessageID)
 		if err != nil {
 			return nil, false, err
 		}
@@ -161,35 +161,42 @@ func (s *store) PutMessage(
 		if countsTowardUnread {
 			nextUnread++
 		}
+		// event_seq is assigned from the event-log head. While every event is a new
+		// message it advances in lockstep with the message ID (nextEventSeq ==
+		// nextSeq); edits and deletes will advance it without minting a seq.
+		nextEventSeq := lastEventSeq + 1
 
 		msg := &messaging.Message{
-			ChatID:    &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
-			ID:        &messagingpb.MessageId{Value: nextSeq},
-			SenderID:  senderID,
-			Content:   content,
-			Timestamp: ts,
-			UnreadSeq: nextUnread,
+			ChatID:        &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
+			ID:            &messagingpb.MessageId{Value: nextSeq},
+			SenderID:      senderID,
+			Content:       content,
+			Timestamp:     ts,
+			UnreadSeq:     nextUnread,
+			EventSequence: nextEventSeq,
 		}
 
 		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 			TransactItems: []types.TransactWriteItem{
-				// [0] advance the counter under an optimistic lock so the whole
-				// transaction rolls back together — no leaked sequence numbers.
-				// last_event_seq mirrors last_seq here — the fleet keeps the
-				// event-log head current (maintain-only), but nothing depends on it
-				// yet; it diverges from last_seq once edits and deletes land.
+				// [0] advance both heads under an optimistic lock on both, so the
+				// whole transaction rolls back together — no leaked sequence numbers.
+				// Locking on last_event_seq (not just last_seq) is what lets edits and
+				// deletes — which advance only the event-log head — serialize against
+				// sends. While every event is a new message the two heads stay equal.
 				{Update: &types.Update{
 					TableName: aws.String(s.messagesTable),
 					Key: map[string]types.AttributeValue{
 						attrPK: avS(chatPK(chatID)),
 						attrSK: avS(skCounter),
 					},
-					UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :next, %s = :nextUnread, %s = :next", attrLastSeq, attrLastUnreadSeq, attrLastEventSeq)),
-					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s) OR %s = :expected", attrPK, attrLastSeq)),
+					UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :nextSeq, %s = :nextUnread, %s = :nextEventSeq", attrLastSeq, attrLastUnreadSeq, attrLastEventSeq)),
+					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s) OR (%s = :expectedSeq AND %s = :expectedEventSeq)", attrPK, attrLastSeq, attrLastEventSeq)),
 					ExpressionAttributeValues: map[string]types.AttributeValue{
-						":next":       avN(nextSeq),
-						":nextUnread": avN(nextUnread),
-						":expected":   avN(lastSeq),
+						":nextSeq":          avN(nextSeq),
+						":nextUnread":       avN(nextUnread),
+						":nextEventSeq":     avN(nextEventSeq),
+						":expectedSeq":      avN(lastSeq),
+						":expectedEventSeq": avN(lastEventSeq),
 					},
 				}},
 				// [1] the message itself.
@@ -235,9 +242,66 @@ func (s *store) PutMessage(
 }
 
 func (s *store) GetLatestEventSequence(ctx context.Context, chatID *commonpb.ChatId) (uint64, error) {
-	// Every event is a new message, so the head event sequence is the highest
-	// assigned message seq, read from the counter row.
-	return s.lastMessageSeq(ctx, chatID)
+	// The event-log head is last_event_seq on the counter row. While every event
+	// is a new message it equals the message-ID head; edits and deletes advance it
+	// independently.
+	return s.lastEventSeq(ctx, chatID)
+}
+
+// lastEventSeq returns the chat's event-log head (last_event_seq) from the counter
+// row, or 0 when the chat has no messages yet. A counter present but missing
+// last_event_seq is a migration gap and surfaces as an error (via parseN).
+func (s *store) lastEventSeq(ctx context.Context, chatID *commonpb.ChatId) (uint64, error) {
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:            aws.String(s.messagesTable),
+		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skCounter)},
+		ProjectionExpression: aws.String(attrLastEventSeq),
+		ConsistentRead:       aws.Bool(true),
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(out.Item) == 0 {
+		return 0, nil // no counter yet → no messages
+	}
+	return parseN(out.Item[attrLastEventSeq])
+}
+
+// GetMessagesByEventSequence reads a page of the chat's messages ordered by current
+// event_seq via the messages_by_event_seq GSI. The GSI holds each message at its
+// current event_seq (it re-indexes on edit/delete), so this returns each changed
+// message once at its latest position — the state delta GetDelta streams. The read
+// is eventually consistent (a GSI cannot be read consistently); GetDelta tolerates
+// that, with the live stream and last-writer-wins covering any lag.
+func (s *store) GetMessagesByEventSequence(ctx context.Context, chatID *commonpb.ChatId, afterEventSeq uint64, limit int) ([]*messaging.Message, error) {
+	if limit <= 0 {
+		limit = database.DefaultQueryOptions().Limit
+	}
+
+	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.messagesTable),
+		IndexName:              aws.String(messagesByEventSeqGSI),
+		KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND %s > :after", attrPK, attrEventSeq)),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":    avS(chatPK(chatID)),
+			":after": avN(afterEventSeq),
+		},
+		ScanIndexForward: aws.Bool(true), // ascending by event_seq
+		Limit:            aws.Int32(int32(limit)),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	messages := make([]*messaging.Message, 0, len(out.Items))
+	for _, item := range out.Items {
+		msg, err := messageFromItem(chatID, item)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, msg)
+	}
+	return messages, nil
 }
 
 func (s *store) GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {
@@ -513,9 +577,11 @@ func (s *store) AdvancePointer(
 //
 // markerSeq is non-nil when a prior send with this client message ID already
 // persisted, carrying that message's sequence number; the caller then returns
-// the existing message rather than assigning a new one. lastSeq and lastUnread
-// are zero when the counter does not yet exist (the chat's first send).
-func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clientMessageID *messagingpb.ClientMessageId) (markerSeq *uint64, lastSeq, lastUnread uint64, err error) {
+// the existing message rather than assigning a new one. lastSeq, lastUnread, and
+// lastEventSeq are zero when the counter does not yet exist (the chat's first
+// send); on an existing counter lastEventSeq is always present (guaranteed by the
+// maintain phase plus the one-time backfill).
+func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clientMessageID *messagingpb.ClientMessageId) (markerSeq *uint64, lastSeq, lastUnread, lastEventSeq uint64, err error) {
 	cmidSKVal := cmidSK(clientMessageID)
 	req := map[string]types.KeysAndAttributes{
 		s.messagesTable: {
@@ -532,26 +598,30 @@ func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clie
 	for len(req[s.messagesTable].Keys) > 0 {
 		resp, batchErr := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
 		if batchErr != nil {
-			return nil, 0, 0, batchErr
+			return nil, 0, 0, 0, batchErr
 		}
 		for _, item := range resp.Responses[s.messagesTable] {
 			switch asS(item[attrSK]) {
 			case cmidSKVal:
 				seq, perr := parseN(item[attrSeq])
 				if perr != nil {
-					return nil, 0, 0, perr
+					return nil, 0, 0, 0, perr
 				}
 				markerSeq = &seq
 			case skCounter:
 				ls, perr := parseN(item[attrLastSeq])
 				if perr != nil {
-					return nil, 0, 0, perr
+					return nil, 0, 0, 0, perr
 				}
 				lu, perr := parseN(item[attrLastUnreadSeq])
 				if perr != nil {
-					return nil, 0, 0, perr
+					return nil, 0, 0, 0, perr
 				}
-				lastSeq, lastUnread = ls, lu
+				les, perr := parseN(item[attrLastEventSeq])
+				if perr != nil {
+					return nil, 0, 0, 0, perr
+				}
+				lastSeq, lastUnread, lastEventSeq = ls, lu, les
 			}
 		}
 		if unprocessed, ok := resp.UnprocessedKeys[s.messagesTable]; ok && len(unprocessed.Keys) > 0 {
@@ -560,7 +630,7 @@ func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clie
 			break
 		}
 	}
-	return markerSeq, lastSeq, lastUnread, nil
+	return markerSeq, lastSeq, lastUnread, lastEventSeq, nil
 }
 
 func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.AttributeValue) map[string]types.AttributeValue {
@@ -574,10 +644,10 @@ func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.Attribu
 		attrContent:   &types.AttributeValueMemberL{Value: contentBlobs},
 		attrTS:        avN(uint64(msg.Timestamp.UnixNano())),
 		attrUnreadSeq: avN(msg.UnreadSeq),
-		// While every event is a new message, a message's event_seq is its own
-		// seq. Written (rather than derived on read) so the messages_by_event_seq
-		// GSI indexes the row.
-		attrEventSeq: avN(msg.ID.Value),
+		// The event-log sequence at which this message reached its current state,
+		// assigned from the chat's event-log head. Indexed by the
+		// messages_by_event_seq GSI (pk, event_seq).
+		attrEventSeq: avN(msg.EventSequence),
 	}
 	if msg.SenderID != nil {
 		item[attrSenderID] = avB(msg.SenderID.Value)
@@ -602,13 +672,18 @@ func messageFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeVal
 	if err != nil {
 		return nil, err
 	}
+	eventSeq, err := parseN(item[attrEventSeq])
+	if err != nil {
+		return nil, err
+	}
 
 	msg := &messaging.Message{
-		ChatID:    &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
-		ID:        &messagingpb.MessageId{Value: seq},
-		Content:   content,
-		Timestamp: time.Unix(0, nanos).UTC(),
-		UnreadSeq: unreadSeq,
+		ChatID:        &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
+		ID:            &messagingpb.MessageId{Value: seq},
+		Content:       content,
+		Timestamp:     time.Unix(0, nanos).UTC(),
+		UnreadSeq:     unreadSeq,
+		EventSequence: eventSeq,
 	}
 	if sender := asB(item[attrSenderID]); len(sender) > 0 {
 		msg.SenderID = &commonpb.UserId{Value: append([]byte(nil), sender...)}

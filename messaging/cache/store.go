@@ -128,6 +128,25 @@ func (c *Cache) GetMessagesByRefs(ctx context.Context, refs []messaging.MessageR
 	return msgs, err
 }
 
+func (c *Cache) GetMessagesByEventSequence(ctx context.Context, chatID *commonpb.ChatId, afterEventSeq uint64, limit int) ([]*messaging.Message, error) {
+	msgs, err := c.db.GetMessagesByEventSequence(ctx, chatID, afterEventSeq, limit)
+	if err == nil {
+		// Every returned message is a confirmed existing ID for the chat; the
+		// largest raises the bound. The page is ordered by event_sequence, not ID,
+		// so take the max rather than assuming a position.
+		var max uint64
+		for _, msg := range msgs {
+			if msg.ID.Value > max {
+				max = msg.ID.Value
+			}
+		}
+		if max > 0 {
+			c.observe(chatID, max)
+		}
+	}
+	return msgs, err
+}
+
 func (c *Cache) MessageExists(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (bool, error) {
 	// Fast path: the message ID is at or below a confirmed existing ID, so it
 	// exists by the gapless-sequence invariant — no backing read needed.

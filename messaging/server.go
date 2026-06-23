@@ -178,16 +178,13 @@ func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.M
 		return stream.Send(&messagingpb.GetDeltaResponse{Result: messagingpb.GetDeltaResponse_RESET_REQUIRED})
 	}
 
-	// While every event is a new message, event_sequence == message_id, so the
-	// delta is exactly the messages with ID in (after, head], read ascending in
-	// pages. Each message appears once, already in its latest (and only) state.
+	// The delta is the current state of every message whose event_sequence is in
+	// (after, head], read from the messages_by_event_seq index in ascending pages.
+	// The index holds each message at its current event_sequence, so an
+	// edited/deleted message appears once at its new position.
 	cursor := req.AfterSequence
 	for cursor < head {
-		msgs, err := s.messages.GetMessages(ctx, req.ChatId,
-			database.WithAscending(),
-			database.WithLimit(deltaPageSize),
-			database.WithPagingToken(PageTokenFromID(&messagingpb.MessageId{Value: cursor})),
-		)
+		msgs, err := s.messages.GetMessagesByEventSequence(ctx, req.ChatId, cursor, deltaPageSize)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure reading delta page")
 			return status.Error(codes.Internal, "")
@@ -195,20 +192,21 @@ func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.M
 
 		batch := make([]*messagingpb.Message, 0, len(msgs))
 		for _, m := range msgs {
-			// Messages sent after head belong to the live stream; this catch-up
-			// stops at the head captured when the stream opened.
-			if m.ID.Value > head {
+			// Messages advanced past head after the stream opened belong to the live
+			// stream; this catch-up stops at the head captured when it opened.
+			if m.EventSequence > head {
 				break
 			}
 			batch = append(batch, m.ToProto())
 		}
-		// Defensive: IDs are gapless, so (cursor, head] is always non-empty while
-		// cursor < head. Break rather than loop forever if a read returns nothing.
+		// Break rather than loop forever when a read returns nothing — e.g. the
+		// eventually-consistent index hasn't yet caught up to head, in which case
+		// the live stream delivers the remainder.
 		if len(batch) == 0 {
 			break
 		}
 
-		checkpoint := batch[len(batch)-1].MessageId.Value
+		checkpoint := batch[len(batch)-1].EventSequence
 		if err := stream.Send(&messagingpb.GetDeltaResponse{
 			Result:             messagingpb.GetDeltaResponse_OK,
 			Messages:           &messagingpb.MessageBatch{Messages: batch},

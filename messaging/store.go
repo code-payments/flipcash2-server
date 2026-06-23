@@ -110,6 +110,18 @@ type Store interface {
 	// builds refs from a shared chat ID.
 	GetMessagesByRefs(ctx context.Context, refs []MessageRef) ([]*Message, error)
 
+	// GetLatestEventSequence returns the chat's current head event sequence — the
+	// highest event_sequence assigned in the chat, or 0 when the chat has no
+	// messages. It bounds GetDelta catch-up: a client whose cursor equals this
+	// value is at the head.
+	//
+	// While every event is a new message (no edits or deletes yet) the event
+	// sequence advances in lockstep with the message ID, so this equals the
+	// chat's highest message ID. The two are distinct concepts: once edits and
+	// deletes advance the event sequence without minting a new message ID, they
+	// diverge.
+	GetLatestEventSequence(ctx context.Context, chatID *commonpb.ChatId) (uint64, error)
+
 	// GetPointers returns all delivered/read pointers for a chat. Returns an
 	// empty result (no error) when the chat has no pointers.
 	GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*messagingpb.Pointer, error)

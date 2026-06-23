@@ -21,6 +21,19 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 )
 
+const (
+	// deltaPageSize bounds each GetDelta batch. MessageBatch caps at 100 messages,
+	// so the delta is streamed in pages of at most this many.
+	deltaPageSize = 100
+
+	// maxDeltaEvents bounds how large a GetDelta catch-up may be: the number of
+	// events between the client's cursor and the head. When the gap exceeds it,
+	// streaming the delta would cost more than a fresh history load, so the server
+	// returns RESET_REQUIRED and the client re-syncs chat history via GetMessages
+	// before resuming the event stream.
+	maxDeltaEvents uint64 = 1000
+)
+
 type Server struct {
 	log *zap.Logger
 
@@ -120,6 +133,94 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 		Result:   messagingpb.GetMessagesResponse_OK,
 		Messages: &messagingpb.MessageBatch{Messages: protos},
 	}, nil
+}
+
+func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.Messaging_GetDeltaServer) error {
+	ctx := stream.Context()
+
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return err
+	}
+
+	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
+
+	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+		return err
+	} else if !member {
+		// A terminal DENIED is a single response that ends the stream.
+		return stream.Send(&messagingpb.GetDeltaResponse{Result: messagingpb.GetDeltaResponse_DENIED})
+	}
+
+	// Capture the head once, at stream open: the delta converges to this target
+	// even as the chat advances under live traffic. Anything past it is delivered
+	// by the live event stream, not this bounded catch-up.
+	head, err := s.messages.GetLatestEventSequence(ctx, req.ChatId)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure getting chat head event sequence")
+		return status.Error(codes.Internal, "")
+	}
+
+	// Already current: nothing changed past the client's cursor. Report the head
+	// and leave messages and checkpoint_sequence unset, so the cursor is unchanged.
+	if req.AfterSequence >= head {
+		return stream.Send(&messagingpb.GetDeltaResponse{
+			Result:         messagingpb.GetDeltaResponse_OK,
+			LatestSequence: head,
+		})
+	}
+
+	// Oversized catch-up: beyond maxDeltaEvents the gap is too large to stream as a
+	// delta, so tell the client to discard its cursor and re-sync history from
+	// GetMessages. head > AfterSequence here (already-current handled above), so
+	// the subtraction can't underflow.
+	if head-req.AfterSequence > maxDeltaEvents {
+		return stream.Send(&messagingpb.GetDeltaResponse{Result: messagingpb.GetDeltaResponse_RESET_REQUIRED})
+	}
+
+	// While every event is a new message, event_sequence == message_id, so the
+	// delta is exactly the messages with ID in (after, head], read ascending in
+	// pages. Each message appears once, already in its latest (and only) state.
+	cursor := req.AfterSequence
+	for cursor < head {
+		msgs, err := s.messages.GetMessages(ctx, req.ChatId,
+			database.WithAscending(),
+			database.WithLimit(deltaPageSize),
+			database.WithPagingToken(PageTokenFromID(&messagingpb.MessageId{Value: cursor})),
+		)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure reading delta page")
+			return status.Error(codes.Internal, "")
+		}
+
+		batch := make([]*messagingpb.Message, 0, len(msgs))
+		for _, m := range msgs {
+			// Messages sent after head belong to the live stream; this catch-up
+			// stops at the head captured when the stream opened.
+			if m.ID.Value > head {
+				break
+			}
+			batch = append(batch, m.ToProto())
+		}
+		// Defensive: IDs are gapless, so (cursor, head] is always non-empty while
+		// cursor < head. Break rather than loop forever if a read returns nothing.
+		if len(batch) == 0 {
+			break
+		}
+
+		checkpoint := batch[len(batch)-1].MessageId.Value
+		if err := stream.Send(&messagingpb.GetDeltaResponse{
+			Result:             messagingpb.GetDeltaResponse_OK,
+			Messages:           &messagingpb.MessageBatch{Messages: batch},
+			LatestSequence:     head,
+			CheckpointSequence: checkpoint,
+		}); err != nil {
+			return err
+		}
+		cursor = checkpoint
+	}
+
+	return nil
 }
 
 func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRequest) (*messagingpb.SendMessageResponse, error) {

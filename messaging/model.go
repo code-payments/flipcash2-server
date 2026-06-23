@@ -197,6 +197,22 @@ func (m *Message) ToProto() *messagingpb.Message {
 	return out
 }
 
+// NewMessageSentEvent builds the event-log entry for a freshly sent message: a
+// single Event carrying one message_sent mutation. While every event is a new
+// message, the event's sequence is the message's event_sequence (which equals
+// its message ID) and its count is 1 — a send consumes exactly one event-log
+// point. msg is referenced, not copied; callers pass a proto they own.
+func NewMessageSentEvent(msg *messagingpb.Message) *messagingpb.Event {
+	return &messagingpb.Event{
+		Sequence: msg.EventSequence,
+		Count:    1,
+		Ts:       msg.Ts,
+		Mutations: []*messagingpb.Mutation{{
+			Type: &messagingpb.Mutation_MessageSent{MessageSent: msg},
+		}},
+	}
+}
+
 // SampleFromReactors orders reactors by descending reaction time (ties broken by
 // ascending user ID, for a total and stable order) and returns the first
 // MaxSampleReactors — the deterministic, most-recent sample surfaced on a reaction

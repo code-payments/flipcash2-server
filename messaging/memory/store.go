@@ -122,6 +122,19 @@ func (m *memory) PutMessage(
 	return msg.Clone(), true, nil
 }
 
+func (m *memory) GetLatestEventSequence(_ context.Context, chatID *commonpb.ChatId) (uint64, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	cs := m.chats[string(chatID.Value)]
+	if cs == nil {
+		return 0, nil
+	}
+	// Every event is a new message, so the head event sequence is the last
+	// assigned message ID.
+	return cs.lastSeq, nil
+}
+
 func (m *memory) GetMessage(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {
 	m.Lock()
 	defer m.Unlock()

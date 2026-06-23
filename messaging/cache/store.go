@@ -144,6 +144,10 @@ func (c *Cache) MessageExists(ctx context.Context, chatID *commonpb.ChatId, mess
 	return exists, err
 }
 
+func (c *Cache) GetLatestEventSequence(ctx context.Context, chatID *commonpb.ChatId) (uint64, error) {
+	return c.db.GetLatestEventSequence(ctx, chatID)
+}
+
 func (c *Cache) GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*messagingpb.Pointer, error) {
 	return c.db.GetPointers(ctx, chatID)
 }

@@ -220,6 +220,12 @@ func (s *store) PutMessage(
 	return nil, false, fmt.Errorf("put message exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
 }
 
+func (s *store) GetLatestEventSequence(ctx context.Context, chatID *commonpb.ChatId) (uint64, error) {
+	// Every event is a new message, so the head event sequence is the highest
+	// assigned message seq, read from the counter row.
+	return s.lastMessageSeq(ctx, chatID)
+}
+
 func (s *store) GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(s.messagesTable),

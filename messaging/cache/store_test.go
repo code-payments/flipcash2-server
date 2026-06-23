@@ -274,6 +274,31 @@ func TestCache_GettersSeedWatermark(t *testing.T) {
 		}
 		require.Equal(t, 0, backing.existsCallCount())
 	})
+
+	t.Run("GetMessagesByEventSequence", func(t *testing.T) {
+		backing := newCountingMemory()
+		c := cache.NewInCache(backing)
+		chatID := generateChatID()
+
+		// Seed through the backing store directly, so the cache holds no watermark
+		// yet — the getter under test is the only thing that can raise it.
+		putMessage(t, ctx, backing, chatID)
+		putMessage(t, ctx, backing, chatID)
+		last := putMessage(t, ctx, backing, chatID)
+
+		msgs, err := c.GetMessagesByEventSequence(ctx, chatID, 0, 100)
+		require.NoError(t, err)
+		require.Len(t, msgs, 3)
+
+		// The page raised the bound to the largest returned ID, so every ID up to it
+		// is now served from the cache without touching the backing store.
+		for id := uint64(1); id <= last.ID.Value; id++ {
+			exists, err := c.MessageExists(ctx, chatID, &messagingpb.MessageId{Value: id})
+			require.NoError(t, err)
+			require.True(t, exists)
+		}
+		require.Equal(t, 0, backing.existsCallCount())
+	})
 }
 
 func putMessage(t *testing.T, ctx context.Context, s messaging.Store, chatID *commonpb.ChatId) *messaging.Message {

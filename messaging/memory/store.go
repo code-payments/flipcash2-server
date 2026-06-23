@@ -112,6 +112,8 @@ func (m *memory) PutMessage(
 		Content:   clonedContent,
 		Timestamp: ts,
 		UnreadSeq: unreadSeq,
+		// Every event is a new message, so the event-log sequence is the seq.
+		EventSequence: seq,
 	}
 
 	cs.messages[seq] = msg.Clone()
@@ -203,6 +205,34 @@ func (m *memory) GetMessages(_ context.Context, chatID *commonpb.ChatId, opts ..
 
 	if q.Limit > 0 && len(ordered) > q.Limit {
 		ordered = ordered[:q.Limit]
+	}
+	return ordered, nil
+}
+
+func (m *memory) GetMessagesByEventSequence(_ context.Context, chatID *commonpb.ChatId, afterEventSeq uint64, limit int) ([]*messaging.Message, error) {
+	if limit <= 0 {
+		limit = database.DefaultQueryOptions().Limit
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	cs := m.chats[string(chatID.Value)]
+	if cs == nil {
+		return nil, nil
+	}
+
+	var ordered []*messaging.Message
+	for _, msg := range cs.messages {
+		if msg.EventSequence > afterEventSeq {
+			ordered = append(ordered, msg.Clone())
+		}
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].EventSequence < ordered[j].EventSequence
+	})
+	if len(ordered) > limit {
+		ordered = ordered[:limit]
 	}
 	return ordered, nil
 }

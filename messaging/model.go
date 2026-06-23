@@ -40,18 +40,22 @@ const (
 
 // Message is a stored chat message.
 //
-// ID and UnreadSeq are server-assigned by the store at PutMessage time. ID is a
-// per-chat gapless sequence number that is the message's canonical identity,
-// sort key, and pagination cursor. UnreadSeq is a separate per-chat running
-// count of unread-eligible messages (see messagingpb.Message for the full
-// semantics).
+// ID, UnreadSeq, and EventSequence are server-assigned by the store at PutMessage
+// time. ID is a per-chat gapless sequence number that is the message's canonical
+// identity, sort key, and pagination cursor. UnreadSeq is a separate per-chat
+// running count of unread-eligible messages. EventSequence is the per-chat
+// event-log sequence at which the message reached its current state; while every
+// event is a new message it equals ID, and it diverges once edits and deletes
+// advance the event log without minting an ID (see messagingpb.Message for the
+// full semantics).
 type Message struct {
-	ChatID    *commonpb.ChatId
-	ID        *messagingpb.MessageId
-	SenderID  *commonpb.UserId // nil for system messages
-	Content   []*messagingpb.Content
-	Timestamp time.Time
-	UnreadSeq uint64
+	ChatID        *commonpb.ChatId
+	ID            *messagingpb.MessageId
+	SenderID      *commonpb.UserId // nil for system messages
+	Content       []*messagingpb.Content
+	Timestamp     time.Time
+	UnreadSeq     uint64
+	EventSequence uint64
 }
 
 // Clone returns a deep copy of the message.
@@ -65,12 +69,13 @@ func (m *Message) Clone() *Message {
 		senderID = &commonpb.UserId{Value: append([]byte(nil), m.SenderID.Value...)}
 	}
 	return &Message{
-		ChatID:    &commonpb.ChatId{Value: append([]byte(nil), m.ChatID.Value...)},
-		ID:        &messagingpb.MessageId{Value: m.ID.Value},
-		SenderID:  senderID,
-		Content:   content,
-		Timestamp: m.Timestamp,
-		UnreadSeq: m.UnreadSeq,
+		ChatID:        &commonpb.ChatId{Value: append([]byte(nil), m.ChatID.Value...)},
+		ID:            &messagingpb.MessageId{Value: m.ID.Value},
+		SenderID:      senderID,
+		Content:       content,
+		Timestamp:     m.Timestamp,
+		UnreadSeq:     m.UnreadSeq,
+		EventSequence: m.EventSequence,
 	}
 }
 
@@ -189,7 +194,7 @@ func (m *Message) ToProto() *messagingpb.Message {
 		Content:       content,
 		Ts:            timestamppb.New(m.Timestamp),
 		UnreadSeq:     m.UnreadSeq,
-		EventSequence: m.ID.Value,
+		EventSequence: m.EventSequence,
 	}
 	if m.SenderID != nil {
 		out.SenderId = &commonpb.UserId{Value: append([]byte(nil), m.SenderID.Value...)}

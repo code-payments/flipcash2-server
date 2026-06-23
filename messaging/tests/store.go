@@ -33,6 +33,7 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_PutMessage_SystemMessage,
 		testStore_GetMessage_NotFound,
 		testStore_MessageExists,
+		testStore_GetLatestEventSequence,
 		testStore_GetMessagesPaging,
 		testStore_GetMessagesByRefs,
 		testStore_Pointers,
@@ -300,6 +301,44 @@ func testStore_MessageExists(t *testing.T, s messaging.Store) {
 	exists, err = s.MessageExists(ctx, chatID, &messagingpb.MessageId{Value: 999})
 	require.NoError(t, err)
 	require.False(t, exists)
+}
+
+func testStore_GetLatestEventSequence(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// An unknown chat has no messages, so its head is 0.
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Zero(t, head)
+
+	// Every event is a new message, so the head advances in lockstep with the
+	// message ID on each send.
+	for i := uint64(1); i <= 3; i++ {
+		msg, _, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i)), generateClientID(), true)
+		require.NoError(t, err)
+
+		got, err := s.GetLatestEventSequence(ctx, chatID)
+		require.NoError(t, err)
+		require.Equal(t, msg.ID.Value, got)
+		require.Equal(t, i, got)
+	}
+
+	// An idempotent replay assigns no new ID, so the head does not advance.
+	clientID := generateClientID()
+	_, created, err := s.PutMessage(ctx, chatID, sender, textContent("dup"), at(10), clientID, true)
+	require.NoError(t, err)
+	require.True(t, created)
+	before, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+
+	_, created, err = s.PutMessage(ctx, chatID, sender, textContent("dup"), at(11), clientID, true)
+	require.NoError(t, err)
+	require.False(t, created)
+	after, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
 }
 
 func testStore_GetMessagesPaging(t *testing.T, s messaging.Store) {

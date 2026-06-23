@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -42,6 +43,8 @@ func RunServerTests(t *testing.T, badges badge.Store, chats chat.Store, messages
 		testServer_GetMessages_NotFound,
 		testServer_GetMessages_Paging,
 		testServer_GetMessages_ByIDs,
+		testServer_GetDelta,
+		testServer_GetDelta_ResetRequired,
 		// Pointers
 		testServer_AdvancePointer,
 		testServer_AdvancePointer_PointerTypes,
@@ -160,6 +163,28 @@ func (e *serverEnv) getMessagesByIDs(keys model.KeyPair, vals ...uint64) (*messa
 	}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.GetMessages(e.ctx, req)
+}
+
+// getDelta opens the GetDelta server stream and drains it to completion,
+// returning every response batch in order (or any non-EOF receive error).
+func (e *serverEnv) getDelta(keys model.KeyPair, afterSequence uint64) ([]*messagingpb.GetDeltaResponse, error) {
+	req := &messagingpb.GetDeltaRequest{ChatId: e.chatID, AfterSequence: afterSequence}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	stream, err := e.client.GetDelta(e.ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	var out []*messagingpb.GetDeltaResponse
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			return out, nil
+		}
+		if err != nil {
+			return out, err
+		}
+		out = append(out, resp)
+	}
 }
 
 // --- pointers ---
@@ -330,6 +355,24 @@ func (e *serverEnv) waitForTyping(recipient *commonpb.UserId) {
 	})
 }
 
+// collectDelta flattens a drained GetDelta stream: every message across batches in
+// order, the head (latest_sequence, constant across the stream), and the final
+// checkpoint_sequence reached.
+func collectDelta(resps []*messagingpb.GetDeltaResponse) (msgs []*messagingpb.Message, latest, checkpoint uint64) {
+	for _, r := range resps {
+		if r.Messages != nil {
+			msgs = append(msgs, r.Messages.Messages...)
+		}
+		if r.LatestSequence != 0 {
+			latest = r.LatestSequence
+		}
+		if r.CheckpointSequence != 0 {
+			checkpoint = r.CheckpointSequence
+		}
+	}
+	return msgs, latest, checkpoint
+}
+
 func containsMessage(msgs []*messagingpb.Message, msgID uint64) bool {
 	for _, m := range msgs {
 		if m.MessageId.Value == msgID {
@@ -462,14 +505,32 @@ func testServer_SendMessage_Broadcast(t *testing.T, chats chat.Store, messages m
 
 	resp, err := e.send(e.keysA, "broadcast me", generateClientID())
 	require.NoError(t, err)
+	id := resp.Message.MessageId.Value
 
-	// userB receives a single ChatUpdate carrying the new message, a last-activity
-	// metadata update, and the sender's auto-advanced READ pointer (the sender has
-	// implicitly read their own message).
+	// The response message carries event_sequence == message_id (every event is a
+	// new message in this phase).
+	require.Equal(t, id, resp.Message.EventSequence)
+
+	// userB receives a single ChatUpdate carrying the send as a gap-detected,
+	// single-mutation message_sent event (sequenced at its event_sequence) and, for
+	// old clients, the same message in the deprecated new_messages; alongside a
+	// last-activity metadata update and the sender's auto-advanced READ pointer (the
+	// sender has implicitly read their own message).
 	e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
-		return u.NewMessages != nil && containsMessage(u.NewMessages.Messages, resp.Message.MessageId.Value) &&
+		if u.Events == nil || len(u.Events.Events) != 1 {
+			return false
+		}
+		ev := u.Events.Events[0]
+		if ev.Sequence != id || ev.Count != 1 || len(ev.Mutations) != 1 {
+			return false
+		}
+		sent := ev.Mutations[0].GetMessageSent()
+		if sent == nil || sent.MessageId.Value != id || sent.EventSequence != id {
+			return false
+		}
+		return u.NewMessages != nil && containsMessage(u.NewMessages.Messages, id) &&
 			len(u.MetadataUpdates) > 0 &&
-			u.PointerUpdates != nil && hasPointer(u.PointerUpdates.Pointers, messagingpb.Pointer_READ, e.userA, resp.Message.MessageId.Value)
+			u.PointerUpdates != nil && hasPointer(u.PointerUpdates.Pointers, messagingpb.Pointer_READ, e.userA, id)
 	})
 }
 
@@ -548,6 +609,86 @@ func testServer_GetMessages_ByIDs(t *testing.T, chats chat.Store, messages messa
 	none, err := e.getMessagesByIDs(e.keysB, 100, 200)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, none.Result)
+}
+
+func testServer_GetDelta(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	// Seed 3 messages, assigned gapless IDs 1..3.
+	for i := 0; i < 3; i++ {
+		_, err := e.send(e.keysA, "m", generateClientID())
+		require.NoError(t, err)
+	}
+
+	// Cold boot (after=0): the full history comes back as a state delta, ascending,
+	// each message at event_sequence == its ID, converging on head == 3.
+	resps, err := e.getDelta(e.keysB, 0)
+	require.NoError(t, err)
+	msgs, latest, checkpoint := collectDelta(resps)
+	require.Equal(t, []uint64{1, 2, 3}, protoMessageIDs(msgs))
+	for _, m := range msgs {
+		require.Equal(t, m.MessageId.Value, m.EventSequence)
+	}
+	require.Equal(t, uint64(3), latest)
+	require.Equal(t, uint64(3), checkpoint)
+
+	// Incremental catch-up from a mid cursor returns only what changed past it.
+	resps, err = e.getDelta(e.keysB, 1)
+	require.NoError(t, err)
+	msgs, latest, checkpoint = collectDelta(resps)
+	require.Equal(t, []uint64{2, 3}, protoMessageIDs(msgs))
+	require.Equal(t, uint64(3), latest)
+	require.Equal(t, uint64(3), checkpoint)
+
+	// Already current (cursor == head): a single response, no messages, head still
+	// reported, and checkpoint left unset so the client's cursor is unchanged.
+	resps, err = e.getDelta(e.keysB, 3)
+	require.NoError(t, err)
+	require.Len(t, resps, 1)
+	require.Equal(t, messagingpb.GetDeltaResponse_OK, resps[0].Result)
+	require.Nil(t, resps[0].Messages)
+	require.Equal(t, uint64(3), resps[0].LatestSequence)
+	require.Zero(t, resps[0].CheckpointSequence)
+
+	// A cursor past the head (client somehow ahead) is treated as already current.
+	resps, err = e.getDelta(e.keysB, 99)
+	require.NoError(t, err)
+	require.Len(t, resps, 1)
+	require.Equal(t, messagingpb.GetDeltaResponse_OK, resps[0].Result)
+	require.Nil(t, resps[0].Messages)
+	require.Equal(t, uint64(3), resps[0].LatestSequence)
+}
+
+func testServer_GetDelta_ResetRequired(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	// Seed one past the cap (maxDeltaEvents + 1 == 1001), assigning gapless IDs
+	// 1..1001. Seeded straight through the store to skip the per-send RPC and
+	// broadcast overhead.
+	const seeded = 1001
+	for i := 0; i < seeded; i++ {
+		_, _, err := messages.PutMessage(e.ctx, e.chatID, e.userA, textContent("m"), at(int64(i+1)), generateClientID(), true)
+		require.NoError(t, err)
+	}
+
+	// Cold boot (after=0): the gap of 1001 exceeds the cap, so the server returns a
+	// single RESET_REQUIRED and no messages.
+	resps, err := e.getDelta(e.keysB, 0)
+	require.NoError(t, err)
+	require.Len(t, resps, 1)
+	require.Equal(t, messagingpb.GetDeltaResponse_RESET_REQUIRED, resps[0].Result)
+	require.Nil(t, resps[0].Messages)
+
+	// A cursor at the cap boundary (gap of exactly 1000) still streams the delta,
+	// in ascending 100-message batches, converging on the head.
+	resps, err = e.getDelta(e.keysB, 1)
+	require.NoError(t, err)
+	msgs, latest, checkpoint := collectDelta(resps)
+	require.Len(t, msgs, seeded-1)
+	require.Equal(t, uint64(2), msgs[0].MessageId.Value)
+	require.Equal(t, uint64(seeded), msgs[len(msgs)-1].MessageId.Value)
+	require.Equal(t, uint64(seeded), latest)
+	require.Equal(t, uint64(seeded), checkpoint)
 }
 
 // ============================================================================
@@ -951,6 +1092,12 @@ func testServer_NonMember_Denied(t *testing.T, chats chat.Store, messages messag
 	listResp, err := e.getMessagesByOptions(strangerKeys, &commonpb.QueryOptions{})
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessagesResponse_DENIED, listResp.Result)
+
+	// Delta (server stream): a single DENIED response ends the stream.
+	deltaResps, err := e.getDelta(strangerKeys, 0)
+	require.NoError(t, err)
+	require.Len(t, deltaResps, 1)
+	require.Equal(t, messagingpb.GetDeltaResponse_DENIED, deltaResps[0].Result)
 
 	// Pointers.
 	advResp, err := e.advancePointer(strangerKeys, messagingpb.Pointer_READ, msgID)

@@ -164,11 +164,15 @@ func (s *Sender) Send(
 	}
 
 	// Notify all members (including the sender's other devices) of the new
-	// message. The sender's read pointer and the new last activity are only
-	// included when they actually advanced — a no-op must not broadcast a stale
-	// pointer or timestamp.
+	// message. The send rides the gap-detected event log as a message_sent event;
+	// new_messages carries the same message for clients that predate the event
+	// log (it is deprecated but still populated during the transition). The
+	// sender's read pointer and the new last activity are only included when they
+	// actually advanced — a no-op must not broadcast a stale pointer or timestamp.
+	msgProto := msg.ToProto()
 	update := &eventpb.ChatUpdate{
-		NewMessages: &messagingpb.MessageBatch{Messages: []*messagingpb.Message{msg.ToProto()}},
+		NewMessages: &messagingpb.MessageBatch{Messages: []*messagingpb.Message{msgProto}},
+		Events:      &messagingpb.EventBatch{Events: []*messagingpb.Event{NewMessageSentEvent(msgProto)}},
 	}
 	if pointerAdvanced {
 		update.PointerUpdates = &messagingpb.PointerBatch{Pointers: []*messagingpb.Pointer{senderPointer}}

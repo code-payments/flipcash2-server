@@ -145,8 +145,8 @@ func (c *Cache) GetMessagesByRefs(ctx context.Context, refs []messaging.MessageR
 	return msgs, err
 }
 
-func (c *Cache) GetMessagesByEventSequence(ctx context.Context, chatID *commonpb.ChatId, afterEventSeq uint64, limit int) ([]*messaging.Message, error) {
-	msgs, err := c.db.GetMessagesByEventSequence(ctx, chatID, afterEventSeq, limit)
+func (c *Cache) GetEventDelta(ctx context.Context, chatID *commonpb.ChatId, afterEventSeq, headEventSeq uint64, limit int) ([]*messaging.Message, uint64, error) {
+	msgs, nextCursor, err := c.db.GetEventDelta(ctx, chatID, afterEventSeq, headEventSeq, limit)
 	if err == nil {
 		// Every returned message is a confirmed existing ID for the chat; the
 		// largest raises the bound. The page is ordered by event_sequence, not ID,
@@ -161,7 +161,7 @@ func (c *Cache) GetMessagesByEventSequence(ctx context.Context, chatID *commonpb
 			c.observe(chatID, max)
 		}
 	}
-	return msgs, err
+	return msgs, nextCursor, err
 }
 
 func (c *Cache) MessageExists(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (bool, error) {

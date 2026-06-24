@@ -36,7 +36,7 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_GetLatestEventSequence,
 		testStore_GetMessagesPaging,
 		testStore_GetMessagesByRefs,
-		testStore_GetMessagesByEventSequence,
+		testStore_GetEventDelta,
 		testStore_DeleteMessage,
 		testStore_Pointers,
 		testStore_GetPointersForChats,
@@ -434,50 +434,61 @@ func testStore_GetMessagesByRefs(t *testing.T, s messaging.Store) {
 	require.Empty(t, none)
 }
 
-func testStore_GetMessagesByEventSequence(t *testing.T, s messaging.Store) {
+func testStore_GetEventDelta(t *testing.T, s messaging.Store) {
 	ctx := context.Background()
 	chatID := generateChatID()
 	sender := model.MustGenerateUserID()
 
-	// Empty chat: nothing changed past any cursor.
-	empty, err := s.GetMessagesByEventSequence(ctx, chatID, 0, 100)
+	// Empty chat: nothing in range; nextCursor is the unchanged cursor.
+	empty, next, err := s.GetEventDelta(ctx, chatID, 0, 0, 100)
 	require.NoError(t, err)
 	require.Empty(t, empty)
+	require.Equal(t, uint64(0), next)
 
-	// Seed 5 messages; event_seq == seq == 1..5.
+	// Seed 5 messages; event_seq == seq == 1..5, so the head is 5.
 	for i := uint64(1); i <= 5; i++ {
 		_, _, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i)), generateClientID(), true)
 		require.NoError(t, err)
 	}
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), head)
 
-	// From the beginning: all 5, ascending by event_sequence, each EventSequence
-	// equal to its message ID.
-	all, err := s.GetMessagesByEventSequence(ctx, chatID, 0, 100)
+	// From the beginning: every message at its current state, ascending by
+	// event_sequence (which equals its message ID while every event is a send). The
+	// cursor advances to the head.
+	all, next, err := s.GetEventDelta(ctx, chatID, 0, head, 100)
 	require.NoError(t, err)
 	require.Equal(t, []uint64{1, 2, 3, 4, 5}, messageIDs(all))
 	for _, m := range all {
 		require.Equal(t, m.ID.Value, m.EventSequence)
 	}
+	require.Equal(t, uint64(5), next)
 
-	// From a mid cursor: only event_sequence > 2.
-	tail, err := s.GetMessagesByEventSequence(ctx, chatID, 2, 100)
+	// From a mid cursor: only events past it.
+	tail, next, err := s.GetEventDelta(ctx, chatID, 2, head, 100)
 	require.NoError(t, err)
 	require.Equal(t, []uint64{3, 4, 5}, messageIDs(tail))
+	require.Equal(t, uint64(5), next)
 
-	// Limit bounds the page, still ascending from the cursor.
-	page, err := s.GetMessagesByEventSequence(ctx, chatID, 0, 2)
+	// Limit bounds how many events are scanned; nextCursor is the last of them, so
+	// the next page resumes right after.
+	page, next, err := s.GetEventDelta(ctx, chatID, 0, head, 2)
 	require.NoError(t, err)
 	require.Equal(t, []uint64{1, 2}, messageIDs(page))
+	require.Equal(t, uint64(2), next)
 
-	// A cursor at or past the head returns nothing.
-	none, err := s.GetMessagesByEventSequence(ctx, chatID, 5, 100)
+	// A cursor at or past the head returns nothing and doesn't move.
+	none, next, err := s.GetEventDelta(ctx, chatID, 5, head, 100)
 	require.NoError(t, err)
 	require.Empty(t, none)
+	require.Equal(t, uint64(5), next)
 
 	// limit <= 0 falls back to the default page size (all 5 fit here).
-	def, err := s.GetMessagesByEventSequence(ctx, chatID, 0, 0)
+	def, next, err := s.GetEventDelta(ctx, chatID, 0, head, 0)
 	require.NoError(t, err)
 	require.Equal(t, []uint64{1, 2, 3, 4, 5}, messageIDs(def))
+	require.Equal(t, uint64(5), next)
 }
 
 func testStore_DeleteMessage(t *testing.T, s messaging.Store) {
@@ -529,9 +540,10 @@ func testStore_DeleteMessage(t *testing.T, s messaging.Store) {
 	require.Equal(t, uint64(4), got.EventSequence)
 	requireDeleted(t, got, sender, deletedTs)
 
-	// The delta view orders by current event_sequence, so the tombstone appears
-	// once at its new position (the head), after the messages it didn't touch.
-	delta, err := s.GetMessagesByEventSequence(ctx, chatID, 0, 100)
+	// The event-log delta returns each message once at its latest event: the
+	// untouched 1 and 3, then the tombstone re-stamped to the head (4). Message 2's
+	// create event is superseded by its delete event and dropped.
+	delta, _, err := s.GetEventDelta(ctx, chatID, 0, head, 100)
 	require.NoError(t, err)
 	require.Equal(t, []uint64{1, 3, 2}, messageIDs(delta))
 

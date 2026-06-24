@@ -27,17 +27,24 @@ import (
 // The messaging store spans three tables:
 //
 //	messages           pk = "chat#<id>", sk in { "#counter", "msg#<padded seq>",
-//	                   "cmid#<client id>" }. All of a chat's messages, its
-//	                   sequence counter, and its idempotency markers share one
-//	                   partition so a send is one single-partition transaction.
-//	                   The #counter row holds last_seq (message-ID head) and
-//	                   last_event_seq (event-log head); each msg# row carries its
-//	                   event_seq, indexed by the messages_by_event_seq GSI (pk,
-//	                   event_seq) for event-sequence-ordered reads. While every
-//	                   event is a new message, event_seq is the message's own seq
-//	                   and last_event_seq mirrors last_seq; the two heads (and
-//	                   event_seq vs seq) diverge once edits and deletes advance the
-//	                   event log without minting a seq.
+//	                   "evt#<padded event_seq>", "cmid#<client id>" }. All of a
+//	                   chat's messages, its event log, its sequence counter, and its
+//	                   idempotency markers share one partition so a send is one
+//	                   single-partition transaction. The #counter row holds last_seq
+//	                   (message-ID head) and last_event_seq (event-log head). Each
+//	                   msg# row is a message's current materialized state (read by ID
+//	                   for history) and carries its current event_seq — the client's
+//	                   optimistic-concurrency token. Each evt#<event_seq> row is an
+//	                   append-only event-log entry — a thin descriptor (message_id,
+//	                   type, ts), not a copy of the message — read as a
+//	                   strongly-consistent, gapless, event-ordered range and joined to
+//	                   the messages' current state for delta catch-up (see
+//	                   GetEventDelta). Unlike a GSI this range can be read consistently
+//	                   and never has transient holes, so a catch-up cursor can't skip an
+//	                   event. While every event is a new message, event_seq is the
+//	                   message's own seq and last_event_seq mirrors last_seq; the two
+//	                   heads (and event_seq vs seq) diverge once edits and deletes
+//	                   append events without minting a seq.
 //
 //	message_pointers   pk = "chat#<id>", sk = "<type>#<user>". Delivered/read
 //	                   pointers, kept out of the messages partition so heavy
@@ -60,6 +67,7 @@ import (
 const (
 	skCounter   = "#counter"
 	msgPrefix   = "msg#"
+	evtPrefix   = "evt#"
 	cmidPrefix  = "cmid#"
 	seqPadWidth = 20
 
@@ -80,7 +88,9 @@ const (
 	attrContent       = "content"
 	attrTS            = "ts"
 	attrUnreadSeq     = "unread_seq"
-	attrEventSeq      = "event_seq"  // msg# row: per-message event-log sequence (== seq while every event is a new message); messages_by_event_seq GSI sort key
+	attrEventSeq      = "event_seq"  // msg# row: the message's current event-log sequence (== seq while every event is a new message); the client's optimistic-concurrency token
+	attrMessageID     = "message_id" // evt# row: the message this event concerns (msg# rows encode it in the sk instead)
+	attrEventType     = "event_type" // evt# row: the messaging.EventType recorded (create/edit/delete)
 	attrExpiresAt     = "expires_at" // DynamoDB TTL attribute (epoch seconds)
 
 	// message_pointers table attributes
@@ -99,8 +109,7 @@ const (
 	attrReactedTs     = "reacted_ts"   // reactor row attr; reactors_by_recency sort key (nanos)
 	attrReactionKey   = "reaction_key" // reactors_by_recency partition key
 
-	reactorsByRecencyGSI  = "reactors_by_recency"
-	messagesByEventSeqGSI = "messages_by_event_seq"
+	reactorsByRecencyGSI = "reactors_by_recency"
 
 	// DynamoDB transaction cancellation / condition codes
 	codeConditionalCheckFailed = "ConditionalCheckFailed"
@@ -203,14 +212,16 @@ func (s *store) PutMessage(
 						":expectedEventSeq": avN(lastEventSeq),
 					},
 				}},
-				// [1] the message itself.
+				// [1] the message's current materialized state, read by ID for
+				// history and carrying its current event_seq.
 				{Put: &types.Put{
 					TableName:           aws.String(s.messagesTable),
 					Item:                s.messageItem(msg, contentBlobs),
 					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 				}},
-				// [2] the idempotency marker. It is transient — only the message
-				// and counter are permanent — so it carries a TTL for auto-reaping.
+				// [2] the idempotency marker. It is transient — only the message,
+				// counter, and event-log entry are permanent — so it carries a TTL
+				// for auto-reaping.
 				{Put: &types.Put{
 					TableName: aws.String(s.messagesTable),
 					Item: map[string]types.AttributeValue{
@@ -219,6 +230,15 @@ func (s *store) PutMessage(
 						attrSeq:       avN(nextSeq),
 						attrExpiresAt: avN(uint64(ts.Add(cmidTTL).Unix())),
 					},
+					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+				}},
+				// [3] the append-only event-log entry for this send: a thin descriptor
+				// keyed by its event_seq, read as a gapless event-ordered range for
+				// delta catch-up. Minted under the same counter lock, so its event_seq
+				// is unique.
+				{Put: &types.Put{
+					TableName:           aws.String(s.messagesTable),
+					Item:                s.eventItem(chatID, msg.EventSequence, msg.ID.Value, messaging.EventTypeMessageSent, msg.Timestamp),
 					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 				}},
 			},
@@ -232,8 +252,8 @@ func (s *store) PutMessage(
 			return nil, false, err
 		}
 		// reasons index matches TransactItems order: [0]=counter, [1]=message,
-		// [2]=idempotency marker.
-		if len(reasons) == 3 && reasons[2] == codeConditionalCheckFailed {
+		// [2]=idempotency marker, [3]=event-log entry.
+		if len(reasons) == 4 && reasons[2] == codeConditionalCheckFailed {
 			// A concurrent identical send already persisted; re-read and return it.
 			continue
 		}
@@ -295,10 +315,10 @@ func (s *store) DeleteMessage(
 					},
 				}},
 				// [1] tombstone the message and re-stamp its event_seq to the new head
-				// (which re-indexes it on messages_by_event_seq), guarded on the
-				// caller's expected event_sequence — a stale expectation is a CONFLICT,
-				// never a clobber. ALL_OLD lets us tell a missing message from a stale
-				// one without a second read.
+				// (its current-state token), guarded on the caller's expected
+				// event_sequence — a stale expectation is a CONFLICT, never a clobber.
+				// ALL_OLD lets us tell a missing message from a stale one without a
+				// second read.
 				{Update: &types.Update{
 					TableName:           aws.String(s.messagesTable),
 					Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(msgSK(messageID.Value))},
@@ -311,6 +331,14 @@ func (s *store) DeleteMessage(
 					},
 					ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 				}},
+				// [2] append the delete to the event log (evt#<newEventSeq>) so the
+				// catch-up read (GetEventDelta) joins and surfaces it. Minted under the
+				// same counter lock as [0], so its event_seq is unique.
+				{Put: &types.Put{
+					TableName:           aws.String(s.messagesTable),
+					Item:                s.eventItem(chatID, newEventSeq, messageID.Value, messaging.EventTypeMessageDeleted, deletedTs),
+					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+				}},
 			},
 		})
 		if err == nil {
@@ -322,10 +350,12 @@ func (s *store) DeleteMessage(
 		}
 
 		var tce *types.TransactionCanceledException
-		if !errors.As(err, &tce) || len(tce.CancellationReasons) != 2 {
+		if !errors.As(err, &tce) || len(tce.CancellationReasons) != 3 {
 			return nil, err
 		}
-		counterReason, msgReason := tce.CancellationReasons[0], tce.CancellationReasons[1]
+		// reasons index matches TransactItems order: [0]=counter, [1]=message,
+		// [2]=event-log entry.
+		counterReason, msgReason, eventReason := tce.CancellationReasons[0], tce.CancellationReasons[1], tce.CancellationReasons[2]
 
 		// A failed message condition is terminal: either the message is gone or the
 		// caller's expected event_sequence is stale. Distinguish via the ALL_OLD item
@@ -341,8 +371,9 @@ func (s *store) DeleteMessage(
 			return current, messaging.ErrEventSequenceConflict
 		}
 		// The head moved under us (a concurrent send/delete that didn't touch this
-		// message), or a transient transaction conflict: re-read the head and retry.
-		if isRetryable([]string{aws.ToString(counterReason.Code), aws.ToString(msgReason.Code)}) {
+		// message — which fails the counter lock and, in lockstep, the evt# guard),
+		// or a transient transaction conflict: re-read the head and retry.
+		if isRetryable([]string{aws.ToString(counterReason.Code), aws.ToString(msgReason.Code), aws.ToString(eventReason.Code)}) {
 			continue
 		}
 		return nil, err
@@ -376,41 +407,124 @@ func (s *store) lastEventSeq(ctx context.Context, chatID *commonpb.ChatId) (uint
 	return parseN(out.Item[attrLastEventSeq])
 }
 
-// GetMessagesByEventSequence reads a page of the chat's messages ordered by current
-// event_seq via the messages_by_event_seq GSI. The GSI holds each message at its
-// current event_seq (it re-indexes on edit/delete), so this returns each changed
-// message once at its latest position — the state delta GetDelta streams. The read
-// is eventually consistent (a GSI cannot be read consistently); GetDelta tolerates
-// that, with the live stream and last-writer-wins covering any lag.
-func (s *store) GetMessagesByEventSequence(ctx context.Context, chatID *commonpb.ChatId, afterEventSeq uint64, limit int) ([]*messaging.Message, error) {
+// GetEventDelta reads the event log in (afterEventSeq, headEventSeq], joins each
+// event to its message's current state, and drops events superseded by a later one
+// — see the Store interface for the full contract.
+func (s *store) GetEventDelta(ctx context.Context, chatID *commonpb.ChatId, afterEventSeq, headEventSeq uint64, limit int) ([]*messaging.Message, uint64, error) {
 	if limit <= 0 {
 		limit = database.DefaultQueryOptions().Limit
 	}
+	if afterEventSeq >= headEventSeq {
+		return nil, afterEventSeq, nil
+	}
 
+	// 1. Read the thin event descriptors in (after, head], ascending. BETWEEN bounds
+	//    the scan to the evt# prefix and stops at head. The sort key encodes event_seq
+	//    zero-padded, so lexicographic order is numeric order. The range is in the
+	//    chat's own partition, so — unlike the eventually-consistent GSI this replaced
+	//    — it is read strongly-consistent and gapless: no transient holes for the
+	//    cursor to skip, no out-of-order propagation between events.
 	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String(s.messagesTable),
-		IndexName:              aws.String(messagesByEventSeqGSI),
-		KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND %s > :after", attrPK, attrEventSeq)),
+		KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND %s BETWEEN :from AND :to", attrPK, attrSK)),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk":    avS(chatPK(chatID)),
-			":after": avN(afterEventSeq),
+			":pk":   avS(chatPK(chatID)),
+			":from": avS(evtSK(afterEventSeq + 1)),
+			":to":   avS(evtSK(headEventSeq)),
 		},
 		ScanIndexForward: aws.Bool(true), // ascending by event_seq
 		Limit:            aws.Int32(int32(limit)),
+		ConsistentRead:   aws.Bool(true),
 	})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	if len(out.Items) == 0 {
+		return nil, afterEventSeq, nil
 	}
 
-	messages := make([]*messaging.Message, 0, len(out.Items))
+	type descriptor struct{ eventSeq, messageID uint64 }
+	descriptors := make([]descriptor, 0, len(out.Items))
+	ids := make(map[uint64]struct{}, len(out.Items))
 	for _, item := range out.Items {
-		msg, err := messageFromItem(chatID, item)
+		eventSeq, err := eventSeqFromEvtSK(asS(item[attrSK]))
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		messages = append(messages, msg)
+		messageID, err := parseN(item[attrMessageID])
+		if err != nil {
+			return nil, 0, err
+		}
+		descriptors = append(descriptors, descriptor{eventSeq, messageID})
+		ids[messageID] = struct{}{}
 	}
-	return messages, nil
+	// The cursor advances over every event scanned, survivor or not, so a wholly
+	// superseded page still makes progress rather than re-reading.
+	nextCursor := descriptors[len(descriptors)-1].eventSeq
+
+	// 2. Join each referenced message to its current materialized state.
+	current, err := s.getMessagesByIDs(ctx, chatID, ids)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// 3. Emit in event order, dropping a superseded event: when the message's current
+	//    event_sequence is past this event's, a newer event (later here, or — if past
+	//    head — on the live stream) carries the up-to-date state, so this entry is
+	//    stale. The survivor of each message is the one whose event_seq equals the
+	//    message's current event_sequence, so each message appears at most once.
+	msgs := make([]*messaging.Message, 0, len(descriptors))
+	for _, d := range descriptors {
+		cur := current[d.messageID]
+		if cur == nil || cur.EventSequence > d.eventSeq {
+			continue
+		}
+		msgs = append(msgs, cur)
+	}
+	return msgs, nextCursor, nil
+}
+
+// getMessagesByIDs fetches the current state of the given message IDs within one
+// chat in a single strongly-consistent batch read, keyed by message ID. Missing
+// IDs are simply absent from the map. It backs GetEventDelta's join.
+func (s *store) getMessagesByIDs(ctx context.Context, chatID *commonpb.ChatId, ids map[uint64]struct{}) (map[uint64]*messaging.Message, error) {
+	keys := make([]map[string]types.AttributeValue, 0, len(ids))
+	for id := range ids {
+		keys = append(keys, map[string]types.AttributeValue{
+			attrPK: avS(chatPK(chatID)),
+			attrSK: avS(msgSK(id)),
+		})
+	}
+
+	out := make(map[uint64]*messaging.Message, len(ids))
+	for start := 0; start < len(keys); start += maxBatchGetKeys {
+		end := start + maxBatchGetKeys
+		if end > len(keys) {
+			end = len(keys)
+		}
+		req := map[string]types.KeysAndAttributes{
+			s.messagesTable: {Keys: keys[start:end], ConsistentRead: aws.Bool(true)},
+		}
+		for len(req[s.messagesTable].Keys) > 0 {
+			resp, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range resp.Responses[s.messagesTable] {
+				msg, err := messageFromItem(chatID, item)
+				if err != nil {
+					return nil, err
+				}
+				out[msg.ID.Value] = msg
+			}
+			if unprocessed, ok := resp.UnprocessedKeys[s.messagesTable]; ok && len(unprocessed.Keys) > 0 {
+				req = map[string]types.KeysAndAttributes{s.messagesTable: unprocessed}
+			} else {
+				break
+			}
+		}
+	}
+	return out, nil
 }
 
 func (s *store) GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {
@@ -763,14 +877,32 @@ func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.Attribu
 		attrTS:        avN(uint64(msg.Timestamp.UnixNano())),
 		attrUnreadSeq: avN(msg.UnreadSeq),
 		// The event-log sequence at which this message reached its current state,
-		// assigned from the chat's event-log head. Indexed by the
-		// messages_by_event_seq GSI (pk, event_seq).
+		// assigned from the chat's event-log head; the client's optimistic-concurrency
+		// token. The append-only evt# rows (not this attribute) drive event-ordered
+		// reads.
 		attrEventSeq: avN(msg.EventSequence),
 	}
 	if msg.SenderID != nil {
 		item[attrSenderID] = avB(msg.SenderID.Value)
 	}
 	return item
+}
+
+// eventItem builds an evt#<event_seq> append-only event-log row: a thin descriptor
+// of one event — the message_id it concerns, the event type, and when it happened.
+// The event_seq is encoded in the sk (evt#<padded event_seq>, see eventSeqFromEvtSK).
+// It deliberately does NOT carry the message body; the read path joins each event to
+// the message's current state (see GetEventDelta). The type and ts are recorded so
+// the log can later be read or filtered by what happened (e.g. deletions only)
+// without that join.
+func (s *store) eventItem(chatID *commonpb.ChatId, eventSeq, messageID uint64, eventType messaging.EventType, ts time.Time) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		attrPK:        avS(chatPK(chatID)),
+		attrSK:        avS(evtSK(eventSeq)),
+		attrMessageID: avN(messageID),
+		attrEventType: avN(uint64(eventType)),
+		attrTS:        avN(uint64(ts.UnixNano())),
+	}
 }
 
 func messageFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue) (*messaging.Message, error) {
@@ -862,6 +994,19 @@ func chatIDFromPK(item map[string]types.AttributeValue) *commonpb.ChatId {
 func chatPK(chatID *commonpb.ChatId) string { return "chat#" + hex.EncodeToString(chatID.Value) }
 
 func msgSK(seq uint64) string { return fmt.Sprintf("%s%0*d", msgPrefix, seqPadWidth, seq) }
+
+func evtSK(eventSeq uint64) string { return fmt.Sprintf("%s%0*d", evtPrefix, seqPadWidth, eventSeq) }
+
+// eventSeqFromEvtSK recovers an event's sequence number from its sk
+// ("evt#<padded event_seq>"), the inverse of evtSK. The zero-padding parses cleanly
+// as a base-10 integer.
+func eventSeqFromEvtSK(sk string) (uint64, error) {
+	padded, ok := strings.CutPrefix(sk, evtPrefix)
+	if !ok {
+		return 0, fmt.Errorf("unexpected event sk %q", sk)
+	}
+	return strconv.ParseUint(padded, 10, 64)
+}
 
 // seqFromMsgSK recovers a message's sequence number from its sk
 // ("msg#<padded seq>"), the inverse of msgSK. The zero-padding parses cleanly as

@@ -37,6 +37,7 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_GetMessagesPaging,
 		testStore_GetMessagesByRefs,
 		testStore_GetEventDelta,
+		testStore_EditMessage,
 		testStore_DeleteMessage,
 		testStore_Pointers,
 		testStore_GetPointersForChats,
@@ -489,6 +490,81 @@ func testStore_GetEventDelta(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	require.Equal(t, []uint64{1, 2, 3, 4, 5}, messageIDs(def))
 	require.Equal(t, uint64(5), next)
+}
+
+func testStore_EditMessage(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// Editing in an unknown chat is a not-found.
+	_, err := s.EditMessage(ctx, chatID, &messagingpb.MessageId{Value: 1}, textContent("x"), at(1), 1)
+	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
+
+	// Seed 3 messages: IDs and event_seq are 1..3, the head is 3.
+	for i := uint64(1); i <= 3; i++ {
+		_, _, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i)), generateClientID(), true)
+		require.NoError(t, err)
+	}
+
+	// Unknown message in a known chat is a not-found.
+	_, err = s.EditMessage(ctx, chatID, &messagingpb.MessageId{Value: 99}, textContent("x"), at(9), 1)
+	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
+
+	// A stale expected event_sequence is a conflict: it returns the current,
+	// unmodified state and advances nothing.
+	current, err := s.EditMessage(ctx, chatID, &messagingpb.MessageId{Value: 2}, textContent("edited"), at(9), 999)
+	require.ErrorIs(t, err, messaging.ErrEventSequenceConflict)
+	require.Equal(t, uint64(2), current.ID.Value)
+	require.Equal(t, uint64(2), current.EventSequence)
+	require.Equal(t, "m", messageText(current)) // still the original text
+	require.True(t, current.LastEditedTs.IsZero())
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), head)
+
+	// Edit message 2 with the matching expected event_sequence.
+	editedTs := at(100)
+	edited, err := s.EditMessage(ctx, chatID, &messagingpb.MessageId{Value: 2}, textContent("edited"), editedTs, 2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), edited.ID.Value)      // message ID unchanged — the sequence stays gapless
+	require.Equal(t, uint64(4), edited.EventSequence) // re-stamped to the new event-log head
+	require.Equal(t, "edited", messageText(edited))   // content replaced
+	require.True(t, editedTs.Equal(edited.LastEditedTs))
+
+	// The event-log head advanced by one; the message-ID head did NOT (no ID minted).
+	head, err = s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), head)
+
+	// GetMessage now returns the edited content at its advanced event_sequence.
+	got, err := s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: 2})
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), got.EventSequence)
+	require.Equal(t, "edited", messageText(got))
+	require.True(t, editedTs.Equal(got.LastEditedTs))
+
+	// The event-log delta returns each message once at its latest event: the
+	// untouched 1 and 3, then the edited message re-stamped to the head (4). Message
+	// 2's create event is superseded by its edit event and dropped.
+	delta, _, err := s.GetEventDelta(ctx, chatID, 0, head, 100)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 3, 2}, messageIDs(delta))
+
+	// A second edit of the same message must supply its NOW-current event_sequence
+	// (4); the original expectation is stale. It advances the head again to 5.
+	edited2, err := s.EditMessage(ctx, chatID, &messagingpb.MessageId{Value: 2}, textContent("edited again"), at(150), 4)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), edited2.ID.Value)
+	require.Equal(t, uint64(5), edited2.EventSequence)
+	require.Equal(t, "edited again", messageText(edited2))
+
+	// A later send proves the divergence: it takes the next message ID (gapless: 4)
+	// but the next event-log head (6), so its event_sequence now exceeds its ID.
+	next, _, err := s.PutMessage(ctx, chatID, sender, textContent("after"), at(200), generateClientID(), true)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), next.ID.Value)
+	require.Equal(t, uint64(6), next.EventSequence)
 }
 
 func testStore_DeleteMessage(t *testing.T, s messaging.Store) {

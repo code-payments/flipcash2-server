@@ -236,17 +236,8 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	var repliedMessageID *messagingpb.MessageId
-	switch content := req.Content[0].Type.(type) {
-	case *messagingpb.Content_Text:
-	case *messagingpb.Content_Reply:
-		switch content.Reply.Content[0].Type.(type) {
-		case *messagingpb.Content_Text:
-		default:
-			return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
-		}
-		repliedMessageID = content.Reply.RepliedMessageId
-	default:
+	repliedMessageID, ok := clientAllowedContent(req.Content)
+	if !ok {
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
 	}
 
@@ -280,6 +271,100 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 	return &messagingpb.SendMessageResponse{
 		Result:  messagingpb.SendMessageResponse_OK,
 		Message: msg.ToProto(),
+	}, nil
+}
+
+func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRequest) (*messagingpb.EditMessageResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
+
+	// The replacement content is held to the same whitelist as a send.
+	repliedMessageID, ok := clientAllowedContent(req.Content)
+	if !ok {
+		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
+	}
+
+	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+		return nil, err
+	} else if !member {
+		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
+	}
+
+	// The target must exist in this chat. Checked after membership so non-members
+	// can't probe which message IDs exist.
+	msg, err := s.messages.GetMessage(ctx, req.ChatId, req.MessageId)
+	switch {
+	case errors.Is(err, ErrMessageNotFound):
+		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_MESSAGE_NOT_FOUND}, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure getting message to edit")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	// Only the original sender may edit their own message; a system message (no
+	// sender) is never user-editable.
+	if msg.SenderID == nil || !bytes.Equal(msg.SenderID.Value, userID.Value) {
+		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
+	}
+
+	// Only user-authored conversational content is editable; a cash payment, a
+	// system message, or an already-deleted tombstone is not (see IsEditable).
+	if !msg.IsEditable() {
+		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_CANNOT_EDIT}, nil
+	}
+
+	// When the new content is a reply, the replied-to message must exist in this
+	// chat and be repliable — the same rule a send is held to.
+	if repliedMessageID != nil {
+		repliedMessage, err := s.messages.GetMessage(ctx, req.ChatId, repliedMessageID)
+		switch {
+		case errors.Is(err, ErrMessageNotFound):
+			return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
+		case err != nil:
+			log.With(zap.Error(err)).Warn("Failure getting replied-to message")
+			return nil, status.Error(codes.Internal, "")
+		}
+		if !repliedMessage.IsReplyable() {
+			return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
+		}
+	}
+
+	now := time.Now().UTC()
+	updated, err := s.messages.EditMessage(ctx, req.ChatId, req.MessageId, req.Content, now, req.ExpectedEventSequence)
+	switch {
+	case errors.Is(err, ErrEventSequenceConflict):
+		// The optimistic guard rejected a stale expectation: a concurrent edit or
+		// delete advanced the message past the version the caller edited against.
+		// Unlike a delete an edit has no idempotent end-state to absorb, so this is
+		// always a genuine conflict; surface the current state for the client to
+		// reconcile rather than retrying blindly.
+		return &messagingpb.EditMessageResponse{
+			Result:  messagingpb.EditMessageResponse_CONFLICT,
+			Message: updated.ToProto(),
+		}, nil
+	case errors.Is(err, ErrMessageNotFound):
+		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_MESSAGE_NOT_FOUND}, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure editing message")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	// The edit rides only the event log: no new_messages (so no push, and no spurious
+	// "new message" on pre-event-log clients) and no unread/pointer change. Members
+	// apply the edit live via the message_edited event, or pick it up on their next
+	// history load.
+	updatedProto := updated.ToProto()
+	publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
+		Events: &messagingpb.EventBatch{Events: []*messagingpb.Event{NewMessageEditedEvent(updatedProto)}},
+	}, nil, nil)
+
+	return &messagingpb.EditMessageResponse{
+		Result:  messagingpb.EditMessageResponse_OK,
+		Message: updatedProto,
 	}, nil
 }
 
@@ -690,6 +775,33 @@ func (s *Server) isMember(ctx context.Context, log *zap.Logger, chatID *commonpb
 		return false, status.Error(codes.Internal, "")
 	}
 	return isMember, nil
+}
+
+// clientAllowedContent reports whether content is a message body a client may
+// author via SendMessage or EditMessage, and extracts the replied-to message ID
+// when it is a reply. The permitted set is a whitelist — currently a plain text
+// message, or a reply whose own content is text — so it excludes server-injected
+// content (e.g. cash payment messages) and any content type added later until it is
+// explicitly allowed. repliedMessageID is non-nil only for a valid reply, signaling
+// the caller to verify the replied-to message exists and is repliable.
+func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *messagingpb.MessageId, ok bool) {
+	if len(content) != 1 {
+		return nil, false
+	}
+	switch c := content[0].Type.(type) {
+	case *messagingpb.Content_Text:
+		return nil, true
+	case *messagingpb.Content_Reply:
+		if len(c.Reply.Content) != 1 {
+			return nil, false
+		}
+		if _, isText := c.Reply.Content[0].Type.(*messagingpb.Content_Text); !isText {
+			return nil, false
+		}
+		return c.Reply.RepliedMessageId, true
+	default:
+		return nil, false
+	}
 }
 
 func (s *Server) messageExists(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (bool, error) {

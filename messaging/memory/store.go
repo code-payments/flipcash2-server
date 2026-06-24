@@ -176,6 +176,54 @@ func (m *memory) GetMessage(_ context.Context, chatID *commonpb.ChatId, messageI
 	return msg.Clone(), nil
 }
 
+func (m *memory) EditMessage(
+	_ context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	content []*messagingpb.Content,
+	editedTs time.Time,
+	expectedEventSeq uint64,
+) (*messaging.Message, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	cs := m.chats[string(chatID.Value)]
+	if cs == nil {
+		return nil, messaging.ErrMessageNotFound
+	}
+	msg, ok := cs.messages[messageID.Value]
+	if !ok {
+		return nil, messaging.ErrMessageNotFound
+	}
+
+	// Optimistic guard: reject a mutation based on a stale version, returning the
+	// current state rather than clobbering it.
+	if msg.EventSequence != expectedEventSeq {
+		return msg.Clone(), messaging.ErrEventSequenceConflict
+	}
+
+	// Advance the event-log head without minting a message ID, replace the content
+	// and stamp the edit time, re-stamp the message to the new head (its
+	// current-state token), and append an edit event to the log so the catch-up read
+	// (GetEventDelta) surfaces it.
+	cs.lastEventSeq++
+	clonedContent := make([]*messagingpb.Content, len(content))
+	for i, c := range content {
+		clonedContent[i] = proto.Clone(c).(*messagingpb.Content)
+	}
+	msg.Content = clonedContent
+	msg.LastEditedTs = editedTs
+	msg.EventSequence = cs.lastEventSeq
+	cs.events = append(cs.events, eventLogEntry{
+		eventSeq:  cs.lastEventSeq,
+		messageID: msg.ID.Value,
+		eventType: messaging.EventTypeMessageEdited,
+		ts:        editedTs,
+	})
+
+	return msg.Clone(), nil
+}
+
 func (m *memory) DeleteMessage(
 	_ context.Context,
 	chatID *commonpb.ChatId,

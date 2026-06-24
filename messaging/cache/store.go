@@ -82,6 +82,23 @@ func (c *Cache) PutMessage(
 	return msg, created, err
 }
 
+func (c *Cache) EditMessage(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	content []*messagingpb.Content,
+	editedTs time.Time,
+	expectedEventSeq uint64,
+) (*messaging.Message, error) {
+	msg, err := c.db.EditMessage(ctx, chatID, messageID, content, editedTs, expectedEventSeq)
+	// A returned message is a confirmed existing ID for the chat, whether the edit
+	// succeeded or it came back as the current state on a conflict.
+	if msg != nil {
+		c.observe(chatID, msg.ID.Value)
+	}
+	return msg, err
+}
+
 func (c *Cache) DeleteMessage(
 	ctx context.Context,
 	chatID *commonpb.ChatId,

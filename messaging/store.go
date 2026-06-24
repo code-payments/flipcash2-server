@@ -110,14 +110,25 @@ type Store interface {
 	// builds refs from a shared chat ID.
 	GetMessagesByRefs(ctx context.Context, refs []MessageRef) ([]*Message, error)
 
-	// GetMessagesByEventSequence returns up to limit messages whose current
-	// event_sequence is greater than afterEventSeq, ordered by event_sequence
-	// ascending — the page primitive behind GetDelta's state delta. Because the
-	// ordering is by CURRENT event_sequence, a message edited or deleted after
-	// afterEventSeq appears at its new (higher) position, so each message appears at
-	// most once. limit <= 0 uses the store's default page size. Returns an empty
-	// result (no error) when nothing changed past afterEventSeq.
-	GetMessagesByEventSequence(ctx context.Context, chatID *commonpb.ChatId, afterEventSeq uint64, limit int) ([]*Message, error)
+	// GetEventDelta reads up to limit event-log entries with event_sequence in
+	// (afterEventSeq, headEventSeq], ascending, and returns the current state of the
+	// messages they concern — the page primitive behind GetDelta's catch-up. The
+	// event log stores only a thin descriptor per event (message_id, type, ts); each
+	// referenced message is joined to its current materialized state here.
+	//
+	// Superseded events are dropped: when a scanned event's message has since changed
+	// again (its current event_sequence is greater than that event's sequence), the
+	// stale entry is skipped because a newer event — later in this delta, or, if past
+	// head, on the live stream — carries the up-to-date state. So a message appears at
+	// most once, at its latest in-range event, in its current state.
+	//
+	// nextCursor is the highest event_sequence scanned (<= headEventSeq), whether or
+	// not it survived the drop — the caller advances its cursor to it so a fully
+	// superseded page still makes progress rather than re-reading. It equals
+	// afterEventSeq when the range is empty. The log is gapless and read consistently,
+	// so advancing by nextCursor never skips an event. limit <= 0 uses the store's
+	// default page size.
+	GetEventDelta(ctx context.Context, chatID *commonpb.ChatId, afterEventSeq, headEventSeq uint64, limit int) (msgs []*Message, nextCursor uint64, err error)
 
 	// GetLatestEventSequence returns the chat's current head event sequence — the
 	// highest event_sequence assigned in the chat, or 0 when the chat has no

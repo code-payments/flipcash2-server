@@ -12,39 +12,27 @@ import (
 
 // CreateTables provisions the messages, message_pointers, and message_reactions
 // tables. All use a composite (pk, sk) string key with on-demand billing. The
-// messages table additionally carries the messages_by_event_seq GSI (pk,
-// event_seq) for event-sequence-ordered delta reads, and the reactions table the
-// reactors_by_recency GSI for most-recent-first reactor paging. The messages
-// table has TTL enabled on attrExpiresAt so the transient cmid# idempotency
-// markers are auto-reaped. It is idempotent: tables that already exist are left
-// as-is. The call blocks until all tables are ACTIVE.
+// reactions table carries the reactors_by_recency GSI for most-recent-first
+// reactor paging; the messages table needs no secondary index — event-ordered
+// delta reads page the evt# rows as a strongly-consistent sort-key range in the
+// chat's own partition. The messages table has TTL enabled on attrExpiresAt so the
+// transient cmid# idempotency markers are auto-reaped. It is idempotent: tables
+// that already exist are left as-is. The call blocks until all tables are ACTIVE.
 func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, pointersTable, reactionsTable string) error {
-	// The messages table carries the messages_by_event_seq GSI on (pk, event_seq),
-	// which orders a chat's messages by event-log sequence for delta reads. Only
-	// msg# rows carry event_seq, so the #counter and cmid# rows are naturally
-	// excluded from the index.
+	// The messages table is a plain (pk, sk) key-value table: every access — by
+	// message ID (msg#), by event sequence (evt#), the counter, and the idempotency
+	// markers — is served from the chat's partition by sort key, so no GSI is needed.
 	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
 		TableName:   aws.String(messagesTable),
 		BillingMode: types.BillingModePayPerRequest,
 		AttributeDefinitions: []types.AttributeDefinition{
 			{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
 			{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
-			{AttributeName: aws.String(attrEventSeq), AttributeType: types.ScalarAttributeTypeN},
 		},
 		KeySchema: []types.KeySchemaElement{
 			{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
 			{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
 		},
-		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{{
-			IndexName: aws.String(messagesByEventSeqGSI),
-			KeySchema: []types.KeySchemaElement{
-				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
-				{AttributeName: aws.String(attrEventSeq), KeyType: types.KeyTypeRange},
-			},
-			// Project all attributes so a delta read can materialize whole messages
-			// from a single index query.
-			Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
-		}},
 	})
 	if err != nil {
 		var inUse *types.ResourceInUseException

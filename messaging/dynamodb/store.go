@@ -159,9 +159,13 @@ func (s *store) PutMessage(
 		if err != nil {
 			return nil, false, err
 		}
-		// Fast idempotent path: a prior send with this client message ID wins.
+		// Fast idempotent path: a prior send with this client message ID wins. The
+		// marker was just read strongly-consistent, so the message it points at is
+		// committed; read it back strongly-consistent too, else a lagging replica
+		// could spuriously return ErrMessageNotFound (or stale content) for a message
+		// that provably exists.
 		if markerSeq != nil {
-			msg, err := s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: *markerSeq})
+			msg, err := s.getMessage(ctx, chatID, &messagingpb.MessageId{Value: *markerSeq}, true)
 			return msg, false, err
 		}
 
@@ -259,6 +263,122 @@ func (s *store) PutMessage(
 		return nil, false, err
 	}
 	return nil, false, fmt.Errorf("put message exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
+}
+
+func (s *store) DeleteMessage(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	deletedBy *commonpb.UserId,
+	deletedTs time.Time,
+	expectedEventSeq uint64,
+) (*messaging.Message, error) {
+	// The tombstone is a single DeletedContent that replaces the message's content.
+	// message_id, unread_seq and ts are left untouched.
+	deleted := &messagingpb.DeletedContent{DeletedTs: timestamppb.New(deletedTs)}
+	if deletedBy != nil {
+		deleted.DeletedBy = &commonpb.UserId{Value: append([]byte(nil), deletedBy.Value...)}
+	}
+	contentBlobs, err := marshalContent([]*messagingpb.Content{{
+		Type: &messagingpb.Content_Deleted{Deleted: deleted},
+	}})
+	if err != nil {
+		return nil, err
+	}
+
+	for attempt := 0; attempt < maxPutMessageAttempts; attempt++ {
+		// The event-log head lives on the counter row. The delete advances it by one
+		// without touching last_seq (no new message ID), so event_seq diverges from
+		// the message ID here. Read it strongly-consistent, then lock on it below.
+		head, err := s.lastEventSeq(ctx, chatID)
+		if err != nil {
+			return nil, err
+		}
+		if head == 0 {
+			return nil, messaging.ErrMessageNotFound // no counter → no messages
+		}
+		newEventSeq := head + 1
+
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: []types.TransactWriteItem{
+				// [0] advance the event-log head under an optimistic lock, serializing
+				// this delete against concurrent sends and other edits/deletes (all of
+				// which advance last_event_seq). last_seq is deliberately left alone.
+				{Update: &types.Update{
+					TableName:           aws.String(s.messagesTable),
+					Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skCounter)},
+					UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :newEventSeq", attrLastEventSeq)),
+					ConditionExpression: aws.String(fmt.Sprintf("%s = :head", attrLastEventSeq)),
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":newEventSeq": avN(newEventSeq),
+						":head":        avN(head),
+					},
+				}},
+				// [1] tombstone the message and re-stamp its event_seq to the new head
+				// (its current-state token), guarded on the caller's expected
+				// event_sequence — a stale expectation is a CONFLICT, never a clobber.
+				// ALL_OLD lets us tell a missing message from a stale one without a
+				// second read.
+				{Update: &types.Update{
+					TableName:           aws.String(s.messagesTable),
+					Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(msgSK(messageID.Value))},
+					UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :content, %s = :newEventSeq", attrContent, attrEventSeq)),
+					ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s) AND %s = :expected", attrPK, attrEventSeq)),
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":content":     &types.AttributeValueMemberL{Value: contentBlobs},
+						":newEventSeq": avN(newEventSeq),
+						":expected":    avN(expectedEventSeq),
+					},
+					ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+				}},
+				// [2] append the delete to the event log (evt#<newEventSeq>) so the
+				// catch-up read (GetEventDelta) joins and surfaces it. Minted under the
+				// same counter lock as [0], so its event_seq is unique.
+				{Put: &types.Put{
+					TableName:           aws.String(s.messagesTable),
+					Item:                s.eventItem(chatID, newEventSeq, messageID.Value, messaging.EventTypeMessageDeleted, deletedTs),
+					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+				}},
+			},
+		})
+		if err == nil {
+			// Re-read strongly-consistent: an eventually-consistent read right after
+			// the commit can still return the pre-delete (non-tombstone) state, which
+			// would surface stale content to the caller and make NewMessageDeletedEvent
+			// dereference a Deleted that isn't there.
+			return s.getMessage(ctx, chatID, messageID, true) // canonical tombstone
+		}
+
+		var tce *types.TransactionCanceledException
+		if !errors.As(err, &tce) || len(tce.CancellationReasons) != 3 {
+			return nil, err
+		}
+		// reasons index matches TransactItems order: [0]=counter, [1]=message,
+		// [2]=event-log entry.
+		counterReason, msgReason, eventReason := tce.CancellationReasons[0], tce.CancellationReasons[1], tce.CancellationReasons[2]
+
+		// A failed message condition is terminal: either the message is gone or the
+		// caller's expected event_sequence is stale. Distinguish via the ALL_OLD item
+		// carried on the cancellation reason.
+		if aws.ToString(msgReason.Code) == codeConditionalCheckFailed {
+			if len(msgReason.Item) == 0 {
+				return nil, messaging.ErrMessageNotFound
+			}
+			current, err := messageFromItem(chatID, msgReason.Item)
+			if err != nil {
+				return nil, err
+			}
+			return current, messaging.ErrEventSequenceConflict
+		}
+		// The head moved under us (a concurrent send/delete that didn't touch this
+		// message — which fails the counter lock and, in lockstep, the evt# guard),
+		// or a transient transaction conflict: re-read the head and retry.
+		if isRetryable([]string{aws.ToString(counterReason.Code), aws.ToString(msgReason.Code), aws.ToString(eventReason.Code)}) {
+			continue
+		}
+		return nil, err
+	}
+	return nil, fmt.Errorf("delete message exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
 }
 
 func (s *store) GetLatestEventSequence(ctx context.Context, chatID *commonpb.ChatId) (uint64, error) {
@@ -408,12 +528,21 @@ func (s *store) getMessagesByIDs(ctx context.Context, chatID *commonpb.ChatId, i
 }
 
 func (s *store) GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {
+	return s.getMessage(ctx, chatID, messageID, false)
+}
+
+// getMessage reads a single message by ID, or ErrMessageNotFound. consistent
+// forces a strongly-consistent read; callers reading a message back immediately
+// after mutating it (e.g. the delete tombstone) must set it, since an
+// eventually-consistent read can still return the pre-mutation state.
+func (s *store) getMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, consistent bool) (*messaging.Message, error) {
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(s.messagesTable),
 		Key: map[string]types.AttributeValue{
 			attrPK: avS(chatPK(chatID)),
 			attrSK: avS(msgSK(messageID.Value)),
 		},
+		ConsistentRead: aws.Bool(consistent),
 	})
 	if err != nil {
 		return nil, err

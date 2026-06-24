@@ -283,6 +283,96 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 	}, nil
 }
 
+func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessageRequest) (*messagingpb.DeleteMessageResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
+
+	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+		return nil, err
+	} else if !member {
+		return &messagingpb.DeleteMessageResponse{Result: messagingpb.DeleteMessageResponse_DENIED}, nil
+	}
+
+	// The target must exist in this chat. Checked after membership so non-members
+	// can't probe which message IDs exist.
+	msg, err := s.messages.GetMessage(ctx, req.ChatId, req.MessageId)
+	switch {
+	case errors.Is(err, ErrMessageNotFound):
+		return &messagingpb.DeleteMessageResponse{Result: messagingpb.DeleteMessageResponse_MESSAGE_NOT_FOUND}, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure getting message to delete")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	// Only the original sender may delete their own message; a system message (no
+	// sender) is never user-deletable.
+	if msg.SenderID == nil || !bytes.Equal(msg.SenderID.Value, userID.Value) {
+		return &messagingpb.DeleteMessageResponse{Result: messagingpb.DeleteMessageResponse_DENIED}, nil
+	}
+
+	// Deleting an already-deleted message is an idempotent no-op: the desired end
+	// state (tombstoned) already holds, so return OK with the current tombstone
+	// without advancing the event log or re-broadcasting. This makes a retried or
+	// double-tapped delete — whose expected_event_sequence is now stale — succeed
+	// rather than fail. A tombstone is also non-deletable, so this precedes the
+	// IsDeletable check below.
+	if msg.IsDeleted() {
+		return &messagingpb.DeleteMessageResponse{
+			Result:  messagingpb.DeleteMessageResponse_OK,
+			Message: msg.ToProto(),
+		}, nil
+	}
+
+	if !msg.IsDeletable() {
+		return &messagingpb.DeleteMessageResponse{Result: messagingpb.DeleteMessageResponse_CANNOT_DELETE}, nil
+	}
+
+	now := time.Now().UTC()
+	updated, err := s.messages.DeleteMessage(ctx, req.ChatId, req.MessageId, userID, now, req.ExpectedEventSequence)
+	switch {
+	case errors.Is(err, ErrEventSequenceConflict):
+		// The optimistic guard rejected a stale expectation. If the message is
+		// already tombstoned, the delete's intent is already satisfied, so treat it
+		// as the same idempotent no-op as above — this also covers the window where
+		// the eventually-consistent pre-read missed a just-completed delete.
+		// Otherwise it's a genuine conflict (e.g. a concurrent edit): surface the
+		// current state so the client can reconcile rather than retrying blindly.
+		if updated.IsDeleted() {
+			return &messagingpb.DeleteMessageResponse{
+				Result:  messagingpb.DeleteMessageResponse_OK,
+				Message: updated.ToProto(),
+			}, nil
+		}
+		return &messagingpb.DeleteMessageResponse{
+			Result:  messagingpb.DeleteMessageResponse_CONFLICT,
+			Message: updated.ToProto(),
+		}, nil
+	case errors.Is(err, ErrMessageNotFound):
+		return &messagingpb.DeleteMessageResponse{Result: messagingpb.DeleteMessageResponse_MESSAGE_NOT_FOUND}, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure deleting message")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	// The tombstone rides only the event log: no new_messages (so no push, and no
+	// spurious "new message" on pre-event-log clients) and no unread/pointer change.
+	// Members apply the deletion live via the message_deleted event, or pick it up
+	// on their next history load.
+	updatedProto := updated.ToProto()
+	publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
+		Events: &messagingpb.EventBatch{Events: []*messagingpb.Event{NewMessageDeletedEvent(updatedProto)}},
+	}, nil, nil)
+
+	return &messagingpb.DeleteMessageResponse{
+		Result:  messagingpb.DeleteMessageResponse_OK,
+		Message: updatedProto,
+	}, nil
+}
+
 func (s *Server) AdvancePointer(ctx context.Context, req *messagingpb.AdvancePointerRequest) (*messagingpb.AdvancePointerResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {

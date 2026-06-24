@@ -121,6 +121,35 @@ func (m *Message) IsReactable() bool {
 	}
 }
 
+// IsDeletable reports whether this message may be tombstoned via DeleteMessage.
+// Like IsReplyable this is a whitelist of user-authored conversational content,
+// so content types added later (and non-conversational ones like system messages)
+// are non-deletable until explicitly allowed. Cash payment messages are excluded:
+// the payment is a settled record and the tombstone path is for ordinary chat
+// content. A Deleted tombstone is itself non-deletable; the DeleteMessage RPC
+// short-circuits an already-deleted message as an idempotent no-op (see
+// IsDeleted) before this check, so it never reaches here.
+func (m *Message) IsDeletable() bool {
+	if len(m.Content) == 0 {
+		return false
+	}
+	switch m.Content[0].Type.(type) {
+	case *messagingpb.Content_Text,
+		*messagingpb.Content_Media,
+		*messagingpb.Content_Reply:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsDeleted reports whether this message has already been tombstoned — its
+// content replaced with a single DeletedContent. A delete targeting an
+// already-deleted message is an idempotent no-op (see the DeleteMessage RPC).
+func (m *Message) IsDeleted() bool {
+	return len(m.Content) > 0 && m.Content[0].GetDeleted() != nil
+}
+
 // Reactor is a single user's reaction to a message, with the time they reacted.
 type Reactor struct {
 	UserID    *commonpb.UserId
@@ -226,6 +255,24 @@ func NewMessageSentEvent(msg *messagingpb.Message) *messagingpb.Event {
 		Ts:       msg.Ts,
 		Mutations: []*messagingpb.Mutation{{
 			Type: &messagingpb.Mutation_MessageSent{MessageSent: msg},
+		}},
+	}
+}
+
+// NewMessageDeletedEvent builds the event-log entry for a tombstoned message: a
+// single Event carrying one message_deleted mutation. The event's sequence is the
+// message's (now advanced) event_sequence and its count is 1 — a delete consumes
+// exactly one event-log point, advancing the event-log head without minting a
+// message ID. The mutation carries the materialized tombstone (content replaced
+// with DeletedContent). msg is referenced, not copied; callers pass a proto they
+// own.
+func NewMessageDeletedEvent(msg *messagingpb.Message) *messagingpb.Event {
+	return &messagingpb.Event{
+		Sequence: msg.EventSequence,
+		Count:    1,
+		Ts:       msg.Content[0].GetDeleted().DeletedTs,
+		Mutations: []*messagingpb.Mutation{{
+			Type: &messagingpb.Mutation_MessageDeleted{MessageDeleted: msg},
 		}},
 	}
 }

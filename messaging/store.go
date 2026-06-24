@@ -16,6 +16,13 @@ import (
 // message ID.
 var ErrMessageNotFound = errors.New("message not found")
 
+// ErrEventSequenceConflict indicates an optimistic-concurrency failure on a
+// message mutation (edit/delete): the message's current event_sequence no longer
+// matches the expected value the caller supplied, so the mutation was rejected
+// rather than clobbering newer state. The store returns the message's current
+// state alongside this error so the caller can surface it.
+var ErrEventSequenceConflict = errors.New("message event sequence conflict")
+
 // MessageRef identifies a single message within a chat. It is the unit of a
 // cross-chat batch read (see Store.GetMessagesByRefs) — e.g. one ref per chat to
 // fetch every chat's last message for the feed.
@@ -82,6 +89,30 @@ type Store interface {
 		clientMessageID *messagingpb.ClientMessageId,
 		countsTowardUnread bool,
 	) (msg *Message, created bool, err error)
+
+	// DeleteMessage tombstones a message: it replaces the message's content with a
+	// single DeletedContent (carrying deletedTs and deletedBy), advances the chat's
+	// event-log head, and re-stamps the message's event_sequence to that new head —
+	// the message ID and unread_seq are left untouched, so the per-chat ID sequence
+	// stays gapless. This is the first operation that advances the event-log head
+	// without minting a message ID, so event_sequence diverges from message ID here.
+	//
+	// It is an optimistic-concurrency operation: the tombstone is applied only if
+	// the message's current event_sequence still equals expectedEventSeq. On a
+	// mismatch nothing is modified and it returns the message's current state
+	// alongside ErrEventSequenceConflict; there is no last-writer-wins path. It
+	// returns ErrMessageNotFound if no such message exists. On success it returns
+	// the tombstoned message at its new event_sequence.
+	//
+	// deletedBy may be nil to denote a system-level deletion (e.g. moderation).
+	DeleteMessage(
+		ctx context.Context,
+		chatID *commonpb.ChatId,
+		messageID *messagingpb.MessageId,
+		deletedBy *commonpb.UserId,
+		deletedTs time.Time,
+		expectedEventSeq uint64,
+	) (*Message, error)
 
 	// GetMessage returns a single message by ID, or ErrMessageNotFound.
 	GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*Message, error)

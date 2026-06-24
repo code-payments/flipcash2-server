@@ -82,6 +82,23 @@ func (c *Cache) PutMessage(
 	return msg, created, err
 }
 
+func (c *Cache) DeleteMessage(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	deletedBy *commonpb.UserId,
+	deletedTs time.Time,
+	expectedEventSeq uint64,
+) (*messaging.Message, error) {
+	msg, err := c.db.DeleteMessage(ctx, chatID, messageID, deletedBy, deletedTs, expectedEventSeq)
+	// A returned message is a confirmed existing ID for the chat, whether the
+	// delete succeeded or it came back as the current state on a conflict.
+	if msg != nil {
+		c.observe(chatID, msg.ID.Value)
+	}
+	return msg, err
+}
+
 func (c *Cache) GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {
 	msg, err := c.db.GetMessage(ctx, chatID, messageID)
 	if err == nil {

@@ -37,6 +37,7 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_GetMessagesPaging,
 		testStore_GetMessagesByRefs,
 		testStore_GetMessagesByEventSequence,
+		testStore_DeleteMessage,
 		testStore_Pointers,
 		testStore_GetPointersForChats,
 		testStore_AdvancePointer_NoExistenceCheck,
@@ -477,6 +478,80 @@ func testStore_GetMessagesByEventSequence(t *testing.T, s messaging.Store) {
 	def, err := s.GetMessagesByEventSequence(ctx, chatID, 0, 0)
 	require.NoError(t, err)
 	require.Equal(t, []uint64{1, 2, 3, 4, 5}, messageIDs(def))
+}
+
+func testStore_DeleteMessage(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// Deleting in an unknown chat is a not-found.
+	_, err := s.DeleteMessage(ctx, chatID, &messagingpb.MessageId{Value: 1}, sender, at(1), 1)
+	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
+
+	// Seed 3 messages: IDs and event_seq are 1..3, the head is 3.
+	for i := uint64(1); i <= 3; i++ {
+		_, _, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i)), generateClientID(), true)
+		require.NoError(t, err)
+	}
+
+	// Unknown message in a known chat is a not-found.
+	_, err = s.DeleteMessage(ctx, chatID, &messagingpb.MessageId{Value: 99}, sender, at(9), 1)
+	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
+
+	// A stale expected event_sequence is a conflict: it returns the current,
+	// unmodified state and advances nothing.
+	current, err := s.DeleteMessage(ctx, chatID, &messagingpb.MessageId{Value: 2}, sender, at(9), 999)
+	require.ErrorIs(t, err, messaging.ErrEventSequenceConflict)
+	require.Equal(t, uint64(2), current.ID.Value)
+	require.Equal(t, uint64(2), current.EventSequence)
+	require.Equal(t, "m", messageText(current)) // still text, not tombstoned
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), head)
+
+	// Delete message 2 with the matching expected event_sequence.
+	deletedTs := at(100)
+	tombstone, err := s.DeleteMessage(ctx, chatID, &messagingpb.MessageId{Value: 2}, sender, deletedTs, 2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), tombstone.ID.Value)      // message ID unchanged — the sequence stays gapless
+	require.Equal(t, uint64(4), tombstone.EventSequence) // re-stamped to the new event-log head
+	requireDeleted(t, tombstone, sender, deletedTs)
+
+	// The event-log head advanced by one; the message-ID head did NOT (no ID minted).
+	head, err = s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), head)
+
+	// GetMessage now returns the tombstone at its advanced event_sequence.
+	got, err := s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: 2})
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), got.EventSequence)
+	requireDeleted(t, got, sender, deletedTs)
+
+	// The delta view orders by current event_sequence, so the tombstone appears
+	// once at its new position (the head), after the messages it didn't touch.
+	delta, err := s.GetMessagesByEventSequence(ctx, chatID, 0, 100)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 3, 2}, messageIDs(delta))
+
+	// A later send proves the divergence: it takes the next message ID (gapless: 4)
+	// but the next event-log head (5), so its event_sequence now exceeds its ID.
+	next, _, err := s.PutMessage(ctx, chatID, sender, textContent("after"), at(200), generateClientID(), true)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), next.ID.Value)
+	require.Equal(t, uint64(5), next.EventSequence)
+}
+
+// requireDeleted asserts a message is a tombstone: its content is a single
+// DeletedContent carrying the expected deleter and deletion timestamp.
+func requireDeleted(t *testing.T, m *messaging.Message, deletedBy *commonpb.UserId, deletedTs time.Time) {
+	t.Helper()
+	require.Len(t, m.Content, 1)
+	deleted := m.Content[0].GetDeleted()
+	require.NotNil(t, deleted)
+	require.Equal(t, deletedBy.Value, deleted.DeletedBy.GetValue())
+	require.True(t, deletedTs.Equal(deleted.DeletedTs.AsTime()))
 }
 
 func testStore_GetPointersForChats(t *testing.T, s messaging.Store) {

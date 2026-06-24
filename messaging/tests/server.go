@@ -39,6 +39,7 @@ func RunServerTests(t *testing.T, badges badge.Store, chats chat.Store, messages
 		testServer_SendReply,
 		testServer_SendMessage_DisallowedContent,
 		testServer_SendMessage_Broadcast,
+		testServer_DeleteMessage,
 		testServer_GetMessage_NotFound,
 		testServer_GetMessages_NotFound,
 		testServer_GetMessages_Paging,
@@ -187,6 +188,12 @@ func (e *serverEnv) getDelta(keys model.KeyPair, afterSequence uint64) ([]*messa
 	}
 }
 
+func (e *serverEnv) deleteMessage(keys model.KeyPair, msgID *messagingpb.MessageId, expectedEventSeq uint64) (*messagingpb.DeleteMessageResponse, error) {
+	req := &messagingpb.DeleteMessageRequest{ChatId: e.chatID, MessageId: msgID, ExpectedEventSequence: expectedEventSeq}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.DeleteMessage(e.ctx, req)
+}
+
 // --- pointers ---
 
 func (e *serverEnv) advancePointer(keys model.KeyPair, pointerType messagingpb.Pointer_Type, newValue *messagingpb.MessageId) (*messagingpb.AdvancePointerResponse, error) {
@@ -289,6 +296,25 @@ func (e *serverEnv) waitForChatUpdate(recipient *commonpb.UserId, match func(*ev
 func (e *serverEnv) waitForNewMessage(recipient *commonpb.UserId, msgID uint64) {
 	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
 		return u.NewMessages != nil && containsMessage(u.NewMessages.Messages, msgID)
+	})
+}
+
+// waitForMessageDeleted blocks until recipient observes a message_deleted event
+// for msgID. A delete rides only the event log, so this asserts on Events (not the
+// deprecated new_messages, which a delete never populates).
+func (e *serverEnv) waitForMessageDeleted(recipient *commonpb.UserId, msgID uint64) {
+	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
+		if u.Events == nil {
+			return false
+		}
+		for _, ev := range u.Events.Events {
+			for _, mut := range ev.Mutations {
+				if d := mut.GetMessageDeleted(); d != nil && d.MessageId.Value == msgID {
+					return true
+				}
+			}
+		}
+		return false
 	})
 }
 
@@ -542,6 +568,72 @@ func testServer_GetMessage_NotFound(t *testing.T, chats chat.Store, messages mes
 	require.Equal(t, messagingpb.GetMessageResponse_NOT_FOUND, resp.Result)
 }
 
+func testServer_DeleteMessage(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	// userA sends a message; in this phase event_sequence == message_id.
+	sent, err := e.send(e.keysA, "delete me", generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	msgID := sent.Message.MessageId
+	eventSeq := sent.Message.EventSequence
+
+	// A non-sender cannot delete someone else's message.
+	denied, err := e.deleteMessage(e.keysB, msgID, eventSeq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_DENIED, denied.Result)
+
+	// A missing message is a not-found.
+	notFound, err := e.deleteMessage(e.keysA, &messagingpb.MessageId{Value: 999}, eventSeq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_MESSAGE_NOT_FOUND, notFound.Result)
+
+	// A stale expected event_sequence conflicts, returning the current (untouched)
+	// state rather than clobbering it.
+	conflict, err := e.deleteMessage(e.keysA, msgID, eventSeq+1)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_CONFLICT, conflict.Result)
+	require.Equal(t, msgID.Value, conflict.Message.MessageId.Value)
+	require.Nil(t, conflict.Message.Content[0].GetDeleted())
+
+	// The sender deletes their own message with the matching expected event_sequence.
+	ok, err := e.deleteMessage(e.keysA, msgID, eventSeq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, ok.Result)
+	// The response is the tombstone: content replaced with DeletedContent (attributed
+	// to the deleter), event_sequence advanced past the message ID, ID unchanged.
+	require.Equal(t, msgID.Value, ok.Message.MessageId.Value)
+	deleted := ok.Message.Content[0].GetDeleted()
+	require.NotNil(t, deleted)
+	require.Equal(t, e.userA.Value, deleted.DeletedBy.Value)
+	require.Greater(t, ok.Message.EventSequence, msgID.Value)
+
+	// Members observe the tombstone as a message_deleted event on the event log.
+	e.waitForMessageDeleted(e.userB, msgID.Value)
+
+	// Re-deleting an already-deleted message is an idempotent no-op: even though the
+	// original expected_event_sequence is now stale, the desired end state already
+	// holds, so it returns OK with the unchanged tombstone and does not advance the
+	// event log a second time.
+	deletedSeq := ok.Message.EventSequence
+	reDelete, err := e.deleteMessage(e.keysA, msgID, eventSeq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, reDelete.Result)
+	require.NotNil(t, reDelete.Message.Content[0].GetDeleted())
+	require.Equal(t, deletedSeq, reDelete.Message.EventSequence)
+	head, err := messages.GetLatestEventSequence(e.ctx, e.chatID)
+	require.NoError(t, err)
+	require.Equal(t, deletedSeq, head)
+
+	// A non-deletable message the caller authored (seeded directly as a system
+	// message, which SendMessage won't accept) is rejected with CANNOT_DELETE.
+	sysMsg, _, err := messages.PutMessage(e.ctx, e.chatID, e.userA, systemContent("system"), at(50), generateClientID(), false)
+	require.NoError(t, err)
+	cannot, err := e.deleteMessage(e.keysA, sysMsg.ID, sysMsg.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_CANNOT_DELETE, cannot.Result)
+}
+
 func testServer_GetMessages_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
 	e := newServerEnv(t, badges, chats, messages, profiles)
 
@@ -657,6 +749,46 @@ func testServer_GetDelta(t *testing.T, chats chat.Store, messages messaging.Stor
 	require.Equal(t, messagingpb.GetDeltaResponse_OK, resps[0].Result)
 	require.Nil(t, resps[0].Messages)
 	require.Equal(t, uint64(3), resps[0].LatestSequence)
+
+	// Deleting the middle message exercises the first divergence of the event
+	// sequence from the message ID through the full RPC path: the delete advances
+	// the event-log head to 4 and re-stamps message 2's event_sequence to 4, leaving
+	// its ID untouched.
+	del, err := e.deleteMessage(e.keysA, &messagingpb.MessageId{Value: 2}, 2)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, del.Result)
+	require.Equal(t, uint64(4), del.Message.EventSequence)
+
+	// A cold catch-up now returns each message once at its CURRENT event sequence —
+	// the untouched 1 and 3, then the tombstone at the new head 4 — so IDs order
+	// [1, 3, 2] and the head/checkpoint converge on 4 (not the message-ID head 3).
+	resps, err = e.getDelta(e.keysB, 0)
+	require.NoError(t, err)
+	msgs, latest, checkpoint = collectDelta(resps)
+	require.Equal(t, []uint64{1, 3, 2}, protoMessageIDs(msgs))
+	require.Equal(t, uint64(4), latest)
+	require.Equal(t, uint64(4), checkpoint)
+
+	// Message 2 is surfaced as a materialized tombstone at event_sequence 4 — proving
+	// the delta reflects the delete rather than the pre-delete text.
+	require.True(t, containsMessage(msgs, 2))
+	for _, m := range msgs {
+		if m.MessageId.Value == 2 {
+			require.Equal(t, uint64(4), m.EventSequence)
+			require.NotNil(t, m.Content[0].GetDeleted())
+			require.Equal(t, e.userA.Value, m.Content[0].GetDeleted().DeletedBy.Value)
+		}
+	}
+
+	// An incremental catch-up from just past the untouched tail (cursor 3) returns
+	// only the tombstone: it alone advanced past the cursor, and it appears exactly
+	// once (no echo at its vacated original position 2).
+	resps, err = e.getDelta(e.keysB, 3)
+	require.NoError(t, err)
+	msgs, latest, checkpoint = collectDelta(resps)
+	require.Equal(t, []uint64{2}, protoMessageIDs(msgs))
+	require.Equal(t, uint64(4), latest)
+	require.Equal(t, uint64(4), checkpoint)
 }
 
 func testServer_GetDelta_ResetRequired(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
@@ -1088,6 +1220,10 @@ func testServer_NonMember_Denied(t *testing.T, chats chat.Store, messages messag
 	getResp, err := e.getMessage(strangerKeys, msgID)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result)
+
+	delResp, err := e.deleteMessage(strangerKeys, msgID, 1)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_DENIED, delResp.Result)
 
 	listResp, err := e.getMessagesByOptions(strangerKeys, &commonpb.QueryOptions{})
 	require.NoError(t, err)

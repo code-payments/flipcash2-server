@@ -19,9 +19,10 @@ import (
 )
 
 type chatState struct {
-	lastSeq    uint64
-	lastUnread uint64
-	messages   map[uint64]*messaging.Message
+	lastSeq      uint64
+	lastUnread   uint64
+	lastEventSeq uint64 // event-log head; tracked independently of lastSeq so edits/deletes can advance it without minting a message ID
+	messages     map[uint64]*messaging.Message
 	byClient   map[string]uint64                  // client message ID -> seq
 	pointers   map[string]*messagingpb.Pointer    // pointerKey -> pointer
 	reactions  map[uint64]map[string]*reactionAgg // message seq -> emoji -> aggregate
@@ -100,26 +101,31 @@ func (m *memory) PutMessage(
 	if countsTowardUnread {
 		unreadSeq++
 	}
+	// The event-log head is tracked independently. While every event is a new
+	// message it advances in lockstep with the message ID (so eventSeq == seq);
+	// once a delete advances the head without minting an ID the two diverge, and a
+	// later send takes the next head, which is then greater than its own ID.
+	eventSeq := cs.lastEventSeq + 1
 
 	clonedContent := make([]*messagingpb.Content, len(content))
 	for i, c := range content {
 		clonedContent[i] = proto.Clone(c).(*messagingpb.Content)
 	}
 	msg := &messaging.Message{
-		ChatID:    &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
-		ID:        &messagingpb.MessageId{Value: seq},
-		SenderID:  senderID,
-		Content:   clonedContent,
-		Timestamp: ts,
-		UnreadSeq: unreadSeq,
-		// Every event is a new message, so the event-log sequence is the seq.
-		EventSequence: seq,
+		ChatID:        &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
+		ID:            &messagingpb.MessageId{Value: seq},
+		SenderID:      senderID,
+		Content:       clonedContent,
+		Timestamp:     ts,
+		UnreadSeq:     unreadSeq,
+		EventSequence: eventSeq,
 	}
 
 	cs.messages[seq] = msg.Clone()
 	cs.byClient[string(clientMessageID.Value)] = seq
 	cs.lastSeq = seq
 	cs.lastUnread = unreadSeq
+	cs.lastEventSeq = eventSeq
 
 	return msg.Clone(), true, nil
 }
@@ -132,9 +138,7 @@ func (m *memory) GetLatestEventSequence(_ context.Context, chatID *commonpb.Chat
 	if cs == nil {
 		return 0, nil
 	}
-	// Every event is a new message, so the head event sequence is the last
-	// assigned message ID.
-	return cs.lastSeq, nil
+	return cs.lastEventSeq, nil
 }
 
 func (m *memory) GetMessage(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {
@@ -149,6 +153,45 @@ func (m *memory) GetMessage(_ context.Context, chatID *commonpb.ChatId, messageI
 	if !ok {
 		return nil, messaging.ErrMessageNotFound
 	}
+	return msg.Clone(), nil
+}
+
+func (m *memory) DeleteMessage(
+	_ context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	deletedBy *commonpb.UserId,
+	deletedTs time.Time,
+	expectedEventSeq uint64,
+) (*messaging.Message, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	cs := m.chats[string(chatID.Value)]
+	if cs == nil {
+		return nil, messaging.ErrMessageNotFound
+	}
+	msg, ok := cs.messages[messageID.Value]
+	if !ok {
+		return nil, messaging.ErrMessageNotFound
+	}
+
+	// Optimistic guard: reject a mutation based on a stale version, returning the
+	// current state rather than clobbering it.
+	if msg.EventSequence != expectedEventSeq {
+		return msg.Clone(), messaging.ErrEventSequenceConflict
+	}
+
+	// Advance the event-log head without minting a message ID, and re-stamp the
+	// tombstone to it — so it sorts to the new head on GetMessagesByEventSequence.
+	cs.lastEventSeq++
+	deleted := &messagingpb.DeletedContent{DeletedTs: timestamppb.New(deletedTs)}
+	if deletedBy != nil {
+		deleted.DeletedBy = &commonpb.UserId{Value: append([]byte(nil), deletedBy.Value...)}
+	}
+	msg.Content = []*messagingpb.Content{{Type: &messagingpb.Content_Deleted{Deleted: deleted}}}
+	msg.EventSequence = cs.lastEventSeq
+
 	return msg.Clone(), nil
 }
 

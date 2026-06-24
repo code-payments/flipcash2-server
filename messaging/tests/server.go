@@ -678,6 +678,7 @@ func testServer_GetDelta_ResetRequired(t *testing.T, chats chat.Store, messages 
 	require.Len(t, resps, 1)
 	require.Equal(t, messagingpb.GetDeltaResponse_RESET_REQUIRED, resps[0].Result)
 	require.Nil(t, resps[0].Messages)
+	require.Equal(t, uint64(seeded), resps[0].LatestSequence)
 
 	// A cursor at the cap boundary (gap of exactly 1000) still streams the delta,
 	// in ascending 100-message batches, converging on the head.

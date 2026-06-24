@@ -173,9 +173,17 @@ func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.M
 	// Oversized catch-up: beyond maxDeltaEvents the gap is too large to stream as a
 	// delta, so tell the client to discard its cursor and re-sync history from
 	// GetMessages. head > AfterSequence here (already-current handled above), so
-	// the subtraction can't underflow.
+	// the subtraction can't underflow. LatestSequence carries the head as the
+	// resume floor: after reloading history the client sets its cursor here, and the
+	// (small) gap accumulated during the reload is caught by its next GetDelta —
+	// without it the client would have to derive the head from the full history,
+	// which is fragile (post-divergence the head is a tombstone's event_sequence,
+	// not the newest message).
 	if head-req.AfterSequence > maxDeltaEvents {
-		return stream.Send(&messagingpb.GetDeltaResponse{Result: messagingpb.GetDeltaResponse_RESET_REQUIRED})
+		return stream.Send(&messagingpb.GetDeltaResponse{
+			Result:         messagingpb.GetDeltaResponse_RESET_REQUIRED,
+			LatestSequence: head,
+		})
 	}
 
 	// Walk the event log in (after, head] in pages. Each page returns the current

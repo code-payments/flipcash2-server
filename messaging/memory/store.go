@@ -18,10 +18,20 @@ import (
 	"github.com/code-payments/flipcash2-server/messaging"
 )
 
+// eventLogEntry is a thin event-log record: which message changed, how, and when.
+// The message body is not stored; GetEventDelta joins to the current message state.
+type eventLogEntry struct {
+	eventSeq  uint64
+	messageID uint64
+	eventType messaging.EventType
+	ts        time.Time
+}
+
 type chatState struct {
 	lastSeq    uint64
 	lastUnread uint64
 	messages   map[uint64]*messaging.Message
+	events     []eventLogEntry                    // append-only event log: one descriptor per event, ascending by event_sequence
 	byClient   map[string]uint64                  // client message ID -> seq
 	pointers   map[string]*messagingpb.Pointer    // pointerKey -> pointer
 	reactions  map[uint64]map[string]*reactionAgg // message seq -> emoji -> aggregate
@@ -117,6 +127,16 @@ func (m *memory) PutMessage(
 	}
 
 	cs.messages[seq] = msg.Clone()
+	// Append a thin descriptor of the send to the event log (the event-ordered read
+	// source; see GetEventDelta). Every event is a new message here, so its event_seq
+	// is the message's seq; edits and deletes will append further events without
+	// minting a message ID.
+	cs.events = append(cs.events, eventLogEntry{
+		eventSeq:  seq,
+		messageID: seq,
+		eventType: messaging.EventTypeMessageSent,
+		ts:        ts,
+	})
 	cs.byClient[string(clientMessageID.Value)] = seq
 	cs.lastSeq = seq
 	cs.lastUnread = unreadSeq
@@ -209,9 +229,12 @@ func (m *memory) GetMessages(_ context.Context, chatID *commonpb.ChatId, opts ..
 	return ordered, nil
 }
 
-func (m *memory) GetMessagesByEventSequence(_ context.Context, chatID *commonpb.ChatId, afterEventSeq uint64, limit int) ([]*messaging.Message, error) {
+func (m *memory) GetEventDelta(_ context.Context, chatID *commonpb.ChatId, afterEventSeq, headEventSeq uint64, limit int) ([]*messaging.Message, uint64, error) {
 	if limit <= 0 {
 		limit = database.DefaultQueryOptions().Limit
+	}
+	if afterEventSeq >= headEventSeq {
+		return nil, afterEventSeq, nil
 	}
 
 	m.Lock()
@@ -219,22 +242,33 @@ func (m *memory) GetMessagesByEventSequence(_ context.Context, chatID *commonpb.
 
 	cs := m.chats[string(chatID.Value)]
 	if cs == nil {
-		return nil, nil
+		return nil, afterEventSeq, nil
 	}
 
-	var ordered []*messaging.Message
-	for _, msg := range cs.messages {
-		if msg.EventSequence > afterEventSeq {
-			ordered = append(ordered, msg.Clone())
+	// The event log is append-only and ascending by event_sequence. Scan up to limit
+	// events in (after, head], joining each to the message's current state and
+	// dropping a superseded event (the message's current event_sequence is past this
+	// event, so a newer event carries the up-to-date state). nextCursor advances over
+	// every event scanned, survivor or not.
+	nextCursor := afterEventSeq
+	var msgs []*messaging.Message
+	scanned := 0
+	for _, ev := range cs.events {
+		if ev.eventSeq <= afterEventSeq {
+			continue
+		}
+		if ev.eventSeq > headEventSeq {
+			break
+		}
+		nextCursor = ev.eventSeq
+		if cur, ok := cs.messages[ev.messageID]; ok && cur.EventSequence <= ev.eventSeq {
+			msgs = append(msgs, cur.Clone())
+		}
+		if scanned++; scanned == limit {
+			break
 		}
 	}
-	sort.Slice(ordered, func(i, j int) bool {
-		return ordered[i].EventSequence < ordered[j].EventSequence
-	})
-	if len(ordered) > limit {
-		ordered = ordered[:limit]
-	}
-	return ordered, nil
+	return msgs, nextCursor, nil
 }
 
 func (m *memory) GetMessagesByRefs(_ context.Context, refs []messaging.MessageRef) ([]*messaging.Message, error) {

@@ -275,7 +275,7 @@ func TestCache_GettersSeedWatermark(t *testing.T) {
 		require.Equal(t, 0, backing.existsCallCount())
 	})
 
-	t.Run("GetMessagesByEventSequence", func(t *testing.T) {
+	t.Run("GetEventDelta", func(t *testing.T) {
 		backing := newCountingMemory()
 		c := cache.NewInCache(backing)
 		chatID := generateChatID()
@@ -286,7 +286,7 @@ func TestCache_GettersSeedWatermark(t *testing.T) {
 		putMessage(t, ctx, backing, chatID)
 		last := putMessage(t, ctx, backing, chatID)
 
-		msgs, err := c.GetMessagesByEventSequence(ctx, chatID, 0, 100)
+		msgs, _, err := c.GetEventDelta(ctx, chatID, 0, last.EventSequence, 100)
 		require.NoError(t, err)
 		require.Len(t, msgs, 3)
 

@@ -202,6 +202,18 @@ func (m *Message) ToProto() *messagingpb.Message {
 	return out
 }
 
+// EventType is the kind of mutation an event-log entry records, mirroring the
+// messagingpb.Mutation oneof. It is stored on each event row so the log can be read
+// or filtered by what happened (e.g. deletions only) without joining to the
+// message. The zero value is EventTypeMessageSent, so a create is the default.
+type EventType uint8
+
+const (
+	EventTypeMessageSent    EventType = iota // a message was created (a send)
+	EventTypeMessageEdited                   // a message's content was edited
+	EventTypeMessageDeleted                  // a message was tombstoned (a delete)
+)
+
 // NewMessageSentEvent builds the event-log entry for a freshly sent message: a
 // single Event carrying one message_sent mutation. While every event is a new
 // message, the event's sequence is the message's event_sequence (which equals

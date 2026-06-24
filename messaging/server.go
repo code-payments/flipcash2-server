@@ -178,44 +178,43 @@ func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.M
 		return stream.Send(&messagingpb.GetDeltaResponse{Result: messagingpb.GetDeltaResponse_RESET_REQUIRED})
 	}
 
-	// The delta is the current state of every message whose event_sequence is in
-	// (after, head], read from the messages_by_event_seq index in ascending pages.
-	// The index holds each message at its current event_sequence, so an
-	// edited/deleted message appears once at its new position.
+	// Walk the event log in (after, head] in pages. Each page returns the current
+	// state of the messages whose events it covers, with superseded events already
+	// dropped by the store; the checkpoint advances over every event scanned (the
+	// store's nextCursor), so a fully superseded page still makes progress. The log
+	// is gapless and read consistently, so this converges on head without skipping.
 	cursor := req.AfterSequence
 	for cursor < head {
-		msgs, err := s.messages.GetMessagesByEventSequence(ctx, req.ChatId, cursor, deltaPageSize)
+		msgs, nextCursor, err := s.messages.GetEventDelta(ctx, req.ChatId, cursor, head, deltaPageSize)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure reading delta page")
 			return status.Error(codes.Internal, "")
 		}
-
-		batch := make([]*messagingpb.Message, 0, len(msgs))
-		for _, m := range msgs {
-			// Messages advanced past head after the stream opened belong to the live
-			// stream; this catch-up stops at the head captured when it opened.
-			if m.EventSequence > head {
-				break
-			}
-			batch = append(batch, m.ToProto())
-		}
-		// Break rather than loop forever when a read returns nothing — e.g. the
-		// eventually-consistent index hasn't yet caught up to head, in which case
-		// the live stream delivers the remainder.
-		if len(batch) == 0 {
+		// No forward progress should be impossible on a gapless log while cursor <
+		// head; guard against re-reading the same page forever (the live stream
+		// delivers anything past head).
+		if nextCursor <= cursor {
 			break
 		}
 
-		checkpoint := batch[len(batch)-1].EventSequence
-		if err := stream.Send(&messagingpb.GetDeltaResponse{
+		resp := &messagingpb.GetDeltaResponse{
 			Result:             messagingpb.GetDeltaResponse_OK,
-			Messages:           &messagingpb.MessageBatch{Messages: batch},
 			LatestSequence:     head,
-			CheckpointSequence: checkpoint,
-		}); err != nil {
+			CheckpointSequence: nextCursor,
+		}
+		// A page may carry no surviving messages (all superseded) yet still advance
+		// the checkpoint, so only attach a batch when there's something to apply.
+		if len(msgs) > 0 {
+			batch := make([]*messagingpb.Message, len(msgs))
+			for i, m := range msgs {
+				batch[i] = m.ToProto()
+			}
+			resp.Messages = &messagingpb.MessageBatch{Messages: batch}
+		}
+		if err := stream.Send(resp); err != nil {
 			return err
 		}
-		cursor = checkpoint
+		cursor = nextCursor
 	}
 
 	return nil

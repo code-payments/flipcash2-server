@@ -53,6 +53,11 @@ type MessagingReader interface {
 	// ref, keyed by string(chatID.Value). Chats with no matching pointers are
 	// absent from the map.
 	Pointers(ctx context.Context, refs []PointerRef) (map[string][]*messagingpb.Pointer, error)
+
+	// LatestEventSequences returns the head event sequence of each given chat,
+	// keyed by string(chatID.Value). Chats at head 0 (no messages) are absent from
+	// the map, so a missing key means 0.
+	LatestEventSequences(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]uint64, error)
 }
 
 // ProfileReader is the read slice of the profile domain the Chat service needs
@@ -215,21 +220,26 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, cursor 
 
 // hydrate builds the proto metadata for a set of chats, batching the reads
 // across the whole set: every chat's last message in one call, every chat's
-// pointers in one call, and every DM member's phone number in one call. Member
-// profiles otherwise carry an empty placeholder (UserProfile is a required
-// field).
+// pointers in one call, every chat's head event sequence in one call, and every
+// DM member's phone number in one call. Member profiles otherwise carry an empty
+// placeholder (UserProfile is a required field).
 //
 // Phone numbers are populated only for members of DM chats, so each party can
 // resolve the other to a contact. Group chats deliberately do not expose member
 // phone numbers.
 func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
+	var seqChatIDs []*commonpb.ChatId
 	pointerRefs := make([]PointerRef, len(chats))
 	uniqueDmUserIds := make(map[string]*commonpb.UserId)
 	for i, c := range chats {
 		pointerRefs[i] = PointerRef{ChatID: c.ID, Members: c.Members}
 		if c.LastMessageID != nil {
 			msgRefs = append(msgRefs, MessageRef{ChatID: c.ID, MessageID: c.LastMessageID})
+			// A chat's head is 0 unless it has at least one message, which is
+			// exactly when it has a last message ID. Skip the rest: their head is
+			// the proto default 0.
+			seqChatIDs = append(seqChatIDs, c.ID)
 		}
 		if c.Type == chatpb.Metadata_DM {
 			for _, m := range c.Members {
@@ -250,6 +260,10 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 	if err != nil {
 		return nil, err
 	}
+	latestEventSeqs, err := s.messaging.LatestEventSequences(ctx, seqChatIDs)
+	if err != nil {
+		return nil, err
+	}
 	phoneNumbersByUserId, err := s.profiles.GetPhoneNumbers(ctx, dmUserIDs)
 	if err != nil {
 		return nil, err
@@ -260,6 +274,7 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 		key := string(c.ID.Value)
 		md := c.ToProto()
 		md.LastMessage = lastMessages[key]
+		md.LatestEventSequence = latestEventSeqs[key]
 		assignPointers(md, pointers[key])
 		for _, m := range md.Members {
 			profile := &profilepb.UserProfile{}

@@ -91,8 +91,8 @@ const (
 	attrEventSeq      = "event_seq"      // msg# row: the message's current event-log sequence (== seq while every event is a new message); the client's optimistic-concurrency token
 	attrLastEditedTs  = "last_edited_ts" // msg# row: when the message's content was last edited (absent until edited); a delete leaves it untouched
 	attrMessageID     = "message_id"     // evt# row: the message this event concerns (msg# rows encode it in the sk instead)
-	attrEventType     = "event_type" // evt# row: the messaging.EventType recorded (create/edit/delete)
-	attrExpiresAt     = "expires_at" // DynamoDB TTL attribute (epoch seconds)
+	attrEventType     = "event_type"     // evt# row: the messaging.EventType recorded (create/edit/delete)
+	attrExpiresAt     = "expires_at"     // DynamoDB TTL attribute (epoch seconds)
 
 	// message_pointers table attributes
 	attrUserID     = "user_id"
@@ -514,6 +514,68 @@ func (s *store) lastEventSeq(ctx context.Context, chatID *commonpb.ChatId) (uint
 		return 0, nil // no counter yet → no messages
 	}
 	return parseN(out.Item[attrLastEventSeq])
+}
+
+func (s *store) GetLatestEventSequencesForChats(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]uint64, error) {
+	// The head lives on each chat's counter row (last_event_seq). The rows are
+	// addressable by exact key (chatPK, #counter), so batch-read them in one path,
+	// mirroring GetMessagesByRefs — no per-chat round trip. Dedup so a repeated
+	// chat ID collapses.
+	seen := make(map[string]struct{}, len(chatIDs))
+	var keys []map[string]types.AttributeValue
+	for _, chatID := range chatIDs {
+		k := string(chatID.Value)
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		keys = append(keys, map[string]types.AttributeValue{
+			attrPK: avS(chatPK(chatID)),
+			attrSK: avS(skCounter),
+		})
+	}
+
+	out := make(map[string]uint64)
+	for start := 0; start < len(keys); start += maxBatchGetKeys {
+		end := start + maxBatchGetKeys
+		if end > len(keys) {
+			end = len(keys)
+		}
+
+		// Retry UnprocessedKeys until the batch drains.
+		req := map[string]types.KeysAndAttributes{
+			s.messagesTable: {
+				Keys:                 keys[start:end],
+				ProjectionExpression: aws.String(strings.Join([]string{attrPK, attrLastEventSeq}, ", ")),
+			},
+		}
+		for len(req[s.messagesTable].Keys) > 0 {
+			resp, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range resp.Responses[s.messagesTable] {
+				// Items come back unordered and intermixed across chats; the owning
+				// chat is recovered from the item's pk.
+				seq, err := parseN(item[attrLastEventSeq])
+				if err != nil {
+					return nil, err
+				}
+				// A head of 0 is the proto default; leave it out so callers treat a
+				// missing key and an explicit 0 identically.
+				if seq == 0 {
+					continue
+				}
+				out[string(chatIDFromPK(item).Value)] = seq
+			}
+			if unprocessed, ok := resp.UnprocessedKeys[s.messagesTable]; ok && len(unprocessed.Keys) > 0 {
+				req = map[string]types.KeysAndAttributes{s.messagesTable: unprocessed}
+			} else {
+				break
+			}
+		}
+	}
+	return out, nil
 }
 
 // GetEventDelta reads the event log in (afterEventSeq, headEventSeq], joins each

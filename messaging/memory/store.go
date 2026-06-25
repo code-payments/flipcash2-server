@@ -161,6 +161,21 @@ func (m *memory) GetLatestEventSequence(_ context.Context, chatID *commonpb.Chat
 	return cs.lastEventSeq, nil
 }
 
+func (m *memory) GetLatestEventSequencesForChats(_ context.Context, chatIDs []*commonpb.ChatId) (map[string]uint64, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	out := make(map[string]uint64)
+	for _, chatID := range chatIDs {
+		cs := m.chats[string(chatID.Value)]
+		if cs == nil || cs.lastEventSeq == 0 {
+			continue
+		}
+		out[string(chatID.Value)] = cs.lastEventSeq
+	}
+	return out, nil
+}
+
 func (m *memory) GetMessage(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {
 	m.Lock()
 	defer m.Unlock()

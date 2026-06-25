@@ -82,16 +82,19 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 }
 
 // fakeMessagingReader is a canned chat.MessagingReader for server tests: it
-// returns whatever last messages and pointers a test registers per chat.
+// returns whatever last messages, pointers, and head event sequences a test
+// registers per chat.
 type fakeMessagingReader struct {
-	lastMessages map[string]*messagingpb.Message
-	pointers     map[string][]*messagingpb.Pointer
+	lastMessages    map[string]*messagingpb.Message
+	pointers        map[string][]*messagingpb.Pointer
+	latestEventSeqs map[string]uint64
 }
 
 func newFakeMessagingReader() *fakeMessagingReader {
 	return &fakeMessagingReader{
-		lastMessages: make(map[string]*messagingpb.Message),
-		pointers:     make(map[string][]*messagingpb.Pointer),
+		lastMessages:    make(map[string]*messagingpb.Message),
+		pointers:        make(map[string][]*messagingpb.Pointer),
+		latestEventSeqs: make(map[string]uint64),
 	}
 }
 
@@ -110,6 +113,16 @@ func (f *fakeMessagingReader) Pointers(_ context.Context, refs []chat.PointerRef
 	for _, ref := range refs {
 		if p, ok := f.pointers[string(ref.ChatID.Value)]; ok {
 			out[string(ref.ChatID.Value)] = p
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeMessagingReader) LatestEventSequences(_ context.Context, chatIDs []*commonpb.ChatId) (map[string]uint64, error) {
+	out := make(map[string]uint64)
+	for _, chatID := range chatIDs {
+		if seq, ok := f.latestEventSeqs[string(chatID.Value)]; ok {
+			out[string(chatID.Value)] = seq
 		}
 	}
 	return out, nil
@@ -285,6 +298,10 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 7}, Ts: timestamppb.New(at(7))},
 		{Type: messagingpb.Pointer_DELIVERED, UserId: peer, Value: &messagingpb.MessageId{Value: 7}, Ts: timestamppb.New(at(7))},
 	}
+	// The head sits ahead of the last message's event sequence (e.g. an older
+	// message was since edited), so this exercises that it is read from the
+	// messaging reader rather than derived from last_message.
+	e.messaging.latestEventSeqs[string(chatID.Value)] = 9
 	e.profiles.phoneNumbers[string(peer.Value)] = &phonepb.PhoneNumber{Value: "+15551234567"}
 
 	resp := e.getChat(e.keys, chatID)
@@ -294,6 +311,9 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	require.NotNil(t, resp.Metadata.LastMessage)
 	require.Equal(t, uint64(7), resp.Metadata.LastMessage.MessageId.Value)
 	require.Equal(t, "hi", resp.Metadata.LastMessage.Content[0].GetText().Text)
+
+	// The chat's head event sequence is hydrated, independent of last_message.
+	require.Equal(t, uint64(9), resp.Metadata.LatestEventSequence)
 
 	// Pointers are distributed onto the matching member by user ID.
 	members := byUserID(resp.Metadata.Members)
@@ -326,6 +346,7 @@ func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {
 	withoutMsg := e.putDM(at(1))
 
 	e.messaging.lastMessages[string(withMsg.Value)] = textMessage(3, e.userID, "yo")
+	e.messaging.latestEventSeqs[string(withMsg.Value)] = 3
 
 	resp := e.getDmFeed(&commonpb.QueryOptions{})
 	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, resp.Result)
@@ -335,11 +356,14 @@ func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {
 	for _, md := range resp.Chats {
 		byChat[string(md.ChatId.Value)] = md
 	}
-	// The chat with a last message ID gets its message hydrated...
+	// The chat with a last message ID gets its message and head sequence hydrated...
 	require.NotNil(t, byChat[string(withMsg.Value)].LastMessage)
 	require.Equal(t, uint64(3), byChat[string(withMsg.Value)].LastMessage.MessageId.Value)
-	// ...and the one without is left nil (no ref is issued for it).
+	require.Equal(t, uint64(3), byChat[string(withMsg.Value)].LatestEventSequence)
+	// ...and the one without is left nil, its head defaulting to 0 (no ref is
+	// issued for it).
 	require.Nil(t, byChat[string(withoutMsg.Value)].LastMessage)
+	require.Zero(t, byChat[string(withoutMsg.Value)].LatestEventSequence)
 }
 
 func textMessage(id uint64, sender *commonpb.UserId, text string) *messagingpb.Message {

@@ -34,6 +34,7 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_GetMessage_NotFound,
 		testStore_MessageExists,
 		testStore_GetLatestEventSequence,
+		testStore_GetLatestEventSequencesForChats,
 		testStore_GetMessagesPaging,
 		testStore_GetMessagesByRefs,
 		testStore_GetEventDelta,
@@ -343,6 +344,44 @@ func testStore_GetLatestEventSequence(t *testing.T, s messaging.Store) {
 	after, err := s.GetLatestEventSequence(ctx, chatID)
 	require.NoError(t, err)
 	require.Equal(t, before, after)
+}
+
+func testStore_GetLatestEventSequencesForChats(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	sender := model.MustGenerateUserID()
+
+	// Two chats with messages (distinct heads) and one with none.
+	chatA := generateChatID()
+	for i := 1; i <= 3; i++ {
+		_, _, err := s.PutMessage(ctx, chatA, sender, textContent("m"), at(int64(i)), generateClientID(), true)
+		require.NoError(t, err)
+	}
+	chatB := generateChatID()
+	_, _, err := s.PutMessage(ctx, chatB, sender, textContent("m"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	empty := generateChatID()
+
+	// Empty input yields an empty map, not an error.
+	out, err := s.GetLatestEventSequencesForChats(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, out)
+
+	// Each chat's head is keyed by its raw chat ID; a duplicate request collapses
+	// and a chat with no messages (head 0) is omitted so a missing key means 0.
+	out, err = s.GetLatestEventSequencesForChats(ctx, []*commonpb.ChatId{chatA, chatB, empty, chatA})
+	require.NoError(t, err)
+	require.Len(t, out, 2)
+	require.Equal(t, uint64(3), out[string(chatA.Value)])
+	require.Equal(t, uint64(1), out[string(chatB.Value)])
+	_, ok := out[string(empty.Value)]
+	require.False(t, ok)
+
+	// Each head matches the single-chat accessor.
+	for _, chatID := range []*commonpb.ChatId{chatA, chatB} {
+		want, err := s.GetLatestEventSequence(ctx, chatID)
+		require.NoError(t, err)
+		require.Equal(t, want, out[string(chatID.Value)])
+	}
 }
 
 func testStore_GetMessagesPaging(t *testing.T, s messaging.Store) {

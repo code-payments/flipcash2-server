@@ -195,6 +195,15 @@ type Store interface {
 	// diverge.
 	GetLatestEventSequence(ctx context.Context, chatID *commonpb.ChatId) (uint64, error)
 
+	// GetLatestEventSequencesForChats returns the head event sequence of each of
+	// the given chats, keyed by string(chatID.Value). It is the cross-chat batch
+	// counterpart to GetLatestEventSequence, used to hydrate Metadata.latest_event_sequence
+	// for the DM feed in one call rather than one read per chat. A chat with no
+	// messages (head 0) is absent from the map and duplicate chat IDs collapse, so
+	// callers must treat a missing key as 0. Returns an empty map (no error) when
+	// chatIDs is empty.
+	GetLatestEventSequencesForChats(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]uint64, error)
+
 	// GetPointers returns all delivered/read pointers for a chat. Returns an
 	// empty result (no error) when the chat has no pointers.
 	GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*messagingpb.Pointer, error)

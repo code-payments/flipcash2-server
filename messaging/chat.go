@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
@@ -54,4 +55,11 @@ func (r *chatMessagingReader) Pointers(ctx context.Context, refs []chat.PointerR
 		storeRefs[i] = PointerRef{ChatID: ref.ChatID, Members: ref.Members}
 	}
 	return r.store.GetPointersForChats(ctx, storeRefs)
+}
+
+func (r *chatMessagingReader) LatestEventSequences(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]uint64, error) {
+	if len(chatIDs) == 0 {
+		return map[string]uint64{}, nil
+	}
+	return r.store.GetLatestEventSequencesForChats(ctx, chatIDs)
 }

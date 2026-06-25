@@ -39,6 +39,7 @@ func RunServerTests(t *testing.T, badges badge.Store, chats chat.Store, messages
 		testServer_SendReply,
 		testServer_SendMessage_DisallowedContent,
 		testServer_SendMessage_Broadcast,
+		testServer_EditMessage,
 		testServer_DeleteMessage,
 		testServer_GetMessage_NotFound,
 		testServer_GetMessages_NotFound,
@@ -188,6 +189,12 @@ func (e *serverEnv) getDelta(keys model.KeyPair, afterSequence uint64) ([]*messa
 	}
 }
 
+func (e *serverEnv) editMessage(keys model.KeyPair, msgID *messagingpb.MessageId, content []*messagingpb.Content, expectedEventSeq uint64) (*messagingpb.EditMessageResponse, error) {
+	req := &messagingpb.EditMessageRequest{ChatId: e.chatID, MessageId: msgID, Content: content, ExpectedEventSequence: expectedEventSeq}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.EditMessage(e.ctx, req)
+}
+
 func (e *serverEnv) deleteMessage(keys model.KeyPair, msgID *messagingpb.MessageId, expectedEventSeq uint64) (*messagingpb.DeleteMessageResponse, error) {
 	req := &messagingpb.DeleteMessageRequest{ChatId: e.chatID, MessageId: msgID, ExpectedEventSequence: expectedEventSeq}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
@@ -310,6 +317,25 @@ func (e *serverEnv) waitForMessageDeleted(recipient *commonpb.UserId, msgID uint
 		for _, ev := range u.Events.Events {
 			for _, mut := range ev.Mutations {
 				if d := mut.GetMessageDeleted(); d != nil && d.MessageId.Value == msgID {
+					return true
+				}
+			}
+		}
+		return false
+	})
+}
+
+// waitForMessageEdited blocks until recipient observes a message_edited event for
+// msgID. An edit rides only the event log, so this asserts on Events (not the
+// deprecated new_messages, which an edit never populates).
+func (e *serverEnv) waitForMessageEdited(recipient *commonpb.UserId, msgID uint64) {
+	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
+		if u.Events == nil {
+			return false
+		}
+		for _, ev := range u.Events.Events {
+			for _, mut := range ev.Mutations {
+				if d := mut.GetMessageEdited(); d != nil && d.MessageId.Value == msgID {
 					return true
 				}
 			}
@@ -566,6 +592,84 @@ func testServer_GetMessage_NotFound(t *testing.T, chats chat.Store, messages mes
 	resp, err := e.getMessage(e.keysA, &messagingpb.MessageId{Value: 99})
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessageResponse_NOT_FOUND, resp.Result)
+}
+
+func testServer_EditMessage(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	// userA sends a message; in this phase event_sequence == message_id.
+	sent, err := e.send(e.keysA, "original", generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	msgID := sent.Message.MessageId
+	eventSeq := sent.Message.EventSequence
+
+	// A non-sender cannot edit someone else's message.
+	denied, err := e.editMessage(e.keysB, msgID, textContent("hijacked"), eventSeq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_DENIED, denied.Result)
+
+	// Disallowed replacement content (a system message a client may not author) is
+	// rejected before the message is touched.
+	badContent, err := e.editMessage(e.keysA, msgID, systemContent("system"), eventSeq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_DENIED, badContent.Result)
+
+	// A missing message is a not-found.
+	notFound, err := e.editMessage(e.keysA, &messagingpb.MessageId{Value: 999}, textContent("nope"), eventSeq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_MESSAGE_NOT_FOUND, notFound.Result)
+
+	// A stale expected event_sequence conflicts, returning the current (untouched)
+	// state rather than clobbering it.
+	conflict, err := e.editMessage(e.keysA, msgID, textContent("edited"), eventSeq+1)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_CONFLICT, conflict.Result)
+	require.Equal(t, msgID.Value, conflict.Message.MessageId.Value)
+	require.Equal(t, "original", conflict.Message.Content[0].GetText().Text)
+	require.Nil(t, conflict.Message.LastEditedTs)
+
+	// The sender edits their own message with the matching expected event_sequence.
+	ok, err := e.editMessage(e.keysA, msgID, textContent("edited"), eventSeq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_OK, ok.Result)
+	// The response carries the new content, last_edited_ts set, event_sequence
+	// advanced past the message ID, ID unchanged.
+	require.Equal(t, msgID.Value, ok.Message.MessageId.Value)
+	require.Equal(t, "edited", ok.Message.Content[0].GetText().Text)
+	require.NotNil(t, ok.Message.LastEditedTs)
+	require.Greater(t, ok.Message.EventSequence, msgID.Value)
+
+	// Members observe the edit as a message_edited event on the event log.
+	e.waitForMessageEdited(e.userB, msgID.Value)
+
+	// A second edit must supply the now-current event_sequence; the original is stale.
+	editedSeq := ok.Message.EventSequence
+	reEditStale, err := e.editMessage(e.keysA, msgID, textContent("edited again"), eventSeq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_CONFLICT, reEditStale.Result)
+
+	reEdit, err := e.editMessage(e.keysA, msgID, textContent("edited again"), editedSeq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_OK, reEdit.Result)
+	require.Equal(t, "edited again", reEdit.Message.Content[0].GetText().Text)
+	require.Greater(t, reEdit.Message.EventSequence, editedSeq)
+
+	// A non-editable message the caller authored (seeded directly as a system
+	// message, which SendMessage won't accept) is rejected with CANNOT_EDIT.
+	sysMsg, _, err := messages.PutMessage(e.ctx, e.chatID, e.userA, systemContent("system"), at(50), generateClientID(), false)
+	require.NoError(t, err)
+	cannot, err := e.editMessage(e.keysA, sysMsg.ID, textContent("edited"), sysMsg.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_CANNOT_EDIT, cannot.Result)
+
+	// A tombstone is not editable: deleting then editing is rejected with CANNOT_EDIT.
+	del, err := e.deleteMessage(e.keysA, msgID, reEdit.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, del.Result)
+	cannotEditDeleted, err := e.editMessage(e.keysA, msgID, textContent("resurrect"), del.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_CANNOT_EDIT, cannotEditDeleted.Result)
 }
 
 func testServer_DeleteMessage(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
@@ -1221,6 +1325,10 @@ func testServer_NonMember_Denied(t *testing.T, chats chat.Store, messages messag
 	getResp, err := e.getMessage(strangerKeys, msgID)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result)
+
+	editResp, err := e.editMessage(strangerKeys, msgID, textContent("intruder edit"), 1)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_DENIED, editResp.Result)
 
 	delResp, err := e.deleteMessage(strangerKeys, msgID, 1)
 	require.NoError(t, err)

@@ -61,6 +61,15 @@ func TestChatMessagingReader(t *testing.T) {
 	require.Equal(t, messagingpb.Pointer_READ, pointers[string(chatA.Value)][0].Type)
 	_, ok := pointers[string(chatB.Value)]
 	require.False(t, ok)
+
+	// LatestEventSequences: delegated, keyed by chat; empty input → empty map.
+	seqs, err := reader.LatestEventSequences(ctx, []*commonpb.ChatId{chatA, chatB})
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), seqs[string(chatA.Value)])
+	require.Equal(t, uint64(1), seqs[string(chatB.Value)])
+	noSeqs, err := reader.LatestEventSequences(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, noSeqs)
 }
 
 func textContent(text string) []*messagingpb.Content {

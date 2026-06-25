@@ -201,6 +201,10 @@ func (c *Cache) GetLatestEventSequence(ctx context.Context, chatID *commonpb.Cha
 	return c.db.GetLatestEventSequence(ctx, chatID)
 }
 
+func (c *Cache) GetLatestEventSequencesForChats(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]uint64, error) {
+	return c.db.GetLatestEventSequencesForChats(ctx, chatIDs)
+}
+
 func (c *Cache) GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*messagingpb.Pointer, error) {
 	return c.db.GetPointers(ctx, chatID)
 }

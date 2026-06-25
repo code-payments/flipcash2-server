@@ -35,6 +35,8 @@ const (
 	staffMinAndroidBuildNumber = 2790
 
 	defaultBillExchangeDataTimeout = 5 * time.Minute
+
+	requireCoinbaseEmailVerification = true
 )
 
 var (
@@ -264,6 +266,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			WithdrawalFeeAmount:              DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 			MinimumHolderValue:               MinHolderValue,
+			RequireCoinbaseEmailVerification: requireCoinbaseEmailVerification,
 		},
 	}, nil
 }
@@ -298,6 +301,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			WithdrawalFeeAmount:              DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 			MinimumHolderValue:               MinHolderValue,
+			RequireCoinbaseEmailVerification: requireCoinbaseEmailVerification,
 		},
 	}, nil
 }

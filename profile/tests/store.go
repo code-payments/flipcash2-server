@@ -293,6 +293,7 @@ func testGetPhonesByHashes(t *testing.T, s profile.Store) {
 	ownerByPhone := make(map[string][]byte, len(gotPay))
 	for _, p := range gotPay {
 		ownerByPhone[p.PhoneNumber.Value] = p.UserID.Value
+		require.False(t, p.JoinedAt.IsZero())
 	}
 	require.Equal(t, user1.Value, ownerByPhone["+11111111111"])
 	require.Equal(t, user3.Value, ownerByPhone["+13333333333"])

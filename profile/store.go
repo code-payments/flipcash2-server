@@ -3,6 +3,7 @@ package profile
 import (
 	"context"
 	"errors"
+	"time"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
@@ -18,6 +19,7 @@ var ErrExistingSocialLink = errors.New("existing social link")
 type PhoneForPayment struct {
 	PhoneNumber *phonepb.PhoneNumber
 	UserID      *commonpb.UserId
+	JoinedAt    time.Time
 }
 
 type Store interface {

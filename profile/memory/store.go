@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"sync"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -22,6 +23,7 @@ type InMemoryStore struct {
 	phoneHashesByUser      map[string][]byte
 	linkedForPaymentByUser map[string]bool
 	xProfilesByUser        map[string]*profilepb.XProfile
+	createdAtByUser        map[string]time.Time
 }
 
 func NewInMemory() profile.Store {
@@ -30,7 +32,20 @@ func NewInMemory() profile.Store {
 		phoneHashesByUser:      make(map[string][]byte),
 		linkedForPaymentByUser: make(map[string]bool),
 		xProfilesByUser:        make(map[string]*profilepb.XProfile),
+		createdAtByUser:        make(map[string]time.Time),
 	}
+}
+
+// ensureProfile returns the profile for key, creating an empty one (and
+// recording the user's join timestamp) if it does not yet exist.
+func (m *InMemoryStore) ensureProfile(key string) *profilepb.UserProfile {
+	p, ok := m.profiles[key]
+	if !ok {
+		p = &profilepb.UserProfile{}
+		m.profiles[key] = p
+		m.createdAtByUser[key] = time.Now()
+	}
+	return p
 }
 
 func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, includePrivateProfile bool) (*profilepb.UserProfile, error) {
@@ -69,15 +84,10 @@ func (m *InMemoryStore) SetDisplayName(_ context.Context, id *commonpb.UserId, d
 	m.Lock()
 	defer m.Unlock()
 
-	profile, ok := m.profiles[userIDCacheKey(id)]
-	if !ok {
-		profile = &profilepb.UserProfile{}
-	}
+	profile := m.ensureProfile(userIDCacheKey(id))
 
 	// TODO: Validate eventually
 	profile.DisplayName = displayName
-
-	m.profiles[userIDCacheKey(id)] = profile
 
 	return nil
 }
@@ -98,14 +108,10 @@ func (m *InMemoryStore) LinkPhoneNumber(_ context.Context, id *commonpb.UserId, 
 		}
 	}
 
-	profile, ok := m.profiles[targetKey]
-	if !ok {
-		profile = &profilepb.UserProfile{}
-	}
+	profile := m.ensureProfile(targetKey)
 
 	profile.PhoneNumber = &phonepb.PhoneNumber{Value: phoneNumber}
 
-	m.profiles[targetKey] = profile
 	m.phoneHashesByUser[targetKey] = phoneNumberHash.Value
 
 	return nil
@@ -206,6 +212,7 @@ func (m *InMemoryStore) getPhonesByHashes(hashes []*commonpb.Hash, forPaymentOnl
 		out = append(out, &profile.PhoneForPayment{
 			PhoneNumber: &phonepb.PhoneNumber{Value: p.PhoneNumber.Value},
 			UserID:      &commonpb.UserId{Value: userID},
+			JoinedAt:    m.createdAtByUser[key],
 		})
 	}
 	return out, nil
@@ -285,14 +292,9 @@ func (m *InMemoryStore) LinkEmailAddress(_ context.Context, id *commonpb.UserId,
 		}
 	}
 
-	profile, ok := m.profiles[targetKey]
-	if !ok {
-		profile = &profilepb.UserProfile{}
-	}
+	profile := m.ensureProfile(targetKey)
 
 	profile.EmailAddress = &emailpb.EmailAddress{Value: emailAddress}
-
-	m.profiles[targetKey] = profile
 
 	return nil
 }
@@ -383,6 +385,7 @@ func (m *InMemoryStore) reset() {
 	m.phoneHashesByUser = make(map[string][]byte)
 	m.linkedForPaymentByUser = make(map[string]bool)
 	m.xProfilesByUser = make(map[string]*profilepb.XProfile)
+	m.createdAtByUser = make(map[string]time.Time)
 }
 
 func userIDCacheKey(id *commonpb.UserId) string {

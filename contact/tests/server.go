@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	contactpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/contact/v1"
@@ -438,6 +439,7 @@ func testServer_GetFlipcashContacts_OK(t *testing.T, accounts account.Store, pro
 
 	var got []string
 	dmChatIDByPhone := make(map[string]*commonpb.ChatId)
+	joinTsByPhone := make(map[string]*timestamppb.Timestamp)
 	for {
 		resp, err := stream.Recv()
 		if err == io.EOF {
@@ -448,6 +450,7 @@ func testServer_GetFlipcashContacts_OK(t *testing.T, accounts account.Store, pro
 		for _, c := range resp.Contacts {
 			got = append(got, c.Phone.Value)
 			dmChatIDByPhone[c.Phone.Value] = c.DmChatId
+			joinTsByPhone[c.Phone.Value] = c.JoinTs
 		}
 	}
 
@@ -458,6 +461,10 @@ func testServer_GetFlipcashContacts_OK(t *testing.T, accounts account.Store, pro
 		chat.MustDeriveDmChatID(f.userID, flipcashUserA).Value,
 		dmChatIDByPhone[phoneA].Value,
 	)
+
+	// The join timestamp reflects when the contact joined Flipcash.
+	require.NotNil(t, joinTsByPhone[phoneA])
+	require.False(t, joinTsByPhone[phoneA].AsTime().IsZero())
 }
 
 func zeroChecksum() []byte {

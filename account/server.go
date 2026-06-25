@@ -92,6 +92,10 @@ var (
 		accountpb.UserFlags_BACKPACK,
 		accountpb.UserFlags_MANUAL_DEPOSIT,
 	}
+
+	minVersionForPhoneNumberSendByPlatform = map[commonpb.Platform]*ocp_client.Version{
+		commonpb.Platform_APPLE: {Major: 1, Minor: 13, Patch: 0},
+	}
 )
 
 type Server struct {
@@ -267,6 +271,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 			MinimumHolderValue:               MinHolderValue,
 			RequireCoinbaseEmailVerification: requireCoinbaseEmailVerification,
+			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
 		},
 	}, nil
 }
@@ -302,8 +307,22 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 			MinimumHolderValue:               MinHolderValue,
 			RequireCoinbaseEmailVerification: requireCoinbaseEmailVerification,
+			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
 		},
 	}, nil
+}
+
+func isPhoneNumberSendEnabled(ctx context.Context, platform commonpb.Platform) bool {
+	minVersion, ok := minVersionForPhoneNumberSendByPlatform[platform]
+	if !ok {
+		return false
+	}
+
+	clientVersion := getClientVersion(ctx)
+	if clientVersion == nil {
+		return false
+	}
+	return clientVersion.GreaterThanOrEqualTo(minVersion)
 }
 
 func getSupportedOnRampProviders(ctx context.Context, countryCode *commonpb.CountryCode, platform commonpb.Platform) []accountpb.UserFlags_OnRampProvider {
@@ -328,13 +347,7 @@ func getSupportedOnRampProviders(ctx context.Context, countryCode *commonpb.Coun
 		return defaultSupported
 	}
 
-	var clientVersion *ocp_client.Version
-	if userAgent, err := ocp_client.GetUserAgent(ctx, rpc.UserAgentName); err == nil {
-		clientVersion = &userAgent.Version
-	}
-	if userAgent, err := ocp_client.GetUserAgent(ctx, rpc.UserAgentName+"/Core"); err == nil {
-		clientVersion = &userAgent.Version
-	}
+	clientVersion := getClientVersion(ctx)
 
 	filtered := make([]accountpb.UserFlags_OnRampProvider, 0, len(byPlatform))
 	for _, entry := range byPlatform {
@@ -350,4 +363,17 @@ func getSupportedOnRampProviders(ctx context.Context, countryCode *commonpb.Coun
 	allSupported = append(allSupported, filtered...)         // Country and platform specific providers take priority
 	allSupported = append(allSupported, defaultSupported...) // Followed by default global providers
 	return allSupported
+}
+
+// getClientVersion extracts the client's version from the gRPC user-agent, or
+// returns nil if no parseable Flipcash user-agent is present.
+func getClientVersion(ctx context.Context) *ocp_client.Version {
+	var clientVersion *ocp_client.Version
+	if userAgent, err := ocp_client.GetUserAgent(ctx, rpc.UserAgentName); err == nil {
+		clientVersion = &userAgent.Version
+	}
+	if userAgent, err := ocp_client.GetUserAgent(ctx, rpc.UserAgentName+"/Core"); err == nil {
+		clientVersion = &userAgent.Version
+	}
+	return clientVersion
 }

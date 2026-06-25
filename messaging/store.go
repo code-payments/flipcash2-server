@@ -90,6 +90,28 @@ type Store interface {
 		countsTowardUnread bool,
 	) (msg *Message, created bool, err error)
 
+	// EditMessage replaces a message's content with the given content and stamps
+	// editedTs as its last-edited time, advances the chat's event-log head, and
+	// re-stamps the message's event_sequence to that new head — the message ID and
+	// unread_seq are left untouched, so the per-chat ID sequence stays gapless. Like
+	// DeleteMessage it advances the event-log head without minting a message ID, so
+	// event_sequence diverges from message ID.
+	//
+	// It is an optimistic-concurrency operation: the edit is applied only if the
+	// message's current event_sequence still equals expectedEventSeq. On a mismatch
+	// nothing is modified and it returns the message's current state alongside
+	// ErrEventSequenceConflict; there is no last-writer-wins path. It returns
+	// ErrMessageNotFound if no such message exists. On success it returns the edited
+	// message at its new event_sequence.
+	EditMessage(
+		ctx context.Context,
+		chatID *commonpb.ChatId,
+		messageID *messagingpb.MessageId,
+		content []*messagingpb.Content,
+		editedTs time.Time,
+		expectedEventSeq uint64,
+	) (*Message, error)
+
 	// DeleteMessage tombstones a message: it replaces the message's content with a
 	// single DeletedContent (carrying deletedTs and deletedBy), advances the chat's
 	// event-log head, and re-stamps the message's event_sequence to that new head —

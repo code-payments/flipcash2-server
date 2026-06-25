@@ -56,6 +56,7 @@ type Message struct {
 	Timestamp     time.Time
 	UnreadSeq     uint64
 	EventSequence uint64
+	LastEditedTs  time.Time // zero until the message is edited; a delete leaves it untouched
 }
 
 // Clone returns a deep copy of the message.
@@ -76,6 +77,7 @@ func (m *Message) Clone() *Message {
 		Timestamp:     m.Timestamp,
 		UnreadSeq:     m.UnreadSeq,
 		EventSequence: m.EventSequence,
+		LastEditedTs:  m.LastEditedTs,
 	}
 }
 
@@ -148,6 +150,28 @@ func (m *Message) IsDeletable() bool {
 // already-deleted message is an idempotent no-op (see the DeleteMessage RPC).
 func (m *Message) IsDeleted() bool {
 	return len(m.Content) > 0 && m.Content[0].GetDeleted() != nil
+}
+
+// IsEditable reports whether this message's content may be replaced via
+// EditMessage. Like IsDeletable this is a whitelist of user-authored
+// conversational content, so content types added later (and non-conversational
+// ones like system messages) are non-editable until explicitly allowed. Cash
+// payment messages are excluded, as is a Deleted tombstone — both are terminal
+// records, not editable chat content; the DeleteMessage tombstone falls through to
+// the default here, so editing an already-deleted message is rejected with
+// CANNOT_EDIT.
+func (m *Message) IsEditable() bool {
+	if len(m.Content) == 0 {
+		return false
+	}
+	switch m.Content[0].Type.(type) {
+	case *messagingpb.Content_Text,
+		*messagingpb.Content_Media,
+		*messagingpb.Content_Reply:
+		return true
+	default:
+		return false
+	}
 }
 
 // Reactor is a single user's reaction to a message, with the time they reacted.
@@ -228,6 +252,9 @@ func (m *Message) ToProto() *messagingpb.Message {
 	if m.SenderID != nil {
 		out.SenderId = &commonpb.UserId{Value: append([]byte(nil), m.SenderID.Value...)}
 	}
+	if !m.LastEditedTs.IsZero() {
+		out.LastEditedTs = timestamppb.New(m.LastEditedTs)
+	}
 	return out
 }
 
@@ -273,6 +300,24 @@ func NewMessageDeletedEvent(msg *messagingpb.Message) *messagingpb.Event {
 		Ts:       msg.Content[0].GetDeleted().DeletedTs,
 		Mutations: []*messagingpb.Mutation{{
 			Type: &messagingpb.Mutation_MessageDeleted{MessageDeleted: msg},
+		}},
+	}
+}
+
+// NewMessageEditedEvent builds the event-log entry for an edited message: a single
+// Event carrying one message_edited mutation. The event's sequence is the message's
+// (now advanced) event_sequence and its count is 1 — an edit consumes exactly one
+// event-log point, advancing the event-log head without minting a message ID. The
+// mutation carries the materialized message (content replaced, last_edited_ts set),
+// and the event's ts is that edit time. msg is referenced, not copied; callers pass
+// a proto they own.
+func NewMessageEditedEvent(msg *messagingpb.Message) *messagingpb.Event {
+	return &messagingpb.Event{
+		Sequence: msg.EventSequence,
+		Count:    1,
+		Ts:       msg.LastEditedTs,
+		Mutations: []*messagingpb.Mutation{{
+			Type: &messagingpb.Mutation_MessageEdited{MessageEdited: msg},
 		}},
 	}
 }

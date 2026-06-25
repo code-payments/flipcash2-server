@@ -88,8 +88,9 @@ const (
 	attrContent       = "content"
 	attrTS            = "ts"
 	attrUnreadSeq     = "unread_seq"
-	attrEventSeq      = "event_seq"  // msg# row: the message's current event-log sequence (== seq while every event is a new message); the client's optimistic-concurrency token
-	attrMessageID     = "message_id" // evt# row: the message this event concerns (msg# rows encode it in the sk instead)
+	attrEventSeq      = "event_seq"      // msg# row: the message's current event-log sequence (== seq while every event is a new message); the client's optimistic-concurrency token
+	attrLastEditedTs  = "last_edited_ts" // msg# row: when the message's content was last edited (absent until edited); a delete leaves it untouched
+	attrMessageID     = "message_id"     // evt# row: the message this event concerns (msg# rows encode it in the sk instead)
 	attrEventType     = "event_type" // evt# row: the messaging.EventType recorded (create/edit/delete)
 	attrExpiresAt     = "expires_at" // DynamoDB TTL attribute (epoch seconds)
 
@@ -263,6 +264,114 @@ func (s *store) PutMessage(
 		return nil, false, err
 	}
 	return nil, false, fmt.Errorf("put message exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
+}
+
+func (s *store) EditMessage(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	content []*messagingpb.Content,
+	editedTs time.Time,
+	expectedEventSeq uint64,
+) (*messaging.Message, error) {
+	contentBlobs, err := marshalContent(content)
+	if err != nil {
+		return nil, err
+	}
+
+	for attempt := 0; attempt < maxPutMessageAttempts; attempt++ {
+		// The event-log head lives on the counter row. The edit advances it by one
+		// without touching last_seq (no new message ID), so event_seq diverges from
+		// the message ID here. Read it strongly-consistent, then lock on it below.
+		head, err := s.lastEventSeq(ctx, chatID)
+		if err != nil {
+			return nil, err
+		}
+		if head == 0 {
+			return nil, messaging.ErrMessageNotFound // no counter → no messages
+		}
+		newEventSeq := head + 1
+
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: []types.TransactWriteItem{
+				// [0] advance the event-log head under an optimistic lock, serializing
+				// this edit against concurrent sends and other edits/deletes (all of
+				// which advance last_event_seq). last_seq is deliberately left alone.
+				{Update: &types.Update{
+					TableName:           aws.String(s.messagesTable),
+					Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skCounter)},
+					UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :newEventSeq", attrLastEventSeq)),
+					ConditionExpression: aws.String(fmt.Sprintf("%s = :head", attrLastEventSeq)),
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":newEventSeq": avN(newEventSeq),
+						":head":        avN(head),
+					},
+				}},
+				// [1] replace the content, stamp the edit time, and re-stamp the
+				// message's event_seq to the new head (its current-state token), guarded
+				// on the caller's expected event_sequence — a stale expectation is a
+				// CONFLICT, never a clobber. ALL_OLD lets us tell a missing message from
+				// a stale one without a second read.
+				{Update: &types.Update{
+					TableName:           aws.String(s.messagesTable),
+					Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(msgSK(messageID.Value))},
+					UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :content, %s = :newEventSeq, %s = :editedTs", attrContent, attrEventSeq, attrLastEditedTs)),
+					ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s) AND %s = :expected", attrPK, attrEventSeq)),
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":content":     &types.AttributeValueMemberL{Value: contentBlobs},
+						":newEventSeq": avN(newEventSeq),
+						":editedTs":    avN(uint64(editedTs.UnixNano())),
+						":expected":    avN(expectedEventSeq),
+					},
+					ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+				}},
+				// [2] append the edit to the event log (evt#<newEventSeq>) so the
+				// catch-up read (GetEventDelta) joins and surfaces it. Minted under the
+				// same counter lock as [0], so its event_seq is unique.
+				{Put: &types.Put{
+					TableName:           aws.String(s.messagesTable),
+					Item:                s.eventItem(chatID, newEventSeq, messageID.Value, messaging.EventTypeMessageEdited, editedTs),
+					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+				}},
+			},
+		})
+		if err == nil {
+			// Re-read strongly-consistent: an eventually-consistent read right after
+			// the commit can still return the pre-edit content/event_seq, which would
+			// surface stale state to the caller and to the broadcast.
+			return s.getMessage(ctx, chatID, messageID, true) // canonical edited state
+		}
+
+		var tce *types.TransactionCanceledException
+		if !errors.As(err, &tce) || len(tce.CancellationReasons) != 3 {
+			return nil, err
+		}
+		// reasons index matches TransactItems order: [0]=counter, [1]=message,
+		// [2]=event-log entry.
+		counterReason, msgReason, eventReason := tce.CancellationReasons[0], tce.CancellationReasons[1], tce.CancellationReasons[2]
+
+		// A failed message condition is terminal: either the message is gone or the
+		// caller's expected event_sequence is stale. Distinguish via the ALL_OLD item
+		// carried on the cancellation reason.
+		if aws.ToString(msgReason.Code) == codeConditionalCheckFailed {
+			if len(msgReason.Item) == 0 {
+				return nil, messaging.ErrMessageNotFound
+			}
+			current, err := messageFromItem(chatID, msgReason.Item)
+			if err != nil {
+				return nil, err
+			}
+			return current, messaging.ErrEventSequenceConflict
+		}
+		// The head moved under us (a concurrent send/edit/delete that didn't touch this
+		// message — which fails the counter lock and, in lockstep, the evt# guard), or
+		// a transient transaction conflict: re-read the head and retry.
+		if isRetryable([]string{aws.ToString(counterReason.Code), aws.ToString(msgReason.Code), aws.ToString(eventReason.Code)}) {
+			continue
+		}
+		return nil, err
+	}
+	return nil, fmt.Errorf("edit message exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
 }
 
 func (s *store) DeleteMessage(
@@ -937,6 +1046,14 @@ func messageFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeVal
 	}
 	if sender := asB(item[attrSenderID]); len(sender) > 0 {
 		msg.SenderID = &commonpb.UserId{Value: append([]byte(nil), sender...)}
+	}
+	// last_edited_ts is absent until the message is edited.
+	if _, ok := item[attrLastEditedTs]; ok {
+		editedNanos, err := parseInt(item[attrLastEditedTs])
+		if err != nil {
+			return nil, err
+		}
+		msg.LastEditedTs = time.Unix(0, editedNanos).UTC()
 	}
 	return msg, nil
 }

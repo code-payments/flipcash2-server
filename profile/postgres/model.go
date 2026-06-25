@@ -236,10 +236,11 @@ func dbGetPhonesByHashesInternal(ctx context.Context, pool *pgxpool.Pool, hashes
 	}
 
 	var rows []struct {
-		ID    string `db:"id"`
-		Phone string `db:"phoneNumber"`
+		ID        string    `db:"id"`
+		Phone     string    `db:"phoneNumber"`
+		CreatedAt time.Time `db:"createdAt"`
 	}
-	query := `SELECT "id", "phoneNumber" FROM ` + usersTableName + ` WHERE "phoneNumber" IS NOT NULL AND "phoneNumberHash" = ANY($1::text[])`
+	query := `SELECT "id", "phoneNumber", "createdAt" FROM ` + usersTableName + ` WHERE "phoneNumber" IS NOT NULL AND "phoneNumberHash" = ANY($1::text[])`
 	if forPaymentOnly {
 		query += ` AND "isPhoneNumberLinkedForPayment" = TRUE`
 	}
@@ -260,6 +261,7 @@ func dbGetPhonesByHashesInternal(ctx context.Context, pool *pgxpool.Pool, hashes
 		out = append(out, &profile.PhoneForPayment{
 			PhoneNumber: &phonepb.PhoneNumber{Value: r.Phone},
 			UserID:      &commonpb.UserId{Value: rawID},
+			JoinedAt:    r.CreatedAt,
 		})
 	}
 	return out, nil

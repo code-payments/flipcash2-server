@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/cloudfront/sign v1.11.6
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.59.0
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.104.0
+	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.42.3
 	github.com/aws/smithy-go v1.27.1
 	github.com/buckket/go-blurhash v1.1.0
 	github.com/code-payments/flipcash2-protobuf-api v1.14.1-0.20260625181127-b730e573575c

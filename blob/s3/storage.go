@@ -26,6 +26,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/cloudfront/sign"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	smithy "github.com/aws/smithy-go"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -101,6 +102,38 @@ func NewStorage(client *s3.Client, cfg Config) *Storage {
 		client: client,
 		signer: sign.NewURLSigner(cfg.CloudFrontKeyID, cfg.PrivateKey),
 	}
+}
+
+// LoadCloudFrontPrivateKey fetches the PEM-encoded RSA private key used to sign
+// CloudFront download URLs from AWS Secrets Manager and parses it into the
+// *rsa.PrivateKey that Config.PrivateKey expects. secretID is the secret's name
+// or ARN; the secret value must be an unencrypted PKCS#1 PEM (the "RSA PRIVATE
+// KEY" block produced by `openssl genrsa`). The caller constructs and configures
+// the *secretsmanager.Client, mirroring how NewStorage takes a ready *s3.Client.
+func LoadCloudFrontPrivateKey(ctx context.Context, client *secretsmanager.Client, secretID string) (*rsa.PrivateKey, error) {
+	out, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(secretID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get secret %q: %w", secretID, err)
+	}
+
+	// The PEM may be stored as a string secret or as binary; support both.
+	var pem []byte
+	switch {
+	case out.SecretString != nil:
+		pem = []byte(*out.SecretString)
+	case len(out.SecretBinary) > 0:
+		pem = out.SecretBinary
+	default:
+		return nil, fmt.Errorf("secret %q has no value", secretID)
+	}
+
+	key, err := sign.LoadPEMPrivKey(strings.NewReader(string(pem)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse cloudfront private key: %w", err)
+	}
+	return key, nil
 }
 
 func (s *Storage) PresignUpload(ctx context.Context, key, mimeType string, sizeBytes uint64) (*blobpb.UploadTarget, error) {

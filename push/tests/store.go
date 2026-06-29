@@ -187,7 +187,8 @@ func testFilterUsersWithTokens(t *testing.T, store push.Store) {
 func testClaimGainPush(t *testing.T, store push.Store) {
 	ctx := context.Background()
 
-	const mint = "mint1"
+	mint := &commonpb.PublicKey{Value: []byte("mint1")}
+	otherMint := &commonpb.PublicKey{Value: []byte("mint2")}
 	const bigCooldown = time.Hour
 
 	// No state recorded yet.
@@ -249,7 +250,7 @@ func testClaimGainPush(t *testing.T, store push.Store) {
 	assert.EqualValues(t, 20, state.AllTimeHighSlot)
 
 	// A different mint is tracked independently.
-	granted, state, err = store.ClaimGainPush(ctx, "mint2", 1, 1, bigCooldown)
+	granted, state, err = store.ClaimGainPush(ctx, otherMint, 1, 1, bigCooldown)
 	require.NoError(t, err)
 	assert.True(t, granted)
 	require.NotNil(t, state)

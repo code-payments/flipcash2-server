@@ -46,7 +46,7 @@ type TokenStore interface {
 // last granted gain push, NOT a true high-water mark: it only advances when a
 // gain push is actually granted (see CurrencyStateStore.ClaimGainPush).
 type CurrencyState struct {
-	Mint              string
+	Mint              *commonpb.PublicKey
 	AllTimeHighSupply uint64
 	AllTimeHighSlot   uint64
 	LastGainPushAt    *time.Time // nil if a gain push has never been granted for the mint
@@ -66,11 +66,11 @@ type CurrencyStateStore interface {
 	// Whenever err is nil, the returned CurrencyState reflects the resulting stored
 	// state — the freshly written values when granted, or the existing values when
 	// not — so callers can populate a local cache regardless of the outcome.
-	ClaimGainPush(ctx context.Context, mint string, supply, slot uint64, cooldown time.Duration) (granted bool, state *CurrencyState, err error)
+	ClaimGainPush(ctx context.Context, mint *commonpb.PublicKey, supply, slot uint64, cooldown time.Duration) (granted bool, state *CurrencyState, err error)
 
 	// GetCurrencyState returns the stored push state for a mint, or
 	// ErrCurrencyStateNotFound if none has been recorded yet.
-	GetCurrencyState(ctx context.Context, mint string) (*CurrencyState, error)
+	GetCurrencyState(ctx context.Context, mint *commonpb.PublicKey) (*CurrencyState, error)
 }
 
 // Store is the combined push persistence surface, implemented by each backend.

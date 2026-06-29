@@ -79,16 +79,16 @@ func (s *store) DeleteToken(ctx context.Context, tokenType pushpb.TokenType, tok
 	return dbDeleteToken(ctx, s.pool, tokenType, token)
 }
 
-func (s *store) ClaimGainPush(ctx context.Context, mint string, supply, slot uint64, cooldown time.Duration) (bool, *push.CurrencyState, error) {
+func (s *store) ClaimGainPush(ctx context.Context, mint *commonpb.PublicKey, supply, slot uint64, cooldown time.Duration) (bool, *push.CurrencyState, error) {
 	return dbClaimGainPush(ctx, s.pool, mint, supply, slot, cooldown)
 }
 
-func (s *store) GetCurrencyState(ctx context.Context, mint string) (*push.CurrencyState, error) {
+func (s *store) GetCurrencyState(ctx context.Context, mint *commonpb.PublicKey) (*push.CurrencyState, error) {
 	model, err := dbGetCurrencyState(ctx, s.pool, mint)
 	if err != nil {
 		return nil, err
 	}
-	return fromCurrencyStateModel(model), nil
+	return fromCurrencyStateModel(model)
 }
 
 func (s *store) reset() {

@@ -120,12 +120,13 @@ func (m *memory) DeleteToken(_ context.Context, tokenType pushpb.TokenType, toke
 	return nil
 }
 
-func (m *memory) ClaimGainPush(_ context.Context, mint string, supply, slot uint64, cooldown time.Duration) (bool, *push.CurrencyState, error) {
+func (m *memory) ClaimGainPush(_ context.Context, mint *commonpb.PublicKey, supply, slot uint64, cooldown time.Duration) (bool, *push.CurrencyState, error) {
 	m.Lock()
 	defer m.Unlock()
 
+	key := string(mint.Value)
 	now := time.Now()
-	state, ok := m.currencyStates[mint]
+	state, ok := m.currencyStates[key]
 
 	isNewHigh := !ok || supply > state.AllTimeHighSupply
 	cooldownElapsed := !ok || state.LastGainPushAt == nil || now.Sub(*state.LastGainPushAt) >= cooldown
@@ -142,15 +143,15 @@ func (m *memory) ClaimGainPush(_ context.Context, mint string, supply, slot uint
 		AllTimeHighSlot:   slot,
 		LastGainPushAt:    &grantedAt,
 	}
-	m.currencyStates[mint] = state
+	m.currencyStates[key] = state
 	return true, cloneCurrencyState(state), nil
 }
 
-func (m *memory) GetCurrencyState(_ context.Context, mint string) (*push.CurrencyState, error) {
+func (m *memory) GetCurrencyState(_ context.Context, mint *commonpb.PublicKey) (*push.CurrencyState, error) {
 	m.RLock()
 	defer m.RUnlock()
 
-	state, ok := m.currencyStates[mint]
+	state, ok := m.currencyStates[string(mint.Value)]
 	if !ok {
 		return nil, push.ErrCurrencyStateNotFound
 	}

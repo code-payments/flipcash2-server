@@ -179,7 +179,8 @@ func (i *Integration) notifyHoldersOfGain(ctx context.Context, mint *ocp_common.
 		return
 	}
 
-	granted, state, err := i.pushes.ClaimGainPush(ctx, mintBase58, liveReserve.SupplyFromBonding, liveReserve.Slot, i.gainPushCooldown)
+	protoMint := &commonpb.PublicKey{Value: mint.PublicKey().ToBytes()}
+	granted, state, err := i.pushes.ClaimGainPush(ctx, protoMint, liveReserve.SupplyFromBonding, liveReserve.Slot, i.gainPushCooldown)
 	if err != nil {
 		log.Warn("failed to claim gain push", zap.Error(err))
 		return

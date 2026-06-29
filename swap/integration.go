@@ -34,7 +34,7 @@ type Integration struct {
 	log *zap.Logger
 
 	accounts         account.Store
-	pushTokens       push.TokenStore
+	pushes           push.Store
 	settings         settings.Store
 	ocpData          ocp_data.Provider
 	ocpExchangeRates ocp_currency_exchange.Store
@@ -46,13 +46,19 @@ type Integration struct {
 	gainPushCooldown         time.Duration
 	mintsProcessingForGainMu sync.Mutex
 	mintsProcessingForGain   map[string]struct{}
-	mintLastGainPushAt       map[string]time.Time
+	gainPushCache            map[string]cachedGainState
+}
+
+// cachedGainState is this instance's local view of a mint's gain-push gate.
+type cachedGainState struct {
+	lastPushAt    time.Time
+	highestSupply uint64 // circulating supply (quarks) at lastPushAt
 }
 
 func NewIntegration(
 	log *zap.Logger,
 	accounts account.Store,
-	pushTokens push.TokenStore,
+	pushes push.Store,
 	settings settings.Store,
 	ocpData ocp_data.Provider,
 	ocpExchangeRates ocp_currency_exchange.Store,
@@ -65,7 +71,7 @@ func NewIntegration(
 		log: log,
 
 		accounts:         accounts,
-		pushTokens:       pushTokens,
+		pushes:           pushes,
 		settings:         settings,
 		ocpData:          ocpData,
 		ocpExchangeRates: ocpExchangeRates,
@@ -76,7 +82,7 @@ func NewIntegration(
 		enableGainPushes:       enableGainPushes,
 		gainPushCooldown:       gainPushCooldown,
 		mintsProcessingForGain: make(map[string]struct{}),
-		mintLastGainPushAt:     make(map[string]time.Time),
+		gainPushCache:          make(map[string]cachedGainState),
 	}
 }
 
@@ -131,11 +137,18 @@ func (i *Integration) notifyHoldersOfGain(ctx context.Context, mint *ocp_common.
 	log := i.log.With(zap.String("mint", mintBase58))
 
 	i.mintsProcessingForGainMu.Lock()
+	// Local short-circuit so concurrent buys for the same mint on this instance
+	// don't each kick off a holder enumeration.
 	if _, ok := i.mintsProcessingForGain[mintBase58]; ok {
 		i.mintsProcessingForGainMu.Unlock()
 		return
 	}
-	if lastPush, ok := i.mintLastGainPushAt[mintBase58]; ok && i.gainPushCooldown > 0 && time.Since(lastPush) < i.gainPushCooldown {
+	// Best-effort in-memory cooldown gate: if this instance already sent a gain
+	// push for this mint within the cooldown window, skip the Postgres round trip
+	// (and the reserve lookup) entirely. Postgres still enforces the cooldown
+	// authoritatively (and across instances); this only avoids redundant work.
+	cached, hasCached := i.gainPushCache[mintBase58]
+	if hasCached && i.gainPushCooldown > 0 && time.Since(cached.lastPushAt) < i.gainPushCooldown {
 		i.mintsProcessingForGainMu.Unlock()
 		return
 	}
@@ -145,9 +158,47 @@ func (i *Integration) notifyHoldersOfGain(ctx context.Context, mint *ocp_common.
 	defer func() {
 		i.mintsProcessingForGainMu.Lock()
 		delete(i.mintsProcessingForGain, mintBase58)
-		i.mintLastGainPushAt[mintBase58] = time.Now()
 		i.mintsProcessingForGainMu.Unlock()
 	}()
+
+	// Only notify holders when the currency reaches a new all-time high in
+	// circulating supply, rate-limited per mint by the gain push cooldown. The
+	// store performs this check-and-update atomically (and consistently across
+	// server instances); the all-time high only advances when a push is granted.
+	liveReserve, err := i.ocpReserveStates.GetLiveReserve(ctx, mintBase58)
+	if err != nil {
+		log.Warn("failed to get live reserve state", zap.Error(err))
+		return
+	}
+
+	// If the live supply has not exceeded the highest supply we've already pushed
+	// for, it cannot be a new all-time high, so skip the Postgres round trip.
+	// Postgres only advances the all-time high on a granted push, so our cached
+	// high never exceeds the stored value — making this a safe suppression.
+	if hasCached && liveReserve.SupplyFromBonding <= cached.highestSupply {
+		return
+	}
+
+	granted, state, err := i.pushes.ClaimGainPush(ctx, mintBase58, liveReserve.SupplyFromBonding, liveReserve.Slot, i.gainPushCooldown)
+	if err != nil {
+		log.Warn("failed to claim gain push", zap.Error(err))
+		return
+	}
+
+	// Populate the cache from the authoritative stored state, whether or not the
+	// push was granted, so subsequent buys within the cooldown or below this high
+	// skip the round trip above. The returned state reflects other instances'
+	// updates too (a higher all-time high, or a more recent push elsewhere).
+	if state != nil && state.LastGainPushAt != nil {
+		entry := cachedGainState{highestSupply: state.AllTimeHighSupply, lastPushAt: *state.LastGainPushAt}
+		i.mintsProcessingForGainMu.Lock()
+		i.gainPushCache[mintBase58] = entry
+		i.mintsProcessingForGainMu.Unlock()
+	}
+
+	if !granted {
+		return
+	}
 
 	// Get all exchange rates for computing gains in each user's preferred region
 	exchangeRates, err := i.ocpExchangeRates.GetAllExchangeRates(ctx, time.Now())
@@ -225,7 +276,7 @@ func (i *Integration) notifyHoldersOfGainBatch(ctx context.Context, log *zap.Log
 	for _, userID := range userIDMap {
 		allUserIDs = append(allUserIDs, userID)
 	}
-	usersWithTokens, err := i.pushTokens.FilterUsersWithTokens(ctx, allUserIDs...)
+	usersWithTokens, err := i.pushes.FilterUsersWithTokens(ctx, allUserIDs...)
 	if err != nil {
 		log.Warn("failed to filter users with push tokens", zap.Error(err))
 		return

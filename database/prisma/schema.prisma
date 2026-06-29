@@ -69,6 +69,24 @@ model PushToken {
   @@map("flipcash_pushtokens")
 }
 
+model CurrencyPushState {
+  // Fields
+
+  mint              String  @id            // currency creator mint, base58 encoded
+  allTimeHighSupply BigInt  @default(0) // circulating supply (quarks) at the last granted gain push
+  allTimeHighSlot   BigInt  @default(0) // slot the all-time high was observed at (observability)
+  lastGainPushAt    DateTime? // last time a gain push wave was granted; null if never
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+
+  // Constraints
+
+  @@map("flipcash_currency_push_states")
+}
+
 model Rendezvous {
   // Fields
 

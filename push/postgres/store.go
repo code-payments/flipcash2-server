@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -15,7 +16,7 @@ type store struct {
 	pool *pgxpool.Pool
 }
 
-func NewInPostgres(pool *pgxpool.Pool) push.TokenStore {
+func NewInPostgres(pool *pgxpool.Pool) push.Store {
 	return &store{
 		pool: pool,
 	}
@@ -29,7 +30,7 @@ func (s *store) GetTokens(ctx context.Context, userID *commonpb.UserId) ([]push.
 
 	res := make([]push.Token, len(models))
 	for i, model := range models {
-		res[i], err = fromModel(model)
+		res[i], err = fromTokenModel(model)
 		if err != nil {
 			return nil, err
 		}
@@ -45,7 +46,7 @@ func (s *store) GetTokensBatch(ctx context.Context, userIDs ...*commonpb.UserId)
 
 	res := make([]push.Token, len(models))
 	for i, model := range models {
-		res[i], err = fromModel(model)
+		res[i], err = fromTokenModel(model)
 		if err != nil {
 			return nil, err
 		}
@@ -59,7 +60,7 @@ func (s *store) AddToken(ctx context.Context, userID *commonpb.UserId, appInstal
 		Token:        tokenValue,
 		AppInstallID: appInstallID.Value,
 	}
-	model, err := toModel(userID, token)
+	model, err := toTokenModel(userID, token)
 	if err != nil {
 		return err
 	}
@@ -78,9 +79,23 @@ func (s *store) DeleteToken(ctx context.Context, tokenType pushpb.TokenType, tok
 	return dbDeleteToken(ctx, s.pool, tokenType, token)
 }
 
-func (s *store) reset() {
-	_, err := s.pool.Exec(context.Background(), "DELETE FROM "+pushTokensTableName)
+func (s *store) ClaimGainPush(ctx context.Context, mint string, supply, slot uint64, cooldown time.Duration) (bool, *push.CurrencyState, error) {
+	return dbClaimGainPush(ctx, s.pool, mint, supply, slot, cooldown)
+}
+
+func (s *store) GetCurrencyState(ctx context.Context, mint string) (*push.CurrencyState, error) {
+	model, err := dbGetCurrencyState(ctx, s.pool, mint)
 	if err != nil {
-		panic(err)
+		return nil, err
+	}
+	return fromCurrencyStateModel(model), nil
+}
+
+func (s *store) reset() {
+	for _, table := range []string{pushTokensTableName, currencyStatesTableName} {
+		_, err := s.pool.Exec(context.Background(), "DELETE FROM "+table)
+		if err != nil {
+			panic(err)
+		}
 	}
 }

@@ -155,13 +155,17 @@ type currencyStateModel struct {
 	UpdatedAt         time.Time  `db:"updatedAt"`
 }
 
-func fromCurrencyStateModel(m *currencyStateModel) *push.CurrencyState {
+func fromCurrencyStateModel(m *currencyStateModel) (*push.CurrencyState, error) {
+	mint, err := pg.Decode(m.Mint)
+	if err != nil {
+		return nil, err
+	}
 	return &push.CurrencyState{
-		Mint:              m.Mint,
+		Mint:              &commonpb.PublicKey{Value: mint},
 		AllTimeHighSupply: uint64(m.AllTimeHighSupply),
 		AllTimeHighSlot:   uint64(m.AllTimeHighSlot),
 		LastGainPushAt:    m.LastGainPushAt,
-	}
+	}, nil
 }
 
 // dbClaimGainPush performs the atomic new-all-time-high + cooldown gate. The row
@@ -175,7 +179,8 @@ func fromCurrencyStateModel(m *currencyStateModel) *push.CurrencyState {
 // (granted) and falls back to the stored values otherwise. The FULL OUTER JOIN
 // keeps the single result row in the first-insert case, where no prior row
 // exists.
-func dbClaimGainPush(ctx context.Context, pool *pgxpool.Pool, mint string, supply, slot uint64, cooldown time.Duration) (bool, *push.CurrencyState, error) {
+func dbClaimGainPush(ctx context.Context, pool *pgxpool.Pool, mint *commonpb.PublicKey, supply, slot uint64, cooldown time.Duration) (bool, *push.CurrencyState, error) {
+	encodedMint := pg.Encode(mint.Value, pg.Base58)
 	var (
 		granted        bool
 		highSupply     int64
@@ -210,7 +215,7 @@ func dbClaimGainPush(ctx context.Context, pool *pgxpool.Pool, mint string, suppl
 		FROM attempted a
 		FULL OUTER JOIN stored s ON true`
 
-		return tx.QueryRow(ctx, query, mint, int64(supply), int64(slot), cooldown.Seconds()).
+		return tx.QueryRow(ctx, query, encodedMint, int64(supply), int64(slot), cooldown.Seconds()).
 			Scan(&granted, &highSupply, &highSlot, &lastGainPushAt)
 	})
 	if err != nil {
@@ -224,10 +229,10 @@ func dbClaimGainPush(ctx context.Context, pool *pgxpool.Pool, mint string, suppl
 	}, nil
 }
 
-func dbGetCurrencyState(ctx context.Context, pool *pgxpool.Pool, mint string) (*currencyStateModel, error) {
+func dbGetCurrencyState(ctx context.Context, pool *pgxpool.Pool, mint *commonpb.PublicKey) (*currencyStateModel, error) {
 	res := &currencyStateModel{}
 	query := `SELECT ` + allCurrencyStateFields + ` FROM ` + currencyStatesTableName + ` WHERE "mint" = $1`
-	err := pgxscan.Get(ctx, pool, res, query, mint)
+	err := pgxscan.Get(ctx, pool, res, query, pg.Encode(mint.Value, pg.Base58))
 	if err != nil {
 		if pgxscan.NotFound(err) {
 			return nil, push.ErrCurrencyStateNotFound

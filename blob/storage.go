@@ -2,7 +2,6 @@ package blob
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -62,7 +61,7 @@ type ObjectStorage interface {
 // so an image's bytes live under a per-media-item directory keyed by its id,
 // leaving room to group its renditions under the same prefix:
 //
-//	images/<id-hex>/original.jpg
+//	images/<uuid>/original.jpg
 //
 // Only images are supported today, so a non-image mime type is rejected outright
 // rather than being silently forced into the image layout. Other kinds (videos,
@@ -74,6 +73,9 @@ func StorageKey(id *blobpb.BlobId, mimeType string) (string, error) {
 	// Gate on the image kind explicitly, not merely on a resolvable extension: if
 	// mimeTypeToExtension later grows video/file entries, this still rejects them
 	// so they cannot inherit the image layout by accident.
+	if err := id.Validate(); err != nil {
+		return "", err
+	}
 	if !SupportedImageMimeTypes[mimeType] {
 		return "", fmt.Errorf("unsupported non-image mime type %q for storage key", mimeType)
 	}
@@ -82,5 +84,5 @@ func StorageKey(id *blobpb.BlobId, mimeType string) (string, error) {
 		// An image kind with no registered extension means the two image maps drifted.
 		return "", fmt.Errorf("missing extension for image mime type %q", mimeType)
 	}
-	return fmt.Sprintf("images/%s/original%s", hex.EncodeToString(id.Value), ext), nil
+	return fmt.Sprintf("images/%s/original%s", blobIDString(id), ext), nil
 }

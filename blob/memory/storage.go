@@ -19,7 +19,8 @@ const (
 	uploadURL         = "https://upload.blobs.test/"
 	downloadURLPrefix = "https://cdn.blobs.test/"
 
-	uploadTTL = 15 * time.Minute
+	uploadTTL   = 15 * time.Minute
+	downloadTTL = 15 * time.Minute
 )
 
 // Storage is an in-memory blob.ObjectStorage for tests. It stands in for the
@@ -88,8 +89,11 @@ func (s *Storage) DeleteUpload(_ context.Context, key string) error {
 	return nil
 }
 
-func (s *Storage) SignDownloadURL(_ context.Context, key string) (string, error) {
-	return downloadURLPrefix + key, nil
+func (s *Storage) SignDownloadURL(_ context.Context, key string) (*blobpb.DownloadUrl, error) {
+	return &blobpb.DownloadUrl{
+		Url:       downloadURLPrefix + key,
+		ExpiresAt: timestamppb.New(time.Now().Add(downloadTTL)),
+	}, nil
 }
 
 // SimulateUpload stores bytes as if the client had POSTed them to the presigned

@@ -207,9 +207,18 @@ func (s *Server) CompleteExternalUpload(ctx context.Context, req *blobpb.Complet
 		return nil, status.Error(codes.Unavailable, "upload not yet finalized")
 	}
 
+	// todo: Support rejection metadata
+	var rejectionMetadata *blobpb.RejectionMetadata
+	if finalStatus == blobpb.BlobStatus_BLOB_STATUS_REJECTED {
+		rejectionMetadata = &blobpb.RejectionMetadata{
+			Reason: blobpb.RejectionReason_REJECTION_REASON_INTERNAL,
+		}
+	}
+
 	return &blobpb.CompleteExternalUploadResponse{
-		Result: blobpb.CompleteExternalUploadResponse_OK,
-		Status: finalStatus,
+		Result:            blobpb.CompleteExternalUploadResponse_OK,
+		Status:            finalStatus,
+		RejectionMetadata: rejectionMetadata,
 	}, nil
 }
 
@@ -243,9 +252,10 @@ func (s *Server) GetBlobs(ctx context.Context, req *blobpb.GetBlobsRequest) (*bl
 			Status: blobStatus,
 		}
 
-		// download_url and the rest of the metadata are only meaningful, and only
-		// minted, for a servable (READY) blob.
-		if blobStatus == blobpb.BlobStatus_BLOB_STATUS_READY {
+		switch blobStatus {
+		case blobpb.BlobStatus_BLOB_STATUS_READY:
+			// download_url and the rest of the metadata are only meaningful, and only
+			// minted, for a servable (READY) blob.
 			metadata, err := s.buildMetadata(ctx, record)
 			if err != nil {
 				s.log.Warn("Failed to mint blob metadata",
@@ -255,6 +265,11 @@ func (s *Server) GetBlobs(ctx context.Context, req *blobpb.GetBlobsRequest) (*bl
 				return nil, status.Error(codes.Internal, "failed to get blobs")
 			}
 			protoBlob.Metadata = metadata
+		case blobpb.BlobStatus_BLOB_STATUS_REJECTED:
+			// todo: Support rejection metadata
+			protoBlob.Rejection = &blobpb.RejectionMetadata{
+				Reason: blobpb.RejectionReason_REJECTION_REASON_INTERNAL,
+			}
 		}
 
 		resolved = append(resolved, protoBlob)

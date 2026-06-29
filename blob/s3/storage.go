@@ -282,13 +282,17 @@ func (s *Storage) DeleteUpload(ctx context.Context, key string) error {
 	return nil
 }
 
-func (s *Storage) SignDownloadURL(_ context.Context, key string) (string, error) {
+func (s *Storage) SignDownloadURL(_ context.Context, key string) (*blobpb.DownloadUrl, error) {
+	expiresAt := time.Now().Add(s.cfg.DownloadTTL)
 	rawURL := strings.TrimRight(s.cfg.CDNBaseURL, "/") + "/" + key
-	signed, err := s.signer.Sign(rawURL, time.Now().Add(s.cfg.DownloadTTL))
+	signed, err := s.signer.Sign(rawURL, expiresAt)
 	if err != nil {
-		return "", fmt.Errorf("failed to sign download url: %w", err)
+		return nil, fmt.Errorf("failed to sign download url: %w", err)
 	}
-	return signed, nil
+	return &blobpb.DownloadUrl{
+		Url:       signed,
+		ExpiresAt: timestamppb.New(expiresAt),
+	}, nil
 }
 
 // sigV4SigningKey derives the SigV4 signing key for the S3 service.

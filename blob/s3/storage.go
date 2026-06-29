@@ -13,9 +13,11 @@ import (
 	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -107,9 +109,10 @@ func NewStorage(client *s3.Client, cfg Config) *Storage {
 // LoadCloudFrontPrivateKey fetches the PEM-encoded RSA private key used to sign
 // CloudFront download URLs from AWS Secrets Manager and parses it into the
 // *rsa.PrivateKey that Config.PrivateKey expects. secretID is the secret's name
-// or ARN; the secret value must be an unencrypted PKCS#1 PEM (the "RSA PRIVATE
-// KEY" block produced by `openssl genrsa`). The caller constructs and configures
-// the *secretsmanager.Client, mirroring how NewStorage takes a ready *s3.Client.
+// or ARN; the secret value must be an unencrypted RSA private key in either
+// PKCS#1 ("RSA PRIVATE KEY", from `openssl genrsa`) or PKCS#8 ("PRIVATE KEY",
+// from `openssl genpkey`) PEM form. The caller constructs and configures the
+// *secretsmanager.Client, mirroring how NewStorage takes a ready *s3.Client.
 func LoadCloudFrontPrivateKey(ctx context.Context, client *secretsmanager.Client, secretID string) (*rsa.PrivateKey, error) {
 	out, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
 		SecretId: aws.String(secretID),
@@ -119,19 +122,44 @@ func LoadCloudFrontPrivateKey(ctx context.Context, client *secretsmanager.Client
 	}
 
 	// The PEM may be stored as a string secret or as binary; support both.
-	var pem []byte
+	var pemBytes []byte
 	switch {
 	case out.SecretString != nil:
-		pem = []byte(*out.SecretString)
+		pemBytes = []byte(*out.SecretString)
 	case len(out.SecretBinary) > 0:
-		pem = out.SecretBinary
+		pemBytes = out.SecretBinary
 	default:
 		return nil, fmt.Errorf("secret %q has no value", secretID)
 	}
 
-	key, err := sign.LoadPEMPrivKey(strings.NewReader(string(pem)))
+	key, err := parseRSAPrivateKey(pemBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse cloudfront private key: %w", err)
+	}
+	return key, nil
+}
+
+// parseRSAPrivateKey decodes a single PEM block and parses it as an RSA private
+// key, accepting both PKCS#1 ("RSA PRIVATE KEY") and PKCS#8 ("PRIVATE KEY")
+// encodings. PKCS#1 is tried first; if that fails the bytes are tried as PKCS#8
+// and asserted to hold an RSA key.
+func parseRSAPrivateKey(pemBytes []byte) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, errors.New("no PEM block found")
+	}
+
+	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+
+	keyAny, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	key, ok := keyAny.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("private key is %T, want RSA", keyAny)
 	}
 	return key, nil
 }

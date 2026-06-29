@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"sync"
+	"time"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
@@ -15,11 +16,15 @@ type memory struct {
 
 	// Map of userID -> map of appInstallID -> Token
 	tokens map[string]map[string]push.Token
+
+	// Map of mint -> currency push state
+	currencyStates map[string]push.CurrencyState
 }
 
-func NewInMemory() push.TokenStore {
+func NewInMemory() push.Store {
 	return &memory{
-		tokens: make(map[string]map[string]push.Token),
+		tokens:         make(map[string]map[string]push.Token),
+		currencyStates: make(map[string]push.CurrencyState),
 	}
 }
 
@@ -28,6 +33,7 @@ func (m *memory) reset() {
 	defer m.Unlock()
 
 	m.tokens = make(map[string]map[string]push.Token)
+	m.currencyStates = make(map[string]push.CurrencyState)
 }
 
 func (m *memory) GetTokens(_ context.Context, userID *commonpb.UserId) ([]push.Token, error) {
@@ -112,4 +118,52 @@ func (m *memory) DeleteToken(_ context.Context, tokenType pushpb.TokenType, toke
 	}
 
 	return nil
+}
+
+func (m *memory) ClaimGainPush(_ context.Context, mint string, supply, slot uint64, cooldown time.Duration) (bool, *push.CurrencyState, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	now := time.Now()
+	state, ok := m.currencyStates[mint]
+
+	isNewHigh := !ok || supply > state.AllTimeHighSupply
+	cooldownElapsed := !ok || state.LastGainPushAt == nil || now.Sub(*state.LastGainPushAt) >= cooldown
+	if !isNewHigh || !cooldownElapsed {
+		// Not a new high, or still within cooldown: leave the stored state untouched
+		// but still return it so callers can populate a local cache.
+		return false, cloneCurrencyState(state), nil
+	}
+
+	grantedAt := now
+	state = push.CurrencyState{
+		Mint:              mint,
+		AllTimeHighSupply: supply,
+		AllTimeHighSlot:   slot,
+		LastGainPushAt:    &grantedAt,
+	}
+	m.currencyStates[mint] = state
+	return true, cloneCurrencyState(state), nil
+}
+
+func (m *memory) GetCurrencyState(_ context.Context, mint string) (*push.CurrencyState, error) {
+	m.RLock()
+	defer m.RUnlock()
+
+	state, ok := m.currencyStates[mint]
+	if !ok {
+		return nil, push.ErrCurrencyStateNotFound
+	}
+	return cloneCurrencyState(state), nil
+}
+
+// cloneCurrencyState returns a deep copy so callers can't mutate the stored
+// LastGainPushAt through the returned pointer.
+func cloneCurrencyState(state push.CurrencyState) *push.CurrencyState {
+	clone := state
+	if state.LastGainPushAt != nil {
+		t := *state.LastGainPushAt
+		clone.LastGainPushAt = &t
+	}
+	return &clone
 }

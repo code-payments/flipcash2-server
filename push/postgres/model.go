@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/georgysavva/scany/v2/pgxscan"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -20,7 +21,7 @@ const (
 	allPushTokenFields  = `"userId", "appInstallId", "token", "type", "createdAt", "updatedAt"`
 )
 
-type model struct {
+type tokenModel struct {
 	UserID       string    `db:"userId"`
 	AppInstallID string    `db:"appInstallId"`
 	Token        string    `db:"token"`
@@ -29,8 +30,8 @@ type model struct {
 	UpdatedAt    time.Time `db:"updatedAt"`
 }
 
-func toModel(userID *commonpb.UserId, token push.Token) (*model, error) {
-	return &model{
+func toTokenModel(userID *commonpb.UserId, token push.Token) (*tokenModel, error) {
+	return &tokenModel{
 		UserID:       pg.Encode(userID.Value),
 		AppInstallID: token.AppInstallID,
 		Token:        token.Token,
@@ -38,7 +39,7 @@ func toModel(userID *commonpb.UserId, token push.Token) (*model, error) {
 	}, nil
 }
 
-func fromModel(m *model) (push.Token, error) {
+func fromTokenModel(m *tokenModel) (push.Token, error) {
 	return push.Token{
 		Type:         pushpb.TokenType(m.Type),
 		AppInstallID: m.AppInstallID,
@@ -46,7 +47,7 @@ func fromModel(m *model) (push.Token, error) {
 	}, nil
 }
 
-func (m *model) dbAdd(ctx context.Context, pool *pgxpool.Pool) error {
+func (m *tokenModel) dbAdd(ctx context.Context, pool *pgxpool.Pool) error {
 	query := `INSERT INTO ` + pushTokensTableName + ` (` + allPushTokenFields + `) VALUES ($1, $2, $3, $4, NOW(), NOW()) ON CONFLICT ("userId", "appInstallId") DO UPDATE SET "token" = $3, "updatedAt" = NOW() WHERE ` + pushTokensTableName + `."userId" = $1 AND ` + pushTokensTableName + `."appInstallId" = $2 RETURNING ` + allPushTokenFields
 	return pgxscan.Get(
 		ctx,
@@ -60,8 +61,8 @@ func (m *model) dbAdd(ctx context.Context, pool *pgxpool.Pool) error {
 	)
 }
 
-func dbGetTokensBatch(ctx context.Context, pool *pgxpool.Pool, userIDs ...*commonpb.UserId) ([]*model, error) {
-	var res []*model
+func dbGetTokensBatch(ctx context.Context, pool *pgxpool.Pool, userIDs ...*commonpb.UserId) ([]*tokenModel, error) {
+	var res []*tokenModel
 
 	queryParameters := make([]any, len(userIDs))
 
@@ -138,4 +139,100 @@ func dbDeleteToken(ctx context.Context, pool *pgxpool.Pool, tokenType pushpb.Tok
 	query := `DELETE FROM ` + pushTokensTableName + ` WHERE "token" = $1 and "type" = $2`
 	_, err := pool.Exec(ctx, query, token, tokenType)
 	return err
+}
+
+const (
+	currencyStatesTableName = "flipcash_currency_push_states"
+	allCurrencyStateFields  = `"mint", "allTimeHighSupply", "allTimeHighSlot", "lastGainPushAt", "createdAt", "updatedAt"`
+)
+
+type currencyStateModel struct {
+	Mint              string     `db:"mint"`
+	AllTimeHighSupply int64      `db:"allTimeHighSupply"`
+	AllTimeHighSlot   int64      `db:"allTimeHighSlot"`
+	LastGainPushAt    *time.Time `db:"lastGainPushAt"`
+	CreatedAt         time.Time  `db:"createdAt"`
+	UpdatedAt         time.Time  `db:"updatedAt"`
+}
+
+func fromCurrencyStateModel(m *currencyStateModel) *push.CurrencyState {
+	return &push.CurrencyState{
+		Mint:              m.Mint,
+		AllTimeHighSupply: uint64(m.AllTimeHighSupply),
+		AllTimeHighSlot:   uint64(m.AllTimeHighSlot),
+		LastGainPushAt:    m.LastGainPushAt,
+	}
+}
+
+// dbClaimGainPush performs the atomic new-all-time-high + cooldown gate. The row
+// (all-time high and last-gain-push timestamp) is updated only when the push is
+// granted; otherwise the stored state is left untouched. Either way it returns
+// the resulting stored state so callers can populate a local cache.
+//
+// A data-modifying CTE performs the conditional upsert while a sibling CTE reads
+// the pre-upsert row (CTEs share one snapshot, so "stored" never sees the
+// upsert's effects). The final SELECT prefers the upserted values when present
+// (granted) and falls back to the stored values otherwise. The FULL OUTER JOIN
+// keeps the single result row in the first-insert case, where no prior row
+// exists.
+func dbClaimGainPush(ctx context.Context, pool *pgxpool.Pool, mint string, supply, slot uint64, cooldown time.Duration) (bool, *push.CurrencyState, error) {
+	var (
+		granted        bool
+		highSupply     int64
+		highSlot       int64
+		lastGainPushAt *time.Time
+	)
+	err := pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
+		query := `WITH attempted AS (
+			INSERT INTO ` + currencyStatesTableName + ` AS t
+				("mint", "allTimeHighSupply", "allTimeHighSlot", "lastGainPushAt", "createdAt", "updatedAt")
+				VALUES ($1, $2, $3, NOW(), NOW(), NOW())
+				ON CONFLICT ("mint") DO UPDATE SET
+					"allTimeHighSupply" = EXCLUDED."allTimeHighSupply",
+					"allTimeHighSlot"   = EXCLUDED."allTimeHighSlot",
+					"lastGainPushAt"    = NOW(),
+					"updatedAt"         = NOW()
+				WHERE t."allTimeHighSupply" < EXCLUDED."allTimeHighSupply"
+				  AND (t."lastGainPushAt" IS NULL
+				       OR t."lastGainPushAt" <= NOW() - make_interval(secs => $4))
+				RETURNING "allTimeHighSupply", "allTimeHighSlot", "lastGainPushAt"
+		),
+		stored AS (
+			SELECT "allTimeHighSupply", "allTimeHighSlot", "lastGainPushAt"
+			FROM ` + currencyStatesTableName + `
+			WHERE "mint" = $1
+		)
+		SELECT
+			(a."allTimeHighSupply" IS NOT NULL) AS granted,
+			COALESCE(a."allTimeHighSupply", s."allTimeHighSupply") AS high_supply,
+			COALESCE(a."allTimeHighSlot", s."allTimeHighSlot") AS high_slot,
+			COALESCE(a."lastGainPushAt", s."lastGainPushAt") AS last_gain_push_at
+		FROM attempted a
+		FULL OUTER JOIN stored s ON true`
+
+		return tx.QueryRow(ctx, query, mint, int64(supply), int64(slot), cooldown.Seconds()).
+			Scan(&granted, &highSupply, &highSlot, &lastGainPushAt)
+	})
+	if err != nil {
+		return false, nil, err
+	}
+	return granted, &push.CurrencyState{
+		Mint:              mint,
+		AllTimeHighSupply: uint64(highSupply),
+		AllTimeHighSlot:   uint64(highSlot),
+		LastGainPushAt:    lastGainPushAt,
+	}, nil
+}
+
+func dbGetCurrencyState(ctx context.Context, pool *pgxpool.Pool, mint string) (*currencyStateModel, error) {
+	res := &currencyStateModel{}
+	query := `SELECT ` + allCurrencyStateFields + ` FROM ` + currencyStatesTableName + ` WHERE "mint" = $1`
+	err := pgxscan.Get(ctx, pool, res, query, mint)
+	if err != nil {
+		if pgxscan.NotFound(err) {
+			return nil, push.ErrCurrencyStateNotFound
+		}
+		return nil, err
+	}
+	return res, nil
 }

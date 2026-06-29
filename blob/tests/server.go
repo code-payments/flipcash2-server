@@ -7,6 +7,7 @@ import (
 	"image/color"
 	"image/png"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
@@ -274,7 +275,10 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		require.NotNil(t, got.Metadata)
 		require.Equal(t, "image/png", got.Metadata.MimeType)
 		require.EqualValues(t, len(imageBytes), got.Metadata.SizeBytes)
-		require.NotEmpty(t, got.Metadata.DownloadUrl)
+		require.NotNil(t, got.Metadata.DownloadUrl)
+		require.NotEmpty(t, got.Metadata.DownloadUrl.Url)
+		require.NotNil(t, got.Metadata.DownloadUrl.ExpiresAt)
+		require.True(t, got.Metadata.DownloadUrl.ExpiresAt.AsTime().After(time.Now()))
 		image := got.Metadata.GetImage()
 		require.NotNil(t, image)
 		require.EqualValues(t, 10, image.Width)

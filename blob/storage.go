@@ -51,9 +51,10 @@ type ObjectStorage interface {
 	DeleteUpload(ctx context.Context, key string) error
 
 	// SignDownloadURL mints a fresh, short-lived CDN URL for fetching a promoted
-	// object's bytes from the ORIGIN store. It is authorized at mint time and
-	// expires on its own, so callers mint a new one rather than persisting it.
-	SignDownloadURL(ctx context.Context, key string) (string, error)
+	// object's bytes from the ORIGIN store, paired with the instant it expires. It
+	// is authorized at mint time and expires on its own, so callers mint a new one
+	// rather than persisting it.
+	SignDownloadURL(ctx context.Context, key string) (*blobpb.DownloadUrl, error)
 }
 
 // StorageKey derives the object key for an image blob's bytes from its id and

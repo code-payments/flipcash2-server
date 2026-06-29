@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
 
 	"firebase.google.com/go/v4/messaging"
 	"github.com/mr-tron/base58"
@@ -101,6 +102,8 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 			targetUrl = fmt.Sprintf("https://app.flipcash.com/token/%s", base58.Encode(typed.CurrencyInfo.Value))
 		case *pushpb.Navigation_ChatId:
 			targetUrl = fmt.Sprintf("https://app.flipcash.com/chat/%s", base64.URLEncoding.EncodeToString(typed.ChatId.Value))
+		case *pushpb.Navigation_ChatContactPhoneNumber:
+			targetUrl = fmt.Sprintf("https://app.flipcash.com/chat/%s", strings.Replace(typed.ChatContactPhoneNumber.Value, "+", "%2B", 1))
 		}
 		if len(targetUrl) > 0 {
 			customDataAndroid["target_url"] = targetUrl

@@ -129,6 +129,11 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 				},
 			},
 		},
+		Navigation: &pushpb.Navigation{
+			Type: &pushpb.Navigation_ChatContactPhoneNumber{
+				ChatContactPhoneNumber: &phonepb.PhoneNumber{Value: joinedPhone.Value},
+			},
+		},
 	}
 	return pusher.SendPushes(ctx, title, body, customPayload, users...)
 }

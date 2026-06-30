@@ -3,6 +3,7 @@ package tests
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -39,10 +40,11 @@ func RunServerTests(
 	accounts account.Store,
 	blobs blob.Store,
 	storage blob.ObjectStorage,
+	access blob.AccessStore,
 	upload uploadFunc,
 	teardown func(),
 ) {
-	for _, tf := range []func(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, upload uploadFunc){
+	for _, tf := range []func(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc){
 		testGetUploadPolicy,
 		testInitiateExternalUpload,
 		testUploadLifecycle,
@@ -50,16 +52,18 @@ func RunServerTests(
 		testModeration,
 		testGetBlobs,
 	} {
-		tf(t, accounts, blobs, storage, upload)
+		// A fresh resolver per test func; the access store is reset by teardown.
+		resolver := newFakeResolver()
+		tf(t, accounts, blobs, storage, access, resolver, upload)
 		teardown()
 	}
 }
 
-func newServer(accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, moderator moderation.Client, t *testing.T) *blob.Server {
+func newServer(accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver blob.PrincipalResolver, moderator moderation.Client, t *testing.T) *blob.Server {
 	log := zaptest.NewLogger(t)
 	authn := auth.NewKeyPairAuthenticator(log)
 	authz := account.NewAuthorizer(log, accounts, authn)
-	return blob.NewServer(log, authz, accounts, blobs, storage, moderator, false)
+	return blob.NewServer(log, authz, accounts, blobs, storage, access, resolver, moderator, false)
 }
 
 // registerUser binds a fresh key pair to a new, registered account.
@@ -72,8 +76,8 @@ func registerUser(t *testing.T, accounts account.Store) (*commonpb.UserId, model
 	return userID, signer
 }
 
-func testGetUploadPolicy(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, _ uploadFunc) {
-	server := newServer(accounts, blobs, storage, nil, t)
+func testGetUploadPolicy(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, _ uploadFunc) {
+	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
 
 	t.Run("unregistered is denied", func(t *testing.T) {
 		signer := model.MustGenerateKeyPair()
@@ -142,8 +146,8 @@ func testGetUploadPolicy(t *testing.T, accounts account.Store, blobs blob.Store,
 	})
 }
 
-func testInitiateExternalUpload(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, _ uploadFunc) {
-	server := newServer(accounts, blobs, storage, nil, t)
+func testInitiateExternalUpload(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, _ uploadFunc) {
+	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
 	imageBytes := makePNG(t, 8, 8)
 
 	t.Run("unregistered is denied", func(t *testing.T) {
@@ -211,8 +215,8 @@ func testInitiateExternalUpload(t *testing.T, accounts account.Store, blobs blob
 	})
 }
 
-func testUploadLifecycle(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, upload uploadFunc) {
-	server := newServer(accounts, blobs, storage, nil, t)
+func testUploadLifecycle(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc) {
+	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
 	_, signer := registerUser(t, accounts)
 	imageBytes := makePNG(t, 12, 9)
 
@@ -274,8 +278,8 @@ func testUploadLifecycle(t *testing.T, accounts account.Store, blobs blob.Store,
 	})
 }
 
-func testFinalizationRejections(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, upload uploadFunc) {
-	server := newServer(accounts, blobs, storage, nil, t)
+func testFinalizationRejections(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc) {
+	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
 	_, signer := registerUser(t, accounts)
 
 	t.Run("non-image bytes are rejected as corrupt", func(t *testing.T) {
@@ -305,12 +309,12 @@ func testFinalizationRejections(t *testing.T, accounts account.Store, blobs blob
 	})
 }
 
-func testModeration(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, upload uploadFunc) {
+func testModeration(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc) {
 	_, signer := registerUser(t, accounts)
 	imageBytes := makePNG(t, 6, 6)
 
 	t.Run("flagged image is rejected with the moderation category", func(t *testing.T) {
-		server := newServer(accounts, blobs, storage, &fakeModerator{flagged: true, categories: []string{"general_nsfw"}}, t)
+		server := newServer(accounts, blobs, storage, access, resolver, &fakeModerator{flagged: true, categories: []string{"general_nsfw"}}, t)
 		blobID, target := initiate(t, server, signer, "image/png", uint64(len(imageBytes)))
 		upload(target, imageBytes)
 
@@ -322,7 +326,7 @@ func testModeration(t *testing.T, accounts account.Store, blobs blob.Store, stor
 	})
 
 	t.Run("clean image is ready", func(t *testing.T) {
-		server := newServer(accounts, blobs, storage, &fakeModerator{flagged: false}, t)
+		server := newServer(accounts, blobs, storage, access, resolver, &fakeModerator{flagged: false}, t)
 		blobID, target := initiate(t, server, signer, "image/png", uint64(len(imageBytes)))
 		upload(target, imageBytes)
 
@@ -330,8 +334,8 @@ func testModeration(t *testing.T, accounts account.Store, blobs blob.Store, stor
 	})
 }
 
-func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, upload uploadFunc) {
-	server := newServer(accounts, blobs, storage, nil, t)
+func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc) {
+	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
 	_, signer := registerUser(t, accounts)
 	imageBytes := makePNG(t, 10, 5)
 
@@ -374,10 +378,10 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		require.EqualValues(t, 5, image.Height)
 	})
 
-	t.Run("a non-owner cannot resolve someone else's blob", func(t *testing.T) {
-		// Access is scoped to the uploader: a non-owner holding the id sees it as if
-		// it did not exist, so the batch comes back unset rather than leaking the
-		// blob's existence.
+	t.Run("a non-owner with no context cannot resolve someone else's blob", func(t *testing.T) {
+		// Without an access context a non-owner holding the id sees it as if it did
+		// not exist, so the batch comes back unset rather than leaking the blob's
+		// existence.
 		_, other := registerUser(t, accounts)
 		req := &blobpb.GetBlobsRequest{BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}}}
 		require.NoError(t, other.Auth(req, &req.Auth))
@@ -385,6 +389,68 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		resp, err := server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.GetBlobsResponse_OK, resp.Result)
+		require.Nil(t, resp.Blobs)
+	})
+
+	t.Run("a non-owner resolves a blob shared into a chat they belong to", func(t *testing.T) {
+		otherID, other := registerUser(t, accounts)
+		chatID := newChatID(t)
+		// The blob is shared into the chat, and the caller is a member of it.
+		require.NoError(t, access.Grant(context.Background(), &blob.Grant{
+			BlobID: readyID, Principal: blob.PrincipalForChat(chatID), Permission: blob.PermissionRead,
+		}))
+		resolver.allow(blob.PrincipalForChat(chatID), otherID)
+
+		req := &blobpb.GetBlobsRequest{
+			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: chatID}},
+		}
+		require.NoError(t, other.Auth(req, &req.Auth))
+
+		resp, err := server.GetBlobs(context.Background(), req)
+		require.NoError(t, err)
+		require.NotNil(t, resp.Blobs)
+		require.Len(t, resp.Blobs.Blobs, 1)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, resp.Blobs.Blobs[0].Status)
+		require.NotNil(t, resp.Blobs.Blobs[0].Metadata)
+	})
+
+	t.Run("a member of the chat cannot resolve a blob never shared into it", func(t *testing.T) {
+		// The caller belongs to the chat, but the blob carries no grant for it, so
+		// membership alone does not authorize the read.
+		otherID, other := registerUser(t, accounts)
+		chatID := newChatID(t)
+		resolver.allow(blob.PrincipalForChat(chatID), otherID)
+
+		req := &blobpb.GetBlobsRequest{
+			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: chatID}},
+		}
+		require.NoError(t, other.Auth(req, &req.Auth))
+
+		resp, err := server.GetBlobs(context.Background(), req)
+		require.NoError(t, err)
+		require.Nil(t, resp.Blobs)
+	})
+
+	t.Run("a grant does not help a caller who is not in the chat", func(t *testing.T) {
+		// The blob is shared into the chat, but the caller is not a member (the
+		// resolver was never told to cover them), so the grant alone does not
+		// authorize the read.
+		_, other := registerUser(t, accounts)
+		chatID := newChatID(t)
+		require.NoError(t, access.Grant(context.Background(), &blob.Grant{
+			BlobID: readyID, Principal: blob.PrincipalForChat(chatID), Permission: blob.PermissionRead,
+		}))
+
+		req := &blobpb.GetBlobsRequest{
+			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: chatID}},
+		}
+		require.NoError(t, other.Auth(req, &req.Auth))
+
+		resp, err := server.GetBlobs(context.Background(), req)
+		require.NoError(t, err)
 		require.Nil(t, resp.Blobs)
 	})
 
@@ -481,6 +547,28 @@ func makePNG(t *testing.T, width, height int) []byte {
 	var buf bytes.Buffer
 	require.NoError(t, png.Encode(&buf, img))
 	return buf.Bytes()
+}
+
+// fakeResolver is a controllable blob.PrincipalResolver for the server suite: a
+// (principal, user) pair resolves as covered only after allow records it.
+type fakeResolver struct {
+	covered map[string]bool
+}
+
+func newFakeResolver() *fakeResolver {
+	return &fakeResolver{covered: make(map[string]bool)}
+}
+
+func (r *fakeResolver) allow(principal blob.Principal, user *commonpb.UserId) {
+	r.covered[resolverKey(principal, user)] = true
+}
+
+func (r *fakeResolver) Covers(_ context.Context, principal blob.Principal, user *commonpb.UserId) (bool, error) {
+	return r.covered[resolverKey(principal, user)], nil
+}
+
+func resolverKey(principal blob.Principal, user *commonpb.UserId) string {
+	return fmt.Sprintf("%d|%q|%q", int(principal.Type), principal.ID, user.Value)
 }
 
 type fakeModerator struct {

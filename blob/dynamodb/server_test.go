@@ -14,16 +14,18 @@ import (
 )
 
 func TestBlob_DynamoDBServer(t *testing.T) {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, blobsTable))
+	require.NoError(t, CreateTables(context.Background(), testEnv.Client, blobsTable, aclTable))
 
 	accounts := account_memory.NewInMemory()
 	blobs := NewInDynamoDB(testEnv.Client, blobsTable)
+	access := NewAccessInDynamoDB(testEnv.Client, aclTable)
 	// The object storage is always the in-memory fake; only the metadata store is
 	// exercised against DynamoDB here. Its keys are per-blob random ids, so leftover
 	// objects across test funcs never collide and it needs no reset.
 	storage := blob_memory.NewInMemoryStorage()
 	teardown := func() {
 		blobs.(*store).reset()
+		access.(*accessStore).reset()
 	}
-	tests.RunServerTests(t, accounts, blobs, storage, storage.SimulateUpload, teardown)
+	tests.RunServerTests(t, accounts, blobs, storage, access, storage.SimulateUpload, teardown)
 }

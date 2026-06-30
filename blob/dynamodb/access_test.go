@@ -11,14 +11,14 @@ import (
 	"github.com/code-payments/flipcash2-server/blob/tests"
 )
 
-const blobsTable = "blobs_test"
+const aclTable = "blob_acls_test"
 
-func TestBlob_DynamoDBStore(t *testing.T) {
+func TestBlobAccess_DynamoDBStore(t *testing.T) {
 	require.NoError(t, CreateTables(context.Background(), testEnv.Client, blobsTable, aclTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, blobsTable)
+	testStore := NewAccessInDynamoDB(testEnv.Client, aclTable)
 	teardown := func() {
-		testStore.(*store).reset()
+		testStore.(*accessStore).reset()
 	}
-	tests.RunStoreTests(t, testStore, teardown)
+	tests.RunAccessStoreTests(t, testStore, teardown)
 }

@@ -5,6 +5,7 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 	"github.com/google/uuid"
 )
 
@@ -14,6 +15,11 @@ var (
 
 	// ErrExists is returned when a blob with the given id already exists.
 	ErrExists = errors.New("blob already exists")
+
+	// ErrCannotAdvanceToRejected is returned by Store.Advance when StateRejected is
+	// passed as the target. Rejection is terminal and carries metadata, so it is
+	// reached only through Store.Reject, never Advance.
+	ErrCannotAdvanceToRejected = errors.New("cannot advance to rejected state; use Reject")
 )
 
 // RenditionType identifies which rendition of a piece of media a blob holds.
@@ -124,6 +130,64 @@ func (s State) ToBlobStatus() blobpb.BlobStatus {
 	}
 }
 
+// RejectionReason is the internal mirror of blobpb.RejectionReason: why a blob's
+// uploaded bytes failed finalization. It is set only on a StateRejected blob, is
+// immutable thereafter, and is its own type (persisted as its own value) so the
+// stored representation does not depend on the wire enum's numbering.
+type RejectionReason int
+
+const (
+	RejectionReasonUnknown RejectionReason = iota
+	RejectionReasonModeration
+	RejectionReasonUnsupportedType
+	RejectionReasonMismatchedType
+	RejectionReasonTooLarge
+	RejectionReasonCorrupt
+	RejectionReasonInternal
+)
+
+// ToProto maps the internal reason onto the public blobpb.RejectionReason.
+func (r RejectionReason) ToProto() blobpb.RejectionReason {
+	switch r {
+	case RejectionReasonModeration:
+		return blobpb.RejectionReason_REJECTION_REASON_MODERATION
+	case RejectionReasonUnsupportedType:
+		return blobpb.RejectionReason_REJECTION_REASON_UNSUPPORTED_TYPE
+	case RejectionReasonMismatchedType:
+		return blobpb.RejectionReason_REJECTION_REASON_MISMATCHED_TYPE
+	case RejectionReasonTooLarge:
+		return blobpb.RejectionReason_REJECTION_REASON_TOO_LARGE
+	case RejectionReasonCorrupt:
+		return blobpb.RejectionReason_REJECTION_REASON_CORRUPT
+	case RejectionReasonInternal:
+		return blobpb.RejectionReason_REJECTION_REASON_INTERNAL
+	default:
+		return blobpb.RejectionReason_REJECTION_REASON_UNKNOWN
+	}
+}
+
+// RejectionMetadata records why a blob was rejected during finalization. It is
+// set only on a StateRejected blob and is immutable thereafter.
+type RejectionMetadata struct {
+	Reason RejectionReason
+
+	// FlaggedCategory is the moderation category that tripped, set only when
+	// Reason is RejectionReasonModeration; it is NONE (the zero value) otherwise.
+	FlaggedCategory moderationpb.FlaggedCategory
+}
+
+// ToProto renders the rejection metadata for the wire. A nil receiver renders to
+// nil, so a non-rejected blob simply carries no rejection.
+func (r *RejectionMetadata) ToProto() *blobpb.RejectionMetadata {
+	if r == nil {
+		return nil
+	}
+	return &blobpb.RejectionMetadata{
+		Reason:          r.Reason.ToProto(),
+		FlaggedCategory: r.FlaggedCategory,
+	}
+}
+
 // Blob is the server-authoritative record for a stored blob. It is the durable
 // identity behind a BlobId and tracks the blob through its lifecycle.
 //
@@ -170,6 +234,10 @@ type Blob struct {
 	// own sibling fields here (e.g. Video, Audio), one per blobpb.BlobMetadata
 	// kind variant. Only images exist today.
 	Image *ImageMetadata
+
+	// Rejection records why this blob was rejected, set only when State is
+	// StateRejected; it is nil for any non-rejected blob.
+	Rejection *RejectionMetadata
 }
 
 func newBlobID() (*blobpb.BlobId, error) {

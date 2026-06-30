@@ -3,6 +3,7 @@ package blob
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -18,6 +19,22 @@ import (
 
 	// Register the WebP decoder.
 	_ "golang.org/x/image/webp"
+)
+
+// InspectImage failure categories. They are wrapped into the descriptive error
+// it returns so finalization can classify a rejection into the right
+// RejectionReason without re-deriving why the bytes were unacceptable. A failure
+// carrying none of these is an internal processing fault.
+var (
+	// ErrImageCorrupt means the bytes could not be read or decoded as an image.
+	ErrImageCorrupt = errors.New("image is corrupt or undecodable")
+
+	// ErrImageUnsupportedType means the bytes are a kind the service does not
+	// accept — an unsupported format, or an animated image.
+	ErrImageUnsupportedType = errors.New("unsupported image type")
+
+	// ErrImageTooLarge means the image's pixel dimensions exceed the limits.
+	ErrImageTooLarge = errors.New("image exceeds dimension limits")
 )
 
 const (
@@ -39,6 +56,22 @@ const (
 	// component for a faithful hash. Capping only the longest side would otherwise
 	// starve the short axis (e.g. a 10:1 panorama → 64x6).
 	blurhashMinShortDimension = 16
+
+	// MaxOriginalImageSizeBytes bounds the declared size of an ORIGINAL image upload.
+	// It is pinned into the upload policy, so storage rejects anything larger before a
+	// single byte lands.
+	MaxOriginalImageSizeBytes = 8 * 1024 * 1024 // 8 MiB
+
+	// maxImageDimension bounds an image's width and height. It is set to the format
+	// ceiling — the largest dimension JPEG and GIF can even encode (their size
+	// fields are 16-bit); PNG permits more but the pixel cap below bounds it, and
+	// WebP is lower still at 16,383. So this is only a format-sanity bound, not a
+	// real resource limit: the total pixel cap is the actual memory guard, and
+	// unlike a per-axis limit it judges an image by its area, not its shape — so an
+	// extreme aspect ratio (a wide panorama, a long screenshot) is accepted as long
+	// as it fits the pixel budget, never rejected for its shape alone. Checked from
+	// the header before the full image is decoded.
+	maxImageDimension = 65_535
 
 	// maxImagePixels bounds the total pixel count (width × height) the server will
 	// decode. It is checked from the image header via DecodeConfig before the full
@@ -95,32 +128,35 @@ func InspectImage(data []byte) (*ImageInspection, error) {
 	// declares enormous dimensions.
 	config, headerFormat, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read image header: %w", err)
+		return nil, fmt.Errorf("failed to read image header: %v: %w", err, ErrImageCorrupt)
 	}
 	if int64(config.Width)*int64(config.Height) > maxImagePixels {
-		return nil, fmt.Errorf("image dimensions %dx%d exceed the %d pixel limit", config.Width, config.Height, maxImagePixels)
+		return nil, fmt.Errorf("image dimensions %dx%d exceed the %d pixel limit: %w", config.Width, config.Height, maxImagePixels, ErrImageTooLarge)
+	}
+	if config.Width > maxImageDimension || config.Height > maxImageDimension {
+		return nil, fmt.Errorf("image dimensions %dx%d exceed the %d per-axis limit: %w", config.Width, config.Height, maxImageDimension, ErrImageTooLarge)
 	}
 	// Reject animated images: only the first frame would be inspected and
 	// moderated, but the whole animation would be served — a moderation bypass.
 	// Detected from the container structure, so no extra frames are decoded.
 	if isImageAnimated(headerFormat, data) {
-		return nil, fmt.Errorf("animated %s images are not supported", headerFormat)
+		return nil, fmt.Errorf("animated %s images are not supported: %w", headerFormat, ErrImageUnsupportedType)
 	}
 
 	img, format, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode image: %w", err)
+		return nil, fmt.Errorf("failed to decode image: %v: %w", err, ErrImageCorrupt)
 	}
 
 	mimeType, ok := imageFormatToMimeType[format]
 	if !ok {
-		return nil, fmt.Errorf("unsupported image format %q", format)
+		return nil, fmt.Errorf("unsupported image format %q: %w", format, ErrImageUnsupportedType)
 	}
 
 	bounds := img.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
 	if width <= 0 || height <= 0 {
-		return nil, fmt.Errorf("image has invalid dimensions %dx%d", width, height)
+		return nil, fmt.Errorf("image has invalid dimensions %dx%d: %w", width, height, ErrImageCorrupt)
 	}
 
 	hash, err := blurhash.Encode(blurhashComponentsX, blurhashComponentsY, downscaleForBlurhash(img))

@@ -34,12 +34,16 @@ type Store interface {
 	// returns an empty slice (not ErrNotFound) when there are none.
 	GetRenditions(ctx context.Context, parentID *blobpb.BlobId) ([]*Blob, error)
 
-	// Advance moves a blob forward to a later lifecycle state, persisting derived
-	// metadata when provided (image is set only on the transition into
-	// StateInspected). It advances strictly forward and never out of a terminal
-	// state, so a replayed or concurrent finalize is idempotent: advancing to a
-	// state the blob is already at or past is a no-op. The declared MimeType and
-	// SizeBytes are never changed.
+	// Advance moves a blob forward along the success path to a later lifecycle
+	// state, persisting derived metadata when provided (image is set only on the
+	// transition into StateInspected). It advances strictly forward and never out
+	// of a terminal state, so a replayed or concurrent finalize is idempotent:
+	// advancing to a state the blob is already at or past is a no-op. The declared
+	// MimeType and SizeBytes are never changed.
+	//
+	// StateRejected is not a valid target — rejection is terminal and carries
+	// metadata, so it is reached only through Reject. Passing it returns
+	// ErrCannotAdvanceToRejected.
 	//
 	// It reports whether this call actually performed the transition. A false
 	// return with a nil error means the blob was already at or past the target
@@ -48,6 +52,16 @@ type Store interface {
 	//
 	// ErrNotFound is returned if no blob exists for the given id.
 	Advance(ctx context.Context, id *blobpb.BlobId, to State, image *ImageMetadata) (bool, error)
+
+	// Reject moves a non-terminal blob to the terminal StateRejected, recording
+	// why. Like Advance it transitions only out of a non-terminal state and is
+	// idempotent: it reports whether it performed the transition, and a false with
+	// a nil error means the blob was already terminal — a concurrent or replayed
+	// finalize won the race, so the committed rejection (or readiness) stands and
+	// must not be overwritten.
+	//
+	// ErrNotFound is returned if no blob exists for the given id.
+	Reject(ctx context.Context, id *blobpb.BlobId, rejection *RejectionMetadata) (bool, error)
 }
 
 // Clone returns a deep copy of the blob, so stores can hand out values callers
@@ -76,6 +90,10 @@ func (b *Blob) Clone() *Blob {
 	if b.Image != nil {
 		image := *b.Image
 		cloned.Image = &image
+	}
+	if b.Rejection != nil {
+		rejection := *b.Rejection
+		cloned.Rejection = &rejection
 	}
 	return cloned
 }

@@ -81,6 +81,10 @@ func (m *memory) GetRenditions(_ context.Context, parentID *blobpb.BlobId) ([]*b
 }
 
 func (m *memory) Advance(_ context.Context, id *blobpb.BlobId, to blob.State, image *blob.ImageMetadata) (bool, error) {
+	if to == blob.StateRejected {
+		return false, blob.ErrCannotAdvanceToRejected
+	}
+
 	m.Lock()
 	defer m.Unlock()
 
@@ -99,6 +103,29 @@ func (m *memory) Advance(_ context.Context, id *blobpb.BlobId, to blob.State, im
 	if image != nil {
 		imageCopy := *image
 		b.Image = &imageCopy
+	}
+	return true, nil
+}
+
+func (m *memory) Reject(_ context.Context, id *blobpb.BlobId, rejection *blob.RejectionMetadata) (bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	b, ok := m.blobs[string(id.Value)]
+	if !ok {
+		return false, blob.ErrNotFound
+	}
+
+	// Never overwrite a terminal blob; a concurrent or replayed reject is an
+	// idempotent no-op that defers to the committed state.
+	if b.State.Terminal() {
+		return false, nil
+	}
+
+	b.State = blob.StateRejected
+	if rejection != nil {
+		rejectionCopy := *rejection
+		b.Rejection = &rejectionCopy
 	}
 	return true, nil
 }

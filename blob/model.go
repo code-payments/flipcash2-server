@@ -240,16 +240,16 @@ type Blob struct {
 	Rejection *RejectionMetadata
 }
 
-func newBlobID() (*blobpb.BlobId, error) {
+func MustGenerateID() *blobpb.BlobId {
 	id, err := uuid.NewRandom()
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 	value := id
-	return &blobpb.BlobId{Value: value[:]}, nil
+	return &blobpb.BlobId{Value: value[:]}
 }
 
-func blobIDString(id *blobpb.BlobId) string {
+func IDString(id *blobpb.BlobId) string {
 	if id == nil {
 		return "<nil>"
 	}

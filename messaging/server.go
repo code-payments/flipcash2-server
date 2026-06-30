@@ -41,6 +41,7 @@ type Server struct {
 
 	chats    chat.Store
 	messages Store
+	media    Media
 
 	sender *Sender
 
@@ -52,6 +53,7 @@ func NewServer(
 	authz auth.Authorizer,
 	chats chat.Store,
 	messages Store,
+	media Media,
 	sender *Sender,
 ) *Server {
 	return &Server{
@@ -59,6 +61,7 @@ func NewServer(
 		authz:    authz,
 		chats:    chats,
 		messages: messages,
+		media:    media,
 		sender:   sender,
 	}
 }
@@ -86,9 +89,14 @@ func (s *Server) GetMessage(ctx context.Context, req *messagingpb.GetMessageRequ
 		return nil, status.Error(codes.Internal, "")
 	}
 
+	proto := msg.ToProto()
+	if err := hydrateMedia(ctx, s.media, []*messagingpb.Message{proto}); err != nil {
+		log.With(zap.Error(err)).Warn("Failure resolving media metadata")
+	}
+
 	return &messagingpb.GetMessageResponse{
 		Result:  messagingpb.GetMessageResponse_OK,
-		Message: msg.ToProto(),
+		Message: proto,
 	}, nil
 }
 
@@ -128,6 +136,9 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 	protos := make([]*messagingpb.Message, len(msgs))
 	for i, m := range msgs {
 		protos[i] = m.ToProto()
+	}
+	if err := hydrateMedia(ctx, s.media, protos); err != nil {
+		log.With(zap.Error(err)).Warn("Failure resolving media metadata")
 	}
 	return &messagingpb.GetMessagesResponse{
 		Result:   messagingpb.GetMessagesResponse_OK,
@@ -217,6 +228,9 @@ func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.M
 			for i, m := range msgs {
 				batch[i] = m.ToProto()
 			}
+			if err := hydrateMedia(ctx, s.media, batch); err != nil {
+				log.With(zap.Error(err)).Warn("Failure resolving media metadata")
+			}
 			resp.Messages = &messagingpb.MessageBatch{Messages: batch}
 		}
 		if err := stream.Send(resp); err != nil {
@@ -263,14 +277,24 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 		}
 	}
 
-	msg, err := s.sender.Send(ctx, req.ChatId, userID, req.Content, req.ClientMessageId, true)
+	// Share any media into the chat — validate the sender owns each blob and it is
+	// a READY original, then grant the chat read access — before the message is
+	// persisted and broadcast, so the grants are durable before any recipient can
+	// resolve the blobs.
+	if denied, err := s.shareMessageMedia(ctx, log, userID, req.ChatId, req.Content); err != nil {
+		return nil, err
+	} else if denied {
+		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
+	}
+
+	msgProto, err := s.sender.Send(ctx, req.ChatId, userID, req.Content, req.ClientMessageId, true)
 	if err != nil {
 		return nil, err
 	}
 
 	return &messagingpb.SendMessageResponse{
 		Result:  messagingpb.SendMessageResponse_OK,
-		Message: msg.ToProto(),
+		Message: msgProto,
 	}, nil
 }
 
@@ -333,6 +357,14 @@ func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRe
 		}
 	}
 
+	// New media on an edit is shared into the chat just like a send, before the
+	// edit is persisted and broadcast.
+	if denied, err := s.shareMessageMedia(ctx, log, userID, req.ChatId, req.Content); err != nil {
+		return nil, err
+	} else if denied {
+		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
+	}
+
 	now := time.Now().UTC()
 	updated, err := s.messages.EditMessage(ctx, req.ChatId, req.MessageId, req.Content, now, req.ExpectedEventSequence)
 	switch {
@@ -358,6 +390,12 @@ func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRe
 	// apply the edit live via the message_edited event, or pick it up on their next
 	// history load.
 	updatedProto := updated.ToProto()
+	// Resolve media metadata onto the edited message before it is broadcast and
+	// returned. Best-effort: the edit is already committed, so a resolution failure
+	// just leaves Blob unset for the client to re-fetch rather than failing the edit.
+	if err := hydrateMedia(ctx, s.media, []*messagingpb.Message{updatedProto}); err != nil {
+		log.With(zap.Error(err)).Warn("Failure resolving media metadata for edit")
+	}
 	publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
 		Events: &messagingpb.EventBatch{Events: []*messagingpb.Event{NewMessageEditedEvent(updatedProto)}},
 	}, nil, nil)
@@ -779,11 +817,12 @@ func (s *Server) isMember(ctx context.Context, log *zap.Logger, chatID *commonpb
 
 // clientAllowedContent reports whether content is a message body a client may
 // author via SendMessage or EditMessage, and extracts the replied-to message ID
-// when it is a reply. The permitted set is a whitelist — currently a plain text
-// message, or a reply whose own content is text — so it excludes server-injected
-// content (e.g. cash payment messages) and any content type added later until it is
-// explicitly allowed. repliedMessageID is non-nil only for a valid reply, signaling
-// the caller to verify the replied-to message exists and is repliable.
+// when it is a reply. The permitted set is a whitelist — currently a text or media
+// message, or a reply whose own body is text or media — so it excludes
+// server-injected content (e.g. cash payment messages) and any content type added
+// later until it is explicitly allowed. repliedMessageID is non-nil only for a
+// valid reply, signaling the caller to verify the replied-to message exists and is
+// repliable.
 func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *messagingpb.MessageId, ok bool) {
 	if len(content) != 1 {
 		return nil, false
@@ -791,16 +830,31 @@ func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *mes
 	switch c := content[0].Type.(type) {
 	case *messagingpb.Content_Text:
 		return nil, true
+	case *messagingpb.Content_Media:
+		return nil, validClientMedia(c.Media)
 	case *messagingpb.Content_Reply:
 		if len(c.Reply.Content) != 1 {
 			return nil, false
 		}
-		if _, isText := c.Reply.Content[0].Type.(*messagingpb.Content_Text); !isText {
+		if !validReplyBody(c.Reply.Content[0]) {
 			return nil, false
 		}
 		return c.Reply.RepliedMessageId, true
 	default:
 		return nil, false
+	}
+}
+
+// validReplyBody reports whether a reply's body is content a client may author:
+// text or well-formed media.
+func validReplyBody(content *messagingpb.Content) bool {
+	switch c := content.Type.(type) {
+	case *messagingpb.Content_Text:
+		return true
+	case *messagingpb.Content_Media:
+		return validClientMedia(c.Media)
+	default:
+		return false
 	}
 }
 

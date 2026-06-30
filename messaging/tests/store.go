@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
@@ -1235,6 +1236,34 @@ func replyContent(repliedMessageID uint64, text string) []*messagingpb.Content {
 			Reply: &messagingpb.ReplyContent{
 				RepliedMessageId: &messagingpb.MessageId{Value: repliedMessageID},
 				Content:          textContent(text),
+			},
+		},
+	}}
+}
+
+// mediaContent builds a one-item media message referencing blobID as its ORIGINAL
+// rendition — the shape a client sends.
+func mediaContent(blobID *blobpb.BlobId) []*messagingpb.Content {
+	return []*messagingpb.Content{{
+		Type: &messagingpb.Content_Media{Media: &messagingpb.MediaContent{
+			Items: []*messagingpb.MediaItem{{
+				Renditions: []*messagingpb.MediaItemRendition{{
+					Role:   messagingpb.MediaItemRendition_ORIGINAL,
+					BlobId: blobID,
+				}},
+			}},
+		}},
+	}}
+}
+
+// replyMediaContent builds a reply to repliedMessageID whose body is a media
+// message referencing blobID.
+func replyMediaContent(repliedMessageID uint64, blobID *blobpb.BlobId) []*messagingpb.Content {
+	return []*messagingpb.Content{{
+		Type: &messagingpb.Content_Reply{
+			Reply: &messagingpb.ReplyContent{
+				RepliedMessageId: &messagingpb.MessageId{Value: repliedMessageID},
+				Content:          mediaContent(blobID),
 			},
 		},
 	}}

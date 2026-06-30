@@ -18,6 +18,8 @@ import (
 
 	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
 	badgememory "github.com/code-payments/flipcash2-server/badge/memory"
+	"github.com/code-payments/flipcash2-server/blob"
+	blobmemory "github.com/code-payments/flipcash2-server/blob/memory"
 	"github.com/code-payments/flipcash2-server/chat"
 	chatmemory "github.com/code-payments/flipcash2-server/chat/memory"
 	"github.com/code-payments/flipcash2-server/event"
@@ -44,7 +46,8 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	ocpData := ocp_data.NewTestDataProvider()
 	bus := event.NewBus[*commonpb.UserId, *eventpb.Event]()
 
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, ocpData, push.NewNoOpPusher(), bus)
+	media := blob.NewMedia(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, media, ocpData, push.NewNoOpPusher(), bus)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
 	integration := intent.NewIntegration(accounts, profiles)
 

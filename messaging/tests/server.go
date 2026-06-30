@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
@@ -19,6 +20,8 @@ import (
 
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/badge"
+	"github.com/code-payments/flipcash2-server/blob"
+	blob_memory "github.com/code-payments/flipcash2-server/blob/memory"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/messaging"
@@ -38,6 +41,8 @@ func RunServerTests(t *testing.T, badges badge.Store, chats chat.Store, messages
 		testServer_SendMessage_Idempotent,
 		testServer_SendReply,
 		testServer_SendMessage_DisallowedContent,
+		testServer_SendMedia,
+		testServer_ResolvesMediaOnRead,
 		testServer_SendMessage_Broadcast,
 		testServer_EditMessage,
 		testServer_DeleteMessage,
@@ -78,6 +83,9 @@ type serverEnv struct {
 	keysA  model.KeyPair
 	userB  *commonpb.UserId
 	keysB  model.KeyPair
+
+	blobStore  blob.Store
+	blobAccess blob.AccessStore
 }
 
 func newServerEnv(t *testing.T, badges badge.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) *serverEnv {
@@ -106,8 +114,14 @@ func newServerEnv(t *testing.T, badges badge.Store, chats chat.Store, messages m
 		LastActivity: at(1),
 	}))
 
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, ocp_data.NewTestDataProvider(), push.NewNoOpPusher(), bus)
-	server := messaging.NewServer(log, authz, chats, messages, sender)
+	blobStore := blob_memory.NewInMemory()
+	blobAccess := blob_memory.NewInMemoryAccessStore()
+	env.blobStore = blobStore
+	env.blobAccess = blobAccess
+	media := blob.NewMedia(blobStore, blob_memory.NewInMemoryStorage(), blobAccess)
+
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, media, ocp_data.NewTestDataProvider(), push.NewNoOpPusher(), bus)
+	server := messaging.NewServer(log, authz, chats, messages, media, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
 	}))
@@ -456,6 +470,37 @@ func lastMessageID(resp *messagingpb.GetMessagesResponse) *messagingpb.MessageId
 	return msgs[len(msgs)-1].MessageId
 }
 
+// putReadyBlob seeds a READY original blob owned by owner into the blob store and
+// returns its id, so a media message can reference a real, shareable blob.
+// newBlobID returns a random, well-formed (16-byte) blob id.
+func newBlobID() *blobpb.BlobId {
+	return &blobpb.BlobId{Value: model.MustGenerateUserID().Value}
+}
+
+func (e *serverEnv) putReadyBlob(owner *commonpb.UserId) *blobpb.BlobId {
+	id := newBlobID()
+	require.NoError(e.t, e.blobStore.CreatePending(e.ctx, &blob.Blob{
+		ID:         id,
+		Rendition:  blob.RenditionOriginal,
+		Owner:      owner,
+		State:      blob.StatePending,
+		StorageKey: "images/x/original.png",
+		MimeType:   "image/png",
+		SizeBytes:  1,
+	}))
+	_, err := e.blobStore.Advance(e.ctx, id, blob.StateReady, nil)
+	require.NoError(e.t, err)
+	return id
+}
+
+// chatGrantedRead reports whether the chat has been granted read access to
+// blobID — i.e. whether a chat-read grant was written when the blob was shared.
+func (e *serverEnv) chatGrantedRead(blobID *blobpb.BlobId) bool {
+	has, err := e.blobAccess.HasGrant(e.ctx, blobID, blob.PrincipalForChat(e.chatID), blob.PermissionRead)
+	require.NoError(e.t, err)
+	return has
+}
+
 // ============================================================================
 // Messaging
 // ============================================================================
@@ -478,6 +523,96 @@ func testServer_SendAndGet(t *testing.T, chats chat.Store, messages messaging.St
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessagesResponse_OK, listResp.Result)
 	require.Len(t, listResp.Messages.Messages, 1)
+}
+
+func testServer_SendMedia(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	// Media owned by the sender is sent, and the blob is granted to the chat.
+	ownedBlob := e.putReadyBlob(e.userA)
+	ownedResp, err := e.sendContent(e.keysA, mediaContent(ownedBlob), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, ownedResp.Result)
+	require.True(t, e.chatGrantedRead(ownedBlob))
+
+	// Media owned by another user is denied, and nothing is granted.
+	othersBlob := e.putReadyBlob(e.userB)
+	deniedResp, err := e.sendContent(e.keysA, mediaContent(othersBlob), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, deniedResp.Result)
+	require.False(t, e.chatGrantedRead(othersBlob))
+
+	// A reply whose body is media shares the media too.
+	original, err := e.send(e.keysA, "original", generateClientID())
+	require.NoError(t, err)
+	replyBlob := e.putReadyBlob(e.userB)
+	replyResp, err := e.sendContent(e.keysB, replyMediaContent(original.Message.MessageId.Value, replyBlob), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, replyResp.Result)
+	require.True(t, e.chatGrantedRead(replyBlob))
+}
+
+func testServer_ResolvesMediaOnRead(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	// A sends a media message referencing a blob.
+	blobID := e.putReadyBlob(e.userA)
+	sendResp, err := e.sendContent(e.keysA, mediaContent(blobID), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sendResp.Result)
+
+	// The send response itself carries the resolved metadata.
+	sent := sendResp.Message.Content[0].GetMedia().Items[0].Renditions[0]
+	require.NotNil(t, sent.Blob)
+	require.NotEmpty(t, sent.Blob.GetDownloadUrl().GetUrl())
+
+	// The live broadcast (message_sent event) carries the resolved metadata too.
+	e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
+		if u.Events == nil || len(u.Events.Events) != 1 || len(u.Events.Events[0].Mutations) != 1 {
+			return false
+		}
+		sent := u.Events.Events[0].Mutations[0].GetMessageSent()
+		if sent == nil || sent.MessageId.Value != sendResp.Message.MessageId.Value {
+			return false
+		}
+		r := sent.Content[0].GetMedia().Items[0].Renditions[0]
+		return r.GetBlob().GetDownloadUrl().GetUrl() != ""
+	})
+
+	// B (a member) reads it, and the server fills the rendition's resolved metadata
+	// — a download URL it can fetch the bytes from — alongside the blob id.
+	getResp, err := e.getMessage(e.keysB, sendResp.Message.MessageId)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+
+	got := getResp.Message.Content[0].GetMedia().Items[0].Renditions[0]
+	require.Equal(t, blobID.Value, got.BlobId.Value)
+	require.NotNil(t, got.Blob)
+	require.Equal(t, "image/png", got.Blob.MimeType)
+	require.NotNil(t, got.Blob.DownloadUrl)
+	require.NotEmpty(t, got.Blob.DownloadUrl.Url)
+
+	// The same metadata is filled on the list (GetMessages) path.
+	listResp, err := e.getMessagesByOptions(e.keysB, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_OK, listResp.Result)
+	listed := listResp.Messages.Messages[0].Content[0].GetMedia().Items[0].Renditions[0]
+	require.NotNil(t, listed.Blob)
+	require.NotEmpty(t, listed.Blob.DownloadUrl.Url)
+
+	// And on the delta (GetDelta) catch-up path.
+	deltaResps, err := e.getDelta(e.keysB, 0)
+	require.NoError(t, err)
+	deltaMsgs, _, _ := collectDelta(deltaResps)
+	var delivered *messagingpb.MediaItemRendition
+	for _, m := range deltaMsgs {
+		if m.MessageId.Value == sendResp.Message.MessageId.Value {
+			delivered = m.Content[0].GetMedia().Items[0].Renditions[0]
+		}
+	}
+	require.NotNil(t, delivered)
+	require.NotNil(t, delivered.Blob)
+	require.NotEmpty(t, delivered.Blob.DownloadUrl.Url)
 }
 
 func testServer_SendMessage_Idempotent(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
@@ -547,9 +682,30 @@ func testServer_SendReply(t *testing.T, chats chat.Store, messages messaging.Sto
 func testServer_SendMessage_DisallowedContent(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
 	e := newServerEnv(t, badges, chats, messages, profiles)
 
+	// A server-injected system message may not be authored by a client.
 	systemResp, err := e.sendContent(e.keysA, systemContent("i joined"), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_DENIED, systemResp.Result)
+
+	// Media referencing a non-ORIGINAL rendition is rejected: a client references
+	// only the original; the server derives and serves the rest.
+	derivedRole := mediaContent(newBlobID())
+	derivedRole[0].GetMedia().Items[0].Renditions[0].Role = messagingpb.MediaItemRendition_DISPLAY
+	roleResp, err := e.sendContent(e.keysA, derivedRole, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, roleResp.Result)
+
+	// Media whose item carries more than the single ORIGINAL rendition a client may
+	// supply is rejected.
+	extraRendition := mediaContent(newBlobID())
+	item := extraRendition[0].GetMedia().Items[0]
+	item.Renditions = append(item.Renditions, &messagingpb.MediaItemRendition{
+		Role:   messagingpb.MediaItemRendition_ORIGINAL,
+		BlobId: newBlobID(),
+	})
+	extraResp, err := e.sendContent(e.keysA, extraRendition, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, extraResp.Result)
 }
 
 func testServer_SendMessage_Broadcast(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {

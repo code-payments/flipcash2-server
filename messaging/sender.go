@@ -43,6 +43,11 @@ type Sender struct {
 	messages Store
 	profiles profile.Store
 
+	// media resolves blob metadata so a broadcast new-message event carries the
+	// same resolved media a read would. Hydration is best-effort and a no-op for
+	// media-free sends (e.g. server-authored cash messages).
+	media Media
+
 	ocpData ocp_data.Provider
 
 	pusher push.Pusher
@@ -56,6 +61,7 @@ func NewSender(
 	chats chat.Store,
 	messages Store,
 	profiles profile.Store,
+	media Media,
 	ocpData ocp_data.Provider,
 	pusher push.Pusher,
 	eventBus *event.Bus[*commonpb.UserId, *eventpb.Event],
@@ -66,6 +72,7 @@ func NewSender(
 		chats:    chats,
 		messages: messages,
 		profiles: profiles,
+		media:    media,
 		ocpData:  ocpData,
 		pusher:   pusher,
 		eventBus: eventBus,
@@ -94,7 +101,7 @@ func (s *Sender) Send(
 	content []*messagingpb.Content,
 	clientMessageID *messagingpb.ClientMessageId,
 	countsTowardUnread bool,
-) (*Message, error) {
+) (*messagingpb.Message, error) {
 	log := s.log
 	if senderID != nil {
 		log = log.With(zap.String("user_id", model.UserIDString(senderID)))
@@ -122,12 +129,22 @@ func (s *Sender) Send(
 		return nil, status.Error(codes.Internal, "")
 	}
 
+	// Build the message proto once and resolve its media metadata, so the proto
+	// returned to the caller (the SendMessage response) and the one broadcast to
+	// members carry the same hydrated message. Best-effort and a no-op for
+	// media-free sends; the message is already persisted, so a resolution failure
+	// just leaves Blob unset for clients to re-fetch.
+	msgProto := msg.ToProto()
+	if err := hydrateMedia(ctx, s.media, []*messagingpb.Message{msgProto}); err != nil {
+		log.With(zap.Error(err)).Warn("Failure resolving media metadata")
+	}
+
 	// A retried send (same client message ID) already ran every side effect when
 	// the message was first persisted — most importantly the push to members.
 	// Re-running them would duplicate notifications, so return the original
 	// message and stop here.
 	if !created {
-		return msg, nil
+		return msgProto, nil
 	}
 
 	// The message is now durable, and a retry skips the side effects below — so
@@ -169,7 +186,7 @@ func (s *Sender) Send(
 	// log (it is deprecated but still populated during the transition). The
 	// sender's read pointer and the new last activity are only included when they
 	// actually advanced — a no-op must not broadcast a stale pointer or timestamp.
-	msgProto := msg.ToProto()
+	// msgProto was already built and media-hydrated above.
 	update := &eventpb.ChatUpdate{
 		NewMessages: &messagingpb.MessageBatch{Messages: []*messagingpb.Message{msgProto}},
 		Events:      &messagingpb.EventBatch{Events: []*messagingpb.Event{NewMessageSentEvent(msgProto)}},
@@ -190,5 +207,5 @@ func (s *Sender) Send(
 	// which case publishChatUpdate loads them itself).
 	publishChatUpdate(ctx, log, s.badges, s.chats, s.profiles, s.ocpData, s.pusher, s.eventBus, chatID, update, nil, members)
 
-	return msg, nil
+	return msgProto, nil
 }

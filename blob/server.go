@@ -327,7 +327,7 @@ func (s *Server) GetBlobs(ctx context.Context, req *blobpb.GetBlobsRequest) (*bl
 		case blobpb.BlobStatus_BLOB_STATUS_READY:
 			// download_url and the rest of the metadata are only meaningful, and only
 			// minted, for a servable (READY) blob.
-			metadata, err := s.buildMetadata(ctx, record)
+			metadata, err := buildMetadata(ctx, s.storage, record)
 			if err != nil {
 				s.log.Warn("Failed to mint blob metadata",
 					zap.String("blob_id", blobIDString(record.ID)),
@@ -602,9 +602,11 @@ func (s *Server) cleanupUpload(ctx context.Context, record *Blob) {
 }
 
 // buildMetadata assembles the server-authoritative metadata for a READY blob,
-// minting a fresh, short-lived download URL.
-func (s *Server) buildMetadata(ctx context.Context, record *Blob) (*blobpb.BlobMetadata, error) {
-	downloadURL, err := s.storage.SignDownloadURL(ctx, record.StorageKey)
+// minting a fresh, short-lived download URL. It is a free function over an
+// ObjectStorage so both the Server (GetBlobs) and Media (Resolve) can mint
+// metadata from their own storage without duplicating the logic.
+func buildMetadata(ctx context.Context, storage ObjectStorage, record *Blob) (*blobpb.BlobMetadata, error) {
+	downloadURL, err := storage.SignDownloadURL(ctx, record.StorageKey)
 	if err != nil {
 		return nil, err
 	}

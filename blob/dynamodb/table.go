@@ -10,11 +10,21 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// CreateTables provisions the blobs table: one item per blob keyed by
+// CreateTables provisions the blob domain's DynamoDB tables — the blobs table
+// and the ACL table — and is the single entry point for setting them up. It is
+// idempotent (existing tables are left as-is) and blocks until both are ACTIVE.
+func CreateTables(ctx context.Context, client *dynamodb.Client, blobsTable, aclTable string) error {
+	if err := createBlobsTable(ctx, client, blobsTable); err != nil {
+		return err
+	}
+	return createACLTable(ctx, client, aclTable)
+}
+
+// createBlobsTable provisions the blobs table: one item per blob keyed by
 // pk = "blob#<id hex>", with on-demand billing and a sparse renditions_by_parent
 // GSI (hash = parent_id) for listing an ORIGINAL's renditions. It is idempotent
 // (an existing table is left as-is) and blocks until the table is ACTIVE.
-func CreateTables(ctx context.Context, client *dynamodb.Client, blobsTable string) error {
+func createBlobsTable(ctx context.Context, client *dynamodb.Client, blobsTable string) error {
 	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
 		TableName:   aws.String(blobsTable),
 		BillingMode: types.BillingModePayPerRequest,
@@ -47,6 +57,38 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, blobsTable strin
 		return err
 	}
 	return enableTTL(ctx, client, blobsTable)
+}
+
+// createACLTable provisions the blob ACL table: one item per access-control
+// entry keyed by pk = "blob#<id hex>" and
+// sk = "<effect>#<perm>#<ptype>#<principal id hex>", with on-demand billing. An
+// entry's existence is the authorization, so there are no other attributes, no
+// secondary indexes, and no TTL — entries are durable until explicitly revoked.
+// It is idempotent (an existing table is left as-is) and blocks until the table
+// is ACTIVE.
+func createACLTable(ctx context.Context, client *dynamodb.Client, aclTable string) error {
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String(aclTable),
+		BillingMode: types.BillingModePayPerRequest,
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+		},
+	})
+	if err != nil {
+		var inUse *types.ResourceInUseException
+		if !errors.As(err, &inUse) {
+			return err
+		}
+		// Already exists; still ensure it is ACTIVE below.
+	}
+	return dynamodb.NewTableExistsWaiter(client).Wait(ctx, &dynamodb.DescribeTableInput{
+		TableName: aws.String(aclTable),
+	}, 2*time.Minute)
 }
 
 // enableTTL turns on DynamoDB's TTL feature against the expires_at attribute, so

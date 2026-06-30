@@ -37,6 +37,12 @@ type Server struct {
 	blobs    Store
 	storage  ObjectStorage
 
+	// access holds the blob ACL grants; resolver resolves a grant's principal to
+	// concrete coverage (e.g. chat membership). Together they back the non-owner
+	// read path in GetBlobs.
+	access   AccessStore
+	resolver PrincipalResolver
+
 	// moderator classifies uploaded image bytes during finalization. It is
 	// optional; when nil, moderation is skipped.
 	moderator moderation.Client
@@ -52,6 +58,8 @@ func NewServer(
 	accounts account.Store,
 	blobs Store,
 	storage ObjectStorage,
+	access AccessStore,
+	resolver PrincipalResolver,
 	moderator moderation.Client,
 	requireStaff bool,
 ) *Server {
@@ -61,6 +69,8 @@ func NewServer(
 		accounts:     accounts,
 		blobs:        blobs,
 		storage:      storage,
+		access:       access,
+		resolver:     resolver,
 		moderator:    moderator,
 		requireStaff: requireStaff,
 	}
@@ -293,9 +303,17 @@ func (s *Server) GetBlobs(ctx context.Context, req *blobpb.GetBlobsRequest) (*bl
 
 	resolved := make([]*blobpb.Blob, 0, len(records))
 	for _, record := range records {
-		// Owner-only access (see the method comment): a record the caller does not
-		// own is skipped, leaving it indistinguishable from one that does not exist.
-		if record.Owner == nil || !bytes.Equal(record.Owner.Value, caller.Value) {
+		allowed, err := s.canRead(ctx, caller, record, req.Context)
+		if err != nil {
+			s.log.Warn("Failed to authorize blob",
+				zap.String("blob_id", blobIDString(record.ID)),
+				zap.Error(err),
+			)
+			return nil, status.Error(codes.Internal, "failed to get blobs")
+		}
+		if !allowed {
+			// A record the caller may not read is skipped, leaving it
+			// indistinguishable from one that does not exist.
 			continue
 		}
 
@@ -331,6 +349,58 @@ func (s *Server) GetBlobs(ctx context.Context, req *blobpb.GetBlobsRequest) (*bl
 		resp.Blobs = &blobpb.BlobBatch{Blobs: resolved}
 	}
 	return resp, nil
+}
+
+// canRead reports whether caller may read record. The blob's owner always may,
+// and needs no access context. Any other caller must present an access context
+// that authorizes the blob: the blob must carry a read grant for the context's
+// principal AND the caller must be covered by that principal (e.g. be a member
+// of the chat). Both are required — coverage alone would let anyone in the scope
+// read any blob id they can guess, and the grant alone would ignore who is
+// asking. A caller who may not read is reported (false, nil) so GetBlobs skips
+// the record, leaving it indistinguishable from one that does not exist.
+func (s *Server) canRead(ctx context.Context, caller *commonpb.UserId, record *Blob, accessContext *blobpb.AccessContext) (bool, error) {
+	if record.Owner != nil && bytes.Equal(record.Owner.Value, caller.Value) {
+		return true, nil
+	}
+	if accessContext == nil {
+		// A non-owner read requires a context; without one the blob is unauthorized.
+		return false, nil
+	}
+
+	principal, ok := principalForAccessContext(accessContext)
+	if !ok {
+		// An unknown or empty access scope authorizes nothing.
+		return false, nil
+	}
+
+	// Grants are made against the ORIGINAL; a server-derived rendition inherits
+	// its original's grants.
+	resourceID := record.ID
+	if record.ParentID != nil {
+		resourceID = record.ParentID
+	}
+
+	granted, err := s.access.HasGrant(ctx, resourceID, principal, PermissionRead)
+	if err != nil {
+		return false, err
+	}
+	if !granted {
+		return false, nil
+	}
+	return s.resolver.Covers(ctx, principal, caller)
+}
+
+// principalForAccessContext maps a request's access context to the principal a
+// grant for that surface is made to. It returns ok=false for an unknown or empty
+// scope, which the caller treats as authorizing nothing.
+func principalForAccessContext(accessContext *blobpb.AccessContext) (Principal, bool) {
+	switch scope := accessContext.GetScope().(type) {
+	case *blobpb.AccessContext_Chat:
+		return PrincipalForChat(scope.Chat), true
+	default:
+		return Principal{}, false
+	}
 }
 
 // finalize drives a blob through its processing pipeline, resuming from whatever

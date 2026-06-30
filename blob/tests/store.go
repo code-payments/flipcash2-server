@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
+	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 
 	"github.com/code-payments/flipcash2-server/blob"
 	"github.com/code-payments/flipcash2-server/model"
@@ -18,6 +19,7 @@ func RunStoreTests(t *testing.T, store blob.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, store blob.Store){
 		testStoreCreateAndGet,
 		testStoreAdvance,
+		testStoreReject,
 		testStoreRenditions,
 	} {
 		tf(t, store)
@@ -128,23 +130,76 @@ func testStoreAdvance(t *testing.T, store blob.Store) {
 	advanced, err = store.Advance(ctx, original.ID, blob.StateUploaded, nil)
 	require.NoError(t, err)
 	require.False(t, advanced)
-	advanced, err = store.Advance(ctx, original.ID, blob.StateRejected, nil)
-	require.NoError(t, err)
-	require.False(t, advanced)
 	got, err = store.GetByID(ctx, original.ID)
 	require.NoError(t, err)
 	require.Equal(t, blob.StateReady, got.State)
 
-	// A blob can be rejected outright with no derived metadata.
-	rejected := pendingOriginal(t)
-	require.NoError(t, store.CreatePending(ctx, rejected))
-	advanced, err = store.Advance(ctx, rejected.ID, blob.StateRejected, nil)
+	// Advance cannot be used to reject a blob; StateRejected is reached only
+	// through Reject, so passing it as a target is an error and changes nothing.
+	advanced, err = store.Advance(ctx, original.ID, blob.StateRejected, nil)
+	require.ErrorIs(t, err, blob.ErrCannotAdvanceToRejected)
+	require.False(t, advanced)
+}
+
+func testStoreReject(t *testing.T, store blob.Store) {
+	ctx := context.Background()
+
+	// Rejecting an unknown blob reports not-found.
+	advanced, err := store.Reject(ctx, newBlobID(t), &blob.RejectionMetadata{Reason: blob.RejectionReasonCorrupt})
+	require.ErrorIs(t, err, blob.ErrNotFound)
+	require.False(t, advanced)
+
+	// A pending blob is rejected, and the reason round-trips (no flagged category
+	// for a non-moderation reason).
+	corrupt := pendingOriginal(t)
+	require.NoError(t, store.CreatePending(ctx, corrupt))
+	advanced, err = store.Reject(ctx, corrupt.ID, &blob.RejectionMetadata{Reason: blob.RejectionReasonCorrupt})
 	require.NoError(t, err)
 	require.True(t, advanced)
-	got, err = store.GetByID(ctx, rejected.ID)
+	got, err := store.GetByID(ctx, corrupt.ID)
 	require.NoError(t, err)
 	require.Equal(t, blob.StateRejected, got.State)
-	require.Nil(t, got.Image)
+	require.NotNil(t, got.Rejection)
+	require.Equal(t, blob.RejectionReasonCorrupt, got.Rejection.Reason)
+	require.Equal(t, moderationpb.FlaggedCategory_NONE, got.Rejection.FlaggedCategory)
+
+	// A moderation rejection also round-trips its flagged category.
+	flagged := pendingOriginal(t)
+	require.NoError(t, store.CreatePending(ctx, flagged))
+	advanced, err = store.Reject(ctx, flagged.ID, &blob.RejectionMetadata{
+		Reason:          blob.RejectionReasonModeration,
+		FlaggedCategory: moderationpb.FlaggedCategory_NSFW,
+	})
+	require.NoError(t, err)
+	require.True(t, advanced)
+	got, err = store.GetByID(ctx, flagged.ID)
+	require.NoError(t, err)
+	require.Equal(t, blob.RejectionReasonModeration, got.Rejection.Reason)
+	require.Equal(t, moderationpb.FlaggedCategory_NSFW, got.Rejection.FlaggedCategory)
+
+	// Rejection is terminal and idempotent: a second reject neither transitions nor
+	// overwrites the recorded reason.
+	advanced, err = store.Reject(ctx, flagged.ID, &blob.RejectionMetadata{Reason: blob.RejectionReasonCorrupt})
+	require.NoError(t, err)
+	require.False(t, advanced)
+	got, err = store.GetByID(ctx, flagged.ID)
+	require.NoError(t, err)
+	require.Equal(t, blob.RejectionReasonModeration, got.Rejection.Reason)
+
+	// A READY blob cannot be rejected.
+	ready := pendingOriginal(t)
+	require.NoError(t, store.CreatePending(ctx, ready))
+	for _, to := range []blob.State{blob.StateUploaded, blob.StateInspected, blob.StatePromoted, blob.StateReady} {
+		_, err = store.Advance(ctx, ready.ID, to, nil)
+		require.NoError(t, err)
+	}
+	advanced, err = store.Reject(ctx, ready.ID, &blob.RejectionMetadata{Reason: blob.RejectionReasonCorrupt})
+	require.NoError(t, err)
+	require.False(t, advanced)
+	got, err = store.GetByID(ctx, ready.ID)
+	require.NoError(t, err)
+	require.Equal(t, blob.StateReady, got.State)
+	require.Nil(t, got.Rejection)
 }
 
 func testStoreRenditions(t *testing.T, store blob.Store) {

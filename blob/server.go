@@ -11,17 +11,13 @@ import (
 	"google.golang.org/grpc/status"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/moderation"
 )
-
-// MaxOriginalSizeBytes bounds the declared size of an ORIGINAL image upload. It
-// is pinned into the upload policy, so storage rejects anything larger before a
-// single byte lands.
-const MaxOriginalSizeBytes = 8 * 1024 * 1024 // 8 MiB
 
 // finalizeTimeout bounds the detached finalization that CompleteExternalUpload
 // drives. Finalization is dominated by moderation (an external call), so it is
@@ -70,6 +66,33 @@ func NewServer(
 	}
 }
 
+// GetUploadPolicy returns the upload constraints in force for the caller. It is
+// advisory and cacheable: a client uses it to validate and resize before
+// reserving an upload, but InitiateExternalUpload remains authoritative. Access
+// is gated identically to initiating an upload, so a caller who could not upload
+// does not receive a policy.
+func (s *Server) GetUploadPolicy(ctx context.Context, req *blobpb.GetUploadPolicyRequest) (*blobpb.GetUploadPolicyResponse, error) {
+	owner, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(zap.String("owner_id", model.UserIDString(owner)))
+
+	allowed, err := s.uploadAllowed(ctx, owner, log)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return &blobpb.GetUploadPolicyResponse{Result: blobpb.GetUploadPolicyResponse_DENIED}, nil
+	}
+
+	return &blobpb.GetUploadPolicyResponse{
+		Result: blobpb.GetUploadPolicyResponse_OK,
+		Policy: currentPolicy,
+	}, nil
+}
+
 func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.InitiateExternalUploadRequest) (*blobpb.InitiateExternalUploadResponse, error) {
 	owner, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
@@ -82,38 +105,35 @@ func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.Initiat
 		zap.Uint64("size_bytes", req.SizeBytes),
 	)
 
-	// Uploads are gated on registration, like other write paths.
-	isRegistered, err := s.accounts.IsRegistered(ctx, owner)
+	// Uploads are gated on registration (and, while the feature is staff-gated, on
+	// staff), like other write paths.
+	allowed, err := s.uploadAllowed(ctx, owner, log)
 	if err != nil {
-		log.Warn("Failed to get registration flag", zap.Error(err))
-		return nil, status.Error(codes.Internal, "failed to get registration flag")
+		return nil, err
 	}
-	if !isRegistered {
+	if !allowed {
 		return &blobpb.InitiateExternalUploadResponse{Result: blobpb.InitiateExternalUploadResponse_DENIED}, nil
-	}
-
-	// While the feature is staff-gated, only staff accounts may initiate uploads.
-	if s.requireStaff {
-		isStaff, err := s.accounts.IsStaff(ctx, owner)
-		if err != nil {
-			log.Warn("Failed to get staff flag", zap.Error(err))
-			return nil, status.Error(codes.Internal, "failed to get staff flag")
-		}
-		if !isStaff {
-			return &blobpb.InitiateExternalUploadResponse{Result: blobpb.InitiateExternalUploadResponse_DENIED}, nil
-		}
 	}
 
 	// The declared type and size become the immutable, pinned contract for the
 	// upload. Reject anything we would not accept up front rather than after the
-	// bytes land.
+	// bytes land, surfacing the specific reason so the client can react instead of
+	// guessing at a generic denial. A policy-driven denial echoes the policy
+	// version so a client running on a stale cached policy knows to re-fetch.
 	if !SupportedImageMimeTypes[req.MimeType] {
 		log.Debug("Rejecting upload of unsupported mime type")
-		return &blobpb.InitiateExternalUploadResponse{Result: blobpb.InitiateExternalUploadResponse_DENIED}, nil
+		return &blobpb.InitiateExternalUploadResponse{
+			Result:        blobpb.InitiateExternalUploadResponse_UNSUPPORTED_TYPE,
+			PolicyVersion: currentPolicyVersion,
+		}, nil
 	}
-	if req.SizeBytes == 0 || req.SizeBytes > MaxOriginalSizeBytes {
-		log.Debug("Rejecting upload outside size limits")
-		return &blobpb.InitiateExternalUploadResponse{Result: blobpb.InitiateExternalUploadResponse_DENIED}, nil
+
+	if req.SizeBytes > MaxOriginalImageSizeBytes {
+		log.Debug("Rejecting oversize upload")
+		return &blobpb.InitiateExternalUploadResponse{
+			Result:        blobpb.InitiateExternalUploadResponse_TOO_LARGE,
+			PolicyVersion: currentPolicyVersion,
+		}, nil
 	}
 
 	id, err := newBlobID()
@@ -154,6 +174,34 @@ func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.Initiat
 		BlobId:       id,
 		UploadTarget: target,
 	}, nil
+}
+
+// uploadAllowed reports whether the caller may upload: they must be registered,
+// and — while the feature is staff-gated — staff. A false with a nil error is a
+// clean denial; a non-nil error is an internal failure already logged and shaped
+// for return to the client.
+func (s *Server) uploadAllowed(ctx context.Context, owner *commonpb.UserId, log *zap.Logger) (bool, error) {
+	isRegistered, err := s.accounts.IsRegistered(ctx, owner)
+	if err != nil {
+		log.Warn("Failed to get registration flag", zap.Error(err))
+		return false, status.Error(codes.Internal, "failed to get registration flag")
+	}
+	if !isRegistered {
+		return false, nil
+	}
+
+	if s.requireStaff {
+		isStaff, err := s.accounts.IsStaff(ctx, owner)
+		if err != nil {
+			log.Warn("Failed to get staff flag", zap.Error(err))
+			return false, status.Error(codes.Internal, "failed to get staff flag")
+		}
+		if !isStaff {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
 
 func (s *Server) CompleteExternalUpload(ctx context.Context, req *blobpb.CompleteExternalUploadRequest) (*blobpb.CompleteExternalUploadResponse, error) {
@@ -207,12 +255,17 @@ func (s *Server) CompleteExternalUpload(ctx context.Context, req *blobpb.Complet
 		return nil, status.Error(codes.Unavailable, "upload not yet finalized")
 	}
 
-	// todo: Support rejection metadata
+	// finalize reports only the status; the rejection metadata it recorded lives on
+	// the (now terminal) record, so read it back to surface why. The committed
+	// record is authoritative even when a concurrent finalize won the race.
 	var rejectionMetadata *blobpb.RejectionMetadata
 	if finalStatus == blobpb.BlobStatus_BLOB_STATUS_REJECTED {
-		rejectionMetadata = &blobpb.RejectionMetadata{
-			Reason: blobpb.RejectionReason_REJECTION_REASON_INTERNAL,
+		rejected, err := s.blobs.GetByID(ctx, record.ID)
+		if err != nil {
+			log.Warn("Failed to load rejection metadata", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to complete upload")
 		}
+		rejectionMetadata = rejected.Rejection.ToProto()
 	}
 
 	return &blobpb.CompleteExternalUploadResponse{
@@ -266,10 +319,7 @@ func (s *Server) GetBlobs(ctx context.Context, req *blobpb.GetBlobsRequest) (*bl
 			}
 			protoBlob.Metadata = metadata
 		case blobpb.BlobStatus_BLOB_STATUS_REJECTED:
-			// todo: Support rejection metadata
-			protoBlob.Rejection = &blobpb.RejectionMetadata{
-				Reason: blobpb.RejectionReason_REJECTION_REASON_INTERNAL,
-			}
+			protoBlob.Rejection = record.Rejection.ToProto()
 		}
 
 		resolved = append(resolved, protoBlob)
@@ -330,15 +380,17 @@ func (s *Server) finalize(ctx context.Context, record *Blob) (blobpb.BlobStatus,
 		// The declared size and type are immutable: if the stored bytes disagree
 		// with either, the blob is rejected rather than corrected.
 		if uint64(len(data)) != record.SizeBytes {
-			return s.reject(ctx, record)
+			// The stored bytes don't match the size pinned at reservation, so the
+			// upload broke its declared size contract.
+			return s.reject(ctx, record, &RejectionMetadata{Reason: RejectionReasonTooLarge})
 		}
 		inspection, err := InspectImage(data)
 		if err != nil {
-			// Undecodable or unsupported bytes: not a servable image.
-			return s.reject(ctx, record)
+			// Undecodable, unsupported, or oversize bytes: not a servable image.
+			return s.reject(ctx, record, &RejectionMetadata{Reason: rejectionReasonForInspection(err)})
 		}
 		if inspection.MimeType != record.MimeType {
-			return s.reject(ctx, record)
+			return s.reject(ctx, record, &RejectionMetadata{Reason: RejectionReasonMismatchedType})
 		}
 		if s.moderator != nil {
 			// Moderate a size-bounded rendering, not the full-resolution original:
@@ -355,7 +407,10 @@ func (s *Server) finalize(ctx context.Context, record *Blob) (blobpb.BlobStatus,
 				return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
 			}
 			if result.Flagged {
-				return s.reject(ctx, record)
+				return s.reject(ctx, record, &RejectionMetadata{
+					Reason:          RejectionReasonModeration,
+					FlaggedCategory: moderation.HighestFlaggedCategory(result),
+				})
 			}
 		}
 
@@ -420,8 +475,8 @@ func (s *Server) fetchUploaded(ctx context.Context, record *Blob) ([]byte, error
 	return data, nil
 }
 
-func (s *Server) reject(ctx context.Context, record *Blob) (blobpb.BlobStatus, error) {
-	advanced, err := s.blobs.Advance(ctx, record.ID, StateRejected, nil)
+func (s *Server) reject(ctx context.Context, record *Blob, rejection *RejectionMetadata) (blobpb.BlobStatus, error) {
+	advanced, err := s.blobs.Reject(ctx, record.ID, rejection)
 	if err != nil {
 		return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
 	}
@@ -433,6 +488,23 @@ func (s *Server) reject(ctx context.Context, record *Blob) (blobpb.BlobStatus, e
 	// Drop the rejected bytes from the upload store; they are never promoted.
 	s.cleanupUpload(ctx, record)
 	return blobpb.BlobStatus_BLOB_STATUS_REJECTED, nil
+}
+
+// rejectionReasonForInspection classifies an InspectImage failure into the
+// rejection reason it should be recorded under. The byte-level validation
+// failures are wrapped with sentinels; anything else (e.g. a downstream
+// processing fault) is reported as internal.
+func rejectionReasonForInspection(err error) RejectionReason {
+	switch {
+	case errors.Is(err, ErrImageUnsupportedType):
+		return RejectionReasonUnsupportedType
+	case errors.Is(err, ErrImageTooLarge):
+		return RejectionReasonTooLarge
+	case errors.Is(err, ErrImageCorrupt):
+		return RejectionReasonCorrupt
+	default:
+		return RejectionReasonInternal
+	}
 }
 
 // currentStatus re-reads a blob and returns its authoritative public status. It

@@ -14,6 +14,7 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 
 	"github.com/code-payments/flipcash2-server/blob"
 )
@@ -38,6 +39,9 @@ const (
 	attrImageHeight   = "image_height"   // N, present only on READY images
 	attrImageBlurhash = "image_blurhash" // S, present only on READY images
 	attrExpiresAt     = "expires_at"     // N, Unix seconds; TTL on non-READY blobs
+
+	attrRejectionReason = "rejection_reason" // N, present only on REJECTED blobs
+	attrFlaggedCategory = "flagged_category" // N, present only on REJECTED-by-moderation blobs
 
 	renditionsByParentGSI = "renditions_by_parent"
 
@@ -191,6 +195,10 @@ func (s *store) GetRenditions(ctx context.Context, parentID *blobpb.BlobId) ([]*
 }
 
 func (s *store) Advance(ctx context.Context, id *blobpb.BlobId, to blob.State, image *blob.ImageMetadata) (bool, error) {
+	if to == blob.StateRejected {
+		return false, blob.ErrCannotAdvanceToRejected
+	}
+
 	names := map[string]string{"#state": attrState}
 	values := map[string]types.AttributeValue{
 		":to":       avInt(int(to)),
@@ -228,6 +236,50 @@ func (s *store) Advance(ctx context.Context, id *blobpb.BlobId, to blob.State, i
 		if errors.As(err, &ccf) {
 			// No old item means the blob does not exist; otherwise it was already at
 			// or past the target (or terminal) and advancing is an idempotent no-op.
+			if len(ccf.Item) == 0 {
+				return false, blob.ErrNotFound
+			}
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *store) Reject(ctx context.Context, id *blobpb.BlobId, rejection *blob.RejectionMetadata) (bool, error) {
+	names := map[string]string{"#state": attrState}
+	values := map[string]types.AttributeValue{
+		":to":       avInt(int(blob.StateRejected)),
+		":ready":    avInt(int(blob.StateReady)),
+		":rejected": avInt(int(blob.StateRejected)),
+	}
+
+	update := "SET #state = :to"
+	if rejection != nil {
+		update += fmt.Sprintf(", %s = :reason, %s = :cat", attrRejectionReason, attrFlaggedCategory)
+		values[":reason"] = avInt(int(rejection.Reason))
+		values[":cat"] = avInt(int(rejection.FlaggedCategory))
+	}
+	// REJECTED keeps the TTL set at creation: a rejected record is a tombstone the
+	// client can read for the reason, then DynamoDB reclaims it. Only READY clears
+	// the TTL (in Advance).
+
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:        aws.String(s.table),
+		Key:              map[string]types.AttributeValue{attrPK: avS(blobPK(id))},
+		UpdateExpression: aws.String(update),
+		// Reject only a non-terminal blob; never overwrite a terminal state.
+		ConditionExpression:       aws.String(fmt.Sprintf("attribute_exists(%s) AND #state <> :ready AND #state <> :rejected", attrPK)),
+		ExpressionAttributeNames:  names,
+		ExpressionAttributeValues: values,
+		// Distinguish "no such blob" from "already terminal" on failure.
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	})
+	if err != nil {
+		var ccf *types.ConditionalCheckFailedException
+		if errors.As(err, &ccf) {
+			// No old item means the blob does not exist; otherwise it was already
+			// terminal and rejecting is an idempotent no-op.
 			if len(ccf.Item) == 0 {
 				return false, blob.ErrNotFound
 			}
@@ -313,6 +365,22 @@ func fromItem(item map[string]types.AttributeValue) (*blob.Blob, error) {
 			Width:    uint32(width),
 			Height:   uint32(height),
 			Blurhash: stringAttr(item, attrImageBlurhash),
+		}
+	}
+
+	if _, ok := item[attrRejectionReason]; ok {
+		reason, err := intAttr(item, attrRejectionReason)
+		if err != nil {
+			return nil, err
+		}
+		b.Rejection = &blob.RejectionMetadata{Reason: blob.RejectionReason(reason)}
+		// flagged_category is present only for a moderation rejection.
+		if _, ok := item[attrFlaggedCategory]; ok {
+			category, err := intAttr(item, attrFlaggedCategory)
+			if err != nil {
+				return nil, err
+			}
+			b.Rejection.FlaggedCategory = moderationpb.FlaggedCategory(category)
 		}
 	}
 

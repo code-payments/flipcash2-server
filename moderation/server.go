@@ -98,7 +98,7 @@ func (s *Server) ModerateText(ctx context.Context, req *moderationpb.ModerateTex
 		resp.Attestation = s.signAttestation(log, req.Text, userID)
 	} else {
 		log.Info("Text is flagged", zap.Strings("categories", result.FlaggedCategories))
-		resp.FlaggedCategory = getHighestFlaggedCategory(result)
+		resp.FlaggedCategory = HighestFlaggedCategory(result)
 	}
 
 	return resp, nil
@@ -135,7 +135,7 @@ func (s *Server) ModerateImage(ctx context.Context, req *moderationpb.ModerateIm
 		resp.Attestation = s.signAttestation(log, req.ImageData, userID)
 	} else {
 		log.Info("Image is flagged", zap.Strings("categories", result.FlaggedCategories))
-		resp.FlaggedCategory = getHighestFlaggedCategory(result)
+		resp.FlaggedCategory = HighestFlaggedCategory(result)
 	}
 
 	return resp, nil
@@ -183,7 +183,12 @@ func isBlockedCurrencyName(name string) bool {
 	return false
 }
 
-func getHighestFlaggedCategory(result *Result) moderationpb.FlaggedCategory {
+// HighestFlaggedCategory maps a moderation Result's flagged categories onto the
+// proto FlaggedCategory vocabulary, returning the highest-scoring one that maps
+// to a well-defined category (falling back to OTHER). It is the shared mapping
+// used both by this service's responses and by callers that surface a moderation
+// verdict elsewhere (e.g. a blob's rejection metadata).
+func HighestFlaggedCategory(result *Result) moderationpb.FlaggedCategory {
 	var highestScore float64
 	highestFlaggedCategory := moderationpb.FlaggedCategory_OTHER
 	for _, flaggedCategory := range result.FlaggedCategories {

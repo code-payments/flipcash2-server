@@ -119,6 +119,29 @@ func TestIsImageAnimated(t *testing.T) {
 	}
 }
 
+func TestInspectImageAcceptsExtremeAspectRatio(t *testing.T) {
+	// A wide, panorama-style image: comfortably under the pixel cap but far past
+	// any per-axis ceiling tied to a normal photo's dimensions. It must be judged
+	// on area, not shape, so it is accepted.
+	var buf bytes.Buffer
+	require.NoError(t, png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 13000, 100))))
+
+	inspection, err := InspectImage(buf.Bytes())
+	require.NoError(t, err)
+	require.EqualValues(t, 13000, inspection.Metadata.Width)
+	require.EqualValues(t, 100, inspection.Metadata.Height)
+}
+
+func TestInspectImageRejectsOversizedDimensions(t *testing.T) {
+	// A 1px-tall strip is cheap in total pixels (so it clears the pixel-count cap)
+	// but exceeds the per-axis format ceiling, isolating the dimension check.
+	var buf bytes.Buffer
+	require.NoError(t, png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, maxImageDimension+1, 1))))
+
+	_, err := InspectImage(buf.Bytes())
+	require.ErrorContains(t, err, "exceed")
+}
+
 func TestInspectImageRejectsAnimated(t *testing.T) {
 	t.Run("static gif is accepted", func(t *testing.T) {
 		inspection, err := InspectImage(encodeGIF(t, 1))

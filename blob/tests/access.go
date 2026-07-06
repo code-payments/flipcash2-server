@@ -38,7 +38,7 @@ func newChatID(t *testing.T) *commonpb.ChatId {
 func testAccessGrantHasRevoke(t *testing.T, store blob.AccessStore) {
 	ctx := context.Background()
 
-	blobID := newBlobID(t)
+	blobID := blob.MustGenerateID()
 	chat := blob.PrincipalForChat(newChatID(t))
 
 	// Absent before granting.
@@ -69,8 +69,8 @@ func testAccessGrantHasRevoke(t *testing.T, store blob.AccessStore) {
 func testAccessNoCollision(t *testing.T, store blob.AccessStore) {
 	ctx := context.Background()
 
-	blobA := newBlobID(t)
-	blobB := newBlobID(t)
+	blobA := blob.MustGenerateID()
+	blobB := blob.MustGenerateID()
 	chat := blob.PrincipalForChat(newChatID(t))
 	user := blob.PrincipalForUser(model.MustGenerateUserID())
 
@@ -108,7 +108,7 @@ func testAccessNoCollision(t *testing.T, store blob.AccessStore) {
 func testAccessValidation(t *testing.T, store blob.AccessStore) {
 	ctx := context.Background()
 
-	blobID := newBlobID(t)
+	blobID := blob.MustGenerateID()
 	chat := blob.PrincipalForChat(newChatID(t))
 
 	// An unknown permission is rejected, not silently stored.

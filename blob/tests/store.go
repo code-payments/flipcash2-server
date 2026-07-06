@@ -4,7 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
@@ -27,15 +26,8 @@ func RunStoreTests(t *testing.T, store blob.Store, teardown func()) {
 	}
 }
 
-func newBlobID(t *testing.T) *blobpb.BlobId {
-	id, err := uuid.NewRandom()
-	require.NoError(t, err)
-	value := id
-	return &blobpb.BlobId{Value: value[:]}
-}
-
 func pendingOriginal(t *testing.T) *blob.Blob {
-	id := newBlobID(t)
+	id := blob.MustGenerateID()
 	key, err := blob.StorageKey(id, "image/png")
 	require.NoError(t, err)
 	return &blob.Blob{
@@ -52,7 +44,7 @@ func pendingOriginal(t *testing.T) *blob.Blob {
 func testStoreCreateAndGet(t *testing.T, store blob.Store) {
 	ctx := context.Background()
 
-	_, err := store.GetByID(ctx, newBlobID(t))
+	_, err := store.GetByID(ctx, blob.MustGenerateID())
 	require.ErrorIs(t, err, blob.ErrNotFound)
 
 	original := pendingOriginal(t)
@@ -75,7 +67,7 @@ func testStoreCreateAndGet(t *testing.T, store blob.Store) {
 	second := pendingOriginal(t)
 	require.NoError(t, store.CreatePending(ctx, second))
 
-	found, err := store.GetByIDs(ctx, []*blobpb.BlobId{original.ID, newBlobID(t), second.ID})
+	found, err := store.GetByIDs(ctx, []*blobpb.BlobId{original.ID, blob.MustGenerateID(), second.ID})
 	require.NoError(t, err)
 	require.Len(t, found, 2)
 }
@@ -83,7 +75,7 @@ func testStoreCreateAndGet(t *testing.T, store blob.Store) {
 func testStoreAdvance(t *testing.T, store blob.Store) {
 	ctx := context.Background()
 
-	advanced, err := store.Advance(ctx, newBlobID(t), blob.StateUploaded, nil)
+	advanced, err := store.Advance(ctx, blob.MustGenerateID(), blob.StateUploaded, nil)
 	require.ErrorIs(t, err, blob.ErrNotFound)
 	require.False(t, advanced)
 
@@ -145,7 +137,7 @@ func testStoreReject(t *testing.T, store blob.Store) {
 	ctx := context.Background()
 
 	// Rejecting an unknown blob reports not-found.
-	advanced, err := store.Reject(ctx, newBlobID(t), &blob.RejectionMetadata{Reason: blob.RejectionReasonCorrupt})
+	advanced, err := store.Reject(ctx, blob.MustGenerateID(), &blob.RejectionMetadata{Reason: blob.RejectionReasonCorrupt})
 	require.ErrorIs(t, err, blob.ErrNotFound)
 	require.False(t, advanced)
 

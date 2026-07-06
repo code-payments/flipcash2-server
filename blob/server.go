@@ -146,11 +146,9 @@ func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.Initiat
 		}, nil
 	}
 
-	id, err := newBlobID()
-	if err != nil {
-		log.Warn("Failed to generate blob id", zap.Error(err))
-		return nil, status.Error(codes.Internal, "failed to initiate upload")
-	}
+	id := MustGenerateID()
+	log = log.With(zap.String("blob_id", IDString(id)))
+
 	// The mime type was validated as a supported image above, so this resolves; an
 	// error here would mean the two lists drifted out of sync.
 	key, err := StorageKey(id, req.MimeType)
@@ -222,7 +220,7 @@ func (s *Server) CompleteExternalUpload(ctx context.Context, req *blobpb.Complet
 
 	log := s.log.With(
 		zap.String("owner_id", model.UserIDString(owner)),
-		zap.String("blob_id", blobIDString(req.BlobId)),
+		zap.String("blob_id", IDString(req.BlobId)),
 	)
 
 	record, err := s.blobs.GetByID(ctx, req.BlobId)
@@ -306,7 +304,7 @@ func (s *Server) GetBlobs(ctx context.Context, req *blobpb.GetBlobsRequest) (*bl
 		allowed, err := s.canRead(ctx, caller, record, req.Context)
 		if err != nil {
 			s.log.Warn("Failed to authorize blob",
-				zap.String("blob_id", blobIDString(record.ID)),
+				zap.String("blob_id", IDString(record.ID)),
 				zap.Error(err),
 			)
 			return nil, status.Error(codes.Internal, "failed to get blobs")
@@ -327,10 +325,10 @@ func (s *Server) GetBlobs(ctx context.Context, req *blobpb.GetBlobsRequest) (*bl
 		case blobpb.BlobStatus_BLOB_STATUS_READY:
 			// download_url and the rest of the metadata are only meaningful, and only
 			// minted, for a servable (READY) blob.
-			metadata, err := s.buildMetadata(ctx, record)
+			metadata, err := buildMetadata(ctx, s.storage, record)
 			if err != nil {
 				s.log.Warn("Failed to mint blob metadata",
-					zap.String("blob_id", blobIDString(record.ID)),
+					zap.String("blob_id", IDString(record.ID)),
 					zap.Error(err),
 				)
 				return nil, status.Error(codes.Internal, "failed to get blobs")
@@ -595,16 +593,18 @@ func (s *Server) currentStatus(ctx context.Context, id *blobpb.BlobId) (blobpb.B
 func (s *Server) cleanupUpload(ctx context.Context, record *Blob) {
 	if err := s.storage.DeleteUpload(ctx, record.StorageKey); err != nil {
 		s.log.Warn("Failed to delete upload object after finalization",
-			zap.String("blob_id", blobIDString(record.ID)),
+			zap.String("blob_id", IDString(record.ID)),
 			zap.Error(err),
 		)
 	}
 }
 
 // buildMetadata assembles the server-authoritative metadata for a READY blob,
-// minting a fresh, short-lived download URL.
-func (s *Server) buildMetadata(ctx context.Context, record *Blob) (*blobpb.BlobMetadata, error) {
-	downloadURL, err := s.storage.SignDownloadURL(ctx, record.StorageKey)
+// minting a fresh, short-lived download URL. It is a free function over an
+// ObjectStorage so both the Server (GetBlobs) and Media (Resolve) can mint
+// metadata from their own storage without duplicating the logic.
+func buildMetadata(ctx context.Context, storage ObjectStorage, record *Blob) (*blobpb.BlobMetadata, error) {
+	downloadURL, err := storage.SignDownloadURL(ctx, record.StorageKey)
 	if err != nil {
 		return nil, err
 	}

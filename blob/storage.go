@@ -85,5 +85,5 @@ func StorageKey(id *blobpb.BlobId, mimeType string) (string, error) {
 		// An image kind with no registered extension means the two image maps drifted.
 		return "", fmt.Errorf("missing extension for image mime type %q", mimeType)
 	}
-	return fmt.Sprintf("images/%s/original%s", blobIDString(id), ext), nil
+	return fmt.Sprintf("images/%s/original%s", IDString(id), ext), nil
 }

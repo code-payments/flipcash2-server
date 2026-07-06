@@ -135,8 +135,10 @@ func (s *Sender) Send(
 	// media-free sends; the message is already persisted, so a resolution failure
 	// just leaves Blob unset for clients to re-fetch.
 	msgProto := msg.ToProto()
-	if err := hydrateMedia(ctx, s.media, []*messagingpb.Message{msgProto}); err != nil {
-		log.With(zap.Error(err)).Warn("Failure resolving media metadata")
+	if s.media != nil {
+		if err := hydrateMedia(ctx, s.media, []*messagingpb.Message{msgProto}); err != nil {
+			log.With(zap.Error(err)).Warn("Failure resolving media metadata")
+		}
 	}
 
 	// A retried send (same client message ID) already ran every side effect when

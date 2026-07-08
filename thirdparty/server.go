@@ -92,8 +92,10 @@ func (s *Server) GetJwt(ctx context.Context, req *thirdpartypb.GetJwtRequest) (*
 		if userProfile.PhoneNumber == nil {
 			return &thirdpartypb.GetJwtResponse{Result: thirdpartypb.GetJwtResponse_PHONE_VERIFICATION_REQUIRED}, nil
 		}
-		if userProfile.EmailAddress == nil {
-			return &thirdpartypb.GetJwtResponse{Result: thirdpartypb.GetJwtResponse_EMAIL_VERIFICATION_REQUIRED}, nil
+		if account.RequireCoinbaseEmailVerification {
+			if userProfile.EmailAddress == nil {
+				return &thirdpartypb.GetJwtResponse{Result: thirdpartypb.GetJwtResponse_EMAIL_VERIFICATION_REQUIRED}, nil
+			}
 		}
 
 		jwt, err = getCoinbaseJwt(

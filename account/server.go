@@ -36,7 +36,7 @@ const (
 
 	defaultBillExchangeDataTimeout = 5 * time.Minute
 
-	requireCoinbaseEmailVerification = false
+	RequireCoinbaseEmailVerification = false
 )
 
 var (
@@ -270,7 +270,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			WithdrawalFeeAmount:              DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 			MinimumHolderValue:               MinHolderValue,
-			RequireCoinbaseEmailVerification: requireCoinbaseEmailVerification,
+			RequireCoinbaseEmailVerification: RequireCoinbaseEmailVerification,
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
 		},
 	}, nil
@@ -306,7 +306,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			WithdrawalFeeAmount:              DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 			MinimumHolderValue:               MinHolderValue,
-			RequireCoinbaseEmailVerification: requireCoinbaseEmailVerification,
+			RequireCoinbaseEmailVerification: RequireCoinbaseEmailVerification,
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
 		},
 	}, nil

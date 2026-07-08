@@ -36,7 +36,7 @@ const (
 
 	defaultBillExchangeDataTimeout = 5 * time.Minute
 
-	requireCoinbaseEmailVerification = true
+	requireCoinbaseEmailVerification = false
 )
 
 var (

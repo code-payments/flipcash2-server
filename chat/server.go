@@ -69,6 +69,11 @@ type ProfileReader interface {
 	// users that has one, keyed by string(userID.Value). Users without a linked
 	// phone number are absent from the map.
 	GetPhoneNumbers(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error)
+
+	// GetDisplayNames returns the display name for each of the given users that
+	// has one, keyed by string(userID.Value). Users without a display name are
+	// absent from the map.
+	GetDisplayNames(ctx context.Context, userIDs []*commonpb.UserId) (map[string]string, error)
 }
 
 type Server struct {
@@ -220,17 +225,19 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, cursor 
 
 // hydrate builds the proto metadata for a set of chats, batching the reads
 // across the whole set: every chat's last message in one call, every chat's
-// pointers in one call, every chat's head event sequence in one call, and every
-// DM member's phone number in one call. Member profiles otherwise carry an empty
-// placeholder (UserProfile is a required field).
+// pointers in one call, every chat's head event sequence in one call, every
+// member's display name in one call, and every DM member's phone number in one
+// call.
 //
-// Phone numbers are populated only for members of DM chats, so each party can
-// resolve the other to a contact. Group chats deliberately do not expose member
-// phone numbers.
+// Display names are populated for members of every chat: they are the public
+// identifier a member is known by within the chat. Phone numbers are populated
+// only for members of DM chats, so each party can resolve the other to a
+// contact. Group chats deliberately do not expose member phone numbers.
 func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
 	pointerRefs := make([]PointerRef, len(chats))
+	uniqueUserIDs := make(map[string]*commonpb.UserId)
 	uniqueDmUserIds := make(map[string]*commonpb.UserId)
 	for i, c := range chats {
 		pointerRefs[i] = PointerRef{ChatID: c.ID, Members: c.Members}
@@ -241,11 +248,16 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 			// the proto default 0.
 			seqChatIDs = append(seqChatIDs, c.ID)
 		}
-		if c.Type == chatpb.Metadata_DM {
-			for _, m := range c.Members {
+		for _, m := range c.Members {
+			uniqueUserIDs[string(m.Value)] = m
+			if c.Type == chatpb.Metadata_DM {
 				uniqueDmUserIds[string(m.Value)] = m
 			}
 		}
+	}
+	userIDs := make([]*commonpb.UserId, 0, len(uniqueUserIDs))
+	for _, u := range uniqueUserIDs {
+		userIDs = append(userIDs, u)
 	}
 	dmUserIDs := make([]*commonpb.UserId, 0, len(uniqueDmUserIds))
 	for _, u := range uniqueDmUserIds {
@@ -268,6 +280,10 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 	if err != nil {
 		return nil, err
 	}
+	displayNamesByUserId, err := s.profiles.GetDisplayNames(ctx, userIDs)
+	if err != nil {
+		return nil, err
+	}
 
 	metadata := make([]*chatpb.Metadata, len(chats))
 	for i, c := range chats {
@@ -277,7 +293,9 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 		md.LatestEventSequence = latestEventSeqs[key]
 		assignPointers(md, pointers[key])
 		for _, m := range md.Members {
-			profile := &profilepb.UserProfile{}
+			profile := &profilepb.UserProfile{
+				DisplayName: displayNamesByUserId[string(m.UserId.Value)],
+			}
 			if md.Type == chatpb.Metadata_DM {
 				profile.PhoneNumber = phoneNumbersByUserId[string(m.UserId.Value)]
 			}

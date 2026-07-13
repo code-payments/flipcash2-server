@@ -26,3 +26,7 @@ func (r *chatProfileReader) GetPhoneNumbers(ctx context.Context, userIDs []*comm
 	// Only numbers the user has enabled for payment are shared into the chat.
 	return r.store.GetPhoneNumbersForPayment(ctx, userIDs)
 }
+
+func (r *chatProfileReader) GetDisplayNames(ctx context.Context, userIDs []*commonpb.UserId) (map[string]string, error) {
+	return r.store.GetDisplayNames(ctx, userIDs)
+}

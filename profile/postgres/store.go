@@ -78,6 +78,10 @@ func (s *store) SetDisplayName(ctx context.Context, id *commonpb.UserId, display
 	return dbSetDisplayName(ctx, s.pool, id, displayName)
 }
 
+func (s *store) GetDisplayNames(ctx context.Context, userIDs []*commonpb.UserId) (map[string]string, error) {
+	return dbGetDisplayNames(ctx, s.pool, userIDs)
+}
+
 func (s *store) LinkPhoneNumber(ctx context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash *commonpb.Hash) error {
 	return dbLinkPhoneNumber(ctx, s.pool, id, phoneNumber, phoneNumberHash)
 }

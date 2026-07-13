@@ -86,14 +86,14 @@ func NewIntegration(
 	}
 }
 
-func (i *Integration) OnSwapSubmitted(ctx context.Context, owner *common.Account, fromMint, toMint *ocp_common.Account) error {
+func (i *Integration) OnSwapSubmitted(ctx context.Context, owner *common.Account, fromMint, toMint *ocp_common.Account, amount uint64) error {
 	if fromMint.PublicKey().ToBase58() == usdc.Mint && ocp_common.IsCoreMint(toMint) {
 		userID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: owner.PublicKey().ToBytes()})
 		if err != nil {
 			return err
 		}
 
-		return push.SendUsdfDepositProcessingPush(ctx, i.pusher, userID)
+		return push.SendUsdfDepositProcessingPush(ctx, i.pusher, userID, float64(amount)/float64(usdc.QuarksPerUsdc))
 	}
 
 	return nil

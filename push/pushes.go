@@ -26,9 +26,9 @@ var (
 	amountPrinter = message.NewPrinter(defaultLocale)
 )
 
-func SendUsdfDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId) error {
-	title := "Deposit Now Available"
-	body := "You can now spend your deposit in Flipcash"
+func SendUsdfDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, dollarAmount float64) error {
+	title := amountPrinter.Sprintf("$%.2f Added", dollarAmount)
+	body := "You can now spend it in Flipcash"
 	customPayload := &pushpb.Payload{
 		Category: pushpb.Payload_DEPOSIT_WITHDRAWAL,
 		GroupKey: pushpb.Payload_DEPOSIT_WITHDRAWAL.String(),
@@ -41,9 +41,9 @@ func SendUsdfDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.Us
 	return pusher.SendPushes(ctx, title, body, customPayload, user)
 }
 
-func SendUsdfDepositProcessingPush(ctx context.Context, pusher Pusher, user *commonpb.UserId) error {
-	title := "Deposit Processing"
-	body := "Deposits take about a minute"
+func SendUsdfDepositProcessingPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, dollarAmount float64) error {
+	title := amountPrinter.Sprintf("Adding $%.2f", dollarAmount)
+	body := "Processing is almost complete"
 	customPayload := &pushpb.Payload{
 		Category: pushpb.Payload_DEPOSIT_WITHDRAWAL,
 		GroupKey: pushpb.Payload_DEPOSIT_WITHDRAWAL.String(),

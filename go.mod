@@ -15,7 +15,7 @@ require (
 	github.com/buckket/go-blurhash v1.1.0
 	github.com/code-payments/flipcash2-protobuf-api v1.16.0
 	github.com/code-payments/ocp-protobuf-api v1.14.0
-	github.com/code-payments/ocp-server v1.20.1-0.20260710131716-f60d692f1340
+	github.com/code-payments/ocp-server v1.21.0
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2
 	github.com/forPelevin/gomoji v1.4.1
 	github.com/georgysavva/scany/v2 v2.1.4

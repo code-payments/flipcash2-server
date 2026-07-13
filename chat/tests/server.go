@@ -129,13 +129,17 @@ func (f *fakeMessagingReader) LatestEventSequences(_ context.Context, chatIDs []
 }
 
 // fakeProfileReader is a canned chat.ProfileReader for server tests: it returns
-// whatever phone number a test registers per user ID.
+// whatever phone number and display name a test registers per user ID.
 type fakeProfileReader struct {
 	phoneNumbers map[string]*phonepb.PhoneNumber
+	displayNames map[string]string
 }
 
 func newFakeProfileReader() *fakeProfileReader {
-	return &fakeProfileReader{phoneNumbers: make(map[string]*phonepb.PhoneNumber)}
+	return &fakeProfileReader{
+		phoneNumbers: make(map[string]*phonepb.PhoneNumber),
+		displayNames: make(map[string]string),
+	}
 }
 
 func (f *fakeProfileReader) GetPhoneNumbers(_ context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error) {
@@ -143,6 +147,16 @@ func (f *fakeProfileReader) GetPhoneNumbers(_ context.Context, userIDs []*common
 	for _, userID := range userIDs {
 		if p, ok := f.phoneNumbers[string(userID.Value)]; ok {
 			out[string(userID.Value)] = p
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeProfileReader) GetDisplayNames(_ context.Context, userIDs []*commonpb.UserId) (map[string]string, error) {
+	out := make(map[string]string)
+	for _, userID := range userIDs {
+		if d, ok := f.displayNames[string(userID.Value)]; ok {
+			out[string(userID.Value)] = d
 		}
 	}
 	return out, nil
@@ -303,6 +317,7 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	// messaging reader rather than derived from last_message.
 	e.messaging.latestEventSeqs[string(chatID.Value)] = 9
 	e.profiles.phoneNumbers[string(peer.Value)] = &phonepb.PhoneNumber{Value: "+15551234567"}
+	e.profiles.displayNames[string(peer.Value)] = "Peer Name"
 
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
@@ -322,13 +337,16 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	require.Len(t, members[string(peer.Value)].Pointers, 1)
 	require.Equal(t, messagingpb.Pointer_DELIVERED, members[string(peer.Value)].Pointers[0].Type)
 
-	// The other DM member's phone number is hydrated onto their profile.
+	// The other DM member's phone number and display name are hydrated onto their
+	// profile.
 	require.NotNil(t, members[string(peer.Value)].UserProfile)
 	require.NotNil(t, members[string(peer.Value)].UserProfile.PhoneNumber)
 	require.Equal(t, "+15551234567", members[string(peer.Value)].UserProfile.PhoneNumber.Value)
-	// The env user registered no phone, so theirs stays unset.
+	require.Equal(t, "Peer Name", members[string(peer.Value)].UserProfile.DisplayName)
+	// The env user registered neither, so both stay unset.
 	require.NotNil(t, members[string(e.userID.Value)].UserProfile)
 	require.Nil(t, members[string(e.userID.Value)].UserProfile.PhoneNumber)
+	require.Empty(t, members[string(e.userID.Value)].UserProfile.DisplayName)
 }
 
 func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {
@@ -336,10 +354,11 @@ func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {
 
 	// A chat with a last message, and one without.
 	withMsg := generateChatID()
+	peer := model.MustGenerateUserID()
 	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
 		ID:            withMsg,
 		Type:          chatpb.Metadata_DM,
-		Members:       []*commonpb.UserId{e.userID, model.MustGenerateUserID()},
+		Members:       []*commonpb.UserId{e.userID, peer},
 		LastActivity:  at(2),
 		LastMessageID: &messagingpb.MessageId{Value: 3},
 	}))
@@ -347,6 +366,8 @@ func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {
 
 	e.messaging.lastMessages[string(withMsg.Value)] = textMessage(3, e.userID, "yo")
 	e.messaging.latestEventSeqs[string(withMsg.Value)] = 3
+	e.profiles.displayNames[string(e.userID.Value)] = "Env User"
+	e.profiles.displayNames[string(peer.Value)] = "Peer Name"
 
 	resp := e.getDmFeed(&commonpb.QueryOptions{})
 	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, resp.Result)
@@ -364,6 +385,14 @@ func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {
 	// issued for it).
 	require.Nil(t, byChat[string(withoutMsg.Value)].LastMessage)
 	require.Zero(t, byChat[string(withoutMsg.Value)].LatestEventSequence)
+
+	// Display names are hydrated for every member of every chat on the page: the
+	// single batched lookup spans chats, so the env user's name lands on both.
+	require.Equal(t, "Peer Name", byUserID(byChat[string(withMsg.Value)].Members)[string(peer.Value)].UserProfile.DisplayName)
+	for _, chatID := range []*commonpb.ChatId{withMsg, withoutMsg} {
+		members := byUserID(byChat[string(chatID.Value)].Members)
+		require.Equal(t, "Env User", members[string(e.userID.Value)].UserProfile.DisplayName)
+	}
 }
 
 func textMessage(id uint64, sender *commonpb.UserId, text string) *messagingpb.Message {

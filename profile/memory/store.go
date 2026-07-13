@@ -92,6 +92,25 @@ func (m *InMemoryStore) SetDisplayName(_ context.Context, id *commonpb.UserId, d
 	return nil
 }
 
+func (m *InMemoryStore) GetDisplayNames(_ context.Context, userIDs []*commonpb.UserId) (map[string]string, error) {
+	out := make(map[string]string)
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	for _, userID := range userIDs {
+		p, ok := m.profiles[userIDCacheKey(userID)]
+		if !ok || len(p.DisplayName) == 0 {
+			continue
+		}
+		out[string(userID.Value)] = p.DisplayName
+	}
+	return out, nil
+}
+
 func (m *InMemoryStore) LinkPhoneNumber(_ context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash *commonpb.Hash) error {
 	m.Lock()
 	defer m.Unlock()

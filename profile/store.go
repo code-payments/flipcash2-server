@@ -31,6 +31,11 @@ type Store interface {
 	// ErrInvalidDisplayName is returned if there is an issue with the display name.
 	SetDisplayName(ctx context.Context, id *commonpb.UserId, displayName string) error
 
+	// GetDisplayNames returns, for each of the given users that has a display
+	// name set, that display name keyed by string(userID.Value). Users without
+	// one are absent from the map. It resolves the whole set in a single lookup.
+	GetDisplayNames(ctx context.Context, userIDs []*commonpb.UserId) (map[string]string, error)
+
 	// LinkPhoneNumber links the phone number and its precomputed hash to a user, provided
 	// they exist. Any other user previously holding the same phone number has both fields
 	// cleared.

@@ -92,6 +92,46 @@ func dbSetDisplayName(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.
 	})
 }
 
+func dbGetDisplayNames(ctx context.Context, pool *pgxpool.Pool, userIDs []*commonpb.UserId) (map[string]string, error) {
+	out := make(map[string]string)
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+
+	encoded := make([]string, 0, len(userIDs))
+	seen := make(map[string]struct{}, len(userIDs))
+	for _, id := range userIDs {
+		e := pg.Encode(id.Value)
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		encoded = append(encoded, e)
+	}
+
+	var rows []struct {
+		ID          string `db:"id"`
+		DisplayName string `db:"displayName"`
+	}
+	query := `SELECT "id", "displayName" FROM ` + usersTableName + ` WHERE "id" = ANY($1::text[]) AND "displayName" IS NOT NULL`
+	err := pgxscan.Select(ctx, pool, &rows, query, encoded)
+	if err != nil {
+		if pgxscan.NotFound(err) {
+			return out, nil
+		}
+		return nil, err
+	}
+
+	for _, r := range rows {
+		rawID, err := pg.Decode(r.ID)
+		if err != nil {
+			return nil, err
+		}
+		out[string(rawID)] = r.DisplayName
+	}
+	return out, nil
+}
+
 func dbGetPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (*string, error) {
 	var res *string
 	query := `SELECT "phoneNumber" FROM ` + usersTableName + ` WHERE "id" = $1`

@@ -22,6 +22,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testPhoneEmailTransfer,
 		testGetPhonesByHashes,
 		testGetPhoneNumbersForPayment,
+		testGetDisplayNames,
 		testGetUserIdByPhoneNumber,
 		testLinkPhoneNumberForPayment,
 	} {
@@ -347,6 +348,42 @@ func testGetPhoneNumbersForPayment(t *testing.T, s profile.Store) {
 	require.False(t, ok)
 	_, ok = got[string(noPhone.Value)]
 	require.False(t, ok)
+}
+
+func testGetDisplayNames(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	user1 := model.MustGenerateUserID()
+	user2 := model.MustGenerateUserID()
+	noName := model.MustGenerateUserID()
+
+	// Empty input.
+	got, err := s.GetDisplayNames(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// Nobody has a display name yet.
+	got, err = s.GetDisplayNames(ctx, []*commonpb.UserId{user1, user2})
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	require.NoError(t, s.SetDisplayName(ctx, user1, "user one"))
+	require.NoError(t, s.SetDisplayName(ctx, user2, "user two"))
+
+	// Only users with a display name are returned, keyed by user ID.
+	got, err = s.GetDisplayNames(ctx, []*commonpb.UserId{user1, user2, noName})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.Equal(t, "user one", got[string(user1.Value)])
+	require.Equal(t, "user two", got[string(user2.Value)])
+	_, ok := got[string(noName.Value)]
+	require.False(t, ok)
+
+	// A rename is reflected on the next read.
+	require.NoError(t, s.SetDisplayName(ctx, user1, "user one renamed"))
+	got, err = s.GetDisplayNames(ctx, []*commonpb.UserId{user1})
+	require.NoError(t, err)
+	require.Equal(t, "user one renamed", got[string(user1.Value)])
 }
 
 func testGetUserIdByPhoneNumber(t *testing.T, s profile.Store) {

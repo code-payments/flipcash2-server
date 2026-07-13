@@ -76,18 +76,6 @@ func (i *Integration) AllowDistribution(_ context.Context, _ *ocp_common.Account
 }
 
 func (i *Integration) AllowSwap(_ context.Context, _ swap.Kind, _ swap.FundingSource, _, _, _ *ocp_common.Account, swapAmount, feeAmount uint64, initializesMint bool) (bool, string, error) {
-	if !initializesMint {
-		return true, "", nil
-	}
-
-	if swapAmount != account.DefaultNewCurrencyPurchaseAmount {
-		return false, "invalid initial purchase amount for currency launch", nil
-	}
-
-	if feeAmount != account.DefaultNewCurrencyFeeAmount {
-		return false, "invalid fee amount for currency launch", nil
-	}
-
 	return true, "", nil
 }
 

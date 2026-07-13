@@ -99,10 +99,7 @@ func (i *Integration) OnSwapSubmitted(ctx context.Context, owner *common.Account
 	return nil
 }
 
-func (i *Integration) OnSwapFinalized(ctx context.Context, owner *ocp_common.Account, isBuy bool, mint *ocp_common.Account, currencyName string, region ocp_currency_lib.Code, amountReceived float64, isMintInit bool) error {
-	if isMintInit {
-		return nil
-	}
+func (i *Integration) OnSwapFinalized(ctx context.Context, owner *ocp_common.Account, isBuy bool, mint *ocp_common.Account, currencyName string, region ocp_currency_lib.Code, amountReceived float64) error {
 	i.notifyCurrencyBoughtOrSold(ctx, owner, isBuy, mint, currencyName, region, amountReceived)
 	if isBuy && i.enableGainPushes {
 		i.notifyHoldersOfGain(ctx, mint, currencyName, owner)

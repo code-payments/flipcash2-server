@@ -3,7 +3,9 @@ package tests
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/png"
@@ -306,6 +308,16 @@ func testFinalizationRejections(t *testing.T, accounts account.Store, blobs blob
 		upload(target, imageBytes)
 
 		requireRejected(t, server, signer, blobID, blobpb.RejectionReason_REJECTION_REASON_TOO_LARGE)
+	})
+
+	t.Run("image carrying privacy metadata is rejected", func(t *testing.T) {
+		// Clients must strip EXIF before uploading; the bytes are served verbatim, so
+		// one that did not would hand recipients the GPS coordinates it was taken at.
+		imageBytes := makePNGWithExif(t, 4, 4)
+		blobID, target := initiate(t, server, signer, "image/png", uint64(len(imageBytes)))
+		upload(target, imageBytes)
+
+		requireRejected(t, server, signer, blobID, blobpb.RejectionReason_REJECTION_REASON_PRIVACY_METADATA)
 	})
 }
 
@@ -621,6 +633,28 @@ func makePNG(t *testing.T, width, height int) []byte {
 	var buf bytes.Buffer
 	require.NoError(t, png.Encode(&buf, img))
 	return buf.Bytes()
+}
+
+// makePNGWithExif returns a PNG that kept an eXIf chunk — an image a client
+// uploaded without stripping its metadata. The chunk is spliced in after the
+// IHDR with a valid CRC, so the image still decodes.
+func makePNGWithExif(t *testing.T, width, height int) []byte {
+	base := makePNG(t, width, height)
+	const afterIHDR = 8 + 12 + 13 // signature + IHDR (length+type+crc) + IHDR data
+
+	payload := []byte("gps coordinates go here")
+
+	var chunk bytes.Buffer
+	require.NoError(t, binary.Write(&chunk, binary.BigEndian, uint32(len(payload))))
+	chunk.WriteString("eXIf")
+	chunk.Write(payload)
+	crc := crc32.ChecksumIEEE(append([]byte("eXIf"), payload...))
+	require.NoError(t, binary.Write(&chunk, binary.BigEndian, crc))
+
+	out := make([]byte, 0, len(base)+chunk.Len())
+	out = append(out, base[:afterIHDR]...)
+	out = append(out, chunk.Bytes()...)
+	return append(out, base[afterIHDR:]...)
 }
 
 // fakeResolver is a controllable blob.PrincipalResolver for the server suite: a

@@ -572,6 +572,8 @@ func rejectionReasonForInspection(err error) RejectionReason {
 		return RejectionReasonTooLarge
 	case errors.Is(err, ErrImageCorrupt):
 		return RejectionReasonCorrupt
+	case errors.Is(err, ErrImagePrivacyMetadata):
+		return RejectionReasonPrivacyMetadataPresent
 	default:
 		return RejectionReasonInternal
 	}

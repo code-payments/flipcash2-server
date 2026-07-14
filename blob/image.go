@@ -35,6 +35,10 @@ var (
 
 	// ErrImageTooLarge means the image's pixel dimensions exceed the limits.
 	ErrImageTooLarge = errors.New("image exceeds dimension limits")
+
+	// ErrImagePrivacyMetadata means the image still carries embedded
+	// privacy-sensitive metadata that the client was required to strip.
+	ErrImagePrivacyMetadata = errors.New("image carries privacy-sensitive metadata")
 )
 
 const (
@@ -119,9 +123,10 @@ type ImageInspection struct {
 }
 
 // InspectImage decodes the bytes as an image and derives their authoritative
-// MIME type, pixel dimensions, and BlurHash. It returns an error if the bytes
-// are not a decodable image of a supported format, or if the image's pixel count
-// exceeds maxImagePixels; callers treat either as a rejection.
+// MIME type, pixel dimensions, and BlurHash. It returns an error if the bytes are
+// not a decodable image of a supported format, if the image's pixel count exceeds
+// maxImagePixels, or if it still carries privacy-sensitive metadata; callers treat
+// any of these as a rejection.
 func InspectImage(data []byte) (*ImageInspection, error) {
 	// Read only the header first to bound the pixel count before decoding the
 	// full image into memory. int64 math avoids overflow on a hostile header that
@@ -141,6 +146,13 @@ func InspectImage(data []byte) (*ImageInspection, error) {
 	// Detected from the container structure, so no extra frames are decoded.
 	if isImageAnimated(headerFormat, data) {
 		return nil, fmt.Errorf("animated %s images are not supported: %w", headerFormat, ErrImageUnsupportedType)
+	}
+	// Reject images that still carry the metadata the client is required to strip:
+	// the uploaded bytes are served to recipients verbatim, so an unstripped photo
+	// hands them the GPS coordinates it was taken at. Structural, so nothing is
+	// decoded to check it.
+	if hasPrivacyMetadata(headerFormat, data) {
+		return nil, fmt.Errorf("%s image carries metadata that must be stripped before upload: %w", headerFormat, ErrImagePrivacyMetadata)
 	}
 
 	img, format, err := image.Decode(bytes.NewReader(data))
@@ -417,6 +429,242 @@ func pngIsAnimated(data []byte) bool {
 		pos += 12 + length
 	}
 	return false
+}
+
+// hasPrivacyMetadata reports whether the encoded image carries an embedded
+// metadata container capable of holding personal data. The headline case is EXIF:
+// a photo straight off a phone records the GPS coordinates it was taken at, plus
+// the capture time and the device model and serial. XMP, IPTC, and the free-form
+// comment blocks are included on the same grounds — each is an arbitrary
+// key/value carrier that tools routinely fill with location and authorship.
+//
+// Clients strip this before uploading, so the server only has to detect it: the
+// stored bytes are served to recipients verbatim, and rejecting an image keeps
+// them that way, where rewriting the file server-side would break the declared
+// size the upload is pinned to. It is the same reject-don't-correct posture
+// finalization already takes on a mismatched size or type.
+//
+// The check is structural — it walks the container looking for the segments,
+// decoding no pixels — and it reports nothing on a malformed stream, since the
+// regular decode path rejects those on its own.
+//
+// Color-management data (ICC profiles, and PNG's gamma/chromaticity chunks) is
+// deliberately not treated as privacy metadata: it carries nothing personal, and
+// dropping it visibly shifts the colors of a wide-gamut photo.
+//
+// Note that stripping EXIF also discards the Orientation tag, which is
+// load-bearing for display, so a client must bake the rotation into the pixels as
+// it strips. That is the client's side of this contract, and it is what makes the
+// dimensions and BlurHash derived here agree with what the image actually looks
+// like: the Go decoders ignore Orientation entirely, so a rotated photo that kept
+// its tag would be measured sideways.
+func hasPrivacyMetadata(format string, data []byte) bool {
+	switch format {
+	case "jpeg":
+		return jpegHasPrivacyMetadata(data)
+	case "png":
+		return pngHasPrivacyMetadata(data)
+	case "webp":
+		return webpHasPrivacyMetadata(data)
+	case "gif":
+		return gifHasPrivacyMetadata(data)
+	default:
+		return false
+	}
+}
+
+// jpegAllowedAppMarkers are the APPn segments a stripped JPEG may still carry.
+// APP0 is the JFIF header a baseline JPEG opens with, APP2 carries the ICC color
+// profile, and APP14 is the Adobe segment declaring the color transform (without
+// it, CMYK/YCCK JPEGs decode with inverted colors). None is a personal-data
+// carrier. Every other APPn is: APP1 holds EXIF and XMP, APP13 holds
+// IPTC/Photoshop resources, and the rest are vendor maker-note space. So this is
+// an allowlist rather than a blocklist — an unrecognized APPn is rejected rather
+// than waved through on the assumption that it is harmless.
+var jpegAllowedAppMarkers = map[byte]bool{
+	0xE0: true, // APP0  — JFIF
+	0xE2: true, // APP2  — ICC profile
+	0xEE: true, // APP14 — Adobe color transform
+}
+
+// jpegHasPrivacyMetadata walks a JPEG's marker segments looking for a
+// metadata-carrying one. It stops at the start of scan: everything past SOS is
+// entropy-coded pixel data, and the metadata segments all precede it.
+func jpegHasPrivacyMetadata(data []byte) bool {
+	const (
+		markerSOI = 0xD8 // start of image
+		markerTEM = 0x01 // temporary — standalone, no payload
+		markerSOS = 0xDA // start of scan
+		markerEOI = 0xD9 // end of image
+		markerCOM = 0xFE // free-form comment
+	)
+
+	if len(data) < 2 || data[0] != 0xFF || data[1] != markerSOI {
+		return false
+	}
+
+	for pos := 2; pos+1 < len(data); {
+		if data[pos] != 0xFF {
+			return false // malformed; let the decoder reject it
+		}
+		marker := data[pos+1]
+
+		switch {
+		case marker == 0xFF:
+			// A marker may be padded with any number of 0xFF fill bytes.
+			pos++
+			continue
+		case marker == markerSOI || marker == markerTEM || (marker >= 0xD0 && marker <= 0xD7):
+			// Standalone markers (the RSTn restart markers included): no payload.
+			pos += 2
+			continue
+		case marker == markerSOS || marker == markerEOI:
+			return false
+		}
+
+		// Every remaining marker carries a big-endian length that counts itself.
+		if pos+4 > len(data) {
+			return false
+		}
+		length := int(binary.BigEndian.Uint16(data[pos+2:]))
+		if length < 2 {
+			return false // malformed
+		}
+		if marker == markerCOM || (marker >= 0xE0 && marker <= 0xEF && !jpegAllowedAppMarkers[marker]) {
+			return true
+		}
+		pos += 2 + length
+	}
+	return false
+}
+
+// pngMetadataChunks are the PNG chunk types that carry personal data: eXIf holds
+// a verbatim EXIF block, and the three text chunks are arbitrary key/value stores
+// (iTXt is where XMP lives). The color-management chunks (iCCP, gAMA, cHRM, sRGB)
+// are deliberately absent — they are kept.
+var pngMetadataChunks = map[string]bool{
+	"eXIf": true,
+	"tEXt": true,
+	"iTXt": true,
+	"zTXt": true,
+}
+
+// pngHasPrivacyMetadata walks a PNG's chunk structure looking for a metadata
+// chunk. Unlike the APNG check it does not stop at the first IDAT: text chunks
+// are legal after the pixel data too, so the walk runs to IEND.
+func pngHasPrivacyMetadata(data []byte) bool {
+	const signature = "\x89PNG\r\n\x1a\n"
+	if len(data) < len(signature) || string(data[:len(signature)]) != signature {
+		return false
+	}
+
+	for pos := len(signature); pos+8 <= len(data); {
+		length := int(binary.BigEndian.Uint32(data[pos:]))
+		switch chunkType := string(data[pos+4 : pos+8]); {
+		case pngMetadataChunks[chunkType]:
+			return true
+		case chunkType == "IEND":
+			return false
+		}
+		// Advance past length(4) + type(4) + data(length) + crc(4).
+		pos += 12 + length
+	}
+	return false
+}
+
+// webpHasPrivacyMetadata reports whether an extended (VP8X) WebP carries an EXIF
+// or XMP chunk. The XMP FourCC is trailing-space padded, as the container
+// requires all four bytes.
+func webpHasPrivacyMetadata(data []byte) bool {
+	// RIFF container: "RIFF" <fileSize:4> "WEBP", then FourCC-tagged chunks.
+	if len(data) < 12 || string(data[:4]) != "RIFF" || string(data[8:12]) != "WEBP" {
+		return false
+	}
+
+	for pos := 12; pos+8 <= len(data); {
+		switch string(data[pos : pos+4]) {
+		case "EXIF", "XMP ":
+			return true
+		}
+		size := int(binary.LittleEndian.Uint32(data[pos+4:]))
+		// Chunk payloads are padded to an even length.
+		pos += 8 + size + (size & 1)
+	}
+	return false
+}
+
+// gifHasPrivacyMetadata walks a GIF's block structure looking for a comment
+// extension, or for the application extension XMP is smuggled through. It decodes
+// no pixel data; the walk mirrors gifIsAnimated's.
+func gifHasPrivacyMetadata(data []byte) bool {
+	const (
+		extensionIntroducer = 0x21
+		imageSeparator      = 0x2C
+		trailer             = 0x3B
+
+		commentLabel     = 0xFE
+		applicationLabel = 0xFF
+	)
+
+	// Header (6 bytes) + Logical Screen Descriptor (7 bytes); the packed field at
+	// offset 10 says whether a Global Color Table follows.
+	if len(data) < 13 {
+		return false
+	}
+	pos := 13
+	if packed := data[10]; packed&0x80 != 0 {
+		pos += colorTableBytes(packed)
+	}
+
+	for pos < len(data) {
+		switch data[pos] {
+		case imageSeparator:
+			// Image Descriptor is 10 bytes; its packed field (offset +9) flags a Local
+			// Color Table, then a 1-byte LZW code size precedes the image data.
+			if pos+10 > len(data) {
+				return false
+			}
+			lct := data[pos+9]
+			pos += 10
+			if lct&0x80 != 0 {
+				pos += colorTableBytes(lct)
+			}
+			pos++ // LZW minimum code size
+			pos = gifSkipSubBlocks(data, pos)
+		case extensionIntroducer:
+			if pos+2 > len(data) {
+				return false
+			}
+			label := data[pos+1]
+			pos += 2 // introducer + label
+			if label == commentLabel {
+				return true
+			}
+			if label == applicationLabel && gifIsXMPApplicationExtension(data, pos) {
+				return true
+			}
+			pos = gifSkipSubBlocks(data, pos)
+		case trailer:
+			return false
+		default:
+			return false // malformed; let the decoder reject it
+		}
+	}
+	return false
+}
+
+// gifIsXMPApplicationExtension reports whether the application extension whose
+// identifier block begins at pos is the XMP one. GIF has no native metadata
+// block, so XMP rides in as an application extension tagged "XMP Data"; the other
+// application extensions in the wild (NETSCAPE2.0, the animation loop count) are
+// not personal-data carriers.
+func gifIsXMPApplicationExtension(data []byte, pos int) bool {
+	// The identifier block is [size=11][8-byte app identifier][3-byte auth code].
+	const blockSize = 11
+	if pos >= len(data) || data[pos] != blockSize || pos+1+blockSize > len(data) {
+		return false
+	}
+	return string(data[pos+1:pos+9]) == "XMP Data"
 }
 
 // webpIsAnimated reports whether a WebP is animated, i.e. an extended (VP8X) file

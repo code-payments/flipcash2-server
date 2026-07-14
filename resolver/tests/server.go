@@ -24,9 +24,11 @@ import (
 
 func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store) {
 	for _, tf := range []func(t *testing.T, accounts account.Store, profiles profile.Store){
-		testServer_Resolve_OK,
-		testServer_Resolve_NotFound,
-		testServer_Resolve_NotEnabledForPayment,
+		testServer_Resolve_ByUserID_OK,
+		testServer_Resolve_ByUserID_NotFound,
+		testServer_Resolve_ByPhoneNumber_OK,
+		testServer_Resolve_ByPhoneNumber_NotFound,
+		testServer_Resolve_ByPhoneNumber_NotEnabledForPayment,
 		testServer_Resolve_Denied_Unregistered,
 		testServer_Resolve_Unauthorized,
 	} {
@@ -72,7 +74,54 @@ func newServerFixture(t *testing.T, accounts account.Store, profiles profile.Sto
 	}
 }
 
-func testServer_Resolve_OK(t *testing.T, accounts account.Store, profiles profile.Store) {
+func testServer_Resolve_ByUserID_OK(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	f := newServerFixture(t, accounts, profiles)
+
+	// Seed a separate Flipcash user, without any phone number linked for payment.
+	targetID := model.MustGenerateUserID()
+	targetKeys := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, targetID, targetKeys.Proto())
+	require.NoError(t, err)
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, targetID, true))
+
+	req := &resolverpb.ResolveRequest{
+		Identifier: &resolverpb.Identifier{
+			Kind: &resolverpb.Identifier_UserId{
+				UserId: targetID,
+			},
+		},
+	}
+	require.NoError(t, f.keys.Auth(req, &req.Auth))
+
+	resp, err := f.client.Resolve(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, resolverpb.ResolveResponse_OK, resp.Result)
+	require.NotNil(t, resp.Resolution)
+	require.Equal(t, targetKeys.Proto().Value, resp.Resolution.GetAddress().Value)
+}
+
+func testServer_Resolve_ByUserID_NotFound(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	f := newServerFixture(t, accounts, profiles)
+
+	// No user exists with this ID, so there's no payment address to resolve to.
+	req := &resolverpb.ResolveRequest{
+		Identifier: &resolverpb.Identifier{
+			Kind: &resolverpb.Identifier_UserId{
+				UserId: model.MustGenerateUserID(),
+			},
+		},
+	}
+	require.NoError(t, f.keys.Auth(req, &req.Auth))
+
+	resp, err := f.client.Resolve(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, resolverpb.ResolveResponse_NOT_FOUND, resp.Result)
+	require.Nil(t, resp.Resolution)
+}
+
+func testServer_Resolve_ByPhoneNumber_OK(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles)
 
@@ -103,7 +152,27 @@ func testServer_Resolve_OK(t *testing.T, accounts account.Store, profiles profil
 	require.Equal(t, targetKeys.Proto().Value, resp.Resolution.GetAddress().Value)
 }
 
-func testServer_Resolve_NotEnabledForPayment(t *testing.T, accounts account.Store, profiles profile.Store) {
+func testServer_Resolve_ByPhoneNumber_NotFound(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	f := newServerFixture(t, accounts, profiles)
+
+	// No user is linked to this number — pick one no other subtest uses.
+	req := &resolverpb.ResolveRequest{
+		Identifier: &resolverpb.Identifier{
+			Kind: &resolverpb.Identifier_Phone{
+				Phone: &phonepb.PhoneNumber{Value: "+15550000404"},
+			},
+		},
+	}
+	require.NoError(t, f.keys.Auth(req, &req.Auth))
+
+	resp, err := f.client.Resolve(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, resolverpb.ResolveResponse_NOT_FOUND, resp.Result)
+	require.Nil(t, resp.Resolution)
+}
+
+func testServer_Resolve_ByPhoneNumber_NotEnabledForPayment(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles)
 
@@ -119,26 +188,6 @@ func testServer_Resolve_NotEnabledForPayment(t *testing.T, accounts account.Stor
 		Identifier: &resolverpb.Identifier{
 			Kind: &resolverpb.Identifier_Phone{
 				Phone: &phonepb.PhoneNumber{Value: "+12223335555"},
-			},
-		},
-	}
-	require.NoError(t, f.keys.Auth(req, &req.Auth))
-
-	resp, err := f.client.Resolve(ctx, req)
-	require.NoError(t, err)
-	require.Equal(t, resolverpb.ResolveResponse_NOT_FOUND, resp.Result)
-	require.Nil(t, resp.Resolution)
-}
-
-func testServer_Resolve_NotFound(t *testing.T, accounts account.Store, profiles profile.Store) {
-	ctx := context.Background()
-	f := newServerFixture(t, accounts, profiles)
-
-	// No user is linked to this number — pick one no other subtest uses.
-	req := &resolverpb.ResolveRequest{
-		Identifier: &resolverpb.Identifier{
-			Kind: &resolverpb.Identifier_Phone{
-				Phone: &phonepb.PhoneNumber{Value: "+15550000404"},
 			},
 		},
 	}

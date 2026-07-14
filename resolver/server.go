@@ -59,17 +59,20 @@ func (s *Server) Resolve(ctx context.Context, req *resolverpb.ResolveRequest) (*
 		return &resolverpb.ResolveResponse{Result: resolverpb.ResolveResponse_DENIED}, nil
 	}
 
-	phone := req.Identifier.GetPhone()
-	if phone == nil {
+	var targetUserID *commonpb.UserId
+	switch typed := req.Identifier.GetKind().(type) {
+	case *resolverpb.Identifier_Phone:
+		targetUserID, err = s.profiles.GetUserIdByPhoneNumberForPayment(ctx, typed.Phone.Value)
+		if errors.Is(err, profile.ErrNotFound) {
+			return &resolverpb.ResolveResponse{Result: resolverpb.ResolveResponse_NOT_FOUND}, nil
+		} else if err != nil {
+			log.With(zap.Error(err)).Warn("Failure looking up user by phone number")
+			return nil, status.Error(codes.Internal, "")
+		}
+	case *resolverpb.Identifier_UserId:
+		targetUserID = typed.UserId
+	default:
 		return nil, status.Error(codes.InvalidArgument, "unsupported identifier")
-	}
-
-	targetUserID, err := s.profiles.GetUserIdByPhoneNumberForPayment(ctx, phone.Value)
-	if errors.Is(err, profile.ErrNotFound) {
-		return &resolverpb.ResolveResponse{Result: resolverpb.ResolveResponse_NOT_FOUND}, nil
-	} else if err != nil {
-		log.With(zap.Error(err)).Warn("Failure looking up user by phone number")
-		return nil, status.Error(codes.Internal, "")
 	}
 
 	pubKey, err := s.getPaymentAddress(ctx, log, targetUserID)

@@ -38,8 +38,7 @@ const (
 
 	// PrincipalTypeProfile is a user's public profile, identified by that user's
 	// id. It covers every caller — a profile is public — so the grant alone gates
-	// the read: exactly the blobs granted to the profile are readable through it,
-	// and superseding a picture revokes its grant.
+	// the read: exactly the blobs granted to the profile are readable through it.
 	PrincipalTypeProfile
 )
 

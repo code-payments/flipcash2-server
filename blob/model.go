@@ -144,6 +144,7 @@ const (
 	RejectionReasonTooLarge
 	RejectionReasonCorrupt
 	RejectionReasonInternal
+	RejectionReasonPrivacyMetadataPresent
 )
 
 // ToProto maps the internal reason onto the public blobpb.RejectionReason.
@@ -161,6 +162,8 @@ func (r RejectionReason) ToProto() blobpb.RejectionReason {
 		return blobpb.RejectionReason_REJECTION_REASON_CORRUPT
 	case RejectionReasonInternal:
 		return blobpb.RejectionReason_REJECTION_REASON_INTERNAL
+	case RejectionReasonPrivacyMetadataPresent:
+		return blobpb.RejectionReason_REJECTION_REASON_PRIVACY_METADATA
 	default:
 		return blobpb.RejectionReason_REJECTION_REASON_UNKNOWN
 	}

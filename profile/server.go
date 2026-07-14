@@ -10,11 +10,13 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/blob"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/social/x"
 )
@@ -27,12 +29,14 @@ type Server struct {
 	accounts account.Store
 	profiles Store
 
+	media Media
+
 	xClient *x.Client
 
 	profilepb.UnimplementedProfileServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, xClient *x.Client) *Server {
+func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, media Media, xClient *x.Client) *Server {
 	return &Server{
 		log: log,
 
@@ -40,6 +44,8 @@ func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, p
 
 		accounts: accounts,
 		profiles: profiles,
+
+		media: media,
 
 		xClient: xClient,
 	}
@@ -65,6 +71,11 @@ func (s *Server) GetProfile(ctx context.Context, req *profilepb.GetProfileReques
 		return &profilepb.GetProfileResponse{Result: profilepb.GetProfileResponse_NOT_FOUND}, nil
 	} else if err != nil {
 		log.Warn("Failed to get profile", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to get profile")
+	}
+
+	if err := hydratePictures(ctx, s.media, profile.ProfilePicture); err != nil {
+		log.Warn("Failed to hydrate profile picture", zap.Error(err))
 		return nil, status.Error(codes.Internal, "failed to get profile")
 	}
 
@@ -101,6 +112,76 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 	}
 
 	return &profilepb.SetDisplayNameResponse{}, nil
+}
+
+func (s *Server) SetProfilePicture(ctx context.Context, req *profilepb.SetProfilePictureRequest) (*profilepb.SetProfilePictureResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.String("blob_id", blob.IDString(req.BlobId)),
+	)
+
+	isRegistered, err := s.accounts.IsRegistered(ctx, userID)
+	if err != nil {
+		log.Warn("Failed to get registration flag")
+		return nil, status.Errorf(codes.Internal, "failed to get registration flag")
+	} else if !isRegistered {
+		return &profilepb.SetProfilePictureResponse{Result: profilepb.SetProfilePictureResponse_DENIED}, nil
+	}
+
+	// Grant before persisting, so the picture is readable the instant it is
+	// discoverable — a profile the client could read a blob id from, but not the
+	// blob, would render as a broken image. This also validates the blob, so
+	// nothing is persisted for a blob that cannot back a picture.
+	if err := s.media.SetAsProfilePicture(ctx, userID, req.BlobId); err != nil {
+		if result, ok := setProfilePictureResultForErr(err); ok {
+			return &profilepb.SetProfilePictureResponse{Result: result}, nil
+		}
+
+		log.Warn("Failed to set blob as profile picture", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to set profile picture")
+	}
+
+	if err := s.profiles.SetProfilePicture(ctx, userID, req.BlobId); err != nil {
+		log.Warn("Failed to set profile picture", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to set profile picture")
+	}
+
+	picture := &blobpb.Media{
+		Renditions: []*blobpb.Rendition{{
+			Role:   blobpb.Rendition_ORIGINAL,
+			BlobId: req.BlobId,
+		}},
+	}
+	if err := hydratePictures(ctx, s.media, picture); err != nil {
+		log.Warn("Failed to hydrate profile picture", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to set profile picture")
+	}
+
+	return &profilepb.SetProfilePictureResponse{ProfilePicture: picture}, nil
+}
+
+// setProfilePictureResultForErr maps the reasons a blob cannot back a picture onto
+// the result the client sees, which tells it what to do next: retry once the blob is
+// READY, or upload again because this id is terminally unusable. It reports ok=false
+// for any other error, which is a server fault rather than a client one.
+func setProfilePictureResultForErr(err error) (profilepb.SetProfilePictureResponse_Result, bool) {
+	switch {
+	case errors.Is(err, blob.ErrBlobNotFound):
+		return profilepb.SetProfilePictureResponse_BLOB_NOT_FOUND, true
+	case errors.Is(err, blob.ErrBlobNotReady):
+		return profilepb.SetProfilePictureResponse_BLOB_NOT_READY, true
+	case errors.Is(err, blob.ErrBlobRejected):
+		return profilepb.SetProfilePictureResponse_BLOB_REJECTED, true
+	case errors.Is(err, blob.ErrBlobInvalid):
+		return profilepb.SetProfilePictureResponse_INVALID_BLOB, true
+	default:
+		return profilepb.SetProfilePictureResponse_OK, false
+	}
 }
 
 func (s *Server) LinkSocialAccount(ctx context.Context, req *profilepb.LinkSocialAccountRequest) (*profilepb.LinkSocialAccountResponse, error) {

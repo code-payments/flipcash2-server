@@ -600,7 +600,7 @@ func testServer_ResolvesMediaOnRead(t *testing.T, chats chat.Store, messages mes
 	deltaResps, err := e.getDelta(e.keysB, 0)
 	require.NoError(t, err)
 	deltaMsgs, _, _ := collectDelta(deltaResps)
-	var delivered *messagingpb.MediaItemRendition
+	var delivered *blobpb.Rendition
 	for _, m := range deltaMsgs {
 		if m.MessageId.Value == sendResp.Message.MessageId.Value {
 			delivered = m.Content[0].GetMedia().Items[0].Renditions[0]
@@ -686,7 +686,7 @@ func testServer_SendMessage_DisallowedContent(t *testing.T, chats chat.Store, me
 	// Media referencing a non-ORIGINAL rendition is rejected: a client references
 	// only the original; the server derives and serves the rest.
 	derivedRole := mediaContent(blob.MustGenerateID())
-	derivedRole[0].GetMedia().Items[0].Renditions[0].Role = messagingpb.MediaItemRendition_DISPLAY
+	derivedRole[0].GetMedia().Items[0].Renditions[0].Role = blobpb.Rendition_DISPLAY
 	roleResp, err := e.sendContent(e.keysA, derivedRole, generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_DENIED, roleResp.Result)
@@ -695,8 +695,8 @@ func testServer_SendMessage_DisallowedContent(t *testing.T, chats chat.Store, me
 	// supply is rejected.
 	extraRendition := mediaContent(blob.MustGenerateID())
 	item := extraRendition[0].GetMedia().Items[0]
-	item.Renditions = append(item.Renditions, &messagingpb.MediaItemRendition{
-		Role:   messagingpb.MediaItemRendition_ORIGINAL,
+	item.Renditions = append(item.Renditions, &blobpb.Rendition{
+		Role:   blobpb.Rendition_ORIGINAL,
 		BlobId: blob.MustGenerateID(),
 	})
 	extraResp, err := e.sendContent(e.keysA, extraRendition, generateClientID())

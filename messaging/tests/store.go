@@ -1246,9 +1246,9 @@ func replyContent(repliedMessageID uint64, text string) []*messagingpb.Content {
 func mediaContent(blobID *blobpb.BlobId) []*messagingpb.Content {
 	return []*messagingpb.Content{{
 		Type: &messagingpb.Content_Media{Media: &messagingpb.MediaContent{
-			Items: []*messagingpb.MediaItem{{
-				Renditions: []*messagingpb.MediaItemRendition{{
-					Role:   messagingpb.MediaItemRendition_ORIGINAL,
+			Items: []*blobpb.Media{{
+				Renditions: []*blobpb.Rendition{{
+					Role:   blobpb.Rendition_ORIGINAL,
 					BlobId: blobID,
 				}},
 			}},

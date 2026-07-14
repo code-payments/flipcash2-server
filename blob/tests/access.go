@@ -18,6 +18,7 @@ func RunAccessStoreTests(t *testing.T, store blob.AccessStore, teardown func()) 
 	for _, tf := range []func(t *testing.T, store blob.AccessStore){
 		testAccessGrantHasRevoke,
 		testAccessNoCollision,
+		testAccessProfileGrant,
 		testAccessValidation,
 	} {
 		tf(t, store)
@@ -103,6 +104,45 @@ func testAccessNoCollision(t *testing.T, store blob.AccessStore) {
 	has, err = store.HasGrant(ctx, blobA, asUser, blob.PermissionRead)
 	require.NoError(t, err)
 	require.True(t, has)
+
+	// A user and their profile are both keyed by the SAME user id bytes, so only
+	// the principal type separates them. They must not collide: a grant to the
+	// profile is public (every caller is covered by it), while a grant to the user
+	// authorizes that user alone — conflating them would publish a private blob.
+	userID := model.MustGenerateUserID()
+	selfPrincipal := blob.PrincipalForUser(userID)
+	profilePrincipal := blob.PrincipalForProfile(userID)
+	require.NoError(t, store.Grant(ctx, &blob.Grant{BlobID: blobB, Principal: selfPrincipal, Permission: blob.PermissionRead}))
+
+	has, err = store.HasGrant(ctx, blobB, profilePrincipal, blob.PermissionRead)
+	require.NoError(t, err)
+	require.False(t, has)
+	has, err = store.HasGrant(ctx, blobB, selfPrincipal, blob.PermissionRead)
+	require.NoError(t, err)
+	require.True(t, has)
+}
+
+// testAccessProfileGrant round-trips a profile-scoped grant — the ACL entry a
+// profile picture rides on.
+func testAccessProfileGrant(t *testing.T, store blob.AccessStore) {
+	ctx := context.Background()
+
+	blobID := blob.MustGenerateID()
+	profilePrincipal := blob.PrincipalForProfile(model.MustGenerateUserID())
+
+	has, err := store.HasGrant(ctx, blobID, profilePrincipal, blob.PermissionRead)
+	require.NoError(t, err)
+	require.False(t, has)
+
+	require.NoError(t, store.Grant(ctx, &blob.Grant{BlobID: blobID, Principal: profilePrincipal, Permission: blob.PermissionRead}))
+	has, err = store.HasGrant(ctx, blobID, profilePrincipal, blob.PermissionRead)
+	require.NoError(t, err)
+	require.True(t, has)
+
+	require.NoError(t, store.Revoke(ctx, blobID, profilePrincipal, blob.PermissionRead))
+	has, err = store.HasGrant(ctx, blobID, profilePrincipal, blob.PermissionRead)
+	require.NoError(t, err)
+	require.False(t, has)
 }
 
 func testAccessValidation(t *testing.T, store blob.AccessStore) {

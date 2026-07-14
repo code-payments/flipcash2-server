@@ -35,11 +35,17 @@ const (
 	// id. A chat principal is resolved against live chat membership, so a single
 	// grant covers the whole chat and stays correct as membership changes.
 	PrincipalTypeChat
+
+	// PrincipalTypeProfile is a user's public profile, identified by that user's
+	// id. It covers every caller — a profile is public — so the grant alone gates
+	// the read: exactly the blobs granted to the profile are readable through it,
+	// and superseding a picture revokes its grant.
+	PrincipalTypeProfile
 )
 
 // Principal is the typed subject a grant is made to. ID is the type-specific
 // identifier bytes: a user id for PrincipalTypeUser, a chat id for
-// PrincipalTypeChat.
+// PrincipalTypeChat, and the profile owner's user id for PrincipalTypeProfile.
 type Principal struct {
 	Type PrincipalType
 	ID   []byte
@@ -55,9 +61,14 @@ func PrincipalForChat(chatID *commonpb.ChatId) Principal {
 	return Principal{Type: PrincipalTypeChat, ID: chatID.Value}
 }
 
+// PrincipalForProfile returns the principal for the public profile of a user.
+func PrincipalForProfile(userID *commonpb.UserId) Principal {
+	return Principal{Type: PrincipalTypeProfile, ID: userID.Value}
+}
+
 func (p Principal) validate() error {
 	switch p.Type {
-	case PrincipalTypeUser, PrincipalTypeChat:
+	case PrincipalTypeUser, PrincipalTypeChat, PrincipalTypeProfile:
 	default:
 		return fmt.Errorf("%w: unknown principal type %d", ErrInvalidGrant, p.Type)
 	}
@@ -204,6 +215,35 @@ func (r *ChatResolver) Covers(ctx context.Context, principal Principal, user *co
 	switch principal.Type {
 	case PrincipalTypeChat:
 		return r.chats.IsMember(ctx, &commonpb.ChatId{Value: principal.ID}, user)
+	default:
+		return false, nil
+	}
+}
+
+// ProfileResolver is the PrincipalResolver for profile-scoped grants: a profile
+// is public, so every caller is covered by a PrincipalTypeProfile principal —
+// there is no membership to resolve, and it therefore needs no store.
+//
+// Coverage being universal is precisely why the grant carries the whole decision
+// here: only the blobs granted to a profile resolve through it, so a picture
+// stops being readable the moment it is superseded and its grant revoked. Read
+// authorization still requires both halves (see Server.canRead), so this is not a
+// blanket authorization of any blob id.
+type ProfileResolver struct{}
+
+// NewProfileResolver returns a ProfileResolver.
+func NewProfileResolver() PrincipalResolver {
+	return &ProfileResolver{}
+}
+
+// Covers reports whether user is covered by principal. Every user is covered by a
+// PrincipalTypeProfile principal, since a profile is public. Any other principal
+// type is outside this resolver's scope, so it reports not-covered rather than
+// guessing.
+func (r *ProfileResolver) Covers(_ context.Context, principal Principal, _ *commonpb.UserId) (bool, error) {
+	switch principal.Type {
+	case PrincipalTypeProfile:
+		return true, nil
 	default:
 		return false, nil
 	}

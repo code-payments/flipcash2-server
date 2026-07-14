@@ -109,6 +109,7 @@ model User {
 
   id                            String             @id
   displayName                   String?
+  profilePictureBlobId          String?
   phoneNumber                   String?            @unique
   phoneNumberHash               String?            @unique
   emailAddress                  String?            @unique

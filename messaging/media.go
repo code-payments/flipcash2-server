@@ -43,7 +43,7 @@ func validClientMedia(media *messagingpb.MediaContent) bool {
 			return false
 		}
 		r := item.Renditions[0]
-		if r.Role != messagingpb.MediaItemRendition_ORIGINAL || r.BlobId == nil || r.Blob != nil {
+		if r.Role != blobpb.Rendition_ORIGINAL || r.BlobId == nil || r.Blob != nil {
 			return false
 		}
 	}
@@ -138,8 +138,8 @@ func hydrateMedia(ctx context.Context, resolver Media, protos []*messagingpb.Mes
 // mediaRenditions returns every media rendition carrying a blob id across the
 // messages — whether the media is a message body or a reply body — so its Blob can
 // be hydrated in place.
-func mediaRenditions(protos []*messagingpb.Message) []*messagingpb.MediaItemRendition {
-	var out []*messagingpb.MediaItemRendition
+func mediaRenditions(protos []*messagingpb.Message) []*blobpb.Rendition {
+	var out []*blobpb.Rendition
 	for _, msg := range protos {
 		for _, c := range msg.Content {
 			media := mediaOf(c)

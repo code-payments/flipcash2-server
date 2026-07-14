@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
@@ -19,7 +20,7 @@ import (
 
 const (
 	usersTableName = "flipcash_users"
-	allUserFields  = `"id", "displayName", "phoneNumber", "emailAddress", "isStaff", "isRegistered", "isPhoneNumberLinkedForPayment", "region", "locale", "createdAt", "updatedAt"`
+	allUserFields  = `"id", "displayName", "profilePictureBlobId", "phoneNumber", "emailAddress", "isStaff", "isRegistered", "isPhoneNumberLinkedForPayment", "region", "locale", "createdAt", "updatedAt"`
 
 	xProfilesTableName = "flipcash_x_profiles"
 	allXUserFields     = `"id", "username", "name", "description", "profilePicUrl", "followerCount", "verifiedType",  "accessToken", "userId", "createdAt", "updatedAt"`
@@ -86,7 +87,7 @@ func dbGetDisplayName(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.
 
 func dbSetDisplayName(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, displayName string) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, $2, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "displayName" = $2 WHERE ` + usersTableName + `."id" = $1`
+		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, $2, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "displayName" = $2 WHERE ` + usersTableName + `."id" = $1`
 		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), displayName)
 		return err
 	})
@@ -128,6 +129,79 @@ func dbGetDisplayNames(ctx context.Context, pool *pgxpool.Pool, userIDs []*commo
 			return nil, err
 		}
 		out[string(rawID)] = r.DisplayName
+	}
+	return out, nil
+}
+
+func dbGetProfilePicture(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (*blobpb.BlobId, error) {
+	var res *string
+	query := `SELECT "profilePictureBlobId" FROM ` + usersTableName + ` WHERE "id" = $1`
+	err := pgxscan.Get(ctx, pool, &res, query, pg.Encode(userID.Value))
+	if err != nil {
+		if pgxscan.NotFound(err) {
+			return nil, profile.ErrNotFound
+		}
+		return nil, err
+	}
+	if res == nil {
+		return nil, nil
+	}
+
+	decoded, err := pg.Decode(*res)
+	if err != nil {
+		return nil, err
+	}
+	return &blobpb.BlobId{Value: decoded}, nil
+}
+
+func dbSetProfilePicture(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, blobID *blobpb.BlobId) error {
+	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
+		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, $2, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "profilePictureBlobId" = $2 WHERE ` + usersTableName + `."id" = $1`
+		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), pg.Encode(blobID.Value))
+		return err
+	})
+}
+
+func dbGetProfilePictures(ctx context.Context, pool *pgxpool.Pool, userIDs []*commonpb.UserId) (map[string]*blobpb.BlobId, error) {
+	out := make(map[string]*blobpb.BlobId)
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+
+	encoded := make([]string, 0, len(userIDs))
+	seen := make(map[string]struct{}, len(userIDs))
+	for _, id := range userIDs {
+		e := pg.Encode(id.Value)
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		encoded = append(encoded, e)
+	}
+
+	var rows []struct {
+		ID                   string `db:"id"`
+		ProfilePictureBlobID string `db:"profilePictureBlobId"`
+	}
+	query := `SELECT "id", "profilePictureBlobId" FROM ` + usersTableName + ` WHERE "id" = ANY($1::text[]) AND "profilePictureBlobId" IS NOT NULL`
+	err := pgxscan.Select(ctx, pool, &rows, query, encoded)
+	if err != nil {
+		if pgxscan.NotFound(err) {
+			return out, nil
+		}
+		return nil, err
+	}
+
+	for _, r := range rows {
+		rawID, err := pg.Decode(r.ID)
+		if err != nil {
+			return nil, err
+		}
+		rawBlobID, err := pg.Decode(r.ProfilePictureBlobID)
+		if err != nil {
+			return nil, err
+		}
+		out[string(rawID)] = &blobpb.BlobId{Value: rawBlobID}
 	}
 	return out, nil
 }

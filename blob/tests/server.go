@@ -336,7 +336,7 @@ func testModeration(t *testing.T, accounts account.Store, blobs blob.Store, stor
 
 func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc) {
 	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
-	_, signer := registerUser(t, accounts)
+	ownerID, signer := registerUser(t, accounts)
 	imageBytes := makePNG(t, 10, 5)
 
 	// A READY blob owned by the uploader.
@@ -454,6 +454,80 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		require.Nil(t, resp.Blobs)
 	})
 
+	t.Run("anyone resolves a blob granted to a user's profile", func(t *testing.T) {
+		// A profile picture is public: the grant to the profile is the whole
+		// authorization, since every caller is covered by a profile principal.
+		_, other := registerUser(t, accounts)
+		require.NoError(t, access.Grant(context.Background(), &blob.Grant{
+			BlobID: readyID, Principal: blob.PrincipalForProfile(ownerID), Permission: blob.PermissionRead,
+		}))
+
+		req := &blobpb.GetBlobsRequest{
+			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Profile{Profile: ownerID}},
+		}
+		require.NoError(t, other.Auth(req, &req.Auth))
+
+		resp, err := server.GetBlobs(context.Background(), req)
+		require.NoError(t, err)
+		require.NotNil(t, resp.Blobs)
+		require.Len(t, resp.Blobs.Blobs, 1)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, resp.Blobs.Blobs[0].Status)
+		require.NotNil(t, resp.Blobs.Blobs[0].Metadata)
+
+		// Revoking the grant stops it resolving through the profile, even though the
+		// caller is still covered by it — the grant, not coverage, is what authorizes.
+		require.NoError(t, access.Revoke(context.Background(), readyID, blob.PrincipalForProfile(ownerID), blob.PermissionRead))
+
+		req = &blobpb.GetBlobsRequest{
+			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Profile{Profile: ownerID}},
+		}
+		require.NoError(t, other.Auth(req, &req.Auth))
+
+		resp, err = server.GetBlobs(context.Background(), req)
+		require.NoError(t, err)
+		require.Nil(t, resp.Blobs)
+	})
+
+	t.Run("a profile context does not resolve a blob never granted to it", func(t *testing.T) {
+		// Coverage is universal for a profile, so the grant is the only thing standing
+		// between a caller and any blob id they can name. A blob the owner uploaded but
+		// never published as their picture must not resolve through their profile.
+		_, other := registerUser(t, accounts)
+
+		req := &blobpb.GetBlobsRequest{
+			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Profile{Profile: ownerID}},
+		}
+		require.NoError(t, other.Auth(req, &req.Auth))
+
+		resp, err := server.GetBlobs(context.Background(), req)
+		require.NoError(t, err)
+		require.Nil(t, resp.Blobs)
+	})
+
+	t.Run("a profile grant does not authorize another user's profile context", func(t *testing.T) {
+		// The grant names one profile; naming a different one must not resolve it.
+		strangerID, other := registerUser(t, accounts)
+		require.NoError(t, access.Grant(context.Background(), &blob.Grant{
+			BlobID: readyID, Principal: blob.PrincipalForProfile(ownerID), Permission: blob.PermissionRead,
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, access.Revoke(context.Background(), readyID, blob.PrincipalForProfile(ownerID), blob.PermissionRead))
+		})
+
+		req := &blobpb.GetBlobsRequest{
+			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Profile{Profile: strangerID}},
+		}
+		require.NoError(t, other.Auth(req, &req.Auth))
+
+		resp, err := server.GetBlobs(context.Background(), req)
+		require.NoError(t, err)
+		require.Nil(t, resp.Blobs)
+	})
+
 	t.Run("owner resolves a rejected blob with rejection metadata", func(t *testing.T) {
 		req := &blobpb.GetBlobsRequest{BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{rejectedID}}}
 		require.NoError(t, signer.Auth(req, &req.Auth))
@@ -563,7 +637,12 @@ func (r *fakeResolver) allow(principal blob.Principal, user *commonpb.UserId) {
 	r.covered[resolverKey(principal, user)] = true
 }
 
-func (r *fakeResolver) Covers(_ context.Context, principal blob.Principal, user *commonpb.UserId) (bool, error) {
+func (r *fakeResolver) Covers(ctx context.Context, principal blob.Principal, user *commonpb.UserId) (bool, error) {
+	// A profile is public, so there is no membership to fake: defer to the real
+	// resolver, the way the production CompositeResolver routes it.
+	if principal.Type == blob.PrincipalTypeProfile {
+		return blob.NewProfileResolver().Covers(ctx, principal, user)
+	}
 	return r.covered[resolverKey(principal, user)], nil
 }
 

@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -129,17 +131,41 @@ func (f *fakeMessagingReader) LatestEventSequences(_ context.Context, chatIDs []
 }
 
 // fakeProfileReader is a canned chat.ProfileReader for server tests: it returns
-// whatever phone number and display name a test registers per user ID.
+// whatever phone number, display name and profile picture a test registers per user
+// ID.
 type fakeProfileReader struct {
-	phoneNumbers map[string]*phonepb.PhoneNumber
-	displayNames map[string]string
+	phoneNumbers    map[string]*phonepb.PhoneNumber
+	displayNames    map[string]string
+	profilePictures map[string]*blobpb.Media
 }
 
 func newFakeProfileReader() *fakeProfileReader {
 	return &fakeProfileReader{
-		phoneNumbers: make(map[string]*phonepb.PhoneNumber),
-		displayNames: make(map[string]string),
+		phoneNumbers:    make(map[string]*phonepb.PhoneNumber),
+		displayNames:    make(map[string]string),
+		profilePictures: make(map[string]*blobpb.Media),
 	}
+}
+
+// setProfilePicture registers a picture for a user, already hydrated the way the
+// real reader returns it — the renditions carry their resolved blob metadata.
+func (f *fakeProfileReader) setProfilePicture(userID *commonpb.UserId, blobID *blobpb.BlobId) *blobpb.Media {
+	picture := &blobpb.Media{
+		Renditions: []*blobpb.Rendition{{
+			Role:   blobpb.Rendition_ORIGINAL,
+			BlobId: blobID,
+			Blob: &blobpb.BlobMetadata{
+				MimeType:  "image/jpeg",
+				SizeBytes: 1024,
+				DownloadUrl: &blobpb.DownloadUrl{
+					Url:       "https://cdn.blobs.test/" + hex.EncodeToString(blobID.Value),
+					ExpiresAt: timestamppb.New(at(1).Add(time.Hour)),
+				},
+			},
+		}},
+	}
+	f.profilePictures[string(userID.Value)] = picture
+	return picture
 }
 
 func (f *fakeProfileReader) GetPhoneNumbers(_ context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error) {
@@ -157,6 +183,16 @@ func (f *fakeProfileReader) GetDisplayNames(_ context.Context, userIDs []*common
 	for _, userID := range userIDs {
 		if d, ok := f.displayNames[string(userID.Value)]; ok {
 			out[string(userID.Value)] = d
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeProfileReader) GetProfilePictures(_ context.Context, userIDs []*commonpb.UserId) (map[string]*blobpb.Media, error) {
+	out := make(map[string]*blobpb.Media)
+	for _, userID := range userIDs {
+		if p, ok := f.profilePictures[string(userID.Value)]; ok {
+			out[string(userID.Value)] = p
 		}
 	}
 	return out, nil
@@ -318,6 +354,7 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	e.messaging.latestEventSeqs[string(chatID.Value)] = 9
 	e.profiles.phoneNumbers[string(peer.Value)] = &phonepb.PhoneNumber{Value: "+15551234567"}
 	e.profiles.displayNames[string(peer.Value)] = "Peer Name"
+	peerPicture := e.profiles.setProfilePicture(peer, &blobpb.BlobId{Value: make([]byte, 16)})
 
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
@@ -337,16 +374,27 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	require.Len(t, members[string(peer.Value)].Pointers, 1)
 	require.Equal(t, messagingpb.Pointer_DELIVERED, members[string(peer.Value)].Pointers[0].Type)
 
-	// The other DM member's phone number and display name are hydrated onto their
-	// profile.
+	// The other DM member's phone number, display name and profile picture are
+	// hydrated onto their profile.
 	require.NotNil(t, members[string(peer.Value)].UserProfile)
 	require.NotNil(t, members[string(peer.Value)].UserProfile.PhoneNumber)
 	require.Equal(t, "+15551234567", members[string(peer.Value)].UserProfile.PhoneNumber.Value)
 	require.Equal(t, "Peer Name", members[string(peer.Value)].UserProfile.DisplayName)
-	// The env user registered neither, so both stay unset.
+
+	// The avatar arrives with its blob metadata already resolved, so the client can
+	// render it without a follow-up GetBlobs.
+	picture := members[string(peer.Value)].UserProfile.GetProfilePicture()
+	require.NotNil(t, picture)
+	require.Len(t, picture.Renditions, 1)
+	require.Equal(t, peerPicture.Renditions[0].BlobId.Value, picture.Renditions[0].BlobId.Value)
+	require.NotNil(t, picture.Renditions[0].Blob)
+	require.NotEmpty(t, picture.Renditions[0].Blob.GetDownloadUrl().GetUrl())
+
+	// The env user registered none of them, so they all stay unset.
 	require.NotNil(t, members[string(e.userID.Value)].UserProfile)
 	require.Nil(t, members[string(e.userID.Value)].UserProfile.PhoneNumber)
 	require.Empty(t, members[string(e.userID.Value)].UserProfile.DisplayName)
+	require.Nil(t, members[string(e.userID.Value)].UserProfile.GetProfilePicture())
 }
 
 func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {

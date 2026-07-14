@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
@@ -35,6 +36,16 @@ type Store interface {
 	// name set, that display name keyed by string(userID.Value). Users without
 	// one are absent from the map. It resolves the whole set in a single lookup.
 	GetDisplayNames(ctx context.Context, userIDs []*commonpb.UserId) (map[string]string, error)
+
+	// SetProfilePicture sets the user's profile picture to the blob holding its
+	// ORIGINAL rendition, replacing any picture already set.
+	SetProfilePicture(ctx context.Context, id *commonpb.UserId, blobID *blobpb.BlobId) error
+
+	// GetProfilePictures returns, for each of the given users that has a profile
+	// picture set, the blob holding its ORIGINAL rendition keyed by
+	// string(userID.Value). Users without one are absent from the map. It resolves
+	// the whole set in a single lookup.
+	GetProfilePictures(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*blobpb.BlobId, error)
 
 	// LinkPhoneNumber links the phone number and its precomputed hash to a user, provided
 	// they exist. Any other user previously holding the same phone number has both fields

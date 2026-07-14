@@ -396,6 +396,8 @@ func principalForAccessContext(accessContext *blobpb.AccessContext) (Principal, 
 	switch scope := accessContext.GetScope().(type) {
 	case *blobpb.AccessContext_Chat:
 		return PrincipalForChat(scope.Chat), true
+	case *blobpb.AccessContext_Profile:
+		return PrincipalForProfile(scope.Profile), true
 	default:
 		return Principal{}, false
 	}

@@ -5,13 +5,14 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	emailpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/email/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
-	"github.com/code-payments/ocp-server/pointer"
 	"github.com/code-payments/flipcash2-server/profile"
+	"github.com/code-payments/ocp-server/pointer"
 )
 
 type store struct {
@@ -68,7 +69,22 @@ func (s *store) GetProfile(ctx context.Context, id *commonpb.UserId, includePriv
 		return nil, err
 	}
 
-	if len(userProfile.DisplayName) == 0 && len(userProfile.SocialProfiles) == 0 && userProfile.PhoneNumber == nil && userProfile.EmailAddress == nil {
+	profilePictureBlobID, err := dbGetProfilePicture(ctx, s.pool, id)
+	if err != nil && err != profile.ErrNotFound {
+		return nil, err
+	}
+	if profilePictureBlobID != nil {
+		// Only the ORIGINAL is stored; the server derives no renditions yet. The
+		// metadata is left for the caller to hydrate.
+		userProfile.ProfilePicture = &blobpb.Media{
+			Renditions: []*blobpb.Rendition{{
+				Role:   blobpb.Rendition_ORIGINAL,
+				BlobId: profilePictureBlobID,
+			}},
+		}
+	}
+
+	if len(userProfile.DisplayName) == 0 && len(userProfile.SocialProfiles) == 0 && userProfile.PhoneNumber == nil && userProfile.EmailAddress == nil && userProfile.ProfilePicture == nil {
 		return nil, profile.ErrNotFound
 	}
 	return userProfile, nil
@@ -76,6 +92,14 @@ func (s *store) GetProfile(ctx context.Context, id *commonpb.UserId, includePriv
 
 func (s *store) SetDisplayName(ctx context.Context, id *commonpb.UserId, displayName string) error {
 	return dbSetDisplayName(ctx, s.pool, id, displayName)
+}
+
+func (s *store) SetProfilePicture(ctx context.Context, id *commonpb.UserId, blobID *blobpb.BlobId) error {
+	return dbSetProfilePicture(ctx, s.pool, id, blobID)
+}
+
+func (s *store) GetProfilePictures(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*blobpb.BlobId, error) {
+	return dbGetProfilePictures(ctx, s.pool, userIDs)
 }
 
 func (s *store) GetDisplayNames(ctx context.Context, userIDs []*commonpb.UserId) (map[string]string, error) {

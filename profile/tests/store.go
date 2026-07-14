@@ -6,10 +6,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
+	"github.com/code-payments/flipcash2-server/blob"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/protoutil"
@@ -25,6 +27,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testGetDisplayNames,
 		testGetUserIdByPhoneNumber,
 		testLinkPhoneNumberForPayment,
+		testProfilePictures,
 	} {
 		tf(t, s)
 		teardown()
@@ -533,4 +536,78 @@ func paymentPhoneValues(phones []*profile.PhoneForPayment) []string {
 		out[i] = p.PhoneNumber.Value
 	}
 	return out
+}
+
+func testProfilePictures(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	userID := model.MustGenerateUserID()
+	otherUserID := model.MustGenerateUserID()
+
+	pictureBlob := func(p *profilepb.UserProfile) *blobpb.BlobId {
+		t.Helper()
+		renditions := p.GetProfilePicture().GetRenditions()
+		require.Len(t, renditions, 1)
+		require.Equal(t, blobpb.Rendition_ORIGINAL, renditions[0].Role)
+		return renditions[0].BlobId
+	}
+
+	t.Run("Unset", func(t *testing.T) {
+		pictures, err := s.GetProfilePictures(ctx, []*commonpb.UserId{userID})
+		require.NoError(t, err)
+		require.Empty(t, pictures)
+
+		pictures, err = s.GetProfilePictures(ctx, nil)
+		require.NoError(t, err)
+		require.Empty(t, pictures)
+	})
+
+	first := blob.MustGenerateID()
+
+	t.Run("Set", func(t *testing.T) {
+		require.NoError(t, s.SetProfilePicture(ctx, userID, first))
+
+		// A picture alone is enough of a profile to exist, even with no display name.
+		p, err := s.GetProfile(ctx, userID, false)
+		require.NoError(t, err)
+		require.Equal(t, first.Value, pictureBlob(p).Value)
+
+		pictures, err := s.GetProfilePictures(ctx, []*commonpb.UserId{userID, otherUserID})
+		require.NoError(t, err)
+		require.Len(t, pictures, 1)
+		require.Equal(t, first.Value, pictures[string(userID.Value)].Value)
+	})
+
+	second := blob.MustGenerateID()
+
+	t.Run("Replace", func(t *testing.T) {
+		require.NoError(t, s.SetProfilePicture(ctx, userID, second))
+
+		p, err := s.GetProfile(ctx, userID, false)
+		require.NoError(t, err)
+		require.Equal(t, second.Value, pictureBlob(p).Value)
+
+		pictures, err := s.GetProfilePictures(ctx, []*commonpb.UserId{userID})
+		require.NoError(t, err)
+		require.Equal(t, second.Value, pictures[string(userID.Value)].Value)
+	})
+
+	t.Run("Set the same picture again", func(t *testing.T) {
+		require.NoError(t, s.SetProfilePicture(ctx, userID, second))
+
+		p, err := s.GetProfile(ctx, userID, false)
+		require.NoError(t, err)
+		require.Equal(t, second.Value, pictureBlob(p).Value)
+	})
+
+	t.Run("Pictures are per user", func(t *testing.T) {
+		third := blob.MustGenerateID()
+		require.NoError(t, s.SetProfilePicture(ctx, otherUserID, third))
+
+		pictures, err := s.GetProfilePictures(ctx, []*commonpb.UserId{userID, otherUserID})
+		require.NoError(t, err)
+		require.Len(t, pictures, 2)
+		require.Equal(t, second.Value, pictures[string(userID.Value)].Value)
+		require.Equal(t, third.Value, pictures[string(otherUserID.Value)].Value)
+	})
 }

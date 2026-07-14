@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -74,6 +75,17 @@ type ProfileReader interface {
 	// has one, keyed by string(userID.Value). Users without a display name are
 	// absent from the map.
 	GetDisplayNames(ctx context.Context, userIDs []*commonpb.UserId) (map[string]string, error)
+
+	// GetProfilePictures returns the profile picture of each of the given users
+	// that has one, keyed by string(userID.Value). Users without one are absent
+	// from the map.
+	//
+	// The renditions come back with their blob metadata already resolved —
+	// including a short-lived download URL — so a client can render member avatars
+	// without a follow-up call. The URL expires; to re-mint one the client calls
+	// GetBlobs with an AccessContext naming that user's profile, which authorizes
+	// it because a profile picture is public.
+	GetProfilePictures(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*blobpb.Media, error)
 }
 
 type Server struct {
@@ -284,6 +296,10 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 	if err != nil {
 		return nil, err
 	}
+	profilePicturesByUserId, err := s.profiles.GetProfilePictures(ctx, userIDs)
+	if err != nil {
+		return nil, err
+	}
 
 	metadata := make([]*chatpb.Metadata, len(chats))
 	for i, c := range chats {
@@ -294,7 +310,8 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 		assignPointers(md, pointers[key])
 		for _, m := range md.Members {
 			profile := &profilepb.UserProfile{
-				DisplayName: displayNamesByUserId[string(m.UserId.Value)],
+				DisplayName:    displayNamesByUserId[string(m.UserId.Value)],
+				ProfilePicture: profilePicturesByUserId[string(m.UserId.Value)],
 			}
 			if md.Type == chatpb.Metadata_DM {
 				profile.PhoneNumber = phoneNumbersByUserId[string(m.UserId.Value)]

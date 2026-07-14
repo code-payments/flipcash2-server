@@ -8,6 +8,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	emailpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/email/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
@@ -73,11 +74,60 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 		clonedBaseProfile.EmailAddress = nil
 	}
 
-	if len(clonedBaseProfile.DisplayName) == 0 && len(clonedBaseProfile.SocialProfiles) == 0 && clonedBaseProfile.PhoneNumber == nil && clonedBaseProfile.EmailAddress == nil {
+	if len(clonedBaseProfile.DisplayName) == 0 && len(clonedBaseProfile.SocialProfiles) == 0 && clonedBaseProfile.PhoneNumber == nil && clonedBaseProfile.EmailAddress == nil && clonedBaseProfile.ProfilePicture == nil {
 		return nil, profile.ErrNotFound
 	}
 
 	return clonedBaseProfile, nil
+}
+
+func (m *InMemoryStore) SetProfilePicture(_ context.Context, id *commonpb.UserId, blobID *blobpb.BlobId) error {
+	m.Lock()
+	defer m.Unlock()
+
+	p := m.ensureProfile(userIDCacheKey(id))
+
+	// Only the ORIGINAL is stored; the server derives no renditions yet.
+	p.ProfilePicture = &blobpb.Media{
+		Renditions: []*blobpb.Rendition{{
+			Role:   blobpb.Rendition_ORIGINAL,
+			BlobId: proto.Clone(blobID).(*blobpb.BlobId),
+		}},
+	}
+
+	return nil
+}
+
+func (m *InMemoryStore) GetProfilePictures(_ context.Context, userIDs []*commonpb.UserId) (map[string]*blobpb.BlobId, error) {
+	out := make(map[string]*blobpb.BlobId)
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	for _, id := range userIDs {
+		p, ok := m.profiles[userIDCacheKey(id)]
+		if !ok {
+			continue
+		}
+		if blobID := profilePictureBlob(p.ProfilePicture); blobID != nil {
+			out[string(id.Value)] = blobID
+		}
+	}
+	return out, nil
+}
+
+// profilePictureBlob returns a copy of the blob holding the media's ORIGINAL
+// rendition, or nil when there is no media or it has no original.
+func profilePictureBlob(media *blobpb.Media) *blobpb.BlobId {
+	for _, r := range media.GetRenditions() {
+		if r.Role == blobpb.Rendition_ORIGINAL && r.BlobId != nil {
+			return proto.Clone(r.BlobId).(*blobpb.BlobId)
+		}
+	}
+	return nil
 }
 
 func (m *InMemoryStore) SetDisplayName(_ context.Context, id *commonpb.UserId, displayName string) error {

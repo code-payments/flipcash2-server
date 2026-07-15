@@ -654,24 +654,36 @@ func testRenditionGeneration(t *testing.T, accounts account.Store, blobs blob.St
 		}
 	})
 
-	t.Run("a mid-size image yields only the rungs below it", func(t *testing.T) {
-		// 500 on the longest side is below the 800 and 1600 rungs, so only the two
-		// thumbnails are generated; the client falls back to the ORIGINAL above them.
+	t.Run("a mid-size image fills the gap up to the next rung at its own size", func(t *testing.T) {
+		// 500 on the longest side clears the two thumbnail rungs but falls between the
+		// 320 thumbnail and the 800 display. So the two thumbnails are generated, plus a
+		// single DISPLAY at the original's own 500x400 size (the next rung's role), never
+		// upscaled to 800.
 		original := readyBlob(t, "image/png", makePNG(t, 500, 400))
 
-		require.Len(t, original.Renditions, 2)
+		require.Len(t, original.Renditions, 3)
 		require.Equal(t, blob.RenditionThumbnail, original.Renditions[0].Rendition)
 		require.EqualValues(t, 160, original.Renditions[0].Image.Width)
 		require.EqualValues(t, 128, original.Renditions[0].Image.Height)
 		require.Equal(t, blob.RenditionThumbnail, original.Renditions[1].Rendition)
 		require.EqualValues(t, 320, original.Renditions[1].Image.Width)
 		require.EqualValues(t, 256, original.Renditions[1].Image.Height)
+		require.Equal(t, blob.RenditionDisplay, original.Renditions[2].Rendition)
+		require.EqualValues(t, 500, original.Renditions[2].Image.Width)
+		require.EqualValues(t, 400, original.Renditions[2].Image.Height)
 	})
 
-	t.Run("a small image generates no renditions", func(t *testing.T) {
-		// Below every rung, so nothing is derived and the ORIGINAL stands alone.
+	t.Run("a small image still gets a re-encoded rendition at its own size", func(t *testing.T) {
+		// Below every rung, so it is never upscaled — but the next rung (the 160
+		// thumbnail) is still processed at the original's own 100x80 size, since
+		// re-encoding to WebP can shrink the bytes over the ORIGINAL.
 		original := readyBlob(t, "image/png", makePNG(t, 100, 80))
-		require.Empty(t, original.Renditions)
+
+		require.Len(t, original.Renditions, 1)
+		require.Equal(t, blob.RenditionThumbnail, original.Renditions[0].Rendition)
+		require.EqualValues(t, 100, original.Renditions[0].Image.Width)
+		require.EqualValues(t, 80, original.Renditions[0].Image.Height)
+		require.Equal(t, "image/webp", original.Renditions[0].MimeType)
 	})
 
 	t.Run("re-completing does not duplicate or alter the manifest", func(t *testing.T) {

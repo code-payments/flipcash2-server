@@ -597,17 +597,25 @@ func (s *Server) finalize(ctx context.Context, record *Blob) (blobpb.BlobStatus,
 // its own ladder. It is idempotent: a rendition's id is a pure function of the
 // original and the rung's output spec, so a replayed generation recreates the same
 // id — overwriting the same object and treating an already-present record as the
-// prior attempt to finish advancing — instead of orphaning a duplicate. A rung
-// whose bound is at or above the original's longest side is skipped rather than
-// upscaled.
+// prior attempt to finish advancing — instead of orphaning a duplicate.
+//
+// The original is never upscaled. The first rung whose bound reaches the original's
+// longest side still yields ONE rendition, encoded at the original's own size and
+// typed as that rung's role: even when its dimensions match the original, re-encoding
+// as WebP typically saves bytes over the (possibly large, un-optimized, non-WebP)
+// ORIGINAL, so a client always has a cheaper encoded variant to reach for at that
+// role. Every larger rung would bound the same size to the same bytes, so generation
+// stops there.
 func (s *Server) generateImageRenditions(ctx context.Context, parent *Blob, decoded image.Image, meta *ImageMetadata) error {
 	refs := make([]RenditionRef, 0, len(imageRenditionSpecs))
 	for _, spec := range imageRenditionSpecs {
-		// Never upscale: a small original simply yields a shorter ladder, and the
-		// client falls back to the ORIGINAL for anything larger.
-		if spec.MaxLongestSide >= max(meta.Width, meta.Height) {
-			continue
-		}
+		// The first rung whose bound is at or above the original's longest side is the
+		// "next" rung the original doesn't exceed. We emit a single rendition at the
+		// original's own size (scaledDimensions never upscales past the bound) typed as
+		// this next rung's role, then stop — every larger rung would bound the same size
+		// to the same bytes.
+		reachedOriginal := spec.MaxLongestSide >= max(meta.Width, meta.Height)
+
 		width, height := scaledDimensions(meta.Width, meta.Height, spec.MaxLongestSide)
 		encoding := imageEncodingFor(spec.Rendition, meta.HasAlpha)
 
@@ -654,6 +662,12 @@ func (s *Server) generateImageRenditions(ctx context.Context, parent *Blob, deco
 		}
 
 		refs = append(refs, renditionRef(child))
+
+		// This rendition already covers the original's full size; any larger rung would
+		// only re-encode the same bytes, so the ladder ends here.
+		if reachedOriginal {
+			break
+		}
 	}
 
 	// Record the manifest on the original so its whole rendition set resolves in the

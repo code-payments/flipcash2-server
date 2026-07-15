@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,7 +31,6 @@ import (
 // owner.
 const (
 	attrPK            = "pk"
-	attrID            = "id"             // blob id, hex
 	attrParentID      = "parent_id"      // parent (ORIGINAL) id, hex; absent on ORIGINALs
 	attrRendition     = "rendition"      // RenditionType, N
 	attrUserID        = "user_id"        // owner id, hex
@@ -164,7 +164,28 @@ func (s *store) GetByIDs(ctx context.Context, ids []*blobpb.BlobId) ([]*blob.Blo
 }
 
 func (s *store) AttachRenditions(ctx context.Context, id *blobpb.BlobId, refs []blob.RenditionRef) error {
-	manifest, err := marshalRenditions(refs)
+	// A rendition normally shares the original's mime type, BlurHash, and alpha, which
+	// are already stored on the original item; read them so marshalRenditions can omit
+	// matching entries and only persist values that genuinely differ. Projecting pk too
+	// distinguishes a missing item (no attributes) from an original that simply lacks
+	// those fields.
+	current, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:            aws.String(s.table),
+		Key:                  map[string]types.AttributeValue{attrPK: avS(blobPK(id))},
+		ProjectionExpression: aws.String(fmt.Sprintf("%s, %s, %s, %s", attrPK, attrMimeType, attrImageBlurhash, attrImageHasAlpha)),
+	})
+	if err != nil {
+		return err
+	}
+	if len(current.Item) == 0 {
+		return blob.ErrNotFound
+	}
+
+	manifest, err := marshalRenditions(refs, renditionDefaults{
+		mimeType: stringAttr(current.Item, attrMimeType),
+		blurhash: stringAttr(current.Item, attrImageBlurhash),
+		hasAlpha: boolAttr(current.Item, attrImageHasAlpha),
+	})
 	if err != nil {
 		return err
 	}
@@ -202,10 +223,11 @@ func (s *store) Advance(ctx context.Context, id *blobpb.BlobId, to blob.State, i
 
 	update := "SET #state = :to"
 	if image != nil {
-		update += fmt.Sprintf(", %s = :w, %s = :h, %s = :b", attrImageWidth, attrImageHeight, attrImageBlurhash)
+		update += fmt.Sprintf(", %s = :w, %s = :h, %s = :b, %s = :a", attrImageWidth, attrImageHeight, attrImageBlurhash, attrImageHasAlpha)
 		values[":w"] = avInt(int(image.Width))
 		values[":h"] = avInt(int(image.Height))
 		values[":b"] = avS(image.Blurhash)
+		values[":a"] = avBool(image.HasAlpha)
 	}
 	// READY is the durable terminal state: clear the TTL so the blob is never
 	// reclaimed. Non-terminal and rejected records keep it and expire if they
@@ -287,7 +309,6 @@ func (s *store) Reject(ctx context.Context, id *blobpb.BlobId, rejection *blob.R
 func toItem(b *blob.Blob) map[string]types.AttributeValue {
 	item := map[string]types.AttributeValue{
 		attrPK:         avS(blobPK(b.ID)),
-		attrID:         avS(hex.EncodeToString(b.ID.Value)),
 		attrRendition:  avInt(int(b.Rendition)),
 		attrUserID:     avS(hex.EncodeToString(b.Owner.Value)),
 		attrState:      avInt(int(b.State)),
@@ -308,9 +329,10 @@ func toItem(b *blob.Blob) map[string]types.AttributeValue {
 }
 
 func fromItem(item map[string]types.AttributeValue) (*blob.Blob, error) {
-	idBytes, err := hexAttr(item, attrID)
+	// The id is not stored on its own; it is the pk with the type prefix stripped.
+	idBytes, err := hex.DecodeString(strings.TrimPrefix(stringAttr(item, attrPK), blobKeyPrefix))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid %s attribute: %w", attrPK, err)
 	}
 	ownerBytes, err := hexAttr(item, attrUserID)
 	if err != nil {
@@ -365,7 +387,14 @@ func fromItem(item map[string]types.AttributeValue) (*blob.Blob, error) {
 	}
 
 	if raw, ok := item[attrRenditions].(*types.AttributeValueMemberS); ok {
-		refs, err := unmarshalRenditions(raw.Value)
+		// A rendition normally shares the original's mime type, BlurHash, and alpha,
+		// stored once on the original item rather than per entry.
+		def := renditionDefaults{mimeType: b.MimeType}
+		if b.Image != nil {
+			def.blurhash = b.Image.Blurhash
+			def.hasAlpha = b.Image.HasAlpha
+		}
+		refs, err := unmarshalRenditions(raw.Value, def)
 		if err != nil {
 			return nil, err
 		}
@@ -392,37 +421,63 @@ func fromItem(item map[string]types.AttributeValue) (*blob.Blob, error) {
 }
 
 // renditionRefItem is the JSON shape a manifest entry is stored as. It flattens
-// the reused ImageMetadata (w/h/blurhash/alpha) so the serialized form stays a
-// compact flat object, and holds the blob id as hex.
+// the reused ImageMetadata (w/h/alpha) so the serialized form stays a compact flat
+// object, and holds the blob id as hex. MimeType, BlurHash, and HasAlpha are stored
+// only when they differ from the original's: each is normally shared across an
+// original's renditions, so an entry that matches the original omits it (see
+// marshalRenditions) and it is rehydrated from the original on read. HasAlpha is a
+// pointer so an omitted value (matches the original) is distinct from a stored false
+// (genuinely differs), which a bare bool with omitempty could not express; MimeType
+// and BlurHash use "" as that sentinel, as neither is ever legitimately empty.
 type renditionRefItem struct {
 	ID         string `json:"id"`
 	Rendition  int    `json:"role"`
-	MimeType   string `json:"mime"`
+	MimeType   string `json:"mime,omitempty"`
 	SizeBytes  uint64 `json:"size"`
 	StorageKey string `json:"key"`
 	Width      uint32 `json:"w"`
 	Height     uint32 `json:"h"`
 	Blurhash   string `json:"bh,omitempty"`
-	HasAlpha   bool   `json:"a,omitempty"`
+	HasAlpha   *bool  `json:"a,omitempty"`
+}
+
+// renditionDefaults are the original's values that a rendition normally inherits.
+// A manifest entry stores each field only when it diverges from these; the omitted
+// ones are rehydrated from here on read. Bundling them keeps the two adjacent string
+// fields from being transposed at a call site.
+type renditionDefaults struct {
+	mimeType string
+	blurhash string
+	hasAlpha bool
 }
 
 // marshalRenditions serializes a rendition manifest to the JSON stored under
-// attrRenditions. An empty manifest serializes to "[]".
-func marshalRenditions(refs []blob.RenditionRef) (string, error) {
+// attrRenditions. An empty manifest serializes to "[]". A rendition normally shares
+// the original's mime type, BlurHash, and alpha, so an entry matching def omits that
+// field and is rehydrated from the original on read; only a field that genuinely
+// differs is stored.
+func marshalRenditions(refs []blob.RenditionRef, def renditionDefaults) (string, error) {
 	items := make([]renditionRefItem, len(refs))
 	for i, ref := range refs {
 		items[i] = renditionRefItem{
 			ID:         hex.EncodeToString(ref.ID.Value),
 			Rendition:  int(ref.Rendition),
-			MimeType:   ref.MimeType,
 			SizeBytes:  ref.SizeBytes,
 			StorageKey: ref.StorageKey,
+		}
+		if ref.MimeType != def.mimeType {
+			items[i].MimeType = ref.MimeType
 		}
 		if ref.Image != nil {
 			items[i].Width = ref.Image.Width
 			items[i].Height = ref.Image.Height
-			items[i].Blurhash = ref.Image.Blurhash
-			items[i].HasAlpha = ref.Image.HasAlpha
+			if ref.Image.Blurhash != def.blurhash {
+				items[i].Blurhash = ref.Image.Blurhash
+			}
+			if ref.Image.HasAlpha != def.hasAlpha {
+				hasAlpha := ref.Image.HasAlpha
+				items[i].HasAlpha = &hasAlpha
+			}
 		}
 	}
 	encoded, err := json.Marshal(items)
@@ -433,8 +488,10 @@ func marshalRenditions(refs []blob.RenditionRef) (string, error) {
 }
 
 // unmarshalRenditions reverses marshalRenditions, rebuilding the manifest (with
-// its reused ImageMetadata) from the stored JSON.
-func unmarshalRenditions(encoded string) ([]blob.RenditionRef, error) {
+// its reused ImageMetadata) from the stored JSON. def holds the original's values;
+// an entry that omitted a field (because it matched) is rehydrated from def, while an
+// entry that stored a differing value keeps that.
+func unmarshalRenditions(encoded string, def renditionDefaults) ([]blob.RenditionRef, error) {
 	var items []renditionRefItem
 	if err := json.Unmarshal([]byte(encoded), &items); err != nil {
 		return nil, fmt.Errorf("invalid rendition manifest: %w", err)
@@ -445,17 +502,29 @@ func unmarshalRenditions(encoded string) ([]blob.RenditionRef, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid rendition id in manifest: %w", err)
 		}
+		mimeType := item.MimeType
+		if mimeType == "" {
+			mimeType = def.mimeType
+		}
+		blurhash := item.Blurhash
+		if blurhash == "" {
+			blurhash = def.blurhash
+		}
+		hasAlpha := def.hasAlpha
+		if item.HasAlpha != nil {
+			hasAlpha = *item.HasAlpha
+		}
 		refs[i] = blob.RenditionRef{
 			ID:         &blobpb.BlobId{Value: idBytes},
 			Rendition:  blob.RenditionType(item.Rendition),
-			MimeType:   item.MimeType,
+			MimeType:   mimeType,
 			SizeBytes:  item.SizeBytes,
 			StorageKey: item.StorageKey,
 			Image: &blob.ImageMetadata{
 				Width:    item.Width,
 				Height:   item.Height,
-				Blurhash: item.Blurhash,
-				HasAlpha: item.HasAlpha,
+				Blurhash: blurhash,
+				HasAlpha: hasAlpha,
 			},
 		}
 	}

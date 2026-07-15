@@ -91,7 +91,7 @@ func testStoreAdvance(t *testing.T, store blob.Store) {
 	require.Equal(t, blob.StateUploaded, got.State)
 
 	// The metadata is persisted at the StateInspected checkpoint.
-	image := &blob.ImageMetadata{Width: 100, Height: 200, Blurhash: "LEHV6nWB"}
+	image := &blob.ImageMetadata{Width: 100, Height: 200, Blurhash: "LEHV6nWB", HasAlpha: true}
 	advanced, err = store.Advance(ctx, original.ID, blob.StateInspected, image)
 	require.NoError(t, err)
 	require.True(t, advanced)
@@ -102,6 +102,7 @@ func testStoreAdvance(t *testing.T, store blob.Store) {
 	require.EqualValues(t, 100, got.Image.Width)
 	require.EqualValues(t, 200, got.Image.Height)
 	require.Equal(t, "LEHV6nWB", got.Image.Blurhash)
+	require.True(t, got.Image.HasAlpha)
 	// The declared type and size are never altered.
 	require.Equal(t, original.MimeType, got.MimeType)
 	require.Equal(t, original.SizeBytes, got.SizeBytes)
@@ -198,6 +199,9 @@ func testStoreRenditions(t *testing.T, store blob.Store) {
 	ctx := context.Background()
 
 	original := pendingOriginal(t)
+	// The original carries a BlurHash and alpha; renditions normally share both, so
+	// the store may dedup them rather than persist a copy per manifest entry.
+	original.Image = &blob.ImageMetadata{Width: 1600, Height: 900, Blurhash: "LKO2", HasAlpha: true}
 	require.NoError(t, store.CreatePending(ctx, original))
 
 	// A freshly created original carries no rendition manifest.
@@ -209,18 +213,26 @@ func testStoreRenditions(t *testing.T, store blob.Store) {
 		{
 			ID:         blob.MustGenerateID(),
 			Rendition:  blob.RenditionThumbnail,
-			MimeType:   "image/jpeg",
+			// Shares the original's mime type (the common case): it must still round-trip
+			// even when the store dedups it against the original.
+			MimeType:   "image/png",
 			SizeBytes:  111,
-			StorageKey: "images/x/thumbnail_160x90.jpg",
-			Image:      &blob.ImageMetadata{Width: 160, Height: 90, Blurhash: "LKO2", HasAlpha: false},
+			StorageKey: "images/x/thumbnail_160x90.png",
+			// Shares the original's BlurHash and alpha (the common case): both must still
+			// round-trip even when the store dedups them against the original.
+			Image: &blob.ImageMetadata{Width: 160, Height: 90, Blurhash: "LKO2", HasAlpha: true},
 		},
 		{
 			ID:         blob.MustGenerateID(),
 			Rendition:  blob.RenditionDisplay,
+			// Differs from the original's mime type: it must be preserved as its own.
 			MimeType:   "image/jpeg",
 			SizeBytes:  222,
 			StorageKey: "images/x/display_800x450.jpg",
-			Image:      &blob.ImageMetadata{Width: 800, Height: 450, Blurhash: "LKO2", HasAlpha: false},
+			// Differs from the original in both BlurHash and alpha: each must be preserved
+			// as its own. The alpha differs to false, which a naive omitempty bool would
+			// drop and wrongly rehydrate as the original's true.
+			Image: &blob.ImageMetadata{Width: 800, Height: 450, Blurhash: "MNO9", HasAlpha: false},
 		},
 	}
 	require.NoError(t, store.AttachRenditions(ctx, original.ID, refs))
@@ -233,16 +245,23 @@ func testStoreRenditions(t *testing.T, store blob.Store) {
 
 	require.Equal(t, refs[0].ID.Value, got.Renditions[0].ID.Value)
 	require.Equal(t, blob.RenditionThumbnail, got.Renditions[0].Rendition)
-	require.Equal(t, "image/jpeg", got.Renditions[0].MimeType)
 	require.EqualValues(t, 111, got.Renditions[0].SizeBytes)
-	require.Equal(t, "images/x/thumbnail_160x90.jpg", got.Renditions[0].StorageKey)
+	require.Equal(t, "images/x/thumbnail_160x90.png", got.Renditions[0].StorageKey)
 	require.NotNil(t, got.Renditions[0].Image)
 	require.EqualValues(t, 160, got.Renditions[0].Image.Width)
 	require.EqualValues(t, 90, got.Renditions[0].Image.Height)
+	// Shared with the original: rehydrated to the same values.
+	require.Equal(t, "image/png", got.Renditions[0].MimeType)
 	require.Equal(t, "LKO2", got.Renditions[0].Image.Blurhash)
+	require.True(t, got.Renditions[0].Image.HasAlpha)
 
 	require.Equal(t, refs[1].ID.Value, got.Renditions[1].ID.Value)
 	require.Equal(t, blob.RenditionDisplay, got.Renditions[1].Rendition)
+	require.NotNil(t, got.Renditions[1].Image)
+	// Differs from the original: preserved as its own.
+	require.Equal(t, "image/jpeg", got.Renditions[1].MimeType)
+	require.Equal(t, "MNO9", got.Renditions[1].Image.Blurhash)
+	require.False(t, got.Renditions[1].Image.HasAlpha)
 
 	// Re-attaching overwrites rather than appends, so a replayed generation is
 	// idempotent.

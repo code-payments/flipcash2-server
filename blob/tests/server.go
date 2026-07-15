@@ -603,7 +603,7 @@ func testRenditionGeneration(t *testing.T, accounts account.Store, blobs blob.St
 		return record
 	}
 
-	t.Run("a large opaque image generates the full ladder as JPEG", func(t *testing.T) {
+	t.Run("a large opaque image generates the full ladder as WebP", func(t *testing.T) {
 		original := readyBlob(t, "image/png", makePNG(t, 2000, 1000))
 
 		require.Equal(t, blob.RenditionOriginal, original.Rendition)
@@ -623,7 +623,7 @@ func testRenditionGeneration(t *testing.T, accounts account.Store, blobs blob.St
 		require.Len(t, original.Renditions, len(want))
 		for i, ref := range original.Renditions {
 			require.Equal(t, want[i].role, ref.Rendition)
-			require.Equal(t, "image/jpeg", ref.MimeType, "an opaque source yields JPEG renditions")
+			require.Equal(t, "image/webp", ref.MimeType, "an opaque source yields lossy WebP renditions")
 			require.NotNil(t, ref.Image)
 			require.EqualValues(t, want[i].w, ref.Image.Width)
 			require.EqualValues(t, want[i].h, ref.Image.Height)
@@ -645,12 +645,12 @@ func testRenditionGeneration(t *testing.T, accounts account.Store, blobs blob.St
 		}
 	})
 
-	t.Run("a transparent image generates renditions as PNG", func(t *testing.T) {
+	t.Run("a transparent image generates renditions as lossless WebP", func(t *testing.T) {
 		original := readyBlob(t, "image/png", makeTransparentPNG(t, 400, 400))
 
 		require.NotEmpty(t, original.Renditions)
 		for _, ref := range original.Renditions {
-			require.Equal(t, "image/png", ref.MimeType, "a transparent source yields PNG renditions")
+			require.Equal(t, "image/webp", ref.MimeType, "a transparent source yields WebP renditions")
 		}
 	})
 

@@ -538,8 +538,9 @@ func webpIsAnimated(data []byte) bool {
 
 // hasAlpha reports whether img carries a non-opaque alpha channel. The standard
 // library image types implement Opaque(), which scans for any non-opaque pixel;
-// a type that does not expose it is treated as potentially transparent, so a
-// rendition of it is encoded losslessly rather than risk flattening real alpha.
+// a type that does not expose it is treated as potentially transparent, so its
+// renditions are encoded losslessly (see imageEncodingFor) rather than risk
+// flattening real alpha.
 func hasAlpha(img image.Image) bool {
 	if o, ok := img.(interface{ Opaque() bool }); ok {
 		return !o.Opaque()

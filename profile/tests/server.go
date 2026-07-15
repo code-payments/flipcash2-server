@@ -359,7 +359,8 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 		resp := setProfilePicture(first)
 		require.Equal(t, profilepb.SetProfilePictureResponse_OK, resp.Result)
 
-		// Only the ORIGINAL exists today; DISPLAY/THUMBNAIL derivation is not built yet.
+		// This blob has no derived renditions (no manifest was attached), so only the
+		// ORIGINAL resolves; expansion of a full set is covered separately below.
 		require.Len(t, resp.ProfilePicture.Renditions, 1)
 		rendition := resp.ProfilePicture.Renditions[0]
 		require.Equal(t, blobpb.Rendition_ORIGINAL, rendition.Role)
@@ -408,5 +409,45 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 		require.Equal(t, profilepb.SetProfilePictureResponse_OK, setProfilePicture(current).Result)
 		require.Equal(t, profilepb.SetProfilePictureResponse_OK, setProfilePicture(current).Result)
 		require.True(t, isGranted(current))
+	})
+
+	t.Run("A picture with derived renditions expands on read", func(t *testing.T) {
+		// A READY original that carries a derived DISPLAY in its manifest.
+		original := seedBlob(t, blobs, userID, blob.StateReady, "image/jpeg")
+		displayID := blob.MustGenerateID()
+		require.NoError(t, blobs.AttachRenditions(ctx, original, []blob.RenditionRef{{
+			ID:         displayID,
+			Rendition:  blob.RenditionDisplay,
+			MimeType:   "image/jpeg",
+			SizeBytes:  64,
+			StorageKey: "images/x/display_800x600.jpg",
+			Image:      &blob.ImageMetadata{Width: 800, Height: 600},
+		}}))
+
+		requireRenditionSet := func(t *testing.T, renditions []*blobpb.Rendition) {
+			t.Helper()
+			require.Len(t, renditions, 2)
+
+			require.Equal(t, blobpb.Rendition_ORIGINAL, renditions[0].Role)
+			require.Equal(t, original.Value, renditions[0].BlobId.Value)
+			require.NotEmpty(t, renditions[0].Blob.GetDownloadUrl().GetUrl())
+
+			require.Equal(t, blobpb.Rendition_DISPLAY, renditions[1].Role)
+			require.Equal(t, displayID.Value, renditions[1].BlobId.Value)
+			require.Equal(t, "image/jpeg", renditions[1].Blob.MimeType)
+			require.EqualValues(t, 800, renditions[1].Blob.GetImage().GetWidth())
+			require.NotEmpty(t, renditions[1].Blob.GetDownloadUrl().GetUrl())
+		}
+
+		// The Set response carries the full set...
+		resp := setProfilePicture(original)
+		require.Equal(t, profilepb.SetProfilePictureResponse_OK, resp.Result)
+		requireRenditionSet(t, resp.ProfilePicture.GetRenditions())
+
+		// ...and so does the public Get.
+		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		require.NoError(t, err)
+		require.Equal(t, profilepb.GetProfileResponse_OK, getResp.Result)
+		requireRenditionSet(t, getResp.UserProfile.GetProfilePicture().GetRenditions())
 	})
 }

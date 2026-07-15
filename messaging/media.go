@@ -17,16 +17,17 @@ import (
 
 // Media is the blob-side integration messaging uses for media: it shares the
 // blobs a message references into the chat on send (ShareIntoChat) and resolves
-// their metadata on read (Resolve). It is implemented by blob.Integration.
+// their rendition sets on read (ResolveRenditions). It is implemented by
+// blob.Integration.
 //
 // ShareIntoChat returns blob.ErrBlobNotShareable when a referenced blob may not be
 // attached (unknown, not owned by the sender, or not a READY original), in which
-// case nothing is granted. Resolve performs no authorization — the caller has
-// already gated on chat membership — and returns metadata keyed by
-// string(BlobId.Value), omitting unknown or not-yet-READY ids.
+// case nothing is granted. ResolveRenditions performs no authorization — the caller
+// has already gated on chat membership — and returns each original's full rendition
+// set keyed by string(BlobId.Value), omitting unknown or not-yet-READY ids.
 type Media interface {
 	ShareIntoChat(ctx context.Context, sharerID *commonpb.UserId, chatID *commonpb.ChatId, blobIDs []*blobpb.BlobId) error
-	Resolve(ctx context.Context, ids []*blobpb.BlobId) (map[string]*blobpb.BlobMetadata, error)
+	ResolveRenditions(ctx context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error)
 }
 
 // validClientMedia reports whether a media content is one a client may author:
@@ -100,62 +101,81 @@ func mediaBlobIDs(content []*messagingpb.Content) []*blobpb.BlobId {
 	return ids
 }
 
-// hydrateMedia fills each media rendition's Blob with freshly resolved metadata
-// (mime type, size, a short-lived download URL, dimensions). The caller has
-// already gated on chat membership, and every blob in a stored message was granted
-// to the chat when it was sent, so this resolves without re-checking the ACL. A
-// blob that no longer resolves (e.g. a later takedown left it non-READY) is left
-// with a nil Blob for the client to treat as unavailable.
+// hydrateMedia replaces each media item's rendition list with the full set the
+// server derived — the ORIGINAL plus every derived rendition (display, thumbnail),
+// each carrying freshly resolved metadata (mime type, size, dimensions, a
+// short-lived download URL). A stored message carries only the ORIGINAL the client
+// sent; this expands it on read. The caller has already gated on chat membership,
+// and every blob in a stored message was granted to the chat when it was sent, so
+// this resolves without re-checking the ACL. An item whose original no longer
+// resolves (e.g. a later takedown left it non-READY) is left with its stored
+// ORIGINAL rendition for the client to treat as unavailable.
 func hydrateMedia(ctx context.Context, resolver Media, protos []*messagingpb.Message) error {
-	renditions := mediaRenditions(protos)
-	if len(renditions) == 0 {
+	items := mediaItems(protos)
+	if len(items) == 0 {
 		return nil
 	}
 
-	ids := make([]*blobpb.BlobId, 0, len(renditions))
-	seen := make(map[string]struct{}, len(renditions))
-	for _, r := range renditions {
-		key := string(r.BlobId.Value)
+	// Resolve by each item's ORIGINAL id, de-duplicated so a page that repeats an
+	// image costs a single lookup.
+	ids := make([]*blobpb.BlobId, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		id := originalBlobID(item)
+		if id == nil {
+			continue
+		}
+		key := string(id.Value)
 		if _, ok := seen[key]; ok {
 			continue
 		}
 		seen[key] = struct{}{}
-		ids = append(ids, r.BlobId)
+		ids = append(ids, id)
 	}
 
-	metadata, err := resolver.Resolve(ctx, ids)
+	resolved, err := resolver.ResolveRenditions(ctx, ids)
 	if err != nil {
 		return err
 	}
-	for _, r := range renditions {
-		if m, ok := metadata[string(r.BlobId.Value)]; ok {
-			r.Blob = m
+	for _, item := range items {
+		id := originalBlobID(item)
+		if id == nil {
+			continue
+		}
+		if renditions, ok := resolved[string(id.Value)]; ok {
+			item.Renditions = renditions
 		}
 	}
 	return nil
 }
 
-// mediaRenditions returns every media rendition carrying a blob id across the
-// messages — whether the media is a message body or a reply body — so its Blob can
-// be hydrated in place.
-func mediaRenditions(protos []*messagingpb.Message) []*blobpb.Rendition {
-	var out []*blobpb.Rendition
+// mediaItems returns every media item across the messages — whether the media is a
+// message body or a reply body — so each item's rendition list can be expanded in
+// place.
+func mediaItems(protos []*messagingpb.Message) []*blobpb.Media {
+	var out []*blobpb.Media
 	for _, msg := range protos {
 		for _, c := range msg.Content {
 			media := mediaOf(c)
 			if media == nil {
 				continue
 			}
-			for _, item := range media.Items {
-				for _, r := range item.Renditions {
-					if r.BlobId != nil {
-						out = append(out, r)
-					}
-				}
-			}
+			out = append(out, media.Items...)
 		}
 	}
 	return out
+}
+
+// originalBlobID returns the id of the item's ORIGINAL rendition — the handle the
+// client sent and the one the server resolves the rendition set from — or nil if
+// the item carries no ORIGINAL.
+func originalBlobID(item *blobpb.Media) *blobpb.BlobId {
+	for _, r := range item.GetRenditions() {
+		if r.Role == blobpb.Rendition_ORIGINAL && r.BlobId != nil {
+			return r.BlobId
+		}
+	}
+	return nil
 }
 
 // mediaOf returns the MediaContent a content element carries — directly or as a

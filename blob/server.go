@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"image"
 	"time"
 
 	"go.uber.org/zap"
@@ -417,6 +418,13 @@ func (s *Server) finalize(ctx context.Context, record *Blob) (blobpb.BlobStatus,
 
 	var data []byte // the uploaded bytes, fetched once and reused across steps
 
+	// The decoded original and its derived metadata, captured when the inspection
+	// step runs so rendition generation can reuse them without decoding twice. Both
+	// stay nil on a finalize that resumes past inspection, in which case the
+	// generation step re-derives them from the still-present upload bytes.
+	var decoded image.Image
+	var imageMeta *ImageMetadata
+
 	// Confirm the client's upload landed, then checkpoint StateUploaded.
 	if state < StateUploaded {
 		fetched, err := s.fetchUploaded(ctx, record)
@@ -491,6 +499,10 @@ func (s *Server) finalize(ctx context.Context, record *Blob) (blobpb.BlobStatus,
 		if !advanced {
 			return s.currentStatus(ctx, record.ID)
 		}
+		// Carry the decoded image and derived metadata forward so the generation
+		// step can derive renditions without re-reading and re-decoding the bytes.
+		decoded = inspection.Decoded
+		imageMeta = inspection.Metadata
 		state = StateInspected
 	}
 
@@ -510,9 +522,49 @@ func (s *Server) finalize(ctx context.Context, record *Blob) (blobpb.BlobStatus,
 		state = StatePromoted
 	}
 
-	// Rendition generation (StateGeneratingRenditions) will slot in here, between
-	// promotion and readiness: a blob is not client-ready until its renditions
-	// exist. It is not implemented yet, so finalize advances straight to Ready.
+	// Derive the renditions from the promoted original, then checkpoint
+	// StateGeneratingRenditions. A blob is not client-ready until its renditions
+	// exist, so this runs before READY. Generation is idempotent (each rendition has
+	// a deterministic id), so a resumed finalize regenerates the same set harmlessly;
+	// a failure here leaves the blob at StatePromoted for a retry rather than
+	// rejecting an original that already passed moderation.
+	//
+	// Renditions are derived per content kind. Only images exist today, so this
+	// dispatches straight to the image strategy; when another kind is added it is
+	// inspected and generated on its own arm here, with its own ladder, rather than
+	// through the image path.
+	if state < StateGeneratingRenditions {
+		if decoded == nil {
+			// Resumed past inspection: the decoded image is no longer in hand. The
+			// upload bytes are still present (cleanup runs only at READY), so re-read
+			// and re-derive from them.
+			if data == nil {
+				fetched, err := s.fetchUploaded(ctx, record)
+				if err != nil {
+					return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
+				}
+				data = fetched
+			}
+			inspection, err := InspectImage(data)
+			if err != nil {
+				return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
+			}
+			decoded = inspection.Decoded
+			imageMeta = inspection.Metadata
+		}
+
+		if err := s.generateImageRenditions(ctx, record, decoded, imageMeta); err != nil {
+			return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
+		}
+		advanced, err := s.blobs.Advance(ctx, record.ID, StateGeneratingRenditions, nil)
+		if err != nil {
+			return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
+		}
+		if !advanced {
+			return s.currentStatus(ctx, record.ID)
+		}
+		state = StateGeneratingRenditions
+	}
 
 	// Clean up the now-redundant upload bytes, then checkpoint StateReady. The
 	// original is durably in the origin store, so the cleanup is best-effort and
@@ -531,6 +583,84 @@ func (s *Server) finalize(ctx context.Context, record *Blob) (blobpb.BlobStatus,
 	}
 
 	return state.ToBlobStatus(), nil
+}
+
+// generateImageRenditions derives every rung of the IMAGE rendition ladder from
+// the decoded original and stores each as its own READY blob: it scales and
+// encodes the bytes, writes them straight into the origin store, and records a
+// child blob whose ParentID points back at the original. meta supplies the
+// original's persisted dimensions (so the derivation matches what the read path
+// predicts), its BlurHash (intrinsic to the content, copied onto each rendition),
+// and its alpha (which picks the output format).
+//
+// It is the image kind's strategy; another content kind has its own generator over
+// its own ladder. It is idempotent: a rendition's id is a pure function of the
+// original and the rung's output spec, so a replayed generation recreates the same
+// id — overwriting the same object and treating an already-present record as the
+// prior attempt to finish advancing — instead of orphaning a duplicate. A rung
+// whose bound is at or above the original's longest side is skipped rather than
+// upscaled.
+func (s *Server) generateImageRenditions(ctx context.Context, parent *Blob, decoded image.Image, meta *ImageMetadata) error {
+	refs := make([]RenditionRef, 0, len(imageRenditionSpecs))
+	for _, spec := range imageRenditionSpecs {
+		// Never upscale: a small original simply yields a shorter ladder, and the
+		// client falls back to the ORIGINAL for anything larger.
+		if spec.MaxLongestSide >= max(meta.Width, meta.Height) {
+			continue
+		}
+		width, height := scaledDimensions(meta.Width, meta.Height, spec.MaxLongestSide)
+		encoding := imageEncodingFor(spec.Rendition, meta.HasAlpha)
+
+		id := imageRenditionID(parent.ID, spec.Rendition, width, height, encoding)
+		key, err := imageRenditionStorageKey(parent.ID, spec.Rendition, width, height, encoding.mimeType)
+		if err != nil {
+			return err
+		}
+
+		encoded, err := encoding.encode(resampleImage(decoded, int(width), int(height)))
+		if err != nil {
+			return err
+		}
+
+		// Bytes before record: the origin object must exist before anything can
+		// reference the rendition. PutOrigin overwrites, so this is replay-safe.
+		if err := s.storage.PutOrigin(ctx, key, encoding.mimeType, encoded); err != nil {
+			return err
+		}
+
+		child := &Blob{
+			ID:         id,
+			Rendition:  spec.Rendition,
+			ParentID:   parent.ID,
+			Owner:      parent.Owner,
+			State:      StatePending,
+			StorageKey: key,
+			MimeType:   encoding.mimeType,
+			SizeBytes:  uint64(len(encoded)),
+			Image: &ImageMetadata{
+				Width:    width,
+				Height:   height,
+				Blurhash: meta.Blurhash,
+				HasAlpha: meta.HasAlpha,
+			},
+		}
+		// A replayed generation finds the record already present; treat that as the
+		// previous attempt and drive it to READY rather than failing.
+		if err := s.blobs.CreatePending(ctx, child); err != nil && !errors.Is(err, ErrExists) {
+			return err
+		}
+		if _, err := s.blobs.Advance(ctx, id, StateReady, child.Image); err != nil {
+			return err
+		}
+
+		refs = append(refs, renditionRef(child))
+	}
+
+	// Record the manifest on the original so its whole rendition set resolves in the
+	// single read that fetches it. The child records above are written first, so the
+	// manifest only ever references renditions that already exist. It overwrites, so
+	// a replay re-attaches the same set harmlessly.
+	return s.blobs.AttachRenditions(ctx, parent.ID, refs)
 }
 
 // fetchUploaded reads a blob's uploaded bytes, translating an absent object into

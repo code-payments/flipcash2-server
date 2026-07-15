@@ -9,8 +9,7 @@ import (
 	"image/jpeg"
 	"math"
 
-	// Register the standard image decoders so image.Decode recognizes them.
-	_ "image/gif"
+	// Register the standard PNG decoder so image.Decode recognizes it.
 	_ "image/png"
 
 	"github.com/buckket/go-blurhash"
@@ -67,9 +66,9 @@ const (
 	MaxOriginalImageSizeBytes = 8 * 1024 * 1024 // 8 MiB
 
 	// maxImageDimension bounds an image's width and height. It is set to the format
-	// ceiling — the largest dimension JPEG and GIF can even encode (their size
-	// fields are 16-bit); PNG permits more but the pixel cap below bounds it, and
-	// WebP is lower still at 16,383. So this is only a format-sanity bound, not a
+	// ceiling — the largest dimension JPEG can even encode (its size fields are
+	// 16-bit); PNG permits more but the pixel cap below bounds it, and WebP is lower
+	// still at 16,383. So this is only a format-sanity bound, not a
 	// real resource limit: the total pixel cap is the actual memory guard, and
 	// unlike a per-axis limit it judges an image by its area, not its shape — so an
 	// extreme aspect ratio (a wide panorama, a long screenshot) is accepted as long
@@ -91,7 +90,6 @@ const (
 var imageFormatToMimeType = map[string]string{
 	"jpeg": "image/jpeg",
 	"png":  "image/png",
-	"gif":  "image/gif",
 	"webp": "image/webp",
 }
 
@@ -101,7 +99,6 @@ var imageFormatToMimeType = map[string]string{
 var mimeTypeToExtension = map[string]string{
 	"image/jpeg": ".jpg",
 	"image/png":  ".png",
-	"image/gif":  ".gif",
 	"image/webp": ".webp",
 }
 
@@ -182,6 +179,7 @@ func InspectImage(data []byte) (*ImageInspection, error) {
 			Width:    uint32(width),
 			Height:   uint32(height),
 			Blurhash: hash,
+			HasAlpha: hasAlpha(img),
 		},
 		Decoded: img,
 	}, nil
@@ -323,8 +321,6 @@ func downscaleForBlurhash(img image.Image) image.Image {
 // decode path rejects it on its own.
 func isImageAnimated(format string, data []byte) bool {
 	switch format {
-	case "gif":
-		return gifIsAnimated(data)
 	case "png":
 		return pngIsAnimated(data)
 	case "webp":
@@ -333,78 +329,6 @@ func isImageAnimated(format string, data []byte) bool {
 		// JPEG (and anything else that decodes) is single-frame.
 		return false
 	}
-}
-
-// gifIsAnimated walks a GIF's block structure counting image descriptors,
-// stopping as soon as a second one is found. It decodes no pixel data.
-func gifIsAnimated(data []byte) bool {
-	const (
-		extensionIntroducer = 0x21
-		imageSeparator      = 0x2C
-		trailer             = 0x3B
-	)
-
-	// Header (6 bytes) + Logical Screen Descriptor (7 bytes); the packed field at
-	// offset 10 says whether a Global Color Table follows.
-	if len(data) < 13 {
-		return false
-	}
-	pos := 13
-	if packed := data[10]; packed&0x80 != 0 {
-		pos += colorTableBytes(packed)
-	}
-
-	images := 0
-	for pos < len(data) {
-		switch data[pos] {
-		case imageSeparator:
-			images++
-			if images > 1 {
-				return true
-			}
-			// Image Descriptor is 10 bytes; its packed field (offset +9) flags a
-			// Local Color Table, then a 1-byte LZW code size precedes the image data.
-			if pos+10 > len(data) {
-				return false
-			}
-			lct := data[pos+9]
-			pos += 10
-			if lct&0x80 != 0 {
-				pos += colorTableBytes(lct)
-			}
-			pos++ // LZW minimum code size
-			pos = gifSkipSubBlocks(data, pos)
-		case extensionIntroducer:
-			pos += 2 // introducer + label
-			pos = gifSkipSubBlocks(data, pos)
-		case trailer:
-			return false
-		default:
-			return false // malformed; let the decoder reject it
-		}
-	}
-	return false
-}
-
-// colorTableBytes returns the byte size of a GIF color table from its packed
-// descriptor field: 3 bytes per entry, 2^(size+1) entries.
-func colorTableBytes(packed byte) int {
-	return 3 * (1 << ((packed & 0x07) + 1))
-}
-
-// gifSkipSubBlocks advances past a GIF sub-block sequence — a run of
-// [size][size bytes] blocks terminated by a zero-size block — returning the
-// index just past the terminator (or len(data) if the stream is truncated).
-func gifSkipSubBlocks(data []byte, pos int) int {
-	for pos < len(data) {
-		size := int(data[pos])
-		pos++
-		if size == 0 {
-			return pos
-		}
-		pos += size
-	}
-	return pos
 }
 
 // pngIsAnimated reports whether a PNG carries an acTL (animation control) chunk
@@ -466,8 +390,6 @@ func hasPrivacyMetadata(format string, data []byte) bool {
 		return pngHasPrivacyMetadata(data)
 	case "webp":
 		return webpHasPrivacyMetadata(data)
-	case "gif":
-		return gifHasPrivacyMetadata(data)
 	default:
 		return false
 	}
@@ -593,80 +515,6 @@ func webpHasPrivacyMetadata(data []byte) bool {
 	return false
 }
 
-// gifHasPrivacyMetadata walks a GIF's block structure looking for a comment
-// extension, or for the application extension XMP is smuggled through. It decodes
-// no pixel data; the walk mirrors gifIsAnimated's.
-func gifHasPrivacyMetadata(data []byte) bool {
-	const (
-		extensionIntroducer = 0x21
-		imageSeparator      = 0x2C
-		trailer             = 0x3B
-
-		commentLabel     = 0xFE
-		applicationLabel = 0xFF
-	)
-
-	// Header (6 bytes) + Logical Screen Descriptor (7 bytes); the packed field at
-	// offset 10 says whether a Global Color Table follows.
-	if len(data) < 13 {
-		return false
-	}
-	pos := 13
-	if packed := data[10]; packed&0x80 != 0 {
-		pos += colorTableBytes(packed)
-	}
-
-	for pos < len(data) {
-		switch data[pos] {
-		case imageSeparator:
-			// Image Descriptor is 10 bytes; its packed field (offset +9) flags a Local
-			// Color Table, then a 1-byte LZW code size precedes the image data.
-			if pos+10 > len(data) {
-				return false
-			}
-			lct := data[pos+9]
-			pos += 10
-			if lct&0x80 != 0 {
-				pos += colorTableBytes(lct)
-			}
-			pos++ // LZW minimum code size
-			pos = gifSkipSubBlocks(data, pos)
-		case extensionIntroducer:
-			if pos+2 > len(data) {
-				return false
-			}
-			label := data[pos+1]
-			pos += 2 // introducer + label
-			if label == commentLabel {
-				return true
-			}
-			if label == applicationLabel && gifIsXMPApplicationExtension(data, pos) {
-				return true
-			}
-			pos = gifSkipSubBlocks(data, pos)
-		case trailer:
-			return false
-		default:
-			return false // malformed; let the decoder reject it
-		}
-	}
-	return false
-}
-
-// gifIsXMPApplicationExtension reports whether the application extension whose
-// identifier block begins at pos is the XMP one. GIF has no native metadata
-// block, so XMP rides in as an application extension tagged "XMP Data"; the other
-// application extensions in the wild (NETSCAPE2.0, the animation loop count) are
-// not personal-data carriers.
-func gifIsXMPApplicationExtension(data []byte, pos int) bool {
-	// The identifier block is [size=11][8-byte app identifier][3-byte auth code].
-	const blockSize = 11
-	if pos >= len(data) || data[pos] != blockSize || pos+1+blockSize > len(data) {
-		return false
-	}
-	return string(data[pos+1:pos+9]) == "XMP Data"
-}
-
 // webpIsAnimated reports whether a WebP is animated, i.e. an extended (VP8X) file
 // carrying ANIM/ANMF chunks. The decoder in use cannot decode animated WebP and
 // already rejects it, but this makes the policy independent of that limitation.
@@ -686,4 +534,15 @@ func webpIsAnimated(data []byte) bool {
 		pos += 8 + size + (size & 1)
 	}
 	return false
+}
+
+// hasAlpha reports whether img carries a non-opaque alpha channel. The standard
+// library image types implement Opaque(), which scans for any non-opaque pixel;
+// a type that does not expose it is treated as potentially transparent, so a
+// rendition of it is encoded losslessly rather than risk flattening real alpha.
+func hasAlpha(img image.Image) bool {
+	if o, ok := img.(interface{ Opaque() bool }); ok {
+		return !o.Opaque()
+	}
+	return true
 }

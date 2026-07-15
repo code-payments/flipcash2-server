@@ -3,6 +3,7 @@ package dynamodb
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -20,11 +21,13 @@ import (
 )
 
 // The blob store uses a single table, one item per blob keyed by
-// pk = "blob#<id hex>". The renditions_by_parent GSI (hash = parent_id) lets all
-// of an ORIGINAL's server-derived renditions be queried by the original's id; it
-// is sparse — only rendition items carry parent_id, so ORIGINALs never appear in
-// it. A BlobId is an opaque capability, so point and batch reads go straight to
-// the partition by id and are not scoped to an owner.
+// pk = "blob#<id hex>". An original's derived renditions are recorded as a manifest
+// on the original's own item (attrRenditions), so the whole set resolves in the one
+// read that fetches the original — there is no by-parent index. The child rendition
+// items still exist and carry parent_id (for ACL inheritance), but they are reached
+// by their own id, never enumerated by parent. A BlobId is an opaque capability, so
+// point and batch reads go straight to the partition by id and are not scoped to an
+// owner.
 const (
 	attrPK            = "pk"
 	attrID            = "id"             // blob id, hex
@@ -35,15 +38,16 @@ const (
 	attrStorageKey    = "storage_key"    // S
 	attrMimeType      = "mime_type"      // S
 	attrSizeBytes     = "size_bytes"     // N
-	attrImageWidth    = "image_width"    // N, present only on READY images
-	attrImageHeight   = "image_height"   // N, present only on READY images
-	attrImageBlurhash = "image_blurhash" // S, present only on READY images
+	attrImageWidth    = "image_width"     // N, present only on READY images
+	attrImageHeight   = "image_height"    // N, present only on READY images
+	attrImageBlurhash = "image_blurhash"  // S, present only on READY images
+	attrImageHasAlpha = "image_has_alpha" // BOOL, present only on READY images
 	attrExpiresAt     = "expires_at"     // N, Unix seconds; TTL on non-READY blobs
 
 	attrRejectionReason = "rejection_reason" // N, present only on REJECTED blobs
 	attrFlaggedCategory = "flagged_category" // N, present only on REJECTED-by-moderation blobs
 
-	renditionsByParentGSI = "renditions_by_parent"
+	attrRenditions = "renditions" // S (JSON manifest), present only on ORIGINALs with generated renditions
 
 	blobKeyPrefix = "blob#"
 
@@ -159,39 +163,29 @@ func (s *store) GetByIDs(ctx context.Context, ids []*blobpb.BlobId) ([]*blob.Blo
 	return res, nil
 }
 
-func (s *store) GetRenditions(ctx context.Context, parentID *blobpb.BlobId) ([]*blob.Blob, error) {
-	var res []*blob.Blob
-
-	var startKey map[string]types.AttributeValue
-	for {
-		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(s.table),
-			IndexName:              aws.String(renditionsByParentGSI),
-			KeyConditionExpression: aws.String(fmt.Sprintf("%s = :parent", attrParentID)),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":parent": avS(hex.EncodeToString(parentID.Value)),
-			},
-			ExclusiveStartKey: startKey,
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		for _, item := range out.Items {
-			b, err := fromItem(item)
-			if err != nil {
-				return nil, err
-			}
-			res = append(res, b)
-		}
-
-		if len(out.LastEvaluatedKey) == 0 {
-			break
-		}
-		startKey = out.LastEvaluatedKey
+func (s *store) AttachRenditions(ctx context.Context, id *blobpb.BlobId, refs []blob.RenditionRef) error {
+	manifest, err := marshalRenditions(refs)
+	if err != nil {
+		return err
 	}
 
-	return res, nil
+	_, err = s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:        aws.String(s.table),
+		Key:              map[string]types.AttributeValue{attrPK: avS(blobPK(id))},
+		UpdateExpression: aws.String(fmt.Sprintf("SET %s = :manifest", attrRenditions)),
+		// The original must exist; overwrite any manifest already there so a replayed
+		// generation is idempotent.
+		ConditionExpression:       aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":manifest": avS(manifest)},
+	})
+	if err != nil {
+		var ccf *types.ConditionalCheckFailedException
+		if errors.As(err, &ccf) {
+			return blob.ErrNotFound
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *store) Advance(ctx context.Context, id *blobpb.BlobId, to blob.State, image *blob.ImageMetadata) (bool, error) {
@@ -308,6 +302,7 @@ func toItem(b *blob.Blob) map[string]types.AttributeValue {
 		item[attrImageWidth] = avInt(int(b.Image.Width))
 		item[attrImageHeight] = avInt(int(b.Image.Height))
 		item[attrImageBlurhash] = avS(b.Image.Blurhash)
+		item[attrImageHasAlpha] = avBool(b.Image.HasAlpha)
 	}
 	return item
 }
@@ -365,7 +360,16 @@ func fromItem(item map[string]types.AttributeValue) (*blob.Blob, error) {
 			Width:    uint32(width),
 			Height:   uint32(height),
 			Blurhash: stringAttr(item, attrImageBlurhash),
+			HasAlpha: boolAttr(item, attrImageHasAlpha),
 		}
+	}
+
+	if raw, ok := item[attrRenditions].(*types.AttributeValueMemberS); ok {
+		refs, err := unmarshalRenditions(raw.Value)
+		if err != nil {
+			return nil, err
+		}
+		b.Renditions = refs
 	}
 
 	if _, ok := item[attrRejectionReason]; ok {
@@ -387,6 +391,77 @@ func fromItem(item map[string]types.AttributeValue) (*blob.Blob, error) {
 	return b, nil
 }
 
+// renditionRefItem is the JSON shape a manifest entry is stored as. It flattens
+// the reused ImageMetadata (w/h/blurhash/alpha) so the serialized form stays a
+// compact flat object, and holds the blob id as hex.
+type renditionRefItem struct {
+	ID         string `json:"id"`
+	Rendition  int    `json:"role"`
+	MimeType   string `json:"mime"`
+	SizeBytes  uint64 `json:"size"`
+	StorageKey string `json:"key"`
+	Width      uint32 `json:"w"`
+	Height     uint32 `json:"h"`
+	Blurhash   string `json:"bh,omitempty"`
+	HasAlpha   bool   `json:"a,omitempty"`
+}
+
+// marshalRenditions serializes a rendition manifest to the JSON stored under
+// attrRenditions. An empty manifest serializes to "[]".
+func marshalRenditions(refs []blob.RenditionRef) (string, error) {
+	items := make([]renditionRefItem, len(refs))
+	for i, ref := range refs {
+		items[i] = renditionRefItem{
+			ID:         hex.EncodeToString(ref.ID.Value),
+			Rendition:  int(ref.Rendition),
+			MimeType:   ref.MimeType,
+			SizeBytes:  ref.SizeBytes,
+			StorageKey: ref.StorageKey,
+		}
+		if ref.Image != nil {
+			items[i].Width = ref.Image.Width
+			items[i].Height = ref.Image.Height
+			items[i].Blurhash = ref.Image.Blurhash
+			items[i].HasAlpha = ref.Image.HasAlpha
+		}
+	}
+	encoded, err := json.Marshal(items)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+// unmarshalRenditions reverses marshalRenditions, rebuilding the manifest (with
+// its reused ImageMetadata) from the stored JSON.
+func unmarshalRenditions(encoded string) ([]blob.RenditionRef, error) {
+	var items []renditionRefItem
+	if err := json.Unmarshal([]byte(encoded), &items); err != nil {
+		return nil, fmt.Errorf("invalid rendition manifest: %w", err)
+	}
+	refs := make([]blob.RenditionRef, len(items))
+	for i, item := range items {
+		idBytes, err := hex.DecodeString(item.ID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid rendition id in manifest: %w", err)
+		}
+		refs[i] = blob.RenditionRef{
+			ID:         &blobpb.BlobId{Value: idBytes},
+			Rendition:  blob.RenditionType(item.Rendition),
+			MimeType:   item.MimeType,
+			SizeBytes:  item.SizeBytes,
+			StorageKey: item.StorageKey,
+			Image: &blob.ImageMetadata{
+				Width:    item.Width,
+				Height:   item.Height,
+				Blurhash: item.Blurhash,
+				HasAlpha: item.HasAlpha,
+			},
+		}
+	}
+	return refs, nil
+}
+
 func blobPK(id *blobpb.BlobId) string { return blobKeyPrefix + hex.EncodeToString(id.Value) }
 
 func avS(v string) types.AttributeValue { return &types.AttributeValueMemberS{Value: v} }
@@ -399,12 +474,20 @@ func avUint64(v uint64) types.AttributeValue {
 func avUnix(t time.Time) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.FormatInt(t.Unix(), 10)}
 }
+func avBool(v bool) types.AttributeValue { return &types.AttributeValueMemberBOOL{Value: v} }
 
 func stringAttr(item map[string]types.AttributeValue, name string) string {
 	if av, ok := item[name].(*types.AttributeValueMemberS); ok {
 		return av.Value
 	}
 	return ""
+}
+
+func boolAttr(item map[string]types.AttributeValue, name string) bool {
+	if av, ok := item[name].(*types.AttributeValueMemberBOOL); ok {
+		return av.Value
+	}
+	return false
 }
 
 func hexAttr(item map[string]types.AttributeValue, name string) ([]byte, error) {

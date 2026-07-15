@@ -81,6 +81,16 @@ func (s *Storage) CopyToOrigin(_ context.Context, key string) error {
 	return blob.ErrObjectNotFound
 }
 
+func (s *Storage) PutOrigin(_ context.Context, key, _ string, data []byte) error {
+	s.Lock()
+	defer s.Unlock()
+
+	// Derived bytes land directly in the served (origin) store, never the upload
+	// store — they are server-produced, not client-uploaded.
+	s.served[key] = append([]byte(nil), data...)
+	return nil
+}
+
 func (s *Storage) DeleteUpload(_ context.Context, key string) error {
 	s.Lock()
 	defer s.Unlock()

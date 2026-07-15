@@ -4,7 +4,6 @@ import (
 	"context"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
-	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 )
 
 // Store persists server-authoritative blob metadata. The bytes themselves live
@@ -26,13 +25,19 @@ type Store interface {
 	// GetByIDs returns the blobs among the given ids that exist, in unspecified
 	// order. A BlobId is an opaque capability, so resolution is not scoped to an
 	// owner; ids that do not exist are simply omitted. A BlobId resolves to at
-	// most one record, so duplicate ids collapse to a single result.
+	// most one record, so duplicate ids collapse to a single result. An original's
+	// rendition manifest (Blob.Renditions) is included.
 	GetByIDs(ctx context.Context, ids []*blobpb.BlobId) ([]*Blob, error)
 
-	// GetRenditions returns every blob whose ParentID is parentID — i.e. all
-	// server-derived renditions of the given original — in unspecified order. It
-	// returns an empty slice (not ErrNotFound) when there are none.
-	GetRenditions(ctx context.Context, parentID *blobpb.BlobId) ([]*Blob, error)
+	// AttachRenditions records an original's rendition manifest onto its own
+	// record, so the whole set resolves in the single read that fetches the
+	// original. It overwrites any manifest already present, so a replayed
+	// generation that recomputes the same set is idempotent. It is only ever
+	// called on an ORIGINAL, and refs may be empty (an original whose ladder
+	// produced nothing).
+	//
+	// ErrNotFound is returned if no blob exists for the given id.
+	AttachRenditions(ctx context.Context, id *blobpb.BlobId, refs []RenditionRef) error
 
 	// Advance moves a blob forward along the success path to a later lifecycle
 	// state, persisting derived metadata when provided (image is set only on the
@@ -62,38 +67,4 @@ type Store interface {
 	//
 	// ErrNotFound is returned if no blob exists for the given id.
 	Reject(ctx context.Context, id *blobpb.BlobId, rejection *RejectionMetadata) (bool, error)
-}
-
-// Clone returns a deep copy of the blob, so stores can hand out values callers
-// cannot mutate in place.
-func (b *Blob) Clone() *Blob {
-	if b == nil {
-		return nil
-	}
-
-	cloned := &Blob{
-		Rendition:  b.Rendition,
-		State:      b.State,
-		StorageKey: b.StorageKey,
-		MimeType:   b.MimeType,
-		SizeBytes:  b.SizeBytes,
-	}
-	if b.ID != nil {
-		cloned.ID = &blobpb.BlobId{Value: append([]byte(nil), b.ID.Value...)}
-	}
-	if b.ParentID != nil {
-		cloned.ParentID = &blobpb.BlobId{Value: append([]byte(nil), b.ParentID.Value...)}
-	}
-	if b.Owner != nil {
-		cloned.Owner = &commonpb.UserId{Value: append([]byte(nil), b.Owner.Value...)}
-	}
-	if b.Image != nil {
-		image := *b.Image
-		cloned.Image = &image
-	}
-	if b.Rejection != nil {
-		rejection := *b.Rejection
-		cloned.Rejection = &rejection
-	}
-	return cloned
 }

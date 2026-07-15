@@ -84,6 +84,10 @@ func (c *StorageCache) CopyToOrigin(ctx context.Context, key string) error {
 	return c.storage.CopyToOrigin(ctx, key)
 }
 
+func (c *StorageCache) PutOrigin(ctx context.Context, key, mimeType string, data []byte) error {
+	return c.storage.PutOrigin(ctx, key, mimeType, data)
+}
+
 func (c *StorageCache) DeleteUpload(ctx context.Context, key string) error {
 	return c.storage.DeleteUpload(ctx, key)
 }

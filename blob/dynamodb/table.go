@@ -21,28 +21,20 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, blobsTable, aclT
 }
 
 // createBlobsTable provisions the blobs table: one item per blob keyed by
-// pk = "blob#<id hex>", with on-demand billing and a sparse renditions_by_parent
-// GSI (hash = parent_id) for listing an ORIGINAL's renditions. It is idempotent
-// (an existing table is left as-is) and blocks until the table is ACTIVE.
+// pk = "blob#<id hex>", with on-demand billing. An original's renditions are
+// recorded as a manifest on the original's item and resolved in the read that
+// fetches it, so there is no by-parent index. It is idempotent (an existing table
+// is left as-is) and blocks until the table is ACTIVE.
 func createBlobsTable(ctx context.Context, client *dynamodb.Client, blobsTable string) error {
 	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
 		TableName:   aws.String(blobsTable),
 		BillingMode: types.BillingModePayPerRequest,
 		AttributeDefinitions: []types.AttributeDefinition{
 			{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
-			{AttributeName: aws.String(attrParentID), AttributeType: types.ScalarAttributeTypeS},
 		},
 		KeySchema: []types.KeySchemaElement{
 			{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
 		},
-		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{{
-			IndexName: aws.String(renditionsByParentGSI),
-			KeySchema: []types.KeySchemaElement{
-				{AttributeName: aws.String(attrParentID), KeyType: types.KeyTypeHash},
-			},
-			// Renditions are read back in full, so project every attribute.
-			Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
-		}},
 	})
 	if err != nil {
 		var inUse *types.ResourceInUseException

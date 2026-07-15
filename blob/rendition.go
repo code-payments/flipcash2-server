@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"fmt"
 	"image"
-	"image/png"
 	"math"
 
+	"github.com/gen2brain/webp"
 	"github.com/google/uuid"
 	"golang.org/x/image/draw"
 
@@ -15,7 +15,7 @@ import (
 
 // Renditions are derived per CONTENT KIND: what variants a piece of media is
 // stored as, and how they are produced, depends on whether it is an image, a
-// video, audio, and so on. An image ladder is pixel sizes encoded as JPEG/PNG; a
+// video, audio, and so on. An image ladder is pixel sizes encoded as WebP; a
 // video's would be resolutions and bitrates plus a poster-frame still. Only images
 // are supported today, so this file holds the IMAGE rendition strategy —
 // everything named image* — alongside the kind-agnostic machinery every strategy
@@ -125,47 +125,58 @@ var imageRenditionSpecs = []imageRenditionSpec{
 }
 
 // imageEncoding is how a rendition's pixels are turned into bytes: the output
-// format plus the format-specific parameters that determine those bytes. It is
-// derived jointly from the role and the source's alpha, and it is the single place
-// that decision lives — so a rendition's id fingerprint and its actual encoding can
-// never disagree about the format or its knobs.
+// format plus the format-specific parameters that determine those bytes. Renditions
+// are always WebP today — it decodes on every client OS version we support and beats
+// both JPEG and PNG on size at equal quality, and it covers both a lossy mode for
+// photographs and a lossless mode for flat graphics, so a single format serves opaque
+// and transparent sources alike. The encoding is derived jointly from the role and the
+// source's alpha, and it is the single place that decision lives — so a rendition's id
+// fingerprint and its actual encoding can never disagree about the format or its knobs.
 type imageEncoding struct {
 	mimeType string
 
-	// jpegQuality is the JPEG quality (1-100). It is meaningful only for image/jpeg
-	// — a lossy format — and is left zero (and ignored) for PNG, which is lossless.
-	jpegQuality int
+	// lossless selects lossless WebP, used for transparent sources: they are almost
+	// always flat graphics (stickers, logos, screenshots) with hard edges and text,
+	// where lossless is both artifact-free and typically smaller than high-quality
+	// lossy. It ignores quality.
+	lossless bool
+
+	// quality is the lossy WebP quality (1-100). It is meaningful only when !lossless
+	// and is left zero (and ignored) for lossless WebP.
+	quality int
 }
 
 // imageEncodingFor picks the encoding for a rendition: a transparent source is kept
-// as PNG so the alpha survives (lossless, so it has no quality knob); an opaque one
-// — including an opaque PNG such as a screenshot — becomes the far smaller JPEG,
-// with quality tuned per role (thumbnails tolerate more compression than the display
-// renditions a user actually scrutinizes). It depends only on the role and the
-// persisted HasAlpha bit, so a rendition's encoding — and thus its id — is computable
-// without decoding.
+// lossless — such images are almost always flat graphics with hard edges and text,
+// where lossy compression rings and, for flat color, is often larger anyway, so
+// lossless is both cleaner and smaller (and the alpha survives exactly). An opaque one
+// — including an opaque screenshot — becomes the far smaller lossy WebP, with quality
+// tuned per role (thumbnails tolerate more compression than the display renditions a
+// user actually scrutinizes). It depends only on the role and the persisted HasAlpha
+// bit, so a rendition's encoding — and thus its id — is computable without decoding.
 func imageEncodingFor(rendition RenditionType, hasAlpha bool) imageEncoding {
 	if hasAlpha {
-		return imageEncoding{mimeType: "image/png"}
+		return imageEncoding{mimeType: "image/webp", lossless: true}
 	}
 	quality := 80
 	if rendition == RenditionThumbnail {
 		quality = 75
 	}
-	return imageEncoding{mimeType: "image/jpeg", jpegQuality: quality}
+	return imageEncoding{mimeType: "image/webp", quality: quality}
 }
 
 // fingerprint is the encoding's contribution to a rendition id: the parameters that
-// determine the bytes for THIS format. JPEG folds in its quality, so retuning it
-// mints new ids; PNG is lossless at a fixed compression, so its bytes are determined
-// by the pixels alone and it contributes only its format — a JPEG-quality retune
-// therefore never churns byte-identical PNG renditions. (If PNG compression ever
-// became role-dependent, its level would join the fingerprint here.)
+// determine the bytes for THIS format. Lossy WebP folds in its quality, so retuning
+// it mints new ids; lossless WebP's bytes are determined by the pixels alone, so it
+// contributes only its format — a quality retune therefore never churns byte-identical
+// lossless renditions. The encoder Method is a fixed constant (see
+// webpRenditionEncodeMethod), so — like a fixed compression level — it stays out of the
+// fingerprint; if it ever became role-dependent it would join here.
 func (e imageEncoding) fingerprint() string {
-	if e.mimeType == "image/jpeg" {
-		return fmt.Sprintf("%s|q%d", e.mimeType, e.jpegQuality)
+	if e.lossless {
+		return fmt.Sprintf("%s|lossless", e.mimeType)
 	}
-	return e.mimeType
+	return fmt.Sprintf("%s|q%d", e.mimeType, e.quality)
 }
 
 // imageRenditionID derives an image rendition's blob id from its parent and full
@@ -196,7 +207,7 @@ func imageRenditionSlug(rendition RenditionType) string {
 // (images/<uuid>/...) and names them by role and dimensions, so distinct rungs
 // never collide and the key is self-describing:
 //
-//	images/<parent-uuid>/display_1600x900.jpg
+//	images/<parent-uuid>/display_1600x900.webp
 //
 // The dimensions are in the key — not just the id — because two rungs of the same
 // role differ only by size, and a ladder retune must land on a new key rather than
@@ -228,20 +239,27 @@ func resampleImage(img image.Image, width, height int) image.Image {
 	return dst
 }
 
-// encode renders img in this encoding: a JPEG at the encoding's quality, or a
-// lossless PNG (which has no quality knob).
+// webpRenditionEncodeMethod is the WebP encoder's quality/speed trade-off (0=fast .. 6=slower,
+// smaller). Renditions are generated once, asynchronously during finalization, and
+// then served for the life of the media, so the extra encode time buys smaller
+// bytes on every future fetch — a trade worth making at the slow-but-smallest end.
+const webpRenditionEncodeMethod = 6
+
+// encode renders img in this encoding: lossless WebP for a transparent source (which
+// has no quality knob), or lossy WebP at the encoding's quality.
 func (e imageEncoding) encode(img image.Image) ([]byte, error) {
-	switch e.mimeType {
-	case "image/jpeg":
-		return encodeJPEG(img, e.jpegQuality)
-	case "image/png":
-		var buf bytes.Buffer
-		encoder := png.Encoder{CompressionLevel: png.DefaultCompression}
-		if err := encoder.Encode(&buf, img); err != nil {
-			return nil, err
-		}
-		return buf.Bytes(), nil
-	default:
+	if e.mimeType != "image/webp" {
 		return nil, fmt.Errorf("unsupported rendition mime type %q", e.mimeType)
 	}
+	opts := webp.Options{Method: webpRenditionEncodeMethod}
+	if e.lossless {
+		opts.Lossless = true
+	} else {
+		opts.Quality = e.quality
+	}
+	var buf bytes.Buffer
+	if err := webp.Encode(&buf, img, opts); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

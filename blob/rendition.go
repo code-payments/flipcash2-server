@@ -240,13 +240,26 @@ func resampleImage(img image.Image, width, height int) image.Image {
 }
 
 // webpRenditionEncodeMethod is the WebP encoder's quality/speed trade-off (0=fast .. 6=slower,
-// smaller). Renditions are generated once, asynchronously during finalization, and
-// then served for the life of the media, so the extra encode time buys smaller
+// smaller). Renditions are generated once during finalization and then served for the
+// life of the media, so the extra encode time is paid a single time and buys smaller
 // bytes on every future fetch — a trade worth making at the slow-but-smallest end.
+// Note that finalization runs inline on the upload RPC (detached from client
+// cancellation, bounded by a timeout), so this cost lands in that call's latency, not
+// on a background worker; revisit the method (or move generation off the RPC) if that
+// tail latency becomes a problem.
 const webpRenditionEncodeMethod = 6
 
 // encode renders img in this encoding: lossless WebP for a transparent source (which
 // has no quality knob), or lossy WebP at the encoding's quality.
+//
+// The WebP encoder reads an *image.RGBA's pixels as STRAIGHT (non-premultiplied)
+// alpha, but Go's image.RGBA — which resampleImage produces — stores PREMULTIPLIED
+// pixels. Handing those bytes over verbatim darkens every semi-transparent pixel
+// (the anti-aliased edges of stickers and logos most of all). So a transparent
+// source is converted to image.NRGBA first, whose pixels are straight alpha, giving
+// the encoder exactly what it expects. The opaque (lossy) path is unaffected —
+// every pixel is fully opaque there, where premultiplied and straight coincide —
+// so it is left untouched to avoid a needless copy.
 func (e imageEncoding) encode(img image.Image) ([]byte, error) {
 	if e.mimeType != "image/webp" {
 		return nil, fmt.Errorf("unsupported rendition mime type %q", e.mimeType)
@@ -254,6 +267,7 @@ func (e imageEncoding) encode(img image.Image) ([]byte, error) {
 	opts := webp.Options{Method: webpRenditionEncodeMethod}
 	if e.lossless {
 		opts.Lossless = true
+		img = toStraightAlpha(img)
 	} else {
 		opts.Quality = e.quality
 	}
@@ -262,4 +276,18 @@ func (e imageEncoding) encode(img image.Image) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// toStraightAlpha returns img with straight (non-premultiplied) alpha as an
+// *image.NRGBA, converting only when needed: an image already in that form is
+// returned as-is, and anything else (notably the premultiplied *image.RGBA that
+// resampleImage yields) is redrawn into an NRGBA canvas, which un-premultiplies as
+// it copies.
+func toStraightAlpha(img image.Image) image.Image {
+	if _, ok := img.(*image.NRGBA); ok {
+		return img
+	}
+	nrgba := image.NewNRGBA(img.Bounds())
+	draw.Draw(nrgba, nrgba.Bounds(), img, img.Bounds().Min, draw.Src)
+	return nrgba
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"image"
 	"image/color"
+	"image/draw"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -143,22 +144,37 @@ func TestImageEncodingEncode(t *testing.T) {
 		require.Equal(t, 48, decoded.Bounds().Dy())
 	})
 
-	t.Run("lossless webp preserves alpha", func(t *testing.T) {
-		// A half-transparent source, so an encoding that dropped alpha would be visible.
-		src := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	t.Run("lossless webp preserves alpha and semi-transparent color", func(t *testing.T) {
+		// A quarter-opaque source whose STRAIGHT color must survive intact. This is
+		// built the way the ladder feeds the encoder: a straight-alpha NRGBA composited
+		// onto a premultiplied *image.RGBA canvas (exactly what resampleImage yields).
+		// The WebP encoder reads *image.RGBA as straight alpha, so unless encode()
+		// converts to straight-alpha NRGBA first, the premultiplied pixels are handed
+		// over verbatim and every semi-transparent color comes back badly darkened.
+		straight := color.NRGBA{R: 200, G: 40, B: 30, A: 64}
+		nsrc := image.NewNRGBA(image.Rect(0, 0, 8, 8))
 		for y := range 8 {
 			for x := range 8 {
-				src.Set(x, y, color.RGBA{R: 200, G: 100, B: 50, A: 64})
+				nsrc.SetNRGBA(x, y, straight)
 			}
 		}
+		src := image.NewRGBA(nsrc.Bounds())
+		draw.Draw(src, src.Bounds(), nsrc, nsrc.Bounds().Min, draw.Src)
+
 		encoded, err := imageEncoding{mimeType: "image/webp", lossless: true}.encode(src)
 		require.NoError(t, err)
 
 		decoded, format, err := image.Decode(bytes.NewReader(encoded))
 		require.NoError(t, err)
 		require.Equal(t, "webp", format)
-		_, _, _, a := decoded.At(0, 0).RGBA()
-		require.Less(t, a, uint32(0xffff), "alpha should be preserved, not flattened")
+
+		got := color.NRGBAModel.Convert(decoded.At(0, 0)).(color.NRGBA)
+		require.InDelta(t, straight.A, got.A, 1, "alpha should be preserved, not flattened")
+		// A premultiplied-as-straight bug darkens R from 200 to ~60; a small delta
+		// absorbs only the rounding of the premultiplied RGBA intermediate.
+		require.InDelta(t, straight.R, got.R, 16, "straight red must survive, not darken")
+		require.InDelta(t, straight.G, got.G, 16, "straight green must survive")
+		require.InDelta(t, straight.B, got.B, 16, "straight blue must survive")
 	})
 
 	t.Run("unsupported mime type errors", func(t *testing.T) {

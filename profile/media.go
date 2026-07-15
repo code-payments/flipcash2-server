@@ -18,58 +18,70 @@ type Media interface {
 	// blob.ErrBlobInvalid when the blob cannot be used.
 	SetAsProfilePicture(ctx context.Context, ownerID *commonpb.UserId, blobID *blobpb.BlobId) error
 
-	// Resolve returns the server-authoritative metadata — including a freshly minted,
-	// short-lived download URL — for each READY blob among ids, keyed by
-	// string(BlobId.Value). It performs no authorization.
-	Resolve(ctx context.Context, ids []*blobpb.BlobId) (map[string]*blobpb.BlobMetadata, error)
+	// ResolveRenditions returns each original's full rendition set — the ORIGINAL
+	// plus every derived rendition, each with a freshly minted, short-lived download
+	// URL — keyed by string(BlobId.Value). It performs no authorization.
+	ResolveRenditions(ctx context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error)
 }
 
-// hydratePicture fills each of the picture's renditions with freshly resolved blob
-// metadata (mime type, size, dimensions, and a short-lived download URL), so a
-// client can fetch the bytes without a second round trip to GetBlobs.
+// hydratePictures replaces each picture's rendition list with the full set the
+// server derived — the ORIGINAL plus every derived rendition, each with freshly
+// resolved metadata (mime type, size, dimensions, and a short-lived download URL) —
+// so a client can fetch the bytes without a second round trip to GetBlobs. A stored
+// picture carries only the ORIGINAL; this expands it on read.
 //
 // A profile picture is public, so this deliberately resolves without consulting the
 // ACL — there is no reader for whom it would resolve differently. Clients still need
 // GetBlobs (with an AccessContext naming the profile) to re-mint a URL once this one
 // expires, since download URLs are not cacheable.
 //
-// A blob that no longer resolves (e.g. a takedown left it non-READY) is left with a
-// nil Blob for the client to treat as unavailable, rather than failing the whole
-// profile read.
-// It is variadic and resolves every rendition of every picture in ONE batch, so
-// hydrating a whole chat's member avatars costs a single Resolve rather than one per
-// member.
+// A picture whose original no longer resolves (e.g. a takedown left it non-READY) is
+// left with its stored ORIGINAL for the client to treat as unavailable, rather than
+// failing the whole profile read. It is variadic and resolves every picture in ONE
+// batch, so hydrating a whole chat's member avatars costs a single lookup rather
+// than one per member. A nil picture (a user with none) is skipped.
 func hydratePictures(ctx context.Context, resolver Media, pictures ...*blobpb.Media) error {
-	var renditions []*blobpb.Rendition
+	ids := make([]*blobpb.BlobId, 0, len(pictures))
+	seen := make(map[string]struct{}, len(pictures))
 	for _, picture := range pictures {
-		for _, r := range picture.GetRenditions() {
-			if r.BlobId != nil {
-				renditions = append(renditions, r)
-			}
+		id := originalBlobID(picture)
+		if id == nil {
+			continue
 		}
-	}
-	if len(renditions) == 0 {
-		return nil
-	}
-
-	ids := make([]*blobpb.BlobId, 0, len(renditions))
-	seen := make(map[string]struct{}, len(renditions))
-	for _, r := range renditions {
-		key := string(r.BlobId.Value)
+		key := string(id.Value)
 		if _, ok := seen[key]; ok {
 			continue
 		}
 		seen[key] = struct{}{}
-		ids = append(ids, r.BlobId)
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil
 	}
 
-	metadata, err := resolver.Resolve(ctx, ids)
+	resolved, err := resolver.ResolveRenditions(ctx, ids)
 	if err != nil {
 		return err
 	}
-	for _, r := range renditions {
-		if m, ok := metadata[string(r.BlobId.Value)]; ok {
-			r.Blob = m
+	for _, picture := range pictures {
+		id := originalBlobID(picture)
+		if id == nil {
+			continue
+		}
+		if renditions, ok := resolved[string(id.Value)]; ok {
+			picture.Renditions = renditions
+		}
+	}
+	return nil
+}
+
+// originalBlobID returns the id of the picture's ORIGINAL rendition — the handle
+// the server resolves the rendition set from — or nil if there is no ORIGINAL (a
+// nil or empty picture).
+func originalBlobID(picture *blobpb.Media) *blobpb.BlobId {
+	for _, r := range picture.GetRenditions() {
+		if r.Role == blobpb.Rendition_ORIGINAL && r.BlobId != nil {
+			return r.BlobId
 		}
 	}
 	return nil

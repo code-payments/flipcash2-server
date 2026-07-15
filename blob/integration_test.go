@@ -121,16 +121,25 @@ func TestIntegration_ShareIntoChat(t *testing.T) {
 	})
 }
 
-func TestIntegration_Resolve(t *testing.T) {
+func TestIntegration_ResolveRenditions(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewInMemory()
 	integration := blob.NewIntegration(store, memory.NewInMemoryStorage(), memory.NewInMemoryAccessStore())
 
 	owner := model.MustGenerateUserID()
 
-	// A READY blob resolves to its metadata with a fresh download URL.
+	// A READY original resolves to its rendition set: the ORIGINAL plus its manifest.
 	ready := putReadyOriginal(t, store, owner)
-	// A pending (non-READY) blob is omitted.
+	displayID := newBlobID(t)
+	require.NoError(t, store.AttachRenditions(ctx, ready, []blob.RenditionRef{{
+		ID:         displayID,
+		Rendition:  blob.RenditionDisplay,
+		MimeType:   "image/jpeg",
+		SizeBytes:  42,
+		StorageKey: "images/x/display_800x600.jpg",
+		Image:      &blob.ImageMetadata{Width: 800, Height: 600, Blurhash: "LKO2"},
+	}}))
+	// A pending (non-READY) original is omitted.
 	pending := newBlobID(t)
 	require.NoError(t, store.CreatePending(ctx, &blob.Blob{
 		ID: pending, Rendition: blob.RenditionOriginal, Owner: owner, State: blob.StatePending,
@@ -139,19 +148,29 @@ func TestIntegration_Resolve(t *testing.T) {
 	// An unknown id is omitted.
 	unknown := newBlobID(t)
 
-	meta, err := integration.Resolve(ctx, []*blobpb.BlobId{ready, pending, unknown})
+	resolved, err := integration.ResolveRenditions(ctx, []*blobpb.BlobId{ready, pending, unknown})
 	require.NoError(t, err)
-	require.Len(t, meta, 1)
+	require.Len(t, resolved, 1)
 
-	m := meta[string(ready.Value)]
-	require.NotNil(t, m)
-	require.Equal(t, "image/png", m.MimeType)
-	require.EqualValues(t, 1, m.SizeBytes)
-	require.NotNil(t, m.DownloadUrl)
-	require.NotEmpty(t, m.DownloadUrl.Url)
+	renditions := resolved[string(ready.Value)]
+	require.Len(t, renditions, 2)
+
+	// ORIGINAL first, with its own metadata and a fresh download URL.
+	require.Equal(t, blobpb.Rendition_ORIGINAL, renditions[0].Role)
+	require.Equal(t, ready.Value, renditions[0].BlobId.Value)
+	require.Equal(t, "image/png", renditions[0].Blob.MimeType)
+	require.NotEmpty(t, renditions[0].Blob.GetDownloadUrl().GetUrl())
+
+	// Then the derived rendition from the manifest.
+	require.Equal(t, blobpb.Rendition_DISPLAY, renditions[1].Role)
+	require.Equal(t, displayID.Value, renditions[1].BlobId.Value)
+	require.Equal(t, "image/jpeg", renditions[1].Blob.MimeType)
+	require.EqualValues(t, 42, renditions[1].Blob.SizeBytes)
+	require.EqualValues(t, 800, renditions[1].Blob.GetImage().GetWidth())
+	require.NotEmpty(t, renditions[1].Blob.GetDownloadUrl().GetUrl())
 
 	// Empty input yields a nil map.
-	empty, err := integration.Resolve(ctx, nil)
+	empty, err := integration.ResolveRenditions(ctx, nil)
 	require.NoError(t, err)
 	require.Nil(t, empty)
 }

@@ -6,7 +6,6 @@ import (
 	"hash/crc32"
 	"image"
 	"image/color"
-	"image/gif"
 	"image/png"
 	"testing"
 
@@ -101,17 +100,13 @@ func TestIsImageAnimated(t *testing.T) {
 		data   []byte
 		want   bool
 	}{
-		{"single-frame gif", "gif", encodeGIF(t, 1), false},
-		{"two-frame gif", "gif", encodeGIF(t, 2), true},
-		{"many-frame gif", "gif", encodeGIF(t, 24), true},
 		{"static png", "png", encodePNG(t), false},
 		{"apng", "png", encodeAPNG(t), true},
 		{"static webp", "webp", webpRIFF("VP8 ", 16), false},
 		{"animated webp", "webp", webpRIFF("ANIM", 6), true},
 		{"jpeg is never animated", "jpeg", nil, false},
-		{"unknown format is not inspected", "tiff", encodeGIF(t, 5), false},
-		{"truncated gif", "gif", []byte("GIF89a\x00\x00"), false},
-		{"empty", "gif", nil, false},
+		{"unknown format is not inspected", "tiff", []byte("II*\x00unrecognized"), false},
+		{"empty", "png", nil, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -144,17 +139,6 @@ func TestInspectImageRejectsOversizedDimensions(t *testing.T) {
 }
 
 func TestInspectImageRejectsAnimated(t *testing.T) {
-	t.Run("static gif is accepted", func(t *testing.T) {
-		inspection, err := InspectImage(encodeGIF(t, 1))
-		require.NoError(t, err)
-		require.Equal(t, "image/gif", inspection.MimeType)
-	})
-
-	t.Run("animated gif is rejected", func(t *testing.T) {
-		_, err := InspectImage(encodeGIF(t, 3))
-		require.ErrorContains(t, err, "animated")
-	})
-
 	t.Run("apng is rejected", func(t *testing.T) {
 		_, err := InspectImage(encodeAPNG(t))
 		require.ErrorContains(t, err, "animated")
@@ -192,11 +176,6 @@ func TestHasPrivacyMetadata(t *testing.T) {
 		{"webp with xmp", "webp", webpRIFF("XMP ", 8), true},
 		{"webp keeps icc profile", "webp", webpRIFF("ICCP", 8), false},
 
-		{"clean gif", "gif", encodeGIF(t, 1), false},
-		{"gif with comment", "gif", gifWithExtension(0xFE, []byte("shot at home")), true},
-		{"gif with xmp", "gif", gifWithExtension(0xFF, []byte("XMP DataXMP")), true},
-		{"gif keeps netscape loop extension", "gif", gifWithExtension(0xFF, []byte("NETSCAPE2.0")), false},
-
 		{"unknown format is not inspected", "tiff", []byte("II*\x00"), false},
 		{"truncated jpeg", "jpeg", []byte{0xFF, 0xD8, 0xFF}, false},
 		{"empty", "jpeg", nil, false},
@@ -206,6 +185,17 @@ func TestHasPrivacyMetadata(t *testing.T) {
 			require.Equal(t, tc.want, hasPrivacyMetadata(tc.format, tc.data))
 		})
 	}
+}
+
+func TestGifIsUnsupported(t *testing.T) {
+	// GIF support was removed: it is not an accepted upload type, and its decoder is
+	// not registered, so bytes that sneak past the declared-type gate do not decode
+	// and are rejected as undecodable rather than served.
+	require.False(t, SupportedImageMimeTypes["image/gif"])
+
+	rawGIF := []byte("GIF89a\x10\x00\x0c\x00\x00\x00\x00\x3b")
+	_, err := InspectImage(rawGIF)
+	require.ErrorIs(t, err, ErrImageCorrupt)
 }
 
 func TestInspectImageRejectsPrivacyMetadata(t *testing.T) {
@@ -234,6 +224,45 @@ func TestInspectImageRejectsPrivacyMetadata(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "image/jpeg", inspection.MimeType)
 	})
+}
+
+func TestInspectImageDerivesAlpha(t *testing.T) {
+	// The alpha bit drives a rendition's output format, so it must be derived
+	// correctly from the source bytes.
+	t.Run("opaque png has no alpha", func(t *testing.T) {
+		var buf bytes.Buffer
+		require.NoError(t, png.Encode(&buf, randomImage(16, 12))) // randomImage is fully opaque
+		inspection, err := InspectImage(buf.Bytes())
+		require.NoError(t, err)
+		require.False(t, inspection.Metadata.HasAlpha)
+	})
+
+	t.Run("transparent png has alpha", func(t *testing.T) {
+		inspection, err := InspectImage(encodeTransparentPNG(t))
+		require.NoError(t, err)
+		require.True(t, inspection.Metadata.HasAlpha)
+	})
+
+	t.Run("jpeg never has alpha", func(t *testing.T) {
+		inspection, err := InspectImage(encodeTestJPEG(t))
+		require.NoError(t, err)
+		require.False(t, inspection.Metadata.HasAlpha)
+	})
+}
+
+// encodeTransparentPNG returns a PNG with a non-opaque pixel, so InspectImage
+// derives HasAlpha=true.
+func encodeTransparentPNG(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for y := range 8 {
+		for x := range 8 {
+			img.Set(x, y, color.RGBA{R: 200, G: 100, B: 50, A: 64})
+		}
+	}
+	var buf bytes.Buffer
+	require.NoError(t, png.Encode(&buf, img))
+	return buf.Bytes()
 }
 
 func encodeTestJPEG(t *testing.T) []byte {
@@ -277,43 +306,6 @@ func pngWithChunk(t *testing.T, chunkType string, payload []byte) []byte {
 	out = append(out, base[:afterIHDR]...)
 	out = append(out, chunk.Bytes()...)
 	return append(out, base[afterIHDR:]...)
-}
-
-// gifWithExtension builds a minimal GIF carrying a single extension block with
-// the given label, its payload written as one sub-block. An application extension
-// (0xFF) identifies itself in that first sub-block, which is how XMP rides in.
-func gifWithExtension(label byte, payload []byte) []byte {
-	var buf bytes.Buffer
-	buf.WriteString("GIF89a")
-	buf.Write([]byte{16, 0, 12, 0, 0x00, 0, 0}) // logical screen descriptor; no global color table
-
-	buf.Write([]byte{0x21, label})
-	buf.WriteByte(byte(len(payload)))
-	buf.Write(payload)
-	buf.WriteByte(0x00) // sub-block terminator
-
-	buf.WriteByte(0x3B) // trailer
-	return buf.Bytes()
-}
-
-// encodeGIF builds a GIF with the given number of frames; one frame yields a
-// still GIF, more than one an animated GIF.
-func encodeGIF(t *testing.T, frames int) []byte {
-	t.Helper()
-	palette := color.Palette{color.Black, color.White, color.RGBA{R: 255, A: 255}}
-	g := &gif.GIF{}
-	for i := range frames {
-		frame := image.NewPaletted(image.Rect(0, 0, 16, 12), palette)
-		fill := uint8(i % len(palette))
-		for p := range frame.Pix {
-			frame.Pix[p] = fill
-		}
-		g.Image = append(g.Image, frame)
-		g.Delay = append(g.Delay, 10)
-	}
-	var buf bytes.Buffer
-	require.NoError(t, gif.EncodeAll(&buf, g))
-	return buf.Bytes()
 }
 
 func encodePNG(t *testing.T) []byte {

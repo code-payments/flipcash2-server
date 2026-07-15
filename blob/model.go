@@ -57,6 +57,7 @@ type ImageMetadata struct {
 	Width    uint32
 	Height   uint32
 	Blurhash string
+	HasAlpha bool
 }
 
 // State is the blob's internal, fine-grained lifecycle state. It records how far
@@ -94,7 +95,6 @@ const (
 	// StateGeneratingRenditions means the original is in the origin store and the
 	// server is deriving its renditions (display, thumbnail) from it. The blob is
 	// still not client-ready, so clients do not see READY until this completes.
-	// Reserved for when rendition generation is implemented; nothing enters it yet.
 	StateGeneratingRenditions
 
 	// StateReady means processing is complete — the renditions are generated and
@@ -238,9 +238,129 @@ type Blob struct {
 	// kind variant. Only images exist today.
 	Image *ImageMetadata
 
+	// Renditions is the manifest of derived renditions, populated ONLY on an
+	// ORIGINAL and only once its renditions have been generated. Each entry is a
+	// compact, immutable copy of a child rendition blob's servable metadata,
+	// denormalized onto the parent so a media's whole rendition set resolves in the
+	// single read that fetches the original — no per-original index query. The child
+	// rendition blobs remain the canonical, independently-addressable records (a
+	// rendition id resolves through GetBlobs and inherits the parent's ACL); this is
+	// purely a read-path manifest. It is nil on a rendition blob itself and on an
+	// original whose ladder produced nothing.
+	Renditions []RenditionRef
+
 	// Rejection records why this blob was rejected, set only when State is
 	// StateRejected; it is nil for any non-rejected blob.
 	Rejection *RejectionMetadata
+}
+
+// RenditionRef is a single entry in an original's rendition manifest: the
+// servable metadata of a derived rendition blob, enough to mint its wire
+// Rendition (role, handle, image descriptors, and a freshly signed download URL)
+// without reading the child blob record. Its fields mirror the same servable
+// subset of a Blob — MimeType, SizeBytes, StorageKey, and the reused ImageMetadata
+// — so a ref converts to the Blob that buildMetadata already understands (see
+// asBlob). It never changes once written, because a rendition's bytes are
+// immutable.
+type RenditionRef struct {
+	// ID is the child rendition blob's id — the same id GetBlobs resolves.
+	ID *blobpb.BlobId
+
+	// Rendition is which rendition role these bytes serve (display, thumbnail).
+	Rendition RenditionType
+
+	// MimeType is the rendition's own encoded type, which may differ from the
+	// original's (e.g. an opaque PNG original yields JPEG renditions).
+	MimeType string
+
+	// SizeBytes is the size of the encoded rendition bytes.
+	SizeBytes uint64
+
+	// StorageKey is the object key the rendition's bytes live under, used to sign
+	// its download URL. It never leaves the server.
+	StorageKey string
+
+	// Image is the rendition's derived image metadata — its own dimensions, and the
+	// BlurHash copied from the original. Reuses the same type the original carries.
+	Image *ImageMetadata
+}
+
+// asBlob adapts a manifest entry to the minimal Blob that buildMetadata reads, so
+// a rendition's wire metadata is minted through exactly the same path as an
+// original's rather than a parallel one.
+func (r RenditionRef) asBlob(originalBlob *Blob) *Blob {
+	return &Blob{
+		ID:         r.ID,
+		ParentID:   originalBlob.ID,
+		Owner:      originalBlob.Owner,
+		Rendition:  r.Rendition,
+		StorageKey: r.StorageKey,
+		MimeType:   r.MimeType,
+		SizeBytes:  r.SizeBytes,
+		Image:      r.Image,
+		State:      StateReady,
+	}
+}
+
+// renditionRef captures the servable subset of a (child rendition) blob as a
+// manifest entry, so a parent's manifest is assembled directly from the child
+// blobs generation just wrote.
+func renditionRef(b *Blob) RenditionRef {
+	return RenditionRef{
+		ID:         b.ID,
+		Rendition:  b.Rendition,
+		MimeType:   b.MimeType,
+		SizeBytes:  b.SizeBytes,
+		StorageKey: b.StorageKey,
+		Image:      b.Image,
+	}
+}
+
+// Clone returns a deep copy of the blob, so stores can hand out values callers
+// cannot mutate in place.
+func (b *Blob) Clone() *Blob {
+	if b == nil {
+		return nil
+	}
+
+	cloned := &Blob{
+		Rendition:  b.Rendition,
+		State:      b.State,
+		StorageKey: b.StorageKey,
+		MimeType:   b.MimeType,
+		SizeBytes:  b.SizeBytes,
+	}
+	if b.ID != nil {
+		cloned.ID = &blobpb.BlobId{Value: append([]byte(nil), b.ID.Value...)}
+	}
+	if b.ParentID != nil {
+		cloned.ParentID = &blobpb.BlobId{Value: append([]byte(nil), b.ParentID.Value...)}
+	}
+	if b.Owner != nil {
+		cloned.Owner = &commonpb.UserId{Value: append([]byte(nil), b.Owner.Value...)}
+	}
+	if b.Image != nil {
+		image := *b.Image
+		cloned.Image = &image
+	}
+	if b.Renditions != nil {
+		cloned.Renditions = make([]RenditionRef, len(b.Renditions))
+		for i, ref := range b.Renditions {
+			cloned.Renditions[i] = ref
+			if ref.ID != nil {
+				cloned.Renditions[i].ID = &blobpb.BlobId{Value: append([]byte(nil), ref.ID.Value...)}
+			}
+			if ref.Image != nil {
+				image := *ref.Image
+				cloned.Renditions[i].Image = &image
+			}
+		}
+	}
+	if b.Rejection != nil {
+		rejection := *b.Rejection
+		cloned.Rejection = &rejection
+	}
+	return cloned
 }
 
 func MustGenerateID() *blobpb.BlobId {

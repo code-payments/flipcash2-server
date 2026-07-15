@@ -204,15 +204,23 @@ func validateAttachable(record *Blob, owner *commonpb.UserId, accepts mimeTypeFi
 	return nil
 }
 
-// Resolve returns the server-authoritative metadata — mime type, size, image
-// dimensions, and a freshly minted, short-lived download URL — for each READY
-// blob among ids, keyed by string(BlobId.Value). Unknown or not-yet-READY ids are
-// omitted. An empty input yields a nil map.
+// ResolveRenditions returns the full, hydrated rendition set for each READY
+// original among ids, keyed by string(BlobId.Value): the ORIGINAL first, then every
+// derived rendition recorded in the original's manifest, each carrying a freshly
+// minted, short-lived download URL alongside its mime type, size, and image
+// descriptors. Unknown or not-yet-READY ids are omitted; an empty input yields a
+// nil map.
 //
-// It performs NO authorization. Callers must only pass ids they have already
-// established the reader may see — e.g. blob ids drawn from a chat message the
+// It reads only the originals — the whole rendition set is denormalized onto each
+// original's record as a manifest — so resolving a page of media costs a single
+// batched store read rather than a per-original index query. Each rendition's wire
+// metadata is minted through the same buildMetadata path as an original's, from the
+// manifest entry, without a second read of the child rendition records.
+//
+// It performs NO authorization. Callers must only pass original ids they have
+// already established the reader may see — e.g. ids drawn from a chat message the
 // reader is a member of, which were granted to the chat when the message was sent.
-func (i *Integration) Resolve(ctx context.Context, ids []*blobpb.BlobId) (map[string]*blobpb.BlobMetadata, error) {
+func (i *Integration) ResolveRenditions(ctx context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -222,18 +230,40 @@ func (i *Integration) Resolve(ctx context.Context, ids []*blobpb.BlobId) (map[st
 		return nil, err
 	}
 
-	out := make(map[string]*blobpb.BlobMetadata, len(records))
-	for _, record := range records {
-		// Only a READY blob is servable; a pending/rejected one has no metadata to
-		// surface, so it is left for the client to treat as unavailable.
-		if record.State != StateReady {
+	out := make(map[string][]*blobpb.Rendition, len(records))
+	for _, original := range records {
+		// Only a READY original is servable and carries a rendition manifest; a
+		// pending/rejected one is left for the client to treat as unavailable.
+		if original.State != StateReady {
 			continue
 		}
-		metadata, err := buildMetadata(ctx, i.storage, record)
+
+		originalMeta, err := buildMetadata(ctx, i.storage, original)
 		if err != nil {
 			return nil, err
 		}
-		out[string(record.ID.Value)] = metadata
+		renditions := make([]*blobpb.Rendition, 0, 1+len(original.Renditions))
+		renditions = append(renditions, &blobpb.Rendition{
+			Role:   RenditionOriginal.ToProtoRole(),
+			BlobId: original.ID,
+			Blob:   originalMeta,
+		})
+
+		// The manifest is already in ladder order (small to large); mint each
+		// rendition's metadata from it without re-reading the child records.
+		for _, ref := range original.Renditions {
+			meta, err := buildMetadata(ctx, i.storage, ref.asBlob(original))
+			if err != nil {
+				return nil, err
+			}
+			renditions = append(renditions, &blobpb.Rendition{
+				Role:   ref.Rendition.ToProtoRole(),
+				BlobId: ref.ID,
+				Blob:   meta,
+			})
+		}
+
+		out[string(original.ID.Value)] = renditions
 	}
 	return out, nil
 }

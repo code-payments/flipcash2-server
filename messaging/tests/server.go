@@ -551,8 +551,18 @@ func testServer_SendMedia(t *testing.T, chats chat.Store, messages messaging.Sto
 func testServer_ResolvesMediaOnRead(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
 	e := newServerEnv(t, badges, chats, messages, profiles)
 
-	// A sends a media message referencing a blob.
+	// A sends a media message referencing a blob that has a derived rendition, so the
+	// read path is exercised expanding the full set, not just the ORIGINAL.
 	blobID := e.putReadyBlob(e.userA)
+	displayID := blob.MustGenerateID()
+	require.NoError(t, e.blobStore.AttachRenditions(e.ctx, blobID, []blob.RenditionRef{{
+		ID:         displayID,
+		Rendition:  blob.RenditionDisplay,
+		MimeType:   "image/jpeg",
+		SizeBytes:  10,
+		StorageKey: "images/x/display_800x600.jpg",
+		Image:      &blob.ImageMetadata{Width: 800, Height: 600},
+	}}))
 	sendResp, err := e.sendContent(e.keysA, mediaContent(blobID), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, sendResp.Result)
@@ -581,12 +591,25 @@ func testServer_ResolvesMediaOnRead(t *testing.T, chats chat.Store, messages mes
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
 
-	got := getResp.Message.Content[0].GetMedia().Items[0].Renditions[0]
+	// The item now carries the full rendition set: the ORIGINAL plus the derived
+	// DISPLAY, each with its own resolved metadata and download URL.
+	gotItem := getResp.Message.Content[0].GetMedia().Items[0]
+	require.Len(t, gotItem.Renditions, 2)
+
+	got := gotItem.Renditions[0]
+	require.Equal(t, blobpb.Rendition_ORIGINAL, got.Role)
 	require.Equal(t, blobID.Value, got.BlobId.Value)
 	require.NotNil(t, got.Blob)
 	require.Equal(t, "image/png", got.Blob.MimeType)
 	require.NotNil(t, got.Blob.DownloadUrl)
 	require.NotEmpty(t, got.Blob.DownloadUrl.Url)
+
+	display := gotItem.Renditions[1]
+	require.Equal(t, blobpb.Rendition_DISPLAY, display.Role)
+	require.Equal(t, displayID.Value, display.BlobId.Value)
+	require.Equal(t, "image/jpeg", display.Blob.MimeType)
+	require.EqualValues(t, 800, display.Blob.GetImage().GetWidth())
+	require.NotEmpty(t, display.Blob.GetDownloadUrl().GetUrl())
 
 	// The same metadata is filled on the list (GetMessages) path.
 	listResp, err := e.getMessagesByOptions(e.keysB, &commonpb.QueryOptions{})

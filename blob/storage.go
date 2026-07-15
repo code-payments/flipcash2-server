@@ -45,6 +45,16 @@ type ObjectStorage interface {
 	// so an interrupted finalization is always replayable from the upload bytes.
 	CopyToOrigin(ctx context.Context, key string) error
 
+	// PutOrigin writes server-derived bytes directly into the ORIGIN store under
+	// the given key, pinning the content type so the CDN serves them correctly. It
+	// is how derived renditions land: unlike a client upload, these bytes were
+	// produced by the server from an original that already passed inspection and
+	// moderation, so they are trusted and bypass the upload quarantine entirely
+	// rather than being staged and copied. It overwrites any object already under
+	// the key, so a replayed finalization that regenerates a rendition is
+	// idempotent.
+	PutOrigin(ctx context.Context, key, mimeType string, data []byte) error
+
 	// DeleteUpload removes an object from the UPLOAD store. It is best-effort
 	// cleanup run after a blob reaches a terminal state, and is idempotent:
 	// deleting an absent key is not an error.

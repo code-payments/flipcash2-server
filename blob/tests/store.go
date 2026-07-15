@@ -200,36 +200,57 @@ func testStoreRenditions(t *testing.T, store blob.Store) {
 	original := pendingOriginal(t)
 	require.NoError(t, store.CreatePending(ctx, original))
 
-	// An original with no renditions yields an empty set.
-	renditions, err := store.GetRenditions(ctx, original.ID)
+	// A freshly created original carries no rendition manifest.
+	got, err := store.GetByID(ctx, original.ID)
 	require.NoError(t, err)
-	require.Empty(t, renditions)
+	require.Empty(t, got.Renditions)
 
-	display := pendingOriginal(t)
-	display.Rendition = blob.RenditionDisplay
-	display.ParentID = original.ID
+	refs := []blob.RenditionRef{
+		{
+			ID:         blob.MustGenerateID(),
+			Rendition:  blob.RenditionThumbnail,
+			MimeType:   "image/jpeg",
+			SizeBytes:  111,
+			StorageKey: "images/x/thumbnail_160x90.jpg",
+			Image:      &blob.ImageMetadata{Width: 160, Height: 90, Blurhash: "LKO2", HasAlpha: false},
+		},
+		{
+			ID:         blob.MustGenerateID(),
+			Rendition:  blob.RenditionDisplay,
+			MimeType:   "image/jpeg",
+			SizeBytes:  222,
+			StorageKey: "images/x/display_800x450.jpg",
+			Image:      &blob.ImageMetadata{Width: 800, Height: 450, Blurhash: "LKO2", HasAlpha: false},
+		},
+	}
+	require.NoError(t, store.AttachRenditions(ctx, original.ID, refs))
 
-	thumbnail := pendingOriginal(t)
-	thumbnail.Rendition = blob.RenditionThumbnail
-	thumbnail.ParentID = original.ID
-
-	require.NoError(t, store.CreatePending(ctx, display))
-	require.NoError(t, store.CreatePending(ctx, thumbnail))
-
-	renditions, err = store.GetRenditions(ctx, original.ID)
+	// The manifest round-trips on the original's own record, in order, every field
+	// intact.
+	got, err = store.GetByID(ctx, original.ID)
 	require.NoError(t, err)
-	require.Len(t, renditions, 2)
+	require.Len(t, got.Renditions, 2)
 
-	kinds := map[blob.RenditionType]bool{}
-	for _, r := range renditions {
-		require.Equal(t, original.ID.Value, r.ParentID.Value)
-		kinds[r.Rendition] = true
-	}
-	require.True(t, kinds[blob.RenditionDisplay])
-	require.True(t, kinds[blob.RenditionThumbnail])
+	require.Equal(t, refs[0].ID.Value, got.Renditions[0].ID.Value)
+	require.Equal(t, blob.RenditionThumbnail, got.Renditions[0].Rendition)
+	require.Equal(t, "image/jpeg", got.Renditions[0].MimeType)
+	require.EqualValues(t, 111, got.Renditions[0].SizeBytes)
+	require.Equal(t, "images/x/thumbnail_160x90.jpg", got.Renditions[0].StorageKey)
+	require.NotNil(t, got.Renditions[0].Image)
+	require.EqualValues(t, 160, got.Renditions[0].Image.Width)
+	require.EqualValues(t, 90, got.Renditions[0].Image.Height)
+	require.Equal(t, "LKO2", got.Renditions[0].Image.Blurhash)
 
-	// The original itself is not one of its own renditions.
-	for _, r := range renditions {
-		require.NotEqual(t, original.ID.Value, r.ID.Value)
-	}
+	require.Equal(t, refs[1].ID.Value, got.Renditions[1].ID.Value)
+	require.Equal(t, blob.RenditionDisplay, got.Renditions[1].Rendition)
+
+	// Re-attaching overwrites rather than appends, so a replayed generation is
+	// idempotent.
+	require.NoError(t, store.AttachRenditions(ctx, original.ID, refs))
+	got, err = store.GetByID(ctx, original.ID)
+	require.NoError(t, err)
+	require.Len(t, got.Renditions, 2)
+
+	// Attaching to an original that does not exist is ErrNotFound.
+	require.ErrorIs(t, store.AttachRenditions(ctx, blob.MustGenerateID(), refs), blob.ErrNotFound)
 }

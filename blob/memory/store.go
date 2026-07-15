@@ -1,7 +1,6 @@
 package memory
 
 import (
-	"bytes"
 	"context"
 	"sync"
 
@@ -67,17 +66,19 @@ func (m *memory) GetByIDs(_ context.Context, ids []*blobpb.BlobId) ([]*blob.Blob
 	return res, nil
 }
 
-func (m *memory) GetRenditions(_ context.Context, parentID *blobpb.BlobId) ([]*blob.Blob, error) {
+func (m *memory) AttachRenditions(_ context.Context, id *blobpb.BlobId, refs []blob.RenditionRef) error {
 	m.Lock()
 	defer m.Unlock()
 
-	var res []*blob.Blob
-	for _, b := range m.blobs {
-		if b.ParentID != nil && bytes.Equal(b.ParentID.Value, parentID.Value) {
-			res = append(res, b.Clone())
-		}
+	b, ok := m.blobs[string(id.Value)]
+	if !ok {
+		return blob.ErrNotFound
 	}
-	return res, nil
+	// Store on a cloned copy so the manifest deep-copies with the record; overwrite
+	// any existing manifest so a replayed generation is idempotent.
+	b.Renditions = refs
+	m.blobs[string(id.Value)] = b.Clone()
+	return nil
 }
 
 func (m *memory) Advance(_ context.Context, id *blobpb.BlobId, to blob.State, image *blob.ImageMetadata) (bool, error) {

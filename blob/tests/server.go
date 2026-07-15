@@ -52,6 +52,7 @@ func RunServerTests(
 		testUploadLifecycle,
 		testFinalizationRejections,
 		testModeration,
+		testRenditionGeneration,
 		testGetBlobs,
 	} {
 		// A fresh resolver per test func; the access store is reset by teardown.
@@ -294,9 +295,9 @@ func testFinalizationRejections(t *testing.T, accounts account.Store, blobs blob
 
 	t.Run("mime type mismatch is rejected", func(t *testing.T) {
 		imageBytes := makePNG(t, 4, 4)
-		// Declare gif, upload png of the matching size: the bytes decode, but as a
+		// Declare webp, upload png of the matching size: the bytes decode, but as a
 		// different type than was pinned.
-		blobID, target := initiate(t, server, signer, "image/gif", uint64(len(imageBytes)))
+		blobID, target := initiate(t, server, signer, "image/webp", uint64(len(imageBytes)))
 		upload(target, imageBytes)
 
 		requireRejected(t, server, signer, blobID, blobpb.RejectionReason_REJECTION_REASON_MISMATCHED_TYPE)
@@ -587,6 +588,113 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 	})
 }
 
+func testRenditionGeneration(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc) {
+	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
+	_, signer := registerUser(t, accounts)
+	ctx := context.Background()
+
+	// readyBlob uploads and finalizes an image, returning the READY original record.
+	readyBlob := func(t *testing.T, mimeType string, data []byte) *blob.Blob {
+		blobID, target := initiate(t, server, signer, mimeType, uint64(len(data)))
+		upload(target, data)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, server, signer, blobID))
+		record, err := blobs.GetByID(ctx, blobID)
+		require.NoError(t, err)
+		return record
+	}
+
+	t.Run("a large opaque image generates the full ladder as JPEG", func(t *testing.T) {
+		original := readyBlob(t, "image/png", makePNG(t, 2000, 1000))
+
+		require.Equal(t, blob.RenditionOriginal, original.Rendition)
+		require.Nil(t, original.ParentID)
+		require.NotEmpty(t, original.Image.Blurhash)
+
+		// The manifest is the ladder, small to large, scaled from the 2000x1000 source.
+		want := []struct {
+			role blob.RenditionType
+			w, h uint32
+		}{
+			{blob.RenditionThumbnail, 160, 80},
+			{blob.RenditionThumbnail, 320, 160},
+			{blob.RenditionDisplay, 800, 400},
+			{blob.RenditionDisplay, 1600, 800},
+		}
+		require.Len(t, original.Renditions, len(want))
+		for i, ref := range original.Renditions {
+			require.Equal(t, want[i].role, ref.Rendition)
+			require.Equal(t, "image/jpeg", ref.MimeType, "an opaque source yields JPEG renditions")
+			require.NotNil(t, ref.Image)
+			require.EqualValues(t, want[i].w, ref.Image.Width)
+			require.EqualValues(t, want[i].h, ref.Image.Height)
+			require.Positive(t, ref.SizeBytes)
+			require.NotEmpty(t, ref.StorageKey)
+
+			// Every manifest entry is backed by a real, servable child rendition blob
+			// that points back at the original and inherits its BlurHash.
+			child, err := blobs.GetByID(ctx, ref.ID)
+			require.NoError(t, err)
+			require.Equal(t, blob.StateReady, child.State)
+			require.Equal(t, ref.Rendition, child.Rendition)
+			require.NotNil(t, child.ParentID)
+			require.Equal(t, original.ID.Value, child.ParentID.Value)
+			require.Equal(t, ref.MimeType, child.MimeType)
+			require.EqualValues(t, want[i].w, child.Image.Width)
+			require.EqualValues(t, want[i].h, child.Image.Height)
+			require.Equal(t, original.Image.Blurhash, child.Image.Blurhash)
+		}
+	})
+
+	t.Run("a transparent image generates renditions as PNG", func(t *testing.T) {
+		original := readyBlob(t, "image/png", makeTransparentPNG(t, 400, 400))
+
+		require.NotEmpty(t, original.Renditions)
+		for _, ref := range original.Renditions {
+			require.Equal(t, "image/png", ref.MimeType, "a transparent source yields PNG renditions")
+		}
+	})
+
+	t.Run("a mid-size image yields only the rungs below it", func(t *testing.T) {
+		// 500 on the longest side is below the 800 and 1600 rungs, so only the two
+		// thumbnails are generated; the client falls back to the ORIGINAL above them.
+		original := readyBlob(t, "image/png", makePNG(t, 500, 400))
+
+		require.Len(t, original.Renditions, 2)
+		require.Equal(t, blob.RenditionThumbnail, original.Renditions[0].Rendition)
+		require.EqualValues(t, 160, original.Renditions[0].Image.Width)
+		require.EqualValues(t, 128, original.Renditions[0].Image.Height)
+		require.Equal(t, blob.RenditionThumbnail, original.Renditions[1].Rendition)
+		require.EqualValues(t, 320, original.Renditions[1].Image.Width)
+		require.EqualValues(t, 256, original.Renditions[1].Image.Height)
+	})
+
+	t.Run("a small image generates no renditions", func(t *testing.T) {
+		// Below every rung, so nothing is derived and the ORIGINAL stands alone.
+		original := readyBlob(t, "image/png", makePNG(t, 100, 80))
+		require.Empty(t, original.Renditions)
+	})
+
+	t.Run("re-completing does not duplicate or alter the manifest", func(t *testing.T) {
+		data := makePNG(t, 1000, 500)
+		blobID, target := initiate(t, server, signer, "image/png", uint64(len(data)))
+		upload(target, data)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, server, signer, blobID))
+
+		before, err := blobs.GetByID(ctx, blobID)
+		require.NoError(t, err)
+
+		// A repeated completion finds the blob terminal and leaves the manifest as-is.
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, server, signer, blobID))
+		after, err := blobs.GetByID(ctx, blobID)
+		require.NoError(t, err)
+
+		require.Len(t, after.Renditions, len(before.Renditions))
+		for i := range before.Renditions {
+			require.Equal(t, before.Renditions[i].ID.Value, after.Renditions[i].ID.Value)
+		}
+	})
+}
+
 // initiate runs InitiateExternalUpload and returns the reserved id and target.
 func initiate(t *testing.T, server *blob.Server, signer model.KeyPair, mimeType string, sizeBytes uint64) (*blobpb.BlobId, *blobpb.UploadTarget) {
 	req := &blobpb.InitiateExternalUploadRequest{MimeType: mimeType, SizeBytes: sizeBytes}
@@ -628,6 +736,21 @@ func makePNG(t *testing.T, width, height int) []byte {
 	for y := range height {
 		for x := range width {
 			img.Set(x, y, color.RGBA{R: uint8(x * 8), G: uint8(y * 8), B: 128, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	require.NoError(t, png.Encode(&buf, img))
+	return buf.Bytes()
+}
+
+// makeTransparentPNG returns an opaque-free PNG (every pixel is partly
+// transparent), so InspectImage derives HasAlpha=true and its renditions are
+// encoded as PNG rather than JPEG.
+func makeTransparentPNG(t *testing.T, width, height int) []byte {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := range height {
+		for x := range width {
+			img.Set(x, y, color.RGBA{R: uint8(x * 8), G: uint8(y * 8), B: 128, A: 128})
 		}
 	}
 	var buf bytes.Buffer

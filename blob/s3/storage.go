@@ -9,6 +9,7 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rsa"
@@ -267,6 +268,22 @@ func (s *Storage) CopyToOrigin(ctx context.Context, key string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("failed to copy object to origin bucket: %w", err)
+	}
+	return nil
+}
+
+func (s *Storage) PutOrigin(ctx context.Context, key, mimeType string, data []byte) error {
+	// Write the derived bytes straight into the origin bucket. These never pass
+	// through the upload bucket: they are server-produced from an already-validated
+	// original, so there is nothing to quarantine. PutObject overwrites, so a
+	// replayed finalization re-putting the same rendition is a no-op.
+	if _, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(s.cfg.OriginBucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String(mimeType),
+	}); err != nil {
+		return fmt.Errorf("failed to put object to origin bucket: %w", err)
 	}
 	return nil
 }

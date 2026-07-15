@@ -78,8 +78,8 @@ func (c *Cache) GetByIDs(ctx context.Context, ids []*blobpb.BlobId) ([]*blob.Blo
 	return out, nil
 }
 
-func (c *Cache) GetRenditions(ctx context.Context, parentID *blobpb.BlobId) ([]*blob.Blob, error) {
-	return c.db.GetRenditions(ctx, parentID)
+func (c *Cache) AttachRenditions(ctx context.Context, id *blobpb.BlobId, refs []blob.RenditionRef) error {
+	return c.db.AttachRenditions(ctx, id, refs)
 }
 
 func (c *Cache) Advance(ctx context.Context, id *blobpb.BlobId, to blob.State, image *blob.ImageMetadata) (bool, error) {

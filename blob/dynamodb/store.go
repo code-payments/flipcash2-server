@@ -31,18 +31,19 @@ import (
 // owner.
 const (
 	attrPK            = "pk"
-	attrParentID      = "parent_id"      // parent (ORIGINAL) id, hex; absent on ORIGINALs
-	attrRendition     = "rendition"      // RenditionType, N
-	attrUserID        = "user_id"        // owner id, hex
-	attrState         = "state"          // blob.State, N
-	attrStorageKey    = "storage_key"    // S
-	attrMimeType      = "mime_type"      // S
-	attrSizeBytes     = "size_bytes"     // N
+	attrParentID      = "parent_id"       // parent (ORIGINAL) id, hex; absent on ORIGINALs
+	attrRendition     = "rendition"       // RenditionType, N
+	attrUserID        = "user_id"         // owner id, hex
+	attrState         = "state"           // blob.State, N
+	attrStorageKey    = "storage_key"     // S
+	attrMimeType      = "mime_type"       // S
+	attrSizeBytes     = "size_bytes"      // N
 	attrImageWidth    = "image_width"     // N, present only on READY images
 	attrImageHeight   = "image_height"    // N, present only on READY images
 	attrImageBlurhash = "image_blurhash"  // S, present only on READY images
 	attrImageHasAlpha = "image_has_alpha" // BOOL, present only on READY images
-	attrExpiresAt     = "expires_at"     // N, Unix seconds; TTL on non-READY blobs
+	attrExpiresAt     = "expires_at"      // N, Unix seconds; TTL on non-READY blobs
+	attrCreatedAt     = "created_at"      // N, Unix nanos; stamped once at creation
 
 	attrRejectionReason = "rejection_reason" // N, present only on REJECTED blobs
 	attrFlaggedCategory = "flagged_category" // N, present only on REJECTED-by-moderation blobs
@@ -77,9 +78,11 @@ func NewInDynamoDB(client *dynamodb.Client, table string) blob.Store {
 
 func (s *store) CreatePending(ctx context.Context, b *blob.Blob) error {
 	item := toItem(b)
+	now := time.Now()
+	item[attrCreatedAt] = avUint64(uint64(now.UnixNano()))
 	// A never-completed reservation should not live forever; give the record a
 	// TTL that Advance clears once the blob reaches READY.
-	item[attrExpiresAt] = avUnix(time.Now().Add(pendingBlobTTL))
+	item[attrExpiresAt] = avUnix(now.Add(pendingBlobTTL))
 
 	_, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:           aws.String(s.table),

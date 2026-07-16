@@ -107,9 +107,13 @@ type imageRenditionSpec struct {
 //   - DISPLAY   800: the inline chat bubble
 //   - DISPLAY  1600: the full-screen, non-zoomed view
 //
-// A rung whose bound is at or above the original's longest side is skipped rather
-// than upscaled (see generateImageRenditions), so a small original simply yields a
-// shorter ladder and the client falls back to the ORIGINAL for anything larger.
+// EVERY role here is generated for every accepted original, whatever its size: a
+// client can always resolve a THUMBNAIL and a DISPLAY and never has to fall back to
+// the (un-optimized, possibly non-WebP) ORIGINAL. Size only shortens the ladder
+// WITHIN a role — an original is never upscaled, so a role whose smallest rung
+// already reaches it collapses to a single rendition at the original's own size and
+// its larger rungs are skipped (see generateImageRenditions).
+//
 // The pixel bounds are deliberately not on the wire: role is the semantic handle
 // and the concrete dimensions travel as each rendition's image metadata, so the
 // ladder can be retuned server-side without a client change — a retune just mints

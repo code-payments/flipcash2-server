@@ -599,21 +599,36 @@ func (s *Server) finalize(ctx context.Context, record *Blob) (blobpb.BlobStatus,
 // id — overwriting the same object and treating an already-present record as the
 // prior attempt to finish advancing — instead of orphaning a duplicate.
 //
-// The original is never upscaled. The first rung whose bound reaches the original's
-// longest side still yields ONE rendition, encoded at the original's own size and
-// typed as that rung's role: even when its dimensions match the original, re-encoding
-// as WebP typically saves bytes over the (possibly large, un-optimized, non-WebP)
-// ORIGINAL, so a client always has a cheaper encoded variant to reach for at that
-// role. Every larger rung would bound the same size to the same bytes, so generation
-// stops there.
+// The original is never upscaled. Within a role, the first rung whose bound reaches
+// the original's longest side still yields ONE rendition, encoded at the original's
+// own size and typed as that rung's role: even when its dimensions match the
+// original, re-encoding as WebP typically saves bytes over the (possibly large,
+// un-optimized, non-WebP) ORIGINAL, so a client always has a cheaper encoded variant
+// to reach for at that role. Every larger rung of that SAME role would bound the same
+// size to the same bytes, so they are skipped — but the ladder keeps climbing, so
+// every role in it lands in the manifest for an image of any size.
 func (s *Server) generateImageRenditions(ctx context.Context, parent *Blob, decoded image.Image, meta *ImageMetadata) error {
+	// Roles whose largest useful rendition has already been emitted — see the
+	// reachedOriginal write below.
+	coveredRoles := make(map[RenditionType]bool)
+
 	refs := make([]RenditionRef, 0, len(imageRenditionSpecs))
 	for _, spec := range imageRenditionSpecs {
-		// The first rung whose bound is at or above the original's longest side is the
-		// "next" rung the original doesn't exceed. We emit a single rendition at the
-		// original's own size (scaledDimensions never upscales past the bound) typed as
-		// this next rung's role, then stop — every larger rung would bound the same size
-		// to the same bytes.
+		// A rung whose role is already covered at the original's own size can only
+		// re-encode those same bytes, so it is skipped. Skipping the rung rather than
+		// ending the ladder is what keeps the remaining ROLES reachable: the ladder
+		// carries several rungs per role, so a small original that tops out on the first
+		// role's first rung must still climb to the later roles' rungs — each of which
+		// emits at the original's size — instead of leaving those roles absent from the
+		// manifest entirely.
+		if coveredRoles[spec.Rendition] {
+			continue
+		}
+
+		// The first rung of a role whose bound is at or above the original's longest side
+		// is the "next" rung the original doesn't exceed. We emit a single rendition at
+		// the original's own size (scaledDimensions never upscales past the bound) typed
+		// as this rung's role, and that role needs nothing larger.
 		reachedOriginal := spec.MaxLongestSide >= max(meta.Width, meta.Height)
 
 		width, height := scaledDimensions(meta.Width, meta.Height, spec.MaxLongestSide)
@@ -663,10 +678,10 @@ func (s *Server) generateImageRenditions(ctx context.Context, parent *Blob, deco
 
 		refs = append(refs, renditionRef(child))
 
-		// This rendition already covers the original's full size; any larger rung would
-		// only re-encode the same bytes, so the ladder ends here.
+		// This rendition already covers the original's full size, so this role is done:
+		// any larger rung of it would only re-encode the same bytes.
 		if reachedOriginal {
-			break
+			coveredRoles[spec.Rendition] = true
 		}
 	}
 

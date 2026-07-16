@@ -267,9 +267,17 @@ func (s *Server) CompleteExternalUpload(ctx context.Context, req *blobpb.Complet
 	// finalization worker. Losing the Advance race to a concurrent finalize is
 	// fine, and marking a blob that meanwhile went terminal is a no-op — the
 	// client's next poll sees the committed state either way.
-	if _, err := s.blobs.Advance(ctx, record.ID, StateUploaded, nil); err != nil {
+	advanced, err := s.blobs.Advance(ctx, record.ID, StateUploaded, nil)
+	if err != nil {
 		log.Warn("Failed to advance blob to uploaded", zap.Error(err))
 		return nil, status.Error(codes.Internal, "failed to complete upload")
+	}
+	if !advanced {
+		// A blob is already being processed by the worker, so report back PROCESSING
+		return &blobpb.CompleteExternalUploadResponse{
+			Result: blobpb.CompleteExternalUploadResponse_OK,
+			Status: blobpb.BlobStatus_BLOB_STATUS_PROCESSING,
+		}, nil
 	}
 	if err := s.blobs.MarkForFinalization(ctx, record.ID, kind, time.Now()); err != nil {
 		log.Warn("Failed to queue blob for finalization", zap.Error(err))

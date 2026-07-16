@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/code-payments/ocp-server/metrics"
+	"github.com/code-payments/ocp-server/metrics/noop"
 )
 
 const (
@@ -187,7 +188,12 @@ func (w *Worker) Start(ctx context.Context, interval time.Duration) error {
 // or terminally failed for exhaustion). Zero means the due queue is drained —
 // tasks other workers hold claims on are not counted.
 func (w *Worker) Process(runtimeCtx context.Context) (int, error) {
-	metricsProvider := runtimeCtx.Value(metrics.ProviderContextKey).(metrics.Provider)
+	// A context carrying no provider traces into the void rather than panicking:
+	// tracing is observability, never a reason to fail a tick.
+	metricsProvider, ok := runtimeCtx.Value(metrics.ProviderContextKey).(metrics.Provider)
+	if !ok || metricsProvider == nil {
+		metricsProvider = noop.NewProvider()
+	}
 	trace := metricsProvider.StartTrace(fmt.Sprintf("blob_%s_worker", w.kind.String()))
 	defer trace.End()
 	tracedCtx := metrics.NewContext(runtimeCtx, trace)

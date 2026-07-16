@@ -65,6 +65,14 @@ func (s *Storage) GetUploaded(_ context.Context, key string) ([]byte, error) {
 	return append([]byte(nil), data...), nil
 }
 
+func (s *Storage) UploadExists(_ context.Context, key string) (bool, error) {
+	s.Lock()
+	defer s.Unlock()
+
+	_, ok := s.uploaded[key]
+	return ok, nil
+}
+
 func (s *Storage) CopyToOrigin(_ context.Context, key string) error {
 	s.Lock()
 	defer s.Unlock()

@@ -37,6 +37,12 @@ type ObjectStorage interface {
 	// them back to validate the content before promoting it.
 	GetUploaded(ctx context.Context, key string) ([]byte, error)
 
+	// UploadExists reports whether bytes are present under the key in the UPLOAD
+	// store, without fetching them. Completion uses it to cheaply distinguish an
+	// upload that landed from one that never happened before queueing the blob
+	// for finalization.
+	UploadExists(ctx context.Context, key string) (bool, error)
+
 	// CopyToOrigin copies a validated object from the UPLOAD store to the ORIGIN
 	// store under the same key, making it servable through the CDN. It overwrites
 	// any object already served under the key, so it is safe to call more than

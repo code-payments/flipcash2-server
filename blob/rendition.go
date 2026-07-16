@@ -246,11 +246,11 @@ func resampleImage(img image.Image, width, height int) image.Image {
 // webpRenditionEncodeMethod is the WebP encoder's quality/speed trade-off (0=fast .. 6=slower,
 // smaller). Renditions are generated once during finalization and then served for the
 // life of the media, so the extra encode time is paid a single time and buys smaller
-// bytes on every future fetch — a trade worth making at the slow-but-smallest end.
-// Note that finalization runs inline on the upload RPC (detached from client
-// cancellation, bounded by a timeout), so this cost lands in that call's latency, not
-// on a background worker; revisit the method (or move generation off the RPC) if that
-// tail latency becomes a problem.
+// bytes on every future fetch — a trade worth making at the slow-but-smallest end,
+// especially since generation runs on the background worker (rungs in parallel, so
+// only the largest rung's encode is on the wall clock), never on a serving RPC.
+// Measured against method 4 on the max-size ladder: 6 is ~25-35% slower per rung for
+// ~3-6% smaller lossy renditions.
 const webpRenditionEncodeMethod = 6
 
 // encode renders img in this encoding: lossless WebP for a transparent source (which

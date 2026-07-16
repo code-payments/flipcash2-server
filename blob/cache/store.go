@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"time"
 
 	"github.com/ReneKroon/ttlcache"
 
@@ -88,4 +89,24 @@ func (c *Cache) Advance(ctx context.Context, id *blobpb.BlobId, to blob.State, i
 
 func (c *Cache) Reject(ctx context.Context, id *blobpb.BlobId, rejection *blob.RejectionMetadata) (bool, error) {
 	return c.db.Reject(ctx, id, rejection)
+}
+
+func (c *Cache) MarkForFinalization(ctx context.Context, id *blobpb.BlobId, kind blob.ContentKind, nextAttemptAt time.Time) error {
+	return c.db.MarkForFinalization(ctx, id, kind, nextAttemptAt)
+}
+
+func (c *Cache) GetDueForFinalization(ctx context.Context, kind blob.ContentKind, asOf time.Time, limit int) ([]*blob.FinalizationTask, error) {
+	return c.db.GetDueForFinalization(ctx, kind, asOf, limit)
+}
+
+func (c *Cache) GetFinalizationQueueStats(ctx context.Context, kind blob.ContentKind) (*blob.FinalizationQueueStats, error) {
+	return c.db.GetFinalizationQueueStats(ctx, kind)
+}
+
+func (c *Cache) ClaimForFinalization(ctx context.Context, id *blobpb.BlobId, asOf, until time.Time) (bool, error) {
+	return c.db.ClaimForFinalization(ctx, id, asOf, until)
+}
+
+func (c *Cache) DelayFinalization(ctx context.Context, id *blobpb.BlobId, nextAttemptAt time.Time) error {
+	return c.db.DelayFinalization(ctx, id, nextAttemptAt)
 }

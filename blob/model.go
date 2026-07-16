@@ -2,6 +2,7 @@ package blob
 
 import (
 	"errors"
+	"time"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -21,6 +22,50 @@ var (
 	// reached only through Store.Reject, never Advance.
 	ErrCannotAdvanceToRejected = errors.New("cannot advance to rejected state; use Reject")
 )
+
+// ContentKind identifies which processing family a blob's bytes belong to:
+// which validation, moderation, and rendition pipeline they go through, and
+// which finalization queue they wait in. It is derived from the blob's pinned
+// MIME type, never stored on its own. Images are the only kind supported today;
+// video, audio, etc. each become their own kind — with their own queue and
+// worker tuning — as they are added.
+//
+// The values are persisted (in finalization queue partition keys), so they must
+// be stable forever.
+type ContentKind int
+
+const (
+	ContentKindUnknown ContentKind = iota
+
+	// ContentKindImage is a still image.
+	ContentKindImage
+)
+
+// ContentKindForMimeType maps a declared MIME type to its processing family.
+// An unsupported type maps to ContentKindUnknown, which nothing may be queued
+// under.
+func ContentKindForMimeType(mimeType string) ContentKind {
+	if SupportedImageMimeTypes[mimeType] {
+		return ContentKindImage
+	}
+	return ContentKindUnknown
+}
+
+// String names the kind for logs and metric dimensions.
+func (k ContentKind) String() string {
+	switch k {
+	case ContentKindImage:
+		return "image"
+	default:
+		return "unknown"
+	}
+}
+
+// ContentKind is the blob's processing family, derived from its pinned MIME
+// type.
+func (b *Blob) ContentKind() ContentKind {
+	return ContentKindForMimeType(b.MimeType)
+}
 
 // RenditionType identifies which rendition of a piece of media a blob holds.
 // The ORIGINAL is the exact bytes the client uploaded; every other type is a
@@ -361,6 +406,35 @@ func (b *Blob) Clone() *Blob {
 		cloned.Rejection = &rejection
 	}
 	return cloned
+}
+
+// FinalizationQueueStats is a point-in-time gauge of one content kind's
+// finalization queue.
+type FinalizationQueueStats struct {
+	// Depth is how many blobs are queued, due or not — a delayed retry is
+	// still backlog.
+	Depth uint64
+
+	// OldestEnqueuedAt is when the longest-queued blob was FIRST enqueued; its
+	// distance from now is the queue's max age. Re-marks and retry delays never
+	// reset it, so it exposes a blob stuck cycling through backoff — which the
+	// depth alone hides. It is the zero time when the queue is empty.
+	OldestEnqueuedAt time.Time
+}
+
+// FinalizationTask is a queued unit of finalization work: a blob whose uploaded
+// bytes are awaiting processing, with the retry bookkeeping the worker schedules
+// off of.
+type FinalizationTask struct {
+	ID *blobpb.BlobId
+
+	// Attempts is the number of failed finalization attempts recorded so far
+	// (via DelayFinalization). The worker uses it to pace backoff and to stop
+	// retrying an unfinalizable blob.
+	Attempts uint32
+
+	// NextAttemptAt is when the task next becomes due.
+	NextAttemptAt time.Time
 }
 
 func MustGenerateID() *blobpb.BlobId {

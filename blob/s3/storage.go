@@ -256,6 +256,22 @@ func (s *Storage) GetUploaded(ctx context.Context, key string) ([]byte, error) {
 	return data, nil
 }
 
+func (s *Storage) UploadExists(ctx context.Context, key string) (bool, error) {
+	// HeadObject confirms presence without fetching the body, so completion can
+	// check a multi-megabyte upload landed without paying to read it.
+	_, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.cfg.UploadBucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to head uploaded object: %w", err)
+	}
+	return true, nil
+}
+
 func (s *Storage) CopyToOrigin(ctx context.Context, key string) error {
 	// Copy the validated bytes from the upload bucket into the origin bucket
 	// under the same key. CopySource is "<bucket>/<key>"; blob keys are hex, so

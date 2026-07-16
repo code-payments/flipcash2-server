@@ -80,6 +80,10 @@ func (c *StorageCache) GetUploaded(ctx context.Context, key string) ([]byte, err
 	return c.storage.GetUploaded(ctx, key)
 }
 
+func (c *StorageCache) UploadExists(ctx context.Context, key string) (bool, error) {
+	return c.storage.UploadExists(ctx, key)
+}
+
 func (c *StorageCache) CopyToOrigin(ctx context.Context, key string) error {
 	return c.storage.CopyToOrigin(ctx, key)
 }

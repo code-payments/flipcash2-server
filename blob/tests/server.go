@@ -62,11 +62,35 @@ func RunServerTests(
 	}
 }
 
-func newServer(accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver blob.PrincipalResolver, moderator moderation.Client, t *testing.T) *blob.Server {
+// harness bundles the server with the worker that drives the finalization
+// pipeline the RPCs only queue work for, so a test can complete an upload and
+// then deterministically run the processing it kicked off.
+type harness struct {
+	server *blob.Server
+	worker *blob.Worker
+}
+
+func newHarness(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver blob.PrincipalResolver, moderator moderation.Client) *harness {
 	log := zaptest.NewLogger(t)
 	authn := auth.NewKeyPairAuthenticator(log)
 	authz := account.NewAuthorizer(log, accounts, authn)
-	return blob.NewServer(log, authz, accounts, blobs, storage, access, resolver, moderator, false)
+	return &harness{
+		server: blob.NewServer(log, authz, accounts, blobs, storage, access, resolver, false),
+		worker: blob.NewWorker(log, blobs, blob.NewFinalizer(log, blobs, storage, moderator), blob.ContentKindImage),
+	}
+}
+
+// drain runs worker ticks until the due queue is empty. Happy-path and
+// rejection finalizations complete on their first attempt, so this terminates
+// for every flow the suite exercises.
+func (h *harness) drain(t *testing.T) {
+	for {
+		processed, err := h.worker.Process(context.Background())
+		require.NoError(t, err)
+		if processed == 0 {
+			return
+		}
+	}
 }
 
 // registerUser binds a fresh key pair to a new, registered account.
@@ -80,7 +104,7 @@ func registerUser(t *testing.T, accounts account.Store) (*commonpb.UserId, model
 }
 
 func testGetUploadPolicy(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, _ uploadFunc) {
-	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
+	h := newHarness(t, accounts, blobs, storage, access, resolver, nil)
 
 	t.Run("unregistered is denied", func(t *testing.T) {
 		signer := model.MustGenerateKeyPair()
@@ -90,7 +114,7 @@ func testGetUploadPolicy(t *testing.T, accounts account.Store, blobs blob.Store,
 		req := &blobpb.GetUploadPolicyRequest{}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.GetUploadPolicy(context.Background(), req)
+		resp, err := h.server.GetUploadPolicy(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.GetUploadPolicyResponse_DENIED, resp.Result)
 		require.Nil(t, resp.Policy)
@@ -101,7 +125,7 @@ func testGetUploadPolicy(t *testing.T, accounts account.Store, blobs blob.Store,
 		req := &blobpb.GetUploadPolicyRequest{}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.GetUploadPolicy(context.Background(), req)
+		resp, err := h.server.GetUploadPolicy(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.GetUploadPolicyResponse_OK, resp.Result)
 		require.NotNil(t, resp.Policy)
@@ -135,13 +159,13 @@ func testGetUploadPolicy(t *testing.T, accounts account.Store, blobs blob.Store,
 
 		policyReq := &blobpb.GetUploadPolicyRequest{}
 		require.NoError(t, signer.Auth(policyReq, &policyReq.Auth))
-		policyResp, err := server.GetUploadPolicy(context.Background(), policyReq)
+		policyResp, err := h.server.GetUploadPolicy(context.Background(), policyReq)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.GetUploadPolicyResponse_OK, policyResp.Result)
 
 		denyReq := &blobpb.InitiateExternalUploadRequest{MimeType: "image/png", SizeBytes: blob.MaxOriginalImageSizeBytes + 1}
 		require.NoError(t, signer.Auth(denyReq, &denyReq.Auth))
-		denyResp, err := server.InitiateExternalUpload(context.Background(), denyReq)
+		denyResp, err := h.server.InitiateExternalUpload(context.Background(), denyReq)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.InitiateExternalUploadResponse_TOO_LARGE, denyResp.Result)
 		require.NotNil(t, denyResp.PolicyVersion)
@@ -150,7 +174,7 @@ func testGetUploadPolicy(t *testing.T, accounts account.Store, blobs blob.Store,
 }
 
 func testInitiateExternalUpload(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, _ uploadFunc) {
-	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
+	h := newHarness(t, accounts, blobs, storage, access, resolver, nil)
 	imageBytes := makePNG(t, 8, 8)
 
 	t.Run("unregistered is denied", func(t *testing.T) {
@@ -161,7 +185,7 @@ func testInitiateExternalUpload(t *testing.T, accounts account.Store, blobs blob
 		req := &blobpb.InitiateExternalUploadRequest{MimeType: "image/png", SizeBytes: uint64(len(imageBytes))}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.InitiateExternalUpload(context.Background(), req)
+		resp, err := h.server.InitiateExternalUpload(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.InitiateExternalUploadResponse_DENIED, resp.Result)
 		// An authorization denial carries no policy version — the policy is not why
@@ -174,7 +198,7 @@ func testInitiateExternalUpload(t *testing.T, accounts account.Store, blobs blob
 		req := &blobpb.InitiateExternalUploadRequest{MimeType: "application/pdf", SizeBytes: 1024}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.InitiateExternalUpload(context.Background(), req)
+		resp, err := h.server.InitiateExternalUpload(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.InitiateExternalUploadResponse_UNSUPPORTED_TYPE, resp.Result)
 		require.NotNil(t, resp.PolicyVersion)
@@ -186,7 +210,7 @@ func testInitiateExternalUpload(t *testing.T, accounts account.Store, blobs blob
 		req := &blobpb.InitiateExternalUploadRequest{MimeType: "image/png", SizeBytes: blob.MaxOriginalImageSizeBytes + 1}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.InitiateExternalUpload(context.Background(), req)
+		resp, err := h.server.InitiateExternalUpload(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.InitiateExternalUploadResponse_TOO_LARGE, resp.Result)
 		require.NotNil(t, resp.PolicyVersion)
@@ -198,7 +222,7 @@ func testInitiateExternalUpload(t *testing.T, accounts account.Store, blobs blob
 		req := &blobpb.InitiateExternalUploadRequest{MimeType: "image/png", SizeBytes: uint64(len(imageBytes))}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.InitiateExternalUpload(context.Background(), req)
+		resp, err := h.server.InitiateExternalUpload(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.InitiateExternalUploadResponse_OK, resp.Result)
 		require.NotNil(t, resp.BlobId)
@@ -219,17 +243,17 @@ func testInitiateExternalUpload(t *testing.T, accounts account.Store, blobs blob
 }
 
 func testUploadLifecycle(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc) {
-	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
+	h := newHarness(t, accounts, blobs, storage, access, resolver, nil)
 	_, signer := registerUser(t, accounts)
 	imageBytes := makePNG(t, 12, 9)
 
-	blobID, target := initiate(t, server, signer, "image/png", uint64(len(imageBytes)))
+	blobID, target := initiate(t, h, signer, "image/png", uint64(len(imageBytes)))
 
 	t.Run("complete before upload reports not uploaded", func(t *testing.T) {
 		req := &blobpb.CompleteExternalUploadRequest{BlobId: blobID}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.CompleteExternalUpload(context.Background(), req)
+		resp, err := h.server.CompleteExternalUpload(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.CompleteExternalUploadResponse_NOT_UPLOADED, resp.Result)
 	})
@@ -239,35 +263,39 @@ func testUploadLifecycle(t *testing.T, accounts account.Store, blobs blob.Store,
 		req := &blobpb.CompleteExternalUploadRequest{BlobId: blobID}
 		require.NoError(t, otherSigner.Auth(req, &req.Auth))
 
-		resp, err := server.CompleteExternalUpload(context.Background(), req)
+		resp, err := h.server.CompleteExternalUpload(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.CompleteExternalUploadResponse_NOT_FOUND, resp.Result)
 	})
 
-	t.Run("complete after upload is ready and idempotent", func(t *testing.T) {
+	t.Run("complete after upload queues processing and the worker drives it ready", func(t *testing.T) {
 		upload(target, imageBytes)
 
-		req := &blobpb.CompleteExternalUploadRequest{BlobId: blobID}
-		require.NoError(t, signer.Auth(req, &req.Auth))
+		// The RPC only confirms the bytes landed and queues the work, so it
+		// reports PROCESSING rather than a terminal status.
+		resp := completeResponse(t, h, signer, blobID)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_PROCESSING, resp.Status)
+		require.Nil(t, resp.RejectionMetadata)
 
-		resp, err := server.CompleteExternalUpload(context.Background(), req)
-		require.NoError(t, err)
-		require.Equal(t, blobpb.CompleteExternalUploadResponse_OK, resp.Result)
-		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, resp.Status)
-
-		// The derived image metadata is recorded.
+		// The blob is checkpointed as uploaded (its public status is PROCESSING)
+		// until the worker runs the pipeline.
 		record, err := blobs.GetByID(context.Background(), blobID)
 		require.NoError(t, err)
+		require.Equal(t, blob.StateUploaded, record.State)
+
+		h.drain(t)
+
+		// The worker drove the blob to READY and recorded the derived metadata.
+		record, err = blobs.GetByID(context.Background(), blobID)
+		require.NoError(t, err)
+		require.Equal(t, blob.StateReady, record.State)
 		require.NotNil(t, record.Image)
 		require.EqualValues(t, 12, record.Image.Width)
 		require.EqualValues(t, 9, record.Image.Height)
 		require.NotEmpty(t, record.Image.Blurhash)
 
-		// Calling again returns the same terminal status.
-		req2 := &blobpb.CompleteExternalUploadRequest{BlobId: blobID}
-		require.NoError(t, signer.Auth(req2, &req2.Auth))
-		resp2, err := server.CompleteExternalUpload(context.Background(), req2)
-		require.NoError(t, err)
+		// Completing again reports the committed terminal status.
+		resp2 := completeResponse(t, h, signer, blobID)
 		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, resp2.Status)
 	})
 
@@ -275,50 +303,50 @@ func testUploadLifecycle(t *testing.T, accounts account.Store, blobs blob.Store,
 		req := &blobpb.CompleteExternalUploadRequest{BlobId: &blobpb.BlobId{Value: model.MustGenerateUserID().Value}}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.CompleteExternalUpload(context.Background(), req)
+		resp, err := h.server.CompleteExternalUpload(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.CompleteExternalUploadResponse_NOT_FOUND, resp.Result)
 	})
 }
 
 func testFinalizationRejections(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc) {
-	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
+	h := newHarness(t, accounts, blobs, storage, access, resolver, nil)
 	_, signer := registerUser(t, accounts)
 
 	t.Run("non-image bytes are rejected as corrupt", func(t *testing.T) {
 		junk := []byte("this is definitely not an image")
-		blobID, target := initiate(t, server, signer, "image/png", uint64(len(junk)))
+		blobID, target := initiate(t, h, signer, "image/png", uint64(len(junk)))
 		upload(target, junk)
 
-		requireRejected(t, server, signer, blobID, blobpb.RejectionReason_REJECTION_REASON_CORRUPT)
+		requireRejected(t, h, signer, blobID, blobpb.RejectionReason_REJECTION_REASON_CORRUPT)
 	})
 
 	t.Run("mime type mismatch is rejected", func(t *testing.T) {
 		imageBytes := makePNG(t, 4, 4)
 		// Declare webp, upload png of the matching size: the bytes decode, but as a
 		// different type than was pinned.
-		blobID, target := initiate(t, server, signer, "image/webp", uint64(len(imageBytes)))
+		blobID, target := initiate(t, h, signer, "image/webp", uint64(len(imageBytes)))
 		upload(target, imageBytes)
 
-		requireRejected(t, server, signer, blobID, blobpb.RejectionReason_REJECTION_REASON_MISMATCHED_TYPE)
+		requireRejected(t, h, signer, blobID, blobpb.RejectionReason_REJECTION_REASON_MISMATCHED_TYPE)
 	})
 
 	t.Run("size mismatch is rejected as too large", func(t *testing.T) {
 		imageBytes := makePNG(t, 4, 4)
-		blobID, target := initiate(t, server, signer, "image/png", uint64(len(imageBytes)+1))
+		blobID, target := initiate(t, h, signer, "image/png", uint64(len(imageBytes)+1))
 		upload(target, imageBytes)
 
-		requireRejected(t, server, signer, blobID, blobpb.RejectionReason_REJECTION_REASON_TOO_LARGE)
+		requireRejected(t, h, signer, blobID, blobpb.RejectionReason_REJECTION_REASON_TOO_LARGE)
 	})
 
 	t.Run("image carrying privacy metadata is rejected", func(t *testing.T) {
 		// Clients must strip EXIF before uploading; the bytes are served verbatim, so
 		// one that did not would hand recipients the GPS coordinates it was taken at.
 		imageBytes := makePNGWithExif(t, 4, 4)
-		blobID, target := initiate(t, server, signer, "image/png", uint64(len(imageBytes)))
+		blobID, target := initiate(t, h, signer, "image/png", uint64(len(imageBytes)))
 		upload(target, imageBytes)
 
-		requireRejected(t, server, signer, blobID, blobpb.RejectionReason_REJECTION_REASON_PRIVACY_METADATA)
+		requireRejected(t, h, signer, blobID, blobpb.RejectionReason_REJECTION_REASON_PRIVACY_METADATA)
 	})
 }
 
@@ -327,11 +355,11 @@ func testModeration(t *testing.T, accounts account.Store, blobs blob.Store, stor
 	imageBytes := makePNG(t, 6, 6)
 
 	t.Run("flagged image is rejected with the moderation category", func(t *testing.T) {
-		server := newServer(accounts, blobs, storage, access, resolver, &fakeModerator{flagged: true, categories: []string{"general_nsfw"}}, t)
-		blobID, target := initiate(t, server, signer, "image/png", uint64(len(imageBytes)))
+		h := newHarness(t, accounts, blobs, storage, access, resolver, &fakeModerator{flagged: true, categories: []string{"general_nsfw"}})
+		blobID, target := initiate(t, h, signer, "image/png", uint64(len(imageBytes)))
 		upload(target, imageBytes)
 
-		resp := completeResponse(t, server, signer, blobID)
+		resp := completeAndProcess(t, h, signer, blobID)
 		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_REJECTED, resp.Status)
 		require.NotNil(t, resp.RejectionMetadata)
 		require.Equal(t, blobpb.RejectionReason_REJECTION_REASON_MODERATION, resp.RejectionMetadata.Reason)
@@ -339,38 +367,38 @@ func testModeration(t *testing.T, accounts account.Store, blobs blob.Store, stor
 	})
 
 	t.Run("clean image is ready", func(t *testing.T) {
-		server := newServer(accounts, blobs, storage, access, resolver, &fakeModerator{flagged: false}, t)
-		blobID, target := initiate(t, server, signer, "image/png", uint64(len(imageBytes)))
+		h := newHarness(t, accounts, blobs, storage, access, resolver, &fakeModerator{flagged: false})
+		blobID, target := initiate(t, h, signer, "image/png", uint64(len(imageBytes)))
 		upload(target, imageBytes)
 
-		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, server, signer, blobID))
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, h, signer, blobID))
 	})
 }
 
 func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc) {
-	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
+	h := newHarness(t, accounts, blobs, storage, access, resolver, nil)
 	ownerID, signer := registerUser(t, accounts)
 	imageBytes := makePNG(t, 10, 5)
 
 	// A READY blob owned by the uploader.
-	readyID, target := initiate(t, server, signer, "image/png", uint64(len(imageBytes)))
+	readyID, target := initiate(t, h, signer, "image/png", uint64(len(imageBytes)))
 	upload(target, imageBytes)
-	require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, server, signer, readyID))
+	require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, h, signer, readyID))
 
 	// A PENDING blob (reserved, never uploaded).
-	pendingID, _ := initiate(t, server, signer, "image/png", uint64(len(imageBytes)))
+	pendingID, _ := initiate(t, h, signer, "image/png", uint64(len(imageBytes)))
 
 	// A REJECTED blob (uploaded bytes that fail validation).
 	junk := []byte("not an image at all")
-	rejectedID, rejectedTarget := initiate(t, server, signer, "image/png", uint64(len(junk)))
+	rejectedID, rejectedTarget := initiate(t, h, signer, "image/png", uint64(len(junk)))
 	upload(rejectedTarget, junk)
-	require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_REJECTED, complete(t, server, signer, rejectedID))
+	require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_REJECTED, complete(t, h, signer, rejectedID))
 
 	t.Run("owner resolves a ready blob with a fresh download url and metadata", func(t *testing.T) {
 		req := &blobpb.GetBlobsRequest{BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}}}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.GetBlobs(context.Background(), req)
+		resp, err := h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.GetBlobsResponse_OK, resp.Result)
 		require.NotNil(t, resp.Blobs)
@@ -399,7 +427,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		req := &blobpb.GetBlobsRequest{BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}}}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
-		resp, err := server.GetBlobs(context.Background(), req)
+		resp, err := h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.GetBlobsResponse_OK, resp.Result)
 		require.Nil(t, resp.Blobs)
@@ -420,7 +448,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
-		resp, err := server.GetBlobs(context.Background(), req)
+		resp, err := h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.NotNil(t, resp.Blobs)
 		require.Len(t, resp.Blobs.Blobs, 1)
@@ -441,7 +469,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
-		resp, err := server.GetBlobs(context.Background(), req)
+		resp, err := h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.Nil(t, resp.Blobs)
 	})
@@ -462,7 +490,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
-		resp, err := server.GetBlobs(context.Background(), req)
+		resp, err := h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.Nil(t, resp.Blobs)
 	})
@@ -481,7 +509,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
-		resp, err := server.GetBlobs(context.Background(), req)
+		resp, err := h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.NotNil(t, resp.Blobs)
 		require.Len(t, resp.Blobs.Blobs, 1)
@@ -498,7 +526,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
-		resp, err = server.GetBlobs(context.Background(), req)
+		resp, err = h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.Nil(t, resp.Blobs)
 	})
@@ -515,7 +543,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
-		resp, err := server.GetBlobs(context.Background(), req)
+		resp, err := h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.Nil(t, resp.Blobs)
 	})
@@ -536,7 +564,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
-		resp, err := server.GetBlobs(context.Background(), req)
+		resp, err := h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.Nil(t, resp.Blobs)
 	})
@@ -545,7 +573,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		req := &blobpb.GetBlobsRequest{BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{rejectedID}}}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.GetBlobs(context.Background(), req)
+		resp, err := h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.NotNil(t, resp.Blobs)
 		require.Len(t, resp.Blobs.Blobs, 1)
@@ -561,7 +589,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		req := &blobpb.GetBlobsRequest{BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{pendingID}}}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.GetBlobs(context.Background(), req)
+		resp, err := h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.NotNil(t, resp.Blobs)
 		require.Len(t, resp.Blobs.Blobs, 1)
@@ -575,7 +603,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		}}}
 		require.NoError(t, signer.Auth(req, &req.Auth))
 
-		resp, err := server.GetBlobs(context.Background(), req)
+		resp, err := h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, blobpb.GetBlobsResponse_OK, resp.Result)
 		require.Nil(t, resp.Blobs)
@@ -583,21 +611,21 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 
 	t.Run("missing auth is rejected", func(t *testing.T) {
 		req := &blobpb.GetBlobsRequest{BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}}}
-		_, err := server.GetBlobs(context.Background(), req)
+		_, err := h.server.GetBlobs(context.Background(), req)
 		require.Equal(t, codes.InvalidArgument, status.Code(err))
 	})
 }
 
 func testRenditionGeneration(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc) {
-	server := newServer(accounts, blobs, storage, access, resolver, nil, t)
+	h := newHarness(t, accounts, blobs, storage, access, resolver, nil)
 	_, signer := registerUser(t, accounts)
 	ctx := context.Background()
 
 	// readyBlob uploads and finalizes an image, returning the READY original record.
 	readyBlob := func(t *testing.T, mimeType string, data []byte) *blob.Blob {
-		blobID, target := initiate(t, server, signer, mimeType, uint64(len(data)))
+		blobID, target := initiate(t, h, signer, mimeType, uint64(len(data)))
 		upload(target, data)
-		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, server, signer, blobID))
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, h, signer, blobID))
 		record, err := blobs.GetByID(ctx, blobID)
 		require.NoError(t, err)
 		return record
@@ -728,15 +756,15 @@ func testRenditionGeneration(t *testing.T, accounts account.Store, blobs blob.St
 
 	t.Run("re-completing does not duplicate or alter the manifest", func(t *testing.T) {
 		data := makePNG(t, 1000, 500)
-		blobID, target := initiate(t, server, signer, "image/png", uint64(len(data)))
+		blobID, target := initiate(t, h, signer, "image/png", uint64(len(data)))
 		upload(target, data)
-		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, server, signer, blobID))
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, h, signer, blobID))
 
 		before, err := blobs.GetByID(ctx, blobID)
 		require.NoError(t, err)
 
 		// A repeated completion finds the blob terminal and leaves the manifest as-is.
-		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, server, signer, blobID))
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, h, signer, blobID))
 		after, err := blobs.GetByID(ctx, blobID)
 		require.NoError(t, err)
 
@@ -748,36 +776,53 @@ func testRenditionGeneration(t *testing.T, accounts account.Store, blobs blob.St
 }
 
 // initiate runs InitiateExternalUpload and returns the reserved id and target.
-func initiate(t *testing.T, server *blob.Server, signer model.KeyPair, mimeType string, sizeBytes uint64) (*blobpb.BlobId, *blobpb.UploadTarget) {
+func initiate(t *testing.T, h *harness, signer model.KeyPair, mimeType string, sizeBytes uint64) (*blobpb.BlobId, *blobpb.UploadTarget) {
 	req := &blobpb.InitiateExternalUploadRequest{MimeType: mimeType, SizeBytes: sizeBytes}
 	require.NoError(t, signer.Auth(req, &req.Auth))
 
-	resp, err := server.InitiateExternalUpload(context.Background(), req)
+	resp, err := h.server.InitiateExternalUpload(context.Background(), req)
 	require.NoError(t, err)
 	require.Equal(t, blobpb.InitiateExternalUploadResponse_OK, resp.Result)
 	return resp.BlobId, resp.UploadTarget
 }
 
 // completeResponse runs CompleteExternalUpload and returns the full OK response.
-func completeResponse(t *testing.T, server *blob.Server, signer model.KeyPair, blobID *blobpb.BlobId) *blobpb.CompleteExternalUploadResponse {
+func completeResponse(t *testing.T, h *harness, signer model.KeyPair, blobID *blobpb.BlobId) *blobpb.CompleteExternalUploadResponse {
 	req := &blobpb.CompleteExternalUploadRequest{BlobId: blobID}
 	require.NoError(t, signer.Auth(req, &req.Auth))
 
-	resp, err := server.CompleteExternalUpload(context.Background(), req)
+	resp, err := h.server.CompleteExternalUpload(context.Background(), req)
 	require.NoError(t, err)
 	require.Equal(t, blobpb.CompleteExternalUploadResponse_OK, resp.Result)
 	return resp
 }
 
-// complete runs CompleteExternalUpload and returns the resulting status.
-func complete(t *testing.T, server *blob.Server, signer model.KeyPair, blobID *blobpb.BlobId) blobpb.BlobStatus {
-	return completeResponse(t, server, signer, blobID).Status
+// completeAndProcess finishes an upload end-to-end: it completes it (which only
+// queues the finalization work), drains the worker, and returns the terminal
+// response reported by the idempotent re-complete.
+func completeAndProcess(t *testing.T, h *harness, signer model.KeyPair, blobID *blobpb.BlobId) *blobpb.CompleteExternalUploadResponse {
+	resp := completeResponse(t, h, signer, blobID)
+	if resp.Status == blobpb.BlobStatus_BLOB_STATUS_READY || resp.Status == blobpb.BlobStatus_BLOB_STATUS_REJECTED {
+		// Already finalized (a re-complete of a terminal blob); there is no
+		// queued work to drive.
+		return resp
+	}
+	require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_PROCESSING, resp.Status)
+	h.drain(t)
+	return completeResponse(t, h, signer, blobID)
 }
 
-// requireRejected asserts that completing the blob rejects it with the given
-// reason, surfaced in the response's rejection metadata.
-func requireRejected(t *testing.T, server *blob.Server, signer model.KeyPair, blobID *blobpb.BlobId, reason blobpb.RejectionReason) {
-	resp := completeResponse(t, server, signer, blobID)
+// complete finishes an upload end-to-end (see completeAndProcess) and returns
+// the terminal status.
+func complete(t *testing.T, h *harness, signer model.KeyPair, blobID *blobpb.BlobId) blobpb.BlobStatus {
+	return completeAndProcess(t, h, signer, blobID).Status
+}
+
+// requireRejected asserts that completing the blob (and running the worker)
+// rejects it with the given reason, surfaced in the terminal completion
+// response's rejection metadata.
+func requireRejected(t *testing.T, h *harness, signer model.KeyPair, blobID *blobpb.BlobId, reason blobpb.RejectionReason) {
+	resp := completeAndProcess(t, h, signer, blobID)
 	require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_REJECTED, resp.Status)
 	require.NotNil(t, resp.RejectionMetadata)
 	require.Equal(t, reason, resp.RejectionMetadata.Reason)

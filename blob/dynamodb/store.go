@@ -50,6 +50,24 @@ const (
 
 	attrRenditions = "renditions" // S (JSON manifest), present only on ORIGINALs with generated renditions
 
+	// The finalization queues are a sparse GSI over the blobs table: the queue
+	// attributes are present exactly while a blob has uploaded bytes awaiting
+	// processing, so only queued blobs appear in the index. There is one queue —
+	// one index partition, see finalizeQueuePK — per content kind, each drained
+	// by its own worker. Reaching a terminal state removes the attributes in the
+	// same UpdateItem as the transition, dequeuing atomically.
+	attrFinalizeQueue      = "finalize_queue"      // S, finalizeQueuePK(kind) (GSI hash); present only while queued
+	attrFinalizeDueAt      = "finalize_due_at"     // N, Unix nanos (GSI range); when the task is next due
+	attrFinalizeAttempts   = "finalize_attempts"   // N, failed attempts so far
+	attrFinalizeEnqueuedAt = "finalize_enqueued_at" // N, Unix nanos; set on first mark, never reset (backs the max-age gauge)
+
+	// finalizationQueueIndex is the sparse GSI backing GetDueForFinalization.
+	finalizationQueueIndex = "finalization_queue"
+
+	// finalizeQueuePrefix prefixes a queue's partition value; the content kind's
+	// stable numeric value completes it (see finalizeQueuePK).
+	finalizeQueuePrefix = "queue#"
+
 	blobKeyPrefix = "blob#"
 
 	// batchGetMaxKeys is the DynamoDB BatchGetItem per-request key limit.
@@ -79,7 +97,7 @@ func NewInDynamoDB(client *dynamodb.Client, table string) blob.Store {
 func (s *store) CreatePending(ctx context.Context, b *blob.Blob) error {
 	item := toItem(b)
 	now := time.Now()
-	item[attrCreatedAt] = avUint64(uint64(now.UnixNano()))
+	item[attrCreatedAt] = avUnixNanos(now)
 	// A never-completed reservation should not live forever; give the record a
 	// TTL that Advance clears once the blob reaches READY.
 	item[attrExpiresAt] = avUnix(now.Add(pendingBlobTTL))
@@ -233,10 +251,10 @@ func (s *store) Advance(ctx context.Context, id *blobpb.BlobId, to blob.State, i
 		values[":a"] = avBool(image.HasAlpha)
 	}
 	// READY is the durable terminal state: clear the TTL so the blob is never
-	// reclaimed. Non-terminal and rejected records keep it and expire if they
-	// never reach READY.
+	// reclaimed, and dequeue it from the finalization queue — the work is done.
+	// Non-terminal records keep the TTL and expire if they never reach READY.
 	if to == blob.StateReady {
-		update += fmt.Sprintf(" REMOVE %s", attrExpiresAt)
+		update += fmt.Sprintf(" REMOVE %s, %s, %s, %s, %s", attrExpiresAt, attrFinalizeQueue, attrFinalizeDueAt, attrFinalizeAttempts, attrFinalizeEnqueuedAt)
 	}
 
 	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
@@ -279,6 +297,9 @@ func (s *store) Reject(ctx context.Context, id *blobpb.BlobId, rejection *blob.R
 		values[":reason"] = avInt(int(rejection.Reason))
 		values[":cat"] = avInt(int(rejection.FlaggedCategory))
 	}
+	// Rejection is terminal: dequeue the blob from the finalization queue along
+	// with the transition.
+	update += fmt.Sprintf(" REMOVE %s, %s, %s, %s", attrFinalizeQueue, attrFinalizeDueAt, attrFinalizeAttempts, attrFinalizeEnqueuedAt)
 	// REJECTED keeps the TTL set at creation: a rejected record is a tombstone the
 	// client can read for the reason, then DynamoDB reclaims it. Only READY clears
 	// the TTL (in Advance).
@@ -307,6 +328,195 @@ func (s *store) Reject(ctx context.Context, id *blobpb.BlobId, rejection *blob.R
 		return false, err
 	}
 	return true, nil
+}
+
+func (s *store) MarkForFinalization(ctx context.Context, id *blobpb.BlobId, kind blob.ContentKind, nextAttemptAt time.Time) error {
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key:       map[string]types.AttributeValue{attrPK: avS(blobPK(id))},
+		// Re-marking resets the due time (and the queue partition, should the kind
+		// differ) but preserves the attempt count and the original enqueue time
+		// (if_not_exists), so a client re-completing cannot wipe the backoff
+		// bookkeeping or hide the entry's age.
+		UpdateExpression: aws.String("SET #q = :q, #due = :due, #attempts = if_not_exists(#attempts, :zero), #enq = if_not_exists(#enq, :enq)"),
+		// Only a live, non-terminal blob is queued: the work behind a terminal one
+		// is already done.
+		ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s) AND #state <> :ready AND #state <> :rejected", attrPK)),
+		ExpressionAttributeNames: map[string]string{
+			"#q":        attrFinalizeQueue,
+			"#due":      attrFinalizeDueAt,
+			"#attempts": attrFinalizeAttempts,
+			"#enq":      attrFinalizeEnqueuedAt,
+			"#state":    attrState,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":q":        avS(finalizeQueuePK(kind)),
+			":due":      avUnixNanos(nextAttemptAt),
+			":zero":     avInt(0),
+			":enq":      avUnixNanos(time.Now()),
+			":ready":    avInt(int(blob.StateReady)),
+			":rejected": avInt(int(blob.StateRejected)),
+		},
+		// Distinguish "no such blob" from "already terminal" on failure.
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	})
+	if err != nil {
+		var ccf *types.ConditionalCheckFailedException
+		if errors.As(err, &ccf) {
+			if len(ccf.Item) == 0 {
+				return blob.ErrNotFound
+			}
+			// The blob is terminal; marking is an idempotent no-op.
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *store) GetDueForFinalization(ctx context.Context, kind blob.ContentKind, asOf time.Time, limit int) ([]*blob.FinalizationTask, error) {
+	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		IndexName:              aws.String(finalizationQueueIndex),
+		KeyConditionExpression: aws.String("#q = :q AND #due <= :asOf"),
+		ExpressionAttributeNames: map[string]string{
+			"#q":   attrFinalizeQueue,
+			"#due": attrFinalizeDueAt,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":q":    avS(finalizeQueuePK(kind)),
+			":asOf": avUnixNanos(asOf),
+		},
+		// The range key is the due time, so the query is already soonest-first.
+		Limit: aws.Int32(int32(limit)),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	tasks := make([]*blob.FinalizationTask, 0, len(out.Items))
+	for _, item := range out.Items {
+		idBytes, err := hex.DecodeString(strings.TrimPrefix(stringAttr(item, attrPK), blobKeyPrefix))
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s attribute: %w", attrPK, err)
+		}
+		attempts, err := intAttr(item, attrFinalizeAttempts)
+		if err != nil {
+			return nil, err
+		}
+		dueAtNanos, err := uint64Attr(item, attrFinalizeDueAt)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, &blob.FinalizationTask{
+			ID:            &blobpb.BlobId{Value: idBytes},
+			Attempts:      uint32(attempts),
+			NextAttemptAt: time.Unix(0, int64(dueAtNanos)),
+		})
+	}
+	return tasks, nil
+}
+
+func (s *store) GetFinalizationQueueStats(ctx context.Context, kind blob.ContentKind) (*blob.FinalizationQueueStats, error) {
+	// One walk of the kind's (sparse, shallow) queue partition yields both
+	// gauges: the item count is the depth, and the minimum enqueue time is the
+	// oldest entry. Only the enqueue attribute is projected, so the walk ships
+	// almost nothing; the pagination loop is only for correctness should a
+	// backlog ever exceed one page.
+	stats := &blob.FinalizationQueueStats{}
+	var startKey map[string]types.AttributeValue
+	for {
+		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(s.table),
+			IndexName:              aws.String(finalizationQueueIndex),
+			KeyConditionExpression: aws.String("#q = :q"),
+			ProjectionExpression:   aws.String("#enq"),
+			ExpressionAttributeNames: map[string]string{
+				"#q":   attrFinalizeQueue,
+				"#enq": attrFinalizeEnqueuedAt,
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":q": avS(finalizeQueuePK(kind)),
+			},
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		stats.Depth += uint64(len(out.Items))
+		for _, item := range out.Items {
+			enqueuedAtNanos, err := uint64Attr(item, attrFinalizeEnqueuedAt)
+			if err != nil {
+				return nil, err
+			}
+			enqueuedAt := time.Unix(0, int64(enqueuedAtNanos))
+			if stats.OldestEnqueuedAt.IsZero() || enqueuedAt.Before(stats.OldestEnqueuedAt) {
+				stats.OldestEnqueuedAt = enqueuedAt
+			}
+		}
+
+		if len(out.LastEvaluatedKey) == 0 {
+			return stats, nil
+		}
+		startKey = out.LastEvaluatedKey
+	}
+}
+
+func (s *store) ClaimForFinalization(ctx context.Context, id *blobpb.BlobId, asOf, until time.Time) (bool, error) {
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:        aws.String(s.table),
+		Key:              map[string]types.AttributeValue{attrPK: avS(blobPK(id))},
+		UpdateExpression: aws.String("SET #due = :until"),
+		// Claim only a blob that is still queued and still due: a dequeued blob was
+		// finalized, and one pushed into the future was claimed or delayed by
+		// another worker first.
+		ConditionExpression: aws.String("attribute_exists(#q) AND #due <= :asOf"),
+		ExpressionAttributeNames: map[string]string{
+			"#q":   attrFinalizeQueue,
+			"#due": attrFinalizeDueAt,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":until": avUnixNanos(until),
+			":asOf":  avUnixNanos(asOf),
+		},
+	})
+	if err != nil {
+		var ccf *types.ConditionalCheckFailedException
+		if errors.As(err, &ccf) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *store) DelayFinalization(ctx context.Context, id *blobpb.BlobId, nextAttemptAt time.Time) error {
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:        aws.String(s.table),
+		Key:              map[string]types.AttributeValue{attrPK: avS(blobPK(id))},
+		UpdateExpression: aws.String("SET #due = :due ADD #attempts :one"),
+		// A blob that left the queue (a concurrent finalize drove it terminal) has
+		// nothing to reschedule.
+		ConditionExpression: aws.String("attribute_exists(#q)"),
+		ExpressionAttributeNames: map[string]string{
+			"#q":        attrFinalizeQueue,
+			"#due":      attrFinalizeDueAt,
+			"#attempts": attrFinalizeAttempts,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":due": avUnixNanos(nextAttemptAt),
+			":one": avInt(1),
+		},
+	})
+	if err != nil {
+		var ccf *types.ConditionalCheckFailedException
+		if errors.As(err, &ccf) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func toItem(b *blob.Blob) map[string]types.AttributeValue {
@@ -536,6 +746,22 @@ func unmarshalRenditions(encoded string, def renditionDefaults) ([]blob.Renditio
 
 func blobPK(id *blobpb.BlobId) string { return blobKeyPrefix + hex.EncodeToString(id.Value) }
 
+// finalizeQueuePK is the queue partition a content kind's blobs wait in, e.g.
+// "queue#1" for images. The kind's numeric value is persisted, matching how the
+// other internal enums (state, rendition) are stored, so it must stay stable —
+// which blob.ContentKind already guarantees.
+//
+// Each kind's queue is deliberately a single partition: entries are ephemeral
+// (a blob dequeues as soon as it finalizes), so the partition holds only
+// in-flight work, and its write budget sustains hundreds of finalizations per
+// second — orders of magnitude above expected load. If a kind ever runs hot,
+// shard ADDITIVELY: keep this value as shard 0 and add "queue#<kind>#1..N-1"
+// beside it, so in-flight entries under the old key stay drainable and no
+// migration is needed.
+func finalizeQueuePK(kind blob.ContentKind) string {
+	return finalizeQueuePrefix + strconv.Itoa(int(kind))
+}
+
 func avS(v string) types.AttributeValue { return &types.AttributeValueMemberS{Value: v} }
 func avInt(v int) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.Itoa(v)}
@@ -545,6 +771,9 @@ func avUint64(v uint64) types.AttributeValue {
 }
 func avUnix(t time.Time) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.FormatInt(t.Unix(), 10)}
+}
+func avUnixNanos(t time.Time) types.AttributeValue {
+	return &types.AttributeValueMemberN{Value: strconv.FormatInt(t.UnixNano(), 10)}
 }
 func avBool(v bool) types.AttributeValue { return &types.AttributeValueMemberBOOL{Value: v} }
 

@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -20,6 +21,7 @@ func RunStoreTests(t *testing.T, store blob.Store, teardown func()) {
 		testStoreAdvance,
 		testStoreReject,
 		testStoreRenditions,
+		testStoreFinalizationQueue,
 	} {
 		tf(t, store)
 		teardown()
@@ -193,6 +195,137 @@ func testStoreReject(t *testing.T, store blob.Store) {
 	require.NoError(t, err)
 	require.Equal(t, blob.StateReady, got.State)
 	require.Nil(t, got.Rejection)
+}
+
+func testStoreFinalizationQueue(t *testing.T, store blob.Store) {
+	ctx := context.Background()
+	now := time.Now()
+
+	// Marking an unknown blob reports not-found.
+	require.ErrorIs(t, store.MarkForFinalization(ctx, blob.MustGenerateID(), blob.ContentKindImage, now), blob.ErrNotFound)
+
+	// An empty queue has nothing due.
+	due, err := store.GetDueForFinalization(ctx, blob.ContentKindImage, now.Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Empty(t, due)
+
+	first := pendingOriginal(t)
+	require.NoError(t, store.CreatePending(ctx, first))
+	second := pendingOriginal(t)
+	require.NoError(t, store.CreatePending(ctx, second))
+
+	// Queue both, the second due later, so the asOf bound and ordering are
+	// observable.
+	require.NoError(t, store.MarkForFinalization(ctx, first.ID, blob.ContentKindImage, now))
+	require.NoError(t, store.MarkForFinalization(ctx, second.ID, blob.ContentKindImage, now.Add(time.Minute)))
+
+	// Only work due as of asOf is returned, with fresh bookkeeping.
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindImage, now, 10)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	require.Equal(t, first.ID.Value, due[0].ID.Value)
+	require.EqualValues(t, 0, due[0].Attempts)
+	require.False(t, due[0].NextAttemptAt.After(now))
+
+	// With both due: soonest first, and the limit is honored.
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindImage, now.Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Len(t, due, 2)
+	require.Equal(t, first.ID.Value, due[0].ID.Value)
+	require.Equal(t, second.ID.Value, due[1].ID.Value)
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindImage, now.Add(time.Hour), 1)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	require.Equal(t, first.ID.Value, due[0].ID.Value)
+
+	// Queues are partitioned by content kind: work queued under one kind is
+	// invisible to another kind's poll.
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindUnknown, now.Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Empty(t, due)
+
+	// The stats cover everything queued under the kind — due or not — and are
+	// likewise partitioned by kind. The oldest enqueue time is a real, recent
+	// instant.
+	stats, err := store.GetFinalizationQueueStats(ctx, blob.ContentKindImage)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, stats.Depth)
+	require.False(t, stats.OldestEnqueuedAt.IsZero())
+	require.False(t, stats.OldestEnqueuedAt.Before(now.Add(-time.Minute)))
+	oldestEnqueuedAt := stats.OldestEnqueuedAt
+	stats, err = store.GetFinalizationQueueStats(ctx, blob.ContentKindUnknown)
+	require.NoError(t, err)
+	require.Zero(t, stats.Depth)
+	require.True(t, stats.OldestEnqueuedAt.IsZero())
+
+	// A claim pushes the due time out, so the task disappears from the due set
+	// and a second claimant is refused until the lease passes.
+	claimed, err := store.ClaimForFinalization(ctx, first.ID, now, now.Add(time.Minute))
+	require.NoError(t, err)
+	require.True(t, claimed)
+	claimed, err = store.ClaimForFinalization(ctx, first.ID, now, now.Add(time.Minute))
+	require.NoError(t, err)
+	require.False(t, claimed)
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindImage, now, 10)
+	require.NoError(t, err)
+	require.Empty(t, due)
+
+	// A delay reschedules with an incremented attempt count.
+	require.NoError(t, store.DelayFinalization(ctx, first.ID, now.Add(2*time.Second)))
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindImage, now.Add(2*time.Second), 10)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	require.Equal(t, first.ID.Value, due[0].ID.Value)
+	require.EqualValues(t, 1, due[0].Attempts)
+
+	// Re-marking resets the due time but preserves the attempt count, so a
+	// client re-completing cannot wipe the backoff bookkeeping.
+	require.NoError(t, store.MarkForFinalization(ctx, first.ID, blob.ContentKindImage, now))
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindImage, now, 10)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	require.EqualValues(t, 1, due[0].Attempts)
+
+	// Neither the delay nor the re-mark reset the enqueue time, so the queue's
+	// max age keeps counting from the FIRST enqueue.
+	stats, err = store.GetFinalizationQueueStats(ctx, blob.ContentKindImage)
+	require.NoError(t, err)
+	require.True(t, stats.OldestEnqueuedAt.Equal(oldestEnqueuedAt))
+
+	// Reaching READY dequeues atomically with the transition.
+	for _, to := range []blob.State{blob.StateUploaded, blob.StateInspected, blob.StatePromoted, blob.StateGeneratingRenditions, blob.StateReady} {
+		_, err = store.Advance(ctx, first.ID, to, nil)
+		require.NoError(t, err)
+	}
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindImage, now.Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	require.Equal(t, second.ID.Value, due[0].ID.Value)
+
+	// Rejection dequeues too, and the terminal transitions drained the count
+	// along with the queue.
+	advanced, err := store.Reject(ctx, second.ID, &blob.RejectionMetadata{Reason: blob.RejectionReasonInternal})
+	require.NoError(t, err)
+	require.True(t, advanced)
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindImage, now.Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Empty(t, due)
+	stats, err = store.GetFinalizationQueueStats(ctx, blob.ContentKindImage)
+	require.NoError(t, err)
+	require.Zero(t, stats.Depth)
+	require.True(t, stats.OldestEnqueuedAt.IsZero())
+
+	// The queue operations are no-ops against terminal blobs: marking queues
+	// nothing (the work is done), and delaying or claiming a dequeued blob does
+	// not resurrect it.
+	require.NoError(t, store.MarkForFinalization(ctx, first.ID, blob.ContentKindImage, now))
+	require.NoError(t, store.DelayFinalization(ctx, second.ID, now))
+	claimed, err = store.ClaimForFinalization(ctx, second.ID, now.Add(time.Hour), now.Add(2*time.Hour))
+	require.NoError(t, err)
+	require.False(t, claimed)
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindImage, now.Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Empty(t, due)
 }
 
 func testStoreRenditions(t *testing.T, store blob.Store) {

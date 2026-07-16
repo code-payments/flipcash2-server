@@ -3,6 +3,7 @@ package blob
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -185,8 +186,13 @@ func (w *Worker) Start(ctx context.Context, interval time.Duration) error {
 // bounded concurrency, reporting how many this worker actually took on (claimed,
 // or terminally failed for exhaustion). Zero means the due queue is drained —
 // tasks other workers hold claims on are not counted.
-func (w *Worker) Process(ctx context.Context) (int, error) {
-	due, err := w.blobs.GetDueForFinalization(ctx, w.kind, time.Now(), w.batchSize)
+func (w *Worker) Process(runtimeCtx context.Context) (int, error) {
+	metricsProvider := runtimeCtx.Value(metrics.ProviderContextKey).(metrics.Provider)
+	trace := metricsProvider.StartTrace(fmt.Sprintf("blob_%s_worker", w.kind.String()))
+	defer trace.End()
+	tracedCtx := metrics.NewContext(runtimeCtx, trace)
+
+	due, err := w.blobs.GetDueForFinalization(tracedCtx, w.kind, time.Now(), w.batchSize)
 	if err != nil {
 		return 0, err
 	}
@@ -198,7 +204,7 @@ func (w *Worker) Process(ctx context.Context) (int, error) {
 		sem <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			if w.processOne(ctx, task) {
+			if w.processOne(tracedCtx, task) {
 				processed.Add(1)
 			}
 		})

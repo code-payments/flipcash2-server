@@ -18,6 +18,7 @@ import (
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/blob"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/moderation"
 	"github.com/code-payments/flipcash2-server/social/x"
 )
 
@@ -31,12 +32,14 @@ type Server struct {
 
 	media Media
 
+	moderator moderation.Client
+
 	xClient *x.Client
 
 	profilepb.UnimplementedProfileServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, media Media, xClient *x.Client) *Server {
+func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, media Media, moderator moderation.Client, xClient *x.Client) *Server {
 	return &Server{
 		log: log,
 
@@ -46,6 +49,8 @@ func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, p
 		profiles: profiles,
 
 		media: media,
+
+		moderator: moderator,
 
 		xClient: xClient,
 	}
@@ -99,6 +104,27 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 		return nil, status.Errorf(codes.Internal, "failed to get registration flag")
 	} else if !isRegistered {
 		return &profilepb.SetDisplayNameResponse{Result: profilepb.SetDisplayNameResponse_DENIED}, nil
+	}
+
+	if s.moderator != nil {
+		// Moderate before persisting, so a flagged name is never briefly visible to
+		// anyone reading the profile.
+		result, err := s.moderator.ClassifyText(ctx, req.DisplayName)
+		if err != nil {
+			// Includes moderation.ErrUnsupportedLanguage: a name that cannot be
+			// classified is never persisted, since allowing it would leave an
+			// unmoderated name in place.
+			log.Warn("Failed to classify display name", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to moderate display name")
+		}
+
+		if result.Flagged {
+			log.Info("Display name is flagged", zap.Strings("categories", result.FlaggedCategories))
+			return &profilepb.SetDisplayNameResponse{
+				Result:          profilepb.SetDisplayNameResponse_FAILED_MODERATED,
+				FlaggedCategory: moderation.HighestFlaggedCategory(result),
+			}, nil
+		}
 	}
 
 	if err := s.profiles.SetDisplayName(ctx, userID, req.DisplayName); err != nil {

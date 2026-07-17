@@ -13,6 +13,7 @@ import (
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	emailpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/email/v1"
+	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/code-payments/flipcash2-server/blob"
 	blobmemory "github.com/code-payments/flipcash2-server/blob/memory"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/moderation"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/protoutil"
 	"github.com/code-payments/flipcash2-server/social/x"
@@ -31,6 +33,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 	for _, tf := range []func(t *testing.T, accounts account.Store, profiles profile.Store){
 		testServer,
 		testProfilePicture,
+		testDisplayNameModeration,
 	} {
 		tf(t, accounts, profiles)
 		teardown()
@@ -83,7 +86,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, x.NewClient())
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -258,7 +261,7 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, blobs, access := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, x.NewClient())
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -450,4 +453,104 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 		require.Equal(t, profilepb.GetProfileResponse_OK, getResp.Result)
 		requireRenditionSet(t, getResp.UserProfile.GetProfilePicture().GetRenditions())
 	})
+}
+
+func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+	media, _, _ := newMedia()
+
+	moderator := &fakeModerator{}
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, x.NewClient())
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+	client := profilepb.NewProfileClient(cc)
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
+	require.NoError(t, err)
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
+
+	setDisplayName := func(name string) (*profilepb.SetDisplayNameResponse, error) {
+		t.Helper()
+		req := &profilepb.SetDisplayNameRequest{DisplayName: name}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		return client.SetDisplayName(ctx, req)
+	}
+
+	displayName := func() string {
+		t.Helper()
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		require.NoError(t, err)
+		return resp.GetUserProfile().GetDisplayName()
+	}
+
+	t.Run("Clean name is moderated and persisted", func(t *testing.T) {
+		moderator.textFlagged = false
+		moderator.textErr = nil
+
+		resp, err := setDisplayName("clean name")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, resp.Result)
+		require.Equal(t, "clean name", displayName())
+	})
+
+	t.Run("Flagged name is rejected and not persisted", func(t *testing.T) {
+		moderator.textFlagged = true
+		moderator.textCategories = []string{"general_nsfw"}
+		moderator.textErr = nil
+
+		resp, err := setDisplayName("bad name")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetDisplayNameResponse_FAILED_MODERATED, resp.Result)
+		require.Equal(t, moderationpb.FlaggedCategory_NSFW, resp.FlaggedCategory)
+
+		// The prior clean name is left untouched.
+		require.Equal(t, "clean name", displayName())
+	})
+
+	t.Run("Unclassifiable name fails closed", func(t *testing.T) {
+		moderator.textFlagged = false
+		moderator.textErr = moderation.ErrUnsupportedLanguage
+
+		_, err := setDisplayName("네네네")
+		require.Equal(t, codes.Internal, status.Code(err))
+
+		require.Equal(t, "clean name", displayName())
+	})
+}
+
+// fakeModerator is a configurable moderation.Client for the display-name tests.
+// Only ClassifyText is exercised; the other methods satisfy the interface.
+type fakeModerator struct {
+	textFlagged    bool
+	textCategories []string
+	textErr        error
+}
+
+func (m *fakeModerator) ClassifyText(context.Context, string) (*moderation.Result, error) {
+	if m.textErr != nil {
+		return nil, m.textErr
+	}
+	result := &moderation.Result{Flagged: m.textFlagged}
+	if len(m.textCategories) > 0 {
+		result.FlaggedCategories = m.textCategories
+		result.CategoryScores = make(map[string]float64, len(m.textCategories))
+		for i, category := range m.textCategories {
+			result.CategoryScores[category] = float64(i + 1)
+		}
+	}
+	return result, nil
+}
+
+func (m *fakeModerator) ClassifyImage(context.Context, []byte) (*moderation.Result, error) {
+	return &moderation.Result{}, nil
+}
+
+func (m *fakeModerator) ClassifyCurrencyName(context.Context, string) (*moderation.Result, error) {
+	return &moderation.Result{}, nil
 }

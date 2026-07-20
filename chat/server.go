@@ -262,7 +262,7 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 		}
 		for _, m := range c.Members {
 			uniqueUserIDs[string(m.Value)] = m
-			if c.Type == chatpb.Metadata_DM {
+			if c.Type == chatpb.ChatType_CONTACT_DM {
 				uniqueDmUserIds[string(m.Value)] = m
 			}
 		}
@@ -313,7 +313,7 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 				DisplayName:    displayNamesByUserId[string(m.UserId.Value)],
 				ProfilePicture: profilePicturesByUserId[string(m.UserId.Value)],
 			}
-			if md.Type == chatpb.Metadata_DM {
+			if md.Type == chatpb.ChatType_CONTACT_DM {
 				profile.PhoneNumber = phoneNumbersByUserId[string(m.UserId.Value)]
 			}
 			m.UserProfile = profile

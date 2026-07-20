@@ -86,7 +86,7 @@ func (e *Executor) sendContactDmPaymentMessage(ctx context.Context, record *ocp_
 
 	// The message must land in the canonical DM between the two users, which is
 	// the chat the client referenced in the validated app metadata.
-	chatID := chat.MustDeriveDmChatID(senderUserID, recipientUserID)
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, senderUserID, recipientUserID)
 	if !bytes.Equal(chatMetadata.GetChatId().GetValue(), chatID.Value) {
 		return errors.New("chat id does not match the dm between sender and recipient")
 	}
@@ -97,7 +97,7 @@ func (e *Executor) sendContactDmPaymentMessage(ctx context.Context, record *ocp_
 	// a failure.
 	err = e.chats.PutChat(ctx, &chat.Chat{
 		ID:           chatID,
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{senderUserID, recipientUserID},
 		LastActivity: time.Now().UTC(),
 	})

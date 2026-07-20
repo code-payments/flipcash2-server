@@ -21,25 +21,46 @@ const ChatIDSize = 32
 
 // dmChatIDDomain namespaces the DM chat ID hash so it can never collide with an
 // ID derived for another purpose, even if that purpose hashes the same members.
-var dmChatIDDomain = []byte("flipcash:chat:dm")
-
-// MustDeriveDmChatID returns the deterministic chat ID for a DM between two
-// users.
 //
-// The ID is derived purely from the participants, so it is stable across calls
-// and independent of who initiates the chat: MustDeriveDmChatID(a, b) always
-// equals MustDeriveDmChatID(b, a). This lets either user open the canonical DM
-// without a prior lookup, and makes creation idempotent.
+// Contact DMs hash under this bare domain; every other DM type appends its
+// ChatType number (e.g. "flipcash:chat:dm:2" for tip DMs), so the same pair of
+// users derives a distinct chat per DM type.
+const dmChatIDDomain = "flipcash:chat:dm"
+
+// MustDeriveDmChatID returns the deterministic chat ID for a DM of the given
+// type between two users.
+//
+// The ID is derived purely from the DM type and the participants, so it is
+// stable across calls and independent of who initiates the chat:
+// MustDeriveDmChatID(t, a, b) always equals MustDeriveDmChatID(t, b, a). This
+// lets either user open the canonical DM without a prior lookup, and makes
+// creation idempotent.
 //
 // Derivation hashes the byte-sorted, de-duplicated set of user IDs (a DM with
-// oneself collapses to a single member) under a domain-separation prefix. Since
-// the input is a sorted set, member ordering and duplicates do not affect the
-// result. The SHA-256 digest is ChatIDSize bytes wide by construction.
+// oneself collapses to a single member) under a domain-separation prefix that
+// encodes the DM type. Contact DMs use the bare prefix because they predate
+// typed derivation, and their chat IDs must not change; the domains cannot
+// alias each other because member sets are fixed-width, so the two encodings
+// never produce equal-length hash inputs. Since the input is a sorted set,
+// member ordering and duplicates do not affect the result. The SHA-256 digest
+// is ChatIDSize bytes wide by construction.
 //
-// It panics if either user ID is not the expected fixed width, which would be a
-// programming error: all user IDs in the system are UUIDs. Fixed-width members
-// also make the sorted concatenation unambiguous without length prefixing.
-func MustDeriveDmChatID(a, b *commonpb.UserId) *commonpb.ChatId {
+// It panics on an unspecified chat type, or if either user ID is not the
+// expected fixed width, which would be a programming error: all user IDs in
+// the system are UUIDs. Fixed-width members also make the sorted concatenation
+// unambiguous without length prefixing.
+func MustDeriveDmChatID(chatType chatpb.ChatType, a, b *commonpb.UserId) *commonpb.ChatId {
+	domain := dmChatIDDomain
+	switch chatType {
+	case chatpb.ChatType_CONTACT_DM:
+		// Bare legacy domain: contact DM IDs predate typed derivation.
+	case chatpb.ChatType_TIP_DM:
+		// Every other DM chat type appends its enum value to the domain
+		domain = fmt.Sprintf("%s:%d", dmChatIDDomain, chatType)
+	default:
+		panic("unsupported chat type")
+	}
+
 	for _, u := range []*commonpb.UserId{a, b} {
 		if len(u.Value) != model.UserIDSize {
 			panic(fmt.Sprintf("user id must be %d bytes, got %d", model.UserIDSize, len(u.Value)))
@@ -57,7 +78,7 @@ func MustDeriveDmChatID(a, b *commonpb.UserId) *commonpb.ChatId {
 	}
 
 	h := sha256.New()
-	h.Write(dmChatIDDomain)
+	h.Write([]byte(domain))
 	for _, m := range members {
 		h.Write(m)
 	}
@@ -74,7 +95,7 @@ func MustDeriveDmChatID(a, b *commonpb.UserId) *commonpb.ChatId {
 // domains (profile, messaging) and are hydrated by the server layer.
 type Chat struct {
 	ID            *commonpb.ChatId
-	Type          chatpb.Metadata_ChatType
+	Type          chatpb.ChatType
 	Members       []*commonpb.UserId
 	LastActivity  time.Time
 	LastMessageID *messagingpb.MessageId

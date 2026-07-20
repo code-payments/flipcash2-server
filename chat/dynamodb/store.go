@@ -398,6 +398,6 @@ func isTransactionCanceled(err error) bool {
 	return errors.As(err, &tce)
 }
 
-func protoChatType(v uint64) chatpb.Metadata_ChatType {
-	return chatpb.Metadata_ChatType(v)
+func protoChatType(v uint64) chatpb.ChatType {
+	return chatpb.ChatType(v)
 }

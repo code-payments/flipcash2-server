@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	contactpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/contact/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
@@ -294,7 +295,7 @@ func (s *Server) GetFlipcashContacts(req *contactpb.GetFlipcashContactsRequest, 
 		for i, m := range batch {
 			contacts[i] = &contactpb.FlipcashContact{
 				Phone:    m.PhoneNumber,
-				DmChatId: chat.MustDeriveDmChatID(userID, m.UserID),
+				DmChatId: chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, userID, m.UserID),
 				JoinTs:   timestamppb.New(m.JoinedAt),
 			}
 		}

@@ -203,7 +203,7 @@ func (e *serverEnv) putDM(lastActivity time.Time) *commonpb.ChatId {
 	chatID := generateChatID()
 	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
 		ID:           chatID,
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{e.userID, model.MustGenerateUserID()},
 		LastActivity: lastActivity,
 	}))
@@ -219,7 +219,7 @@ func (e *serverEnv) getChat(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb
 }
 
 func (e *serverEnv) getDmFeed(opts *commonpb.QueryOptions) *chatpb.GetDmChatFeedResponse {
-	req := &chatpb.GetDmChatFeedRequest{QueryOptions: opts}
+	req := &chatpb.GetDmChatFeedRequest{DmChatType: chatpb.ChatType_CONTACT_DM, QueryOptions: opts}
 	require.NoError(e.t, e.keys.Auth(req, &req.Auth))
 	resp, err := e.client.GetDmChatFeed(e.ctx, req)
 	require.NoError(e.t, err)
@@ -235,7 +235,7 @@ func testServer_GetChat_OK(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.NotNil(t, resp.Metadata)
 	require.Equal(t, chatID.Value, resp.Metadata.ChatId.Value)
-	require.Equal(t, chatpb.Metadata_DM, resp.Metadata.Type)
+	require.Equal(t, chatpb.ChatType_CONTACT_DM, resp.Metadata.Type)
 	require.Len(t, resp.Metadata.Members, 2)
 	require.Equal(t, e.userID.Value, resp.Metadata.Members[0].UserId.Value)
 	require.True(t, resp.Metadata.LastActivity.AsTime().Equal(at(1)))
@@ -291,7 +291,7 @@ func testServer_GetDmChatFeed_OrderAndContent(t *testing.T, s chat.Store) {
 
 	// The chat-domain metadata is populated for each entry.
 	first := resp.Chats[0]
-	require.Equal(t, chatpb.Metadata_DM, first.Type)
+	require.Equal(t, chatpb.ChatType_CONTACT_DM, first.Type)
 	require.Len(t, first.Members, 2)
 	require.Equal(t, e.userID.Value, first.Members[0].UserId.Value)
 	require.True(t, first.LastActivity.AsTime().Equal(at(2)))
@@ -337,7 +337,7 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	chatID := generateChatID()
 	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
 		ID:            chatID,
-		Type:          chatpb.Metadata_DM,
+		Type:          chatpb.ChatType_CONTACT_DM,
 		Members:       []*commonpb.UserId{e.userID, peer},
 		LastActivity:  at(1),
 		LastMessageID: &messagingpb.MessageId{Value: 7},
@@ -405,7 +405,7 @@ func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {
 	peer := model.MustGenerateUserID()
 	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
 		ID:            withMsg,
-		Type:          chatpb.Metadata_DM,
+		Type:          chatpb.ChatType_CONTACT_DM,
 		Members:       []*commonpb.UserId{e.userID, peer},
 		LastActivity:  at(2),
 		LastMessageID: &messagingpb.MessageId{Value: 3},

@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
 
@@ -140,7 +141,7 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 	}
 
 	// The chat must be the canonical DM between the sender and recipient.
-	expectedChatID := chat.MustDeriveDmChatID(senderUserID, recipientUserID)
+	expectedChatID := chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, senderUserID, recipientUserID)
 	if !bytes.Equal(chatMetadata.GetChatId().GetValue(), expectedChatID.Value) {
 		return ocp_transaction.NewIntentValidationError("chat id does not match the dm between sender and recipient")
 	}

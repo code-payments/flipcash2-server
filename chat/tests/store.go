@@ -44,7 +44,7 @@ func testStore_PutAndGet(t *testing.T, s chat.Store) {
 	userB := model.MustGenerateUserID()
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{userA, userB},
 		LastActivity: at(100),
 	}
@@ -53,7 +53,7 @@ func testStore_PutAndGet(t *testing.T, s chat.Store) {
 	got, err := s.GetChatByID(ctx, c.ID)
 	require.NoError(t, err)
 	require.Equal(t, c.ID.Value, got.ID.Value)
-	require.Equal(t, chatpb.Metadata_DM, got.Type)
+	require.Equal(t, chatpb.ChatType_CONTACT_DM, got.Type)
 	require.True(t, got.LastActivity.Equal(at(100)))
 	require.ElementsMatch(t, userIDValues(c.Members), userIDValues(got.Members))
 }
@@ -63,7 +63,7 @@ func testStore_PutChat_Duplicate(t *testing.T, s chat.Store) {
 
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID()},
 		LastActivity: at(1),
 	}
@@ -88,7 +88,7 @@ func testStore_Members(t *testing.T, s chat.Store) {
 	userB := model.MustGenerateUserID()
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{userA, userB},
 		LastActivity: at(5),
 	}
@@ -107,7 +107,7 @@ func testStore_IsMember(t *testing.T, s chat.Store) {
 	stranger := model.MustGenerateUserID()
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{userA, userB},
 		LastActivity: at(5),
 	}
@@ -133,7 +133,7 @@ func testStore_AdvanceLastMessage(t *testing.T, s chat.Store) {
 	member := model.MustGenerateUserID()
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{member},
 		LastActivity: at(100),
 	}
@@ -280,7 +280,7 @@ func cursorOf(c *chat.Chat) *chat.DmFeedCursor {
 func putChat(t *testing.T, s chat.Store, a, b *commonpb.UserId, lastActivity time.Time) *chat.Chat {
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{a, b},
 		LastActivity: lastActivity,
 	}

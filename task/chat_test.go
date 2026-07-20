@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/protobuf/proto"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
@@ -61,7 +62,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	_, err = accounts.Bind(ctx, recipientUserID, recipientKeys.Proto())
 	require.NoError(t, err)
 
-	chatID := chat.MustDeriveDmChatID(senderUserID, recipientUserID)
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, senderUserID, recipientUserID)
 
 	rawIntentID := []byte(model.MustGenerateKeyPair().Public())
 	intentID := base58.Encode(rawIntentID)

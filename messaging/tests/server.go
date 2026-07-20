@@ -109,7 +109,7 @@ func newServerEnv(t *testing.T, badges badge.Store, chats chat.Store, messages m
 
 	require.NoError(t, chats.PutChat(ctx, &chat.Chat{
 		ID:           env.chatID,
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{env.userA, env.userB},
 		LastActivity: at(1),
 	}))

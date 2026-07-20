@@ -122,6 +122,7 @@ type imageRenditionSpec struct {
 // This ladder is IMAGE-specific; another content kind supplies its own rather than
 // reusing these sizes.
 var imageRenditionSpecs = []imageRenditionSpec{
+	{Rendition: RenditionThumbnail, MaxLongestSide: 32},
 	{Rendition: RenditionThumbnail, MaxLongestSide: 160},
 	{Rendition: RenditionThumbnail, MaxLongestSide: 320},
 	{Rendition: RenditionDisplay, MaxLongestSide: 800},

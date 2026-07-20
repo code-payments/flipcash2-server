@@ -6,6 +6,7 @@ import (
 
 	"github.com/ReneKroon/ttlcache"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
@@ -35,8 +36,8 @@ func (c *Cache) GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*chat
 	return c.db.GetChatByID(ctx, chatID)
 }
 
-func (c *Cache) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
-	return c.db.GetDmFeedPage(ctx, userID, snapshot, cursor, limit)
+func (c *Cache) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
+	return c.db.GetDmFeedPage(ctx, userID, chatType, snapshot, cursor, limit)
 }
 
 func (c *Cache) GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*commonpb.UserId, error) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 )
@@ -39,12 +40,13 @@ type Store interface {
 	// GetChatByID returns the chat with the given ID, or ErrChatNotFound.
 	GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*Chat, error)
 
-	// GetDmFeedPage returns one page of userID's DM feed pinned to a snapshot:
-	// the DMs userID is a member of whose last_activity is at or before snapshot,
-	// ordered by (last_activity, chat_id) descending (most recent first), at most
-	// limit chats (limit <= 0 means unbounded). When cursor is nil the page starts
-	// at the most recent chat in the snapshot; otherwise it resumes strictly after
-	// cursor. An empty result (no error) is returned when no chats remain.
+	// GetDmFeedPage returns one page of userID's DM feed for a single chat type,
+	// pinned to a snapshot: the DMs of chatType userID is a member of whose
+	// last_activity is at or before snapshot, ordered by (last_activity, chat_id)
+	// descending (most recent first), at most limit chats (limit <= 0 means
+	// unbounded). When cursor is nil the page starts at the most recent chat in
+	// the snapshot; otherwise it resumes strictly after cursor. An empty result
+	// (no error) is returned when no chats remain.
 	//
 	// Pinning to a fixed watermark makes a multi-page read internally consistent.
 	// last_activity only ever advances to a wall-clock send time, so any chat that
@@ -53,10 +55,10 @@ type Store interface {
 	// later page. Those freshly-active chats are surfaced through the live
 	// MetadataUpdate event stream instead (see the Chat service's GetDmChatFeed).
 	//
-	// It is scoped to DMs because the per-user inbox is split by chat type (see
-	// the dynamodb store). Group chats will have a parallel accessor, and the
-	// server merges the two descending streams into one feed.
-	GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, snapshot time.Time, cursor *DmFeedCursor, limit int) ([]*Chat, error)
+	// It is scoped to a single DM type because each type is its own feed (see
+	// GetDmChatFeedRequest.dm_chat_type). Group chats will have a parallel
+	// accessor, and the server merges the descending streams into one feed.
+	GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, snapshot time.Time, cursor *DmFeedCursor, limit int) ([]*Chat, error)
 
 	// GetMembers returns the member user IDs of a chat, or ErrChatNotFound.
 	GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*commonpb.UserId, error)

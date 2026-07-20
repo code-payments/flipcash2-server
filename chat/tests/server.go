@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
@@ -36,6 +38,8 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetDmChatFeed_OrderAndContent,
 		testServer_GetDmChatFeed_Paging,
 		testServer_GetDmChatFeed_Hydrates,
+		testServer_GetDmChatFeed_TypeScoped,
+		testServer_GetDmChatFeed_TokenBoundToType,
 	} {
 		tf(t, s)
 		teardown()
@@ -199,12 +203,19 @@ func (f *fakeProfileReader) GetProfilePictures(_ context.Context, userIDs []*com
 	return out, nil
 }
 
-// putDM persists a DM the env user is a member of, with the given last activity.
+// putDM persists a contact DM the env user is a member of, with the given last
+// activity.
 func (e *serverEnv) putDM(lastActivity time.Time) *commonpb.ChatId {
+	return e.putDMOfType(chatpb.ChatType_CONTACT_DM, lastActivity)
+}
+
+// putDMOfType persists a DM of the given type the env user is a member of,
+// with the given last activity.
+func (e *serverEnv) putDMOfType(chatType chatpb.ChatType, lastActivity time.Time) *commonpb.ChatId {
 	chatID := generateChatID()
 	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
 		ID:           chatID,
-		Type:         chatpb.ChatType_CONTACT_DM,
+		Type:         chatType,
 		Members:      []*commonpb.UserId{e.userID, model.MustGenerateUserID()},
 		LastActivity: lastActivity,
 	}))
@@ -220,11 +231,15 @@ func (e *serverEnv) getChat(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb
 }
 
 func (e *serverEnv) getDmFeed(opts *commonpb.QueryOptions) *chatpb.GetDmChatFeedResponse {
-	req := &chatpb.GetDmChatFeedRequest{DmChatType: chatpb.ChatType_CONTACT_DM, QueryOptions: opts}
-	require.NoError(e.t, e.keys.Auth(req, &req.Auth))
-	resp, err := e.client.GetDmChatFeed(e.ctx, req)
+	resp, err := e.getDmFeedOfType(chatpb.ChatType_CONTACT_DM, opts)
 	require.NoError(e.t, err)
 	return resp
+}
+
+func (e *serverEnv) getDmFeedOfType(chatType chatpb.ChatType, opts *commonpb.QueryOptions) (*chatpb.GetDmChatFeedResponse, error) {
+	req := &chatpb.GetDmChatFeedRequest{DmChatType: chatType, QueryOptions: opts}
+	require.NoError(e.t, e.keys.Auth(req, &req.Auth))
+	return e.client.GetDmChatFeed(e.ctx, req)
 }
 
 func testServer_GetChat_OK(t *testing.T, s chat.Store) {
@@ -424,6 +439,50 @@ func testServer_GetChat_TipDm_HidesPhoneNumbers(t *testing.T, s chat.Store) {
 	require.Nil(t, profile.PhoneNumber)
 	require.Equal(t, "Peer Name", profile.DisplayName)
 	require.NotNil(t, profile.GetProfilePicture())
+}
+
+func testServer_GetDmChatFeed_TypeScoped(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	contactID := e.putDMOfType(chatpb.ChatType_CONTACT_DM, at(1))
+	tipID := e.putDMOfType(chatpb.ChatType_TIP_DM, at(2))
+
+	contactResp, err := e.getDmFeedOfType(chatpb.ChatType_CONTACT_DM, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, contactResp.Result)
+	require.Len(t, contactResp.Chats, 1)
+	require.Equal(t, contactID.Value, contactResp.Chats[0].ChatId.Value)
+	require.Equal(t, chatpb.ChatType_CONTACT_DM, contactResp.Chats[0].Type)
+
+	tipResp, err := e.getDmFeedOfType(chatpb.ChatType_TIP_DM, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, tipResp.Result)
+	require.Len(t, tipResp.Chats, 1)
+	require.Equal(t, tipID.Value, tipResp.Chats[0].ChatId.Value)
+	require.Equal(t, chatpb.ChatType_TIP_DM, tipResp.Chats[0].Type)
+}
+
+func testServer_GetDmChatFeed_TokenBoundToType(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// Two contact DMs so the first page (size 1) yields a resumable token.
+	e.putDMOfType(chatpb.ChatType_CONTACT_DM, at(1))
+	e.putDMOfType(chatpb.ChatType_CONTACT_DM, at(2))
+
+	resp, err := e.getDmFeedOfType(chatpb.ChatType_CONTACT_DM, &commonpb.QueryOptions{PageSize: 1})
+	require.NoError(t, err)
+	require.True(t, resp.HasMore)
+	require.NotNil(t, resp.PagingToken)
+
+	// The same token resumes its own feed...
+	resumed, err := e.getDmFeedOfType(chatpb.ChatType_CONTACT_DM, &commonpb.QueryOptions{PageSize: 1, PagingToken: resp.PagingToken})
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, resumed.Result)
+	require.Len(t, resumed.Chats, 1)
+
+	// ...but is rejected against the other feed.
+	_, err = e.getDmFeedOfType(chatpb.ChatType_TIP_DM, &commonpb.QueryOptions{PageSize: 1, PagingToken: resp.PagingToken})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
 func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {

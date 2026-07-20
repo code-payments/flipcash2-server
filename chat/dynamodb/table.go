@@ -32,6 +32,7 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 			AttributeDefinitions: []types.AttributeDefinition{
 				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrFeed), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String(attrLastActivity), AttributeType: types.ScalarAttributeTypeN},
 			},
 			KeySchema: []types.KeySchemaElement{
@@ -43,6 +44,14 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 					IndexName: aws.String(gsiByActivity),
 					KeySchema: []types.KeySchemaElement{
 						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrLastActivity), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+				{
+					IndexName: aws.String(gsiByTypeActivity),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrFeed), KeyType: types.KeyTypeHash},
 						{AttributeName: aws.String(attrLastActivity), KeyType: types.KeyTypeRange},
 					},
 					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},

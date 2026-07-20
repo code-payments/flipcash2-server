@@ -28,14 +28,23 @@ import (
 //	          truth.
 //
 //	dm_inbox  pk = "user#<id>", sk = "chat#<id>" (one item per (user, DM)). The
-//	          per-user DM inbox index. A GSI on (user, last_activity) lets a
-//	          user's DMs be listed most-recently-active first with true
-//	          server-side pagination. last_activity and the participants are
-//	          denormalized so the inbox renders from one query. AdvanceLast-
-//	          Activity fans the new last_activity out to each member's row (two
-//	          for a DM), re-sorting the GSI.
+//	          per-user DM inbox index. A GSI on (feed, last_activity) — where
+//	          feed = "user#<id>#<type>" partitions each user's inbox by chat
+//	          type — lets one type's DMs be listed most-recently-active first
+//	          with true server-side pagination and no filtering. last_activity
+//	          and the participants are denormalized so the inbox renders from
+//	          one query. AdvanceLastActivity fans the new last_activity out to
+//	          each member's row (two for a DM), re-sorting the GSI.
 const (
+	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
+	// all of a user's DM types. Superseded by gsiByTypeActivity; retained until
+	// the feed backfill completes everywhere and the index is dropped from the
+	// table.
 	gsiByActivity = "by_activity"
+
+	// gsiByTypeActivity orders one chat type's slice of a user's inbox by
+	// last_activity, keyed by the composite feed attribute.
+	gsiByTypeActivity = "by_type_activity"
 
 	// chatKeyPrefix prefixes a chat ID in the chats table pk and the dm_inbox
 	// sk. The chat ID is recovered from the key, so it is not stored as its own
@@ -45,6 +54,7 @@ const (
 	attrPK            = "pk"
 	attrSK            = "sk"
 	attrType          = "type"
+	attrFeed          = "feed"
 	attrMembers       = "members"
 	attrLastActivity  = "last_activity"
 	attrLastMessageID = "last_message_id"
@@ -116,16 +126,18 @@ func (s *store) GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*chat
 	return chatFromItem(chatID, out.Item)
 }
 
-func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
+func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
 	// Constrain the GSI range key to the snapshot window: only inbox rows whose
-	// last_activity is at or before the watermark. Descending order (most recent
-	// first) is fixed for the feed.
+	// last_activity is at or before the watermark. The composite feed hash key
+	// scopes the query to one chat type, so pages come back dense — no filter
+	// expression. Descending order (most recent first) is fixed for the feed.
 	input := &dynamodb.QueryInput{
-		TableName:              aws.String(s.dmInboxTable),
-		IndexName:              aws.String(gsiByActivity),
-		KeyConditionExpression: aws.String(fmt.Sprintf("%s = :u AND %s <= :snap", attrPK, attrLastActivity)),
+		TableName:                aws.String(s.dmInboxTable),
+		IndexName:                aws.String(gsiByTypeActivity),
+		KeyConditionExpression:   aws.String(fmt.Sprintf("#feed = :f AND %s <= :snap", attrLastActivity)),
+		ExpressionAttributeNames: map[string]string{"#feed": attrFeed},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":u":    avS(userPK(userID)),
+			":f":    avS(feedPK(userID, chatType)),
 			":snap": avN(uint64(snapshot.UnixNano())),
 		},
 		ScanIndexForward: aws.Bool(false),
@@ -135,12 +147,13 @@ func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, snap
 	}
 
 	// The cursor carries (last_activity, chat_id) explicitly, so the GSI start
-	// key is built directly without a lookup. A GSI start key must also include
-	// the base table key (pk, sk), hence all three attributes.
+	// key is built directly without a lookup. A GSI start key must include the
+	// GSI key (feed, last_activity) and the base table key (pk, sk).
 	if cursor != nil {
 		input.ExclusiveStartKey = map[string]types.AttributeValue{
 			attrPK:           avS(userPK(userID)),
 			attrSK:           avS(chatSK(cursor.ChatID)),
+			attrFeed:         avS(feedPK(userID, chatType)),
 			attrLastActivity: avN(uint64(cursor.LastActivity.UnixNano())),
 		}
 	}
@@ -274,6 +287,7 @@ func (s *store) dmInboxItem(c *chat.Chat, member *commonpb.UserId) map[string]ty
 		attrPK:           avS(userPK(member)),
 		attrSK:           avS(chatSK(c.ID)),
 		attrType:         avN(uint64(c.Type)),
+		attrFeed:         avS(feedPK(member, c.Type)),
 		attrMembers:      membersAttr(c.Members),
 		attrLastActivity: avN(uint64(c.LastActivity.UnixNano())),
 	}
@@ -332,6 +346,12 @@ func membersAttr(members []*commonpb.UserId) types.AttributeValue {
 func chatPK(chatID *commonpb.ChatId) string { return chatKeyPrefix + hex.EncodeToString(chatID.Value) }
 func chatSK(chatID *commonpb.ChatId) string { return chatKeyPrefix + hex.EncodeToString(chatID.Value) }
 func userPK(userID *commonpb.UserId) string { return "user#" + hex.EncodeToString(userID.Value) }
+
+// feedPK is the composite hash key of gsiByTypeActivity: one chat type's slice
+// of a user's inbox. The chat type is encoded by its stable proto enum number.
+func feedPK(userID *commonpb.UserId, chatType chatpb.ChatType) string {
+	return fmt.Sprintf("%s#%d", userPK(userID), chatType)
+}
 
 // chatIDFromSK recovers a chat ID from a dm_inbox item's sk ("chat#<hex>"),
 // the inverse of chatSK.

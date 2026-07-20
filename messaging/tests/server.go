@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/badge"
@@ -27,7 +30,6 @@ import (
 	"github.com/code-payments/flipcash2-server/messaging"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
-	"github.com/code-payments/flipcash2-server/push"
 	"github.com/code-payments/flipcash2-server/testutil"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 )
@@ -65,6 +67,7 @@ func RunServerTests(t *testing.T, badges badge.Store, chats chat.Store, messages
 		// Cross-cutting
 		testServer_NonMember_Denied,
 		testServer_Broadcast_IncludesActor,
+		testServer_SendMessage_PushPerChatType,
 	} {
 		tf(t, chats, messages, profiles, badges)
 		teardown()
@@ -77,6 +80,7 @@ type serverEnv struct {
 	client   messagingpb.MessagingClient
 	authz    *auth.StaticAuthorizer
 	observer *event.TestEventObserver[*commonpb.UserId, *eventpb.Event]
+	pusher   *capturingPusher
 
 	chatID *commonpb.ChatId
 	userA  *commonpb.UserId
@@ -102,6 +106,7 @@ func newServerEnv(t *testing.T, badges badge.Store, chats chat.Store, messages m
 		ctx:      ctx,
 		authz:    authz,
 		observer: observer,
+		pusher:   &capturingPusher{},
 		chatID:   generateChatID(),
 	}
 	env.userA, env.keysA = env.addUser()
@@ -120,7 +125,7 @@ func newServerEnv(t *testing.T, badges badge.Store, chats chat.Store, messages m
 	env.blobAccess = blobAccess
 	media := blob.NewIntegration(blobStore, blob_memory.NewInMemoryStorage(), blobAccess)
 
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, media, ocp_data.NewTestDataProvider(), push.NewNoOpPusher(), bus)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, media, ocp_data.NewTestDataProvider(), env.pusher, bus)
 	server := messaging.NewServer(log, authz, chats, messages, media, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
@@ -134,6 +139,37 @@ func (e *serverEnv) addUser() (*commonpb.UserId, model.KeyPair) {
 	keys := model.MustGenerateKeyPair()
 	e.authz.Add(userID, keys)
 	return userID, keys
+}
+
+type capturedPush struct {
+	title   string
+	body    string
+	payload *pushpb.Payload
+	users   []*commonpb.UserId
+}
+
+// capturingPusher records every push so tests can assert on exactly what
+// would reach a device.
+type capturingPusher struct {
+	mu     sync.Mutex
+	pushes []capturedPush
+}
+
+func (p *capturingPusher) SendPushes(_ context.Context, title, body string, customPayload *pushpb.Payload, users ...*commonpb.UserId) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pushes = append(p.pushes, capturedPush{title: title, body: body, payload: customPayload, users: users})
+	return nil
+}
+
+func (p *capturingPusher) SendBadgeCountPush(_ context.Context, _ *commonpb.UserId, _ uint64) error {
+	return nil
+}
+
+func (p *capturingPusher) snapshot() []capturedPush {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]capturedPush(nil), p.pushes...)
 }
 
 // ============================================================================
@@ -152,7 +188,11 @@ func (e *serverEnv) send(keys model.KeyPair, text string, clientID *messagingpb.
 }
 
 func (e *serverEnv) sendContent(keys model.KeyPair, content []*messagingpb.Content, clientID *messagingpb.ClientMessageId) (*messagingpb.SendMessageResponse, error) {
-	req := &messagingpb.SendMessageRequest{ChatId: e.chatID, Content: content, ClientMessageId: clientID}
+	return e.sendContentToChat(keys, e.chatID, content, clientID)
+}
+
+func (e *serverEnv) sendContentToChat(keys model.KeyPair, chatID *commonpb.ChatId, content []*messagingpb.Content, clientID *messagingpb.ClientMessageId) (*messagingpb.SendMessageResponse, error) {
+	req := &messagingpb.SendMessageRequest{ChatId: chatID, Content: content, ClientMessageId: clientID}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.SendMessage(e.ctx, req)
 }
@@ -1595,4 +1635,65 @@ func testServer_Broadcast_IncludesActor(t *testing.T, chats chat.Store, messages
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.RemoveReactionResponse_OK, rmResp.Result)
 	e.waitForReactionUpdate(e.userB, messagingpb.ReactionUpdate_REMOVED, msgID.Value, emoji, e.userB)
+}
+
+func testServer_SendMessage_PushPerChatType(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
+	e := newServerEnv(t, badges, chats, messages, profiles)
+
+	// The sender has both a display name and a phone number, so each chat type
+	// must actively pick the right identifier.
+	const senderPhone = "+15551234567"
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Tipper Name"))
+	require.NoError(t, profiles.LinkPhoneNumber(e.ctx, e.userA, senderPhone, &commonpb.Hash{Value: make([]byte, 32)}))
+
+	// The push path recovers the chat type from the canonical DM derivation,
+	// so the chats must live at their derived IDs (unlike the env's default
+	// random-ID chat).
+	send := func(chatType chatpb.ChatType, text string) {
+		chatID := chat.MustDeriveDmChatID(chatType, e.userA, e.userB)
+		require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+			ID:           chatID,
+			Type:         chatType,
+			Members:      []*commonpb.UserId{e.userA, e.userB},
+			LastActivity: at(1),
+		}))
+		resp, err := e.sendContentToChat(e.keysA, chatID, textContent(text), generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+	}
+
+	// Pushes are sent asynchronously after the send returns.
+	waitForPushes := func(n int) []capturedPush {
+		require.Eventually(t, func() bool {
+			return len(e.pusher.snapshot()) >= n
+		}, 5*time.Second, 10*time.Millisecond)
+		pushes := e.pusher.snapshot()
+		require.Len(t, pushes, n)
+		return pushes
+	}
+
+	send(chatpb.ChatType_TIP_DM, "tip message")
+	pushes := waitForPushes(1)
+
+	tipPush := pushes[0]
+	require.Equal(t, "Tipper Name", tipPush.title)
+	require.Equal(t, "tip message", tipPush.body)
+	require.Empty(t, tipPush.payload.TitleSubstitutions)
+	require.Len(t, tipPush.users, 1)
+	require.Equal(t, e.userB.Value, tipPush.users[0].Value)
+	// Nothing in the push may carry the sender's phone number.
+	require.NotContains(t, tipPush.title, senderPhone)
+	require.NotContains(t, tipPush.body, senderPhone)
+	require.NotContains(t, tipPush.payload.String(), strings.TrimPrefix(senderPhone, "+"))
+
+	send(chatpb.ChatType_CONTACT_DM, "contact message")
+	pushes = waitForPushes(2)
+
+	contactPush := pushes[1]
+	require.Equal(t, "{0}", contactPush.title)
+	require.Equal(t, "contact message", contactPush.body)
+	require.Len(t, contactPush.payload.TitleSubstitutions, 1)
+	require.Equal(t, senderPhone, contactPush.payload.TitleSubstitutions[0].GetContact().GetValue())
+	require.Len(t, contactPush.users, 1)
+	require.Equal(t, e.userB.Value, contactPush.users[0].Value)
 }

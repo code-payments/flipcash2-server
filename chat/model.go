@@ -86,6 +86,49 @@ func MustDeriveDmChatID(chatType chatpb.ChatType, a, b *commonpb.UserId) *common
 	return &commonpb.ChatId{Value: h.Sum(nil)}
 }
 
+// dmChatTypes are the DM chat types with a canonical member-derived ID.
+var dmChatTypes = []chatpb.ChatType{
+	chatpb.ChatType_CONTACT_DM,
+	chatpb.ChatType_TIP_DM,
+}
+
+// DeriveDmChatType reports which DM type's canonical derivation over the
+// members produces chatID, letting callers that already hold a chat's members
+// recover its type without a store read. It returns UNKNOWN when no DM type
+// matches — including any malformed input — so callers must treat UNKNOWN as
+// "not a derivable DM", not an error.
+//
+// This works because every DM's ID commits to its type via the derivation
+// domain. A future chat type whose ID is not member-derived (e.g. group chats)
+// will return UNKNOWN here and needs its own discriminator.
+func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatpb.ChatType {
+	if len(chatID.GetValue()) != ChatIDSize {
+		return chatpb.ChatType_UNKNOWN
+	}
+
+	var a, b *commonpb.UserId
+	switch len(members) {
+	case 1:
+		a, b = members[0], members[0]
+	case 2:
+		a, b = members[0], members[1]
+	default:
+		return chatpb.ChatType_UNKNOWN
+	}
+	for _, u := range members {
+		if len(u.GetValue()) != model.UserIDSize {
+			return chatpb.ChatType_UNKNOWN
+		}
+	}
+
+	for _, chatType := range dmChatTypes {
+		if bytes.Equal(MustDeriveDmChatID(chatType, a, b).Value, chatID.Value) {
+			return chatType
+		}
+	}
+	return chatpb.ChatType_UNKNOWN
+}
+
 // Chat is the stored metadata for a chat.
 //
 // It deliberately holds only the state owned by the chat domain: the chat's

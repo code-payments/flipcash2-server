@@ -250,7 +250,7 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 	var seqChatIDs []*commonpb.ChatId
 	pointerRefs := make([]PointerRef, len(chats))
 	uniqueUserIDs := make(map[string]*commonpb.UserId)
-	uniqueDmUserIds := make(map[string]*commonpb.UserId)
+	uniquePrivateProfileUserIds := make(map[string]*commonpb.UserId)
 	for i, c := range chats {
 		pointerRefs[i] = PointerRef{ChatID: c.ID, Members: c.Members}
 		if c.LastMessageID != nil {
@@ -263,7 +263,7 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 		for _, m := range c.Members {
 			uniqueUserIDs[string(m.Value)] = m
 			if c.Type == chatpb.ChatType_CONTACT_DM {
-				uniqueDmUserIds[string(m.Value)] = m
+				uniquePrivateProfileUserIds[string(m.Value)] = m
 			}
 		}
 	}
@@ -271,9 +271,9 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 	for _, u := range uniqueUserIDs {
 		userIDs = append(userIDs, u)
 	}
-	dmUserIDs := make([]*commonpb.UserId, 0, len(uniqueDmUserIds))
-	for _, u := range uniqueDmUserIds {
-		dmUserIDs = append(dmUserIDs, u)
+	privateProfileUserIDs := make([]*commonpb.UserId, 0, len(uniquePrivateProfileUserIds))
+	for _, u := range uniquePrivateProfileUserIds {
+		privateProfileUserIDs = append(privateProfileUserIDs, u)
 	}
 
 	lastMessages, err := s.messaging.LastMessages(ctx, msgRefs)
@@ -288,7 +288,7 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 	if err != nil {
 		return nil, err
 	}
-	phoneNumbersByUserId, err := s.profiles.GetPhoneNumbers(ctx, dmUserIDs)
+	phoneNumbersByUserId, err := s.profiles.GetPhoneNumbers(ctx, privateProfileUserIDs)
 	if err != nil {
 		return nil, err
 	}

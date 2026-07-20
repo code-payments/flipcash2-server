@@ -31,6 +31,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_NotFound,
 		testServer_GetChat_Denied,
 		testServer_GetChat_Hydrates,
+		testServer_GetChat_TipDm_HidesPhoneNumbers,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
 		testServer_GetDmChatFeed_Paging,
@@ -395,6 +396,34 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	require.Nil(t, members[string(e.userID.Value)].UserProfile.PhoneNumber)
 	require.Empty(t, members[string(e.userID.Value)].UserProfile.DisplayName)
 	require.Nil(t, members[string(e.userID.Value)].UserProfile.GetProfilePicture())
+}
+
+func testServer_GetChat_TipDm_HidesPhoneNumbers(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	peer := model.MustGenerateUserID()
+	chatID := generateChatID()
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_TIP_DM,
+		Members:      []*commonpb.UserId{e.userID, peer},
+		LastActivity: at(1),
+	}))
+
+	e.profiles.phoneNumbers[string(peer.Value)] = &phonepb.PhoneNumber{Value: "+15551234567"}
+	e.profiles.displayNames[string(peer.Value)] = "Peer Name"
+	e.profiles.setProfilePicture(peer, &blobpb.BlobId{Value: make([]byte, 16)})
+
+	resp := e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Equal(t, chatpb.ChatType_TIP_DM, resp.Metadata.Type)
+
+	members := byUserID(resp.Metadata.Members)
+	profile := members[string(peer.Value)].UserProfile
+	require.NotNil(t, profile)
+	require.Nil(t, profile.PhoneNumber)
+	require.Equal(t, "Peer Name", profile.DisplayName)
+	require.NotNil(t, profile.GetProfilePicture())
 }
 
 func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {

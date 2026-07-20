@@ -22,13 +22,25 @@ import (
 )
 
 // sendContactDmPaymentMessage injects the cash message for a contact DM
-// payment into the DM between the sender and recipient. A returned error
-// means the task is retried with backoff.
+// payment into the DM between the sender and recipient.
+func (e *Executor) sendContactDmPaymentMessage(ctx context.Context, record *ocp_task.Record) error {
+	return e.sendDmPaymentMessage(ctx, record, chatpb.ChatType_CONTACT_DM)
+}
+
+// sendTipDmPaymentMessage injects the cash message for a tip DM payment into
+// the tip DM between the sender and recipient.
+func (e *Executor) sendTipDmPaymentMessage(ctx context.Context, record *ocp_task.Record) error {
+	return e.sendDmPaymentMessage(ctx, record, chatpb.ChatType_TIP_DM)
+}
+
+// sendDmPaymentMessage injects the cash message for a DM payment into the
+// canonical DM of the given type between the sender and recipient. A returned
+// error means the task is retried with backoff.
 //
 // Idempotency under at-least-once delivery comes from the messaging layer:
 // sends dedupe on (chatID, clientMessageID), and the client message ID is the
 // task's UUID, which is stable across retries.
-func (e *Executor) sendContactDmPaymentMessage(ctx context.Context, record *ocp_task.Record) error {
+func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Record, chatType chatpb.ChatType) error {
 	taskID, err := uuid.Parse(record.TaskId)
 	if err != nil {
 		return fmt.Errorf("task id is not a uuid: %w", err)
@@ -49,17 +61,26 @@ func (e *Executor) sendContactDmPaymentMessage(ctx context.Context, record *ocp_
 		return fmt.Errorf("failed to get intent record: %w", err)
 	}
 
-	// The task is only ever scheduled for a validated contact DM payment, which
-	// is always a direct SendPublicPayment between two Flipcash users carrying
-	// contact DM payment app metadata (enforced in
+	// The task is only ever scheduled for a validated DM payment, which is
+	// always a direct SendPublicPayment between two Flipcash users carrying the
+	// matching DM payment app metadata (enforced in
 	// intent.Integration.AllowCreation).
 	metadata := intentRecord.SendPublicPaymentMetadata
 	if intentRecord.IntentType != ocp_intent.SendPublicPayment || metadata == nil {
 		return errors.New("intent is not a send public payment")
 	}
 	chatMetadata := intent.GetChatMetadata(intentRecord)
-	if chatMetadata.GetContactDmPayment() == nil {
-		return errors.New("intent is not a contact dm payment")
+	switch chatType {
+	case chatpb.ChatType_CONTACT_DM:
+		if chatMetadata.GetContactDmPayment() == nil {
+			return errors.New("intent is not a contact dm payment")
+		}
+	case chatpb.ChatType_TIP_DM:
+		if chatMetadata.GetTipDmPayment() == nil {
+			return errors.New("intent is not a tip dm payment")
+		}
+	default:
+		return fmt.Errorf("unsupported dm chat type %d", chatType)
 	}
 
 	senderOwner, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
@@ -84,9 +105,10 @@ func (e *Executor) sendContactDmPaymentMessage(ctx context.Context, record *ocp_
 		return fmt.Errorf("failed to get recipient user id: %w", err)
 	}
 
-	// The message must land in the canonical DM between the two users, which is
-	// the chat the client referenced in the validated app metadata.
-	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, senderUserID, recipientUserID)
+	// The message must land in the canonical DM of this type between the two
+	// users, which is the chat the client referenced in the validated app
+	// metadata.
+	chatID := chat.MustDeriveDmChatID(chatType, senderUserID, recipientUserID)
 	if !bytes.Equal(chatMetadata.GetChatId().GetValue(), chatID.Value) {
 		return errors.New("chat id does not match the dm between sender and recipient")
 	}
@@ -97,12 +119,12 @@ func (e *Executor) sendContactDmPaymentMessage(ctx context.Context, record *ocp_
 	// a failure.
 	err = e.chats.PutChat(ctx, &chat.Chat{
 		ID:           chatID,
-		Type:         chatpb.ChatType_CONTACT_DM,
+		Type:         chatType,
 		Members:      []*commonpb.UserId{senderUserID, recipientUserID},
 		LastActivity: time.Now().UTC(),
 	})
 	if err != nil && !errors.Is(err, chat.ErrChatExists) {
-		return fmt.Errorf("failed to create contact dm chat: %w", err)
+		return fmt.Errorf("failed to create dm chat: %w", err)
 	}
 
 	content := []*messagingpb.Content{{
@@ -127,7 +149,7 @@ func (e *Executor) sendContactDmPaymentMessage(ctx context.Context, record *ocp_
 		&messagingpb.ClientMessageId{Value: taskID[:]},
 		true,
 	); err != nil {
-		return fmt.Errorf("failed to send contact payment message: %w", err)
+		return fmt.Errorf("failed to send dm payment message: %w", err)
 	}
 
 	return nil

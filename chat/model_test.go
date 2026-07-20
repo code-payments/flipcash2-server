@@ -48,6 +48,35 @@ func TestMustDeriveDmChatID(t *testing.T) {
 	})
 }
 
+func TestDeriveDmChatType(t *testing.T) {
+	a := model.MustGenerateUserID()
+	b := model.MustGenerateUserID()
+	members := []*commonpb.UserId{a, b}
+
+	// Each DM type's canonical ID maps back to that type, regardless of member
+	// order.
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_TIP_DM} {
+		id := MustDeriveDmChatID(chatType, a, b)
+		require.Equal(t, chatType, DeriveDmChatType(id, members))
+		require.Equal(t, chatType, DeriveDmChatType(id, []*commonpb.UserId{b, a}))
+	}
+
+	// A self-DM's single collapsed member still recovers the type.
+	selfID := MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, a)
+	require.Equal(t, chatpb.ChatType_CONTACT_DM, DeriveDmChatType(selfID, []*commonpb.UserId{a}))
+
+	// Anything that isn't a derivable DM resolves to UNKNOWN rather than
+	// erroring: a random ID, mismatched members, too many members, a malformed
+	// member, or a malformed chat ID.
+	contactID := MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, b)
+	require.Equal(t, chatpb.ChatType_UNKNOWN, DeriveDmChatType(&commonpb.ChatId{Value: make([]byte, ChatIDSize)}, members))
+	require.Equal(t, chatpb.ChatType_UNKNOWN, DeriveDmChatType(contactID, []*commonpb.UserId{a, model.MustGenerateUserID()}))
+	require.Equal(t, chatpb.ChatType_UNKNOWN, DeriveDmChatType(contactID, []*commonpb.UserId{a, b, model.MustGenerateUserID()}))
+	require.Equal(t, chatpb.ChatType_UNKNOWN, DeriveDmChatType(contactID, []*commonpb.UserId{a, {Value: []byte("short")}}))
+	require.Equal(t, chatpb.ChatType_UNKNOWN, DeriveDmChatType(&commonpb.ChatId{Value: []byte("short")}, members))
+	require.Equal(t, chatpb.ChatType_UNKNOWN, DeriveDmChatType(nil, members))
+}
+
 // TestMustDeriveDmChatID_Domains pins the exact hash input per DM type. Contact
 // DMs must keep the bare legacy domain forever: existing chat IDs are persisted
 // and clients derive them independently, so a domain change would orphan every

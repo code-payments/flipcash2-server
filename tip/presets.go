@@ -1,56 +1,57 @@
-package intent
+package tip
 
 import (
-	"fmt"
-	"strconv"
+	"slices"
 	"strings"
 
 	currency_lib "github.com/code-payments/ocp-server/currency"
-	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
-	ocp_transaction "github.com/code-payments/ocp-server/ocp/rpc/transaction"
 )
 
-// validateMinimumTipAmount enforces the minimum tip amount for the payment's
-// exchange currency. Clients surface the minimum as the first tip preset, but
-// the amount is ultimately client-chosen, so the floor is enforced here too.
-// Currencies without a preset fall back to a USD floor applied to the payment's
-// USD market value, so no currency is left without a minimum.
-func validateMinimumTipAmount(paymentMetadata *ocp_intent.SendPublicPaymentMetadata) error {
-	currencyCode := paymentMetadata.ExchangeCurrency
-	amount := paymentMetadata.NativeAmount
-	presets, ok := TipPresetsByCurrency[currencyCode]
-	minimum := presets.Minimum
-	if !ok {
-		currencyCode, amount, minimum = currency_lib.USD, paymentMetadata.UsdMarketValue, TipPresetsByCurrency[currency_lib.USD].Minimum
-	}
-
-	if amount < minimum {
-		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf(
-			"tip amount is below the minimum of %s %s",
-			strconv.FormatFloat(minimum, 'f', -1, 64),
-			strings.ToUpper(string(currencyCode)),
-		))
-	}
-
-	return nil
-}
-
-// TipPresets are the tip amounts offered for a currency, in major currency
-// units. Minimum is the floor enforced on any tip; the remaining tiers are the
-// amounts clients surface as one-tap presets.
-type TipPresets struct {
+// Presets are the tip amounts offered for a currency, in major currency units.
+// Minimum is the floor enforced on any tip; the remaining tiers are the amounts
+// clients surface as one-tap presets.
+type Presets struct {
 	Minimum float64
 	Low     float64
 	Medium  float64
 	High    float64
 }
 
-// tipPresetsByCurrency mirrors the fiat tip preset table shipped to clients.
-// Each minimum is a locally recognizable cash denomination near a one-dollar
-// gesture, chosen for product familiarity rather than exact exchange-rate
-// parity, and always sits below the currency's low preset. Keep this table in
-// sync with the client presets.
-var TipPresetsByCurrency = map[currency_lib.Code]TipPresets{
+// Entry pairs a currency with its presets.
+type Entry struct {
+	Region  currency_lib.Code
+	Presets Presets
+}
+
+// ordered is presetsByCurrency sorted by currency code, so responses built from
+// it are stable across calls.
+var ordered = func() []Entry {
+	entries := make([]Entry, 0, len(presetsByRegion))
+	for region, presets := range presetsByRegion {
+		entries = append(entries, Entry{Region: region, Presets: presets})
+	}
+	slices.SortFunc(entries, func(a, b Entry) int { return strings.Compare(string(a.Region), string(b.Region)) })
+	return entries
+}()
+
+// PresetsFor returns the presets for a currency, and whether it has any.
+func PresetsFor(region currency_lib.Code) (Presets, bool) {
+	presets, ok := presetsByRegion[region]
+	return presets, ok
+}
+
+// All returns every currency's presets, ordered by currency code.
+func All() []Entry {
+	return slices.Clone(ordered)
+}
+
+// presetsByRegion is the fiat tip preset table. Each minimum is a locally
+// recognizable cash denomination near a one-dollar gesture, chosen for product
+// familiarity rather than exact exchange-rate parity, and always sits below the
+// currency's low preset. Clients receive this table through user flags, so
+// changing an amount here changes what clients offer and what the server
+// accepts in one step.
+var presetsByRegion = map[currency_lib.Code]Presets{
 	"aed": {5, 20, 50, 100},
 	"afn": {50, 100, 500, 1_000},
 	"all": {100, 200, 500, 1_000},

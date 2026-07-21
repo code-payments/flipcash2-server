@@ -20,6 +20,7 @@ import (
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/rpc"
+	"github.com/code-payments/flipcash2-server/tip"
 	ocp_client "github.com/code-payments/ocp-server/grpc/client"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 )
@@ -96,7 +97,23 @@ var (
 	minVersionForPhoneNumberSendByPlatform = map[commonpb.Platform]*ocp_client.Version{
 		commonpb.Platform_APPLE: {Major: 1, Minor: 13, Patch: 0},
 	}
+
+	tipPresets []*accountpb.TipPresets
 )
+
+func init() {
+	entries := tip.All()
+	tipPresets = make([]*accountpb.TipPresets, 0, len(entries))
+	for _, entry := range entries {
+		tipPresets = append(tipPresets, &accountpb.TipPresets{
+			Region:  &commonpb.Region{Value: string(entry.Region)},
+			Minimum: entry.Presets.Minimum,
+			Low:     entry.Presets.Low,
+			Medium:  entry.Presets.Medium,
+			High:    entry.Presets.High,
+		})
+	}
+}
 
 type Server struct {
 	log      *zap.Logger
@@ -272,6 +289,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			MinimumHolderValue:               MinHolderValue,
 			RequireCoinbaseEmailVerification: RequireCoinbaseEmailVerification,
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
+			TipPresets:                       tipPresets,
 		},
 	}, nil
 }
@@ -308,6 +326,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			MinimumHolderValue:               MinHolderValue,
 			RequireCoinbaseEmailVerification: RequireCoinbaseEmailVerification,
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
+			TipPresets:                       tipPresets,
 		},
 	}, nil
 }

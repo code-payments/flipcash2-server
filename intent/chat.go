@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
@@ -16,6 +18,8 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/profile"
+	"github.com/code-payments/flipcash2-server/tip"
+	currency_lib "github.com/code-payments/ocp-server/currency"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_task "github.com/code-payments/ocp-server/ocp/data/task"
@@ -216,6 +220,33 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 	expectedChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
 	if !bytes.Equal(chatMetadata.GetChatId().GetValue(), expectedChatID.Value) {
 		return ocp_transaction.NewIntentValidationError("chat id does not match the tip dm between sender and recipient")
+	}
+
+	return nil
+}
+
+// validateMinimumTipAmount enforces the minimum tip amount for the payment's
+// exchange currency. Clients surface the minimum as the first tip preset, but
+// the amount is ultimately client-chosen, so the floor is enforced here too.
+// Currencies without a preset fall back to a USD floor applied to the payment's
+// USD market value, so no currency is left without a minimum.
+func validateMinimumTipAmount(paymentMetadata *ocp_intent.SendPublicPaymentMetadata) error {
+	currencyCode := paymentMetadata.ExchangeCurrency
+	amount := paymentMetadata.NativeAmount
+	presets, ok := tip.PresetsFor(currencyCode)
+	minimum := presets.Minimum
+	if !ok {
+		// USD always has presets; tip's tests pin the row the fallback reads.
+		usdPresets, _ := tip.PresetsFor(currency_lib.USD)
+		currencyCode, amount, minimum = currency_lib.USD, paymentMetadata.UsdMarketValue, usdPresets.Minimum
+	}
+
+	if amount < minimum {
+		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf(
+			"tip amount is below the minimum of %s %s",
+			strconv.FormatFloat(minimum, 'f', -1, 64),
+			strings.ToUpper(string(currencyCode)),
+		))
 	}
 
 	return nil

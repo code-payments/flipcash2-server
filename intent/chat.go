@@ -199,6 +199,10 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 		return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
 	}
 
+	if err := validateMinimumTipAmount(intentRecord.SendPublicPaymentMetadata); err != nil {
+		return err
+	}
+
 	senderUserID, recipientUserID, err := i.resolveDirectDmPaymentParties(ctx, intentRecord, "tip dm")
 	if err != nil {
 		return err

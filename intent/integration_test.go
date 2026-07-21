@@ -21,6 +21,7 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
 	profilememory "github.com/code-payments/flipcash2-server/profile/memory"
+	currency_lib "github.com/code-payments/ocp-server/currency"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
 )
@@ -160,6 +161,39 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		selfChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, senderUserID)
 		record := dmPaymentIntentRecord(t, tipDmChatMetadata(selfChatID), base58.Encode(senderKeys.Public()), base58.Encode(senderKeys.Public()))
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "tip to yourself")
+	})
+
+	// Tips below the per-currency minimum are denied. The minimum itself, and
+	// anything above it, is allowed.
+	t.Run("minimum_amount", func(t *testing.T) {
+		for _, tc := range []struct {
+			currency       string
+			nativeAmount   float64
+			usdMarketValue float64
+			allowed        bool
+		}{
+			{"usd", 1.0, 1.0, true},    // exactly the usd minimum
+			{"usd", 5.0, 5.0, true},    // above the usd minimum
+			{"usd", 0.99, 0.99, false}, // below the usd minimum
+			{"jpy", 100, 0.68, true},   // exactly the jpy minimum
+			{"jpy", 50, 0.34, false},   // below the jpy minimum
+			{"kwd", 0.25, 0.82, true},  // fractional minimum
+			{"kwd", 0.1, 0.33, false},  // below a fractional minimum
+			{"bgn", 5.0, 2.85, true},   // no preset: usd market value clears the floor
+			{"bgn", 1.0, 0.57, false},  // no preset: usd market value below the floor
+		} {
+			record := validRecord()
+			record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.Code(tc.currency)
+			record.SendPublicPaymentMetadata.NativeAmount = tc.nativeAmount
+			record.SendPublicPaymentMetadata.UsdMarketValue = tc.usdMarketValue
+
+			err := e.integration.AllowCreation(e.ctx, record, nil, nil)
+			if tc.allowed {
+				require.NoError(t, err, "%s %v", tc.currency, tc.nativeAmount)
+			} else {
+				require.ErrorContains(t, err, "tip amount is below the minimum", "%s %v", tc.currency, tc.nativeAmount)
+			}
+		}
 	})
 
 	// A tip payment referencing the pair's *contact* DM must fail: the two

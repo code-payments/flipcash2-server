@@ -101,6 +101,25 @@ func TestBlob_StorageCache_ServedUrlKeepsMinimumLifetime(t *testing.T) {
 	require.Greater(t, time.Until(refreshed.ExpiresAt.AsTime()), 100*time.Millisecond)
 }
 
+func TestBlob_StorageCache_ContinuouslyReadKeyIsStillReminted(t *testing.T) {
+	ctx := context.Background()
+
+	backing := newCountingStorage(150 * time.Millisecond)
+	storage := cache.NewStorageCache(backing, 100*time.Millisecond)
+
+	// A key read continuously — the recurring avatar this cache exists for — must
+	// still be re-minted on schedule. Reading an entry cannot be what keeps it alive,
+	// since its URL expires on a fixed instant that no amount of reading moves.
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		served, err := storage.SignDownloadURL(ctx, "images/a/original.jpg")
+		require.NoError(t, err)
+		require.Greater(t, time.Until(served.ExpiresAt.AsTime()), 100*time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.Greater(t, backing.signCount(), 1)
+}
+
 func TestBlob_StorageCache_ShortLivedUrlIsNotCached(t *testing.T) {
 	ctx := context.Background()
 

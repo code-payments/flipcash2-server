@@ -643,6 +643,7 @@ func testRenditionGeneration(t *testing.T, accounts account.Store, blobs blob.St
 			role blob.RenditionType
 			w, h uint32
 		}{
+			{blob.RenditionThumbnail, 32, 16},
 			{blob.RenditionThumbnail, 160, 80},
 			{blob.RenditionThumbnail, 320, 160},
 			{blob.RenditionDisplay, 800, 400},
@@ -683,56 +684,70 @@ func testRenditionGeneration(t *testing.T, accounts account.Store, blobs blob.St
 	})
 
 	t.Run("a mid-size image fills the gap up to the next rung at its own size", func(t *testing.T) {
-		// 500 on the longest side clears the two thumbnail rungs but falls between the
-		// 320 thumbnail and the 800 display. So the two thumbnails are generated, plus a
-		// single DISPLAY at the original's own 500x400 size (the next rung's role), never
-		// upscaled to 800.
+		// 500 on the longest side clears all three thumbnail rungs but falls between the
+		// 320 thumbnail and the 800 display. So the three thumbnails are generated, plus
+		// a single DISPLAY at the original's own 500x400 size (the next rung's role),
+		// never upscaled to 800.
 		original := readyBlob(t, "image/png", makePNG(t, 500, 400))
 
-		require.Len(t, original.Renditions, 3)
+		require.Len(t, original.Renditions, 4)
 		require.Equal(t, blob.RenditionThumbnail, original.Renditions[0].Rendition)
-		require.EqualValues(t, 160, original.Renditions[0].Image.Width)
-		require.EqualValues(t, 128, original.Renditions[0].Image.Height)
+		require.EqualValues(t, 32, original.Renditions[0].Image.Width)
+		require.EqualValues(t, 26, original.Renditions[0].Image.Height)
 		require.Equal(t, blob.RenditionThumbnail, original.Renditions[1].Rendition)
-		require.EqualValues(t, 320, original.Renditions[1].Image.Width)
-		require.EqualValues(t, 256, original.Renditions[1].Image.Height)
-		require.Equal(t, blob.RenditionDisplay, original.Renditions[2].Rendition)
-		require.EqualValues(t, 500, original.Renditions[2].Image.Width)
-		require.EqualValues(t, 400, original.Renditions[2].Image.Height)
+		require.EqualValues(t, 160, original.Renditions[1].Image.Width)
+		require.EqualValues(t, 128, original.Renditions[1].Image.Height)
+		require.Equal(t, blob.RenditionThumbnail, original.Renditions[2].Rendition)
+		require.EqualValues(t, 320, original.Renditions[2].Image.Width)
+		require.EqualValues(t, 256, original.Renditions[2].Image.Height)
+		require.Equal(t, blob.RenditionDisplay, original.Renditions[3].Rendition)
+		require.EqualValues(t, 500, original.Renditions[3].Image.Width)
+		require.EqualValues(t, 400, original.Renditions[3].Image.Height)
 	})
 
 	t.Run("an image between the thumbnail rungs still gets a DISPLAY", func(t *testing.T) {
-		// 200 on the longest side clears the 160 thumbnail but tops out within the
-		// thumbnail role at the 320 rung. The ladder must keep climbing to the DISPLAY
-		// role regardless, emitting it at the original's own size rather than stopping
-		// once the thumbnails are covered.
+		// 200 on the longest side clears the 32 and 160 thumbnails but tops out within
+		// the thumbnail role at the 320 rung. The ladder must keep climbing to the
+		// DISPLAY role regardless, emitting it at the original's own size rather than
+		// stopping once the thumbnails are covered.
 		original := readyBlob(t, "image/png", makePNG(t, 200, 160))
+
+		require.Len(t, original.Renditions, 4)
+		require.Equal(t, blob.RenditionThumbnail, original.Renditions[0].Rendition)
+		require.EqualValues(t, 32, original.Renditions[0].Image.Width)
+		require.EqualValues(t, 26, original.Renditions[0].Image.Height)
+		require.Equal(t, blob.RenditionThumbnail, original.Renditions[1].Rendition)
+		require.EqualValues(t, 160, original.Renditions[1].Image.Width)
+		require.EqualValues(t, 128, original.Renditions[1].Image.Height)
+		require.Equal(t, blob.RenditionThumbnail, original.Renditions[2].Rendition)
+		require.EqualValues(t, 200, original.Renditions[2].Image.Width)
+		require.EqualValues(t, 160, original.Renditions[2].Image.Height)
+		require.Equal(t, blob.RenditionDisplay, original.Renditions[3].Rendition)
+		require.EqualValues(t, 200, original.Renditions[3].Image.Width)
+		require.EqualValues(t, 160, original.Renditions[3].Image.Height)
+	})
+
+	t.Run("a small image still gets the 32 thumbnail plus one rendition per role at its own size", func(t *testing.T) {
+		// Under every rung but the 32 thumbnail, which is small enough to remain a real
+		// downscale. Above it the original is never upscaled — but each ROLE's smallest
+		// rung that reaches it is still processed at its own 100x80 size, since
+		// re-encoding to WebP can shrink the bytes over the ORIGINAL. Both roles collapse
+		// to that one size, so the ladder is the 32 thumbnail, one more THUMBNAIL, and
+		// one DISPLAY.
+		original := readyBlob(t, "image/png", makePNG(t, 100, 80))
 
 		require.Len(t, original.Renditions, 3)
 		require.Equal(t, blob.RenditionThumbnail, original.Renditions[0].Rendition)
-		require.EqualValues(t, 160, original.Renditions[0].Image.Width)
-		require.EqualValues(t, 128, original.Renditions[0].Image.Height)
+		require.EqualValues(t, 32, original.Renditions[0].Image.Width)
+		require.EqualValues(t, 26, original.Renditions[0].Image.Height)
+
 		require.Equal(t, blob.RenditionThumbnail, original.Renditions[1].Rendition)
-		require.EqualValues(t, 200, original.Renditions[1].Image.Width)
-		require.EqualValues(t, 160, original.Renditions[1].Image.Height)
 		require.Equal(t, blob.RenditionDisplay, original.Renditions[2].Rendition)
-		require.EqualValues(t, 200, original.Renditions[2].Image.Width)
-		require.EqualValues(t, 160, original.Renditions[2].Image.Height)
-	})
-
-	t.Run("a small image gets one re-encoded rendition per role at its own size", func(t *testing.T) {
-		// Below every rung, so it is never upscaled — but each ROLE's smallest rung is
-		// still processed at the original's own 100x80 size, since re-encoding to WebP
-		// can shrink the bytes over the ORIGINAL. Both roles collapse to that one size,
-		// so the ladder is exactly one THUMBNAIL and one DISPLAY.
-		original := readyBlob(t, "image/png", makePNG(t, 100, 80))
-
-		require.Len(t, original.Renditions, 2)
-		require.Equal(t, blob.RenditionThumbnail, original.Renditions[0].Rendition)
-		require.Equal(t, blob.RenditionDisplay, original.Renditions[1].Rendition)
-		for _, ref := range original.Renditions {
+		for _, ref := range original.Renditions[1:] {
 			require.EqualValues(t, 100, ref.Image.Width)
 			require.EqualValues(t, 80, ref.Image.Height)
+		}
+		for _, ref := range original.Renditions {
 			require.Equal(t, "image/webp", ref.MimeType)
 		}
 	})

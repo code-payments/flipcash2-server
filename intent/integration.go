@@ -69,7 +69,14 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 
 		switch appMetadata.Domain.(type) {
 		case *intentpb.AppMetadata_Chat:
-			return i.validateContactDmAppMetadata(ctx, intentRecord, &appMetadata)
+			switch appMetadata.GetChat().GetType().(type) {
+			case *intentpb.ChatMetadata_ContactDmPayment_:
+				return i.validateContactDmAppMetadata(ctx, intentRecord, &appMetadata)
+			case *intentpb.ChatMetadata_TipDmPayment_:
+				return i.validateTipDmAppMetadata(ctx, intentRecord, &appMetadata)
+			default:
+				return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
+			}
 		default:
 			return ocp_transaction.NewIntentDeniedError("flipcash app metadata domain not supported")
 		}
@@ -83,11 +90,17 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 }
 
 // GetTasksToSchedule returns the guaranteed work derived from a submitted
-// intent. A contact DM payment schedules the cash message injected into the
-// DM between the sender and recipient; execution is handled by task.Executor.
+// intent. A DM payment (contact or tip) schedules the cash message injected
+// into the DM between the sender and recipient; execution is handled by
+// task.Executor.
 func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_intent.Record) ([]*ocp_task.Record, error) {
-	if intentRecord.IntentType == ocp_intent.SendPublicPayment && GetContactDmPayment(intentRecord) != nil {
-		return []*ocp_task.Record{NewSendContactDmPaymentMessageTask(intentRecord)}, nil
+	if intentRecord.IntentType == ocp_intent.SendPublicPayment {
+		if GetContactDmPayment(intentRecord) != nil {
+			return []*ocp_task.Record{NewSendContactDmPaymentMessageTask(intentRecord)}, nil
+		}
+		if GetTipDmPayment(intentRecord) != nil {
+			return []*ocp_task.Record{NewSendTipDmPaymentMessageTask(intentRecord)}, nil
+		}
 	}
 
 	return nil, nil

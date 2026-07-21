@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -71,10 +72,18 @@ func publishChatUpdate(
 	}
 
 	// todo: Tie in push to the event bus?
-	// todo: Assumes a contact-based DM chat
 	if update.NewMessages == nil {
 		return
 	}
+
+	// Pushes identify the sender differently per chat type — a contact DM push
+	// carries the sender's phone number, which is private in every other chat
+	// type. The type is recovered from the members already in hand, since a
+	// DM's ID commits to its type via the derivation domain — no store read.
+	// Skipping pushes on UNKNOWN is the safe default: a push must never fall
+	// back to a rendering that could leak the sender's phone number.
+	chatType := chat.DeriveDmChatType(chatID, members)
+
 	for _, message := range update.NewMessages.Messages {
 		if message.SenderId == nil {
 			continue
@@ -91,9 +100,6 @@ func publishChatUpdate(
 				log.With(zap.Error(err)).Warn("Failure getting sender profile for push")
 				return
 			}
-			if senderProfile.PhoneNumber == nil {
-				return
-			}
 
 			var membersForPush []*commonpb.UserId
 			for _, member := range members {
@@ -102,7 +108,20 @@ func publishChatUpdate(
 				}
 			}
 
-			err = push.SendContactDmPush(ctx, pusher, badges, ocpData, update.Chat, message, senderProfile.PhoneNumber, membersForPush...)
+			switch chatType {
+			case chatpb.ChatType_CONTACT_DM:
+				if senderProfile.PhoneNumber == nil {
+					return
+				}
+				err = push.SendContactDmPush(ctx, pusher, badges, ocpData, update.Chat, message, senderProfile.PhoneNumber, membersForPush...)
+			case chatpb.ChatType_TIP_DM:
+				if senderProfile.DisplayName == "" {
+					return
+				}
+				err = push.SendTipDmPush(ctx, pusher, badges, ocpData, update.Chat, message, senderProfile.DisplayName, membersForPush...)
+			default:
+				return
+			}
 			if err != nil {
 				log.With(zap.Error(err)).Warn("Failure sending message push")
 				return

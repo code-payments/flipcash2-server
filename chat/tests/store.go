@@ -31,6 +31,7 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_GetDmFeedPage_Paging,
 		testStore_GetDmFeedPage_SnapshotPinned,
 		testStore_GetDmFeedPage_Empty,
+		testStore_GetDmFeedPage_TypeScoped,
 	} {
 		tf(t, s)
 		teardown()
@@ -44,7 +45,7 @@ func testStore_PutAndGet(t *testing.T, s chat.Store) {
 	userB := model.MustGenerateUserID()
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{userA, userB},
 		LastActivity: at(100),
 	}
@@ -53,7 +54,7 @@ func testStore_PutAndGet(t *testing.T, s chat.Store) {
 	got, err := s.GetChatByID(ctx, c.ID)
 	require.NoError(t, err)
 	require.Equal(t, c.ID.Value, got.ID.Value)
-	require.Equal(t, chatpb.Metadata_DM, got.Type)
+	require.Equal(t, chatpb.ChatType_CONTACT_DM, got.Type)
 	require.True(t, got.LastActivity.Equal(at(100)))
 	require.ElementsMatch(t, userIDValues(c.Members), userIDValues(got.Members))
 }
@@ -63,7 +64,7 @@ func testStore_PutChat_Duplicate(t *testing.T, s chat.Store) {
 
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID()},
 		LastActivity: at(1),
 	}
@@ -88,7 +89,7 @@ func testStore_Members(t *testing.T, s chat.Store) {
 	userB := model.MustGenerateUserID()
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{userA, userB},
 		LastActivity: at(5),
 	}
@@ -107,7 +108,7 @@ func testStore_IsMember(t *testing.T, s chat.Store) {
 	stranger := model.MustGenerateUserID()
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{userA, userB},
 		LastActivity: at(5),
 	}
@@ -133,7 +134,7 @@ func testStore_AdvanceLastMessage(t *testing.T, s chat.Store) {
 	member := model.MustGenerateUserID()
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{member},
 		LastActivity: at(100),
 	}
@@ -186,7 +187,7 @@ func testStore_GetDmFeedPage_Order(t *testing.T, s chat.Store) {
 	_ = putChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(999))
 
 	// A watermark above every chat includes them all, most recent first.
-	got, err := s.GetDmFeedPage(ctx, user, at(1000), nil, 0)
+	got, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c2.ID.Value, c3.ID.Value, c1.ID.Value}, chatIDValues(got))
 }
@@ -201,7 +202,7 @@ func testStore_GetDmFeedPage_Watermark(t *testing.T, s chat.Store) {
 	c3 := putChat(t, s, user, other, at(200))
 
 	// A watermark of 250 pins out the chat last active at 300.
-	got, err := s.GetDmFeedPage(ctx, user, at(250), nil, 0)
+	got, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(250), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c3.ID.Value, c1.ID.Value}, chatIDValues(got))
 }
@@ -218,17 +219,17 @@ func testStore_GetDmFeedPage_Paging(t *testing.T, s chat.Store) {
 	snapshot := at(1000)
 
 	// Page 1: most recent, limit 2 → [c2, c3].
-	page1, err := s.GetDmFeedPage(ctx, user, snapshot, nil, 2)
+	page1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, snapshot, nil, 2)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c2.ID.Value, c3.ID.Value}, chatIDValues(page1))
 
 	// Page 2: resume after the last chat of page 1 (c3) → [c1].
-	page2, err := s.GetDmFeedPage(ctx, user, snapshot, cursorOf(page1[len(page1)-1]), 2)
+	page2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, snapshot, cursorOf(page1[len(page1)-1]), 2)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c1.ID.Value}, chatIDValues(page2))
 
 	// Resuming after the final chat yields an empty page.
-	page3, err := s.GetDmFeedPage(ctx, user, snapshot, cursorOf(c1), 2)
+	page3, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, snapshot, cursorOf(c1), 2)
 	require.NoError(t, err)
 	require.Empty(t, page3)
 }
@@ -248,7 +249,7 @@ func testStore_GetDmFeedPage_SnapshotPinned(t *testing.T, s chat.Store) {
 	snapshot := at(350) // All three are within the window.
 
 	// Page 1: the most recent chat.
-	page1, err := s.GetDmFeedPage(ctx, user, snapshot, nil, 1)
+	page1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, snapshot, nil, 1)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c3.ID.Value}, chatIDValues(page1))
 
@@ -260,7 +261,7 @@ func testStore_GetDmFeedPage_SnapshotPinned(t *testing.T, s chat.Store) {
 
 	// Page 2 sees only c2: c1 has left the snapshot window, so it is neither
 	// duplicated nor reordered into the read. Its freshness is the stream's job.
-	page2, err := s.GetDmFeedPage(ctx, user, snapshot, cursorOf(page1[len(page1)-1]), 10)
+	page2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, snapshot, cursorOf(page1[len(page1)-1]), 10)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c2.ID.Value}, chatIDValues(page2))
 }
@@ -268,9 +269,46 @@ func testStore_GetDmFeedPage_SnapshotPinned(t *testing.T, s chat.Store) {
 func testStore_GetDmFeedPage_Empty(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
-	got, err := s.GetDmFeedPage(ctx, model.MustGenerateUserID(), at(1000), nil, 0)
+	got, err := s.GetDmFeedPage(ctx, model.MustGenerateUserID(), chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Empty(t, got)
+}
+
+func testStore_GetDmFeedPage_TypeScoped(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	user := model.MustGenerateUserID()
+	other := model.MustGenerateUserID()
+
+	contact1 := putChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, other, at(100))
+	tip1 := putChatOfType(t, s, chatpb.ChatType_TIP_DM, user, other, at(200))
+	contact2 := putChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, other, at(300))
+	tip2 := putChatOfType(t, s, chatpb.ChatType_TIP_DM, user, other, at(400))
+
+	// Each feed contains only its own type, most recent first.
+	contacts, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{contact2.ID.Value, contact1.ID.Value}, chatIDValues(contacts))
+	for _, c := range contacts {
+		require.Equal(t, chatpb.ChatType_CONTACT_DM, c.Type)
+	}
+
+	tips, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_TIP_DM, at(1000), nil, 0)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{tip2.ID.Value, tip1.ID.Value}, chatIDValues(tips))
+	for _, c := range tips {
+		require.Equal(t, chatpb.ChatType_TIP_DM, c.Type)
+	}
+
+	// Paging within one feed steps over the other type's activity: a limit-1
+	// tip page resumes at the older tip, not at the interleaved contact chats.
+	tipPage1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_TIP_DM, at(1000), nil, 1)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{tip2.ID.Value}, chatIDValues(tipPage1))
+
+	tipPage2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_TIP_DM, at(1000), cursorOf(tipPage1[0]), 1)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{tip1.ID.Value}, chatIDValues(tipPage2))
 }
 
 func cursorOf(c *chat.Chat) *chat.DmFeedCursor {
@@ -278,9 +316,13 @@ func cursorOf(c *chat.Chat) *chat.DmFeedCursor {
 }
 
 func putChat(t *testing.T, s chat.Store, a, b *commonpb.UserId, lastActivity time.Time) *chat.Chat {
+	return putChatOfType(t, s, chatpb.ChatType_CONTACT_DM, a, b, lastActivity)
+}
+
+func putChatOfType(t *testing.T, s chat.Store, chatType chatpb.ChatType, a, b *commonpb.UserId, lastActivity time.Time) *chat.Chat {
 	c := &chat.Chat{
 		ID:           generateChatID(),
-		Type:         chatpb.Metadata_DM,
+		Type:         chatType,
 		Members:      []*commonpb.UserId{a, b},
 		LastActivity: lastActivity,
 	}

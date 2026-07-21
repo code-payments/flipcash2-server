@@ -151,6 +151,15 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
+	// Each DM type is its own feed; the request names which one (proto
+	// validation restricts the value to a known DM type).
+	chatType := req.GetDmChatType()
+
+	// For backwards compatiblity for legacy clients
+	if chatType == chatpb.ChatType_UNKNOWN {
+		chatType = chatpb.ChatType_CONTACT_DM
+	}
+
 	limit := maxDmChatFeedPageSize
 	if pageSize := req.GetQueryOptions().GetPageSize(); pageSize > 0 && int(pageSize) < limit {
 		limit = int(pageSize)
@@ -158,21 +167,23 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 
 	// The first request (no token) mints a snapshot watermark at the current
 	// time; later requests carry it back in the token so every page is served
-	// against the same point-in-time view. The cursor advances within it.
+	// against the same point-in-time view. The cursor advances within it. The
+	// token also binds the feed's chat type, so a cursor from one feed cannot
+	// be replayed against another.
 	var snapshot time.Time
 	var cursor *DmFeedCursor
 	if token := req.GetQueryOptions().GetPagingToken(); token != nil {
-		var ok bool
-		snapshot, cursor, ok = decodeDmFeedToken(token)
-		if !ok {
+		tokenSnapshot, tokenChatType, tokenCursor, ok := decodeDmFeedToken(token)
+		if !ok || tokenChatType != chatType {
 			return nil, status.Error(codes.InvalidArgument, "invalid paging token")
 		}
+		snapshot, cursor = tokenSnapshot, tokenCursor
 	} else {
 		snapshot = time.Now().UTC()
 	}
 
 	// Fetch one extra to detect whether a further page remains.
-	chats, err := s.chats.GetDmFeedPage(ctx, userID, snapshot, cursor, limit+1)
+	chats, err := s.chats.GetDmFeedPage(ctx, userID, chatType, snapshot, cursor, limit+1)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure getting DM chats")
 		return nil, status.Error(codes.Internal, "")
@@ -198,7 +209,7 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 	// chat. An empty page has nothing to resume from, so the token is omitted.
 	if n := len(chats); n > 0 {
 		last := chats[n-1]
-		resp.PagingToken = encodeDmFeedToken(snapshot, &DmFeedCursor{
+		resp.PagingToken = encodeDmFeedToken(snapshot, chatType, &DmFeedCursor{
 			LastActivity: last.LastActivity,
 			ChatID:       last.ID,
 		})
@@ -208,31 +219,37 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 
 // dmFeedTokenLen is the byte length of an encoded GetDmChatFeed paging token:
 // the snapshot watermark and the cursor's last_activity, each as big-endian
-// int64 unix-nanos, followed by the cursor's chat ID.
-const dmFeedTokenLen = 8 + 8 + ChatIDSize
+// int64 unix-nanos, followed by the cursor's chat ID and the feed's chat type
+// as a single byte.
+const dmFeedTokenLen = 8 + 8 + ChatIDSize + 1
 
-// encodeDmFeedToken serializes the snapshot watermark and resume cursor into an
-// opaque paging token for the client to echo on the next request.
-func encodeDmFeedToken(snapshot time.Time, cursor *DmFeedCursor) *commonpb.PagingToken {
+// encodeDmFeedToken serializes the snapshot watermark, feed chat type, and
+// resume cursor into an opaque paging token for the client to echo on the next
+// request.
+func encodeDmFeedToken(snapshot time.Time, chatType chatpb.ChatType, cursor *DmFeedCursor) *commonpb.PagingToken {
 	buf := make([]byte, dmFeedTokenLen)
 	binary.BigEndian.PutUint64(buf[0:8], uint64(snapshot.UnixNano()))
 	binary.BigEndian.PutUint64(buf[8:16], uint64(cursor.LastActivity.UnixNano()))
-	copy(buf[16:], cursor.ChatID.Value)
+	copy(buf[16:16+ChatIDSize], cursor.ChatID.Value)
+	buf[16+ChatIDSize] = byte(chatType)
 	return &commonpb.PagingToken{Value: buf}
 }
 
 // decodeDmFeedToken reverses encodeDmFeedToken. ok is false if the token is nil
-// or not the expected length (e.g. a client-fabricated value).
-func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, cursor *DmFeedCursor, ok bool) {
+// or not the expected length (e.g. a client-fabricated value). The caller must
+// check the returned chat type against the request's, rejecting a token minted
+// for a different feed.
+func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatType chatpb.ChatType, cursor *DmFeedCursor, ok bool) {
 	if token == nil || len(token.Value) != dmFeedTokenLen {
-		return time.Time{}, nil, false
+		return time.Time{}, chatpb.ChatType_UNKNOWN, nil, false
 	}
 	snapshot = time.Unix(0, int64(binary.BigEndian.Uint64(token.Value[0:8]))).UTC()
+	chatType = chatpb.ChatType(token.Value[16+ChatIDSize])
 	cursor = &DmFeedCursor{
 		LastActivity: time.Unix(0, int64(binary.BigEndian.Uint64(token.Value[8:16]))).UTC(),
-		ChatID:       &commonpb.ChatId{Value: append([]byte(nil), token.Value[16:]...)},
+		ChatID:       &commonpb.ChatId{Value: append([]byte(nil), token.Value[16:16+ChatIDSize]...)},
 	}
-	return snapshot, cursor, true
+	return snapshot, chatType, cursor, true
 }
 
 // hydrate builds the proto metadata for a set of chats, batching the reads
@@ -250,7 +267,7 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 	var seqChatIDs []*commonpb.ChatId
 	pointerRefs := make([]PointerRef, len(chats))
 	uniqueUserIDs := make(map[string]*commonpb.UserId)
-	uniqueDmUserIds := make(map[string]*commonpb.UserId)
+	uniquePrivateProfileUserIds := make(map[string]*commonpb.UserId)
 	for i, c := range chats {
 		pointerRefs[i] = PointerRef{ChatID: c.ID, Members: c.Members}
 		if c.LastMessageID != nil {
@@ -262,8 +279,8 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 		}
 		for _, m := range c.Members {
 			uniqueUserIDs[string(m.Value)] = m
-			if c.Type == chatpb.Metadata_DM {
-				uniqueDmUserIds[string(m.Value)] = m
+			if c.Type == chatpb.ChatType_CONTACT_DM {
+				uniquePrivateProfileUserIds[string(m.Value)] = m
 			}
 		}
 	}
@@ -271,9 +288,9 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 	for _, u := range uniqueUserIDs {
 		userIDs = append(userIDs, u)
 	}
-	dmUserIDs := make([]*commonpb.UserId, 0, len(uniqueDmUserIds))
-	for _, u := range uniqueDmUserIds {
-		dmUserIDs = append(dmUserIDs, u)
+	privateProfileUserIDs := make([]*commonpb.UserId, 0, len(uniquePrivateProfileUserIds))
+	for _, u := range uniquePrivateProfileUserIds {
+		privateProfileUserIDs = append(privateProfileUserIDs, u)
 	}
 
 	lastMessages, err := s.messaging.LastMessages(ctx, msgRefs)
@@ -288,7 +305,7 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 	if err != nil {
 		return nil, err
 	}
-	phoneNumbersByUserId, err := s.profiles.GetPhoneNumbers(ctx, dmUserIDs)
+	phoneNumbersByUserId, err := s.profiles.GetPhoneNumbers(ctx, privateProfileUserIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -313,7 +330,7 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 				DisplayName:    displayNamesByUserId[string(m.UserId.Value)],
 				ProfilePicture: profilePicturesByUserId[string(m.UserId.Value)],
 			}
-			if md.Type == chatpb.Metadata_DM {
+			if md.Type == chatpb.ChatType_CONTACT_DM {
 				profile.PhoneNumber = phoneNumbersByUserId[string(m.UserId.Value)]
 			}
 			m.UserProfile = profile

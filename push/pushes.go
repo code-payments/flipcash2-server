@@ -138,45 +138,19 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 	return pusher.SendPushes(ctx, title, body, customPayload, users...)
 }
 
+// SendContactDmPush notifies recipients of a new message in a contact DM. The
+// title is a contact substitution on the sender's phone number, which the
+// recipient's client resolves against their address book.
 func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderContact *phonepb.PhoneNumber, recipients ...*commonpb.UserId) error {
-	title := "{0}"
-
-	var body string
-	switch content := message.Content[0].Type.(type) {
-	case *messagingpb.Content_Text:
-		body = content.Text.Text
-	case *messagingpb.Content_Reply:
-		// Push the reply's wrapped content. Only text replies are supported today.
-		if len(content.Reply.Content) == 0 {
-			return nil
-		}
-		textContent, ok := content.Reply.Content[0].Type.(*messagingpb.Content_Text)
-		if !ok {
-			return nil
-		}
-		body = textContent.Text.Text
-	case *messagingpb.Content_Cash:
-		currencyName, err := resolveCurrencyName(ctx, ocpData, content.Cash.Amount.Mint)
-		if err != nil {
-			return err
-		}
-		body = fmt.Sprintf(
-			"Sent you %s of %s",
-			localization.FormatFiat(
-				defaultLocale,
-				ocp_currency.Code(content.Cash.Amount.Currency),
-				content.Cash.Amount.NativeAmount,
-			),
-			currencyName,
-		)
-	default:
+	body, ok, err := renderDmMessagePushBody(ctx, ocpData, message)
+	if err != nil {
+		return err
+	}
+	if !ok {
 		return nil
 	}
 
-	if len(body) > 1024 {
-		body = fmt.Sprintf("%s...", body[:1024])
-	}
-
+	title := "{0}"
 	customPayload := &pushpb.Payload{
 		Category: pushpb.Payload_CHAT,
 		GroupKey: base64.StdEncoding.EncodeToString(chatId.Value),
@@ -195,6 +169,79 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 		},
 	}
 
+	return sendDmMessagePush(ctx, pusher, badges, title, body, customPayload, recipients...)
+}
+
+// SendTipDmPush notifies recipients of a new message in a tip DM. The sender
+// is typically not in the recipient's contacts, so the title carries the
+// sender's display name directly rather than a contact substitution — and
+// never the sender's phone number, which is private in a tip DM.
+func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderDisplayName string, recipients ...*commonpb.UserId) error {
+	body, ok, err := renderDmMessagePushBody(ctx, ocpData, message)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+
+	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_CHAT,
+		GroupKey: base64.StdEncoding.EncodeToString(chatId.Value),
+		Navigation: &pushpb.Navigation{
+			Type: &pushpb.Navigation_ChatId{
+				ChatId: chatId,
+			},
+		},
+	}
+
+	return sendDmMessagePush(ctx, pusher, badges, senderDisplayName, body, customPayload, recipients...)
+}
+
+// renderDmMessagePushBody renders the push body for a DM message. ok is false
+// for content types that don't produce a push.
+func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, message *messagingpb.Message) (body string, ok bool, err error) {
+	switch content := message.Content[0].Type.(type) {
+	case *messagingpb.Content_Text:
+		body = content.Text.Text
+	case *messagingpb.Content_Reply:
+		// Push the reply's wrapped content. Only text replies are supported today.
+		if len(content.Reply.Content) == 0 {
+			return "", false, nil
+		}
+		textContent, ok := content.Reply.Content[0].Type.(*messagingpb.Content_Text)
+		if !ok {
+			return "", false, nil
+		}
+		body = textContent.Text.Text
+	case *messagingpb.Content_Cash:
+		currencyName, err := resolveCurrencyName(ctx, ocpData, content.Cash.Amount.Mint)
+		if err != nil {
+			return "", false, err
+		}
+		body = fmt.Sprintf(
+			"Sent you %s of %s",
+			localization.FormatFiat(
+				defaultLocale,
+				ocp_currency.Code(content.Cash.Amount.Currency),
+				content.Cash.Amount.NativeAmount,
+			),
+			currencyName,
+		)
+	default:
+		return "", false, nil
+	}
+
+	if len(body) > 1024 {
+		body = fmt.Sprintf("%s...", body[:1024])
+	}
+
+	return body, true, nil
+}
+
+// sendDmMessagePush sends a rendered DM message push and bumps each
+// recipient's badge count.
+func sendDmMessagePush(ctx context.Context, pusher Pusher, badges badge.Store, title, body string, customPayload *pushpb.Payload, recipients ...*commonpb.UserId) error {
 	if err := pusher.SendPushes(ctx, title, body, customPayload, recipients...); err != nil {
 		return err
 	}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
@@ -77,7 +78,7 @@ func TestChatResolver_Covers(t *testing.T) {
 	chats := chat_memory.NewInMemory()
 	member := model.MustGenerateUserID()
 	stranger := model.MustGenerateUserID()
-	chatID := chat.MustDeriveDmChatID(member, stranger)
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, member, stranger)
 	require.NoError(t, chats.PutChat(ctx, &chat.Chat{
 		ID:      chatID,
 		Members: []*commonpb.UserId{member},
@@ -96,7 +97,7 @@ func TestChatResolver_Covers(t *testing.T) {
 	require.False(t, ok)
 
 	// An unknown chat is not covered (IsMember reports false without error).
-	unknownChat := chat.MustDeriveDmChatID(member, model.MustGenerateUserID())
+	unknownChat := chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, member, model.MustGenerateUserID())
 	ok, err = r.Covers(ctx, PrincipalForChat(unknownChat), member)
 	require.NoError(t, err)
 	require.False(t, ok)

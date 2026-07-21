@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	contactpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/contact/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
@@ -458,7 +459,7 @@ func testServer_GetFlipcashContacts_OK(t *testing.T, accounts account.Store, pro
 
 	// The DM chat ID is derived from the caller and the contact's Flipcash user.
 	require.Equal(t,
-		chat.MustDeriveDmChatID(f.userID, flipcashUserA).Value,
+		chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, f.userID, flipcashUserA).Value,
 		dmChatIDByPhone[phoneA].Value,
 	)
 

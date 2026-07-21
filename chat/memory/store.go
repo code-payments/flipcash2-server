@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
@@ -56,16 +57,17 @@ func (m *memory) GetChatByID(_ context.Context, chatID *commonpb.ChatId) (*chat.
 	return c.Clone(), nil
 }
 
-func (m *memory) GetDmFeedPage(_ context.Context, userID *commonpb.UserId, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
+func (m *memory) GetDmFeedPage(_ context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
 	m.Lock()
 	defer m.Unlock()
 
-	// Collect the user's chats within the snapshot window (last_activity at or
-	// before the watermark). A chat that became active after the snapshot has
-	// moved above the watermark and is excluded from the read.
+	// Collect the user's chats of the requested type within the snapshot window
+	// (last_activity at or before the watermark). A chat that became active
+	// after the snapshot has moved above the watermark and is excluded from the
+	// read.
 	var chats []*chat.Chat
 	for _, c := range m.chats {
-		if c.HasMember(userID) && !c.LastActivity.After(snapshot) {
+		if c.Type == chatType && c.HasMember(userID) && !c.LastActivity.After(snapshot) {
 			chats = append(chats, c.Clone())
 		}
 	}

@@ -14,7 +14,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.42.3
 	github.com/aws/smithy-go v1.27.3
 	github.com/buckket/go-blurhash v1.1.0
-	github.com/code-payments/flipcash2-protobuf-api v1.17.1-0.20260720184933-868bf166f7e9
+	github.com/code-payments/flipcash2-protobuf-api v1.18.0
 	github.com/code-payments/ocp-protobuf-api v1.14.0
 	github.com/code-payments/ocp-server v1.21.1-0.20260713175018-443700a6b7c8
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2

@@ -43,9 +43,16 @@ type StorageCache struct {
 // minRemaining at or above the signer's TTL disables caching entirely, since no
 // entry could satisfy it.
 func NewStorageCache(storage blob.ObjectStorage, minRemaining time.Duration) blob.ObjectStorage {
+	urls := ttlcache.NewCache()
+	// A cached URL expires at an absolute instant baked into its signature, so its
+	// entry has to expire on a deadline fixed at insertion. ttlcache renews an entry's
+	// lifetime on every read by default, which for a hot key — exactly the recurring
+	// avatar this cache exists for — would keep the entry alive indefinitely while the
+	// URL inside it expired.
+	urls.SkipTtlExtensionOnHit(true)
 	return &StorageCache{
 		storage:      storage,
-		urls:         ttlcache.NewCache(),
+		urls:         urls,
 		minRemaining: minRemaining,
 	}
 }
@@ -54,8 +61,15 @@ func NewStorageCache(storage blob.ObjectStorage, minRemaining time.Duration) blo
 // life left in it, and otherwise mints and caches a fresh one. The returned proto is
 // a copy, so a caller mutating it cannot corrupt the cached entry.
 func (c *StorageCache) SignDownloadURL(ctx context.Context, key string) (*blobpb.DownloadUrl, error) {
+	// The entry's own TTL is what normally evicts it in time; re-checking the margin
+	// against the URL's actual expiry is what guarantees it, so the promise this
+	// cache makes holds at the point it hands one out rather than resting on the
+	// eviction behaviour of the map behind it.
 	if cached, ok := c.urls.Get(key); ok {
-		return proto.Clone(cached.(*blobpb.DownloadUrl)).(*blobpb.DownloadUrl), nil
+		url := cached.(*blobpb.DownloadUrl)
+		if time.Until(url.ExpiresAt.AsTime()) > c.minRemaining {
+			return proto.Clone(url).(*blobpb.DownloadUrl), nil
+		}
 	}
 
 	signed, err := c.storage.SignDownloadURL(ctx, key)

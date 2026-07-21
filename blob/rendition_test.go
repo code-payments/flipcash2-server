@@ -112,6 +112,7 @@ func TestImageEncodingFor(t *testing.T) {
 func TestImageRenditionSpecsLadder(t *testing.T) {
 	// The ladder is ordered small to large so hydration emits it in that order.
 	require.Equal(t, []imageRenditionSpec{
+		{Rendition: RenditionThumbnail, MaxLongestSide: 32},
 		{Rendition: RenditionThumbnail, MaxLongestSide: 160},
 		{Rendition: RenditionThumbnail, MaxLongestSide: 320},
 		{Rendition: RenditionDisplay, MaxLongestSide: 800},

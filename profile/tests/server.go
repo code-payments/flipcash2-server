@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -489,9 +490,14 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 		return resp.GetUserProfile().GetDisplayName()
 	}
 
+	// Each subtest configures the moderator from a clean slate, so a verdict left
+	// behind by an earlier one cannot be what makes a later one pass.
+	reset := func() {
+		*moderator = fakeModerator{}
+	}
+
 	t.Run("Clean name is moderated and persisted", func(t *testing.T) {
-		moderator.textFlagged = false
-		moderator.textErr = nil
+		reset()
 
 		resp, err := setDisplayName("clean name")
 		require.NoError(t, err)
@@ -499,10 +505,10 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 		require.Equal(t, "clean name", displayName())
 	})
 
-	t.Run("Flagged name is rejected and not persisted", func(t *testing.T) {
+	t.Run("Name flagged as text is rejected and not persisted", func(t *testing.T) {
+		reset()
 		moderator.textFlagged = true
 		moderator.textCategories = []string{"general_nsfw"}
-		moderator.textErr = nil
 
 		resp, err := setDisplayName("bad name")
 		require.NoError(t, err)
@@ -513,38 +519,87 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 		require.Equal(t, "clean name", displayName())
 	})
 
-	t.Run("Unclassifiable name fails closed", func(t *testing.T) {
-		moderator.textFlagged = false
-		moderator.textErr = moderation.ErrUnsupportedLanguage
+	t.Run("Name flagged as a display name is rejected and not persisted", func(t *testing.T) {
+		reset()
+		moderator.displayNameFlagged = true
+		moderator.displayNameCategories = []string{"solicitation"}
 
-		_, err := setDisplayName("네네네")
-		require.Equal(t, codes.Internal, status.Code(err))
+		resp, err := setDisplayName("dm me for signals")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetDisplayNameResponse_FAILED_MODERATED, resp.Result)
+		require.Equal(t, moderationpb.FlaggedCategory_SPAM, resp.FlaggedCategory)
 
 		require.Equal(t, "clean name", displayName())
+	})
+
+	t.Run("Display name category is reported when both classifiers flag", func(t *testing.T) {
+		reset()
+		moderator.textFlagged = true
+		moderator.textCategories = []string{"general_nsfw"}
+		moderator.displayNameFlagged = true
+		moderator.displayNameCategories = []string{"solicitation"}
+
+		resp, err := setDisplayName("bad name, dm me")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetDisplayNameResponse_FAILED_MODERATED, resp.Result)
+		require.Equal(t, moderationpb.FlaggedCategory_SPAM, resp.FlaggedCategory)
+
+		require.Equal(t, "clean name", displayName())
+	})
+
+	t.Run("Name the text classifier cannot identify a language for is still allowed", func(t *testing.T) {
+		reset()
+		// A short name gives the text classifier too little to work with. The
+		// display-name classifier still covers it, so this is not fatal.
+		moderator.textErr = moderation.ErrUnsupportedLanguage
+
+		resp, err := setDisplayName("네네네")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, resp.Result)
+		require.Equal(t, "네네네", displayName())
+	})
+
+	t.Run("Name the text classifier fails on fails closed", func(t *testing.T) {
+		reset()
+		moderator.textErr = errors.New("classifier unavailable")
+
+		_, err := setDisplayName("unclassifiable")
+		require.Equal(t, codes.Internal, status.Code(err))
+
+		require.Equal(t, "네네네", displayName())
+	})
+
+	t.Run("Name the display name classifier fails on fails closed", func(t *testing.T) {
+		reset()
+		moderator.displayNameErr = errors.New("classifier unavailable")
+
+		_, err := setDisplayName("unclassifiable")
+		require.Equal(t, codes.Internal, status.Code(err))
+
+		require.Equal(t, "네네네", displayName())
 	})
 }
 
 // fakeModerator is a configurable moderation.Client for the display-name tests.
-// Only ClassifyText is exercised; the other methods satisfy the interface.
+// SetDisplayName runs both ClassifyText and ClassifyDisplayName, so each is
+// configured independently; ClassifyImage and ClassifyCurrencyName are here only
+// to satisfy the interface.
 type fakeModerator struct {
 	textFlagged    bool
 	textCategories []string
 	textErr        error
+
+	displayNameFlagged    bool
+	displayNameCategories []string
+	displayNameErr        error
 }
 
 func (m *fakeModerator) ClassifyText(context.Context, string) (*moderation.Result, error) {
-	if m.textErr != nil {
-		return nil, m.textErr
-	}
-	result := &moderation.Result{Flagged: m.textFlagged}
-	if len(m.textCategories) > 0 {
-		result.FlaggedCategories = m.textCategories
-		result.CategoryScores = make(map[string]float64, len(m.textCategories))
-		for i, category := range m.textCategories {
-			result.CategoryScores[category] = float64(i + 1)
-		}
-	}
-	return result, nil
+	return fakeResult(m.textFlagged, m.textCategories, m.textErr)
+}
+
+func (m *fakeModerator) ClassifyDisplayName(context.Context, string) (*moderation.Result, error) {
+	return fakeResult(m.displayNameFlagged, m.displayNameCategories, m.displayNameErr)
 }
 
 func (m *fakeModerator) ClassifyImage(context.Context, []byte) (*moderation.Result, error) {
@@ -553,4 +608,19 @@ func (m *fakeModerator) ClassifyImage(context.Context, []byte) (*moderation.Resu
 
 func (m *fakeModerator) ClassifyCurrencyName(context.Context, string) (*moderation.Result, error) {
 	return &moderation.Result{}, nil
+}
+
+func fakeResult(flagged bool, categories []string, err error) (*moderation.Result, error) {
+	if err != nil {
+		return nil, err
+	}
+	result := &moderation.Result{Flagged: flagged}
+	if len(categories) > 0 {
+		result.FlaggedCategories = categories
+		result.CategoryScores = make(map[string]float64, len(categories))
+		for i, category := range categories {
+			result.CategoryScores[category] = float64(i + 1)
+		}
+	}
+	return result, nil
 }

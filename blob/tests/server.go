@@ -945,3 +945,7 @@ func (m *fakeModerator) ClassifyImage(context.Context, []byte) (*moderation.Resu
 func (m *fakeModerator) ClassifyCurrencyName(context.Context, string) (*moderation.Result, error) {
 	return &moderation.Result{}, nil
 }
+
+func (m *fakeModerator) ClassifyDisplayName(context.Context, string) (*moderation.Result, error) {
+	return &moderation.Result{}, nil
+}

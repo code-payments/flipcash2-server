@@ -198,6 +198,10 @@ func (c *client) ClassifyCurrencyName(ctx context.Context, name string) (*modera
 	return nil, errors.New("not implemented")
 }
 
+func (c *client) ClassifyDisplayName(ctx context.Context, name string) (*moderation.Result, error) {
+	return nil, errors.New("not implemented")
+}
+
 type response struct {
 	Status []taskStatus `json:"status"`
 }

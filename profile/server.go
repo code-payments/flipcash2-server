@@ -108,17 +108,34 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 
 	if s.moderator != nil {
 		// Moderate before persisting, so a flagged name is never briefly visible to
-		// anyone reading the profile.
-		result, err := s.moderator.ClassifyText(ctx, req.DisplayName)
+		// anyone reading the profile. Both classifiers run: the general text
+		// classifier catches what it can, and the display-name classifier covers
+		// the name-specific abuse it is not tuned for.
+		textResult, err := s.moderator.ClassifyText(ctx, req.DisplayName)
+		if err != nil && !errors.Is(err, moderation.ErrUnsupportedLanguage) {
+			log.Warn("Failed to classify display name as text", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to moderate display name")
+		}
+		// ErrUnsupportedLanguage is not fatal here. A one- or two-word name often
+		// gives the text classifier too little to identify a language from, and the
+		// display-name classifier below still covers the name.
+
+		displayNameResult, err := s.moderator.ClassifyDisplayName(ctx, req.DisplayName)
 		if err != nil {
-			// Includes moderation.ErrUnsupportedLanguage: a name that cannot be
-			// classified is never persisted, since allowing it would leave an
-			// unmoderated name in place.
+			// A name that cannot be classified is never persisted, since allowing it
+			// would leave an unmoderated name in place.
 			log.Warn("Failed to classify display name", zap.Error(err))
 			return nil, status.Error(codes.Internal, "failed to moderate display name")
 		}
 
-		if result.Flagged {
+		// The display-name result is checked first so that its name-specific
+		// category is the one reported when both classifiers flag. Their scores are
+		// on different scales, so they cannot be merged and ranked together.
+		for _, result := range []*moderation.Result{displayNameResult, textResult} {
+			if result == nil || !result.Flagged {
+				continue
+			}
+
 			log.Info("Display name is flagged", zap.Strings("categories", result.FlaggedCategories))
 			return &profilepb.SetDisplayNameResponse{
 				Result:          profilepb.SetDisplayNameResponse_FAILED_MODERATED,

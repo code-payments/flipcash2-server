@@ -23,6 +23,7 @@ type mockClient struct {
 	textResult         *Result
 	imageResult        *Result
 	currencyNameResult *Result
+	displayNameResult  *Result
 	err                error
 }
 
@@ -36,6 +37,10 @@ func (m *mockClient) ClassifyImage(_ context.Context, _ []byte) (*Result, error)
 
 func (m *mockClient) ClassifyCurrencyName(_ context.Context, _ string) (*Result, error) {
 	return m.currencyNameResult, m.err
+}
+
+func (m *mockClient) ClassifyDisplayName(_ context.Context, _ string) (*Result, error) {
+	return m.displayNameResult, m.err
 }
 
 func TestModerateText_Allowed(t *testing.T) {

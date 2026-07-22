@@ -35,4 +35,15 @@ type Client interface {
 	// misleading. The result includes per-category scores for areas like
 	// cryptocurrency, financial_service, impersonation, etc.
 	ClassifyCurrencyName(ctx context.Context, name string) (*Result, error)
+
+	// ClassifyDisplayName checks whether a user-chosen display name abuses the
+	// name field to advertise, solicit, or expose others to harmful content.
+	// The result includes per-category scores for areas like solicitation,
+	// contact_info, hate, etc.
+	//
+	// It deliberately does not score impersonation: users are free to call
+	// themselves whatever they like, including the name of a real person or
+	// brand. It is also distinct from ClassifyText, which is tuned for prose
+	// and has little to work with in a one- or two-word name.
+	ClassifyDisplayName(ctx context.Context, name string) (*Result, error)
 }

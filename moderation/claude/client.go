@@ -20,8 +20,12 @@ const (
 
 	metricsStructName = "moderation.claude.client"
 
-	model     = "claude-haiku-4-5"
-	maxTokens = 256
+	model = "claude-sonnet-5"
+
+	// maxTokens caps the whole response, and only tokens actually generated are
+	// billed, so this is sized well above the ~150 tokens a score object needs
+	// rather than trimmed to fit it.
+	maxTokens = 512
 
 	currencyNameFlagThreshold = 0.7
 
@@ -43,6 +47,36 @@ Score each category from 0.0 (no match) to 1.0 (clear match):
 - tech_company: Matches a major technology company (Apple, Google, Meta, Amazon, Microsoft, Tesla, etc.)
 
 Respond with only a JSON object mapping each category to its score. No other text. Evaluate the entire text as a currency name.`
+
+	displayNameFlagThreshold = 0.5
+
+	displayNameSystemPrompt = `You are a moderation system that evaluates user-chosen display names for a peer-to-peer payments app. A display name appears next to the user in chats, contact lists, and payment confirmations, so it is a surface users can abuse to advertise, solicit, or expose others to harmful content.
+
+Users are free to call themselves whatever they like, including the name of a real person, celebrity, company, brand, or product. That is not a violation and must not be scored.
+
+Evaluate the entire text as one person's chosen display name.
+
+Score each category from 0.0 (no match) to 1.0 (clear match):
+
+- financial_claim: Promises returns, giveaways, guarantees, or free money (Free USDC, Guaranteed 10x, Crypto Giveaway, etc.)
+- solicitation: Advertises a service, recruits, or directs the reader elsewhere (DM for signals, Buy followers, Join my channel, etc.)
+- contact_info: Contains a URL, domain, social handle, phone number, email address, or wallet address
+- gibberish: Random characters or filler with no plausible meaning as a name (asdfgh, xxxxxxxx, etc.)
+- sexual: Sexually explicit or graphic
+- hate: Slurs, hate symbols, hate groups, or coded hate references (1488, 88, etc.)
+- violence: Threats, glorification of violence, or terrorism references
+- child_safety: Sexualizes minors or references child exploitation
+- self_harm: References or encourages suicide or self-harm
+- drugs: Advertises or promotes illegal drugs
+- profanity: Obscene or vulgar language
+
+Rules:
+- Ordinary personal names, nicknames, usernames, and handles in any language or script are NOT violations. Do not flag a name merely because it is non-English, transliterated, or unfamiliar. Common given names and surnames that happen to coincide with a crude word score low absent other signals.
+- Score based on the whole name, including obfuscation. Read leetspeak, homoglyphs, inserted spacing, and zero-width characters as the letters they imitate, so that an evaded slur or an obscured URL is scored the same as a plain one.
+- Only score above 0.5 when the interpretation is clear. Short or ambiguous strings score low.
+- Emoji, stylization, and unusual capitalization are not themselves violations.
+
+Respond with only a JSON object mapping each category to its score. No other text. Evaluate the entire text as a display name.`
 )
 
 type client struct {
@@ -50,7 +84,8 @@ type client struct {
 	httpClient *http.Client
 }
 
-// NewClient creates a moderation client uses Claude Haiku for currency name classification.
+// NewClient creates a moderation client that uses Claude Sonnet for currency
+// name and display name classification.
 func NewClient(apiKey string) moderation.Client {
 	return &client{
 		apiKey:     apiKey,
@@ -75,12 +110,25 @@ func (c *client) ClassifyCurrencyName(ctx context.Context, name string) (*modera
 	return res, err
 }
 
+func (c *client) ClassifyDisplayName(ctx context.Context, name string) (*moderation.Result, error) {
+	tracer := metrics.TraceMethodCall(ctx, metricsStructName, "ClassifyDisplayName")
+	defer tracer.End()
+
+	res, err := c.classifyDisplayName(ctx, name)
+	tracer.OnError(err)
+	return res, err
+}
+
 type messagesRequest struct {
-	Model       string         `json:"model"`
-	MaxTokens   int            `json:"max_tokens"`
-	Temperature float64        `json:"temperature"`
-	System      string         `json:"system"`
-	Messages    []messageParam `json:"messages"`
+	Model     string         `json:"model"`
+	MaxTokens int            `json:"max_tokens"`
+	System    string         `json:"system"`
+	Thinking  thinkingParam  `json:"thinking"`
+	Messages  []messageParam `json:"messages"`
+}
+
+type thinkingParam struct {
+	Type string `json:"type"`
 }
 
 type messageParam struct {
@@ -98,13 +146,54 @@ type contentBlock struct {
 }
 
 func (c *client) classifyCurrencyName(ctx context.Context, name string) (*moderation.Result, error) {
+	scores, err := c.score(ctx, currencyNameSystemPrompt, name)
+	if err != nil {
+		return nil, err
+	}
+	return toResult(scores, currencyNameFlagThreshold), nil
+}
+
+func (c *client) classifyDisplayName(ctx context.Context, name string) (*moderation.Result, error) {
+	scores, err := c.score(ctx, displayNameSystemPrompt, name)
+	if err != nil {
+		return nil, err
+	}
+	return toResult(scores, displayNameFlagThreshold), nil
+}
+
+// toResult flags every category scored at or above threshold.
+func toResult(scores map[string]float64, threshold float64) *moderation.Result {
+	result := &moderation.Result{
+		CategoryScores: make(map[string]float64, len(scores)),
+	}
+
+	for category, score := range scores {
+		result.CategoryScores[category] = score
+
+		if score >= threshold {
+			result.Flagged = true
+			result.FlaggedCategories = append(result.FlaggedCategories, category)
+		}
+	}
+
+	return result
+}
+
+// score asks the model to classify input under the given system prompt and
+// returns the per-category scores it responded with.
+func (c *client) score(ctx context.Context, systemPrompt, input string) (map[string]float64, error) {
 	reqBody := messagesRequest{
-		Model:       model,
-		MaxTokens:   maxTokens,
-		Temperature: 0.0,
-		System:      currencyNameSystemPrompt,
+		Model:     model,
+		MaxTokens: maxTokens,
+		System:    systemPrompt,
+		// Thinking is disabled explicitly: this model runs adaptive thinking when
+		// the field is omitted, and reasoning shares the max_tokens budget with the
+		// response, so a name that provoked a long deliberation would truncate the
+		// score object and fail the parse. Scoring against a fixed rubric does not
+		// need it, and it would add latency to a synchronous RPC.
+		Thinking: thinkingParam{Type: "disabled"},
 		Messages: []messageParam{
-			{Role: "user", Content: name},
+			{Role: "user", Content: input},
 		},
 	}
 
@@ -158,17 +247,5 @@ func (c *client) classifyCurrencyName(ctx context.Context, name string) (*modera
 		return nil, fmt.Errorf("failed to parse claude scores: %w", err)
 	}
 
-	result := &moderation.Result{
-		CategoryScores: make(map[string]float64),
-	}
-
-	for category, score := range scores {
-		result.CategoryScores[category] = score
-		if score >= currencyNameFlagThreshold {
-			result.Flagged = true
-			result.FlaggedCategories = append(result.FlaggedCategories, category)
-		}
-	}
-
-	return result, nil
+	return scores, nil
 }

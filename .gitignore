@@ -38,3 +38,10 @@ node_modules/
 # Executable Golang code
 cmd*/
 main.go
+
+# Moderation test fixtures. These hold the names the classifiers must flag —
+# slurs, hate codes, and child-safety terms — so they are deliberately kept out
+# of version control. See MODERATION_DISPLAY_NAME_FIXTURES in
+# moderation/claude/client_test.go for the format and how to point the tests at
+# a copy.
+moderation/claude/testdata/

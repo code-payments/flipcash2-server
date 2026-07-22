@@ -222,6 +222,7 @@ func mapFlaggedCategory(flaggedCategory string) moderationpb.FlaggedCategory {
 		return moderationpb.FlaggedCategory_IMPERSONATION
 
 	case
+		"financial_claim",
 		"misleading_backing":
 		return moderationpb.FlaggedCategory_MISLEADING
 
@@ -309,10 +310,12 @@ func mapFlaggedCategory(flaggedCategory string) moderationpb.FlaggedCategory {
 		return moderationpb.FlaggedCategory_NSFW
 
 	case
+		"contact_info",
 		"gibberish",
 		"phone_number",
 		"promotions",
 		"redirection",
+		"solicitation",
 		"spam",
 		"yes_qr_code":
 		return moderationpb.FlaggedCategory_SPAM

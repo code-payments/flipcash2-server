@@ -361,32 +361,20 @@ var imageFlaggedCategories = map[string]struct{}{
 	"yes_undressed":              {},
 
 	// --- Sexual content (suggestive) ---
-	"general_suggestive":     {},
-	"kissing":                {},
-	"licking":                {},
-	"yes_bodysuit":           {},
-	"yes_bra":                {},
-	"yes_bulge":              {},
-	"yes_butt":               {},
-	"yes_cleavage":           {},
-	"yes_female_swimwear":    {},
-	"yes_female_underwear":   {},
-	"yes_male_shirtless":     {},
-	"yes_male_underwear":     {},
-	"yes_miniskirt":          {},
-	"yes_negligee":           {},
-	"yes_panties":            {},
-	"yes_sports_bra":         {},
-	"yes_sportswear_bottoms": {},
+	"general_suggestive":   {},
+	"yes_bulge":            {},
+	"yes_butt":             {},
+	"yes_female_underwear": {},
+	"yes_male_underwear":   {},
+	"yes_negligee":         {},
+	"yes_panties":          {},
 
 	// --- Weapons ---
-	"animated_gun":               {},
-	"culinary_knife_in_hand":     {},
-	"culinary_knife_not_in_hand": {},
-	"gun_in_hand":                {},
-	"gun_not_in_hand":            {},
-	"knife_in_hand":              {},
-	"knife_not_in_hand":          {},
+	"animated_gun":      {},
+	"gun_in_hand":       {},
+	"gun_not_in_hand":   {},
+	"knife_in_hand":     {},
+	"knife_not_in_hand": {},
 
 	// --- Gore / violence ---
 	"a_little_bloody":    {},
@@ -402,26 +390,21 @@ var imageFlaggedCategories = map[string]struct{}{
 	"yes_self_harm":      {},
 
 	// --- Hate symbols ---
-	"yes_confederate":   {},
-	"yes_kkk":           {},
-	"yes_middle_finger": {},
-	"yes_nazi":          {},
-	"yes_terrorist":     {},
+	"yes_confederate":      {},
+	"yes_confederate_flag": {},
+	"yes_kkk":              {},
+	"yes_middle_finger":    {},
+	"yes_nazi":             {},
+	"yes_terrorist":        {},
 
 	// --- Drugs / illicit ---
-	"animated_alcohol":     {},
-	"illicit_injectables":  {},
-	"medical_injectables":  {},
-	"yes_alcohol":          {},
-	"yes_drinking_alcohol": {},
-	"yes_gambling":         {},
-	"yes_marijuana":        {},
-	"yes_pills":            {},
-	"yes_smoking":          {},
+	"illicit_injectables": {},
+	"recreational_pills":  {},
+	"yes_marijuana":       {},
+	"yes_pills":           {},
 
 	// --- Child safety / abuse signals ---
-	"yes_child_present": {},
-	"yes_child_safety":  {},
+	"yes_child_safety": {},
 
 	// --- Spam / phishing signals ---
 	"yes_qr_code": {},

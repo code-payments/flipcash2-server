@@ -31,6 +31,12 @@ const (
 	// base table's pk as its hash key.
 	gsiByBlockedAt = "by_blocked_at"
 
+	// gsiByBlockedUser is the reverse of gsiByBlockedAt: it reuses the base
+	// table's sk (the blocked user) as its hash key, so a query for one user
+	// returns everyone who has blocked them, ordered by blocked_at. The blocker
+	// is recovered from the base table's pk.
+	gsiByBlockedUser = "by_blocked_user"
+
 	// userKeyPrefix prefixes an owner ID in the pk; blockedKeyPrefix prefixes a
 	// blocked user ID in the sk.
 	userKeyPrefix    = "user#"

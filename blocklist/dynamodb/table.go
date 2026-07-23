@@ -11,8 +11,9 @@ import (
 )
 
 // CreateTable provisions the blocklist table with on-demand billing. It is
-// keyed by (pk, sk) with a GSI ordering each owner's blocklist by blocked_at.
-// It is idempotent and blocks until the table is ACTIVE.
+// keyed by (pk, sk) with two GSIs: one ordering each owner's blocklist by
+// blocked_at, and its reverse listing everyone who has blocked a given user. It
+// is idempotent and blocks until the table is ACTIVE.
 func CreateTable(ctx context.Context, client *dynamodb.Client, table string) error {
 	input := &dynamodb.CreateTableInput{
 		TableName:   aws.String(table),
@@ -34,6 +35,14 @@ func CreateTable(ctx context.Context, client *dynamodb.Client, table string) err
 					{AttributeName: aws.String(attrBlockedAt), KeyType: types.KeyTypeRange},
 				},
 				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+			{
+				IndexName: aws.String(gsiByBlockedUser),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeHash},
+					{AttributeName: aws.String(attrBlockedAt), KeyType: types.KeyTypeRange},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeKeysOnly},
 			},
 		},
 	}

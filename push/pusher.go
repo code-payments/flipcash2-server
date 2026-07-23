@@ -132,7 +132,7 @@ func (p *FCMPusher) SendPushes(ctx context.Context, title, body string, customPa
 					},
 					Category:       categoryString,
 					ThreadID:       customPayload.GroupKey,
-					MutableContent: hasSubstitutions,
+					MutableContent: hasSubstitutions || customPayload.ChatMetadata != nil,
 					CustomData:     customDataApns,
 				},
 			},

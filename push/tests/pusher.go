@@ -35,6 +35,7 @@ func RunPusherTests(t *testing.T, s push.TokenStore, teardown func()) {
 	for _, tf := range []func(t *testing.T, s push.TokenStore){
 		testFCMPusher_SendBasicPushes,
 		testFCMPusher_SendPushesWithSubstitutions,
+		testFCMPusher_SendPushesWithChatMetadata,
 		testFCMPusher_SendBadgeCountPush,
 		testFCMPusher_SendBadgeCountPush_NoIOSTokens,
 	} {
@@ -159,6 +160,86 @@ func testFCMPusher_SendPushesWithSubstitutions(t *testing.T, store push.TokenSto
 			payload: &pushpb.Payload{
 				TitleSubstitutions: []*pushpb.Substitution{titleSub},
 				BodySubstitutions:  []*pushpb.Substitution{bodySub, bodySub},
+			},
+			wantMutable: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fcmClient := &testFCMClient{}
+			pusher := push.NewFCMPusher(zap.NewNop(), store, fcmClient)
+
+			require.NoError(t, pusher.SendPushes(ctx, "title", "body", tc.payload, user))
+
+			marshalled, err := proto.Marshal(tc.payload)
+			require.NoError(t, err)
+			expectedEncoded := base64.StdEncoding.EncodeToString(marshalled)
+
+			require.NotNil(t, fcmClient.sentMessage)
+
+			require.NotNil(t, fcmClient.sentMessage.APNS)
+			require.Equal(t, tc.wantMutable, fcmClient.sentMessage.APNS.Payload.Aps.MutableContent)
+			require.Equal(t, expectedEncoded, fcmClient.sentMessage.APNS.Payload.Aps.CustomData["flipcash_payload"])
+
+			require.NotNil(t, fcmClient.sentMessage.Android)
+			require.Equal(t, expectedEncoded, fcmClient.sentMessage.Android.Data["flipcash_payload"])
+		})
+	}
+}
+
+// testFCMPusher_SendPushesWithChatMetadata verifies that the presence of chat
+// metadata alone makes the APNs payload mutable, so the client can render it
+// (e.g. resolve the sending user) before display — independent of whether the
+// payload also carries substitutions.
+func testFCMPusher_SendPushesWithChatMetadata(t *testing.T, store push.TokenStore) {
+	ctx := context.Background()
+
+	user := &commonpb.UserId{Value: []byte("user_chat_meta")}
+	installId := &commonpb.AppInstallId{Value: "install_chat_meta"}
+	require.NoError(t, store.AddToken(ctx, user, installId, pushpb.TokenType_FCM_APNS, "token_chat_meta"))
+
+	titleSub := &pushpb.Substitution{
+		Fallback: "Alice",
+		Kind: &pushpb.Substitution_Contact{
+			Contact: &phonepb.PhoneNumber{Value: "+14155551111"},
+		},
+	}
+	chatMetadata := &pushpb.ChatMetadata{
+		SendingUserId: &commonpb.UserId{Value: []byte("sender")},
+	}
+
+	for _, tc := range []struct {
+		name        string
+		payload     *pushpb.Payload
+		wantMutable bool
+	}{
+		{
+			name:        "no chat metadata",
+			payload:     &pushpb.Payload{},
+			wantMutable: false,
+		},
+		{
+			name: "chat metadata with sending user id",
+			payload: &pushpb.Payload{
+				ChatMetadata: chatMetadata,
+			},
+			wantMutable: true,
+		},
+		{
+			// A non-nil ChatMetadata makes the push mutable even when it carries
+			// no fields (e.g. a system message with no sending user).
+			name: "empty chat metadata",
+			payload: &pushpb.Payload{
+				ChatMetadata: &pushpb.ChatMetadata{},
+			},
+			wantMutable: true,
+		},
+		{
+			// Chat metadata and substitutions independently force mutability, so
+			// the combination is mutable too.
+			name: "chat metadata and substitutions",
+			payload: &pushpb.Payload{
+				TitleSubstitutions: []*pushpb.Substitution{titleSub},
+				ChatMetadata:       chatMetadata,
 			},
 			wantMutable: true,
 		},

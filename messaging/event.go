@@ -113,12 +113,12 @@ func publishChatUpdate(
 				if senderProfile.PhoneNumber == nil {
 					return
 				}
-				err = push.SendContactDmPush(ctx, pusher, badges, ocpData, update.Chat, message, senderProfile.PhoneNumber, membersForPush...)
+				err = push.SendContactDmPush(ctx, pusher, badges, ocpData, update.Chat, message, message.SenderId, senderProfile.PhoneNumber, membersForPush...)
 			case chatpb.ChatType_TIP_DM:
 				if senderProfile.DisplayName == "" {
 					return
 				}
-				err = push.SendTipDmPush(ctx, pusher, badges, ocpData, update.Chat, message, senderProfile.DisplayName, membersForPush...)
+				err = push.SendTipDmPush(ctx, pusher, badges, ocpData, update.Chat, message, message.SenderId, senderProfile.DisplayName, membersForPush...)
 			default:
 				return
 			}

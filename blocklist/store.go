@@ -35,6 +35,22 @@ type Store interface {
 	// IsBlocked reports whether blockedID is on ownerID's blocklist.
 	IsBlocked(ctx context.Context, ownerID, blockedID *commonpb.UserId) (bool, error)
 
+	// GetBlockedCount returns the number of users on ownerID's blocklist. It is a
+	// maintained aggregate, not a scan, so it is a cheap O(1) read intended as a
+	// signal for sizing a read strategy (e.g. a range scan while small, a cached
+	// set once large). An owner who has blocked no one reports 0.
+	GetBlockedCount(ctx context.Context, ownerID *commonpb.UserId) (int, error)
+
+	// GetBlocked returns which of candidateIDs are on ownerID's blocklist, as a
+	// set keyed by string(userID.Value): a candidate is present (value true) iff
+	// ownerID has blocked it. Candidates that are not blocked — along with
+	// duplicate or empty input — are simply absent from the map.
+	//
+	// It is the batch form of IsBlocked, for checking one owner against many
+	// candidates in a single round trip (e.g. resolving hidden state for a page of
+	// DM peers) rather than a lookup per candidate.
+	GetBlocked(ctx context.Context, ownerID *commonpb.UserId, candidateIDs []*commonpb.UserId) (map[string]bool, error)
+
 	// GetBlocklistPage returns one page of ownerID's blocklist ordered by
 	// (blocked_at, user_id) descending (most recently blocked first), at most
 	// limit entries (limit <= 0 means unbounded). When cursor is nil the page

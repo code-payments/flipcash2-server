@@ -251,7 +251,7 @@ func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRe
 	if err := hydrateMedia(ctx, s.media, []*messagingpb.Message{updatedProto}); err != nil {
 		log.With(zap.Error(err)).Warn("Failure resolving media metadata for edit")
 	}
-	publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
+	publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.blocklists, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
 		Events: &messagingpb.EventBatch{Events: []*messagingpb.Event{NewMessageEditedEvent(updatedProto)}},
 	}, nil, nil)
 
@@ -341,7 +341,7 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 	// Members apply the deletion live via the message_deleted event, or pick it up
 	// on their next history load.
 	updatedProto := updated.ToProto()
-	publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
+	publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.blocklists, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
 		Events: &messagingpb.EventBatch{Events: []*messagingpb.Event{NewMessageDeletedEvent(updatedProto)}},
 	}, nil, nil)
 

@@ -34,12 +34,14 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_Denied,
 		testServer_GetChat_Hydrates,
 		testServer_GetChat_TipDm_HidesPhoneNumbers,
+		testServer_GetChat_HiddenWhenPeerBlocked,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
 		testServer_GetDmChatFeed_Paging,
 		testServer_GetDmChatFeed_Hydrates,
 		testServer_GetDmChatFeed_TypeScoped,
 		testServer_GetDmChatFeed_TokenBoundToType,
+		testServer_GetDmChatFeed_HiddenPerViewer,
 	} {
 		tf(t, s)
 		teardown()
@@ -54,6 +56,7 @@ type serverEnv struct {
 	store     chat.Store
 	messaging *fakeMessagingReader
 	profiles  *fakeProfileReader
+	blocklist *fakeBlocklistReader
 
 	userID *commonpb.UserId
 	keys   model.KeyPair
@@ -70,7 +73,8 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 
 	messaging := newFakeMessagingReader()
 	profiles := newFakeProfileReader()
-	server := chat.NewServer(log, authz, s, messaging, profiles)
+	blocklist := newFakeBlocklistReader()
+	server := chat.NewServer(log, authz, s, messaging, profiles, blocklist)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
@@ -83,6 +87,7 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 		store:     s,
 		messaging: messaging,
 		profiles:  profiles,
+		blocklist: blocklist,
 		userID:    userID,
 		keys:      keys,
 	}
@@ -203,6 +208,41 @@ func (f *fakeProfileReader) GetProfilePictures(_ context.Context, userIDs []*com
 	return out, nil
 }
 
+// fakeBlocklistReader is a canned chat.BlocklistReader for server tests: it
+// reports, for each owner, which candidates the test has registered as blocked.
+type fakeBlocklistReader struct {
+	// blocked maps an owner to the set of user IDs they have blocked.
+	blocked map[string]map[string]bool
+}
+
+func newFakeBlocklistReader() *fakeBlocklistReader {
+	return &fakeBlocklistReader{blocked: make(map[string]map[string]bool)}
+}
+
+// block registers that owner has blocked blockedID.
+func (f *fakeBlocklistReader) block(owner, blockedID *commonpb.UserId) {
+	set, ok := f.blocked[string(owner.Value)]
+	if !ok {
+		set = make(map[string]bool)
+		f.blocked[string(owner.Value)] = set
+	}
+	set[string(blockedID.Value)] = true
+}
+
+func (f *fakeBlocklistReader) GetBlocked(_ context.Context, ownerID *commonpb.UserId, candidateIDs []*commonpb.UserId) (map[string]bool, error) {
+	set := f.blocked[string(ownerID.Value)]
+	if len(set) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]bool)
+	for _, c := range candidateIDs {
+		if set[string(c.Value)] {
+			out[string(c.Value)] = true
+		}
+	}
+	return out, nil
+}
+
 // putDM persists a contact DM the env user is a member of, with the given last
 // activity.
 func (e *serverEnv) putDM(lastActivity time.Time) *commonpb.ChatId {
@@ -212,11 +252,18 @@ func (e *serverEnv) putDM(lastActivity time.Time) *commonpb.ChatId {
 // putDMOfType persists a DM of the given type the env user is a member of,
 // with the given last activity.
 func (e *serverEnv) putDMOfType(chatType chatpb.ChatType, lastActivity time.Time) *commonpb.ChatId {
+	return e.putDMWithPeer(chatType, model.MustGenerateUserID(), lastActivity)
+}
+
+// putDMWithPeer persists a DM of the given type between the env user and the
+// given peer, with the given last activity. It lets a test control the peer's
+// identity (e.g. to then block it).
+func (e *serverEnv) putDMWithPeer(chatType chatpb.ChatType, peer *commonpb.UserId, lastActivity time.Time) *commonpb.ChatId {
 	chatID := generateChatID()
 	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
 		ID:           chatID,
 		Type:         chatType,
-		Members:      []*commonpb.UserId{e.userID, model.MustGenerateUserID()},
+		Members:      []*commonpb.UserId{e.userID, peer},
 		LastActivity: lastActivity,
 	}))
 	return chatID
@@ -280,6 +327,26 @@ func testServer_GetChat_Denied(t *testing.T, s chat.Store) {
 	require.Nil(t, resp.Metadata)
 }
 
+func testServer_GetChat_HiddenWhenPeerBlocked(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// A DM whose peer the viewer has blocked comes back hidden.
+	blockedPeer := model.MustGenerateUserID()
+	hidden := e.putDMWithPeer(chatpb.ChatType_CONTACT_DM, blockedPeer, at(1))
+	e.blocklist.block(e.userID, blockedPeer)
+
+	resp := e.getChat(e.keys, hidden)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.True(t, resp.Metadata.IsHidden)
+
+	// A DM whose peer the viewer has not blocked stays visible — proving the flag
+	// tracks the block, not merely DM-ness.
+	visible := e.putDMWithPeer(chatpb.ChatType_CONTACT_DM, model.MustGenerateUserID(), at(1))
+	resp = e.getChat(e.keys, visible)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.False(t, resp.Metadata.IsHidden)
+}
+
 func testServer_GetDmChatFeed_Empty(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
@@ -288,6 +355,28 @@ func testServer_GetDmChatFeed_Empty(t *testing.T, s chat.Store) {
 	require.Empty(t, resp.Chats)
 	require.False(t, resp.HasMore)
 	require.Nil(t, resp.PagingToken)
+}
+
+func testServer_GetDmChatFeed_HiddenPerViewer(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// Two DMs in the viewer's feed; the peer of one is blocked. A single batched
+	// blocklist read must mark exactly that chat hidden.
+	blockedPeer := model.MustGenerateUserID()
+	hidden := e.putDMWithPeer(chatpb.ChatType_CONTACT_DM, blockedPeer, at(2))
+	visible := e.putDMWithPeer(chatpb.ChatType_CONTACT_DM, model.MustGenerateUserID(), at(1))
+	e.blocklist.block(e.userID, blockedPeer)
+
+	resp := e.getDmFeed(&commonpb.QueryOptions{})
+	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, resp.Result)
+	require.Len(t, resp.Chats, 2)
+
+	byID := make(map[string]*chatpb.Metadata, len(resp.Chats))
+	for _, c := range resp.Chats {
+		byID[string(c.ChatId.Value)] = c
+	}
+	require.True(t, byID[string(hidden.Value)].IsHidden)
+	require.False(t, byID[string(visible.Value)].IsHidden)
 }
 
 func testServer_GetDmChatFeed_OrderAndContent(t *testing.T, s chat.Store) {

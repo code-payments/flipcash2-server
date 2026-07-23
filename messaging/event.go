@@ -14,6 +14,7 @@ import (
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/badge"
+	"github.com/code-payments/flipcash2-server/blocklist"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/profile"
@@ -39,6 +40,7 @@ func publishChatUpdate(
 	badges badge.Store,
 	chats chat.Store,
 	profiles profile.Store,
+	blocklists blocklist.Store,
 	ocpData ocp_data.Provider,
 
 	pusher push.Pusher,
@@ -93,19 +95,42 @@ func publishChatUpdate(
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pushTimeout)
 			defer cancel()
 
+			// Push recipients are every member but the sender, minus anyone who has
+			// blocked the sender — a user who blocks another must stop receiving
+			// pushes for that user's messages. The block check is scoped to the
+			// recipient's own blocklist (recipient is the owner, sender the blocked
+			// candidate). It fails closed: on a lookup failure we suppress the push
+			// rather than risk notifying a recipient who has blocked the sender. The
+			// message itself is still delivered on the event stream, so a transient
+			// blocklist error costs only the notification, never the message.
+			var membersForPush []*commonpb.UserId
+			for _, member := range members {
+				if bytes.Equal(member.Value, message.SenderId.Value) {
+					continue
+				}
+				blocked, err := blocklists.IsBlocked(ctx, member, message.SenderId)
+				if err != nil {
+					log.With(zap.Error(err)).Warn("Failure checking blocklist for message push; suppressing push")
+					continue
+				}
+				if blocked {
+					continue
+				}
+				membersForPush = append(membersForPush, member)
+			}
+			// Every recipient was the sender or has blocked the sender: nothing to
+			// push. Return before the sender-profile read and body render, which
+			// would otherwise be spent on a push addressed to no one.
+			if len(membersForPush) == 0 {
+				return
+			}
+
 			senderProfile, err := profiles.GetProfile(ctx, message.SenderId, true)
 			if err == profile.ErrNotFound {
 				return
 			} else if err != nil {
 				log.With(zap.Error(err)).Warn("Failure getting sender profile for push")
 				return
-			}
-
-			var membersForPush []*commonpb.UserId
-			for _, member := range members {
-				if !bytes.Equal(member.Value, message.SenderId.Value) {
-					membersForPush = append(membersForPush, member)
-				}
 			}
 
 			switch chatType {

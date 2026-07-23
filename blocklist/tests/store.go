@@ -1,7 +1,9 @@
 package tests
 
 import (
+	"bytes"
 	"context"
+	"sort"
 	"testing"
 	"time"
 
@@ -22,6 +24,9 @@ func RunStoreTests(t *testing.T, s blocklist.Store, teardown func()) {
 		testStore_Unblock,
 		testStore_Unblock_NotBlocked,
 		testStore_Isolation,
+		testStore_GetBlockedCount,
+		testStore_GetBlocked,
+		testStore_GetBlocked_FiltersInRangeNonCandidate,
 		testStore_GetBlocklistPage_Order,
 		testStore_GetBlocklistPage_Paging,
 		testStore_GetBlocklistPage_Empty,
@@ -126,6 +131,113 @@ func testStore_Isolation(t *testing.T, s blocklist.Store) {
 	require.Empty(t, pageB)
 }
 
+func testStore_GetBlockedCount(t *testing.T, s blocklist.Store) {
+	ctx := context.Background()
+
+	owner := model.MustGenerateUserID()
+
+	// Empty to start.
+	n, err := s.GetBlockedCount(ctx, owner)
+	require.NoError(t, err)
+	require.Equal(t, 0, n)
+
+	// Each new block increments the count.
+	b1 := block(t, s, owner, at(100))
+	block(t, s, owner, at(200))
+	n, err = s.GetBlockedCount(ctx, owner)
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+
+	// Re-blocking an already-blocked user is a no-op and does not double-count.
+	added, err := s.Block(ctx, owner, b1, at(300))
+	require.NoError(t, err)
+	require.False(t, added)
+	n, err = s.GetBlockedCount(ctx, owner)
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+
+	// Unblocking decrements.
+	removed, err := s.Unblock(ctx, owner, b1)
+	require.NoError(t, err)
+	require.True(t, removed)
+	n, err = s.GetBlockedCount(ctx, owner)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	// Unblocking a user who was never blocked is a no-op and leaves the count.
+	removed, err = s.Unblock(ctx, owner, model.MustGenerateUserID())
+	require.NoError(t, err)
+	require.False(t, removed)
+	n, err = s.GetBlockedCount(ctx, owner)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	// A blocklist is scoped to its owner: another owner's count is independent.
+	nOther, err := s.GetBlockedCount(ctx, model.MustGenerateUserID())
+	require.NoError(t, err)
+	require.Equal(t, 0, nOther)
+}
+
+func testStore_GetBlocked(t *testing.T, s blocklist.Store) {
+	ctx := context.Background()
+
+	owner := model.MustGenerateUserID()
+	blocked1 := block(t, s, owner, at(100))
+	blocked2 := block(t, s, owner, at(200))
+	notBlocked := model.MustGenerateUserID()
+
+	// Another owner blocked notBlocked: it must not leak into this owner's result.
+	_, err := s.Block(ctx, model.MustGenerateUserID(), notBlocked, at(300))
+	require.NoError(t, err)
+
+	// Mixed candidate set (a duplicate included): only this owner's blocked
+	// candidates come back, present with value true, keyed by user ID bytes.
+	got, err := s.GetBlocked(ctx, owner, []*commonpb.UserId{blocked1, notBlocked, blocked2, blocked1})
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{
+		string(blocked1.Value): true,
+		string(blocked2.Value): true,
+	}, got)
+
+	// Not blocked and absent (never mapped to false).
+	_, ok := got[string(notBlocked.Value)]
+	require.False(t, ok)
+
+	// Empty candidate set → empty result, no error.
+	got, err = s.GetBlocked(ctx, owner, nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// An owner with no blocklist → empty result for any candidates.
+	got, err = s.GetBlocked(ctx, model.MustGenerateUserID(), []*commonpb.UserId{blocked1, blocked2})
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+func testStore_GetBlocked_FiltersInRangeNonCandidate(t *testing.T, s blocklist.Store) {
+	ctx := context.Background()
+
+	owner := model.MustGenerateUserID()
+	low, mid, high := orderedTriple()
+	for _, id := range []*commonpb.UserId{low, mid, high} {
+		added, err := s.Block(ctx, owner, id, at(100))
+		require.NoError(t, err)
+		require.True(t, added)
+	}
+
+	got, err := s.GetBlocked(ctx, owner, []*commonpb.UserId{low, high})
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{
+		string(low.Value):  true,
+		string(high.Value): true,
+	}, got)
+
+	// mid is blocked and sorts within the scanned range, but was not asked about,
+	// so it must be absent — the scan is filtered to the exact candidate set.
+	_, ok := got[string(mid.Value)]
+	require.False(t, ok)
+}
+
 func testStore_GetBlocklistPage_Order(t *testing.T, s blocklist.Store) {
 	ctx := context.Background()
 
@@ -187,6 +299,21 @@ func block(t *testing.T, s blocklist.Store, owner *commonpb.UserId, blockedAt ti
 
 func cursorOf(e *blocklist.BlockedUser) *blocklist.Cursor {
 	return &blocklist.Cursor{BlockedAt: e.BlockedAt, UserID: e.UserID}
+}
+
+// orderedTriple returns three distinct user IDs sorted strictly ascending by the
+// byte order the store's sort key preserves (low < mid < high), so a caller can
+// rely on mid sorting between low and high.
+func orderedTriple() (low, mid, high *commonpb.UserId) {
+	ids := []*commonpb.UserId{
+		model.MustGenerateUserID(),
+		model.MustGenerateUserID(),
+		model.MustGenerateUserID(),
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return bytes.Compare(ids[i].Value, ids[j].Value) < 0
+	})
+	return ids[0], ids[1], ids[2]
 }
 
 // at returns a deterministic timestamp offset by the given number of seconds

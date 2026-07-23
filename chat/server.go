@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -88,6 +89,17 @@ type ProfileReader interface {
 	GetProfilePictures(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*blobpb.Media, error)
 }
 
+// BlocklistReader is the read slice of the blocklist domain the Chat service
+// needs to compute per-viewer hidden state. Like the other readers it is
+// declared here (consumer side) so the chat package need not import blocklist;
+// the blocklist package supplies the concrete adapter.
+type BlocklistReader interface {
+	// GetBlocked returns which of candidateIDs the owner has blocked, as a set
+	// keyed by string(userID.Value). Candidates the owner has not blocked are
+	// absent from the map.
+	GetBlocked(ctx context.Context, ownerID *commonpb.UserId, candidateIDs []*commonpb.UserId) (map[string]bool, error)
+}
+
 type Server struct {
 	log *zap.Logger
 
@@ -96,17 +108,19 @@ type Server struct {
 	chats     Store
 	messaging MessagingReader
 	profiles  ProfileReader
+	blocklist BlocklistReader
 
 	chatpb.UnimplementedChatServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, chats Store, messaging MessagingReader, profiles ProfileReader) *Server {
+func NewServer(log *zap.Logger, authz auth.Authorizer, chats Store, messaging MessagingReader, profiles ProfileReader, blocklist BlocklistReader) *Server {
 	return &Server{
 		log:       log,
 		authz:     authz,
 		chats:     chats,
 		messaging: messaging,
 		profiles:  profiles,
+		blocklist: blocklist,
 	}
 }
 
@@ -131,7 +145,7 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
 	}
 
-	metadata, err := s.hydrate(ctx, []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
 		return nil, status.Error(codes.Internal, "")
@@ -194,7 +208,7 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 		chats = chats[:limit]
 	}
 
-	metadata, err := s.hydrate(ctx, chats)
+	metadata, err := s.hydrate(ctx, userID, chats)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating DM feed metadata")
 		return nil, status.Error(codes.Internal, "")
@@ -262,12 +276,18 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatTyp
 // identifier a member is known by within the chat. Phone numbers are populated
 // only for members of DM chats, so each party can resolve the other to a
 // contact. Group chats deliberately do not expose member phone numbers.
-func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata, error) {
+//
+// is_hidden is per-viewer: a DM is hidden from viewerID when the DM's peer (the
+// member who is not the viewer) is on the viewer's blocklist. Every DM peer
+// across the set is resolved against the viewer's blocklist in one batched read.
+func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
 	pointerRefs := make([]PointerRef, len(chats))
 	uniqueUserIDs := make(map[string]*commonpb.UserId)
 	uniquePrivateProfileUserIds := make(map[string]*commonpb.UserId)
+	dmPeerByChat := make(map[string]*commonpb.UserId)
+	uniquePeerIDs := make(map[string]*commonpb.UserId)
 	for i, c := range chats {
 		pointerRefs[i] = PointerRef{ChatID: c.ID, Members: c.Members}
 		if c.LastMessageID != nil {
@@ -283,6 +303,15 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 				uniquePrivateProfileUserIds[string(m.Value)] = m
 			}
 		}
+		if IsDmChatType(c.Type) {
+			for _, m := range c.Members {
+				if !bytes.Equal(m.Value, viewerID.Value) {
+					dmPeerByChat[string(c.ID.Value)] = m
+					uniquePeerIDs[string(m.Value)] = m
+					break
+				}
+			}
+		}
 	}
 	userIDs := make([]*commonpb.UserId, 0, len(uniqueUserIDs))
 	for _, u := range uniqueUserIDs {
@@ -291,6 +320,10 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 	privateProfileUserIDs := make([]*commonpb.UserId, 0, len(uniquePrivateProfileUserIds))
 	for _, u := range uniquePrivateProfileUserIds {
 		privateProfileUserIDs = append(privateProfileUserIDs, u)
+	}
+	peerIDs := make([]*commonpb.UserId, 0, len(uniquePeerIDs))
+	for _, u := range uniquePeerIDs {
+		peerIDs = append(peerIDs, u)
 	}
 
 	lastMessages, err := s.messaging.LastMessages(ctx, msgRefs)
@@ -317,6 +350,10 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 	if err != nil {
 		return nil, err
 	}
+	blockedPeers, err := s.blocklist.GetBlocked(ctx, viewerID, peerIDs)
+	if err != nil {
+		return nil, err
+	}
 
 	metadata := make([]*chatpb.Metadata, len(chats))
 	for i, c := range chats {
@@ -324,6 +361,9 @@ func (s *Server) hydrate(ctx context.Context, chats []*Chat) ([]*chatpb.Metadata
 		md := c.ToProto()
 		md.LastMessage = lastMessages[key]
 		md.LatestEventSequence = latestEventSeqs[key]
+		if peer, ok := dmPeerByChat[key]; ok {
+			md.IsHidden = blockedPeers[string(peer.Value)]
+		}
 		assignPointers(md, pointers[key])
 		for _, m := range md.Members {
 			profile := &profilepb.UserProfile{

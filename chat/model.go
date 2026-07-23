@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -90,6 +91,13 @@ func MustDeriveDmChatID(chatType chatpb.ChatType, a, b *commonpb.UserId) *common
 var dmChatTypes = []chatpb.ChatType{
 	chatpb.ChatType_CONTACT_DM,
 	chatpb.ChatType_TIP_DM,
+}
+
+// IsDmChatType reports whether chatType is a direct-message chat type — one
+// with two participants and a canonical, member-derived ID — as opposed to a
+// group or unknown chat.
+func IsDmChatType(chatType chatpb.ChatType) bool {
+	return slices.Contains(dmChatTypes, chatType)
 }
 
 // DeriveDmChatType reports which DM type's canonical derivation over the

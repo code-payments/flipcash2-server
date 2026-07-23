@@ -85,6 +85,30 @@ func (m *memory) IsBlocked(_ context.Context, ownerID, blockedID *commonpb.UserI
 	return ok, nil
 }
 
+func (m *memory) GetBlockedCount(_ context.Context, ownerID *commonpb.UserId) (int, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	return len(m.entries[string(ownerID.Value)]), nil
+}
+
+func (m *memory) GetBlocked(_ context.Context, ownerID *commonpb.UserId, candidateIDs []*commonpb.UserId) (map[string]bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	list := m.entries[string(ownerID.Value)]
+	if len(list) == 0 || len(candidateIDs) == 0 {
+		return nil, nil
+	}
+	blocked := make(map[string]bool)
+	for _, c := range candidateIDs {
+		if _, ok := list[string(c.Value)]; ok {
+			blocked[string(c.Value)] = true
+		}
+	}
+	return blocked, nil
+}
+
 func (m *memory) GetBlocklistPage(_ context.Context, ownerID *commonpb.UserId, cursor *blocklist.Cursor, limit int) ([]*blocklist.BlockedUser, error) {
 	m.Lock()
 	defer m.Unlock()

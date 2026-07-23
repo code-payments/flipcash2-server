@@ -25,6 +25,7 @@ import (
 	"github.com/code-payments/flipcash2-server/badge"
 	"github.com/code-payments/flipcash2-server/blob"
 	blob_memory "github.com/code-payments/flipcash2-server/blob/memory"
+	"github.com/code-payments/flipcash2-server/blocklist"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/messaging"
@@ -36,8 +37,8 @@ import (
 
 // RunServerTests runs the shared messaging.Server test suite. chats and messages
 // are the backing stores; teardown resets both between tests.
-func RunServerTests(t *testing.T, badges badge.Store, chats chat.Store, messages messaging.Store, profiles profile.Store, teardown func()) {
-	for _, tf := range []func(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store){
+func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store, teardown func()) {
+	for _, tf := range []func(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store){
 		// Messaging
 		testServer_SendAndGet,
 		testServer_SendMessage_Idempotent,
@@ -68,8 +69,9 @@ func RunServerTests(t *testing.T, badges badge.Store, chats chat.Store, messages
 		testServer_NonMember_Denied,
 		testServer_Broadcast_IncludesActor,
 		testServer_SendMessage_PushPerChatType,
+		testServer_SendMessage_SuppressedForBlockedSender,
 	} {
-		tf(t, chats, messages, profiles, badges)
+		tf(t, badges, blocklists, chats, messages, profiles)
 		teardown()
 	}
 }
@@ -88,11 +90,13 @@ type serverEnv struct {
 	userB  *commonpb.UserId
 	keysB  model.KeyPair
 
+	blocklist blocklist.Store
+
 	blobStore  blob.Store
 	blobAccess blob.AccessStore
 }
 
-func newServerEnv(t *testing.T, badges badge.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) *serverEnv {
+func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) *serverEnv {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
@@ -102,12 +106,13 @@ func newServerEnv(t *testing.T, badges badge.Store, chats chat.Store, messages m
 	bus.AddHandler(observer)
 
 	env := &serverEnv{
-		t:        t,
-		ctx:      ctx,
-		authz:    authz,
-		observer: observer,
-		pusher:   &capturingPusher{},
-		chatID:   generateChatID(),
+		t:         t,
+		ctx:       ctx,
+		authz:     authz,
+		observer:  observer,
+		pusher:    &capturingPusher{},
+		blocklist: blocklists,
+		chatID:    generateChatID(),
 	}
 	env.userA, env.keysA = env.addUser()
 	env.userB, env.keysB = env.addUser()
@@ -125,7 +130,7 @@ func newServerEnv(t *testing.T, badges badge.Store, chats chat.Store, messages m
 	env.blobAccess = blobAccess
 	media := blob.NewIntegration(blobStore, blob_memory.NewInMemoryStorage(), blobAccess)
 
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, media, ocp_data.NewTestDataProvider(), env.pusher, bus)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus)
 	server := messaging.NewServer(log, authz, chats, messages, media, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
@@ -541,8 +546,8 @@ func (e *serverEnv) chatGrantedRead(blobID *blobpb.BlobId) bool {
 // Messaging
 // ============================================================================
 
-func testServer_SendAndGet(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_SendAndGet(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	resp, err := e.send(e.keysA, "hello", generateClientID())
 	require.NoError(t, err)
@@ -561,8 +566,8 @@ func testServer_SendAndGet(t *testing.T, chats chat.Store, messages messaging.St
 	require.Len(t, listResp.Messages.Messages, 1)
 }
 
-func testServer_SendMedia(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_SendMedia(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// Media owned by the sender is sent, and the blob is granted to the chat.
 	ownedBlob := e.putReadyBlob(e.userA)
@@ -588,8 +593,8 @@ func testServer_SendMedia(t *testing.T, chats chat.Store, messages messaging.Sto
 	require.True(t, e.chatGrantedRead(replyBlob))
 }
 
-func testServer_ResolvesMediaOnRead(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_ResolvesMediaOnRead(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// A sends a media message referencing a blob that has a derived rendition, so the
 	// read path is exercised expanding the full set, not just the ORIGINAL.
@@ -674,8 +679,8 @@ func testServer_ResolvesMediaOnRead(t *testing.T, chats chat.Store, messages mes
 	require.NotEmpty(t, delivered.Blob.DownloadUrl.Url)
 }
 
-func testServer_SendMessage_Idempotent(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_SendMessage_Idempotent(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	clientID := generateClientID()
 	first, err := e.send(e.keysA, "hi", clientID)
@@ -695,8 +700,8 @@ func testServer_SendMessage_Idempotent(t *testing.T, chats chat.Store, messages 
 	require.Equal(t, 1, e.countNewMessages(e.userB, first.Message.MessageId.Value))
 }
 
-func testServer_SendReply(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_SendReply(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// Seed a message to reply to.
 	original, err := e.send(e.keysA, "original", generateClientID())
@@ -738,8 +743,8 @@ func testServer_SendReply(t *testing.T, chats chat.Store, messages messaging.Sto
 	require.Equal(t, messagingpb.SendMessageResponse_DENIED, systemReplyResp.Result)
 }
 
-func testServer_SendMessage_DisallowedContent(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_SendMessage_DisallowedContent(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// A server-injected system message may not be authored by a client.
 	systemResp, err := e.sendContent(e.keysA, systemContent("i joined"), generateClientID())
@@ -767,8 +772,8 @@ func testServer_SendMessage_DisallowedContent(t *testing.T, chats chat.Store, me
 	require.Equal(t, messagingpb.SendMessageResponse_DENIED, extraResp.Result)
 }
 
-func testServer_SendMessage_Broadcast(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_SendMessage_Broadcast(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	resp, err := e.send(e.keysA, "broadcast me", generateClientID())
 	require.NoError(t, err)
@@ -801,16 +806,16 @@ func testServer_SendMessage_Broadcast(t *testing.T, chats chat.Store, messages m
 	})
 }
 
-func testServer_GetMessage_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_GetMessage_NotFound(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	resp, err := e.getMessage(e.keysA, &messagingpb.MessageId{Value: 99})
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessageResponse_NOT_FOUND, resp.Result)
 }
 
-func testServer_EditMessage(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_EditMessage(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// userA sends a message; in this phase event_sequence == message_id.
 	sent, err := e.send(e.keysA, "original", generateClientID())
@@ -906,8 +911,8 @@ func testServer_EditMessage(t *testing.T, chats chat.Store, messages messaging.S
 	require.Equal(t, messagingpb.EditMessageResponse_CANNOT_EDIT, cannotEditDeleted.Result)
 }
 
-func testServer_DeleteMessage(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_DeleteMessage(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// userA sends a message; in this phase event_sequence == message_id.
 	sent, err := e.send(e.keysA, "delete me", generateClientID())
@@ -972,16 +977,16 @@ func testServer_DeleteMessage(t *testing.T, chats chat.Store, messages messaging
 	require.Equal(t, messagingpb.DeleteMessageResponse_CANNOT_DELETE, cannot.Result)
 }
 
-func testServer_GetMessages_NotFound(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_GetMessages_NotFound(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	resp, err := e.getMessagesByOptions(e.keysA, &commonpb.QueryOptions{})
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, resp.Result)
 }
 
-func testServer_GetMessages_Paging(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_GetMessages_Paging(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// Seed 5 messages, assigned gapless IDs 1..5.
 	for i := 0; i < 5; i++ {
@@ -1020,8 +1025,8 @@ func testServer_GetMessages_Paging(t *testing.T, chats chat.Store, messages mess
 	require.Equal(t, []uint64{5, 4}, protoMessageIDs(desc.Messages.Messages))
 }
 
-func testServer_GetMessages_ByIDs(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_GetMessages_ByIDs(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	for i := 0; i < 5; i++ {
 		_, err := e.send(e.keysA, "m", generateClientID())
@@ -1041,8 +1046,8 @@ func testServer_GetMessages_ByIDs(t *testing.T, chats chat.Store, messages messa
 	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, none.Result)
 }
 
-func testServer_GetDelta(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_GetDelta(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// Seed 3 messages, assigned gapless IDs 1..3.
 	for i := 0; i < 3; i++ {
@@ -1129,8 +1134,8 @@ func testServer_GetDelta(t *testing.T, chats chat.Store, messages messaging.Stor
 	require.Equal(t, uint64(4), checkpoint)
 }
 
-func testServer_GetDelta_ResetRequired(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_GetDelta_ResetRequired(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// Seed one past the cap (maxDeltaEvents + 1 == 1001), assigning gapless IDs
 	// 1..1001. Seeded straight through the store to skip the per-send RPC and
@@ -1166,8 +1171,8 @@ func testServer_GetDelta_ResetRequired(t *testing.T, chats chat.Store, messages 
 // Pointers
 // ============================================================================
 
-func testServer_AdvancePointer(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_AdvancePointer(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	m1, err := e.send(e.keysA, "first", generateClientID())
 	require.NoError(t, err)
@@ -1200,8 +1205,8 @@ func testServer_AdvancePointer(t *testing.T, chats chat.Store, messages messagin
 	require.Equal(t, messagingpb.AdvancePointerResponse_MESSAGE_NOT_FOUND, missResp.Result)
 }
 
-func testServer_AdvancePointer_PointerTypes(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_AdvancePointer_PointerTypes(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	m1, err := e.send(e.keysA, "first", generateClientID())
 	require.NoError(t, err)
@@ -1239,8 +1244,8 @@ func testServer_AdvancePointer_PointerTypes(t *testing.T, chats chat.Store, mess
 // its per-viewer reacted_by_self bit, idempotent re-add, a second reactor, the
 // ADDED/REMOVED broadcasts to the other member, and removal down to empty (the
 // aggregate is retained while a reactor remains, then omitted).
-func testServer_Reactions(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_Reactions(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
 
 	sent, err := e.send(e.keysA, "react to me", generateClientID())
@@ -1313,8 +1318,8 @@ func testServer_Reactions(t *testing.T, chats chat.Store, messages messaging.Sto
 // testServer_Reactions_Reactors covers the reactor drill-down (GetReactors):
 // paging with the server-issued token round-tripped through options.paging_token,
 // and an empty result for an emoji with no reactors.
-func testServer_Reactions_Reactors(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_Reactions_Reactors(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
 
 	sent, err := e.send(e.keysA, "react", generateClientID())
@@ -1368,8 +1373,8 @@ func testServer_Reactions_Reactors(t *testing.T, chats chat.Store, messages mess
 // branches (paged query options and an explicit message-ID batch): the per-viewer
 // reacted_by_self overlay is resolved correctly across messages, and a message
 // with no reactions is returned with an empty summary rather than omitted.
-func testServer_Reactions_Summaries(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_Reactions_Summaries(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const thumbsUp = "👍"
 	const heart = "❤️"
 
@@ -1450,8 +1455,8 @@ func testServer_Reactions_Summaries(t *testing.T, chats chat.Store, messages mes
 // empty read, non-reactable messages, and the per-message distinct-emoji cap.
 // Non-member denial is covered uniformly across all RPCs by
 // testServer_NonMember_Denied.
-func testServer_Reactions_Errors(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_Reactions_Errors(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
 
 	sent, err := e.send(e.keysA, "hi", generateClientID())
@@ -1520,8 +1525,8 @@ func testServer_Reactions_Errors(t *testing.T, chats chat.Store, messages messag
 // Typing
 // ============================================================================
 
-func testServer_NotifyIsTyping(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_NotifyIsTyping(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	resp, err := e.notifyIsTyping(e.keysA, messagingpb.IsTypingNotification_STARTED_TYPING)
 	require.NoError(t, err)
@@ -1544,8 +1549,8 @@ func testServer_NotifyIsTyping(t *testing.T, chats chat.Store, messages messagin
 // testServer_NonMember_Denied asserts that a non-member is denied on every RPC
 // the service exposes. Membership is checked before any payload-specific
 // validation, so a valid message ID and emoji still come back DENIED.
-func testServer_NonMember_Denied(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_NonMember_Denied(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	_, strangerKeys := e.addUser()
 
 	msgID := &messagingpb.MessageId{Value: 1}
@@ -1610,8 +1615,8 @@ func testServer_NonMember_Denied(t *testing.T, chats chat.Store, messages messag
 	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
 }
 
-func testServer_Broadcast_IncludesActor(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_Broadcast_IncludesActor(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
 
 	sent, err := e.send(e.keysA, "react to me", generateClientID())
@@ -1637,8 +1642,8 @@ func testServer_Broadcast_IncludesActor(t *testing.T, chats chat.Store, messages
 	e.waitForReactionUpdate(e.userB, messagingpb.ReactionUpdate_REMOVED, msgID.Value, emoji, e.userB)
 }
 
-func testServer_SendMessage_PushPerChatType(t *testing.T, chats chat.Store, messages messaging.Store, profiles profile.Store, badges badge.Store) {
-	e := newServerEnv(t, badges, chats, messages, profiles)
+func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// The sender has both a display name and a phone number, so each chat type
 	// must actively pick the right identifier.
@@ -1696,4 +1701,60 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, chats chat.Store, mess
 	require.Equal(t, senderPhone, contactPush.payload.TitleSubstitutions[0].GetContact().GetValue())
 	require.Len(t, contactPush.users, 1)
 	require.Equal(t, e.userB.Value, contactPush.users[0].Value)
+}
+
+func testServer_SendMessage_SuppressedForBlockedSender(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	// A display name is what a tip-DM push renders, so its presence rules out a
+	// missing-name early return as the reason no push is sent.
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
+
+	// The push path recovers the chat type from the canonical DM derivation, so
+	// the chat must live at its derived ID (unlike the env's default random-ID chat).
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.userA, e.userB)
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_TIP_DM,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+
+	// userB blocks userA: userB must no longer be pushed for userA's messages.
+	added, err := e.blocklist.Block(e.ctx, e.userB, e.userA, time.Now())
+	require.NoError(t, err)
+	require.True(t, added)
+
+	resp, err := e.sendContentToChat(e.keysA, chatID, textContent("blocked hello"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+
+	// The message still reaches userB on the event stream — only the push is
+	// suppressed.
+	e.waitForNewMessage(e.userB, resp.Message.MessageId.Value)
+
+	// No push is ever emitted while the block stands. The window gives the
+	// asynchronous push path ample room to (not) fire.
+	require.Never(t, func() bool {
+		return len(e.pusher.snapshot()) > 0
+	}, 500*time.Millisecond, 20*time.Millisecond)
+
+	// Unblocking restores pushes: an identical send now reaches userB, proving the
+	// suppression was the block and not some unrelated gate.
+	removed, err := e.blocklist.Unblock(e.ctx, e.userB, e.userA)
+	require.NoError(t, err)
+	require.True(t, removed)
+
+	resp, err = e.sendContentToChat(e.keysA, chatID, textContent("unblocked hello"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+
+	require.Eventually(t, func() bool {
+		return len(e.pusher.snapshot()) >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+	pushes := e.pusher.snapshot()
+	require.Len(t, pushes, 1)
+	require.Equal(t, "unblocked hello", pushes[0].body)
+	require.Len(t, pushes[0].users, 1)
+	require.Equal(t, e.userB.Value, pushes[0].users[0].Value)
 }

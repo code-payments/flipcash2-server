@@ -64,7 +64,7 @@ func (s *Server) AddReaction(ctx context.Context, req *messagingpb.AddReactionRe
 	reaction.ReactedBySelf = true
 
 	if created {
-		publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
+		publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.blocklists, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
 			ReactionUpdates: &messagingpb.ReactionUpdateBatch{
 				ReactionUpdates: []*messagingpb.ReactionUpdate{
 					{
@@ -118,7 +118,7 @@ func (s *Server) RemoveReaction(ctx context.Context, req *messagingpb.RemoveReac
 	}
 
 	if removed {
-		publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
+		publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.blocklists, s.sender.ocpData, s.sender.pusher, s.sender.eventBus, req.ChatId, &eventpb.ChatUpdate{
 			ReactionUpdates: &messagingpb.ReactionUpdateBatch{
 				ReactionUpdates: []*messagingpb.ReactionUpdate{
 					{

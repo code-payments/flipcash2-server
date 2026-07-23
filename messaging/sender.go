@@ -16,6 +16,7 @@ import (
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/badge"
+	"github.com/code-payments/flipcash2-server/blocklist"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/model"
@@ -38,10 +39,11 @@ const sideEffectTimeout = 5 * time.Second
 type Sender struct {
 	log *zap.Logger
 
-	badges   badge.Store
-	chats    chat.Store
-	messages Store
-	profiles profile.Store
+	badges     badge.Store
+	chats      chat.Store
+	messages   Store
+	profiles   profile.Store
+	blocklists blocklist.Store
 
 	// media resolves blob metadata so a broadcast new-message event carries the
 	// same resolved media a read would. Hydration is best-effort and a no-op for
@@ -61,21 +63,23 @@ func NewSender(
 	chats chat.Store,
 	messages Store,
 	profiles profile.Store,
+	blocklists blocklist.Store,
 	media Media,
 	ocpData ocp_data.Provider,
 	pusher push.Pusher,
 	eventBus *event.Bus[*commonpb.UserId, *eventpb.Event],
 ) *Sender {
 	return &Sender{
-		log:      log,
-		badges:   badges,
-		chats:    chats,
-		messages: messages,
-		profiles: profiles,
-		media:    media,
-		ocpData:  ocpData,
-		pusher:   pusher,
-		eventBus: eventBus,
+		log:        log,
+		badges:     badges,
+		chats:      chats,
+		messages:   messages,
+		profiles:   profiles,
+		blocklists: blocklists,
+		media:      media,
+		ocpData:    ocpData,
+		pusher:     pusher,
+		eventBus:   eventBus,
 	}
 }
 
@@ -207,7 +211,7 @@ func (s *Sender) Send(
 	}
 	// Reuse the members AdvanceLastMessage already loaded (nil if it failed, in
 	// which case publishChatUpdate loads them itself).
-	publishChatUpdate(ctx, log, s.badges, s.chats, s.profiles, s.ocpData, s.pusher, s.eventBus, chatID, update, nil, members)
+	publishChatUpdate(ctx, log, s.badges, s.chats, s.profiles, s.blocklists, s.ocpData, s.pusher, s.eventBus, chatID, update, nil, members)
 
 	return msgProto, nil
 }

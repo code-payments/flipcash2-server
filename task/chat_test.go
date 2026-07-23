@@ -21,6 +21,7 @@ import (
 	badgememory "github.com/code-payments/flipcash2-server/badge/memory"
 	"github.com/code-payments/flipcash2-server/blob"
 	blobmemory "github.com/code-payments/flipcash2-server/blob/memory"
+	blocklistmemory "github.com/code-payments/flipcash2-server/blocklist/memory"
 	"github.com/code-payments/flipcash2-server/chat"
 	chatmemory "github.com/code-payments/flipcash2-server/chat/memory"
 	"github.com/code-payments/flipcash2-server/event"
@@ -41,6 +42,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 
 	accounts := accountmemory.NewInMemory()
 	badges := badgememory.NewInMemory()
+	blocklists := blocklistmemory.NewInMemory()
 	chats := chatmemory.NewInMemory()
 	messages := messagingmemory.NewInMemory()
 	profiles := profilememory.NewInMemory()
@@ -48,7 +50,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	bus := event.NewBus[*commonpb.UserId, *eventpb.Event]()
 
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, media, ocpData, push.NewNoOpPusher(), bus)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
 	integration := intent.NewIntegration(accounts, profiles)
 
@@ -153,7 +155,8 @@ func TestExecutor_SendTipDmPaymentMessage(t *testing.T) {
 	bus := event.NewBus[*commonpb.UserId, *eventpb.Event]()
 
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, media, ocpData, push.NewNoOpPusher(), bus)
+	blocklists := blocklistmemory.NewInMemory()
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
 	integration := intent.NewIntegration(accounts, profiles)
 

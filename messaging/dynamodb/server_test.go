@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	badge_dynamodb "github.com/code-payments/flipcash2-server/badge/dynamodb"
+	blocklist_memory "github.com/code-payments/flipcash2-server/blocklist/memory"
 	chat_dynamodb "github.com/code-payments/flipcash2-server/chat/dynamodb"
 	"github.com/code-payments/flipcash2-server/messaging/tests"
 	profile_memory "github.com/code-payments/flipcash2-server/profile/memory"
@@ -28,6 +29,7 @@ func TestMessaging_DynamoDBServer(t *testing.T) {
 	require.NoError(t, badge_dynamodb.CreateTables(ctx, testEnv.Client, badgesTable))
 
 	badges := badge_dynamodb.NewInDynamoDB(testEnv.Client, badgesTable)
+	blocklists := blocklist_memory.NewInMemory()
 	chats := chat_dynamodb.NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable)
 	profiles := profile_memory.NewInMemory()
 	messages := NewInDynamoDB(testEnv.Client, messagesTable, pointersTable, reactionsTable)
@@ -37,5 +39,5 @@ func TestMessaging_DynamoDBServer(t *testing.T) {
 		// and idempotency keys are scoped per chat) needs clearing between runs.
 		messages.(*store).reset()
 	}
-	tests.RunServerTests(t, badges, chats, messages, profiles, teardown)
+	tests.RunServerTests(t, badges, blocklists, chats, messages, profiles, teardown)
 }

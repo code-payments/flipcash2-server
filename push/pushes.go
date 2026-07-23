@@ -141,7 +141,7 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 // SendContactDmPush notifies recipients of a new message in a contact DM. The
 // title is a contact substitution on the sender's phone number, which the
 // recipient's client resolves against their address book.
-func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderContact *phonepb.PhoneNumber, recipients ...*commonpb.UserId) error {
+func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderContact *phonepb.PhoneNumber, recipients ...*commonpb.UserId) error {
 	body, ok, err := renderDmMessagePushBody(ctx, ocpData, message)
 	if err != nil {
 		return err
@@ -167,6 +167,9 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 				ChatId: chatId,
 			},
 		},
+		ChatMetadata: &pushpb.ChatMetadata{
+			SendingUserId: senderID,
+		},
 	}
 
 	return sendDmMessagePush(ctx, pusher, badges, title, body, customPayload, recipients...)
@@ -176,7 +179,7 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 // is typically not in the recipient's contacts, so the title carries the
 // sender's display name directly rather than a contact substitution — and
 // never the sender's phone number, which is private in a tip DM.
-func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderDisplayName string, recipients ...*commonpb.UserId) error {
+func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName string, recipients ...*commonpb.UserId) error {
 	body, ok, err := renderDmMessagePushBody(ctx, ocpData, message)
 	if err != nil {
 		return err
@@ -192,6 +195,9 @@ func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpDa
 			Type: &pushpb.Navigation_ChatId{
 				ChatId: chatId,
 			},
+		},
+		ChatMetadata: &pushpb.ChatMetadata{
+			SendingUserId: senderID,
 		},
 	}
 

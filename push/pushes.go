@@ -228,8 +228,14 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 		if err != nil {
 			return "", false, err
 		}
+		// Unknown actions fall back to SENT, matching what clients render.
+		verb := "Sent"
+		if content.Cash.GetAction() == messagingpb.CashContent_TIPPED {
+			verb = "Tipped"
+		}
 		body = fmt.Sprintf(
-			"Sent you %s of %s",
+			"%s you %s of %s",
+			verb,
 			localization.FormatFiat(
 				defaultLocale,
 				ocp_currency.Code(content.Cash.Amount.Currency),

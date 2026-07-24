@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
@@ -205,6 +206,7 @@ func testFCMPusher_SendPushesWithChatMetadata(t *testing.T, store push.TokenStor
 	}
 	chatMetadata := &pushpb.ChatMetadata{
 		SendingUserId: &commonpb.UserId{Value: []byte("sender")},
+		Type:          chatpb.ChatType_CONTACT_DM,
 	}
 
 	for _, tc := range []struct {
@@ -229,7 +231,9 @@ func testFCMPusher_SendPushesWithChatMetadata(t *testing.T, store push.TokenStor
 			// no fields (e.g. a system message with no sending user).
 			name: "empty chat metadata",
 			payload: &pushpb.Payload{
-				ChatMetadata: &pushpb.ChatMetadata{},
+				ChatMetadata: &pushpb.ChatMetadata{
+					Type: chatpb.ChatType_CONTACT_DM,
+				},
 			},
 			wantMutable: true,
 		},

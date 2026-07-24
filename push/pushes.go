@@ -9,6 +9,7 @@ import (
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
@@ -169,6 +170,7 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 		},
 		ChatMetadata: &pushpb.ChatMetadata{
 			SendingUserId: senderID,
+			Type:          chatpb.ChatType_CONTACT_DM,
 		},
 	}
 
@@ -198,6 +200,7 @@ func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpDa
 		},
 		ChatMetadata: &pushpb.ChatMetadata{
 			SendingUserId: senderID,
+			Type:          chatpb.ChatType_TIP_DM,
 		},
 	}
 

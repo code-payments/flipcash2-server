@@ -15,6 +15,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 
 	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
@@ -132,6 +133,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	assert.EqualValues(t, 10_000, cash.Amount.GetQuarks())
 	assert.Equal(t, "usd", cash.Amount.GetCurrency())
 	assert.EqualValues(t, 1.0, cash.Amount.GetNativeAmount())
+	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetAction())
 
 	// Tasks are delivered at least once, so re-execution must not duplicate
 	// the message.
@@ -232,6 +234,7 @@ func TestExecutor_SendTipDmPaymentMessage(t *testing.T) {
 	require.NotNil(t, cash)
 	assert.Equal(t, rawIntentID, cash.IntentId.GetValue())
 	assert.EqualValues(t, 10_000, cash.Amount.GetQuarks())
+	assert.Equal(t, messagingpb.CashContent_TIPPED, cash.GetAction())
 
 	// Tasks are delivered at least once, so re-execution must not duplicate
 	// the message.

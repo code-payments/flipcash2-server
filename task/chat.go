@@ -70,15 +70,21 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 		return errors.New("intent is not a send public payment")
 	}
 	chatMetadata := intent.GetChatMetadata(intentRecord)
+
+	// The action is how the client renders the payment, and today it's fully
+	// determined by which DM the payment lands in.
+	var action messagingpb.CashContent_Action
 	switch chatType {
 	case chatpb.ChatType_CONTACT_DM:
 		if chatMetadata.GetContactDmPayment() == nil {
 			return errors.New("intent is not a contact dm payment")
 		}
+		action = messagingpb.CashContent_SENT
 	case chatpb.ChatType_TIP_DM:
 		if chatMetadata.GetTipDmPayment() == nil {
 			return errors.New("intent is not a tip dm payment")
 		}
+		action = messagingpb.CashContent_TIPPED
 	default:
 		return fmt.Errorf("unsupported dm chat type %d", chatType)
 	}
@@ -137,6 +143,7 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 					Quarks:       metadata.Quantity,
 					Mint:         &commonpb.PublicKey{Value: mintAccount.PublicKey().ToBytes()},
 				},
+				Action: action,
 			},
 		},
 	}}

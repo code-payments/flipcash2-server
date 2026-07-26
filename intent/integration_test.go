@@ -164,7 +164,8 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 	})
 
 	// Tips below the per-currency minimum are denied. The minimum itself, and
-	// anything above it, is allowed.
+	// anything above it, is allowed, as is anything within half of the
+	// currency's smallest transferable unit below the minimum.
 	t.Run("minimum_amount", func(t *testing.T) {
 		for _, tc := range []struct {
 			currency       string
@@ -172,15 +173,21 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 			usdMarketValue float64
 			allowed        bool
 		}{
-			{"usd", 1.0, 1.0, true},    // exactly the usd minimum
-			{"usd", 5.0, 5.0, true},    // above the usd minimum
-			{"usd", 0.99, 0.99, false}, // below the usd minimum
-			{"jpy", 100, 0.68, true},   // exactly the jpy minimum
-			{"jpy", 50, 0.34, false},   // below the jpy minimum
-			{"kwd", 0.25, 0.82, true},  // fractional minimum
-			{"kwd", 0.1, 0.33, false},  // below a fractional minimum
-			{"bgn", 5.0, 2.85, true},   // no preset: usd market value clears the floor
-			{"bgn", 1.0, 0.57, false},  // no preset: usd market value below the floor
+			{"usd", 1.0, 1.0, true},      // exactly the usd minimum
+			{"usd", 5.0, 5.0, true},      // above the usd minimum
+			{"usd", 0.995, 0.995, true},  // within half a cent of the usd minimum
+			{"usd", 0.99, 0.99, false},   // below the usd tolerance band
+			{"jpy", 100, 0.68, true},     // exactly the jpy minimum
+			{"jpy", 99.5, 0.677, true},   // within half a yen of the jpy minimum
+			{"jpy", 99, 0.674, false},    // below the jpy tolerance band
+			{"jpy", 50, 0.34, false},     // below the jpy minimum
+			{"kwd", 0.25, 0.82, true},    // fractional minimum
+			{"kwd", 0.2495, 0.818, true}, // within half a fils of the kwd minimum
+			{"kwd", 0.249, 0.816, false}, // below the kwd tolerance band
+			{"kwd", 0.1, 0.33, false},    // below a fractional minimum
+			{"bgn", 5.0, 2.85, true},     // no preset: usd market value clears the floor
+			{"bgn", 1.0, 0.995, true},    // no preset: usd market value within the usd tolerance band
+			{"bgn", 1.0, 0.57, false},    // no preset: usd market value below the floor
 		} {
 			record := validRecord()
 			record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.Code(tc.currency)

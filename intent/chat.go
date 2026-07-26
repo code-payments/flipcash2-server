@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -241,7 +242,13 @@ func validateMinimumTipAmount(paymentMetadata *ocp_intent.SendPublicPaymentMetad
 		currencyCode, amount, minimum = currency_lib.USD, paymentMetadata.UsdMarketValue, usdPresets.Minimum
 	}
 
-	if amount < minimum {
+	// The amount reaching us is a fiat value derived from a quoted exchange
+	// rate, so it can land a fraction of a minor unit under the advertised
+	// minimum through rounding alone. Allow half of the currency's smallest
+	// transferable unit of slack so those tips aren't denied.
+	tolerance := 0.5 * math.Pow10(-currency_lib.GetDecimals(currencyCode))
+
+	if amount < minimum-tolerance {
 		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf(
 			"tip amount is below the minimum of %s %s",
 			strconv.FormatFloat(minimum, 'f', -1, 64),

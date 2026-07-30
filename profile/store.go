@@ -32,20 +32,22 @@ type Store interface {
 	// ErrInvalidDisplayName is returned if there is an issue with the display name.
 	SetDisplayName(ctx context.Context, id *commonpb.UserId, displayName string) error
 
-	// GetDisplayNames returns, for each of the given users that has a display
-	// name set, that display name keyed by string(userID.Value). Users without
-	// one are absent from the map. It resolves the whole set in a single lookup.
-	GetDisplayNames(ctx context.Context, userIDs []*commonpb.UserId) (map[string]string, error)
+	// GetPublicProfiles returns, for each of the given users the store knows, the
+	// public part of that user's profile keyed by string(userID.Value): the
+	// fields any viewer may see, carrying no private ones. Unknown users are
+	// absent from the map. It resolves the whole set in a single lookup.
+	//
+	// Display name is empty and profile picture nil for a user who has set
+	// neither, while the join timestamp is always set — so a present entry means
+	// "this user exists", not "this user filled in a profile".
+	//
+	// The returned picture carries only the blob holding its ORIGINAL rendition;
+	// resolving that blob's metadata is left to the caller.
+	GetPublicProfiles(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error)
 
 	// SetProfilePicture sets the user's profile picture to the blob holding its
 	// ORIGINAL rendition, replacing any picture already set.
 	SetProfilePicture(ctx context.Context, id *commonpb.UserId, blobID *blobpb.BlobId) error
-
-	// GetProfilePictures returns, for each of the given users that has a profile
-	// picture set, the blob holding its ORIGINAL rendition keyed by
-	// string(userID.Value). Users without one are absent from the map. It resolves
-	// the whole set in a single lookup.
-	GetProfilePictures(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*blobpb.BlobId, error)
 
 	// LinkPhoneNumber links the phone number and its precomputed hash to a user, provided
 	// they exist. Any other user previously holding the same phone number has both fields

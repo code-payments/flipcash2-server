@@ -139,6 +139,10 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 			UserId: userID,
 		})
 		require.NoError(t, err)
+
+		require.NotNil(t, getResp.UserProfile.JoinTs)
+		expected.JoinTs = getResp.UserProfile.JoinTs
+
 		require.NoError(t, protoutil.ProtoEqualError(expected, getResp.UserProfile))
 
 		xProfile := &profilepb.XProfile{

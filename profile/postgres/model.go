@@ -7,6 +7,7 @@ import (
 	"github.com/georgysavva/scany/v2/pgxscan"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -66,9 +67,13 @@ func fromXProfileModel(m *xProfileModel) (*profilepb.XProfile, error) {
 	}, nil
 }
 
-func dbGetDisplayName(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (*string, error) {
-	var res *string
-	query := `SELECT "displayName" FROM ` + usersTableName + ` WHERE "id" = $1`
+func dbGetPublicProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (*profilepb.UserProfile, error) {
+	var res struct {
+		DisplayName          *string   `db:"displayName"`
+		ProfilePictureBlobID *string   `db:"profilePictureBlobId"`
+		CreatedAt            time.Time `db:"createdAt"`
+	}
+	query := `SELECT "displayName", "profilePictureBlobId", "createdAt" FROM ` + usersTableName + ` WHERE "id" = $1`
 	err := pgxscan.Get(
 		ctx,
 		pool,
@@ -82,7 +87,25 @@ func dbGetDisplayName(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.
 		}
 		return nil, err
 	}
-	return res, nil
+
+	userProfile := &profilepb.UserProfile{
+		DisplayName: *pointer.StringOrDefault(res.DisplayName, ""),
+		JoinTs:      timestamppb.New(res.CreatedAt),
+	}
+
+	if res.ProfilePictureBlobID != nil {
+		rawBlobID, err := pg.Decode(*res.ProfilePictureBlobID)
+		if err != nil {
+			return nil, err
+		}
+		userProfile.ProfilePicture = &blobpb.Media{
+			Renditions: []*blobpb.Rendition{{
+				Role:   blobpb.Rendition_ORIGINAL,
+				BlobId: &blobpb.BlobId{Value: rawBlobID},
+			}},
+		}
+	}
+	return userProfile, nil
 }
 
 func dbSetDisplayName(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, displayName string) error {
@@ -93,8 +116,8 @@ func dbSetDisplayName(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.
 	})
 }
 
-func dbGetDisplayNames(ctx context.Context, pool *pgxpool.Pool, userIDs []*commonpb.UserId) (map[string]string, error) {
-	out := make(map[string]string)
+func dbGetPublicProfiles(ctx context.Context, pool *pgxpool.Pool, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
+	out := make(map[string]*profilepb.UserProfile)
 	if len(userIDs) == 0 {
 		return out, nil
 	}
@@ -111,10 +134,12 @@ func dbGetDisplayNames(ctx context.Context, pool *pgxpool.Pool, userIDs []*commo
 	}
 
 	var rows []struct {
-		ID          string `db:"id"`
-		DisplayName string `db:"displayName"`
+		ID                   string    `db:"id"`
+		DisplayName          *string   `db:"displayName"`
+		ProfilePictureBlobID *string   `db:"profilePictureBlobId"`
+		CreatedAt            time.Time `db:"createdAt"`
 	}
-	query := `SELECT "id", "displayName" FROM ` + usersTableName + ` WHERE "id" = ANY($1::text[]) AND "displayName" IS NOT NULL`
+	query := `SELECT "id", "displayName", "profilePictureBlobId", "createdAt" FROM ` + usersTableName + ` WHERE "id" = ANY($1::text[])`
 	err := pgxscan.Select(ctx, pool, &rows, query, encoded)
 	if err != nil {
 		if pgxscan.NotFound(err) {
@@ -128,30 +153,28 @@ func dbGetDisplayNames(ctx context.Context, pool *pgxpool.Pool, userIDs []*commo
 		if err != nil {
 			return nil, err
 		}
-		out[string(rawID)] = r.DisplayName
+
+		userProfile := &profilepb.UserProfile{
+			DisplayName: *pointer.StringOrDefault(r.DisplayName, ""),
+			JoinTs:      timestamppb.New(r.CreatedAt),
+		}
+
+		if r.ProfilePictureBlobID != nil {
+			rawBlobID, err := pg.Decode(*r.ProfilePictureBlobID)
+			if err != nil {
+				return nil, err
+			}
+			userProfile.ProfilePicture = &blobpb.Media{
+				Renditions: []*blobpb.Rendition{{
+					Role:   blobpb.Rendition_ORIGINAL,
+					BlobId: &blobpb.BlobId{Value: rawBlobID},
+				}},
+			}
+		}
+
+		out[string(rawID)] = userProfile
 	}
 	return out, nil
-}
-
-func dbGetProfilePicture(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (*blobpb.BlobId, error) {
-	var res *string
-	query := `SELECT "profilePictureBlobId" FROM ` + usersTableName + ` WHERE "id" = $1`
-	err := pgxscan.Get(ctx, pool, &res, query, pg.Encode(userID.Value))
-	if err != nil {
-		if pgxscan.NotFound(err) {
-			return nil, profile.ErrNotFound
-		}
-		return nil, err
-	}
-	if res == nil {
-		return nil, nil
-	}
-
-	decoded, err := pg.Decode(*res)
-	if err != nil {
-		return nil, err
-	}
-	return &blobpb.BlobId{Value: decoded}, nil
 }
 
 func dbSetProfilePicture(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, blobID *blobpb.BlobId) error {
@@ -162,54 +185,13 @@ func dbSetProfilePicture(ctx context.Context, pool *pgxpool.Pool, userID *common
 	})
 }
 
-func dbGetProfilePictures(ctx context.Context, pool *pgxpool.Pool, userIDs []*commonpb.UserId) (map[string]*blobpb.BlobId, error) {
-	out := make(map[string]*blobpb.BlobId)
-	if len(userIDs) == 0 {
-		return out, nil
+func dbGetPrivateProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (phoneNumber, emailAddress *string, err error) {
+	var res struct {
+		PhoneNumber  *string `db:"phoneNumber"`
+		EmailAddress *string `db:"emailAddress"`
 	}
-
-	encoded := make([]string, 0, len(userIDs))
-	seen := make(map[string]struct{}, len(userIDs))
-	for _, id := range userIDs {
-		e := pg.Encode(id.Value)
-		if _, ok := seen[e]; ok {
-			continue
-		}
-		seen[e] = struct{}{}
-		encoded = append(encoded, e)
-	}
-
-	var rows []struct {
-		ID                   string `db:"id"`
-		ProfilePictureBlobID string `db:"profilePictureBlobId"`
-	}
-	query := `SELECT "id", "profilePictureBlobId" FROM ` + usersTableName + ` WHERE "id" = ANY($1::text[]) AND "profilePictureBlobId" IS NOT NULL`
-	err := pgxscan.Select(ctx, pool, &rows, query, encoded)
-	if err != nil {
-		if pgxscan.NotFound(err) {
-			return out, nil
-		}
-		return nil, err
-	}
-
-	for _, r := range rows {
-		rawID, err := pg.Decode(r.ID)
-		if err != nil {
-			return nil, err
-		}
-		rawBlobID, err := pg.Decode(r.ProfilePictureBlobID)
-		if err != nil {
-			return nil, err
-		}
-		out[string(rawID)] = &blobpb.BlobId{Value: rawBlobID}
-	}
-	return out, nil
-}
-
-func dbGetPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (*string, error) {
-	var res *string
-	query := `SELECT "phoneNumber" FROM ` + usersTableName + ` WHERE "id" = $1`
-	err := pgxscan.Get(
+	query := `SELECT "phoneNumber", "emailAddress" FROM ` + usersTableName + ` WHERE "id" = $1`
+	err = pgxscan.Get(
 		ctx,
 		pool,
 		&res,
@@ -218,30 +200,11 @@ func dbGetPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.
 	)
 	if err != nil {
 		if pgxscan.NotFound(err) {
-			return nil, profile.ErrNotFound
+			return nil, nil, profile.ErrNotFound
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	return res, nil
-}
-
-func dbGetEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (*string, error) {
-	var res *string
-	query := `SELECT "emailAddress" FROM ` + usersTableName + ` WHERE "id" = $1`
-	err := pgxscan.Get(
-		ctx,
-		pool,
-		&res,
-		query,
-		pg.Encode(userID.Value),
-	)
-	if err != nil {
-		if pgxscan.NotFound(err) {
-			return nil, profile.ErrNotFound
-		}
-		return nil, err
-	}
-	return res, nil
+	return res.PhoneNumber, res.EmailAddress, nil
 }
 
 func dbLinkPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumber string, phoneNumberHash *commonpb.Hash) error {

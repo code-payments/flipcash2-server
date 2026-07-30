@@ -10,8 +10,8 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
-	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -72,21 +72,23 @@ type ProfileReader interface {
 	// phone number are absent from the map.
 	GetPhoneNumbers(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error)
 
-	// GetDisplayNames returns the display name for each of the given users that
-	// has one, keyed by string(userID.Value). Users without a display name are
-	// absent from the map.
-	GetDisplayNames(ctx context.Context, userIDs []*commonpb.UserId) (map[string]string, error)
-
-	// GetProfilePictures returns the profile picture of each of the given users
-	// that has one, keyed by string(userID.Value). Users without one are absent
-	// from the map.
+	// GetPublicProfiles returns the public profile of each of the given users the
+	// profile domain knows, keyed by string(userID.Value). Unknown users are
+	// absent from the map. Every public field a member row shows — display name,
+	// profile picture, join timestamp — comes back in this one call.
 	//
-	// The renditions come back with their blob metadata already resolved —
+	// A member who has set neither a name nor a picture still gets an entry,
+	// carrying just the join timestamp.
+	//
+	// Profile pictures come back with their blob metadata already resolved —
 	// including a short-lived download URL — so a client can render member avatars
 	// without a follow-up call. The URL expires; to re-mint one the client calls
 	// GetBlobs with an AccessContext naming that user's profile, which authorizes
 	// it because a profile picture is public.
-	GetProfilePictures(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*blobpb.Media, error)
+	//
+	// There is one proto per user, so a caller that fills in per-member fields
+	// must copy before mutating: the same user can be a member of several chats.
+	GetPublicProfiles(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error)
 }
 
 // BlocklistReader is the read slice of the blocklist domain the Chat service
@@ -342,11 +344,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 	if err != nil {
 		return nil, err
 	}
-	displayNamesByUserId, err := s.profiles.GetDisplayNames(ctx, userIDs)
-	if err != nil {
-		return nil, err
-	}
-	profilePicturesByUserId, err := s.profiles.GetProfilePictures(ctx, userIDs)
+	publicProfilesByUserId, err := s.profiles.GetPublicProfiles(ctx, userIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -366,9 +364,14 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 		}
 		assignPointers(md, pointers[key])
 		for _, m := range md.Members {
-			profile := &profilepb.UserProfile{
-				DisplayName:    displayNamesByUserId[string(m.UserId.Value)],
-				ProfilePicture: profilePicturesByUserId[string(m.UserId.Value)],
+			// The batch returns one proto per user, but each member row is filled in
+			// per chat below, so every row needs its own copy. Sharing one would let
+			// a contact DM's phone number show up on that same user's row in a chat
+			// of another type. Today's callers pass a single chat or a single-type
+			// feed page, so the copy is what keeps that true of any future caller.
+			profile := &profilepb.UserProfile{}
+			if publicProfile, ok := publicProfilesByUserId[string(m.UserId.Value)]; ok {
+				profile = proto.Clone(publicProfile).(*profilepb.UserProfile)
 			}
 			if md.Type == chatpb.ChatType_CONTACT_DM {
 				profile.PhoneNumber = phoneNumbersByUserId[string(m.UserId.Value)]

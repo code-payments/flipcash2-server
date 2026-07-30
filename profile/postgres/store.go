@@ -59,10 +59,6 @@ func (s *store) GetProfile(ctx context.Context, id *commonpb.UserId, includePriv
 		return nil, err
 	}
 
-	if len(userProfile.DisplayName) == 0 && len(userProfile.SocialProfiles) == 0 && userProfile.PhoneNumber == nil && userProfile.EmailAddress == nil && userProfile.ProfilePicture == nil {
-		return nil, profile.ErrNotFound
-	}
-
 	return userProfile, nil
 }
 

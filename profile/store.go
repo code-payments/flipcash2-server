@@ -24,7 +24,8 @@ type PhoneForPayment struct {
 }
 
 type Store interface {
-	// GetProfile returns the user profile for a user, or ErrNotFound.
+	// GetProfile returns the user profile for a user, or ErrNotFound when the store
+	// does not know the user.
 	GetProfile(ctx context.Context, id *commonpb.UserId, includePrivateProfile bool) (*profilepb.UserProfile, error)
 
 	// SetDisplayName sets the display name for a user, provided they exist.

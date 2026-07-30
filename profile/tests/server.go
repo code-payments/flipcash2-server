@@ -80,6 +80,22 @@ func seedBlob(t *testing.T, blobs blob.Store, owner *commonpb.UserId, state blob
 	return id
 }
 
+// requireProfileUnset asserts that a user has filled in no part of their profile.
+// Whether that reads back as NOT_FOUND or as an empty profile depends on whether
+// the store knows the user at all — Postgres shares the user row with account
+// binding, the in-memory store only learns of a user when a profile field is set
+// — so the assertion is on the fields, which are unset either way. The join
+// timestamp is exempt: every user the store knows has one.
+func requireProfileUnset(t *testing.T, resp *profilepb.GetProfileResponse) {
+	t.Helper()
+
+	require.Empty(t, resp.UserProfile.GetDisplayName())
+	require.Nil(t, resp.UserProfile.GetProfilePicture())
+	require.Empty(t, resp.UserProfile.GetSocialProfiles())
+	require.Nil(t, resp.UserProfile.GetPhoneNumber())
+	require.Nil(t, resp.UserProfile.GetEmailAddress())
+}
+
 func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
@@ -117,13 +133,13 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 		require.NoError(t, err)
 		require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
 
-		// Binding of a user isn't sufficient, a profile must be set!
+		// Binding of a user does not fill in a profile: there is nothing to read
+		// back until one is set.
 		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{
 			UserId: userID,
 		})
 		require.NoError(t, err)
-		require.Equal(t, profilepb.GetProfileResponse_NOT_FOUND, getResp.Result)
-		require.Nil(t, getResp.UserProfile)
+		requireProfileUnset(t, getResp)
 
 		setDisplayName := &profilepb.SetDisplayNameRequest{
 			DisplayName: "my name",
@@ -255,7 +271,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 			UserId: userID2,
 		})
 		require.NoError(t, err)
-		require.NoError(t, protoutil.ProtoEqualError(&profilepb.GetProfileResponse{Result: profilepb.GetProfileResponse_NOT_FOUND}, get))
+		requireProfileUnset(t, get)
 	})
 }
 

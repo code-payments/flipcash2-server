@@ -54,13 +54,17 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 	m.Lock()
 	defer m.Unlock()
 
-	baseProfile, ok := m.profiles[userIDCacheKey(id)]
-	clonedBaseProfile := &profilepb.UserProfile{}
-	if ok {
-		clonedBaseProfile = proto.Clone(baseProfile).(*profilepb.UserProfile)
+	key := userIDCacheKey(id)
+
+	baseProfile, ok := m.profiles[key]
+	if !ok {
+		return nil, profile.ErrNotFound
 	}
 
-	xProfile, ok := m.xProfilesByUser[userIDCacheKey(id)]
+	clonedBaseProfile := proto.Clone(baseProfile).(*profilepb.UserProfile)
+	clonedBaseProfile.JoinTs = timestamppb.New(m.createdAtByUser[key])
+
+	xProfile, ok := m.xProfilesByUser[key]
 	if ok {
 		clonedXProfile := proto.Clone(xProfile).(*profilepb.XProfile)
 		clonedBaseProfile.SocialProfiles = append(clonedBaseProfile.SocialProfiles, &profilepb.SocialProfile{
@@ -74,15 +78,6 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 		clonedBaseProfile.PhoneNumber = nil
 		clonedBaseProfile.EmailAddress = nil
 	}
-
-	if len(clonedBaseProfile.DisplayName) == 0 && len(clonedBaseProfile.SocialProfiles) == 0 && clonedBaseProfile.PhoneNumber == nil && clonedBaseProfile.EmailAddress == nil && clonedBaseProfile.ProfilePicture == nil {
-		return nil, profile.ErrNotFound
-	}
-
-	// Set after the emptiness check: every known user has a join timestamp, so
-	// one on its own must not make an otherwise empty profile look like one that
-	// exists.
-	clonedBaseProfile.JoinTs = timestamppb.New(m.createdAtByUser[userIDCacheKey(id)])
 
 	return clonedBaseProfile, nil
 }

@@ -18,6 +18,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
+	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/chat"
@@ -147,6 +148,7 @@ type fakeProfileReader struct {
 	phoneNumbers    map[string]*phonepb.PhoneNumber
 	displayNames    map[string]string
 	profilePictures map[string]*blobpb.Media
+	joinedAt        map[string]time.Time
 }
 
 func newFakeProfileReader() *fakeProfileReader {
@@ -154,6 +156,7 @@ func newFakeProfileReader() *fakeProfileReader {
 		phoneNumbers:    make(map[string]*phonepb.PhoneNumber),
 		displayNames:    make(map[string]string),
 		profilePictures: make(map[string]*blobpb.Media),
+		joinedAt:        make(map[string]time.Time),
 	}
 }
 
@@ -188,21 +191,23 @@ func (f *fakeProfileReader) GetPhoneNumbers(_ context.Context, userIDs []*common
 	return out, nil
 }
 
-func (f *fakeProfileReader) GetDisplayNames(_ context.Context, userIDs []*commonpb.UserId) (map[string]string, error) {
-	out := make(map[string]string)
+// GetPublicProfiles returns an entry for every user asked about, the way the real
+// reader does for a chat's members: they are all users the profile domain knows,
+// so each has at least a join timestamp even with no name or picture set.
+func (f *fakeProfileReader) GetPublicProfiles(_ context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
+	out := make(map[string]*profilepb.UserProfile)
 	for _, userID := range userIDs {
-		if d, ok := f.displayNames[string(userID.Value)]; ok {
-			out[string(userID.Value)] = d
-		}
-	}
-	return out, nil
-}
+		key := string(userID.Value)
 
-func (f *fakeProfileReader) GetProfilePictures(_ context.Context, userIDs []*commonpb.UserId) (map[string]*blobpb.Media, error) {
-	out := make(map[string]*blobpb.Media)
-	for _, userID := range userIDs {
-		if p, ok := f.profilePictures[string(userID.Value)]; ok {
-			out[string(userID.Value)] = p
+		joinedAt, ok := f.joinedAt[key]
+		if !ok {
+			joinedAt = at(0)
+		}
+
+		out[key] = &profilepb.UserProfile{
+			DisplayName:    f.displayNames[key],
+			ProfilePicture: f.profilePictures[key],
+			JoinTs:         timestamppb.New(joinedAt),
 		}
 	}
 	return out, nil

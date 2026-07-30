@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -53,13 +54,17 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 	m.Lock()
 	defer m.Unlock()
 
-	baseProfile, ok := m.profiles[userIDCacheKey(id)]
-	clonedBaseProfile := &profilepb.UserProfile{}
-	if ok {
-		clonedBaseProfile = proto.Clone(baseProfile).(*profilepb.UserProfile)
+	key := userIDCacheKey(id)
+
+	baseProfile, ok := m.profiles[key]
+	if !ok {
+		return nil, profile.ErrNotFound
 	}
 
-	xProfile, ok := m.xProfilesByUser[userIDCacheKey(id)]
+	clonedBaseProfile := proto.Clone(baseProfile).(*profilepb.UserProfile)
+	clonedBaseProfile.JoinTs = timestamppb.New(m.createdAtByUser[key])
+
+	xProfile, ok := m.xProfilesByUser[key]
 	if ok {
 		clonedXProfile := proto.Clone(xProfile).(*profilepb.XProfile)
 		clonedBaseProfile.SocialProfiles = append(clonedBaseProfile.SocialProfiles, &profilepb.SocialProfile{
@@ -72,10 +77,6 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 	if !includePrivateProfile {
 		clonedBaseProfile.PhoneNumber = nil
 		clonedBaseProfile.EmailAddress = nil
-	}
-
-	if len(clonedBaseProfile.DisplayName) == 0 && len(clonedBaseProfile.SocialProfiles) == 0 && clonedBaseProfile.PhoneNumber == nil && clonedBaseProfile.EmailAddress == nil && clonedBaseProfile.ProfilePicture == nil {
-		return nil, profile.ErrNotFound
 	}
 
 	return clonedBaseProfile, nil
@@ -96,27 +97,6 @@ func (m *InMemoryStore) SetProfilePicture(_ context.Context, id *commonpb.UserId
 	}
 
 	return nil
-}
-
-func (m *InMemoryStore) GetProfilePictures(_ context.Context, userIDs []*commonpb.UserId) (map[string]*blobpb.BlobId, error) {
-	out := make(map[string]*blobpb.BlobId)
-	if len(userIDs) == 0 {
-		return out, nil
-	}
-
-	m.Lock()
-	defer m.Unlock()
-
-	for _, id := range userIDs {
-		p, ok := m.profiles[userIDCacheKey(id)]
-		if !ok {
-			continue
-		}
-		if blobID := profilePictureBlob(p.ProfilePicture); blobID != nil {
-			out[string(id.Value)] = blobID
-		}
-	}
-	return out, nil
 }
 
 // profilePictureBlob returns a copy of the blob holding the media's ORIGINAL
@@ -142,8 +122,8 @@ func (m *InMemoryStore) SetDisplayName(_ context.Context, id *commonpb.UserId, d
 	return nil
 }
 
-func (m *InMemoryStore) GetDisplayNames(_ context.Context, userIDs []*commonpb.UserId) (map[string]string, error) {
-	out := make(map[string]string)
+func (m *InMemoryStore) GetPublicProfiles(_ context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
+	out := make(map[string]*profilepb.UserProfile)
 	if len(userIDs) == 0 {
 		return out, nil
 	}
@@ -152,11 +132,27 @@ func (m *InMemoryStore) GetDisplayNames(_ context.Context, userIDs []*commonpb.U
 	defer m.Unlock()
 
 	for _, userID := range userIDs {
-		p, ok := m.profiles[userIDCacheKey(userID)]
-		if !ok || len(p.DisplayName) == 0 {
+		key := userIDCacheKey(userID)
+		p, ok := m.profiles[key]
+		if !ok {
 			continue
 		}
-		out[string(userID.Value)] = p.DisplayName
+
+		// Only the public fields, and a fresh proto per user so a caller mutating
+		// what it gets back cannot reach into the store.
+		publicProfile := &profilepb.UserProfile{
+			DisplayName: p.DisplayName,
+			JoinTs:      timestamppb.New(m.createdAtByUser[key]),
+		}
+		if blobID := profilePictureBlob(p.ProfilePicture); blobID != nil {
+			publicProfile.ProfilePicture = &blobpb.Media{
+				Renditions: []*blobpb.Rendition{{
+					Role:   blobpb.Rendition_ORIGINAL,
+					BlobId: blobID,
+				}},
+			}
+		}
+		out[string(userID.Value)] = publicProfile
 	}
 	return out, nil
 }
@@ -408,6 +404,10 @@ func (m *InMemoryStore) LinkXAccount(ctx context.Context, userID *commonpb.UserI
 			delete(m.xProfilesByUser, key)
 		}
 	}
+
+	// A user reachable only through an X link is still a user, and Postgres would
+	// have a row (and so a join timestamp) for them. Record one here too.
+	m.ensureProfile(userIDCacheKey(userID))
 
 	cloned := proto.Clone(xProfile).(*profilepb.XProfile)
 	m.xProfilesByUser[userIDCacheKey(userID)] = cloned

@@ -12,7 +12,6 @@ import (
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/profile"
-	"github.com/code-payments/ocp-server/pointer"
 )
 
 type store struct {
@@ -26,27 +25,18 @@ func NewInPostgres(pool *pgxpool.Pool) profile.Store {
 }
 
 func (s *store) GetProfile(ctx context.Context, id *commonpb.UserId, includePrivateProfile bool) (*profilepb.UserProfile, error) {
-	displayName, err := dbGetDisplayName(ctx, s.pool, id)
+	userProfile, err := dbGetPublicProfile(ctx, s.pool, id)
 	if err != nil {
 		return nil, err
 	}
 
-	userProfile := &profilepb.UserProfile{
-		DisplayName: *pointer.StringOrDefault(displayName, ""),
-	}
-
 	if includePrivateProfile {
-		phoneNumber, err := dbGetPhoneNumber(ctx, s.pool, id)
+		phoneNumber, emailAddress, err := dbGetPrivateProfile(ctx, s.pool, id)
 		if err != nil {
 			return nil, err
 		}
 		if phoneNumber != nil {
 			userProfile.PhoneNumber = &phonepb.PhoneNumber{Value: *phoneNumber}
-		}
-
-		emailAddress, err := dbGetEmailAddress(ctx, s.pool, id)
-		if err != nil {
-			return nil, err
 		}
 		if emailAddress != nil {
 			userProfile.EmailAddress = &emailpb.EmailAddress{Value: *emailAddress}
@@ -69,24 +59,6 @@ func (s *store) GetProfile(ctx context.Context, id *commonpb.UserId, includePriv
 		return nil, err
 	}
 
-	profilePictureBlobID, err := dbGetProfilePicture(ctx, s.pool, id)
-	if err != nil && err != profile.ErrNotFound {
-		return nil, err
-	}
-	if profilePictureBlobID != nil {
-		// Only the ORIGINAL is stored; the server derives no renditions yet. The
-		// metadata is left for the caller to hydrate.
-		userProfile.ProfilePicture = &blobpb.Media{
-			Renditions: []*blobpb.Rendition{{
-				Role:   blobpb.Rendition_ORIGINAL,
-				BlobId: profilePictureBlobID,
-			}},
-		}
-	}
-
-	if len(userProfile.DisplayName) == 0 && len(userProfile.SocialProfiles) == 0 && userProfile.PhoneNumber == nil && userProfile.EmailAddress == nil && userProfile.ProfilePicture == nil {
-		return nil, profile.ErrNotFound
-	}
 	return userProfile, nil
 }
 
@@ -98,12 +70,8 @@ func (s *store) SetProfilePicture(ctx context.Context, id *commonpb.UserId, blob
 	return dbSetProfilePicture(ctx, s.pool, id, blobID)
 }
 
-func (s *store) GetProfilePictures(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*blobpb.BlobId, error) {
-	return dbGetProfilePictures(ctx, s.pool, userIDs)
-}
-
-func (s *store) GetDisplayNames(ctx context.Context, userIDs []*commonpb.UserId) (map[string]string, error) {
-	return dbGetDisplayNames(ctx, s.pool, userIDs)
+func (s *store) GetPublicProfiles(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
+	return dbGetPublicProfiles(ctx, s.pool, userIDs)
 }
 
 func (s *store) LinkPhoneNumber(ctx context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash *commonpb.Hash) error {

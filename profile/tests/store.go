@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -24,10 +25,11 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testPhoneEmailTransfer,
 		testGetPhonesByHashes,
 		testGetPhoneNumbersForPayment,
-		testGetDisplayNames,
+		testGetPublicProfiles,
 		testGetUserIdByPhoneNumber,
 		testLinkPhoneNumberForPayment,
 		testProfilePictures,
+		testJoinTs,
 	} {
 		tf(t, s)
 		teardown()
@@ -353,40 +355,69 @@ func testGetPhoneNumbersForPayment(t *testing.T, s profile.Store) {
 	require.False(t, ok)
 }
 
-func testGetDisplayNames(t *testing.T, s profile.Store) {
+func testGetPublicProfiles(t *testing.T, s profile.Store) {
 	ctx := context.Background()
 
 	user1 := model.MustGenerateUserID()
 	user2 := model.MustGenerateUserID()
-	noName := model.MustGenerateUserID()
+	unknown := model.MustGenerateUserID()
 
 	// Empty input.
-	got, err := s.GetDisplayNames(ctx, nil)
+	got, err := s.GetPublicProfiles(ctx, nil)
 	require.NoError(t, err)
 	require.Empty(t, got)
 
-	// Nobody has a display name yet.
-	got, err = s.GetDisplayNames(ctx, []*commonpb.UserId{user1, user2})
+	// Nobody is known to the store yet.
+	got, err = s.GetPublicProfiles(ctx, []*commonpb.UserId{user1, user2})
 	require.NoError(t, err)
 	require.Empty(t, got)
 
 	require.NoError(t, s.SetDisplayName(ctx, user1, "user one"))
 	require.NoError(t, s.SetDisplayName(ctx, user2, "user two"))
 
-	// Only users with a display name are returned, keyed by user ID.
-	got, err = s.GetDisplayNames(ctx, []*commonpb.UserId{user1, user2, noName})
+	// Known users are returned keyed by user ID; unknown ones are absent.
+	got, err = s.GetPublicProfiles(ctx, []*commonpb.UserId{user1, user2, unknown})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
-	require.Equal(t, "user one", got[string(user1.Value)])
-	require.Equal(t, "user two", got[string(user2.Value)])
-	_, ok := got[string(noName.Value)]
+	require.Equal(t, "user one", got[string(user1.Value)].DisplayName)
+	require.Equal(t, "user two", got[string(user2.Value)].DisplayName)
+	_, ok := got[string(unknown.Value)]
 	require.False(t, ok)
+
+	// Every entry is a complete public profile: it validates, and carries a join
+	// timestamp whether or not the user set anything else.
+	for _, user := range []*commonpb.UserId{user1, user2} {
+		p := got[string(user.Value)]
+		require.NoError(t, p.Validate())
+		require.NotNil(t, p.JoinTs)
+		require.False(t, p.JoinTs.AsTime().IsZero())
+	}
+
+	// Private fields are never part of a public profile.
+	require.NoError(t, s.LinkPhoneNumber(ctx, user1, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
+	require.NoError(t, s.LinkEmailAddress(ctx, user1, "someone@gmail.com"))
+
+	got, err = s.GetPublicProfiles(ctx, []*commonpb.UserId{user1})
+	require.NoError(t, err)
+	require.Nil(t, got[string(user1.Value)].PhoneNumber)
+	require.Nil(t, got[string(user1.Value)].EmailAddress)
+
+	// A user known to the store but with no display name still has a public
+	// profile: an empty name, and the join timestamp that makes it valid.
+	noName := model.MustGenerateUserID()
+	require.NoError(t, s.SetProfilePicture(ctx, noName, blob.MustGenerateID()))
+
+	got, err = s.GetPublicProfiles(ctx, []*commonpb.UserId{noName})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Empty(t, got[string(noName.Value)].DisplayName)
+	require.NoError(t, got[string(noName.Value)].Validate())
 
 	// A rename is reflected on the next read.
 	require.NoError(t, s.SetDisplayName(ctx, user1, "user one renamed"))
-	got, err = s.GetDisplayNames(ctx, []*commonpb.UserId{user1})
+	got, err = s.GetPublicProfiles(ctx, []*commonpb.UserId{user1})
 	require.NoError(t, err)
-	require.Equal(t, "user one renamed", got[string(user1.Value)])
+	require.Equal(t, "user one renamed", got[string(user1.Value)].DisplayName)
 }
 
 func testGetUserIdByPhoneNumber(t *testing.T, s profile.Store) {
@@ -553,13 +584,13 @@ func testProfilePictures(t *testing.T, s profile.Store) {
 	}
 
 	t.Run("Unset", func(t *testing.T) {
-		pictures, err := s.GetProfilePictures(ctx, []*commonpb.UserId{userID})
+		profiles, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{userID})
 		require.NoError(t, err)
-		require.Empty(t, pictures)
+		require.Empty(t, profiles)
 
-		pictures, err = s.GetProfilePictures(ctx, nil)
+		profiles, err = s.GetPublicProfiles(ctx, nil)
 		require.NoError(t, err)
-		require.Empty(t, pictures)
+		require.Empty(t, profiles)
 	})
 
 	first := blob.MustGenerateID()
@@ -572,10 +603,10 @@ func testProfilePictures(t *testing.T, s profile.Store) {
 		require.NoError(t, err)
 		require.Equal(t, first.Value, pictureBlob(p).Value)
 
-		pictures, err := s.GetProfilePictures(ctx, []*commonpb.UserId{userID, otherUserID})
+		profiles, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{userID, otherUserID})
 		require.NoError(t, err)
-		require.Len(t, pictures, 1)
-		require.Equal(t, first.Value, pictures[string(userID.Value)].Value)
+		require.Len(t, profiles, 1)
+		require.Equal(t, first.Value, pictureBlob(profiles[string(userID.Value)]).Value)
 	})
 
 	second := blob.MustGenerateID()
@@ -587,9 +618,9 @@ func testProfilePictures(t *testing.T, s profile.Store) {
 		require.NoError(t, err)
 		require.Equal(t, second.Value, pictureBlob(p).Value)
 
-		pictures, err := s.GetProfilePictures(ctx, []*commonpb.UserId{userID})
+		profiles, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{userID})
 		require.NoError(t, err)
-		require.Equal(t, second.Value, pictures[string(userID.Value)].Value)
+		require.Equal(t, second.Value, pictureBlob(profiles[string(userID.Value)]).Value)
 	})
 
 	t.Run("Set the same picture again", func(t *testing.T) {
@@ -604,10 +635,61 @@ func testProfilePictures(t *testing.T, s profile.Store) {
 		third := blob.MustGenerateID()
 		require.NoError(t, s.SetProfilePicture(ctx, otherUserID, third))
 
-		pictures, err := s.GetProfilePictures(ctx, []*commonpb.UserId{userID, otherUserID})
+		profiles, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{userID, otherUserID})
 		require.NoError(t, err)
-		require.Len(t, pictures, 2)
-		require.Equal(t, second.Value, pictures[string(userID.Value)].Value)
-		require.Equal(t, third.Value, pictures[string(otherUserID.Value)].Value)
+		require.Len(t, profiles, 2)
+		require.Equal(t, second.Value, pictureBlob(profiles[string(userID.Value)]).Value)
+		require.Equal(t, third.Value, pictureBlob(profiles[string(otherUserID.Value)]).Value)
 	})
+}
+
+func testJoinTs(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	userID := model.MustGenerateUserID()
+
+	before := time.Now().Add(-time.Minute)
+	require.NoError(t, s.SetDisplayName(ctx, userID, "my name"))
+	after := time.Now().Add(time.Minute)
+
+	// The timestamp is public: it comes back whether or not private fields were
+	// asked for, and it reflects when the user first became known to the store.
+	for _, includePrivateFields := range []bool{false, true} {
+		p, err := s.GetProfile(ctx, userID, includePrivateFields)
+		require.NoError(t, err)
+		require.NoError(t, p.Validate())
+		require.NotNil(t, p.JoinTs)
+		joinedAt := p.JoinTs.AsTime()
+		require.True(t, joinedAt.After(before), "join ts %s is before %s", joinedAt, before)
+		require.True(t, joinedAt.Before(after), "join ts %s is after %s", joinedAt, after)
+	}
+
+	p, err := s.GetProfile(ctx, userID, false)
+	require.NoError(t, err)
+	joinedAt := p.JoinTs.AsTime()
+
+	// Later edits to the profile do not move the join timestamp.
+	require.NoError(t, s.SetDisplayName(ctx, userID, "my other name"))
+	require.NoError(t, s.LinkPhoneNumber(ctx, userID, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
+	require.NoError(t, s.LinkEmailAddress(ctx, userID, "someone@gmail.com"))
+
+	p, err = s.GetProfile(ctx, userID, true)
+	require.NoError(t, err)
+	require.Equal(t, joinedAt, p.JoinTs.AsTime())
+
+	// Linking a social account does not move it either.
+	require.NoError(t, s.LinkXAccount(ctx, userID, &profilepb.XProfile{
+		Id:            "join-ts",
+		Username:      "username",
+		Name:          "name",
+		Description:   "description",
+		ProfilePicUrl: "url",
+		VerifiedType:  profilepb.XProfile_NONE,
+		FollowerCount: 42,
+	}, "accessToken"))
+
+	p, err = s.GetProfile(ctx, userID, false)
+	require.NoError(t, err)
+	require.NoError(t, p.Validate())
+	require.Equal(t, joinedAt, p.JoinTs.AsTime())
 }

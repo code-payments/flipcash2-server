@@ -59,7 +59,7 @@ func (s *Server) GetJwt(ctx context.Context, req *thirdpartypb.GetJwtRequest) (*
 
 	log := s.log.With(
 		zap.String("user_id", model.UserIDString(userID)),
-		zap.String("provider", req.ApiKey.Provider.String()),
+		zap.String("partner", req.ApiKey.Partner.String()),
 		zap.String("method", req.Method),
 		zap.String("host", req.Host),
 		zap.String("path", req.Path),
@@ -75,8 +75,8 @@ func (s *Server) GetJwt(ctx context.Context, req *thirdpartypb.GetJwtRequest) (*
 	}
 
 	var jwt string
-	switch req.ApiKey.Provider {
-	case thirdpartypb.Provider_COINBASE:
+	switch req.ApiKey.Partner {
+	case thirdpartypb.Partner_COINBASE:
 		if req.ApiKey.Value != s.coinbaseApiKey {
 			return &thirdpartypb.GetJwtResponse{Result: thirdpartypb.GetJwtResponse_INVALID_API_KEY}, nil
 		}

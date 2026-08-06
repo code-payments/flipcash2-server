@@ -28,6 +28,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testGetUserIdByPhoneNumber,
 		testLinkPhoneNumberForPayment,
 		testProfilePictures,
+		testTipCardColor,
 		testJoinTs,
 	} {
 		tf(t, s)
@@ -352,6 +353,55 @@ func testGetPhoneNumbersForPayment(t *testing.T, s profile.Store) {
 	require.False(t, ok)
 	_, ok = got[string(noPhone.Value)]
 	require.False(t, ok)
+}
+
+func testTipCardColor(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	user1 := model.MustGenerateUserID()
+	user2 := model.MustGenerateUserID()
+
+	// A user who has picked no colour still reads back a complete customization,
+	// resolved from the default.
+	require.NoError(t, s.SetDisplayName(ctx, user1, "user one"))
+	p, err := s.GetProfile(ctx, user1, false)
+	require.NoError(t, err)
+	require.NoError(t, protoutil.ProtoEqualError(profile.DefaultTipCardCustomization(), p.TipCardCustomization))
+
+	// Setting a colour is enough on its own to make the store know a user, the
+	// same way setting any other profile field is.
+	require.NoError(t, s.SetTipCardColor(ctx, user2, "#19191A"))
+	p, err = s.GetProfile(ctx, user2, false)
+	require.NoError(t, err)
+	require.Equal(t, "#19191A", p.TipCardCustomization.Color.Hex)
+
+	// Colours are per user: user2's choice does not reach user1.
+	p, err = s.GetProfile(ctx, user1, false)
+	require.NoError(t, err)
+	require.Equal(t, profile.DefaultTipCardColorHex, p.TipCardCustomization.Color.Hex)
+
+	// A second set replaces the first rather than accumulating.
+	require.NoError(t, s.SetTipCardColor(ctx, user2, "#FFFFFF"))
+	p, err = s.GetProfile(ctx, user2, false)
+	require.NoError(t, err)
+	require.Equal(t, "#FFFFFF", p.TipCardCustomization.Color.Hex)
+
+	// Whatever casing reached the store, reads are canonical.
+	require.NoError(t, s.SetTipCardColor(ctx, user2, "#abcdef"))
+	p, err = s.GetProfile(ctx, user2, false)
+	require.NoError(t, err)
+	require.Equal(t, "#ABCDEF", p.TipCardCustomization.Color.Hex)
+
+	// The batch read resolves the same way as the single one — it is the path
+	// chat member rows are built from, so a default missed here would leave a
+	// member row failing validation.
+	got, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{user1, user2})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.NoError(t, got[string(user1.Value)].Validate())
+	require.NoError(t, got[string(user2.Value)].Validate())
+	require.Equal(t, profile.DefaultTipCardColorHex, got[string(user1.Value)].TipCardCustomization.Color.Hex)
+	require.Equal(t, "#ABCDEF", got[string(user2.Value)].TipCardCustomization.Color.Hex)
 }
 
 func testGetPublicProfiles(t *testing.T, s profile.Store) {

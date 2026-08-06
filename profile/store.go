@@ -38,8 +38,9 @@ type Store interface {
 	// absent from the map. It resolves the whole set in a single lookup.
 	//
 	// Display name is empty and profile picture nil for a user who has set
-	// neither, while the join timestamp is always set — so a present entry means
-	// "this user exists", not "this user filled in a profile".
+	// neither, while the join timestamp and Tip Card customization are always set
+	// — so a present entry means "this user exists", not "this user filled in a
+	// profile".
 	//
 	// The returned picture carries only the blob holding its ORIGINAL rendition;
 	// resolving that blob's metadata is left to the caller.
@@ -48,6 +49,11 @@ type Store interface {
 	// SetProfilePicture sets the user's profile picture to the blob holding its
 	// ORIGINAL rendition, replacing any picture already set.
 	SetProfilePicture(ctx context.Context, id *commonpb.UserId, blobID *blobpb.BlobId) error
+
+	// SetTipCardColor sets the colour of the user's Tip Card, provided they exist,
+	// replacing any colour already picked. colorHex is stored as given, so callers
+	// normalize it first.
+	SetTipCardColor(ctx context.Context, id *commonpb.UserId, colorHex string) error
 
 	// LinkPhoneNumber links the phone number and its precomputed hash to a user, provided
 	// they exist. Any other user previously holding the same phone number has both fields

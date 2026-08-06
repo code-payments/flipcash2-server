@@ -228,9 +228,9 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 		if err != nil {
 			return "", false, err
 		}
-		// Unknown actions fall back to SENT, matching what clients render.
+		// Unknown verbs fall back to SENT, matching what clients render.
 		verb := "Sent"
-		if content.Cash.GetAction() == messagingpb.CashContent_TIPPED {
+		if content.Cash.GetVerb() == messagingpb.CashContent_TIPPED {
 			verb = "Tipped"
 		}
 		body = fmt.Sprintf(

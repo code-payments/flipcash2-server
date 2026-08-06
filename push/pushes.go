@@ -12,7 +12,6 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 
 	"github.com/code-payments/flipcash2-server/badge"
@@ -113,7 +112,7 @@ func SendFlipcashCurrencySoldPush(ctx context.Context, pusher Pusher, user *comm
 	return pusher.SendPushes(ctx, title, body, customPayload, user)
 }
 
-func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPhone *phonepb.PhoneNumber, users ...*commonpb.UserId) error {
+func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPhone *commonpb.PhoneNumber, users ...*commonpb.UserId) error {
 	if len(users) == 0 {
 		return nil
 	}
@@ -122,17 +121,17 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 	customPayload := &pushpb.Payload{
 		Category: pushpb.Payload_CONTACT_JOIN,
 		GroupKey: pushpb.Payload_CONTACT_JOIN.String(),
-		TitleSubstitutions: []*pushpb.Substitution{
+		TitleSubstitutions: []*commonpb.Substitution{
 			{
 				Fallback: joinedPhone.Value,
-				Kind: &pushpb.Substitution_Contact{
-					Contact: joinedPhone,
+				Kind: &commonpb.Substitution_PhoneNumberToContactName{
+					PhoneNumberToContactName: joinedPhone,
 				},
 			},
 		},
 		Navigation: &pushpb.Navigation{
 			Type: &pushpb.Navigation_ChatContactPhoneNumber{
-				ChatContactPhoneNumber: &phonepb.PhoneNumber{Value: joinedPhone.Value},
+				ChatContactPhoneNumber: &commonpb.PhoneNumber{Value: joinedPhone.Value},
 			},
 		},
 	}
@@ -142,7 +141,7 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 // SendContactDmPush notifies recipients of a new message in a contact DM. The
 // title is a contact substitution on the sender's phone number, which the
 // recipient's client resolves against their address book.
-func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderContact *phonepb.PhoneNumber, recipients ...*commonpb.UserId) error {
+func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderContact *commonpb.PhoneNumber, recipients ...*commonpb.UserId) error {
 	body, ok, err := renderDmMessagePushBody(ctx, ocpData, message)
 	if err != nil {
 		return err
@@ -155,11 +154,11 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 	customPayload := &pushpb.Payload{
 		Category: pushpb.Payload_CHAT,
 		GroupKey: base64.StdEncoding.EncodeToString(chatId.Value),
-		TitleSubstitutions: []*pushpb.Substitution{
+		TitleSubstitutions: []*commonpb.Substitution{
 			{
 				Fallback: senderContact.Value,
-				Kind: &pushpb.Substitution_Contact{
-					Contact: senderContact,
+				Kind: &commonpb.Substitution_PhoneNumberToContactName{
+					PhoneNumberToContactName: senderContact,
 				},
 			},
 		},

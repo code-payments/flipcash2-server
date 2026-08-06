@@ -3,8 +3,10 @@ package chat
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -15,7 +17,6 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/auth"
@@ -70,7 +71,7 @@ type ProfileReader interface {
 	// GetPhoneNumbers returns the linked phone number for each of the given
 	// users that has one, keyed by string(userID.Value). Users without a linked
 	// phone number are absent from the map.
-	GetPhoneNumbers(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error)
+	GetPhoneNumbers(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*commonpb.PhoneNumber, error)
 
 	// GetPublicProfiles returns the public profile of each of the given users the
 	// profile domain knows, keyed by string(userID.Value). Unknown users are
@@ -78,7 +79,9 @@ type ProfileReader interface {
 	// profile picture, join timestamp — comes back in this one call.
 	//
 	// A member who has set neither a name nor a picture still gets an entry,
-	// carrying just the join timestamp.
+	// carrying just the join timestamp. Every chat member is a user the profile
+	// domain knows, so hydration treats a missing entry as an error rather than
+	// standing in a profile of its own.
 	//
 	// Profile pictures come back with their blob metadata already resolved —
 	// including a short-lived download URL — so a client can render member avatars
@@ -364,15 +367,20 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 		}
 		assignPointers(md, pointers[key])
 		for _, m := range md.Members {
+			// Every chat member is a user the profile domain knows, so a miss here
+			// is a data integrity problem rather than something to paper over with
+			// an invented profile.
+			publicProfile, ok := publicProfilesByUserId[string(m.UserId.Value)]
+			if !ok {
+				return nil, fmt.Errorf("no public profile for chat member %s", base64.StdEncoding.EncodeToString(m.UserId.Value))
+			}
+
 			// The batch returns one proto per user, but each member row is filled in
 			// per chat below, so every row needs its own copy. Sharing one would let
 			// a contact DM's phone number show up on that same user's row in a chat
 			// of another type. Today's callers pass a single chat or a single-type
 			// feed page, so the copy is what keeps that true of any future caller.
-			profile := &profilepb.UserProfile{}
-			if publicProfile, ok := publicProfilesByUserId[string(m.UserId.Value)]; ok {
-				profile = proto.Clone(publicProfile).(*profilepb.UserProfile)
-			}
+			profile := proto.Clone(publicProfile).(*profilepb.UserProfile)
 			if md.Type == chatpb.ChatType_CONTACT_DM {
 				profile.PhoneNumber = phoneNumbersByUserId[string(m.UserId.Value)]
 			}

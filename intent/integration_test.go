@@ -12,7 +12,6 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
@@ -102,8 +101,8 @@ func contactDmChatMetadata(chatID *commonpb.ChatId, sourcePhone, destinationPhon
 		ChatId: chatID,
 		Type: &intentpb.ChatMetadata_ContactDmPayment_{
 			ContactDmPayment: &intentpb.ChatMetadata_ContactDmPayment{
-				Source:      &phonepb.PhoneNumber{Value: sourcePhone},
-				Destination: &phonepb.PhoneNumber{Value: destinationPhone},
+				Source:      &commonpb.PhoneNumber{Value: sourcePhone},
+				Destination: &commonpb.PhoneNumber{Value: destinationPhone},
 			},
 		},
 	}

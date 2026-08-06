@@ -15,7 +15,6 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	contactpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/contact/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
@@ -320,7 +319,7 @@ func (s *Server) isRegistered(ctx context.Context, log *zap.Logger, userID *comm
 	return isRegistered, nil
 }
 
-func (s *Server) secureHashPhones(phones []*phonepb.PhoneNumber) []*commonpb.Hash {
+func (s *Server) secureHashPhones(phones []*commonpb.PhoneNumber) []*commonpb.Hash {
 	if len(phones) == 0 {
 		return nil
 	}
@@ -331,7 +330,7 @@ func (s *Server) secureHashPhones(phones []*phonepb.PhoneNumber) []*commonpb.Has
 	return out
 }
 
-func xorPhoneHashes(dst []byte, phones []*phonepb.PhoneNumber) {
+func xorPhoneHashes(dst []byte, phones []*commonpb.PhoneNumber) {
 	for _, p := range phones {
 		sum := sha256.Sum256([]byte(p.Value))
 		for i := range ChecksumSize {

@@ -13,9 +13,7 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	emailpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/email/v1"
 	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
@@ -149,7 +147,10 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 		require.NoError(t, err)
 		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetDisplayNameResponse{Result: profilepb.SetDisplayNameResponse_OK}, setDisplayNameResp))
 
-		expected := &profilepb.UserProfile{DisplayName: "my name"}
+		expected := &profilepb.UserProfile{
+			DisplayName:          "my name",
+			TipCardCustomization: profile.DefaultTipCardCustomization(),
+		}
 
 		getResp, err = client.GetProfile(ctx, &profilepb.GetProfileRequest{
 			UserId: userID,
@@ -227,8 +228,8 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 			require.NoError(t, err)
 			require.NoError(t, protoutil.ProtoEqualError(expected, getResp.UserProfile))
 
-			expected.PhoneNumber = &phonepb.PhoneNumber{Value: "+12223334444"}
-			expected.EmailAddress = &emailpb.EmailAddress{Value: "someone@gmail.com"}
+			expected.PhoneNumber = &commonpb.PhoneNumber{Value: "+12223334444"}
+			expected.EmailAddress = &commonpb.EmailAddress{Value: "someone@gmail.com"}
 			require.NoError(t, keyPair.Auth(get, &get.Auth))
 
 			getResp, err = client.GetProfile(ctx, get)

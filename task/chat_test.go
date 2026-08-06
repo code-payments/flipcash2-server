@@ -16,7 +16,6 @@ import (
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 
 	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
 	badgememory "github.com/code-payments/flipcash2-server/badge/memory"
@@ -76,8 +75,8 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 				ChatId: chatID,
 				Type: &intentpb.ChatMetadata_ContactDmPayment_{
 					ContactDmPayment: &intentpb.ChatMetadata_ContactDmPayment{
-						Source:      &phonepb.PhoneNumber{Value: "+12223334444"},
-						Destination: &phonepb.PhoneNumber{Value: "+13334445555"},
+						Source:      &commonpb.PhoneNumber{Value: "+12223334444"},
+						Destination: &commonpb.PhoneNumber{Value: "+13334445555"},
 					},
 				},
 			},

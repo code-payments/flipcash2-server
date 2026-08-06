@@ -17,12 +17,12 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/testutil"
 )
 
@@ -145,7 +145,7 @@ func (f *fakeMessagingReader) LatestEventSequences(_ context.Context, chatIDs []
 // whatever phone number, display name and profile picture a test registers per user
 // ID.
 type fakeProfileReader struct {
-	phoneNumbers    map[string]*phonepb.PhoneNumber
+	phoneNumbers    map[string]*commonpb.PhoneNumber
 	displayNames    map[string]string
 	profilePictures map[string]*blobpb.Media
 	joinedAt        map[string]time.Time
@@ -153,7 +153,7 @@ type fakeProfileReader struct {
 
 func newFakeProfileReader() *fakeProfileReader {
 	return &fakeProfileReader{
-		phoneNumbers:    make(map[string]*phonepb.PhoneNumber),
+		phoneNumbers:    make(map[string]*commonpb.PhoneNumber),
 		displayNames:    make(map[string]string),
 		profilePictures: make(map[string]*blobpb.Media),
 		joinedAt:        make(map[string]time.Time),
@@ -181,8 +181,8 @@ func (f *fakeProfileReader) setProfilePicture(userID *commonpb.UserId, blobID *b
 	return picture
 }
 
-func (f *fakeProfileReader) GetPhoneNumbers(_ context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error) {
-	out := make(map[string]*phonepb.PhoneNumber)
+func (f *fakeProfileReader) GetPhoneNumbers(_ context.Context, userIDs []*commonpb.UserId) (map[string]*commonpb.PhoneNumber, error) {
+	out := make(map[string]*commonpb.PhoneNumber)
 	for _, userID := range userIDs {
 		if p, ok := f.phoneNumbers[string(userID.Value)]; ok {
 			out[string(userID.Value)] = p
@@ -205,9 +205,10 @@ func (f *fakeProfileReader) GetPublicProfiles(_ context.Context, userIDs []*comm
 		}
 
 		out[key] = &profilepb.UserProfile{
-			DisplayName:    f.displayNames[key],
-			ProfilePicture: f.profilePictures[key],
-			JoinTs:         timestamppb.New(joinedAt),
+			DisplayName:          f.displayNames[key],
+			ProfilePicture:       f.profilePictures[key],
+			JoinTs:               timestamppb.New(joinedAt),
+			TipCardCustomization: profile.DefaultTipCardCustomization(),
 		}
 	}
 	return out, nil
@@ -462,7 +463,7 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	// message was since edited), so this exercises that it is read from the
 	// messaging reader rather than derived from last_message.
 	e.messaging.latestEventSeqs[string(chatID.Value)] = 9
-	e.profiles.phoneNumbers[string(peer.Value)] = &phonepb.PhoneNumber{Value: "+15551234567"}
+	e.profiles.phoneNumbers[string(peer.Value)] = &commonpb.PhoneNumber{Value: "+15551234567"}
 	e.profiles.displayNames[string(peer.Value)] = "Peer Name"
 	peerPicture := e.profiles.setProfilePicture(peer, &blobpb.BlobId{Value: make([]byte, 16)})
 
@@ -519,7 +520,7 @@ func testServer_GetChat_TipDm_HidesPhoneNumbers(t *testing.T, s chat.Store) {
 		LastActivity: at(1),
 	}))
 
-	e.profiles.phoneNumbers[string(peer.Value)] = &phonepb.PhoneNumber{Value: "+15551234567"}
+	e.profiles.phoneNumbers[string(peer.Value)] = &commonpb.PhoneNumber{Value: "+15551234567"}
 	e.profiles.displayNames[string(peer.Value)] = "Peer Name"
 	e.profiles.setProfilePicture(peer, &blobpb.BlobId{Value: make([]byte, 16)})
 

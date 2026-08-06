@@ -7,7 +7,6 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 )
 
@@ -18,7 +17,7 @@ var ErrExistingSocialLink = errors.New("existing social link")
 // PhoneForPayment is a payment-enabled phone number together with the user that
 // owns it.
 type PhoneForPayment struct {
-	PhoneNumber *phonepb.PhoneNumber
+	PhoneNumber *commonpb.PhoneNumber
 	UserID      *commonpb.UserId
 	JoinedAt    time.Time
 }
@@ -72,7 +71,7 @@ type Store interface {
 
 	// GetPhonesByHashes returns the phone numbers for users whose stored
 	// phoneNumberHash matches any of the provided hashes. Order is unspecified.
-	GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error)
+	GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) ([]*commonpb.PhoneNumber, error)
 
 	// GetPhonesByHashesForPayment returns the payment-enabled phone numbers,
 	// each paired with the user that owns it, for users whose stored
@@ -84,7 +83,7 @@ type Store interface {
 	// phone number enabled for payment, that phone number keyed by
 	// string(userID.Value). Users without a payment-enabled phone number are
 	// absent from the map. It resolves the whole set in a single lookup.
-	GetPhoneNumbersForPayment(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error)
+	GetPhoneNumbersForPayment(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*commonpb.PhoneNumber, error)
 
 	// GetUserIdByPhoneNumber returns the UserId currently linked to the given
 	// phone number. Returns ErrNotFound when no user holds the number.

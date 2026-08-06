@@ -11,8 +11,6 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	emailpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/email/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/profile"
@@ -63,6 +61,7 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 
 	clonedBaseProfile := proto.Clone(baseProfile).(*profilepb.UserProfile)
 	clonedBaseProfile.JoinTs = timestamppb.New(m.createdAtByUser[key])
+	clonedBaseProfile.TipCardCustomization = profile.DefaultTipCardCustomization()
 
 	xProfile, ok := m.xProfilesByUser[key]
 	if ok {
@@ -141,8 +140,9 @@ func (m *InMemoryStore) GetPublicProfiles(_ context.Context, userIDs []*commonpb
 		// Only the public fields, and a fresh proto per user so a caller mutating
 		// what it gets back cannot reach into the store.
 		publicProfile := &profilepb.UserProfile{
-			DisplayName: p.DisplayName,
-			JoinTs:      timestamppb.New(m.createdAtByUser[key]),
+			DisplayName:          p.DisplayName,
+			JoinTs:               timestamppb.New(m.createdAtByUser[key]),
+			TipCardCustomization: profile.DefaultTipCardCustomization(),
 		}
 		if blobID := profilePictureBlob(p.ProfilePicture); blobID != nil {
 			publicProfile.ProfilePicture = &blobpb.Media{
@@ -175,7 +175,7 @@ func (m *InMemoryStore) LinkPhoneNumber(_ context.Context, id *commonpb.UserId, 
 
 	profile := m.ensureProfile(targetKey)
 
-	profile.PhoneNumber = &phonepb.PhoneNumber{Value: phoneNumber}
+	profile.PhoneNumber = &commonpb.PhoneNumber{Value: phoneNumber}
 
 	m.phoneHashesByUser[targetKey] = phoneNumberHash.Value
 
@@ -229,12 +229,12 @@ func (m *InMemoryStore) IsPhoneNumberLinkedForPayment(_ context.Context, id *com
 	return m.linkedForPaymentByUser[key], nil
 }
 
-func (m *InMemoryStore) GetPhonesByHashes(_ context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+func (m *InMemoryStore) GetPhonesByHashes(_ context.Context, hashes []*commonpb.Hash) ([]*commonpb.PhoneNumber, error) {
 	matches, err := m.getPhonesByHashes(hashes, false)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]*phonepb.PhoneNumber, len(matches))
+	out := make([]*commonpb.PhoneNumber, len(matches))
 	for i, match := range matches {
 		out[i] = match.PhoneNumber
 	}
@@ -275,7 +275,7 @@ func (m *InMemoryStore) getPhonesByHashes(hashes []*commonpb.Hash, forPaymentOnl
 			return nil, err
 		}
 		out = append(out, &profile.PhoneForPayment{
-			PhoneNumber: &phonepb.PhoneNumber{Value: p.PhoneNumber.Value},
+			PhoneNumber: &commonpb.PhoneNumber{Value: p.PhoneNumber.Value},
 			UserID:      &commonpb.UserId{Value: userID},
 			JoinedAt:    m.createdAtByUser[key],
 		})
@@ -283,8 +283,8 @@ func (m *InMemoryStore) getPhonesByHashes(hashes []*commonpb.Hash, forPaymentOnl
 	return out, nil
 }
 
-func (m *InMemoryStore) GetPhoneNumbersForPayment(_ context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error) {
-	out := make(map[string]*phonepb.PhoneNumber)
+func (m *InMemoryStore) GetPhoneNumbersForPayment(_ context.Context, userIDs []*commonpb.UserId) (map[string]*commonpb.PhoneNumber, error) {
+	out := make(map[string]*commonpb.PhoneNumber)
 	if len(userIDs) == 0 {
 		return out, nil
 	}
@@ -301,7 +301,7 @@ func (m *InMemoryStore) GetPhoneNumbersForPayment(_ context.Context, userIDs []*
 		if !ok || p.PhoneNumber == nil {
 			continue
 		}
-		out[string(userID.Value)] = &phonepb.PhoneNumber{Value: p.PhoneNumber.Value}
+		out[string(userID.Value)] = &commonpb.PhoneNumber{Value: p.PhoneNumber.Value}
 	}
 	return out, nil
 }
@@ -359,7 +359,7 @@ func (m *InMemoryStore) LinkEmailAddress(_ context.Context, id *commonpb.UserId,
 
 	profile := m.ensureProfile(targetKey)
 
-	profile.EmailAddress = &emailpb.EmailAddress{Value: emailAddress}
+	profile.EmailAddress = &commonpb.EmailAddress{Value: emailAddress}
 
 	return nil
 }

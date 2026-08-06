@@ -11,7 +11,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	resolverpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/resolver/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
@@ -139,7 +138,7 @@ func testServer_Resolve_ByPhoneNumber_OK(t *testing.T, accounts account.Store, p
 	req := &resolverpb.ResolveRequest{
 		Identifier: &resolverpb.Identifier{
 			Kind: &resolverpb.Identifier_Phone{
-				Phone: &phonepb.PhoneNumber{Value: "+12223334444"},
+				Phone: &commonpb.PhoneNumber{Value: "+12223334444"},
 			},
 		},
 	}
@@ -160,7 +159,7 @@ func testServer_Resolve_ByPhoneNumber_NotFound(t *testing.T, accounts account.St
 	req := &resolverpb.ResolveRequest{
 		Identifier: &resolverpb.Identifier{
 			Kind: &resolverpb.Identifier_Phone{
-				Phone: &phonepb.PhoneNumber{Value: "+15550000404"},
+				Phone: &commonpb.PhoneNumber{Value: "+15550000404"},
 			},
 		},
 	}
@@ -187,7 +186,7 @@ func testServer_Resolve_ByPhoneNumber_NotEnabledForPayment(t *testing.T, account
 	req := &resolverpb.ResolveRequest{
 		Identifier: &resolverpb.Identifier{
 			Kind: &resolverpb.Identifier_Phone{
-				Phone: &phonepb.PhoneNumber{Value: "+12223335555"},
+				Phone: &commonpb.PhoneNumber{Value: "+12223335555"},
 			},
 		},
 	}
@@ -222,7 +221,7 @@ func testServer_Resolve_Denied_Unregistered(t *testing.T, accounts account.Store
 	req := &resolverpb.ResolveRequest{
 		Identifier: &resolverpb.Identifier{
 			Kind: &resolverpb.Identifier_Phone{
-				Phone: &phonepb.PhoneNumber{Value: "+15550000503"},
+				Phone: &commonpb.PhoneNumber{Value: "+15550000503"},
 			},
 		},
 	}
@@ -243,7 +242,7 @@ func testServer_Resolve_Unauthorized(t *testing.T, accounts account.Store, profi
 	req := &resolverpb.ResolveRequest{
 		Identifier: &resolverpb.Identifier{
 			Kind: &resolverpb.Identifier_Phone{
-				Phone: &phonepb.PhoneNumber{Value: "+15550000401"},
+				Phone: &commonpb.PhoneNumber{Value: "+15550000401"},
 			},
 		},
 	}

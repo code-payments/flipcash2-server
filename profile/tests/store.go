@@ -9,7 +9,6 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/blob"
@@ -553,7 +552,7 @@ func testLinkPhoneNumberForPayment(t *testing.T, s profile.Store) {
 	require.True(t, linked)
 }
 
-func phoneValues(phones []*phonepb.PhoneNumber) []string {
+func phoneValues(phones []*commonpb.PhoneNumber) []string {
 	out := make([]string, len(phones))
 	for i, p := range phones {
 		out[i] = p.Value

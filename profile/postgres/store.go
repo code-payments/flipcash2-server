@@ -7,8 +7,6 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	emailpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/email/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/profile"
@@ -36,10 +34,10 @@ func (s *store) GetProfile(ctx context.Context, id *commonpb.UserId, includePriv
 			return nil, err
 		}
 		if phoneNumber != nil {
-			userProfile.PhoneNumber = &phonepb.PhoneNumber{Value: *phoneNumber}
+			userProfile.PhoneNumber = &commonpb.PhoneNumber{Value: *phoneNumber}
 		}
 		if emailAddress != nil {
-			userProfile.EmailAddress = &emailpb.EmailAddress{Value: *emailAddress}
+			userProfile.EmailAddress = &commonpb.EmailAddress{Value: *emailAddress}
 		}
 	}
 
@@ -90,7 +88,7 @@ func (s *store) IsPhoneNumberLinkedForPayment(ctx context.Context, userID *commo
 	return dbIsPhoneNumberLinkedForPayment(ctx, s.pool, userID, phoneNumber)
 }
 
-func (s *store) GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+func (s *store) GetPhonesByHashes(ctx context.Context, hashes []*commonpb.Hash) ([]*commonpb.PhoneNumber, error) {
 	return dbGetPhonesByHashes(ctx, s.pool, hashes)
 }
 
@@ -98,7 +96,7 @@ func (s *store) GetPhonesByHashesForPayment(ctx context.Context, hashes []*commo
 	return dbGetPhonesByHashesForPayment(ctx, s.pool, hashes)
 }
 
-func (s *store) GetPhoneNumbersForPayment(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error) {
+func (s *store) GetPhoneNumbersForPayment(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*commonpb.PhoneNumber, error) {
 	return dbGetPhoneNumbersForPayment(ctx, s.pool, userIDs)
 }
 

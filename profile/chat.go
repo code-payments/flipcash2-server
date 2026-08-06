@@ -5,7 +5,6 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
@@ -27,7 +26,7 @@ func NewChatProfileReader(store Store, media Media) chat.ProfileReader {
 	return &chatProfileReader{store: store, media: media}
 }
 
-func (r *chatProfileReader) GetPhoneNumbers(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error) {
+func (r *chatProfileReader) GetPhoneNumbers(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*commonpb.PhoneNumber, error) {
 	// Only numbers the user has enabled for payment are shared into the chat.
 	return r.store.GetPhoneNumbersForPayment(ctx, userIDs)
 }

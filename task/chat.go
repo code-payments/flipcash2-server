@@ -12,6 +12,7 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
@@ -71,20 +72,27 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 	}
 	chatMetadata := intent.GetChatMetadata(intentRecord)
 
-	// The action is how the client renders the payment, and today it's fully
-	// determined by which DM the payment lands in.
-	var action messagingpb.CashContent_Action
+	// The verb is how the client renders the payment. A contact DM payment is
+	// always a plain send. A tip DM payment is only a tip when it was sent from
+	// the recipient's tip card — the same DM also carries ordinary payments sent
+	// from within the chat itself.
+	var verb messagingpb.CashContent_Verb
 	switch chatType {
 	case chatpb.ChatType_CONTACT_DM:
 		if chatMetadata.GetContactDmPayment() == nil {
 			return errors.New("intent is not a contact dm payment")
 		}
-		action = messagingpb.CashContent_SENT
+		verb = messagingpb.CashContent_SENT
 	case chatpb.ChatType_TIP_DM:
-		if chatMetadata.GetTipDmPayment() == nil {
+		tipDmPayment := chatMetadata.GetTipDmPayment()
+		if tipDmPayment == nil {
 			return errors.New("intent is not a tip dm payment")
 		}
-		action = messagingpb.CashContent_TIPPED
+		// Locations other than the tip card fall back to SENT
+		verb = messagingpb.CashContent_SENT
+		if tipDmPayment.GetLocation() == intentpb.ChatMetadata_TipDmPayment_TIPCARD {
+			verb = messagingpb.CashContent_TIPPED
+		}
 	default:
 		return fmt.Errorf("unsupported dm chat type %d", chatType)
 	}
@@ -143,7 +151,7 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 					Quarks:       metadata.Quantity,
 					Mint:         &commonpb.PublicKey{Value: mintAccount.PublicKey().ToBytes()},
 				},
-				Action: action,
+				Verb: verb,
 			},
 		},
 	}}

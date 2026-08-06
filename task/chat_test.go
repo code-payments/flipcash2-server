@@ -133,7 +133,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	assert.EqualValues(t, 10_000, cash.Amount.GetQuarks())
 	assert.Equal(t, "usd", cash.Amount.GetCurrency())
 	assert.EqualValues(t, 1.0, cash.Amount.GetNativeAmount())
-	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetAction())
+	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetVerb())
 
 	// Tasks are delivered at least once, so re-execution must not duplicate
 	// the message.
@@ -145,6 +145,23 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 }
 
 func TestExecutor_SendTipDmPaymentMessage(t *testing.T) {
+	// The location the payment was sent from decides the verb: only a payment
+	// from the recipient's tip card is a tip, everything else is a plain send.
+	for _, tc := range []struct {
+		name         string
+		location     intentpb.ChatMetadata_TipDmPayment_Location
+		expectedVerb messagingpb.CashContent_Verb
+	}{
+		{"tipcard", intentpb.ChatMetadata_TipDmPayment_TIPCARD, messagingpb.CashContent_TIPPED},
+		{"chat", intentpb.ChatMetadata_TipDmPayment_CHAT, messagingpb.CashContent_SENT},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testExecutor_SendTipDmPaymentMessage(t, tc.location, tc.expectedVerb)
+		})
+	}
+}
+
+func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMetadata_TipDmPayment_Location, expectedVerb messagingpb.CashContent_Verb) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
@@ -182,7 +199,9 @@ func TestExecutor_SendTipDmPaymentMessage(t *testing.T) {
 			Chat: &intentpb.ChatMetadata{
 				ChatId: chatID,
 				Type: &intentpb.ChatMetadata_TipDmPayment_{
-					TipDmPayment: &intentpb.ChatMetadata_TipDmPayment{},
+					TipDmPayment: &intentpb.ChatMetadata_TipDmPayment{
+						Location: location,
+					},
 				},
 			},
 		},
@@ -234,7 +253,7 @@ func TestExecutor_SendTipDmPaymentMessage(t *testing.T) {
 	require.NotNil(t, cash)
 	assert.Equal(t, rawIntentID, cash.IntentId.GetValue())
 	assert.EqualValues(t, 10_000, cash.Amount.GetQuarks())
-	assert.Equal(t, messagingpb.CashContent_TIPPED, cash.GetAction())
+	assert.Equal(t, expectedVerb, cash.GetVerb())
 
 	// Tasks are delivered at least once, so re-execution must not duplicate
 	// the message.

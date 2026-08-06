@@ -1698,7 +1698,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	require.Equal(t, "{0}", contactPush.title)
 	require.Equal(t, "contact message", contactPush.body)
 	require.Len(t, contactPush.payload.TitleSubstitutions, 1)
-	require.Equal(t, senderPhone, contactPush.payload.TitleSubstitutions[0].GetContact().GetValue())
+	require.Equal(t, senderPhone, contactPush.payload.TitleSubstitutions[0].GetPhoneNumberToContactName().GetValue())
 	require.Len(t, contactPush.users, 1)
 	require.Equal(t, e.userB.Value, contactPush.users[0].Value)
 }

@@ -241,7 +241,7 @@ func (s *Server) LinkForPayment(ctx context.Context, req *phonepb.LinkForPayment
 	}
 }
 
-func (s *Server) hashPhoneNumber(phoneNumber *phonepb.PhoneNumber) *commonpb.Hash {
+func (s *Server) hashPhoneNumber(phoneNumber *commonpb.PhoneNumber) *commonpb.Hash {
 	return SecureHash(phoneNumber, s.hashPepper)
 }
 
@@ -249,7 +249,7 @@ func (s *Server) notifyContactsOfJoin(
 	ctx context.Context,
 	log *zap.Logger,
 	joiningUserID *commonpb.UserId,
-	phoneNumber *phonepb.PhoneNumber,
+	phoneNumber *commonpb.PhoneNumber,
 	phoneHash *commonpb.Hash,
 ) {
 	recipients, err := s.contacts.GetUserIdsByPhoneHash(ctx, phoneHash)

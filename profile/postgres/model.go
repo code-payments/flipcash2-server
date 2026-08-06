@@ -11,7 +11,6 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	pg "github.com/code-payments/flipcash2-server/database/postgres"
@@ -89,8 +88,9 @@ func dbGetPublicProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 	}
 
 	userProfile := &profilepb.UserProfile{
-		DisplayName: *pointer.StringOrDefault(res.DisplayName, ""),
-		JoinTs:      timestamppb.New(res.CreatedAt),
+		DisplayName:          *pointer.StringOrDefault(res.DisplayName, ""),
+		JoinTs:               timestamppb.New(res.CreatedAt),
+		TipCardCustomization: profile.DefaultTipCardCustomization(),
 	}
 
 	if res.ProfilePictureBlobID != nil {
@@ -155,8 +155,9 @@ func dbGetPublicProfiles(ctx context.Context, pool *pgxpool.Pool, userIDs []*com
 		}
 
 		userProfile := &profilepb.UserProfile{
-			DisplayName: *pointer.StringOrDefault(r.DisplayName, ""),
-			JoinTs:      timestamppb.New(r.CreatedAt),
+			DisplayName:          *pointer.StringOrDefault(r.DisplayName, ""),
+			JoinTs:               timestamppb.New(r.CreatedAt),
+			TipCardCustomization: profile.DefaultTipCardCustomization(),
 		}
 
 		if r.ProfilePictureBlobID != nil {
@@ -280,12 +281,12 @@ func dbLinkEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 	})
 }
 
-func dbGetPhonesByHashes(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash) ([]*phonepb.PhoneNumber, error) {
+func dbGetPhonesByHashes(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash) ([]*commonpb.PhoneNumber, error) {
 	matches, err := dbGetPhonesByHashesInternal(ctx, pool, hashes, false)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]*phonepb.PhoneNumber, len(matches))
+	out := make([]*commonpb.PhoneNumber, len(matches))
 	for i, match := range matches {
 		out[i] = match.PhoneNumber
 	}
@@ -336,7 +337,7 @@ func dbGetPhonesByHashesInternal(ctx context.Context, pool *pgxpool.Pool, hashes
 			return nil, err
 		}
 		out = append(out, &profile.PhoneForPayment{
-			PhoneNumber: &phonepb.PhoneNumber{Value: r.Phone},
+			PhoneNumber: &commonpb.PhoneNumber{Value: r.Phone},
 			UserID:      &commonpb.UserId{Value: rawID},
 			JoinedAt:    r.CreatedAt,
 		})
@@ -344,8 +345,8 @@ func dbGetPhonesByHashesInternal(ctx context.Context, pool *pgxpool.Pool, hashes
 	return out, nil
 }
 
-func dbGetPhoneNumbersForPayment(ctx context.Context, pool *pgxpool.Pool, userIDs []*commonpb.UserId) (map[string]*phonepb.PhoneNumber, error) {
-	out := make(map[string]*phonepb.PhoneNumber)
+func dbGetPhoneNumbersForPayment(ctx context.Context, pool *pgxpool.Pool, userIDs []*commonpb.UserId) (map[string]*commonpb.PhoneNumber, error) {
+	out := make(map[string]*commonpb.PhoneNumber)
 	if len(userIDs) == 0 {
 		return out, nil
 	}
@@ -379,7 +380,7 @@ func dbGetPhoneNumbersForPayment(ctx context.Context, pool *pgxpool.Pool, userID
 		if err != nil {
 			return nil, err
 		}
-		out[string(rawID)] = &phonepb.PhoneNumber{Value: r.Phone}
+		out[string(rawID)] = &commonpb.PhoneNumber{Value: r.Phone}
 	}
 	return out, nil
 }

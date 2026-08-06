@@ -17,7 +17,6 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	contactpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/contact/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
@@ -115,7 +114,7 @@ func testServer_DeltaUpload_Success(t *testing.T, accounts account.Store, profil
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 
-	adds := []*phonepb.PhoneNumber{
+	adds := []*commonpb.PhoneNumber{
 		{Value: "+12223334444"},
 		{Value: "+15556667777"},
 	}
@@ -150,7 +149,7 @@ func testServer_DeltaUpload_Mismatch(t *testing.T, accounts account.Store, profi
 		bogusNewChecksum.Value[i] = 0xAB
 	}
 	req := &contactpb.DeltaUploadRequest{
-		Adds:        []*phonepb.PhoneNumber{{Value: "+12223334444"}},
+		Adds:        []*commonpb.PhoneNumber{{Value: "+12223334444"}},
 		OldChecksum: contact.ZeroChecksum(),
 		NewChecksum: bogusNewChecksum,
 	}
@@ -176,7 +175,7 @@ func testServer_DeltaUpload_Drift(t *testing.T, accounts account.Store, profiles
 	// The delta is internally consistent (XOR-derivable), but the CAS
 	// fails because stored != old_checksum and stored != new_checksum.
 	zero := contact.ZeroChecksum()
-	adds := []*phonepb.PhoneNumber{{Value: "+12223334444"}}
+	adds := []*commonpb.PhoneNumber{{Value: "+12223334444"}}
 	newChecksum := xorChecksums(zero, phoneSha256("+12223334444"))
 
 	req := &contactpb.DeltaUploadRequest{
@@ -200,8 +199,8 @@ func testServer_FullUpload_Success(t *testing.T, accounts account.Store, profile
 	f := newServerFixture(t, accounts, profiles, store)
 
 	// Stream two messages — the second carries the expected_checksum.
-	phones1 := []*phonepb.PhoneNumber{{Value: "+12223334444"}}
-	phones2 := []*phonepb.PhoneNumber{{Value: "+15556667777"}}
+	phones1 := []*commonpb.PhoneNumber{{Value: "+12223334444"}}
+	phones2 := []*commonpb.PhoneNumber{{Value: "+15556667777"}}
 	expected := xorChecksums(contact.ZeroChecksum(), phoneSha256("+12223334444"), phoneSha256("+15556667777"))
 
 	stream, err := f.client.FullUpload(ctx)
@@ -238,7 +237,7 @@ func testServer_FullUpload_Mismatch(t *testing.T, accounts account.Store, profil
 	require.NoError(t, err)
 
 	r := &contactpb.FullUploadRequest{
-		Phones:           []*phonepb.PhoneNumber{{Value: "+12223334444"}},
+		Phones:           []*commonpb.PhoneNumber{{Value: "+12223334444"}},
 		ExpectedChecksum: bogus,
 	}
 	require.NoError(t, f.keys.Auth(r, &r.Auth))
@@ -280,7 +279,7 @@ func testServer_Unauthorized(t *testing.T, accounts account.Store, profiles prof
 	stream, err := f.client.FullUpload(ctx)
 	require.NoError(t, err)
 	freq := &contactpb.FullUploadRequest{
-		Phones:           []*phonepb.PhoneNumber{{Value: "+12223334444"}},
+		Phones:           []*commonpb.PhoneNumber{{Value: "+12223334444"}},
 		ExpectedChecksum: phoneSha256("+12223334444"),
 	}
 	require.NoError(t, other.Auth(freq, &freq.Auth))
@@ -334,7 +333,7 @@ func testServer_Unregistered(t *testing.T, accounts account.Store, profiles prof
 	stream, err := client.FullUpload(ctx)
 	require.NoError(t, err)
 	freq := &contactpb.FullUploadRequest{
-		Phones:           []*phonepb.PhoneNumber{{Value: "+12223334444"}},
+		Phones:           []*commonpb.PhoneNumber{{Value: "+12223334444"}},
 		ExpectedChecksum: phoneSha256("+12223334444"),
 	}
 	require.NoError(t, keys.Auth(freq, &freq.Auth))

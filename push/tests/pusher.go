@@ -13,7 +13,6 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	phonepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/phone/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 
 	"github.com/code-payments/flipcash2-server/push"
@@ -119,16 +118,16 @@ func testFCMPusher_SendPushesWithSubstitutions(t *testing.T, store push.TokenSto
 	installId := &commonpb.AppInstallId{Value: "install_subs"}
 	require.NoError(t, store.AddToken(ctx, user, installId, pushpb.TokenType_FCM_APNS, "token_subs"))
 
-	titleSub := &pushpb.Substitution{
+	titleSub := &commonpb.Substitution{
 		Fallback: "Alice",
-		Kind: &pushpb.Substitution_Contact{
-			Contact: &phonepb.PhoneNumber{Value: "+14155551111"},
+		Kind: &commonpb.Substitution_PhoneNumberToContactName{
+			PhoneNumberToContactName: &commonpb.PhoneNumber{Value: "+14155551111"},
 		},
 	}
-	bodySub := &pushpb.Substitution{
+	bodySub := &commonpb.Substitution{
 		Fallback: "Bob",
-		Kind: &pushpb.Substitution_Contact{
-			Contact: &phonepb.PhoneNumber{Value: "+14155552222"},
+		Kind: &commonpb.Substitution_PhoneNumberToContactName{
+			PhoneNumberToContactName: &commonpb.PhoneNumber{Value: "+14155552222"},
 		},
 	}
 
@@ -145,22 +144,22 @@ func testFCMPusher_SendPushesWithSubstitutions(t *testing.T, store push.TokenSto
 		{
 			name: "title substitutions only",
 			payload: &pushpb.Payload{
-				TitleSubstitutions: []*pushpb.Substitution{titleSub},
+				TitleSubstitutions: []*commonpb.Substitution{titleSub},
 			},
 			wantMutable: true,
 		},
 		{
 			name: "body substitutions only",
 			payload: &pushpb.Payload{
-				BodySubstitutions: []*pushpb.Substitution{bodySub},
+				BodySubstitutions: []*commonpb.Substitution{bodySub},
 			},
 			wantMutable: true,
 		},
 		{
 			name: "title and body substitutions",
 			payload: &pushpb.Payload{
-				TitleSubstitutions: []*pushpb.Substitution{titleSub},
-				BodySubstitutions:  []*pushpb.Substitution{bodySub, bodySub},
+				TitleSubstitutions: []*commonpb.Substitution{titleSub},
+				BodySubstitutions:  []*commonpb.Substitution{bodySub, bodySub},
 			},
 			wantMutable: true,
 		},
@@ -198,10 +197,10 @@ func testFCMPusher_SendPushesWithChatMetadata(t *testing.T, store push.TokenStor
 	installId := &commonpb.AppInstallId{Value: "install_chat_meta"}
 	require.NoError(t, store.AddToken(ctx, user, installId, pushpb.TokenType_FCM_APNS, "token_chat_meta"))
 
-	titleSub := &pushpb.Substitution{
+	titleSub := &commonpb.Substitution{
 		Fallback: "Alice",
-		Kind: &pushpb.Substitution_Contact{
-			Contact: &phonepb.PhoneNumber{Value: "+14155551111"},
+		Kind: &commonpb.Substitution_PhoneNumberToContactName{
+			PhoneNumberToContactName: &commonpb.PhoneNumber{Value: "+14155551111"},
 		},
 	}
 	chatMetadata := &pushpb.ChatMetadata{
@@ -242,7 +241,7 @@ func testFCMPusher_SendPushesWithChatMetadata(t *testing.T, store push.TokenStor
 			// the combination is mutable too.
 			name: "chat metadata and substitutions",
 			payload: &pushpb.Payload{
-				TitleSubstitutions: []*pushpb.Substitution{titleSub},
+				TitleSubstitutions: []*commonpb.Substitution{titleSub},
 				ChatMetadata:       chatMetadata,
 			},
 			wantMutable: true,

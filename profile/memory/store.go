@@ -24,6 +24,7 @@ type InMemoryStore struct {
 	linkedForPaymentByUser map[string]bool
 	xProfilesByUser        map[string]*profilepb.XProfile
 	createdAtByUser        map[string]time.Time
+	tipCardColorByUser     map[string]string
 }
 
 func NewInMemory() profile.Store {
@@ -33,7 +34,18 @@ func NewInMemory() profile.Store {
 		linkedForPaymentByUser: make(map[string]bool),
 		xProfilesByUser:        make(map[string]*profilepb.XProfile),
 		createdAtByUser:        make(map[string]time.Time),
+		tipCardColorByUser:     make(map[string]string),
 	}
+}
+
+// tipCardCustomization resolves the Tip Card customization for key, filling in
+// defaults for anything the user has not picked. Callers hold the lock.
+func (m *InMemoryStore) tipCardCustomization(key string) *profilepb.TipCardCustomization {
+	var storedColorHex *string
+	if colorHex, ok := m.tipCardColorByUser[key]; ok {
+		storedColorHex = &colorHex
+	}
+	return profile.TipCardCustomizationFromStored(storedColorHex)
 }
 
 // ensureProfile returns the profile for key, creating an empty one (and
@@ -61,7 +73,7 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 
 	clonedBaseProfile := proto.Clone(baseProfile).(*profilepb.UserProfile)
 	clonedBaseProfile.JoinTs = timestamppb.New(m.createdAtByUser[key])
-	clonedBaseProfile.TipCardCustomization = profile.DefaultTipCardCustomization()
+	clonedBaseProfile.TipCardCustomization = m.tipCardCustomization(key)
 
 	xProfile, ok := m.xProfilesByUser[key]
 	if ok {
@@ -94,6 +106,17 @@ func (m *InMemoryStore) SetProfilePicture(_ context.Context, id *commonpb.UserId
 			BlobId: proto.Clone(blobID).(*blobpb.BlobId),
 		}},
 	}
+
+	return nil
+}
+
+func (m *InMemoryStore) SetTipCardColor(_ context.Context, id *commonpb.UserId, colorHex string) error {
+	m.Lock()
+	defer m.Unlock()
+
+	key := userIDCacheKey(id)
+	m.ensureProfile(key)
+	m.tipCardColorByUser[key] = colorHex
 
 	return nil
 }
@@ -142,7 +165,7 @@ func (m *InMemoryStore) GetPublicProfiles(_ context.Context, userIDs []*commonpb
 		publicProfile := &profilepb.UserProfile{
 			DisplayName:          p.DisplayName,
 			JoinTs:               timestamppb.New(m.createdAtByUser[key]),
-			TipCardCustomization: profile.DefaultTipCardCustomization(),
+			TipCardCustomization: m.tipCardCustomization(key),
 		}
 		if blobID := profilePictureBlob(p.ProfilePicture); blobID != nil {
 			publicProfile.ProfilePicture = &blobpb.Media{
@@ -455,6 +478,7 @@ func (m *InMemoryStore) reset() {
 	m.linkedForPaymentByUser = make(map[string]bool)
 	m.xProfilesByUser = make(map[string]*profilepb.XProfile)
 	m.createdAtByUser = make(map[string]time.Time)
+	m.tipCardColorByUser = make(map[string]string)
 }
 
 func userIDCacheKey(id *commonpb.UserId) string {

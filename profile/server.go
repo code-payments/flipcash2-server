@@ -227,6 +227,36 @@ func setProfilePictureResultForErr(err error) (profilepb.SetProfilePictureRespon
 	}
 }
 
+func (s *Server) UpdateTipCard(ctx context.Context, req *profilepb.UpdateTipCardRequest) (*profilepb.UpdateTipCardResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
+
+	isRegistered, err := s.accounts.IsRegistered(ctx, userID)
+	if err != nil {
+		log.Warn("Failed to get registration flag")
+		return nil, status.Errorf(codes.Internal, "failed to get registration flag")
+	} else if !isRegistered {
+		return &profilepb.UpdateTipCardResponse{Result: profilepb.UpdateTipCardResponse_DENIED}, nil
+	}
+
+	// Every field of the customization is optional, so whatever is left unset
+	// here stays as the user already had it.
+	if req.Color != nil {
+		colorHex := NormalizeColorHex(req.Color.Hex)
+
+		if err := s.profiles.SetTipCardColor(ctx, userID, colorHex); err != nil {
+			log.Warn("Failed to set tip card color", zap.Error(err), zap.String("color", colorHex))
+			return nil, status.Error(codes.Internal, "failed to set tip card color")
+		}
+	}
+
+	return &profilepb.UpdateTipCardResponse{}, nil
+}
+
 func (s *Server) LinkSocialAccount(ctx context.Context, req *profilepb.LinkSocialAccountRequest) (*profilepb.LinkSocialAccountResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {

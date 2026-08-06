@@ -68,6 +68,10 @@ func (s *store) SetProfilePicture(ctx context.Context, id *commonpb.UserId, blob
 	return dbSetProfilePicture(ctx, s.pool, id, blobID)
 }
 
+func (s *store) SetTipCardColor(ctx context.Context, id *commonpb.UserId, colorHex string) error {
+	return dbSetTipCardColor(ctx, s.pool, id, colorHex)
+}
+
 func (s *store) GetPublicProfiles(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
 	return dbGetPublicProfiles(ctx, s.pool, userIDs)
 }
@@ -147,7 +151,7 @@ func (s *store) GetXProfile(ctx context.Context, userID *commonpb.UserId) (*prof
 }
 
 func (s *store) reset() {
-	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL, "isPhoneNumberLinkedForPayment" = FALSE`)
+	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "profilePictureBlobId" = NULL, "tipCardColor" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL, "isPhoneNumberLinkedForPayment" = FALSE`)
 	if err != nil {
 		panic(err)
 	}

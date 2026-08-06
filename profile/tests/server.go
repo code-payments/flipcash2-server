@@ -32,6 +32,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 	for _, tf := range []func(t *testing.T, accounts account.Store, profiles profile.Store){
 		testServer,
 		testProfilePicture,
+		testTipCardCustomization,
 		testDisplayNameModeration,
 	} {
 		tf(t, accounts, profiles)
@@ -83,7 +84,8 @@ func seedBlob(t *testing.T, blobs blob.Store, owner *commonpb.UserId, state blob
 // the store knows the user at all — Postgres shares the user row with account
 // binding, the in-memory store only learns of a user when a profile field is set
 // — so the assertion is on the fields, which are unset either way. The join
-// timestamp is exempt: every user the store knows has one.
+// timestamp is exempt: every user the store knows has one, as is the Tip Card
+// customization, which is asserted to be the default rather than absent.
 func requireProfileUnset(t *testing.T, resp *profilepb.GetProfileResponse) {
 	t.Helper()
 
@@ -92,6 +94,10 @@ func requireProfileUnset(t *testing.T, resp *profilepb.GetProfileResponse) {
 	require.Empty(t, resp.UserProfile.GetSocialProfiles())
 	require.Nil(t, resp.UserProfile.GetPhoneNumber())
 	require.Nil(t, resp.UserProfile.GetEmailAddress())
+
+	if resp.UserProfile != nil {
+		require.NoError(t, protoutil.ProtoEqualError(profile.DefaultTipCardCustomization(), resp.UserProfile.TipCardCustomization))
+	}
 }
 
 func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
@@ -273,6 +279,78 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 		})
 		require.NoError(t, err)
 		requireProfileUnset(t, get)
+	})
+}
+
+func testTipCardCustomization(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+
+	media, _, _ := newMedia()
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient())
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+
+	client := profilepb.NewProfileClient(cc)
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
+	require.NoError(t, err)
+
+	updateTipCard := func(color *commonpb.Color) *profilepb.UpdateTipCardResponse {
+		t.Helper()
+		req := &profilepb.UpdateTipCardRequest{Color: color}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		resp, err := client.UpdateTipCard(ctx, req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	// Read without auth, since the customization is public: what this returns is
+	// what any other user sees on the Tip Card.
+	getColorHex := func() string {
+		t.Helper()
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		require.NoError(t, err)
+		require.Equal(t, profilepb.GetProfileResponse_OK, resp.Result)
+		return resp.UserProfile.TipCardCustomization.Color.Hex
+	}
+
+	t.Run("Unregistered user is denied", func(t *testing.T) {
+		resp := updateTipCard(&commonpb.Color{Hex: "#19191A"})
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateTipCardResponse{Result: profilepb.UpdateTipCardResponse_DENIED}, resp))
+
+		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		require.NoError(t, err)
+		requireProfileUnset(t, getResp)
+	})
+
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
+
+	t.Run("Color is set and replaced", func(t *testing.T) {
+		resp := updateTipCard(&commonpb.Color{Hex: "#19191A"})
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateTipCardResponse{Result: profilepb.UpdateTipCardResponse_OK}, resp))
+		require.Equal(t, "#19191A", getColorHex())
+
+		updateTipCard(&commonpb.Color{Hex: "#FFFFFF"})
+		require.Equal(t, "#FFFFFF", getColorHex())
+	})
+
+	t.Run("Color is normalized", func(t *testing.T) {
+		updateTipCard(&commonpb.Color{Hex: "#abcdef"})
+		require.Equal(t, "#ABCDEF", getColorHex())
+	})
+
+	t.Run("Unset fields are left alone", func(t *testing.T) {
+		updateTipCard(&commonpb.Color{Hex: "#19191A"})
+
+		resp := updateTipCard(nil)
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateTipCardResponse{Result: profilepb.UpdateTipCardResponse_OK}, resp))
+		require.Equal(t, "#19191A", getColorHex())
 	})
 }
 

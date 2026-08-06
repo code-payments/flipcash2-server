@@ -110,6 +110,7 @@ model User {
   id                            String             @id
   displayName                   String?
   profilePictureBlobId          String?
+  tipCardColor                  String?            // Tip Card colour as a hex string (e.g. "#19191a"); null until the user picks one, in which case the server resolves the default
   phoneNumber                   String?            @unique
   phoneNumberHash               String?            @unique
   emailAddress                  String?            @unique

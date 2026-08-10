@@ -12,7 +12,6 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
@@ -72,30 +71,22 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 	}
 	chatMetadata := intent.GetChatMetadata(intentRecord)
 
-	// The verb is how the client renders the payment. A contact DM payment is
-	// always a plain send. A tip DM payment is only a tip when it was sent from
-	// the recipient's tip card — the same DM also carries ordinary payments sent
-	// from within the chat itself.
-	var verb messagingpb.CashContent_Verb
+	// The metadata must match the DM the payment is being injected into.
 	switch chatType {
 	case chatpb.ChatType_CONTACT_DM:
 		if chatMetadata.GetContactDmPayment() == nil {
 			return errors.New("intent is not a contact dm payment")
 		}
-		verb = messagingpb.CashContent_SENT
 	case chatpb.ChatType_TIP_DM:
-		tipDmPayment := chatMetadata.GetTipDmPayment()
-		if tipDmPayment == nil {
+		if chatMetadata.GetTipDmPayment() == nil {
 			return errors.New("intent is not a tip dm payment")
-		}
-		// Locations other than the tip card fall back to SENT
-		verb = messagingpb.CashContent_SENT
-		if tipDmPayment.GetLocation() == intentpb.ChatMetadata_TipDmPayment_TIPCARD {
-			verb = messagingpb.CashContent_TIPPED
 		}
 	default:
 		return fmt.Errorf("unsupported dm chat type %d", chatType)
 	}
+
+	// The verb is how the client renders the payment.
+	verb := intent.GetDmPaymentVerb(intentRecord)
 
 	senderOwner, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
 	if err != nil {

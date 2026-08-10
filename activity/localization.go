@@ -5,12 +5,18 @@ import (
 	"errors"
 
 	activitypb "github.com/code-payments/flipcash2-protobuf-api/generated/go/activity/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 )
 
-func InjectLocalizedText(ctx context.Context, ocpData ocp_data.Provider, userOwnerAccount *ocp_common.Account, notification *activitypb.Notification) error {
+// InjectLocalizedText sets the notification's display text. cashMessageVerb
+// applies only to a payment sent to a known recipient, where it distinguishes a
+// tip from a plain send; it is ignored for every other notification type.
+// Callers derive it with intent.GetDmPaymentVerb so the feed and the DM cash
+// message agree.
+func InjectLocalizedText(ctx context.Context, ocpData ocp_data.Provider, userOwnerAccount *ocp_common.Account, notification *activitypb.Notification, cashMessageVerb messagingpb.CashContent_Verb) error {
 	var localizedText string
 	switch typed := notification.AdditionalMetadata.(type) {
 
@@ -18,7 +24,12 @@ func InjectLocalizedText(ctx context.Context, ocpData ocp_data.Provider, userOwn
 		localizedText = "Gave"
 
 		if typed.DirectlySentCrypto.GetDestinationIdentifier() != nil {
-			localizedText = "Sent"
+			switch cashMessageVerb {
+			case messagingpb.CashContent_TIPPED:
+				localizedText = "Tipped"
+			default:
+				localizedText = "Sent"
+			}
 		}
 
 	case *activitypb.Notification_ReceivedCrypto:

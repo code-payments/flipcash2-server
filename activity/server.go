@@ -12,7 +12,9 @@ import (
 
 	activitypb "github.com/code-payments/flipcash2-protobuf-api/generated/go/activity/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
+	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/intent"
 	"github.com/code-payments/flipcash2-server/model"
@@ -39,6 +41,8 @@ type Server struct {
 
 	authz auth.Authorizer
 
+	accounts account.Store
+
 	ocpData ocp_data.Provider
 
 	activitypb.UnimplementedActivityFeedServer
@@ -47,12 +51,15 @@ type Server struct {
 func NewServer(
 	log *zap.Logger,
 	authz auth.Authorizer,
+	accounts account.Store,
 	ocpData ocp_data.Provider,
 ) *Server {
 	return &Server{
 		log: log,
 
 		authz: authz,
+
+		accounts: accounts,
 
 		ocpData: ocpData,
 	}
@@ -226,8 +233,18 @@ func (s *Server) getNotificationsFromBatchIntents(ctx context.Context, log *zap.
 	return s.toLocalizedNotifications(ctx, log, userID, userOwnerAccount, intentRecords)
 }
 
+type unlocalizedNotification struct {
+	notification    *activitypb.Notification
+	cashMessageVerb messagingpb.CashContent_Verb
+}
+
 func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, userOwnerAccount *ocp_common.Account, intentRecords []*ocp_intent.Record) ([]*activitypb.Notification, error) {
-	var notifications []*activitypb.Notification
+	counterpartyUserIDs, err := s.resolveTipDmCounterparties(ctx, userOwnerAccount, intentRecords)
+	if err != nil {
+		return nil, err
+	}
+
+	var unlocalized []unlocalizedNotification
 	for _, intentRecord := range intentRecords {
 		rawNotificationID, err := base58.Decode(intentRecord.IntentId)
 		if err != nil {
@@ -307,8 +324,17 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 				} else {
 					directlySentMetadata := &activitypb.DirectlySentCryptoNotificationMetadata{}
 					if contactPayment := intent.GetContactDmPayment(intentRecord); contactPayment.GetDestination() != nil {
+						// A contact DM identifies the recipient by phone number, which
+						// the client resolves against the viewer's address book.
 						directlySentMetadata.DestinationIdentifier = &activitypb.DirectlySentCryptoNotificationMetadata_Phone{
 							Phone: contactPayment.GetDestination(),
+						}
+					} else if recipientUserID, ok := counterpartyUserIDs[intentMetadata.DestinationOwnerAccount]; ok {
+						// A tip DM identifies the recipient by user ID instead, so the
+						// client can render their profile without either party's phone
+						// number, which stays private in a tip DM.
+						directlySentMetadata.DestinationIdentifier = &activitypb.DirectlySentCryptoNotificationMetadata_UserId{
+							UserId: recipientUserID,
 						}
 					}
 					notification.AdditionalMetadata = &activitypb.Notification_DirectlySentCrypto{DirectlySentCrypto: directlySentMetadata}
@@ -321,6 +347,10 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 					if contactPayment := intent.GetContactDmPayment(intentRecord); contactPayment.GetSource() != nil {
 						receivedMetadata.SourceIdentifier = &activitypb.ReceivedCryptoNotificationMetadata_Phone{
 							Phone: contactPayment.GetSource(),
+						}
+					} else if senderUserID, ok := counterpartyUserIDs[intentRecord.InitiatorOwnerAccount]; ok {
+						receivedMetadata.SourceIdentifier = &activitypb.ReceivedCryptoNotificationMetadata_UserId{
+							UserId: senderUserID,
 						}
 					}
 					notification.AdditionalMetadata = &activitypb.Notification_ReceivedCrypto{ReceivedCrypto: receivedMetadata}
@@ -376,17 +406,64 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 			notification.PaymentAmount.Mint = &commonpb.PublicKey{Value: mintAccount.ToProto().Value}
 		}
 
-		notifications = append(notifications, notification)
+		unlocalized = append(unlocalized, unlocalizedNotification{
+			notification:    notification,
+			cashMessageVerb: intent.GetDmPaymentVerb(intentRecord),
+		})
 	}
 
-	for _, notification := range notifications {
-		log := log.With(zap.String("notification_id", NotificationIDString(notification.Id)))
+	notifications := make([]*activitypb.Notification, 0, len(unlocalized))
+	for _, unlocalized := range unlocalized {
+		log := log.With(zap.String("notification_id", NotificationIDString(unlocalized.notification.Id)))
 
-		err := InjectLocalizedText(ctx, s.ocpData, userOwnerAccount, notification)
+		err := InjectLocalizedText(ctx, s.ocpData, userOwnerAccount, unlocalized.notification, unlocalized.cashMessageVerb)
 		if err != nil {
 			log.Warn("Failed to inject localized notification text", zap.Error(err))
 			return nil, err
 		}
+
+		notifications = append(notifications, unlocalized.notification)
 	}
 	return notifications, nil
+}
+
+// resolveTipDmCounterparties returns the user ID of the other party to each tip
+// DM payment in intentRecords, keyed by that party's owner account. Unlike a
+// contact DM, a tip DM carries no phone number for either side, so the feed
+// identifies the counterparty by user ID — resolved here for the whole page in
+// one lookup rather than once per notification.
+//
+// Only tip DM payments are resolved. A payment handed off in person also has an
+// owner account that would resolve, but no identity was exchanged there, so
+// naming the counterparty would disclose one that neither party shared.
+func (s *Server) resolveTipDmCounterparties(ctx context.Context, userOwnerAccount *ocp_common.Account, intentRecords []*ocp_intent.Record) (map[string]*commonpb.UserId, error) {
+	var pubKeys []*commonpb.PublicKey
+	for _, intentRecord := range intentRecords {
+		if intentRecord.IntentType != ocp_intent.SendPublicPayment || intent.GetTipDmPayment(intentRecord) == nil {
+			continue
+		}
+
+		counterpartyOwnerAccount := intentRecord.SendPublicPaymentMetadata.DestinationOwnerAccount
+		if intentRecord.InitiatorOwnerAccount != userOwnerAccount.PublicKey().ToBase58() {
+			counterpartyOwnerAccount = intentRecord.InitiatorOwnerAccount
+		}
+		if len(counterpartyOwnerAccount) == 0 {
+			continue
+		}
+
+		ownerAccount, err := ocp_common.NewAccountFromPublicKeyString(counterpartyOwnerAccount)
+		if err != nil {
+			return nil, err
+		}
+		pubKeys = append(pubKeys, &commonpb.PublicKey{Value: ownerAccount.PublicKey().ToBytes()})
+	}
+
+	if len(pubKeys) == 0 {
+		return nil, nil
+	}
+
+	// Keyed by base58 public key, which is what an owner account already is, so
+	// callers can look up by the owner account they hold. Owner accounts with no
+	// binding are absent.
+	return s.accounts.GetUserIds(ctx, pubKeys)
 }

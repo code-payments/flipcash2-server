@@ -15,6 +15,7 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/chat"
@@ -95,6 +96,27 @@ func GetContactDmPayment(intentRecord *ocp_intent.Record) *intentpb.ChatMetadata
 // app metadata, the metadata fails to decode, or it is not a tip DM payment.
 func GetTipDmPayment(intentRecord *ocp_intent.Record) *intentpb.ChatMetadata_TipDmPayment {
 	return GetChatMetadata(intentRecord).GetTipDmPayment()
+}
+
+// GetDmPaymentVerb reports how a DM payment should be rendered. A tip DM
+// payment is only a tip when it was sent from the recipient's tip card — the
+// same DM also carries ordinary payments sent from within the chat itself.
+// Everything else, contact DM payments included, is a plain send.
+//
+// Both the cash message injected into the DM and the sender's activity feed
+// entry render off this, so they cannot disagree about what a payment was.
+func GetDmPaymentVerb(intentRecord *ocp_intent.Record) messagingpb.CashContent_Verb {
+	tipDmPayment := GetTipDmPayment(intentRecord)
+	if tipDmPayment == nil {
+		return messagingpb.CashContent_SENT
+	}
+
+	// TIPCARD is the zero value, so a tip DM payment that leaves the location
+	// unset is treated as having come from the tip card.
+	if tipDmPayment.GetLocation() == intentpb.ChatMetadata_TipDmPayment_TIPCARD {
+		return messagingpb.CashContent_TIPPED
+	}
+	return messagingpb.CashContent_SENT
 }
 
 // resolveDirectDmPaymentParties enforces the checks shared by every DM payment

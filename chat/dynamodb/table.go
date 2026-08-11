@@ -10,11 +10,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// CreateTables provisions the chats and dm_inbox tables with on-demand
-// billing. The chats table is keyed by pk only; dm_inbox is keyed by (pk, sk)
-// with a GSI ordering each user's DMs by last_activity. It is idempotent and
-// blocks until both tables are ACTIVE.
-func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable string) error {
+// CreateTables provisions the chats, dm_inbox, and group_members tables with
+// on-demand billing. The chats table is keyed by pk only; dm_inbox is keyed by
+// (pk, sk) with a GSI ordering each user's DMs by last_activity; group_members
+// is keyed by (pk, sk) = (chat, user) with an inverted GSI for listing a user's
+// group chats and a sparse GSI enumerating a group's joined members by join
+// time. It is idempotent and blocks until all tables are ACTIVE.
+func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
 			TableName:   aws.String(chatsTable),
@@ -24,6 +26,49 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 			},
 			KeySchema: []types.KeySchemaElement{
 				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+			},
+		},
+		{
+			TableName:   aws.String(groupMembersTable),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrUser), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrJoinedAt), AttributeType: types.ScalarAttributeTypeN},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+			},
+			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
+				{
+					// Inverted index: (user, chat). Listing a user's group chats
+					// (the group feed's fan-out-on-read entry point) is a query on
+					// the user's slice; membership state rides along in the
+					// projection. Keyed by the sparse user attribute — present on
+					// membership rows (tombstones included) and nothing else — so
+					// non-membership items like the counter stay out of the index
+					// (see gsiByUser).
+					IndexName: aws.String(gsiByUser),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrUser), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+				{
+					// Sparse index of joined members ordered by join time:
+					// joined_at exists only while joined, so tombstones (and the
+					// counter item) never appear and enumeration is dense (see
+					// gsiByJoinedAt).
+					IndexName: aws.String(gsiByJoinedAt),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrJoinedAt), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
 			},
 		},
 		{
@@ -77,13 +122,16 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 	return nil
 }
 
-// reset deletes every item from both tables, for tests.
+// reset deletes every item from all tables, for tests.
 func (s *store) reset() {
 	ctx := context.Background()
 	if err := clearTable(ctx, s.client, s.chatsTable, []string{attrPK}); err != nil {
 		panic(err)
 	}
 	if err := clearTable(ctx, s.client, s.dmInboxTable, []string{attrPK, attrSK}); err != nil {
+		panic(err)
+	}
+	if err := clearTable(ctx, s.client, s.groupMembersTable, []string{attrPK, attrSK}); err != nil {
 		panic(err)
 	}
 }

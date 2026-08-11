@@ -21,7 +21,7 @@ func TestMustDeriveDmChatID(t *testing.T) {
 	id := MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, b)
 	require.Equal(t, id.Value, MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, b).Value)
 	require.Equal(t, id.Value, MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, b, a).Value)
-	require.Len(t, id.Value, ChatIDSize)
+	require.Len(t, id.Value, DmChatIDSize)
 
 	// Distinct pairs derive distinct IDs.
 	c := model.MustGenerateUserID()
@@ -34,7 +34,7 @@ func TestMustDeriveDmChatID(t *testing.T) {
 
 	// A self-DM collapses to a single member and is still derivable.
 	self := MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, a)
-	require.Len(t, self.Value, ChatIDSize)
+	require.Len(t, self.Value, DmChatIDSize)
 	require.NotEqual(t, id.Value, self.Value)
 
 	// An unspecified chat type is a programming error.
@@ -69,7 +69,7 @@ func TestDeriveDmChatType(t *testing.T) {
 	// erroring: a random ID, mismatched members, too many members, a malformed
 	// member, or a malformed chat ID.
 	contactID := MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, b)
-	require.Equal(t, chatpb.ChatType_UNKNOWN, DeriveDmChatType(&commonpb.ChatId{Value: make([]byte, ChatIDSize)}, members))
+	require.Equal(t, chatpb.ChatType_UNKNOWN, DeriveDmChatType(&commonpb.ChatId{Value: make([]byte, DmChatIDSize)}, members))
 	require.Equal(t, chatpb.ChatType_UNKNOWN, DeriveDmChatType(contactID, []*commonpb.UserId{a, model.MustGenerateUserID()}))
 	require.Equal(t, chatpb.ChatType_UNKNOWN, DeriveDmChatType(contactID, []*commonpb.UserId{a, b, model.MustGenerateUserID()}))
 	require.Equal(t, chatpb.ChatType_UNKNOWN, DeriveDmChatType(contactID, []*commonpb.UserId{a, {Value: []byte("short")}}))

@@ -13,9 +13,11 @@ import (
 	"github.com/code-payments/flipcash2-server/chat"
 )
 
-// Cache wraps a chat.Store, caching membership checks. Membership is fixed at
-// chat creation and never changes, so a confirmed member is safe to cache; the
-// rest of the store is passed straight through.
+// Cache wraps a chat.Store, caching DM membership checks. A DM's membership is
+// fixed at chat creation and never changes, so a confirmed DM member is safe to
+// cache. Group membership is mutable — and can be mutated by other processes,
+// which this cache can never observe — so group membership checks always defer
+// to the backing store. The rest of the store is passed straight through.
 type Cache struct {
 	db          chat.Store
 	memberCache *ttlcache.Cache
@@ -32,6 +34,14 @@ func (c *Cache) PutChat(ctx context.Context, ch *chat.Chat) error {
 	return c.db.PutChat(ctx, ch)
 }
 
+func (c *Cache) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) error {
+	return c.db.AddGroupMembers(ctx, chatID, userIDs)
+}
+
+func (c *Cache) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) error {
+	return c.db.RemoveGroupMember(ctx, chatID, userID)
+}
+
 func (c *Cache) GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*chat.Chat, error) {
 	return c.db.GetChatByID(ctx, chatID)
 }
@@ -45,6 +55,12 @@ func (c *Cache) GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*com
 }
 
 func (c *Cache) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
+	// Group membership is mutable, so it is never cached: a stale positive
+	// would let a removed member keep reading and sending.
+	if chat.IsGroupChatID(chatID) {
+		return c.db.IsMember(ctx, chatID, userID)
+	}
+
 	key := memberCacheKey(chatID, userID)
 	if cached, ok := c.memberCache.Get(key); ok {
 		return cached.(bool), nil
@@ -52,7 +68,7 @@ func (c *Cache) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *c
 
 	isMember, err := c.db.IsMember(ctx, chatID, userID)
 	if err == nil && isMember {
-		// Only cache positive results: membership is fixed at creation, so a
+		// Only cache positive results: DM membership is fixed at creation, so a
 		// confirmed member stays a member. A negative result is not cached —
 		// the chat may not exist yet at check time and could later be created
 		// with this user as a member.
@@ -65,8 +81,9 @@ func (c *Cache) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId,
 	return c.db.AdvanceLastMessage(ctx, chatID, messageID, ts)
 }
 
-// memberCacheKey keys the membership cache by (chat, user). Chat IDs are fixed
-// width (chat.ChatIDSize), so concatenating the raw bytes is unambiguous.
+// memberCacheKey keys the membership cache by (chat, user). Only DM memberships
+// are cached, and DM chat IDs are fixed width (chat.DmChatIDSize), so
+// concatenating the raw bytes is unambiguous.
 func memberCacheKey(chatID *commonpb.ChatId, userID *commonpb.UserId) string {
 	return string(chatID.Value) + string(userID.Value)
 }

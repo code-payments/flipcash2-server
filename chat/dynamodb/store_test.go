@@ -12,14 +12,15 @@ import (
 )
 
 const (
-	chatsTable   = "chats_test"
-	dmInboxTable = "dm_inbox_test"
+	chatsTable        = "chats_test"
+	dmInboxTable      = "dm_inbox_test"
+	groupMembersTable = "group_members_test"
 )
 
 func TestChat_DynamoDBStore(t *testing.T) {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, chatsTable, dmInboxTable))
+	require.NoError(t, CreateTables(context.Background(), testEnv.Client, chatsTable, dmInboxTable, groupMembersTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable)
+	testStore := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable)
 	teardown := func() {
 		testStore.(*store).reset()
 	}

@@ -80,11 +80,25 @@ func publishChatUpdate(
 
 	// Pushes identify the sender differently per chat type — a contact DM push
 	// carries the sender's phone number, which is private in every other chat
-	// type. The type is recovered from the members already in hand, since a
-	// DM's ID commits to its type via the derivation domain — no store read.
-	// Skipping pushes on UNKNOWN is the safe default: a push must never fall
-	// back to a rendering that could leak the sender's phone number.
-	chatType := chat.DeriveDmChatType(chatID, members)
+	// type. A DM's type is recovered from the members already in hand, since a
+	// DM's ID commits to its type via the derivation domain — no store read. A
+	// group's type cannot be member-derived, so its stored metadata is read
+	// instead, which the push needs anyway for the group's title. That read is
+	// the canonical record alone — it does not re-enumerate the membership this
+	// function already has in hand.
+	var chatType chatpb.ChatType
+	var chatTitle string
+	if chat.IsGroupChatID(chatID) {
+		chatType = chatpb.ChatType_GROUP
+		md, err := chats.GetChatByID(ctx, chatID)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure loading chat metadata for message pushes")
+			return
+		}
+		chatTitle = md.Title
+	} else {
+		chatType = chat.DeriveDmChatType(chatID, members)
+	}
 
 	for _, message := range update.NewMessages.Messages {
 		if message.SenderId == nil {
@@ -144,6 +158,11 @@ func publishChatUpdate(
 					return
 				}
 				err = push.SendTipDmPush(ctx, pusher, badges, ocpData, update.Chat, message, message.SenderId, senderProfile.DisplayName, membersForPush...)
+			case chatpb.ChatType_GROUP:
+				if senderProfile.DisplayName == "" {
+					return
+				}
+				err = push.SendGroupChatPush(ctx, pusher, badges, ocpData, update.Chat, message, message.SenderId, senderProfile.DisplayName, chatTitle, membersForPush...)
 			default:
 				return
 			}

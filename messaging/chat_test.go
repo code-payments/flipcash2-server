@@ -79,7 +79,7 @@ func textContent(text string) []*messagingpb.Content {
 }
 
 func randomChatID() *commonpb.ChatId {
-	b := make([]byte, chat.ChatIDSize)
+	b := make([]byte, chat.DmChatIDSize)
 	if _, err := rand.Read(b); err != nil {
 		panic(err)
 	}

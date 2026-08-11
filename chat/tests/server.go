@@ -36,6 +36,8 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_Hydrates,
 		testServer_GetChat_TipDm_HidesPhoneNumbers,
 		testServer_GetChat_HiddenWhenPeerBlocked,
+		testServer_GetChat_Group_Hydrates,
+		testServer_GetChat_Group_MembershipLifecycle,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
 		testServer_GetDmChatFeed_Paging,
@@ -265,11 +267,25 @@ func (e *serverEnv) putDMOfType(chatType chatpb.ChatType, lastActivity time.Time
 // given peer, with the given last activity. It lets a test control the peer's
 // identity (e.g. to then block it).
 func (e *serverEnv) putDMWithPeer(chatType chatpb.ChatType, peer *commonpb.UserId, lastActivity time.Time) *commonpb.ChatId {
-	chatID := generateChatID()
+	chatID := generateDmChatID()
 	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
 		ID:           chatID,
 		Type:         chatType,
 		Members:      []*commonpb.UserId{e.userID, peer},
+		LastActivity: lastActivity,
+	}))
+	return chatID
+}
+
+// putGroup persists a group chat whose members are the env user and the given
+// others, with the given title and last activity.
+func (e *serverEnv) putGroup(title string, lastActivity time.Time, others ...*commonpb.UserId) *commonpb.ChatId {
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      append([]*commonpb.UserId{e.userID}, others...),
+		Title:        title,
 		LastActivity: lastActivity,
 	}))
 	return chatID
@@ -313,7 +329,7 @@ func testServer_GetChat_OK(t *testing.T, s chat.Store) {
 func testServer_GetChat_NotFound(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
-	resp := e.getChat(e.keys, generateChatID())
+	resp := e.getChat(e.keys, generateDmChatID())
 	require.Equal(t, chatpb.GetChatResponse_NOT_FOUND, resp.Result)
 	require.Nil(t, resp.Metadata)
 }
@@ -445,7 +461,7 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
 	peer := model.MustGenerateUserID()
-	chatID := generateChatID()
+	chatID := generateDmChatID()
 	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
 		ID:            chatID,
 		Type:          chatpb.ChatType_CONTACT_DM,
@@ -512,7 +528,7 @@ func testServer_GetChat_TipDm_HidesPhoneNumbers(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
 	peer := model.MustGenerateUserID()
-	chatID := generateChatID()
+	chatID := generateDmChatID()
 	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
 		ID:           chatID,
 		Type:         chatpb.ChatType_TIP_DM,
@@ -534,6 +550,82 @@ func testServer_GetChat_TipDm_HidesPhoneNumbers(t *testing.T, s chat.Store) {
 	require.Nil(t, profile.PhoneNumber)
 	require.Equal(t, "Peer Name", profile.DisplayName)
 	require.NotNil(t, profile.GetProfilePicture())
+}
+
+func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	memberB := model.MustGenerateUserID()
+	memberC := model.MustGenerateUserID()
+	chatID := e.putGroup("Weekend Trip", at(1), memberB, memberC)
+
+	// Members have full profiles registered — including a phone number, which a
+	// group must never expose.
+	e.profiles.displayNames[string(memberB.Value)] = "Member B"
+	e.profiles.displayNames[string(memberC.Value)] = "Member C"
+	e.profiles.phoneNumbers[string(memberB.Value)] = &commonpb.PhoneNumber{Value: "+15551234567"}
+	e.messaging.pointers[string(chatID.Value)] = []*messagingpb.Pointer{
+		{Type: messagingpb.Pointer_READ, UserId: memberB, Value: &messagingpb.MessageId{Value: 4}, Ts: timestamppb.New(at(4))},
+	}
+
+	// One member is on the viewer's blocklist: a group has no single peer, so
+	// the DM peer-blocked hiding must not apply.
+	e.blocklist.block(e.userID, memberC)
+
+	resp := e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Equal(t, chatpb.ChatType_GROUP, resp.Metadata.Type)
+	require.Equal(t, "Weekend Trip", resp.Metadata.Title)
+	require.False(t, resp.Metadata.IsHidden)
+	require.True(t, resp.Metadata.LastActivity.AsTime().Equal(at(1)))
+
+	// Every joined member is present with a hydrated profile.
+	members := byUserID(resp.Metadata.Members)
+	require.Len(t, members, 3)
+	require.Equal(t, "Member B", members[string(memberB.Value)].UserProfile.DisplayName)
+	require.Equal(t, "Member C", members[string(memberC.Value)].UserProfile.DisplayName)
+
+	// Pointers are distributed onto the matching member.
+	require.Len(t, members[string(memberB.Value)].Pointers, 1)
+	require.Equal(t, messagingpb.Pointer_READ, members[string(memberB.Value)].Pointers[0].Type)
+
+	// No member's phone number is exposed, registered or not.
+	for _, m := range members {
+		require.NotNil(t, m.UserProfile)
+		require.Nil(t, m.UserProfile.PhoneNumber)
+	}
+}
+
+func testServer_GetChat_Group_MembershipLifecycle(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	member := model.MustGenerateUserID()
+	chatID := e.putGroup("", at(1), member)
+
+	// An untitled group's metadata simply carries an empty title (display
+	// fallbacks are a rendering concern).
+	resp := e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Empty(t, resp.Metadata.Title)
+
+	// A registered non-member is denied.
+	strangerID := model.MustGenerateUserID()
+	strangerKeys := model.MustGenerateKeyPair()
+	e.authz.Add(strangerID, strangerKeys)
+	resp = e.getChat(strangerKeys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result)
+	require.Nil(t, resp.Metadata)
+
+	// A removed member loses access — the tombstone is not membership...
+	require.NoError(t, s.RemoveGroupMember(e.ctx, chatID, e.userID))
+	resp = e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result)
+
+	// ...and a rejoin restores it.
+	require.NoError(t, s.AddGroupMembers(e.ctx, chatID, []*commonpb.UserId{e.userID}))
+	resp = e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Len(t, resp.Metadata.Members, 2)
 }
 
 func testServer_GetDmChatFeed_TypeScoped(t *testing.T, s chat.Store) {
@@ -584,7 +676,7 @@ func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
 	// A chat with a last message, and one without.
-	withMsg := generateChatID()
+	withMsg := generateDmChatID()
 	peer := model.MustGenerateUserID()
 	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
 		ID:            withMsg,

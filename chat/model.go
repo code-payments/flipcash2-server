@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
@@ -17,8 +18,37 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 )
 
-// ChatIDSize is the length, in bytes, of a chat ID.
-const ChatIDSize = 32
+// DmChatIDSize is the length, in bytes, of a DM chat ID: a SHA-256 digest over
+// the DM's type and members (see MustDeriveDmChatID).
+const DmChatIDSize = 32
+
+// GroupChatIDSize is the length, in bytes, of a group chat ID: a
+// server-generated UUID. Group membership is mutable, so a group's ID cannot be
+// member-derived; it is an opaque random value minted at creation.
+//
+// The two sizes never overlap, so a chat ID's length is its type family's
+// discriminator: 32 bytes is a DM, 16 bytes is a group. Every DM path must
+// reject 16-byte IDs and every group path must reject 32-byte IDs — that
+// enforcement is what keeps the discriminator sound (an ID can never be claimed
+// as both a derived DM and a group).
+const GroupChatIDSize = 16
+
+// IsGroupChatID reports whether chatID is a group chat ID, by length (see
+// GroupChatIDSize).
+func IsGroupChatID(chatID *commonpb.ChatId) bool {
+	return len(chatID.GetValue()) == GroupChatIDSize
+}
+
+// MustGenerateGroupChatID mints the ID for a new group chat: a random UUID.
+// Group chat IDs are always generated server-side — a client-supplied ID is
+// never trusted as a chat's identity.
+func MustGenerateGroupChatID() *commonpb.ChatId {
+	id, err := uuid.NewRandom()
+	if err != nil {
+		panic(fmt.Sprintf("failed to generate group chat id: %v", err))
+	}
+	return &commonpb.ChatId{Value: id[:]}
+}
 
 // dmChatIDDomain namespaces the DM chat ID hash so it can never collide with an
 // ID derived for another purpose, even if that purpose hashes the same members.
@@ -44,7 +74,7 @@ const dmChatIDDomain = "flipcash:chat:dm"
 // alias each other because member sets are fixed-width, so the two encodings
 // never produce equal-length hash inputs. Since the input is a sorted set,
 // member ordering and duplicates do not affect the result. The SHA-256 digest
-// is ChatIDSize bytes wide by construction.
+// is DmChatIDSize bytes wide by construction.
 //
 // It panics on an unspecified chat type, or if either user ID is not the
 // expected fixed width, which would be a programming error: all user IDs in
@@ -110,7 +140,7 @@ func IsDmChatType(chatType chatpb.ChatType) bool {
 // domain. A future chat type whose ID is not member-derived (e.g. group chats)
 // will return UNKNOWN here and needs its own discriminator.
 func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatpb.ChatType {
-	if len(chatID.GetValue()) != ChatIDSize {
+	if len(chatID.GetValue()) != DmChatIDSize {
 		return chatpb.ChatType_UNKNOWN
 	}
 
@@ -140,14 +170,21 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // Chat is the stored metadata for a chat.
 //
 // It deliberately holds only the state owned by the chat domain: the chat's
-// identity, type, immutable membership, and the last-activity timestamp used to
+// identity, type, membership, title, and the last-activity timestamp used to
 // order a user's chat list. The richer fields of chatpb.Metadata — member
 // profiles, per-member message pointers, and the last message — live in other
 // domains (profile, messaging) and are hydrated by the server layer.
+//
+// Members is the full, immutable member set for a DM, and is always empty for
+// a group chat: group membership is mutable and lives in its own store records,
+// which no path that reads the canonical record touches. A caller that needs a
+// group's members reads them explicitly via Store.GetMembers. Title is
+// group-only and empty for DMs.
 type Chat struct {
 	ID            *commonpb.ChatId
 	Type          chatpb.ChatType
 	Members       []*commonpb.UserId
+	Title         string
 	LastActivity  time.Time
 	LastMessageID *messagingpb.MessageId
 }
@@ -166,19 +203,10 @@ func (c *Chat) Clone() *Chat {
 		ID:            &commonpb.ChatId{Value: append([]byte(nil), c.ID.Value...)},
 		Type:          c.Type,
 		Members:       members,
+		Title:         c.Title,
 		LastActivity:  c.LastActivity,
 		LastMessageID: lastMessageID,
 	}
-}
-
-// HasMember reports whether userID is a member of the chat.
-func (c *Chat) HasMember(userID *commonpb.UserId) bool {
-	for _, m := range c.Members {
-		if string(m.Value) == string(userID.Value) {
-			return true
-		}
-	}
-	return false
 }
 
 // ToProto projects the stored chat onto a chatpb.Metadata. Only the fields
@@ -196,6 +224,7 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 		ChatId:       &commonpb.ChatId{Value: append([]byte(nil), c.ID.Value...)},
 		Type:         c.Type,
 		Members:      members,
+		Title:        c.Title,
 		LastActivity: timestamppb.New(c.LastActivity),
 	}
 }

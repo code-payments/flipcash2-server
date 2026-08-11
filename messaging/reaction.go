@@ -15,6 +15,7 @@ import (
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/model"
 )
@@ -170,7 +171,10 @@ func (s *Server) GetReactionSummary(ctx context.Context, req *messagingpb.GetRea
 	}
 
 	summary := &ReactionSummary{MessageID: req.MessageId, Reactions: reactions}
-	overlaySelfReactions(userID, []*ReactionSummary{summary})
+	if err := s.applySelfReactions(ctx, req.ChatId, userID, []*ReactionSummary{summary}); err != nil {
+		log.With(zap.Error(err)).Warn("Failure resolving self reactions")
+		return nil, status.Error(codes.Internal, "")
+	}
 
 	return &messagingpb.GetReactionSummaryResponse{
 		Result:  messagingpb.GetReactionSummaryResponse_OK,
@@ -204,7 +208,10 @@ func (s *Server) GetReactionSummaries(ctx context.Context, req *messagingpb.GetR
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	overlaySelfReactions(userID, summaries)
+	if err := s.applySelfReactions(ctx, req.ChatId, userID, summaries); err != nil {
+		log.With(zap.Error(err)).Warn("Failure resolving self reactions")
+		return nil, status.Error(codes.Internal, "")
+	}
 
 	protos := make([]*messagingpb.ReactionSummary, len(summaries))
 	for i, summary := range summaries {
@@ -240,12 +247,21 @@ func (s *Server) GetReactors(ctx context.Context, req *messagingpb.GetReactorsRe
 		return &messagingpb.GetReactorsResponse{Result: messagingpb.GetReactorsResponse_MESSAGE_NOT_FOUND}, nil
 	}
 
-	// Reactor sets are small in DMs and the drill-down is often opened right after
-	// reacting, so read consistently rather than off the eventually consistent index.
+	// A DM's reactor set is at most two, and the drill-down is often opened right
+	// after reacting, so read those consistently rather than off the eventually
+	// consistent index: the cost is trivial and the reader is guaranteed to see the
+	// reaction they just added.
 	//
-	// todo: Revisit when we introduce groups
+	// A group's reactor set is unbounded, and the consistent read has no way to
+	// order by recency without reading the whole set — the base table keys reactors
+	// by user, not by reaction time — so it pays O(reactors) on every page. Groups
+	// page the recency index instead, which reads only the page it returns. Both
+	// paths return the same order and honor the same cursor, so this changes
+	// consistency alone; a group member who just reacted may briefly not see
+	// themselves at the top, which the AddReaction response already told them.
+	consistent := !chat.IsGroupChatID(req.ChatId)
 	opts := database.FromProtoQueryOptions(req.GetOptions())
-	reactors, hasMore, err := s.messages.GetReactors(ctx, req.ChatId, req.MessageId, req.Emoji.Value, true, opts...)
+	reactors, hasMore, err := s.messages.GetReactors(ctx, req.ChatId, req.MessageId, req.Emoji.Value, consistent, opts...)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure getting reactors")
 		return nil, status.Error(codes.Internal, "")
@@ -267,13 +283,74 @@ func (s *Server) GetReactors(ctx context.Context, req *messagingpb.GetReactorsRe
 	return resp, nil
 }
 
-// overlaySelfReactions sets ReactedBySelf on the given summaries' aggregates for
-// userID. Chats are DMs — at most two members — so every emoji's reactor set fits
-// within the surfaced sample (MaxSampleReactors). The sample therefore lists every
-// reactor, making userID's membership in it an exact answer that needs no extra
-// store read.
+// applySelfReactions sets ReactedBySelf on the given summaries' aggregates for
+// the viewer, choosing its strategy by chat type.
 //
-// todo: Revisit when we introduce groups
+// A DM answers from the sample already in hand: it has at most two members, so an
+// emoji's reactor set can never outgrow the surfaced sample (MaxSampleReactors)
+// and the sample lists every reactor. Membership in it is an exact answer that
+// costs no store read at all.
+//
+// A group's reactor set is unbounded, so the sample is only its most-recent
+// window: a viewer who reacted early drops out of it once enough others pile on,
+// and scanning it would silently report a reaction of their own as absent. Groups
+// therefore resolve the question against the authoritative per-reactor records,
+// addressed by exact key and batched across every (message, emoji) in the page —
+// one round trip for the whole read, not one per aggregate.
+func (s *Server) applySelfReactions(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, summaries []*ReactionSummary) error {
+	if !chat.IsGroupChatID(chatID) {
+		overlaySelfReactions(userID, summaries)
+		return nil
+	}
+
+	// Every aggregate in the page is a candidate; a summary carrying none (a
+	// message with no reactions) contributes nothing to ask about.
+	var refs []ReactionRef
+	for _, summary := range summaries {
+		for _, reaction := range summary.Reactions {
+			refs = append(refs, ReactionRef{MessageID: summary.MessageID, Emoji: reaction.Emoji})
+		}
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+
+	present, err := s.messages.GetSelfReactions(ctx, chatID, userID, refs)
+	if err != nil {
+		return err
+	}
+	if len(present) == 0 {
+		return nil
+	}
+
+	reacted := make(map[selfReactionKey]struct{}, len(present))
+	for _, ref := range present {
+		reacted[selfReactionKey{messageID: ref.MessageID.Value, emoji: ref.Emoji}] = struct{}{}
+	}
+	for _, summary := range summaries {
+		for _, reaction := range summary.Reactions {
+			key := selfReactionKey{messageID: summary.MessageID.Value, emoji: reaction.Emoji}
+			if _, ok := reacted[key]; ok {
+				reaction.ReactedBySelf = true
+			}
+		}
+	}
+	return nil
+}
+
+// selfReactionKey identifies one (message, emoji) aggregate within a chat, for
+// matching the store's answer back onto the summaries it was derived from. The
+// message ID is a per-chat sequence number, so the pair is unambiguous without
+// encoding either field.
+type selfReactionKey struct {
+	messageID uint64
+	emoji     string
+}
+
+// overlaySelfReactions sets ReactedBySelf on the given summaries' aggregates for
+// userID by scanning each aggregate's surfaced sample. It is exact only where the
+// sample is guaranteed to hold every reactor — DMs — and applySelfReactions is
+// what enforces that; see there for why a group must not use it.
 func overlaySelfReactions(userID *commonpb.UserId, summaries []*ReactionSummary) {
 	for _, summary := range summaries {
 		for _, reaction := range summary.Reactions {

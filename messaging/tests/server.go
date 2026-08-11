@@ -63,12 +63,14 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_Reactions_Reactors,
 		testServer_Reactions_Summaries,
 		testServer_Reactions_Errors,
+		testServer_Reactions_GroupSelfReaction,
 		// Typing
 		testServer_NotifyIsTyping,
 		// Cross-cutting
 		testServer_NonMember_Denied,
 		testServer_Broadcast_IncludesActor,
 		testServer_SendMessage_PushPerChatType,
+		testServer_SendMessage_GroupChatPush,
 		testServer_SendMessage_SuppressedForBlockedSender,
 	} {
 		tf(t, badges, blocklists, chats, messages, profiles)
@@ -271,7 +273,11 @@ func (e *serverEnv) advancePointer(keys model.KeyPair, pointerType messagingpb.P
 // --- reactions ---
 
 func (e *serverEnv) addReaction(keys model.KeyPair, msgID *messagingpb.MessageId, emoji string) (*messagingpb.AddReactionResponse, error) {
-	req := &messagingpb.AddReactionRequest{ChatId: e.chatID, MessageId: msgID, Emoji: &messagingpb.Emoji{Value: emoji}}
+	return e.addReactionInChat(keys, e.chatID, msgID, emoji)
+}
+
+func (e *serverEnv) addReactionInChat(keys model.KeyPair, chatID *commonpb.ChatId, msgID *messagingpb.MessageId, emoji string) (*messagingpb.AddReactionResponse, error) {
+	req := &messagingpb.AddReactionRequest{ChatId: chatID, MessageId: msgID, Emoji: &messagingpb.Emoji{Value: emoji}}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.AddReaction(e.ctx, req)
 }
@@ -283,7 +289,11 @@ func (e *serverEnv) removeReaction(keys model.KeyPair, msgID *messagingpb.Messag
 }
 
 func (e *serverEnv) getReactionSummary(keys model.KeyPair, msgID *messagingpb.MessageId) (*messagingpb.GetReactionSummaryResponse, error) {
-	req := &messagingpb.GetReactionSummaryRequest{ChatId: e.chatID, MessageId: msgID}
+	return e.getReactionSummaryInChat(keys, e.chatID, msgID)
+}
+
+func (e *serverEnv) getReactionSummaryInChat(keys model.KeyPair, chatID *commonpb.ChatId, msgID *messagingpb.MessageId) (*messagingpb.GetReactionSummaryResponse, error) {
+	req := &messagingpb.GetReactionSummaryRequest{ChatId: chatID, MessageId: msgID}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.GetReactionSummary(e.ctx, req)
 }
@@ -298,8 +308,12 @@ func (e *serverEnv) getReactionSummariesByOptions(keys model.KeyPair, opts *comm
 }
 
 func (e *serverEnv) getReactionSummariesByIDs(keys model.KeyPair, vals ...uint64) (*messagingpb.GetReactionSummariesResponse, error) {
+	return e.getReactionSummariesByIDsInChat(keys, e.chatID, vals...)
+}
+
+func (e *serverEnv) getReactionSummariesByIDsInChat(keys model.KeyPair, chatID *commonpb.ChatId, vals ...uint64) (*messagingpb.GetReactionSummariesResponse, error) {
 	req := &messagingpb.GetReactionSummariesRequest{
-		ChatId: e.chatID,
+		ChatId: chatID,
 		Query:  &messagingpb.GetReactionSummariesRequest_MessageIds{MessageIds: &messagingpb.MessageIdBatch{MessageIds: ids(vals...)}},
 	}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
@@ -1701,6 +1715,167 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	require.Equal(t, senderPhone, contactPush.payload.TitleSubstitutions[0].GetPhoneNumberToContactName().GetValue())
 	require.Len(t, contactPush.users, 1)
 	require.Equal(t, e.userB.Value, contactPush.users[0].Value)
+}
+
+// testServer_Reactions_GroupSelfReaction pins reacted_by_self in a group, where
+// an emoji's reactor set outgrows the sample surfaced on its aggregate. The
+// viewer reacts first and is then pushed out of that sample by later reactors:
+// the flag must still come back true, resolved against the per-reactor records
+// rather than inferred from the sample the way a DM's is.
+func testServer_Reactions_GroupSelfReaction(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	const emoji = "👍"
+
+	// Enough later reactors to bury the viewer several positions below the
+	// surfaced sample, so the assertion doesn't rest on a single boundary case.
+	others := make([]model.KeyPair, messaging.MaxSampleReactors+3)
+	members := []*commonpb.UserId{e.userA}
+	for i := range others {
+		userID, keys := e.addUser()
+		others[i] = keys
+		members = append(members, userID)
+	}
+	// A member who reacts to nothing: proof the flag isn't simply always set.
+	bystander, bystanderKeys := e.addUser()
+	members = append(members, bystander)
+
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      members,
+		Title:        "Reactions",
+		LastActivity: at(1),
+	}))
+
+	sent, err := e.sendContentToChat(e.keysA, chatID, textContent("react to me"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	msgID := sent.Message.MessageId
+
+	// The viewer reacts first, so every other reactor is strictly more recent and
+	// outranks them in the most-recent-first sample.
+	addResp, err := e.addReactionInChat(e.keysA, chatID, msgID, emoji)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, addResp.Result)
+	require.True(t, addResp.Reaction.ReactedBySelf)
+
+	for _, keys := range others {
+		resp, err := e.addReactionInChat(keys, chatID, msgID, emoji)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AddReactionResponse_OK, resp.Result)
+	}
+
+	assertViewerReacted := func(reaction *messagingpb.EmojiReaction) {
+		t.Helper()
+		require.EqualValues(t, len(others)+1, reaction.Count)
+		// The viewer really is absent from the sample — a scan of it would answer
+		// false — and the flag is true regardless.
+		require.Len(t, reaction.SampleReactors, messaging.MaxSampleReactors)
+		for _, reactor := range reaction.SampleReactors {
+			require.NotEqual(t, e.userA.Value, reactor.UserId.Value)
+		}
+		require.True(t, reaction.ReactedBySelf)
+	}
+
+	sum, err := e.getReactionSummaryInChat(e.keysA, chatID, msgID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, sum.Result)
+	require.Len(t, sum.Summary.Reactions, 1)
+	assertViewerReacted(sum.Summary.Reactions[0])
+
+	// The batched read resolves it the same way.
+	batch, err := e.getReactionSummariesByIDsInChat(e.keysA, chatID, msgID.Value)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactionSummariesResponse_OK, batch.Result)
+	require.Len(t, batch.Summaries, 1)
+	require.Len(t, batch.Summaries[0].Reactions, 1)
+	assertViewerReacted(batch.Summaries[0].Reactions[0])
+
+	// The same aggregate, read by a member who never reacted.
+	bystanderSum, err := e.getReactionSummaryInChat(bystanderKeys, chatID, msgID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, bystanderSum.Result)
+	require.Len(t, bystanderSum.Summary.Reactions, 1)
+	require.False(t, bystanderSum.Summary.Reactions[0].ReactedBySelf)
+
+	// A reactor who is inside the sample is unaffected by the group path.
+	recentSum, err := e.getReactionSummaryInChat(others[len(others)-1], chatID, msgID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, recentSum.Result)
+	require.Len(t, recentSum.Summary.Reactions, 1)
+	require.True(t, recentSum.Summary.Reactions[0].ReactedBySelf)
+}
+
+func testServer_SendMessage_GroupChatPush(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	// The sender has both a display name and a phone number: a group push must
+	// use only the display name.
+	const senderPhone = "+15551234567"
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
+	require.NoError(t, profiles.LinkPhoneNumber(e.ctx, e.userA, senderPhone, &commonpb.Hash{Value: make([]byte, 32)}))
+
+	userC, _ := e.addUser()
+
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB, userC},
+		Title:        "Trip Planning",
+		LastActivity: at(1),
+	}))
+
+	resp, err := e.sendContentToChat(e.keysA, chatID, textContent("group hello"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+
+	// Every other member receives the message on the event stream — the group
+	// broadcast set comes from membership records, not an inline member list.
+	e.waitForNewMessage(e.userB, resp.Message.MessageId.Value)
+	e.waitForNewMessage(userC, resp.Message.MessageId.Value)
+
+	require.Eventually(t, func() bool {
+		return len(e.pusher.snapshot()) >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+	pushes := e.pusher.snapshot()
+	require.Len(t, pushes, 1)
+
+	// Titled by the group, sender named in the body, addressed to every member
+	// but the sender — and never the sender's phone number.
+	groupPush := pushes[0]
+	require.Equal(t, "Trip Planning", groupPush.title)
+	require.Equal(t, "Sender Name: group hello", groupPush.body)
+	require.Empty(t, groupPush.payload.TitleSubstitutions)
+	require.Equal(t, chatpb.ChatType_GROUP, groupPush.payload.ChatMetadata.Type)
+	require.Equal(t, e.userA.Value, groupPush.payload.ChatMetadata.SendingUserId.Value)
+	require.NotContains(t, groupPush.payload.String(), strings.TrimPrefix(senderPhone, "+"))
+	recipients := make([][]byte, len(groupPush.users))
+	for i, u := range groupPush.users {
+		recipients[i] = u.Value
+	}
+	require.ElementsMatch(t, [][]byte{e.userB.Value, userC.Value}, recipients)
+
+	// An untitled group is pushed under the fallback title.
+	untitledID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           untitledID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+	resp, err = e.sendContentToChat(e.keysA, untitledID, textContent("untitled hello"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+
+	require.Eventually(t, func() bool {
+		return len(e.pusher.snapshot()) >= 2
+	}, 5*time.Second, 10*time.Millisecond)
+	untitledPush := e.pusher.snapshot()[1]
+	require.Equal(t, "Untitled Group", untitledPush.title)
+	require.Equal(t, "Sender Name: untitled hello", untitledPush.body)
 }
 
 func testServer_SendMessage_SuppressedForBlockedSender(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

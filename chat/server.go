@@ -137,6 +137,9 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
+	// The canonical record first: its absence is the only thing that
+	// distinguishes NOT_FOUND from DENIED, since IsMember reports a missing chat
+	// as a plain non-membership.
 	c, err := s.chats.GetChatByID(ctx, req.ChatId)
 	switch {
 	case errors.Is(err, ErrChatNotFound):
@@ -146,8 +149,27 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	if !c.HasMember(userID) {
+	// Authorize on a keyed membership check rather than by scanning the member
+	// list, so a group's membership is never enumerated on behalf of a caller who
+	// turns out not to be a member.
+	isMember, err := s.chats.IsMember(ctx, req.ChatId, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure checking chat membership")
+		return nil, status.Error(codes.Internal, "")
+	}
+	if !isMember {
 		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
+	}
+
+	// A DM's members ride in on the canonical record; a group's are a separate
+	// read, paid for only now that the caller is known to be a member.
+	if IsGroupChatID(req.ChatId) {
+		members, err := s.chats.GetMembers(ctx, req.ChatId)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure getting chat members")
+			return nil, status.Error(codes.Internal, "")
+		}
+		c.Members = members
 	}
 
 	metadata, err := s.hydrate(ctx, userID, []*Chat{c})
@@ -240,7 +262,7 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 // the snapshot watermark and the cursor's last_activity, each as big-endian
 // int64 unix-nanos, followed by the cursor's chat ID and the feed's chat type
 // as a single byte.
-const dmFeedTokenLen = 8 + 8 + ChatIDSize + 1
+const dmFeedTokenLen = 8 + 8 + DmChatIDSize + 1
 
 // encodeDmFeedToken serializes the snapshot watermark, feed chat type, and
 // resume cursor into an opaque paging token for the client to echo on the next
@@ -249,8 +271,8 @@ func encodeDmFeedToken(snapshot time.Time, chatType chatpb.ChatType, cursor *DmF
 	buf := make([]byte, dmFeedTokenLen)
 	binary.BigEndian.PutUint64(buf[0:8], uint64(snapshot.UnixNano()))
 	binary.BigEndian.PutUint64(buf[8:16], uint64(cursor.LastActivity.UnixNano()))
-	copy(buf[16:16+ChatIDSize], cursor.ChatID.Value)
-	buf[16+ChatIDSize] = byte(chatType)
+	copy(buf[16:16+DmChatIDSize], cursor.ChatID.Value)
+	buf[16+DmChatIDSize] = byte(chatType)
 	return &commonpb.PagingToken{Value: buf}
 }
 
@@ -263,10 +285,10 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatTyp
 		return time.Time{}, chatpb.ChatType_UNKNOWN, nil, false
 	}
 	snapshot = time.Unix(0, int64(binary.BigEndian.Uint64(token.Value[0:8]))).UTC()
-	chatType = chatpb.ChatType(token.Value[16+ChatIDSize])
+	chatType = chatpb.ChatType(token.Value[16+DmChatIDSize])
 	cursor = &DmFeedCursor{
 		LastActivity: time.Unix(0, int64(binary.BigEndian.Uint64(token.Value[8:16]))).UTC(),
-		ChatID:       &commonpb.ChatId{Value: append([]byte(nil), token.Value[16:16+ChatIDSize]...)},
+		ChatID:       &commonpb.ChatId{Value: append([]byte(nil), token.Value[16:16+DmChatIDSize]...)},
 	}
 	return snapshot, chatType, cursor, true
 }

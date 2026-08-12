@@ -44,7 +44,7 @@ func TestCache_IsMember_CachesPositive(t *testing.T) {
 	backing := &countingStore{result: true}
 	c := cache.NewInCache(backing)
 
-	chatID := generateChatID()
+	chatID := generateDmChatID()
 	userID := model.MustGenerateUserID()
 
 	for i := 0; i < 3; i++ {
@@ -62,7 +62,7 @@ func TestCache_IsMember_DoesNotCacheNegative(t *testing.T) {
 	backing := &countingStore{result: false}
 	c := cache.NewInCache(backing)
 
-	chatID := generateChatID()
+	chatID := generateDmChatID()
 	userID := model.MustGenerateUserID()
 
 	// A negative result is re-queried, not cached.
@@ -86,8 +86,8 @@ func TestCache_IsMember_KeyedByChatAndUser(t *testing.T) {
 	backing := &countingStore{result: true}
 	c := cache.NewInCache(backing)
 
-	chatA := generateChatID()
-	chatB := generateChatID()
+	chatA := generateDmChatID()
+	chatB := generateDmChatID()
 	userX := model.MustGenerateUserID()
 	userY := model.MustGenerateUserID()
 
@@ -104,8 +104,8 @@ func TestCache_IsMember_KeyedByChatAndUser(t *testing.T) {
 	require.Equal(t, 3, backing.callCount())
 }
 
-func generateChatID() *commonpb.ChatId {
-	b := make([]byte, chat.ChatIDSize)
+func generateDmChatID() *commonpb.ChatId {
+	b := make([]byte, chat.DmChatIDSize)
 	if _, err := rand.Read(b); err != nil {
 		panic(err)
 	}

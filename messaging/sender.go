@@ -180,7 +180,10 @@ func (s *Sender) Send(
 	// chat sorts to the top of members' inboxes and denormalizes last_message_id
 	// for the feed. Decoupled from persistence: a lagging bump self-heals on the
 	// next message. It also hands back the chat members, which the broadcast below
-	// reuses to avoid a second membership read.
+	// reuses to avoid a second membership read — only for DMs, whose members ride
+	// on the canonical record the bump touches anyway. A group chat's membership
+	// lives in its own records, so members comes back empty and the broadcast
+	// loads it itself.
 	lastMessageAdvanced, members, err := s.chats.AdvanceLastMessage(ctx, chatID, msg.ID, msg.Timestamp)
 	if err != nil && !errors.Is(err, chat.ErrChatNotFound) {
 		log.With(zap.Error(err)).Warn("Failure advancing chat last message")
@@ -209,8 +212,8 @@ func (s *Sender) Send(
 			},
 		}}
 	}
-	// Reuse the members AdvanceLastMessage already loaded (nil if it failed, in
-	// which case publishChatUpdate loads them itself).
+	// Reuse the members AdvanceLastMessage already loaded (empty for a group
+	// chat or if it failed, in which case publishChatUpdate loads them itself).
 	publishChatUpdate(ctx, log, s.badges, s.chats, s.profiles, s.blocklists, s.ocpData, s.pusher, s.eventBus, chatID, update, nil, members)
 
 	return msgProto, nil

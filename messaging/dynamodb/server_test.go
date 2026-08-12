@@ -16,21 +16,22 @@ import (
 )
 
 const (
-	chatsTable   = "chats_test"
-	dmInboxTable = "dm_inbox_test"
-	badgesTable  = "badges_test"
+	chatsTable        = "chats_test"
+	dmInboxTable      = "dm_inbox_test"
+	groupMembersTable = "group_members_test"
+	badgesTable       = "badges_test"
 )
 
 func TestMessaging_DynamoDBServer(t *testing.T) {
 	ctx := context.Background()
 
-	require.NoError(t, chat_dynamodb.CreateTables(ctx, testEnv.Client, chatsTable, dmInboxTable))
+	require.NoError(t, chat_dynamodb.CreateTables(ctx, testEnv.Client, chatsTable, dmInboxTable, groupMembersTable))
 	require.NoError(t, CreateTables(ctx, testEnv.Client, messagesTable, pointersTable, reactionsTable))
 	require.NoError(t, badge_dynamodb.CreateTables(ctx, testEnv.Client, badgesTable))
 
 	badges := badge_dynamodb.NewInDynamoDB(testEnv.Client, badgesTable)
 	blocklists := blocklist_memory.NewInMemory()
-	chats := chat_dynamodb.NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable)
+	chats := chat_dynamodb.NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable)
 	profiles := profile_memory.NewInMemory()
 	messages := NewInDynamoDB(testEnv.Client, messagesTable, pointersTable, reactionsTable)
 	teardown := func() {

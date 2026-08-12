@@ -173,7 +173,7 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 		},
 	}
 
-	return sendDmMessagePush(ctx, pusher, badges, title, body, customPayload, recipients...)
+	return sendChatMessagePush(ctx, pusher, badges, title, body, customPayload, recipients...)
 }
 
 // SendTipDmPush notifies recipients of a new message in a tip DM. The sender
@@ -203,7 +203,96 @@ func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpDa
 		},
 	}
 
-	return sendDmMessagePush(ctx, pusher, badges, senderDisplayName, body, customPayload, recipients...)
+	return sendChatMessagePush(ctx, pusher, badges, senderDisplayName, body, customPayload, recipients...)
+}
+
+// SendGroupChatPush notifies recipients of a new message in a group chat. The
+// notification is titled by the group ("Untitled Group" when it has none), with
+// the sender identified by display name in the body ("Alice: hello"). Like a
+// tip DM, a group push never carries the sender's phone number, which is
+// private outside contact DMs.
+func SendGroupChatPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName, chatTitle string, recipients ...*commonpb.UserId) error {
+	body, ok, err := renderGroupChatMessagePushBody(ctx, ocpData, message, senderDisplayName)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+
+	title := chatTitle
+	if title == "" {
+		title = "Untitled Group"
+	}
+
+	customPayload := &pushpb.Payload{
+		Category: pushpb.Payload_CHAT,
+		GroupKey: base64.StdEncoding.EncodeToString(chatId.Value),
+		Navigation: &pushpb.Navigation{
+			Type: &pushpb.Navigation_ChatId{
+				ChatId: chatId,
+			},
+		},
+		ChatMetadata: &pushpb.ChatMetadata{
+			SendingUserId: senderID,
+			Type:          chatpb.ChatType_GROUP,
+		},
+	}
+
+	return sendChatMessagePush(ctx, pusher, badges, title, body, customPayload, recipients...)
+}
+
+// renderGroupChatMessagePushBody renders the push body for a group chat
+// message. Bodies read in the third person, naming the sender — a group push
+// announces activity in a room titled by the group, not a personal message.
+// ok is false for content types that don't produce a push.
+func renderGroupChatMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, message *messagingpb.Message, senderDisplayName string) (body string, ok bool, err error) {
+	switch content := message.Content[0].Type.(type) {
+	case *messagingpb.Content_Text:
+		body = fmt.Sprintf("%s: %s", senderDisplayName, content.Text.Text)
+	case *messagingpb.Content_Reply:
+		// Push the reply's wrapped content. Only text replies are supported today.
+		if len(content.Reply.Content) == 0 {
+			return "", false, nil
+		}
+		textContent, ok := content.Reply.Content[0].Type.(*messagingpb.Content_Text)
+		if !ok {
+			return "", false, nil
+		}
+		body = fmt.Sprintf("%s: %s", senderDisplayName, textContent.Text.Text)
+	case *messagingpb.Content_Cash:
+		currencyName, err := resolveCurrencyName(ctx, ocpData, content.Cash.Amount.Mint)
+		if err != nil {
+			return "", false, err
+		}
+		// Unknown verbs fall back to sent, matching what clients render. Cash
+		// bodies name the sender rather than the DM renderer's "you", which has
+		// no referent when everyone in the group but the sender receives the
+		// same push.
+		verb := "sent"
+		if content.Cash.GetVerb() == messagingpb.CashContent_TIPPED {
+			verb = "tipped"
+		}
+		body = fmt.Sprintf(
+			"%s %s %s of %s",
+			senderDisplayName,
+			verb,
+			localization.FormatFiat(
+				defaultLocale,
+				ocp_currency.Code(content.Cash.Amount.Currency),
+				content.Cash.Amount.NativeAmount,
+			),
+			currencyName,
+		)
+	default:
+		return "", false, nil
+	}
+
+	if len(body) > 1024 {
+		body = fmt.Sprintf("%s...", body[:1024])
+	}
+
+	return body, true, nil
 }
 
 // renderDmMessagePushBody renders the push body for a DM message. ok is false
@@ -253,9 +342,9 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 	return body, true, nil
 }
 
-// sendDmMessagePush sends a rendered DM message push and bumps each
+// sendChatMessagePush sends a rendered chat message push and bumps each
 // recipient's badge count.
-func sendDmMessagePush(ctx context.Context, pusher Pusher, badges badge.Store, title, body string, customPayload *pushpb.Payload, recipients ...*commonpb.UserId) error {
+func sendChatMessagePush(ctx context.Context, pusher Pusher, badges badge.Store, title, body string, customPayload *pushpb.Payload, recipients ...*commonpb.UserId) error {
 	if err := pusher.SendPushes(ctx, title, body, customPayload, recipients...); err != nil {
 		return err
 	}

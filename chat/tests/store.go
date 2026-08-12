@@ -22,10 +22,19 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, s chat.Store){
 		testStore_PutAndGet,
 		testStore_PutChat_Duplicate,
+		testStore_PutChat_TypeIDMismatch,
+		testStore_PutChat_NoMembers,
 		testStore_GetChatByID_NotFound,
 		testStore_Members,
 		testStore_IsMember,
 		testStore_AdvanceLastMessage,
+		testStore_GroupChat_PutAndGet,
+		testStore_GroupChat_Membership,
+		testStore_GroupChat_CreationCap,
+		testStore_GroupChat_DuplicateMembers,
+		testStore_GroupChat_AddMembersErrors,
+		testStore_GroupChat_AdvanceLastMessage,
+		testStore_GroupChat_NotInDmFeed,
 		testStore_GetDmFeedPage_Order,
 		testStore_GetDmFeedPage_Watermark,
 		testStore_GetDmFeedPage_Paging,
@@ -44,7 +53,7 @@ func testStore_PutAndGet(t *testing.T, s chat.Store) {
 	userA := model.MustGenerateUserID()
 	userB := model.MustGenerateUserID()
 	c := &chat.Chat{
-		ID:           generateChatID(),
+		ID:           generateDmChatID(),
 		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{userA, userB},
 		LastActivity: at(100),
@@ -63,7 +72,7 @@ func testStore_PutChat_Duplicate(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
 	c := &chat.Chat{
-		ID:           generateChatID(),
+		ID:           generateDmChatID(),
 		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID()},
 		LastActivity: at(1),
@@ -75,10 +84,10 @@ func testStore_PutChat_Duplicate(t *testing.T, s chat.Store) {
 func testStore_GetChatByID_NotFound(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
-	_, err := s.GetChatByID(ctx, generateChatID())
+	_, err := s.GetChatByID(ctx, generateDmChatID())
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 
-	_, err = s.GetMembers(ctx, generateChatID())
+	_, err = s.GetMembers(ctx, generateDmChatID())
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 }
 
@@ -88,7 +97,7 @@ func testStore_Members(t *testing.T, s chat.Store) {
 	userA := model.MustGenerateUserID()
 	userB := model.MustGenerateUserID()
 	c := &chat.Chat{
-		ID:           generateChatID(),
+		ID:           generateDmChatID(),
 		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{userA, userB},
 		LastActivity: at(5),
@@ -107,7 +116,7 @@ func testStore_IsMember(t *testing.T, s chat.Store) {
 	userB := model.MustGenerateUserID()
 	stranger := model.MustGenerateUserID()
 	c := &chat.Chat{
-		ID:           generateChatID(),
+		ID:           generateDmChatID(),
 		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{userA, userB},
 		LastActivity: at(5),
@@ -123,7 +132,7 @@ func testStore_IsMember(t *testing.T, s chat.Store) {
 	require.False(t, ok)
 
 	// Unknown chat → false, no error.
-	ok, err = s.IsMember(ctx, generateChatID(), userA)
+	ok, err = s.IsMember(ctx, generateDmChatID(), userA)
 	require.NoError(t, err)
 	require.False(t, ok)
 }
@@ -133,7 +142,7 @@ func testStore_AdvanceLastMessage(t *testing.T, s chat.Store) {
 
 	member := model.MustGenerateUserID()
 	c := &chat.Chat{
-		ID:           generateChatID(),
+		ID:           generateDmChatID(),
 		Type:         chatpb.ChatType_CONTACT_DM,
 		Members:      []*commonpb.UserId{member},
 		LastActivity: at(100),
@@ -169,9 +178,262 @@ func testStore_AdvanceLastMessage(t *testing.T, s chat.Store) {
 	require.Equal(t, uint64(5), got.LastMessageID.Value)
 
 	// Unknown chat → ErrChatNotFound, with nil members.
-	_, members, err = s.AdvanceLastMessage(ctx, generateChatID(), &messagingpb.MessageId{Value: 1}, at(1))
+	_, members, err = s.AdvanceLastMessage(ctx, generateDmChatID(), &messagingpb.MessageId{Value: 1}, at(1))
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 	require.Nil(t, members)
+}
+
+func testStore_PutChat_TypeIDMismatch(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// A chat ID's length is its type family's discriminator, so a group type
+	// with a DM-sized ID must be rejected...
+	err := s.PutChat(ctx, &chat.Chat{
+		ID:           generateDmChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{model.MustGenerateUserID()},
+		LastActivity: at(1),
+	})
+	require.Error(t, err)
+	require.NotErrorIs(t, err, chat.ErrChatExists)
+
+	// ...and so must a DM type with a group-sized ID.
+	err = s.PutChat(ctx, &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_CONTACT_DM,
+		Members:      []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID()},
+		LastActivity: at(1),
+	})
+	require.Error(t, err)
+	require.NotErrorIs(t, err, chat.ErrChatExists)
+}
+
+func testStore_GroupChat_PutAndGet(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	members := []*commonpb.UserId{
+		model.MustGenerateUserID(),
+		model.MustGenerateUserID(),
+		model.MustGenerateUserID(),
+	}
+	c := putGroupChat(t, s, "Weekend Trip", at(100), members...)
+
+	// The metadata read returns the canonical record alone: a group's membership
+	// lives in its own records and is never joined into a metadata read.
+	got, err := s.GetChatByID(ctx, c.ID)
+	require.NoError(t, err)
+	require.Equal(t, c.ID.Value, got.ID.Value)
+	require.Equal(t, chatpb.ChatType_GROUP, got.Type)
+	require.Equal(t, "Weekend Trip", got.Title)
+	require.True(t, got.LastActivity.Equal(at(100)))
+	require.Empty(t, got.Members)
+
+	// Membership is reached explicitly, and PutChat's initial set is what it
+	// converges to.
+	gotMembers, err := s.GetMembers(ctx, c.ID)
+	require.NoError(t, err)
+	require.ElementsMatch(t, userIDValues(members), userIDValues(gotMembers))
+
+	require.ErrorIs(t, s.PutChat(ctx, c), chat.ErrChatExists)
+}
+
+func testStore_GroupChat_Membership(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+	userC := model.MustGenerateUserID()
+	c := putGroupChat(t, s, "Group", at(5), userA, userB)
+
+	ok, err := s.IsMember(ctx, c.ID, userA)
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, err = s.IsMember(ctx, c.ID, userC)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	members, err := s.GetMembers(ctx, c.ID)
+	require.NoError(t, err)
+	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{userA, userB}), userIDValues(members))
+
+	// Adding is idempotent for an existing member and joins new ones.
+	require.NoError(t, s.AddGroupMembers(ctx, c.ID, []*commonpb.UserId{userB, userC}))
+	members, err = s.GetMembers(ctx, c.ID)
+	require.NoError(t, err)
+	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{userA, userB, userC}), userIDValues(members))
+
+	// Departure: no longer a member, excluded from the member set.
+	require.NoError(t, s.RemoveGroupMember(ctx, c.ID, userB))
+	ok, err = s.IsMember(ctx, c.ID, userB)
+	require.NoError(t, err)
+	require.False(t, ok)
+	members, err = s.GetMembers(ctx, c.ID)
+	require.NoError(t, err)
+	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{userA, userC}), userIDValues(members))
+
+	// Removing an already-departed member or a stranger is a no-op.
+	require.NoError(t, s.RemoveGroupMember(ctx, c.ID, userB))
+	require.NoError(t, s.RemoveGroupMember(ctx, c.ID, model.MustGenerateUserID()))
+
+	// A departed member can rejoin.
+	require.NoError(t, s.AddGroupMembers(ctx, c.ID, []*commonpb.UserId{userB}))
+	ok, err = s.IsMember(ctx, c.ID, userB)
+	require.NoError(t, err)
+	require.True(t, ok)
+	members, err = s.GetMembers(ctx, c.ID)
+	require.NoError(t, err)
+	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{userA, userB, userC}), userIDValues(members))
+}
+
+// testStore_PutChat_NoMembers pins that a memberless chat of either family is
+// refused. Nothing could ever reach such a chat: every read, send, and
+// membership mutation gates on membership, so it would be an unreachable record
+// that only a direct store read could observe.
+func testStore_PutChat_NoMembers(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	group := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Title:        "Nobody",
+		LastActivity: at(1),
+	}
+	require.ErrorIs(t, s.PutChat(ctx, group), chat.ErrNoMembers)
+	_, err := s.GetChatByID(ctx, group.ID)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+
+	dm := &chat.Chat{
+		ID:           generateDmChatID(),
+		Type:         chatpb.ChatType_CONTACT_DM,
+		LastActivity: at(1),
+	}
+	require.ErrorIs(t, s.PutChat(ctx, dm), chat.ErrNoMembers)
+	_, err = s.GetChatByID(ctx, dm.ID)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+}
+
+// testStore_GroupChat_CreationCap covers the boundary of the initial member set:
+// a group at the cap is created whole, and one over it is rejected outright
+// rather than partially written.
+func testStore_GroupChat_CreationCap(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	members := make([]*commonpb.UserId, chat.MaxGroupChatCreationMembers)
+	for i := range members {
+		members[i] = model.MustGenerateUserID()
+	}
+	c := putGroupChat(t, s, "Big Group", at(10), members...)
+
+	got, err := s.GetMembers(ctx, c.ID)
+	require.NoError(t, err)
+	require.ElementsMatch(t, userIDValues(members), userIDValues(got))
+
+	// One past the cap is refused, and nothing is left behind — creation is
+	// all-or-nothing, so the caller can retry at a legal size against the same
+	// chat ID without first cleaning up.
+	overCap := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      append(members, model.MustGenerateUserID()),
+		Title:        "Too Big",
+		LastActivity: at(10),
+	}
+	require.ErrorIs(t, s.PutChat(ctx, overCap), chat.ErrTooManyMembers)
+	_, err = s.GetChatByID(ctx, overCap.ID)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+}
+
+// testStore_GroupChat_DuplicateMembers pins that a repeated member in the
+// initial set collapses rather than failing the creation — the persistent
+// stores write one record per member, and a repeat would otherwise be two
+// writes to one key.
+func testStore_GroupChat_DuplicateMembers(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+	c := putGroupChat(t, s, "Dupes", at(10), userA, userB, userA)
+
+	got, err := s.GetMembers(ctx, c.ID)
+	require.NoError(t, err)
+	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{userA, userB}), userIDValues(got))
+
+	// Duplicates collapse before the cap is applied, so a set that is only over
+	// the cap by repetition is still legal.
+	members := make([]*commonpb.UserId, 0, chat.MaxGroupChatCreationMembers+2)
+	for i := 0; i < chat.MaxGroupChatCreationMembers; i++ {
+		members = append(members, model.MustGenerateUserID())
+	}
+	members = append(members, members[0], members[1])
+	atCap := putGroupChat(t, s, "Dupes At Cap", at(10), members...)
+
+	got, err = s.GetMembers(ctx, atCap.ID)
+	require.NoError(t, err)
+	require.Len(t, got, chat.MaxGroupChatCreationMembers)
+}
+
+func testStore_GroupChat_AddMembersErrors(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	user := model.MustGenerateUserID()
+
+	// Membership writes against a chat that does not exist must not accrete
+	// orphaned records.
+	err := s.AddGroupMembers(ctx, chat.MustGenerateGroupChatID(), []*commonpb.UserId{user})
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+
+	// Group membership methods reject DM chat IDs outright.
+	dm := putDmChat(t, s, user, model.MustGenerateUserID(), at(1))
+	require.Error(t, s.AddGroupMembers(ctx, dm.ID, []*commonpb.UserId{user}))
+	require.Error(t, s.RemoveGroupMember(ctx, dm.ID, user))
+
+	// An unknown group chat has no members, as opposed to an empty set.
+	_, err = s.GetMembers(ctx, chat.MustGenerateGroupChatID())
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+}
+
+func testStore_GroupChat_AdvanceLastMessage(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	c := putGroupChat(t, s, "Group", at(100), model.MustGenerateUserID(), model.MustGenerateUserID())
+
+	// Advancing touches only the canonical record — a group has no inline
+	// member list, so no members are returned; group fan-out reads membership
+	// explicitly via GetMembers.
+	advanced, members, err := s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: 5}, at(200))
+	require.NoError(t, err)
+	require.True(t, advanced)
+	require.Empty(t, members)
+
+	got, err := s.GetChatByID(ctx, c.ID)
+	require.NoError(t, err)
+	require.True(t, got.LastActivity.Equal(at(200)))
+	require.NotNil(t, got.LastMessageID)
+	require.Equal(t, uint64(5), got.LastMessageID.Value)
+
+	// Backward is a no-op, as for DMs.
+	advanced, _, err = s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: 3}, at(150))
+	require.NoError(t, err)
+	require.False(t, advanced)
+}
+
+func testStore_GroupChat_NotInDmFeed(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	user := model.MustGenerateUserID()
+	_ = putGroupChat(t, s, "Group", at(200), user, model.MustGenerateUserID())
+	dm := putDmChat(t, s, user, model.MustGenerateUserID(), at(100))
+
+	// A group chat never surfaces in a DM feed, neither in a DM type's feed nor
+	// via a feed query for the group type itself — groups get their own
+	// read-time feed.
+	feed, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{dm.ID.Value}, chatIDValues(feed))
+
+	feed, err = s.GetDmFeedPage(ctx, user, chatpb.ChatType_GROUP, at(1000), nil, 0)
+	require.NoError(t, err)
+	require.Empty(t, feed)
 }
 
 func testStore_GetDmFeedPage_Order(t *testing.T, s chat.Store) {
@@ -181,10 +443,10 @@ func testStore_GetDmFeedPage_Order(t *testing.T, s chat.Store) {
 	other := model.MustGenerateUserID()
 
 	// Three chats the user is in, plus one they are not.
-	c1 := putChat(t, s, user, other, at(100))
-	c2 := putChat(t, s, user, other, at(300))
-	c3 := putChat(t, s, user, other, at(200))
-	_ = putChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(999))
+	c1 := putDmChat(t, s, user, other, at(100))
+	c2 := putDmChat(t, s, user, other, at(300))
+	c3 := putDmChat(t, s, user, other, at(200))
+	_ = putDmChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(999))
 
 	// A watermark above every chat includes them all, most recent first.
 	got, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
@@ -197,9 +459,9 @@ func testStore_GetDmFeedPage_Watermark(t *testing.T, s chat.Store) {
 
 	user := model.MustGenerateUserID()
 	other := model.MustGenerateUserID()
-	c1 := putChat(t, s, user, other, at(100))
-	_ = putChat(t, s, user, other, at(300)) // Above the watermark; excluded.
-	c3 := putChat(t, s, user, other, at(200))
+	c1 := putDmChat(t, s, user, other, at(100))
+	_ = putDmChat(t, s, user, other, at(300)) // Above the watermark; excluded.
+	c3 := putDmChat(t, s, user, other, at(200))
 
 	// A watermark of 250 pins out the chat last active at 300.
 	got, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(250), nil, 0)
@@ -212,9 +474,9 @@ func testStore_GetDmFeedPage_Paging(t *testing.T, s chat.Store) {
 
 	user := model.MustGenerateUserID()
 	other := model.MustGenerateUserID()
-	c1 := putChat(t, s, user, other, at(100))
-	c2 := putChat(t, s, user, other, at(300))
-	c3 := putChat(t, s, user, other, at(200))
+	c1 := putDmChat(t, s, user, other, at(100))
+	c2 := putDmChat(t, s, user, other, at(300))
+	c3 := putDmChat(t, s, user, other, at(200))
 
 	snapshot := at(1000)
 
@@ -242,9 +504,9 @@ func testStore_GetDmFeedPage_SnapshotPinned(t *testing.T, s chat.Store) {
 
 	user := model.MustGenerateUserID()
 	other := model.MustGenerateUserID()
-	c1 := putChat(t, s, user, other, at(100))
-	c2 := putChat(t, s, user, other, at(200))
-	c3 := putChat(t, s, user, other, at(300))
+	c1 := putDmChat(t, s, user, other, at(100))
+	c2 := putDmChat(t, s, user, other, at(200))
+	c3 := putDmChat(t, s, user, other, at(300))
 
 	snapshot := at(350) // All three are within the window.
 
@@ -280,10 +542,10 @@ func testStore_GetDmFeedPage_TypeScoped(t *testing.T, s chat.Store) {
 	user := model.MustGenerateUserID()
 	other := model.MustGenerateUserID()
 
-	contact1 := putChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, other, at(100))
-	tip1 := putChatOfType(t, s, chatpb.ChatType_TIP_DM, user, other, at(200))
-	contact2 := putChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, other, at(300))
-	tip2 := putChatOfType(t, s, chatpb.ChatType_TIP_DM, user, other, at(400))
+	contact1 := putDmChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, other, at(100))
+	tip1 := putDmChatOfType(t, s, chatpb.ChatType_TIP_DM, user, other, at(200))
+	contact2 := putDmChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, other, at(300))
+	tip2 := putDmChatOfType(t, s, chatpb.ChatType_TIP_DM, user, other, at(400))
 
 	// Each feed contains only its own type, most recent first.
 	contacts, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
@@ -315,15 +577,27 @@ func cursorOf(c *chat.Chat) *chat.DmFeedCursor {
 	return &chat.DmFeedCursor{LastActivity: c.LastActivity, ChatID: c.ID}
 }
 
-func putChat(t *testing.T, s chat.Store, a, b *commonpb.UserId, lastActivity time.Time) *chat.Chat {
-	return putChatOfType(t, s, chatpb.ChatType_CONTACT_DM, a, b, lastActivity)
+func putDmChat(t *testing.T, s chat.Store, a, b *commonpb.UserId, lastActivity time.Time) *chat.Chat {
+	return putDmChatOfType(t, s, chatpb.ChatType_CONTACT_DM, a, b, lastActivity)
 }
 
-func putChatOfType(t *testing.T, s chat.Store, chatType chatpb.ChatType, a, b *commonpb.UserId, lastActivity time.Time) *chat.Chat {
+func putDmChatOfType(t *testing.T, s chat.Store, chatType chatpb.ChatType, a, b *commonpb.UserId, lastActivity time.Time) *chat.Chat {
 	c := &chat.Chat{
-		ID:           generateChatID(),
+		ID:           generateDmChatID(),
 		Type:         chatType,
 		Members:      []*commonpb.UserId{a, b},
+		LastActivity: lastActivity,
+	}
+	require.NoError(t, s.PutChat(context.Background(), c))
+	return c
+}
+
+func putGroupChat(t *testing.T, s chat.Store, title string, lastActivity time.Time, members ...*commonpb.UserId) *chat.Chat {
+	c := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      members,
+		Title:        title,
 		LastActivity: lastActivity,
 	}
 	require.NoError(t, s.PutChat(context.Background(), c))
@@ -336,8 +610,8 @@ func at(seconds int64) time.Time {
 	return time.Unix(1_700_000_000+seconds, 0).UTC()
 }
 
-func generateChatID() *commonpb.ChatId {
-	b := make([]byte, chat.ChatIDSize)
+func generateDmChatID() *commonpb.ChatId {
+	b := make([]byte, chat.DmChatIDSize)
 	if _, err := rand.Read(b); err != nil {
 		panic(err)
 	}

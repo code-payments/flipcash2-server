@@ -51,6 +51,18 @@ type Store interface {
 	// DM peers) rather than a lookup per candidate.
 	GetBlocked(ctx context.Context, ownerID *commonpb.UserId, candidateIDs []*commonpb.UserId) (map[string]bool, error)
 
+	// GetBlockers returns which of candidateOwnerIDs have blocked blockedID, as a
+	// set keyed by string(userID.Value): an owner is present (value true) iff they
+	// have blocked blockedID. Owners who have not — along with duplicate or empty
+	// input — are simply absent from the map.
+	//
+	// It is GetBlocked in the other direction: many owners against one candidate,
+	// still in a single round trip. Message fan-out is what needs this direction —
+	// the chat's members are the blocklist owners and the sender is the candidate —
+	// so deciding who to push a message to costs one read for the whole member set
+	// rather than an IsBlocked per member.
+	GetBlockers(ctx context.Context, blockedID *commonpb.UserId, candidateOwnerIDs []*commonpb.UserId) (map[string]bool, error)
+
 	// GetBlocklistPage returns one page of ownerID's blocklist ordered by
 	// (blocked_at, user_id) descending (most recently blocked first), at most
 	// limit entries (limit <= 0 means unbounded). When cursor is nil the page

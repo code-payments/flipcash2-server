@@ -109,6 +109,24 @@ func (m *memory) GetBlocked(_ context.Context, ownerID *commonpb.UserId, candida
 	return blocked, nil
 }
 
+func (m *memory) GetBlockers(_ context.Context, blockedID *commonpb.UserId, candidateOwnerIDs []*commonpb.UserId) (map[string]bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	if len(candidateOwnerIDs) == 0 {
+		return nil, nil
+	}
+	blockers := make(map[string]bool)
+	for _, ownerID := range candidateOwnerIDs {
+		// A candidate with no blocklist at all indexes an absent map, which is an
+		// empty lookup rather than a panic.
+		if _, ok := m.entries[string(ownerID.Value)][string(blockedID.Value)]; ok {
+			blockers[string(ownerID.Value)] = true
+		}
+	}
+	return blockers, nil
+}
+
 func (m *memory) GetBlocklistPage(_ context.Context, ownerID *commonpb.UserId, cursor *blocklist.Cursor, limit int) ([]*blocklist.BlockedUser, error) {
 	m.Lock()
 	defer m.Unlock()

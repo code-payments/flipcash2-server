@@ -111,30 +111,44 @@ func publishChatUpdate(
 
 			// Push recipients are every member but the sender, minus anyone who has
 			// blocked the sender — a user who blocks another must stop receiving
-			// pushes for that user's messages. The block check is scoped to the
+			// pushes for that user's messages. The check is scoped to each
 			// recipient's own blocklist (recipient is the owner, sender the blocked
-			// candidate). It fails closed: on a lookup failure we suppress the push
-			// rather than risk notifying a recipient who has blocked the sender. The
-			// message itself is still delivered on the event stream, so a transient
-			// blocklist error costs only the notification, never the message.
-			var membersForPush []*commonpb.UserId
+			// candidate), and every recipient is resolved in one batched read, so a
+			// group send costs a single lookup rather than one per member.
+			var candidates []*commonpb.UserId
 			for _, member := range members {
 				if bytes.Equal(member.Value, message.SenderId.Value) {
 					continue
 				}
-				blocked, err := blocklists.IsBlocked(ctx, member, message.SenderId)
-				if err != nil {
-					log.With(zap.Error(err)).Warn("Failure checking blocklist for message push; suppressing push")
-					continue
-				}
-				if blocked {
-					continue
-				}
-				membersForPush = append(membersForPush, member)
+				candidates = append(candidates, member)
 			}
-			// Every recipient was the sender or has blocked the sender: nothing to
-			// push. Return before the sender-profile read and body render, which
-			// would otherwise be spent on a push addressed to no one.
+			// The sender was the only member: nothing to push, and nothing to ask the
+			// blocklist about.
+			if len(candidates) == 0 {
+				return
+			}
+
+			// Fails closed: on a lookup failure we suppress the push rather than risk
+			// notifying a recipient who has blocked the sender. One batched read has
+			// no partial outcome to salvage, so that suppresses the push for every
+			// recipient rather than just the one that failed — the message itself is
+			// still delivered on the event stream, so a transient blocklist error
+			// costs only the notification, never the message.
+			blockingSender, err := blocklists.GetBlockers(ctx, message.SenderId, candidates)
+			if err != nil {
+				log.With(zap.Error(err)).Warn("Failure checking blocklists for message push; suppressing push")
+				return
+			}
+			membersForPush := make([]*commonpb.UserId, 0, len(candidates))
+			for _, candidate := range candidates {
+				if blockingSender[string(candidate.Value)] {
+					continue
+				}
+				membersForPush = append(membersForPush, candidate)
+			}
+			// Every recipient has blocked the sender: nothing to push. Return before
+			// the sender-profile read and body render, which would otherwise be spent
+			// on a push addressed to no one.
 			if len(membersForPush) == 0 {
 				return
 			}

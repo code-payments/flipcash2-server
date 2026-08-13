@@ -32,6 +32,12 @@ import (
 //	           blocklists stay small. The blocked user ID is recovered from the sk,
 //	           so it is not stored as its own attribute.
 //
+//	           GetBlockers answers the reverse question — which of these owners
+//	           have blocked one user — off the reverse GSI, intersecting one
+//	           blocker set against the candidates in memory, with a keyed
+//	           BatchGetItem fallback once that set outgrows a bounded probe. See
+//	           there for why the index rather than the keys is the default.
+//
 //	           Each owner also has one metadata item (sk = "#meta") holding
 //	           per-owner aggregates — currently just their blocklist size in a
 //	           count attribute — maintained atomically with each Block/Unblock via
@@ -65,6 +71,20 @@ const (
 	attrSK        = "sk"
 	attrBlockedAt = "blocked_at"
 	attrCount     = "count"
+
+	// blockersQueryLimit bounds the reverse-index probe in GetBlockers: at most
+	// this many of a user's blockers are read before the strategy switches to the
+	// keyed fallback. At roughly 100 bytes per KEYS_ONLY index entry a full probe
+	// costs about 2.5 RCU, and a user blocked by fewer than this — nearly all of
+	// them — is answered by that one query regardless of how large the chat is.
+	//
+	// The shared store suite's ManyBlockers test must block more than this many
+	// users to reach the fallback path; raising this without raising that leaves
+	// the fallback uncovered.
+	blockersQueryLimit = 200
+
+	// maxBatchGetKeys is DynamoDB's per-BatchGetItem key limit.
+	maxBatchGetKeys = 100
 )
 
 type store struct {
@@ -258,6 +278,123 @@ func (s *store) GetBlocked(ctx context.Context, ownerID *commonpb.UserId, candid
 	return blocked, nil
 }
 
+func (s *store) GetBlockers(ctx context.Context, blockedID *commonpb.UserId, candidateOwnerIDs []*commonpb.UserId) (map[string]bool, error) {
+	if len(candidateOwnerIDs) == 0 {
+		return nil, nil
+	}
+
+	// Deduped once here: it bounds the fallback's key set (BatchGetItem rejects a
+	// request carrying the same key twice, rather than collapsing it) and gives the
+	// probe path its membership test.
+	wanted := make(map[string]struct{}, len(candidateOwnerIDs))
+	ownerIDs := make([]*commonpb.UserId, 0, len(candidateOwnerIDs))
+	for _, ownerID := range candidateOwnerIDs {
+		if _, dup := wanted[string(ownerID.Value)]; dup {
+			continue
+		}
+		wanted[string(ownerID.Value)] = struct{}{}
+		ownerIDs = append(ownerIDs, ownerID)
+	}
+
+	// Read the reverse index for blockedID — everyone who has blocked them — and
+	// intersect with the candidates in memory. A Query is billed on the summed size
+	// of what it reads before rounding to 4KB, so a whole blocker set of tens of
+	// tiny KEYS_ONLY entries costs the 0.5 RCU minimum. The keyed fallback below is
+	// billed per item instead (each key rounded to its own 4KB), making it cost
+	// proportional to the candidate set — which for a group send is the membership.
+	// So this path is what keeps a send's blocklist read independent of group size.
+	//
+	// The cost of this path scales with how blocked the sender is, which has nothing
+	// to do with the chat and is unbounded — a mass-blocked account would otherwise
+	// read its entire blocker list, over many pages, on every message it sends, all
+	// against a single index partition. The limit caps that: past it, this probe is
+	// abandoned for the fallback, whose cost is bounded by the candidates.
+	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+		TableName:                aws.String(s.table),
+		IndexName:                aws.String(gsiByBlockedUser),
+		KeyConditionExpression:   aws.String("#sk = :blocked"),
+		ExpressionAttributeNames: map[string]string{"#sk": attrSK},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":blocked": avS(blockedSK(blockedID)),
+		},
+		Limit: aws.Int32(blockersQueryLimit),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// A start key means the partition did not drain within the limit, so the
+	// blockers read so far are an arbitrary prefix: a candidate absent from it may
+	// still be further in. Only a drained partition licenses concluding "absent
+	// here means not blocking". (DynamoDB also returns a start key when it stops
+	// exactly at the limit with nothing left, so a user blocked by precisely this
+	// many falls back needlessly — one wasted query in a case that barely exists.)
+	if len(out.LastEvaluatedKey) > 0 {
+		return s.getBlockersByKey(ctx, blockedID, ownerIDs)
+	}
+
+	blockers := make(map[string]bool)
+	for _, item := range out.Items {
+		ownerID, err := blockerIDFromPK(item)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := wanted[string(ownerID.Value)]; ok {
+			blockers[string(ownerID.Value)] = true
+		}
+	}
+	return blockers, nil
+}
+
+// getBlockersByKey answers GetBlockers by addressing one exact base-table key per
+// candidate owner — their partition, and within it the single entry that would
+// record them blocking blockedID. It is the fallback for a user with more blockers
+// than the reverse-index probe will read: the read is bounded by the candidate set
+// however many blockers they have, at the cost of being billed per key rather than
+// in aggregate. ownerIDs must already be deduped.
+func (s *store) getBlockersByKey(ctx context.Context, blockedID *commonpb.UserId, ownerIDs []*commonpb.UserId) (map[string]bool, error) {
+	keys := make([]map[string]types.AttributeValue, len(ownerIDs))
+	for i, ownerID := range ownerIDs {
+		keys[i] = map[string]types.AttributeValue{
+			attrPK: avS(ownerPK(ownerID)),
+			attrSK: avS(blockedSK(blockedID)),
+		}
+	}
+
+	// Only the pk is projected: an item coming back at all is the answer, and its
+	// pk is which owner it belongs to.
+	blockers := make(map[string]bool)
+	for start := 0; start < len(keys); start += maxBatchGetKeys {
+		end := start + maxBatchGetKeys
+		if end > len(keys) {
+			end = len(keys)
+		}
+		req := map[string]types.KeysAndAttributes{
+			s.table: {Keys: keys[start:end], ProjectionExpression: aws.String(attrPK)},
+		}
+		// Retry UnprocessedKeys until the batch drains.
+		for len(req[s.table].Keys) > 0 {
+			out, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range out.Responses[s.table] {
+				ownerID, err := blockerIDFromPK(item)
+				if err != nil {
+					return nil, err
+				}
+				blockers[string(ownerID.Value)] = true
+			}
+			if unprocessed, ok := out.UnprocessedKeys[s.table]; ok && len(unprocessed.Keys) > 0 {
+				req = map[string]types.KeysAndAttributes{s.table: unprocessed}
+			} else {
+				break
+			}
+		}
+	}
+	return blockers, nil
+}
+
 func (s *store) GetBlocklistPage(ctx context.Context, ownerID *commonpb.UserId, cursor *blocklist.Cursor, limit int) ([]*blocklist.BlockedUser, error) {
 	// Query the GSI for one owner's entries, most recent first. blocked_at is
 	// immutable, so no watermark bound is needed; the partition holds exactly the
@@ -322,6 +459,23 @@ func blockedUserFromItem(item map[string]types.AttributeValue) (*blocklist.Block
 func ownerPK(userID *commonpb.UserId) string { return userKeyPrefix + hex.EncodeToString(userID.Value) }
 func blockedSK(userID *commonpb.UserId) string {
 	return blockedKeyPrefix + hex.EncodeToString(userID.Value)
+}
+
+// blockerIDFromPK recovers an owner (blocker) ID from an item's pk
+// ("user#<hex>"), the inverse of ownerPK. It is how GetBlockers attributes a
+// result back to an owner: both of its read paths return items keyed by owner,
+// and neither knows which owner an item belongs to until its pk is read.
+func blockerIDFromPK(item map[string]types.AttributeValue) (*commonpb.UserId, error) {
+	pk := asS(item[attrPK])
+	encoded, ok := strings.CutPrefix(pk, userKeyPrefix)
+	if !ok {
+		return nil, fmt.Errorf("unexpected pk %q", pk)
+	}
+	id, err := hex.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("decoding user id from pk %q: %w", pk, err)
+	}
+	return &commonpb.UserId{Value: id}, nil
 }
 
 // blockedIDFromSK recovers a blocked user ID from an item's sk

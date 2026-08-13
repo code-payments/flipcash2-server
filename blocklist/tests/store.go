@@ -27,6 +27,8 @@ func RunStoreTests(t *testing.T, s blocklist.Store, teardown func()) {
 		testStore_GetBlockedCount,
 		testStore_GetBlocked,
 		testStore_GetBlocked_FiltersInRangeNonCandidate,
+		testStore_GetBlockers,
+		testStore_GetBlockers_ManyBlockers,
 		testStore_GetBlocklistPage_Order,
 		testStore_GetBlocklistPage_Paging,
 		testStore_GetBlocklistPage_Empty,
@@ -236,6 +238,100 @@ func testStore_GetBlocked_FiltersInRangeNonCandidate(t *testing.T, s blocklist.S
 	// so it must be absent — the scan is filtered to the exact candidate set.
 	_, ok := got[string(mid.Value)]
 	require.False(t, ok)
+}
+
+func testStore_GetBlockers(t *testing.T, s blocklist.Store) {
+	ctx := context.Background()
+
+	blocked := model.MustGenerateUserID()
+	blocker1 := model.MustGenerateUserID()
+	blocker2 := model.MustGenerateUserID()
+	notBlocking := model.MustGenerateUserID()
+
+	for _, owner := range []*commonpb.UserId{blocker1, blocker2} {
+		added, err := s.Block(ctx, owner, blocked, at(100))
+		require.NoError(t, err)
+		require.True(t, added)
+	}
+
+	// notBlocking has a blocklist, just not one containing blocked: having blocked
+	// someone else must not make them a blocker here.
+	_, err := s.Block(ctx, notBlocking, model.MustGenerateUserID(), at(200))
+	require.NoError(t, err)
+
+	// Mixed candidate set (a duplicate included): only the owners who blocked
+	// blocked come back, present with value true, keyed by user ID bytes.
+	got, err := s.GetBlockers(ctx, blocked, []*commonpb.UserId{blocker1, notBlocking, blocker2, blocker1})
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{
+		string(blocker1.Value): true,
+		string(blocker2.Value): true,
+	}, got)
+
+	// Not blocking and absent (never mapped to false).
+	_, ok := got[string(notBlocking.Value)]
+	require.False(t, ok)
+
+	// A blocker who wasn't asked about is absent: the result is filtered to the
+	// exact candidate set, not everyone who blocked blocked.
+	got, err = s.GetBlockers(ctx, blocked, []*commonpb.UserId{blocker1})
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{string(blocker1.Value): true}, got)
+
+	// The relation is directional: blocker1 blocked blocked, not the reverse, so
+	// asking about blocked as a blocker of blocker1 yields nothing.
+	got, err = s.GetBlockers(ctx, blocker1, []*commonpb.UserId{blocked})
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// Empty candidate set → empty result, no error.
+	got, err = s.GetBlockers(ctx, blocked, nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// A user nobody has blocked → empty result for any candidates.
+	got, err = s.GetBlockers(ctx, model.MustGenerateUserID(), []*commonpb.UserId{blocker1, blocker2})
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// Unblocking removes the owner from the result.
+	removed, err := s.Unblock(ctx, blocker1, blocked)
+	require.NoError(t, err)
+	require.True(t, removed)
+	got, err = s.GetBlockers(ctx, blocked, []*commonpb.UserId{blocker1, blocker2})
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{string(blocker2.Value): true}, got)
+}
+
+// testStore_GetBlockers_ManyBlockers covers a user with more blockers than the
+// DynamoDB store's bounded reverse-index probe will read (blockersQueryLimit),
+// which is what sends that store down its keyed fallback path. The contract is
+// the same either way, so the assertion is on the answer rather than the strategy
+// — but the blocker count must stay above that limit for this to reach the
+// fallback at all.
+func testStore_GetBlockers_ManyBlockers(t *testing.T, s blocklist.Store) {
+	ctx := context.Background()
+
+	blocked := model.MustGenerateUserID()
+
+	// Well past the probe limit, none of them candidates below.
+	for i := 0; i < 205; i++ {
+		added, err := s.Block(ctx, model.MustGenerateUserID(), blocked, at(int64(i)))
+		require.NoError(t, err)
+		require.True(t, added)
+	}
+
+	blocker := model.MustGenerateUserID()
+	added, err := s.Block(ctx, blocker, blocked, at(500))
+	require.NoError(t, err)
+	require.True(t, added)
+	notBlocking := model.MustGenerateUserID()
+
+	// The candidates are resolved exactly, even though the blocker set they are
+	// drawn from is far larger than one probe reads.
+	got, err := s.GetBlockers(ctx, blocked, []*commonpb.UserId{blocker, notBlocking})
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{string(blocker.Value): true}, got)
 }
 
 func testStore_GetBlocklistPage_Order(t *testing.T, s blocklist.Store) {

@@ -95,10 +95,10 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 // task.Executor.
 func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_intent.Record) ([]*ocp_task.Record, error) {
 	if intentRecord.IntentType == ocp_intent.SendPublicPayment {
-		if GetContactDmPayment(intentRecord) != nil {
+		if GetContactDmPayment(intentRecord.AppMetadata) != nil {
 			return []*ocp_task.Record{NewSendContactDmPaymentMessageTask(intentRecord)}, nil
 		}
-		if GetTipDmPayment(intentRecord) != nil {
+		if GetTipDmPayment(intentRecord.AppMetadata) != nil {
 			return []*ocp_task.Record{NewSendTipDmPaymentMessageTask(intentRecord)}, nil
 		}
 	}

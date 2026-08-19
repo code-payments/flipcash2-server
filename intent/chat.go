@@ -68,34 +68,39 @@ func NewSendTipDmPaymentMessageTask(intentRecord *ocp_intent.Record) *ocp_task.R
 	}
 }
 
-// GetChatMetadata extracts the chat metadata from the intent record's
-// additional app metadata, if present. It returns nil when the intent carries
-// no app metadata, the metadata fails to decode, or it is not chat metadata.
-func GetChatMetadata(intentRecord *ocp_intent.Record) *intentpb.ChatMetadata {
-	if len(intentRecord.AppMetadata) == 0 {
+// GetChatMetadata extracts the chat metadata from an intent's additional app
+// metadata, if present. It returns nil when there is no app metadata, the
+// metadata fails to decode, or it is not chat metadata.
+//
+// This and the accessors below take the blob rather than the intent it came
+// from, because the intent is not the only thing that carries it: a transaction
+// history record passes the same bytes through unmodified, and decodes to the
+// same metadata the intent was submitted with.
+func GetChatMetadata(appMetadata []byte) *intentpb.ChatMetadata {
+	if len(appMetadata) == 0 {
 		return nil
 	}
 
-	var appMetadata intentpb.AppMetadata
-	if err := proto.Unmarshal(intentRecord.AppMetadata, &appMetadata); err != nil {
+	var decoded intentpb.AppMetadata
+	if err := proto.Unmarshal(appMetadata, &decoded); err != nil {
 		return nil
 	}
 
-	return appMetadata.GetChat()
+	return decoded.GetChat()
 }
 
-// GetContactDmPayment extracts the contact DM payment from the intent record's
-// additional app metadata, if present. It returns nil when the intent carries no
-// app metadata, the metadata fails to decode, or it is not a contact DM payment.
-func GetContactDmPayment(intentRecord *ocp_intent.Record) *intentpb.ChatMetadata_ContactDmPayment {
-	return GetChatMetadata(intentRecord).GetContactDmPayment()
+// GetContactDmPayment extracts the contact DM payment from app metadata, if
+// present. It returns nil when there is no app metadata, the metadata fails to
+// decode, or it is not a contact DM payment.
+func GetContactDmPayment(appMetadata []byte) *intentpb.ChatMetadata_ContactDmPayment {
+	return GetChatMetadata(appMetadata).GetContactDmPayment()
 }
 
-// GetTipDmPayment extracts the tip DM payment from the intent record's
-// additional app metadata, if present. It returns nil when the intent carries no
-// app metadata, the metadata fails to decode, or it is not a tip DM payment.
-func GetTipDmPayment(intentRecord *ocp_intent.Record) *intentpb.ChatMetadata_TipDmPayment {
-	return GetChatMetadata(intentRecord).GetTipDmPayment()
+// GetTipDmPayment extracts the tip DM payment from app metadata, if present. It
+// returns nil when there is no app metadata, the metadata fails to decode, or it
+// is not a tip DM payment.
+func GetTipDmPayment(appMetadata []byte) *intentpb.ChatMetadata_TipDmPayment {
+	return GetChatMetadata(appMetadata).GetTipDmPayment()
 }
 
 // GetDmPaymentVerb reports how a DM payment should be rendered. A tip DM
@@ -105,8 +110,8 @@ func GetTipDmPayment(intentRecord *ocp_intent.Record) *intentpb.ChatMetadata_Tip
 //
 // Both the cash message injected into the DM and the sender's activity feed
 // entry render off this, so they cannot disagree about what a payment was.
-func GetDmPaymentVerb(intentRecord *ocp_intent.Record) messagingpb.CashContent_Verb {
-	tipDmPayment := GetTipDmPayment(intentRecord)
+func GetDmPaymentVerb(appMetadata []byte) messagingpb.CashContent_Verb {
+	tipDmPayment := GetTipDmPayment(appMetadata)
 	if tipDmPayment == nil {
 		return messagingpb.CashContent_SENT
 	}

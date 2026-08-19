@@ -69,7 +69,7 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 	if intentRecord.IntentType != ocp_intent.SendPublicPayment || metadata == nil {
 		return errors.New("intent is not a send public payment")
 	}
-	chatMetadata := intent.GetChatMetadata(intentRecord)
+	chatMetadata := intent.GetChatMetadata(intentRecord.AppMetadata)
 
 	// The metadata must match the DM the payment is being injected into.
 	switch chatType {
@@ -86,7 +86,7 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 	}
 
 	// The verb is how the client renders the payment.
-	verb := intent.GetDmPaymentVerb(intentRecord)
+	verb := intent.GetDmPaymentVerb(intentRecord.AppMetadata)
 
 	senderOwner, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
 	if err != nil {

@@ -384,15 +384,6 @@ func getSupportedOnRampProviders(ctx context.Context, countryCode *commonpb.Coun
 	return allSupported
 }
 
-// getClientVersion extracts the client's version from the gRPC user-agent, or
-// returns nil if no parseable Flipcash user-agent is present.
 func getClientVersion(ctx context.Context) *ocp_client.Version {
-	var clientVersion *ocp_client.Version
-	if userAgent, err := ocp_client.GetUserAgent(ctx, rpc.UserAgentName); err == nil {
-		clientVersion = &userAgent.Version
-	}
-	if userAgent, err := ocp_client.GetUserAgent(ctx, rpc.UserAgentName+"/Core"); err == nil {
-		clientVersion = &userAgent.Version
-	}
-	return clientVersion
+	return rpc.GetClientVersion(ctx)
 }

@@ -25,6 +25,7 @@ type InMemoryStore struct {
 	xProfilesByUser        map[string]*profilepb.XProfile
 	createdAtByUser        map[string]time.Time
 	tipCardColorByUser     map[string]string
+	usernameByUser         map[string]string
 }
 
 func NewInMemory() profile.Store {
@@ -35,6 +36,7 @@ func NewInMemory() profile.Store {
 		xProfilesByUser:        make(map[string]*profilepb.XProfile),
 		createdAtByUser:        make(map[string]time.Time),
 		tipCardColorByUser:     make(map[string]string),
+		usernameByUser:         make(map[string]string),
 	}
 }
 
@@ -46,6 +48,16 @@ func (m *InMemoryStore) tipCardCustomization(key string) *profilepb.TipCardCusto
 		storedColorHex = &colorHex
 	}
 	return profile.TipCardCustomizationFromStored(storedColorHex)
+}
+
+// username resolves the handle for key, leaving it unset for a user who has not
+// claimed one. Callers hold the lock.
+func (m *InMemoryStore) username(key string) *profilepb.Username {
+	username, ok := m.usernameByUser[key]
+	if !ok {
+		return nil
+	}
+	return &profilepb.Username{Value: username}
 }
 
 // ensureProfile returns the profile for key, creating an empty one (and
@@ -74,6 +86,7 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 	clonedBaseProfile := proto.Clone(baseProfile).(*profilepb.UserProfile)
 	clonedBaseProfile.JoinTs = timestamppb.New(m.createdAtByUser[key])
 	clonedBaseProfile.TipCardCustomization = m.tipCardCustomization(key)
+	clonedBaseProfile.Username = m.username(key)
 
 	xProfile, ok := m.xProfilesByUser[key]
 	if ok {
@@ -144,6 +157,45 @@ func (m *InMemoryStore) SetDisplayName(_ context.Context, id *commonpb.UserId, d
 	return nil
 }
 
+func (m *InMemoryStore) SetUsername(_ context.Context, id *commonpb.UserId, username string) error {
+	if err := profile.ValidateUsername(username); err != nil {
+		return err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	targetKey := userIDCacheKey(id)
+	for key, held := range m.usernameByUser {
+		if key != targetKey && held == username {
+			return profile.ErrUsernameTaken
+		}
+	}
+
+	m.ensureProfile(targetKey)
+	m.usernameByUser[targetKey] = username
+
+	return nil
+}
+
+func (m *InMemoryStore) GetUserIdByUsername(_ context.Context, username string) (*commonpb.UserId, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	normalized := profile.NormalizeUsername(username)
+	for key, held := range m.usernameByUser {
+		if held != normalized {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(key)
+		if err != nil {
+			return nil, err
+		}
+		return &commonpb.UserId{Value: decoded}, nil
+	}
+	return nil, profile.ErrNotFound
+}
+
 func (m *InMemoryStore) GetPublicProfiles(_ context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
 	out := make(map[string]*profilepb.UserProfile)
 	if len(userIDs) == 0 {
@@ -164,6 +216,7 @@ func (m *InMemoryStore) GetPublicProfiles(_ context.Context, userIDs []*commonpb
 		// what it gets back cannot reach into the store.
 		publicProfile := &profilepb.UserProfile{
 			DisplayName:          p.DisplayName,
+			Username:             m.username(key),
 			JoinTs:               timestamppb.New(m.createdAtByUser[key]),
 			TipCardCustomization: m.tipCardCustomization(key),
 		}
@@ -479,6 +532,7 @@ func (m *InMemoryStore) reset() {
 	m.xProfilesByUser = make(map[string]*profilepb.XProfile)
 	m.createdAtByUser = make(map[string]time.Time)
 	m.tipCardColorByUser = make(map[string]string)
+	m.usernameByUser = make(map[string]string)
 }
 
 func userIDCacheKey(id *commonpb.UserId) string {

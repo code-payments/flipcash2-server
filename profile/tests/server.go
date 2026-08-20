@@ -381,7 +381,7 @@ func testUsernameIsPublic(t *testing.T, accounts account.Store, profiles profile
 
 	// Read without auth, since a handle is public: what this returns is what any
 	// other user sees.
-	getUsername := func() *profilepb.Username {
+	getUsername := func() *commonpb.Username {
 		t.Helper()
 		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
 		require.NoError(t, err)

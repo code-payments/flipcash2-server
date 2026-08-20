@@ -97,7 +97,7 @@ func dbGetPublicProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 	}
 
 	if res.Username != nil {
-		userProfile.Username = &profilepb.Username{Value: *res.Username}
+		userProfile.Username = &commonpb.Username{Value: *res.Username}
 	}
 
 	if res.ProfilePictureBlobID != nil {
@@ -212,7 +212,7 @@ func dbGetPublicProfiles(ctx context.Context, pool *pgxpool.Pool, userIDs []*com
 		}
 
 		if r.Username != nil {
-			userProfile.Username = &profilepb.Username{Value: *r.Username}
+			userProfile.Username = &commonpb.Username{Value: *r.Username}
 		}
 
 		if r.ProfilePictureBlobID != nil {

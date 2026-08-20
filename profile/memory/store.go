@@ -52,12 +52,12 @@ func (m *InMemoryStore) tipCardCustomization(key string) *profilepb.TipCardCusto
 
 // username resolves the handle for key, leaving it unset for a user who has not
 // claimed one. Callers hold the lock.
-func (m *InMemoryStore) username(key string) *profilepb.Username {
+func (m *InMemoryStore) username(key string) *commonpb.Username {
 	username, ok := m.usernameByUser[key]
 	if !ok {
 		return nil
 	}
-	return &profilepb.Username{Value: username}
+	return &commonpb.Username{Value: username}
 }
 
 // ensureProfile returns the profile for key, creating an empty one (and

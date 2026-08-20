@@ -29,6 +29,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testLinkPhoneNumberForPayment,
 		testProfilePictures,
 		testTipCardColor,
+		testUsername,
 		testJoinTs,
 	} {
 		tf(t, s)
@@ -402,6 +403,96 @@ func testTipCardColor(t *testing.T, s profile.Store) {
 	require.NoError(t, got[string(user2.Value)].Validate())
 	require.Equal(t, profile.DefaultTipCardColorHex, got[string(user1.Value)].TipCardCustomization.Color.Hex)
 	require.Equal(t, "#ABCDEF", got[string(user2.Value)].TipCardCustomization.Color.Hex)
+}
+
+func testUsername(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	user1 := model.MustGenerateUserID()
+	user2 := model.MustGenerateUserID()
+
+	// A user who has claimed nothing has no handle, and their profile is still a
+	// complete one.
+	require.NoError(t, s.SetDisplayName(ctx, user1, "user one"))
+	p, err := s.GetProfile(ctx, user1, false)
+	require.NoError(t, err)
+	require.Nil(t, p.Username)
+	require.NoError(t, p.Validate())
+
+	// A handle nobody has claimed resolves to nobody.
+	_, err = s.GetUserIdByUsername(ctx, "user_one")
+	require.ErrorIs(t, err, profile.ErrNotFound)
+
+	// Only canonical handles are ever held, so nothing else reaches the store.
+	for _, invalid := range []string{"", "a", "Uppercase", "has-a-dash", "has space", "sixteencharacter"} {
+		require.ErrorIs(t, s.SetUsername(ctx, user1, invalid), profile.ErrInvalidUsername)
+	}
+	_, err = s.GetUserIdByUsername(ctx, "uppercase")
+	require.ErrorIs(t, err, profile.ErrNotFound)
+
+	require.NoError(t, s.SetUsername(ctx, user1, "user_one"))
+
+	p, err = s.GetProfile(ctx, user1, false)
+	require.NoError(t, err)
+	require.Equal(t, "user_one", p.Username.Value)
+	require.NoError(t, p.Validate())
+
+	// Claiming a handle is enough on its own to make the store know a user, the
+	// same way setting any other profile field is.
+	require.NoError(t, s.SetUsername(ctx, user2, "user_two"))
+	p, err = s.GetProfile(ctx, user2, false)
+	require.NoError(t, err)
+	require.Equal(t, "user_two", p.Username.Value)
+
+	// A handle resolves back to its holder, whatever casing it is looked up in.
+	for _, lookup := range []string{"user_one", "USER_ONE", "User_One"} {
+		got, err := s.GetUserIdByUsername(ctx, lookup)
+		require.NoError(t, err)
+		require.Equal(t, user1.Value, got.Value)
+	}
+
+	// A handle has one holder: a second user cannot take it, and the failed claim
+	// leaves the handle they already held alone.
+	require.ErrorIs(t, s.SetUsername(ctx, user2, "user_one"), profile.ErrUsernameTaken)
+	p, err = s.GetProfile(ctx, user2, false)
+	require.NoError(t, err)
+	require.Equal(t, "user_two", p.Username.Value)
+
+	// Re-claiming the handle a user already holds is a no-op, not a conflict.
+	require.NoError(t, s.SetUsername(ctx, user1, "user_one"))
+	p, err = s.GetProfile(ctx, user1, false)
+	require.NoError(t, err)
+	require.Equal(t, "user_one", p.Username.Value)
+
+	// Changing a handle replaces the old one rather than accumulating, and frees
+	// it for anyone else to take.
+	require.NoError(t, s.SetUsername(ctx, user1, "renamed"))
+	p, err = s.GetProfile(ctx, user1, false)
+	require.NoError(t, err)
+	require.Equal(t, "renamed", p.Username.Value)
+
+	_, err = s.GetUserIdByUsername(ctx, "user_one")
+	require.ErrorIs(t, err, profile.ErrNotFound)
+
+	require.NoError(t, s.SetUsername(ctx, user2, "user_one"))
+	got, err := s.GetUserIdByUsername(ctx, "user_one")
+	require.NoError(t, err)
+	require.Equal(t, user2.Value, got.Value)
+
+	// The batch read carries handles the same way the single one does — it is the
+	// path chat member rows are built from.
+	noUsername := model.MustGenerateUserID()
+	require.NoError(t, s.SetDisplayName(ctx, noUsername, "no handle"))
+
+	publicProfiles, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{user1, user2, noUsername})
+	require.NoError(t, err)
+	require.Len(t, publicProfiles, 3)
+	require.Equal(t, "renamed", publicProfiles[string(user1.Value)].Username.Value)
+	require.Equal(t, "user_one", publicProfiles[string(user2.Value)].Username.Value)
+	require.Nil(t, publicProfiles[string(noUsername.Value)].Username)
+	for _, publicProfile := range publicProfiles {
+		require.NoError(t, publicProfile.Validate())
+	}
 }
 
 func testGetPublicProfiles(t *testing.T, s profile.Store) {

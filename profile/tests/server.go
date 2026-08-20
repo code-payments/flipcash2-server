@@ -33,6 +33,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 		testServer,
 		testProfilePicture,
 		testTipCardCustomization,
+		testUsernameIsPublic,
 		testDisplayNameModeration,
 	} {
 		tf(t, accounts, profiles)
@@ -352,6 +353,52 @@ func testTipCardCustomization(t *testing.T, accounts account.Store, profiles pro
 		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateTipCardResponse{Result: profilepb.UpdateTipCardResponse_OK}, resp))
 		require.Equal(t, "#19191A", getColorHex())
 	})
+}
+
+// testUsernameIsPublic covers the read side of usernames, which is all the API
+// exposes so far: there is no RPC to claim one yet, so the handle is seeded
+// through the store the way a claim would leave it.
+func testUsernameIsPublic(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+
+	media, _, _ := newMedia()
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient())
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+
+	client := profilepb.NewProfileClient(cc)
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
+	require.NoError(t, err)
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
+	require.NoError(t, profiles.SetDisplayName(ctx, userID, "my name"))
+
+	// Read without auth, since a handle is public: what this returns is what any
+	// other user sees.
+	getUsername := func() *profilepb.Username {
+		t.Helper()
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		require.NoError(t, err)
+		require.Equal(t, profilepb.GetProfileResponse_OK, resp.Result)
+		require.NoError(t, resp.UserProfile.Validate())
+		return resp.UserProfile.Username
+	}
+
+	// A user who has claimed nothing has no handle.
+	require.Nil(t, getUsername())
+
+	require.NoError(t, profiles.SetUsername(ctx, userID, "my_handle"))
+	require.Equal(t, "my_handle", getUsername().Value)
+
+	// A change is reflected on the next read.
+	require.NoError(t, profiles.SetUsername(ctx, userID, "renamed"))
+	require.Equal(t, "renamed", getUsername().Value)
 }
 
 func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.Store) {

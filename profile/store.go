@@ -12,6 +12,8 @@ import (
 
 var ErrNotFound = errors.New("not found")
 var ErrInvalidDisplayName = errors.New("invalid display name")
+var ErrInvalidUsername = errors.New("invalid username")
+var ErrUsernameTaken = errors.New("username taken")
 var ErrExistingSocialLink = errors.New("existing social link")
 
 // PhoneForPayment is a payment-enabled phone number together with the user that
@@ -32,15 +34,30 @@ type Store interface {
 	// ErrInvalidDisplayName is returned if there is an issue with the display name.
 	SetDisplayName(ctx context.Context, id *commonpb.UserId, displayName string) error
 
+	// SetUsername claims username as the user's handle, replacing any handle they
+	// already hold — which, having no holder any more, is immediately claimable by
+	// anyone else.
+	//
+	// username must already be in canonical form, so callers normalize what a user
+	// typed before claiming it; ErrInvalidUsername is returned otherwise. A handle
+	// has one holder at a time: ErrUsernameTaken is returned when another user
+	// holds it, while re-claiming the handle the user already holds is a no-op.
+	SetUsername(ctx context.Context, id *commonpb.UserId, username string) error
+
+	// GetUserIdByUsername returns the user currently holding the given handle,
+	// matched case-insensitively since handles are only ever held in canonical
+	// form. Returns ErrNotFound when nobody holds it.
+	GetUserIdByUsername(ctx context.Context, username string) (*commonpb.UserId, error)
+
 	// GetPublicProfiles returns, for each of the given users the store knows, the
 	// public part of that user's profile keyed by string(userID.Value): the
 	// fields any viewer may see, carrying no private ones. Unknown users are
 	// absent from the map. It resolves the whole set in a single lookup.
 	//
-	// Display name is empty and profile picture nil for a user who has set
-	// neither, while the join timestamp and Tip Card customization are always set
-	// — so a present entry means "this user exists", not "this user filled in a
-	// profile".
+	// Display name is empty, and username and profile picture nil, for a user who
+	// has set none of them, while the join timestamp and Tip Card customization are
+	// always set — so a present entry means "this user exists", not "this user
+	// filled in a profile".
 	//
 	// The returned picture carries only the blob holding its ORIGINAL rendition;
 	// resolving that blob's metadata is left to the caller.

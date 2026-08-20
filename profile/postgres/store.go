@@ -64,6 +64,14 @@ func (s *store) SetDisplayName(ctx context.Context, id *commonpb.UserId, display
 	return dbSetDisplayName(ctx, s.pool, id, displayName)
 }
 
+func (s *store) SetUsername(ctx context.Context, id *commonpb.UserId, username string) error {
+	return dbSetUsername(ctx, s.pool, id, username)
+}
+
+func (s *store) GetUserIdByUsername(ctx context.Context, username string) (*commonpb.UserId, error) {
+	return dbGetUserIdByUsername(ctx, s.pool, username)
+}
+
 func (s *store) SetProfilePicture(ctx context.Context, id *commonpb.UserId, blobID *blobpb.BlobId) error {
 	return dbSetProfilePicture(ctx, s.pool, id, blobID)
 }
@@ -151,7 +159,7 @@ func (s *store) GetXProfile(ctx context.Context, userID *commonpb.UserId) (*prof
 }
 
 func (s *store) reset() {
-	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "profilePictureBlobId" = NULL, "tipCardColor" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL, "isPhoneNumberLinkedForPayment" = FALSE`)
+	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "username" = NULL, "profilePictureBlobId" = NULL, "tipCardColor" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL, "isPhoneNumberLinkedForPayment" = FALSE`)
 	if err != nil {
 		panic(err)
 	}

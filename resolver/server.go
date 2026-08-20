@@ -71,6 +71,14 @@ func (s *Server) Resolve(ctx context.Context, req *resolverpb.ResolveRequest) (*
 		}
 	case *resolverpb.Identifier_UserId:
 		targetUserID = typed.UserId
+	case *resolverpb.Identifier_Username:
+		targetUserID, err = s.profiles.GetUserIdByUsername(ctx, typed.Username.Value)
+		if errors.Is(err, profile.ErrNotFound) {
+			return &resolverpb.ResolveResponse{Result: resolverpb.ResolveResponse_NOT_FOUND}, nil
+		} else if err != nil {
+			log.With(zap.Error(err)).Warn("Failure looking up user by username")
+			return nil, status.Error(codes.Internal, "")
+		}
 	default:
 		return nil, status.Error(codes.InvalidArgument, "unsupported identifier")
 	}

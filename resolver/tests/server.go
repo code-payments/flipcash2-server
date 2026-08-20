@@ -28,6 +28,9 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 		testServer_Resolve_ByPhoneNumber_OK,
 		testServer_Resolve_ByPhoneNumber_NotFound,
 		testServer_Resolve_ByPhoneNumber_NotEnabledForPayment,
+		testServer_Resolve_ByUsername_OK,
+		testServer_Resolve_ByUsername_NotFound,
+		testServer_Resolve_ByUsername_AfterRename,
 		testServer_Resolve_Denied_Unregistered,
 		testServer_Resolve_Unauthorized,
 	} {
@@ -194,6 +197,98 @@ func testServer_Resolve_ByPhoneNumber_NotEnabledForPayment(t *testing.T, account
 
 	resp, err := f.client.Resolve(ctx, req)
 	require.NoError(t, err)
+	require.Equal(t, resolverpb.ResolveResponse_NOT_FOUND, resp.Result)
+	require.Nil(t, resp.Resolution)
+}
+
+func testServer_Resolve_ByUsername_OK(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	f := newServerFixture(t, accounts, profiles)
+
+	// Seed a separate Flipcash user holding a handle, without any phone number
+	// linked for payment: the handle alone is enough to resolve them.
+	targetID := model.MustGenerateUserID()
+	targetKeys := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, targetID, targetKeys.Proto())
+	require.NoError(t, err)
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, targetID, true))
+	require.NoError(t, profiles.SetUsername(ctx, targetID, "resolve_me"))
+
+	req := &resolverpb.ResolveRequest{
+		Identifier: &resolverpb.Identifier{
+			Kind: &resolverpb.Identifier_Username{
+				Username: &commonpb.Username{Value: "resolve_me"},
+			},
+		},
+	}
+	require.NoError(t, f.keys.Auth(req, &req.Auth))
+
+	resp, err := f.client.Resolve(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, resolverpb.ResolveResponse_OK, resp.Result)
+	require.NotNil(t, resp.Resolution)
+	require.Equal(t, targetKeys.Proto().Value, resp.Resolution.GetAddress().Value)
+}
+
+func testServer_Resolve_ByUsername_NotFound(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	f := newServerFixture(t, accounts, profiles)
+
+	// Nobody holds this handle — pick one no other subtest claims.
+	req := &resolverpb.ResolveRequest{
+		Identifier: &resolverpb.Identifier{
+			Kind: &resolverpb.Identifier_Username{
+				Username: &commonpb.Username{Value: "unclaimed_404"},
+			},
+		},
+	}
+	require.NoError(t, f.keys.Auth(req, &req.Auth))
+
+	resp, err := f.client.Resolve(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, resolverpb.ResolveResponse_NOT_FOUND, resp.Result)
+	require.Nil(t, resp.Resolution)
+}
+
+func testServer_Resolve_ByUsername_AfterRename(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	f := newServerFixture(t, accounts, profiles)
+
+	targetID := model.MustGenerateUserID()
+	targetKeys := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, targetID, targetKeys.Proto())
+	require.NoError(t, err)
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, targetID, true))
+	require.NoError(t, profiles.SetUsername(ctx, targetID, "old_handle"))
+
+	resolve := func(username string) *resolverpb.ResolveResponse {
+		t.Helper()
+		req := &resolverpb.ResolveRequest{
+			Identifier: &resolverpb.Identifier{
+				Kind: &resolverpb.Identifier_Username{
+					Username: &commonpb.Username{Value: username},
+				},
+			},
+		}
+		require.NoError(t, f.keys.Auth(req, &req.Auth))
+		resp, err := f.client.Resolve(ctx, req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	resp := resolve("old_handle")
+	require.Equal(t, resolverpb.ResolveResponse_OK, resp.Result)
+	require.Equal(t, targetKeys.Proto().Value, resp.Resolution.GetAddress().Value)
+
+	// Renaming moves the resolution to the new handle and leaves the old one with
+	// no holder.
+	require.NoError(t, profiles.SetUsername(ctx, targetID, "new_handle"))
+
+	resp = resolve("new_handle")
+	require.Equal(t, resolverpb.ResolveResponse_OK, resp.Result)
+	require.Equal(t, targetKeys.Proto().Value, resp.Resolution.GetAddress().Value)
+
+	resp = resolve("old_handle")
 	require.Equal(t, resolverpb.ResolveResponse_NOT_FOUND, resp.Result)
 	require.Nil(t, resp.Resolution)
 }

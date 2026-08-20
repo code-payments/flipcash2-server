@@ -97,7 +97,7 @@ func SendFlipcashCurrencyBoughtPush(ctx context.Context, pusher Pusher, user *co
 func SendFlipcashCurrencySoldPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string, region ocp_currency.Code, nativeAmount float64) error {
 	title := fmt.Sprintf("%s Successfully Sold", currencyName)
 	body := amountPrinter.Sprintf(
-		"%s of USDF was added to your Flipcash wallet",
+		"%s of Dollars was added to your Flipcash wallet",
 		localization.FormatFiat(defaultLocale, region, nativeAmount),
 	)
 	customPayload := &pushpb.Payload{

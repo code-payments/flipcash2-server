@@ -728,8 +728,8 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 
 // fakeModerator is a configurable moderation.Client for the display-name tests.
 // SetDisplayName runs both ClassifyText and ClassifyDisplayName, so each is
-// configured independently; ClassifyImage and ClassifyCurrencyName are here only
-// to satisfy the interface.
+// configured independently; ClassifyImage, ClassifyCurrencyName, and
+// ClassifyUsername are here only to satisfy the interface.
 type fakeModerator struct {
 	textFlagged    bool
 	textCategories []string
@@ -753,6 +753,10 @@ func (m *fakeModerator) ClassifyImage(context.Context, []byte) (*moderation.Resu
 }
 
 func (m *fakeModerator) ClassifyCurrencyName(context.Context, string) (*moderation.Result, error) {
+	return &moderation.Result{}, nil
+}
+
+func (m *fakeModerator) ClassifyUsername(context.Context, string) (*moderation.Result, error) {
 	return &moderation.Result{}, nil
 }
 

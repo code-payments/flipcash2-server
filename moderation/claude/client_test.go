@@ -591,6 +591,319 @@ func TestClassifyCurrencyName_SafeNameNotFlagged(t *testing.T) {
 	}
 }
 
+// usernameHarmCategories are the categories the username prompt scores for what
+// a handle says rather than who it claims to be. They are split out from the
+// squatting categories because their fixtures cannot live in this file: a handle
+// that trips one is, by construction, a string a public repository should not
+// contain. Squatting fixtures are brand and ticker names, so those stay inline.
+//
+// A JSON file of {category: [handle, ...]} holds them instead:
+// usernameFixturesPath by default, overridden by usernameFixturesEnv. Without
+// one, every category here reports itself uncovered.
+var usernameHarmCategories = []string{
+	"child_safety",
+	"drugs",
+	"hate",
+	"self_harm",
+	"sexual",
+	"violence",
+}
+
+const (
+	usernameFixturesEnv = "MODERATION_USERNAME_FIXTURES"
+
+	// Relative to this package's directory, which is the working directory
+	// `go test` runs the test binary in.
+	usernameFixturesPath = "testdata/username_fixtures.json"
+)
+
+// TestClassifyUsername checks that handles which squat a known entity, or which
+// are harmful in their own right, are flagged. Every input is a valid username —
+// lower case, at most 15 characters of [a-z0-9_] — since that is all the
+// classifier is ever handed in production.
+func TestClassifyUsername(t *testing.T) {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		t.Fatal("ANTHROPIC_API_KEY environment variable is required")
+	}
+
+	client := NewClient(apiKey)
+	ctx := context.Background()
+
+	tests := []struct {
+		category string
+		inputs   []string
+	}{
+		{
+			category: "cryptocurrency",
+			inputs: []string{
+				"bitcoin",
+				"ethereum",
+				"solana",
+				"dogecoin",
+				"litecoin",
+				"cardano",
+				"polkadot",
+				"chainlink",
+				"monero",
+				"shibainu",
+				"uniswap",
+				"arbitrum",
+				"btc",
+				"eth",
+			},
+		},
+		{
+			category: "exchange_platform",
+			inputs: []string{
+				"coinbase",
+				"binance",
+				"kraken",
+				"robinhood",
+				"bitfinex",
+				"bybit",
+				"kucoin",
+				"bitstamp",
+				"pancakeswap",
+				"etoro",
+			},
+		},
+		{
+			category: "fiat_currency",
+			inputs: []string{
+				"usdollar",
+				"us_dollar",
+				"britishpound",
+				"japaneseyen",
+			},
+		},
+		{
+			category: "financial_service",
+			inputs: []string{
+				"venmo",
+				"paypal",
+				"cashapp",
+				"stripe",
+				"zelle",
+				"westernunion",
+				"mastercard",
+				"jpmorgan",
+				"goldmansachs",
+				"jpm",
+			},
+		},
+		{
+			category: "general_trademark",
+			inputs: []string{
+				"nike",
+				"disney",
+				"cocacola",
+				"mcdonalds",
+				"starbucks",
+				"gucci",
+				"rolex",
+				"walmart",
+				"ferrari",
+			},
+		},
+		{
+			category: "government_affiliation",
+			inputs: []string{
+				"federalreserve",
+				"ustreasury",
+				"irs_official",
+				"secgov",
+				"fbi",
+				"irs",
+			},
+		},
+		{
+			category: "impersonation",
+			inputs: []string{
+				"c0inbase",
+				"paypa1",
+				"b1tcoin",
+				"coin_base",
+				"appple",
+				"venmo_support",
+			},
+		},
+		{
+			category: "misleading_backing",
+			inputs: []string{
+				"fdicinsured",
+				"guaranteed10x",
+				"goldbacked",
+				"insuredfunds",
+			},
+		},
+		{
+			category: "official_role",
+			inputs: []string{
+				"support",
+				"admin",
+				"helpdesk",
+				"moderator",
+				"flipcash_support",
+				"support_team",
+				"usdf_admin",
+				"account_security",
+			},
+		},
+		{
+			category: "platform_impersonation",
+			inputs: []string{
+				"flipcash",
+				"flipcashteam",
+				"flip_cash",
+				"usdf",
+				"usdf_official",
+			},
+		},
+		{
+			category: "public_figure",
+			inputs: []string{
+				"elonmusk",
+				"elon",
+				"donaldtrump",
+				"trump",
+				"taylorswift",
+				"barackobama",
+				"kanyewest",
+			},
+		},
+		{
+			category: "stablecoin",
+			inputs: []string{
+				"usdc",
+				"usdt",
+				"tether",
+				"dai_stablecoin",
+				"pyusd",
+			},
+		},
+		{
+			category: "tech_company",
+			inputs: []string{
+				"apple",
+				"google",
+				"microsoft",
+				"amazon",
+				"tesla",
+				"anthropic",
+				"openai",
+				"nvidia",
+				"tsla",
+				"aapl",
+				"nvda",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		for _, input := range tt.inputs {
+			t.Run(tt.category+"/"+input, func(t *testing.T) {
+				result, err := client.ClassifyUsername(ctx, input)
+				require.NoError(t, err)
+
+				assert.True(t, result.Flagged, "expected %q to be flagged (scores: %v)", input, result.CategoryScores)
+			})
+		}
+	}
+
+	byCategory := loadUsernameFixtures(t)
+
+	for _, category := range usernameHarmCategories {
+		inputs := byCategory[category]
+		if len(inputs) == 0 {
+			t.Run(category, func(t *testing.T) {
+				t.Skipf("no fixtures for %q; put a JSON file of {category: [handle, ...]} at %s, or set %s to one elsewhere",
+					category, usernameFixturesPath, usernameFixturesEnv)
+			})
+			continue
+		}
+
+		for _, input := range inputs {
+			t.Run(category+"/"+input, func(t *testing.T) {
+				result, err := client.ClassifyUsername(ctx, input)
+				require.NoError(t, err)
+
+				assert.True(t, result.Flagged, "expected %q to be flagged (scores: %v)", input, result.CategoryScores)
+			})
+		}
+	}
+}
+
+func TestClassifyUsername_AllCategoriesPresent(t *testing.T) {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		t.Fatal("ANTHROPIC_API_KEY environment variable is required")
+	}
+
+	client := NewClient(apiKey)
+	ctx := context.Background()
+
+	expectedCategories := []string{
+		"cryptocurrency",
+		"exchange_platform",
+		"fiat_currency",
+		"financial_service",
+		"general_trademark",
+		"government_affiliation",
+		"impersonation",
+		"misleading_backing",
+		"official_role",
+		"platform_impersonation",
+		"public_figure",
+		"stablecoin",
+		"tech_company",
+	}
+	expectedCategories = append(expectedCategories, usernameHarmCategories...)
+
+	result, err := client.ClassifyUsername(ctx, "funkyjeffy")
+	require.NoError(t, err)
+
+	for _, category := range expectedCategories {
+		_, ok := result.CategoryScores[category]
+		assert.True(t, ok, "missing category %q in response scores", category)
+	}
+}
+
+// TestClassifyUsername_SafeNameNotFlagged is the false-positive guard. A handle
+// that merely contains a word a brand also uses, or that reads as a person's own
+// name, is not a claim to be that brand and must survive.
+func TestClassifyUsername_SafeNameNotFlagged(t *testing.T) {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		t.Fatal("ANTHROPIC_API_KEY environment variable is required")
+	}
+
+	client := NewClient(apiKey)
+	ctx := context.Background()
+
+	safeNames := []string{
+		"appleorchard",
+		"jose_ramirez",
+		"yuki_tanaka",
+		"kwame99",
+		"golden_hour",
+		"admiral",
+		"analyst",
+		"grasshopper",
+	}
+
+	for _, name := range safeNames {
+		t.Run(name, func(t *testing.T) {
+			result, err := client.ClassifyUsername(ctx, name)
+			require.NoError(t, err)
+
+			assert.False(t, result.Flagged,
+				"expected %q to not be flagged, flagged categories: %v (scores: %v)",
+				name, result.FlaggedCategories, result.CategoryScores)
+		})
+	}
+}
+
 // displayNameCategories are the categories the display name prompt scores. It is
 // the authoritative list: TestClassifyDisplayName reports any category it has no
 // fixtures for, and TestClassifyDisplayName_AllCategoriesPresent asserts the
@@ -627,23 +940,22 @@ const (
 	displayNameFixturesPath = "testdata/display_name_fixtures.json"
 )
 
-// loadDisplayNameFixtures reads the fixture file, returning nil when there is
-// none at the default path. An explicitly configured path that cannot be read is
-// a failure rather than a skip: it means coverage was asked for and not
-// delivered.
-func loadDisplayNameFixtures(t *testing.T) map[string][]string {
+// loadFlaggedFixtures reads a fixture file, returning nil when there is none at
+// defaultPath. An explicitly configured path that cannot be read is a failure
+// rather than a skip: it means coverage was asked for and not delivered.
+func loadFlaggedFixtures(t *testing.T, env, defaultPath string, categories []string) map[string][]string {
 	t.Helper()
 
-	path := os.Getenv(displayNameFixturesEnv)
+	path := os.Getenv(env)
 	if path == "" {
-		path = displayNameFixturesPath
+		path = defaultPath
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 	}
 
 	data, err := os.ReadFile(path)
-	require.NoError(t, err, "failed to read %s named by %s", path, displayNameFixturesEnv)
+	require.NoError(t, err, "failed to read %s named by %s", path, env)
 
 	var fixtures map[string][]string
 	require.NoError(t, json.Unmarshal(data, &fixtures), "failed to parse %s", path)
@@ -651,11 +963,21 @@ func loadDisplayNameFixtures(t *testing.T) map[string][]string {
 	// A misspelled key would contribute nothing and leave the category it was
 	// meant to cover silently uncovered, so reject it rather than ignore it.
 	for category := range fixtures {
-		require.Contains(t, displayNameCategories, category,
+		require.Contains(t, categories, category,
 			"%s has unknown category %q", path, category)
 	}
 
 	return fixtures
+}
+
+func loadDisplayNameFixtures(t *testing.T) map[string][]string {
+	t.Helper()
+	return loadFlaggedFixtures(t, displayNameFixturesEnv, displayNameFixturesPath, displayNameCategories)
+}
+
+func loadUsernameFixtures(t *testing.T) map[string][]string {
+	t.Helper()
+	return loadFlaggedFixtures(t, usernameFixturesEnv, usernameFixturesPath, usernameHarmCategories)
 }
 
 // TestClassifyDisplayName checks that names which should be flagged are. Its

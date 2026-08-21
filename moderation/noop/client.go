@@ -25,6 +25,10 @@ func (c *client) ClassifyCurrencyName(ctx context.Context, name string) (*modera
 	return &moderation.Result{Flagged: false, CategoryScores: make(map[string]float64)}, nil
 }
 
+func (c *client) ClassifyUsername(ctx context.Context, username string) (*moderation.Result, error) {
+	return &moderation.Result{Flagged: false, CategoryScores: make(map[string]float64)}, nil
+}
+
 func (c *client) ClassifyDisplayName(ctx context.Context, name string) (*moderation.Result, error) {
 	return &moderation.Result{Flagged: false, CategoryScores: make(map[string]float64)}, nil
 }

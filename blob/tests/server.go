@@ -946,6 +946,10 @@ func (m *fakeModerator) ClassifyCurrencyName(context.Context, string) (*moderati
 	return &moderation.Result{}, nil
 }
 
+func (m *fakeModerator) ClassifyUsername(context.Context, string) (*moderation.Result, error) {
+	return &moderation.Result{}, nil
+}
+
 func (m *fakeModerator) ClassifyDisplayName(context.Context, string) (*moderation.Result, error) {
 	return &moderation.Result{}, nil
 }

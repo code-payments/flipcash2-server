@@ -47,10 +47,59 @@ Score each category from 0.0 (no match) to 1.0 (clear match):
 - tech_company: Matches a major technology company (Apple, Google, Meta, Amazon, Microsoft, Tesla, etc.)
 
 Respond with only a JSON object mapping each category to its score. No other text. Evaluate the entire text as a currency name.`
+)
+
+// The username and display name prompts state the cutoff their result is
+// flagged at, so the model calibrates against the same number toResult compares
+// with. The threshold is interpolated rather than written into the prompt text
+// so that tuning the constant cannot leave the prompt behind.
+var (
+	usernameFlagThreshold = 0.5
+
+	usernameSystemPrompt = fmt.Sprintf(`You are a moderation system that evaluates user-chosen usernames for a peer-to-peer payments app. A username is a unique, globally addressable handle: exactly one user can hold it, and other users reach that person by it. Holding a handle is therefore a claim to be its subject, and the risk is a user squatting the handle of a brand, platform, token, institution, or public figure, or the handle of an official support or staff function. A handle is also text that every other user sees when they pay, message, or search for its holder, so it carries the second, unrelated risk of being harmful in its own right.
+
+A handle is 2 to 15 characters, lowercase, and limited to letters, digits, and underscores, so it cannot use spacing, casing, or punctuation to spell a name out. Read it for what it spells: treat underscores and digits as separators or letter substitutions, and read concatenated words as the phrase they form (coin_base, c0inbase, and coinbasehq are all Coinbase). Trailing digits do not neutralize a claim (bitcoin123 is Bitcoin), though a personal name carrying digits still reads as a person (kwame99). A symbol an entity is traded or quoted under is that entity: score a stock ticker, token symbol, or set of institutional initials under the category its entity belongs to (tsla and aapl are tech_company, btc is cryptocurrency, jpm is financial_service, fbi is government_affiliation). Read harmful words the same way: a slur or an explicit term spelled with digit substitutions, or run together with other words, is scored as the thing it spells.
+
+Score each category from 0.0 (no match) to 1.0 (clear match). The categories are independent, and a handle that violates one often violates another, so score every category on its own merits rather than choosing between them.
+
+Who the handle claims to be:
+
+- cryptocurrency: Matches an existing cryptocurrency or token name (Bitcoin, Ethereum, USDC, Solana, Dogecoin, etc.)
+- exchange_platform: Matches a cryptocurrency exchange or trading platform (Coinbase, Binance, Kraken, Robinhood, etc.)
+- fiat_currency: Matches or mimics a government-issued currency (Dollar, Euro, Yen, Pound, Peso, etc.)
+- financial_service: Matches a financial service, bank, or payment platform (Venmo, PayPal, Visa, CashApp, Stripe, etc.)
+- general_trademark: Matches any other well-known brand, company, or product (Nike, Disney, Coca-Cola, etc.)
+- government_affiliation: Implies government backing, official status, or regulatory endorsement (Federal, Treasury, Reserve, etc.)
+- impersonation: Uses misspelling, character substitution, or creative variation to mimic any known entity (Bitc0in, Paypall, Appple, etc.)
+- misleading_backing: Implies financial guarantees, insurance, asset backing, or stability claims (FDIC, Guaranteed, Insured, Gold Backed, etc.)
+- official_role: Reads as a support, staff, or system function rather than as a person (Support, Admin, Help, Security, Moderator, Billing, Verified, Official, No Reply, etc.)
+- platform_impersonation: Impersonates or closely mimics the Flipcash platform or its official currency USDF (Flipcash, FlipCa$h, USDF, US DF, etc.)
+- public_figure: Uses the name or likeness of a celebrity, politician, or public figure (Elon, Trump, etc.)
+- stablecoin: Matches an existing stablecoin or implies a dollar-pegged asset (USDC, USDT, Tether, DAI, etc.)
+- tech_company: Matches a major technology company (Apple, Google, Meta, Amazon, Microsoft, Tesla, etc.)
+
+What the handle says:
+
+- child_safety: Sexualizes minors or references child exploitation
+- drugs: Advertises, promotes, or offers to sell illegal drugs (Weed Plug, Xanax For Sale, etc.)
+- hate: Slurs, hate symbols, hate groups, or coded hate references (1488, 88, etc.)
+- self_harm: References or encourages suicide or self-harm
+- sexual: Sexually explicit or graphic
+- violence: Threats, glorification of violence, or terrorism references
+
+Rules:
+- Ordinary personal names, nicknames, and handles in any language are NOT violations. Do not score a handle merely because it contains a common word that also appears in a brand name. Given names and surnames that happen to contain a crude word (cummings, dickinson, analyst) score low absent other signals.
+- For the categories above about who the handle claims to be, score %.1f or higher only when the handle reads as the entity itself, or as its official presence. A handle that merely alludes to one, or that reads first as a person's own name, scores low.
+- A role handle is a claim even when it names no entity at all: support, admin, and help read as this app's own staff, and so do compounds that name a role (flipcash_support, usdf_admin, support_team, helpdesk). Score those under official_role. A handle that merely contains such a word while reading as a person or an ordinary phrase (admiral, helping_hand) does not.
+- Length alone is not the signal. A short handle is a claim when it is an exact match for a symbol a known entity is addressed by: a stock ticker (tsla, aapl, nvda), a token or currency symbol (btc, eth, usdc, usdf), or an institution's initials (fbi, irs, sec, fdic). Score those on the entity they name.
+- Otherwise, short or ambiguous handles score low. Two or three characters that match no known entity are rarely a claim to anything. That leniency is about squatting only, and never excuses a short handle that spells a slur or an explicit term.
+- The categories above about what the handle says are judged separately from all of the above. They need no entity, no brand, and no claim of office: score them on the words the handle spells once it is read through its substitutions, whoever the holder is otherwise taken to be.
+
+Respond with only a JSON object mapping each category to its score. No other text. Evaluate the entire text as a username.`, usernameFlagThreshold)
 
 	displayNameFlagThreshold = 0.5
 
-	displayNameSystemPrompt = `You are a moderation system that evaluates user-chosen display names for a peer-to-peer payments app. A display name appears next to the user in chats, contact lists, and payment confirmations, so it is a surface users can abuse to advertise, solicit, or expose others to harmful content.
+	displayNameSystemPrompt = fmt.Sprintf(`You are a moderation system that evaluates user-chosen display names for a peer-to-peer payments app. A display name appears next to the user in chats, contact lists, and payment confirmations, so it is a surface users can abuse to advertise, solicit, or expose others to harmful content.
 
 Users are free to call themselves whatever they like, including the name of a real person, celebrity, company, brand, or product. That is not a violation and must not be scored.
 
@@ -73,10 +122,10 @@ Score each category from 0.0 (no match) to 1.0 (clear match):
 Rules:
 - Ordinary personal names, nicknames, usernames, and handles in any language or script are NOT violations. Do not flag a name merely because it is non-English, transliterated, or unfamiliar. Common given names and surnames that happen to coincide with a crude word score low absent other signals.
 - Score based on the whole name, including obfuscation. Read leetspeak, homoglyphs, inserted spacing, and zero-width characters as the letters they imitate, so that an evaded slur or an obscured URL is scored the same as a plain one.
-- Only score above 0.5 when the interpretation is clear. Short or ambiguous strings score low.
+- Score %.1f or higher only when the interpretation is clear. Short or ambiguous strings score low.
 - Emoji, stylization, and unusual capitalization are not themselves violations.
 
-Respond with only a JSON object mapping each category to its score. No other text. Evaluate the entire text as a display name.`
+Respond with only a JSON object mapping each category to its score. No other text. Evaluate the entire text as a display name.`, displayNameFlagThreshold)
 )
 
 type client struct {
@@ -85,7 +134,7 @@ type client struct {
 }
 
 // NewClient creates a moderation client that uses Claude Sonnet for currency
-// name and display name classification.
+// name, username, and display name classification.
 func NewClient(apiKey string) moderation.Client {
 	return &client{
 		apiKey:     apiKey,
@@ -106,6 +155,15 @@ func (c *client) ClassifyCurrencyName(ctx context.Context, name string) (*modera
 	defer tracer.End()
 
 	res, err := c.classifyCurrencyName(ctx, name)
+	tracer.OnError(err)
+	return res, err
+}
+
+func (c *client) ClassifyUsername(ctx context.Context, username string) (*moderation.Result, error) {
+	tracer := metrics.TraceMethodCall(ctx, metricsStructName, "ClassifyUsername")
+	defer tracer.End()
+
+	res, err := c.classifyUsername(ctx, username)
 	tracer.OnError(err)
 	return res, err
 }
@@ -151,6 +209,14 @@ func (c *client) classifyCurrencyName(ctx context.Context, name string) (*modera
 		return nil, err
 	}
 	return toResult(scores, currencyNameFlagThreshold), nil
+}
+
+func (c *client) classifyUsername(ctx context.Context, username string) (*moderation.Result, error) {
+	scores, err := c.score(ctx, usernameSystemPrompt, username)
+	if err != nil {
+		return nil, err
+	}
+	return toResult(scores, usernameFlagThreshold), nil
 }
 
 func (c *client) classifyDisplayName(ctx context.Context, name string) (*moderation.Result, error) {

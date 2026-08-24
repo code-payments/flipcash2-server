@@ -35,7 +35,10 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 		testTipCardCustomization,
 		testUsernameIsPublic,
 		testGetProfileByUsername,
+		testSetUsername,
+		testSetUsernameStaffGated,
 		testDisplayNameModeration,
+		testUsernameModeration,
 	} {
 		tf(t, accounts, profiles)
 		teardown()
@@ -109,7 +112,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient())
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -292,7 +295,7 @@ func testTipCardCustomization(t *testing.T, accounts account.Store, profiles pro
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient())
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -357,9 +360,9 @@ func testTipCardCustomization(t *testing.T, accounts account.Store, profiles pro
 	})
 }
 
-// testUsernameIsPublic covers the read side of usernames, which is all the API
-// exposes so far: there is no RPC to claim one yet, so the handle is seeded
-// through the store the way a claim would leave it.
+// testUsernameIsPublic covers the read side of usernames: a handle is visible to
+// anyone, with no auth. It is seeded through the store rather than claimed over
+// the RPC, which testSetUsername covers.
 func testUsernameIsPublic(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
@@ -367,7 +370,7 @@ func testUsernameIsPublic(t *testing.T, accounts account.Store, profiles profile
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient())
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -412,7 +415,7 @@ func testGetProfileByUsername(t *testing.T, accounts account.Store, profiles pro
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient())
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -479,6 +482,353 @@ func testGetProfileByUsername(t *testing.T, accounts account.Store, profiles pro
 	})
 }
 
+// testSetUsername covers claiming a handle over the RPC, with the staff gate off
+// so registration is the only thing standing between a user and a handle.
+func testSetUsername(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+
+	media, _, _ := newMedia()
+	moderator := &fakeModerator{}
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, x.NewClient(), false)
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+
+	client := profilepb.NewProfileClient(cc)
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
+	require.NoError(t, err)
+
+	trySetUsername := func(keyPair *model.KeyPair, username string) (*profilepb.SetUsernameResponse, error) {
+		t.Helper()
+		req := &profilepb.SetUsernameRequest{Username: &commonpb.Username{Value: username}}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		return client.SetUsername(ctx, req)
+	}
+
+	setUsername := func(keyPair *model.KeyPair, username string) *profilepb.SetUsernameResponse {
+		t.Helper()
+		resp, err := trySetUsername(keyPair, username)
+		require.NoError(t, err)
+		return resp
+	}
+
+	// Read without auth, since a handle is public.
+	usernameOf := func(userID *commonpb.UserId) string {
+		t.Helper()
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
+		require.NoError(t, err)
+		return resp.GetUserProfile().GetUsername().GetValue()
+	}
+
+	t.Run("Unregistered user is denied", func(t *testing.T) {
+		resp := setUsername(&keyPair, "denied_user")
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_DENIED}, resp))
+
+		// A denial claims nothing, so the handle is still there for someone else.
+		require.Empty(t, usernameOf(userID))
+	})
+
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
+
+	t.Run("Handle is claimed", func(t *testing.T) {
+		resp := setUsername(&keyPair, "first_handle")
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_OK}, resp))
+		require.Equal(t, "first_handle", usernameOf(userID))
+
+		// The claim is what makes the profile reachable by handle.
+		byUsername, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{
+			Identifier: &profilepb.GetProfileRequest_Username{Username: &commonpb.Username{Value: "first_handle"}},
+		})
+		require.NoError(t, err)
+		require.Equal(t, profilepb.GetProfileResponse_OK, byUsername.Result)
+		require.Equal(t, userID.Value, byUsername.UserProfile.UserId.Value)
+	})
+
+	t.Run("Re-claiming the same handle is a no-op", func(t *testing.T) {
+		moderator.classifiedUsername = ""
+
+		require.Equal(t, profilepb.SetUsernameResponse_OK, setUsername(&keyPair, "first_handle").Result)
+		require.Equal(t, "first_handle", usernameOf(userID))
+
+		// Nothing about the handle changed, so it is not judged a second time — it
+		// was moderated when it was first claimed.
+		require.Empty(t, moderator.classifiedUsername)
+	})
+
+	t.Run("Reserved word is refused", func(t *testing.T) {
+		for _, reserved := range []string{"flipcash", "flipcash_admin", "pay_flipcash"} {
+			moderator.classifiedUsername = ""
+
+			resp := setUsername(&keyPair, reserved)
+			require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_RESERVED_WORD}, resp), "username: %q", reserved)
+
+			// Nobody may hold it, so it is refused on the handle alone — without a
+			// classification, and without the handle being claimed.
+			require.Empty(t, moderator.classifiedUsername)
+
+			getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{
+				Identifier: &profilepb.GetProfileRequest_Username{Username: &commonpb.Username{Value: reserved}},
+			})
+			require.NoError(t, err)
+			require.Equal(t, profilepb.GetProfileResponse_NOT_FOUND, getResp.Result)
+		}
+
+		// The handle the user already held is untouched.
+		require.Equal(t, "first_handle", usernameOf(userID))
+	})
+
+	// A handle that is not in canonical form never reaches the RPC: the wire
+	// contract on common.v1.Username is the same pattern the store enforces, so
+	// request validation turns it away first. INVALID_USERNAME is what the RPC
+	// answers with where that validation is not in front of it.
+	t.Run("Malformed handle is rejected before the RPC", func(t *testing.T) {
+		for _, invalid := range []string{
+			"",
+			"a",
+			"sixteen_chars_ab",
+			"has space",
+			"has-dash",
+			"emoji_🙂",
+			"MiXeD_Case",
+		} {
+			_, err := trySetUsername(&keyPair, invalid)
+			require.Equal(t, codes.InvalidArgument, status.Code(err), "username: %q", invalid)
+		}
+
+		// The handle the user already held is untouched by any of the rejections.
+		require.Equal(t, "first_handle", usernameOf(userID))
+	})
+
+	t.Run("A handle has one holder", func(t *testing.T) {
+		otherUserID := model.MustGenerateUserID()
+		otherKeyPair := model.MustGenerateKeyPair()
+		_, err := accounts.Bind(ctx, otherUserID, otherKeyPair.Proto())
+		require.NoError(t, err)
+		require.NoError(t, accounts.SetRegistrationFlag(ctx, otherUserID, true))
+
+		moderator.classifiedUsername = ""
+
+		resp := setUsername(&otherKeyPair, "first_handle")
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_ALREADY_TAKEN}, resp))
+		require.Empty(t, usernameOf(otherUserID))
+
+		// A handle that is already gone is turned away before it costs a
+		// classification.
+		require.Empty(t, moderator.classifiedUsername)
+
+		// Once the holder moves off it, the handle is claimable again.
+		require.Equal(t, profilepb.SetUsernameResponse_OK, setUsername(&keyPair, "second_handle").Result)
+		require.Equal(t, profilepb.SetUsernameResponse_OK, setUsername(&otherKeyPair, "first_handle").Result)
+		require.Equal(t, "first_handle", usernameOf(otherUserID))
+		require.Equal(t, "second_handle", usernameOf(userID))
+	})
+}
+
+// testSetUsernameStaffGated covers the rollout gate: while it is on, claiming a
+// handle is staff-only, and everyone else is denied however registered they are.
+func testSetUsernameStaffGated(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+	media, _, _ := newMedia()
+
+	newClient := func(accounts account.Store) profilepb.ProfileClient {
+		t.Helper()
+		serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), true)
+		cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+			profilepb.RegisterProfileServer(s, serv)
+		}))
+		return profilepb.NewProfileClient(cc)
+	}
+
+	setUsername := func(client profilepb.ProfileClient, keyPair *model.KeyPair, username string) *profilepb.SetUsernameResponse {
+		t.Helper()
+		req := &profilepb.SetUsernameRequest{Username: &commonpb.Username{Value: username}}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		resp, err := client.SetUsername(ctx, req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
+	require.NoError(t, err)
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
+
+	t.Run("Non-staff user is denied", func(t *testing.T) {
+		resp := setUsername(newClient(accounts), &keyPair, "gated_handle")
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_DENIED}, resp))
+
+		getResp, err := newClient(accounts).GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
+		require.NoError(t, err)
+		require.Nil(t, getResp.GetUserProfile().GetUsername())
+	})
+
+	// Neither account store lets a test flag a user as staff, so the staff answer is
+	// substituted to cover the other side of the gate.
+	t.Run("Staff user is allowed", func(t *testing.T) {
+		client := newClient(&staffAccounts{Store: accounts})
+
+		resp := setUsername(client, &keyPair, "gated_handle")
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_OK}, resp))
+
+		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
+		require.NoError(t, err)
+		require.Equal(t, "gated_handle", getResp.GetUserProfile().GetUsername().GetValue())
+	})
+}
+
+// staffAccounts answers every staff check with yes, leaving the rest of the store
+// as it is. It stands in for a staff flag the account stores expose no setter for.
+type staffAccounts struct {
+	account.Store
+}
+
+func (s *staffAccounts) IsStaff(context.Context, *commonpb.UserId) (bool, error) {
+	return true, nil
+}
+
+func testUsernameModeration(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+	media, _, _ := newMedia()
+
+	moderator := &fakeModerator{}
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, x.NewClient(), false)
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+	client := profilepb.NewProfileClient(cc)
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
+	require.NoError(t, err)
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
+
+	setUsername := func(username string) (*profilepb.SetUsernameResponse, error) {
+		t.Helper()
+		req := &profilepb.SetUsernameRequest{Username: &commonpb.Username{Value: username}}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		return client.SetUsername(ctx, req)
+	}
+
+	username := func() string {
+		t.Helper()
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
+		require.NoError(t, err)
+		return resp.GetUserProfile().GetUsername().GetValue()
+	}
+
+	// Each subtest configures the moderator from a clean slate, so a verdict left
+	// behind by an earlier one cannot be what makes a later one pass.
+	reset := func() {
+		*moderator = fakeModerator{}
+	}
+
+	t.Run("Clean handle is moderated and claimed", func(t *testing.T) {
+		reset()
+
+		resp, err := setUsername("clean_handle")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetUsernameResponse_OK, resp.Result)
+		require.Equal(t, "clean_handle", username())
+
+		// The handle itself is what was judged, not some other rendering of it.
+		require.Equal(t, "clean_handle", moderator.classifiedUsername)
+	})
+
+	t.Run("Handle flagged as a username is rejected and not claimed", func(t *testing.T) {
+		reset()
+		moderator.usernameFlagged = true
+		moderator.usernameCategories = []string{"official_role"}
+
+		resp, err := setUsername("support_team")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetUsernameResponse_FAILED_MODERATED, resp.Result)
+		require.Equal(t, moderationpb.FlaggedCategory_IMPERSONATION, resp.FlaggedCategory)
+
+		// The handle the user already held is left untouched, and the flagged one is
+		// unclaimed — nobody can reach a profile by it.
+		require.Equal(t, "clean_handle", username())
+		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{
+			Identifier: &profilepb.GetProfileRequest_Username{Username: &commonpb.Username{Value: "support_team"}},
+		})
+		require.NoError(t, err)
+		require.Equal(t, profilepb.GetProfileResponse_NOT_FOUND, getResp.Result)
+	})
+
+	t.Run("Handle flagged as text is rejected and not claimed", func(t *testing.T) {
+		reset()
+		moderator.textFlagged = true
+		moderator.textCategories = []string{"general_nsfw"}
+
+		resp, err := setUsername("bad_handle")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetUsernameResponse_FAILED_MODERATED, resp.Result)
+		require.Equal(t, moderationpb.FlaggedCategory_NSFW, resp.FlaggedCategory)
+
+		require.Equal(t, "clean_handle", username())
+	})
+
+	t.Run("Username category is reported when both classifiers flag", func(t *testing.T) {
+		reset()
+		moderator.textFlagged = true
+		moderator.textCategories = []string{"general_nsfw"}
+		moderator.usernameFlagged = true
+		moderator.usernameCategories = []string{"official_role"}
+
+		resp, err := setUsername("bad_admin")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetUsernameResponse_FAILED_MODERATED, resp.Result)
+		require.Equal(t, moderationpb.FlaggedCategory_IMPERSONATION, resp.FlaggedCategory)
+
+		require.Equal(t, "clean_handle", username())
+	})
+
+	t.Run("Handle the text classifier cannot identify a language for is still allowed", func(t *testing.T) {
+		reset()
+		// A handle is short and has no whitespace, so the text classifier routinely
+		// has too little to work with. The username classifier still covers it.
+		moderator.textErr = moderation.ErrUnsupportedLanguage
+
+		resp, err := setUsername("unjudged_text")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetUsernameResponse_OK, resp.Result)
+		require.Equal(t, "unjudged_text", username())
+	})
+
+	t.Run("Handle the text classifier fails on fails closed", func(t *testing.T) {
+		reset()
+		moderator.textErr = errors.New("classifier unavailable")
+
+		_, err := setUsername("unclassifiable")
+		require.Equal(t, codes.Internal, status.Code(err))
+
+		require.Equal(t, "unjudged_text", username())
+	})
+
+	t.Run("Handle the username classifier fails on fails closed", func(t *testing.T) {
+		reset()
+		moderator.usernameErr = errors.New("classifier unavailable")
+
+		_, err := setUsername("unclassifiable")
+		require.Equal(t, codes.Internal, status.Code(err))
+
+		require.Equal(t, "unjudged_text", username())
+	})
+}
+
 func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
@@ -486,7 +836,7 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, blobs, access := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient())
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -688,7 +1038,7 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 	media, _, _ := newMedia()
 
 	moderator := &fakeModerator{}
-	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, x.NewClient())
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -804,10 +1154,10 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 	})
 }
 
-// fakeModerator is a configurable moderation.Client for the display-name tests.
-// SetDisplayName runs both ClassifyText and ClassifyDisplayName, so each is
-// configured independently; ClassifyImage, ClassifyCurrencyName, and
-// ClassifyUsername are here only to satisfy the interface.
+// fakeModerator is a configurable moderation.Client for the display-name and
+// username tests. Each of those paths runs the general text classifier alongside
+// its own, so every classifier is configured independently; ClassifyImage and
+// ClassifyCurrencyName are here only to satisfy the interface.
 type fakeModerator struct {
 	textFlagged    bool
 	textCategories []string
@@ -816,6 +1166,14 @@ type fakeModerator struct {
 	displayNameFlagged    bool
 	displayNameCategories []string
 	displayNameErr        error
+
+	usernameFlagged    bool
+	usernameCategories []string
+	usernameErr        error
+
+	// classifiedUsername records the handle ClassifyUsername last saw, so a test
+	// can assert the moderator judged the canonical form rather than what was typed.
+	classifiedUsername string
 }
 
 func (m *fakeModerator) ClassifyText(context.Context, string) (*moderation.Result, error) {
@@ -834,8 +1192,9 @@ func (m *fakeModerator) ClassifyCurrencyName(context.Context, string) (*moderati
 	return &moderation.Result{}, nil
 }
 
-func (m *fakeModerator) ClassifyUsername(context.Context, string) (*moderation.Result, error) {
-	return &moderation.Result{}, nil
+func (m *fakeModerator) ClassifyUsername(_ context.Context, username string) (*moderation.Result, error) {
+	m.classifiedUsername = username
+	return fakeResult(m.usernameFlagged, m.usernameCategories, m.usernameErr)
 }
 
 func fakeResult(flagged bool, categories []string, err error) (*moderation.Result, error) {

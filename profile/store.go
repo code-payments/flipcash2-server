@@ -14,7 +14,6 @@ var ErrNotFound = errors.New("not found")
 var ErrInvalidDisplayName = errors.New("invalid display name")
 var ErrInvalidUsername = errors.New("invalid username")
 var ErrUsernameTaken = errors.New("username taken")
-var ErrUsernameAlreadySet = errors.New("username already set")
 var ErrExistingSocialLink = errors.New("existing social link")
 
 // PhoneForPayment is a payment-enabled phone number together with the user that
@@ -35,13 +34,14 @@ type Store interface {
 	// ErrInvalidDisplayName is returned if there is an issue with the display name.
 	SetDisplayName(ctx context.Context, id *commonpb.UserId, displayName string) error
 
-	// SetUsername claims username as the user's handle. A handle is claimed once
-	// and kept: ErrUsernameAlreadySet is returned when the user already holds a
-	// different one, while re-claiming the handle they already hold is a no-op.
+	// SetUsername claims username as the user's handle, replacing any handle they
+	// already hold — which, having no holder any more, is immediately claimable by
+	// anyone else.
 	//
 	// username must already be in canonical form, so callers normalize what a user
 	// typed before claiming it; ErrInvalidUsername is returned otherwise. A handle
-	// has one holder: ErrUsernameTaken is returned when another user holds it.
+	// has one holder at a time: ErrUsernameTaken is returned when another user
+	// holds it, while re-claiming the handle the user already holds is a no-op.
 	SetUsername(ctx context.Context, id *commonpb.UserId, username string) error
 
 	// GetUserIdByUsername returns the user currently holding the given handle,

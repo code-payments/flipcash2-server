@@ -30,7 +30,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 		testServer_Resolve_ByPhoneNumber_NotEnabledForPayment,
 		testServer_Resolve_ByUsername_OK,
 		testServer_Resolve_ByUsername_NotFound,
-		testServer_Resolve_ByUsername_AfterRename,
+		testServer_Resolve_ByUsername_RenameRejected,
 		testServer_Resolve_Denied_Unregistered,
 		testServer_Resolve_Unauthorized,
 	} {
@@ -250,7 +250,7 @@ func testServer_Resolve_ByUsername_NotFound(t *testing.T, accounts account.Store
 	require.Nil(t, resp.Resolution)
 }
 
-func testServer_Resolve_ByUsername_AfterRename(t *testing.T, accounts account.Store, profiles profile.Store) {
+func testServer_Resolve_ByUsername_RenameRejected(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles)
 
@@ -280,15 +280,15 @@ func testServer_Resolve_ByUsername_AfterRename(t *testing.T, accounts account.St
 	require.Equal(t, resolverpb.ResolveResponse_OK, resp.Result)
 	require.Equal(t, targetKeys.Proto().Value, resp.Resolution.GetAddress().Value)
 
-	// Renaming moves the resolution to the new handle and leaves the old one with
-	// no holder.
-	require.NoError(t, profiles.SetUsername(ctx, targetID, "new_handle"))
+	// A handle is claimed once and kept, so a rejected rename leaves the
+	// resolution where it was and gives the new handle no holder.
+	require.ErrorIs(t, profiles.SetUsername(ctx, targetID, "new_handle"), profile.ErrUsernameAlreadySet)
 
-	resp = resolve("new_handle")
+	resp = resolve("old_handle")
 	require.Equal(t, resolverpb.ResolveResponse_OK, resp.Result)
 	require.Equal(t, targetKeys.Proto().Value, resp.Resolution.GetAddress().Value)
 
-	resp = resolve("old_handle")
+	resp = resolve("new_handle")
 	require.Equal(t, resolverpb.ResolveResponse_NOT_FOUND, resp.Result)
 	require.Nil(t, resp.Resolution)
 }

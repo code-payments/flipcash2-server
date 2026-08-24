@@ -126,7 +126,7 @@ var reservedExactWords = map[string]struct{}{
 	"media": {}, "news": {}, "newsletter": {}, "partners": {}, "podcast": {},
 	"press": {}, "pricing": {}, "privacy": {}, "roadmap": {}, "security": {},
 	"status": {}, "subscribe": {}, "subscriptions": {}, "support": {},
-	"terms": {}, "tos": {},
+	"terms": {}, "termsofservice": {}, "tos": {},
 
 	// Account and auth flows. "me", "my" and "id" are short but are exactly the
 	// kind of self-referential route that collides.
@@ -160,7 +160,8 @@ var reservedExactWords = map[string]struct{}{
 	"messages": {}, "money": {}, "pay": {}, "payment": {}, "payments": {},
 	"receive": {}, "referral": {}, "referrals": {}, "request": {},
 	"rewards": {}, "search": {}, "sell": {}, "send": {}, "swap": {}, "tip": {},
-	"tips": {}, "trade": {}, "transaction": {}, "transactions": {},
+	"tipcard": {}, "tipcardcreator": {}, "tips": {}, "trade": {},
+	"transaction": {}, "transactions": {},
 	"transfer": {}, "wallet": {}, "welcome": {}, "withdraw": {},
 
 	// The routes a claimable link is served from, and the words a claim is
@@ -174,10 +175,10 @@ var reservedExactWords = map[string]struct{}{
 	// here reads as the market or as the money rather than as someone trading in
 	// it.
 	"analytics": {}, "chart": {}, "charts": {}, "coin": {}, "coins": {},
-	"currencies": {}, "currency": {}, "dollar": {}, "dollars": {},
-	"featured": {}, "leaderboard": {}, "market": {}, "markets": {}, "new": {},
-	"popular": {}, "price": {}, "prices": {}, "stats": {}, "top": {},
-	"trending": {},
+	"currencies": {}, "currency": {}, "currencycreator": {}, "dollar": {},
+	"dollars": {}, "featured": {}, "leaderboard": {}, "market": {},
+	"markets": {}, "new": {}, "popular": {}, "price": {}, "prices": {},
+	"stats": {}, "top": {}, "trending": {},
 
 	// Trust, safety and compliance. These are plausible routes, but the reason
 	// to hold them is that a handle reporting fraud is a good way to commit it.
@@ -194,9 +195,9 @@ var reservedExactWords = map[string]struct{}{
 
 	// Technical routes, asset prefixes and crawler conventions.
 	"404": {}, "500": {}, "api": {}, "assets": {}, "callback": {}, "cdn": {},
-	"config": {}, "css": {}, "debug": {}, "default": {}, "demo": {}, "dev": {},
-	"developer": {}, "developers": {}, "doc": {}, "docs": {},
-	"documentation": {}, "embed": {}, "error": {}, "errors": {},
+	"config": {}, "css": {}, "data": {}, "debug": {}, "default": {},
+	"demo": {}, "dev": {}, "developer": {}, "developers": {}, "doc": {},
+	"docs": {}, "documentation": {}, "embed": {}, "error": {}, "errors": {},
 	"favicon": {}, "files": {}, "fonts": {}, "graphql": {}, "health": {},
 	"healthz": {}, "images": {}, "img": {}, "index": {}, "internal": {},
 	"js": {}, "manifest": {}, "metrics": {}, "ping": {}, "proxy": {},

@@ -170,12 +170,14 @@ var reservedExactWords = map[string]struct{}{
 	"get": {}, "go": {}, "link": {}, "links": {}, "promo": {}, "qr": {},
 	"redeem": {}, "refer": {}, "scan": {}, "share": {}, "voucher": {},
 
-	// The currency-launch surface. A handle here reads as the market itself
-	// rather than as someone trading in it.
+	// The currency-launch surface, and the words money itself goes by. A handle
+	// here reads as the market or as the money rather than as someone trading in
+	// it.
 	"analytics": {}, "chart": {}, "charts": {}, "coin": {}, "coins": {},
-	"currencies": {}, "currency": {}, "featured": {}, "leaderboard": {},
-	"market": {}, "markets": {}, "new": {}, "popular": {}, "price": {},
-	"prices": {}, "stats": {}, "top": {}, "trending": {},
+	"currencies": {}, "currency": {}, "dollar": {}, "dollars": {},
+	"featured": {}, "leaderboard": {}, "market": {}, "markets": {}, "new": {},
+	"popular": {}, "price": {}, "prices": {}, "stats": {}, "top": {},
+	"trending": {},
 
 	// Trust, safety and compliance. These are plausible routes, but the reason
 	// to hold them is that a handle reporting fraud is a good way to commit it.

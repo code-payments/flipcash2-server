@@ -129,8 +129,10 @@ func dbSetUsername(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.Use
 	}
 
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, $2, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "username" = $2 WHERE ` + usersTableName + `."id" = $1`
-		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), username)
+		// The update is guarded on the user holding no handle yet, or holding this
+		// very one, so a claim never overwrites the handle a user already has.
+		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, $2, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "username" = $2 WHERE ` + usersTableName + `."username" IS NULL OR ` + usersTableName + `."username" = $2`
+		res, err := tx.Exec(ctx, query, pg.Encode(userID.Value), username)
 		// The id conflict is handled above, so the only unique constraint left to
 		// trip is the one holding a handle to a single user. Letting the constraint
 		// report the conflict is what keeps two users claiming the same handle at
@@ -138,7 +140,16 @@ func dbSetUsername(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.Use
 		if err != nil && strings.Contains(err.Error(), "23505") { // todo: better utility for detecting unique violations with pgx.Tx
 			return profile.ErrUsernameTaken
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		// The insert creates the row when the user is unknown, so the guard is the
+		// only thing that can leave the row untouched: the user holds a different
+		// handle already.
+		if res.RowsAffected() == 0 {
+			return profile.ErrUsernameAlreadySet
+		}
+		return nil
 	})
 }
 

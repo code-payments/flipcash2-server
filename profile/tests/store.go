@@ -451,12 +451,12 @@ func testUsername(t *testing.T, s profile.Store) {
 		require.Equal(t, user1.Value, got.Value)
 	}
 
-	// A handle has one holder: a second user cannot take it, and the failed claim
-	// leaves the handle they already held alone.
-	require.ErrorIs(t, s.SetUsername(ctx, user2, "user_one"), profile.ErrUsernameTaken)
-	p, err = s.GetProfile(ctx, user2, false)
-	require.NoError(t, err)
-	require.Equal(t, "user_two", p.Username.Value)
+	// A handle has one holder: a user who holds none cannot take one that is held,
+	// and the failed claim leaves them holding none.
+	user3 := model.MustGenerateUserID()
+	require.ErrorIs(t, s.SetUsername(ctx, user3, "user_one"), profile.ErrUsernameTaken)
+	_, err = s.GetProfile(ctx, user3, false)
+	require.ErrorIs(t, err, profile.ErrNotFound)
 
 	// Re-claiming the handle a user already holds is a no-op, not a conflict.
 	require.NoError(t, s.SetUsername(ctx, user1, "user_one"))
@@ -464,20 +464,24 @@ func testUsername(t *testing.T, s profile.Store) {
 	require.NoError(t, err)
 	require.Equal(t, "user_one", p.Username.Value)
 
-	// Changing a handle replaces the old one rather than accumulating, and frees
-	// it for anyone else to take.
-	require.NoError(t, s.SetUsername(ctx, user1, "renamed"))
+	// A handle is claimed once and kept: a user holding one cannot swap it for
+	// another, whether or not anyone else holds that other one.
+	for _, other := range []string{"renamed", "user_two"} {
+		require.ErrorIs(t, s.SetUsername(ctx, user1, other), profile.ErrUsernameAlreadySet)
+	}
 	p, err = s.GetProfile(ctx, user1, false)
 	require.NoError(t, err)
-	require.Equal(t, "renamed", p.Username.Value)
+	require.Equal(t, "user_one", p.Username.Value)
 
-	_, err = s.GetUserIdByUsername(ctx, "user_one")
+	// The rejected claim leaves the handle unheld, so it is still there for anyone
+	// who has yet to claim one.
+	_, err = s.GetUserIdByUsername(ctx, "renamed")
 	require.ErrorIs(t, err, profile.ErrNotFound)
 
-	require.NoError(t, s.SetUsername(ctx, user2, "user_one"))
-	got, err := s.GetUserIdByUsername(ctx, "user_one")
+	require.NoError(t, s.SetUsername(ctx, user3, "renamed"))
+	got, err := s.GetUserIdByUsername(ctx, "renamed")
 	require.NoError(t, err)
-	require.Equal(t, user2.Value, got.Value)
+	require.Equal(t, user3.Value, got.Value)
 
 	// The batch read carries handles the same way the single one does — it is the
 	// path chat member rows are built from.
@@ -487,8 +491,8 @@ func testUsername(t *testing.T, s profile.Store) {
 	publicProfiles, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{user1, user2, noUsername})
 	require.NoError(t, err)
 	require.Len(t, publicProfiles, 3)
-	require.Equal(t, "renamed", publicProfiles[string(user1.Value)].Username.Value)
-	require.Equal(t, "user_one", publicProfiles[string(user2.Value)].Username.Value)
+	require.Equal(t, "user_one", publicProfiles[string(user1.Value)].Username.Value)
+	require.Equal(t, "user_two", publicProfiles[string(user2.Value)].Username.Value)
 	require.Nil(t, publicProfiles[string(noUsername.Value)].Username)
 	for _, publicProfile := range publicProfiles {
 		require.NoError(t, publicProfile.Validate())

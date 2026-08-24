@@ -395,9 +395,12 @@ func testUsernameIsPublic(t *testing.T, accounts account.Store, profiles profile
 	// A user who has claimed nothing has no handle.
 	require.Nil(t, getUsername())
 
-	// A claim is reflected on the next read.
 	require.NoError(t, profiles.SetUsername(ctx, userID, "my_handle"))
 	require.Equal(t, "my_handle", getUsername().Value)
+
+	// A change is reflected on the next read.
+	require.NoError(t, profiles.SetUsername(ctx, userID, "renamed"))
+	require.Equal(t, "renamed", getUsername().Value)
 }
 
 // testGetProfileByUsername covers fetching a profile by the handle its holder

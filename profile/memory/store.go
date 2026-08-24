@@ -167,16 +167,8 @@ func (m *InMemoryStore) SetUsername(_ context.Context, id *commonpb.UserId, user
 	defer m.Unlock()
 
 	targetKey := userIDCacheKey(id)
-	if held, ok := m.usernameByUser[targetKey]; ok {
-		// Re-claiming the handle the user already holds asks for the state they are
-		// already in, so it is a no-op rather than a conflict.
-		if held == username {
-			return nil
-		}
-		return profile.ErrUsernameAlreadySet
-	}
-	for _, held := range m.usernameByUser {
-		if held == username {
+	for key, held := range m.usernameByUser {
+		if key != targetKey && held == username {
 			return profile.ErrUsernameTaken
 		}
 	}

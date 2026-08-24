@@ -36,10 +36,12 @@ type Server struct {
 
 	xClient *x.Client
 
+	requireStaffForUsername bool
+
 	profilepb.UnimplementedProfileServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, media Media, moderator moderation.Client, xClient *x.Client) *Server {
+func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, media Media, moderator moderation.Client, xClient *x.Client, requireStaffForUsername bool) *Server {
 	return &Server{
 		log: log,
 
@@ -53,6 +55,8 @@ func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, p
 		moderator: moderator,
 
 		xClient: xClient,
+
+		requireStaffForUsername: requireStaffForUsername,
 	}
 }
 
@@ -175,6 +179,132 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 	}
 
 	return &profilepb.SetDisplayNameResponse{}, nil
+}
+
+func (s *Server) SetUsername(ctx context.Context, req *profilepb.SetUsernameRequest) (*profilepb.SetUsernameResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	// A handle is only ever held in canonical form, so whatever arrives is put in
+	// it before anything is checked against it — the moderator then classifies the
+	// handle that would actually be held, and the store is only handed a spelling
+	// it accepts. Request validation already enforces the same form on the wire,
+	// so this is what makes the RPC correct on its own rather than by virtue of
+	// what runs in front of it.
+	username := NormalizeUsername(req.GetUsername().GetValue())
+
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.String("username", username),
+	)
+
+	isRegistered, err := s.accounts.IsRegistered(ctx, userID)
+	if err != nil {
+		log.Warn("Failed to get registration flag", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to get registration flag")
+	} else if !isRegistered {
+		return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_DENIED}, nil
+	}
+
+	if s.requireStaffForUsername {
+		isStaff, err := s.accounts.IsStaff(ctx, userID)
+		if err != nil {
+			log.Warn("Failed to get staff flag", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to get staff flag")
+		} else if !isStaff {
+			return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_DENIED}, nil
+		}
+	}
+
+	// Validate before moderating, so a handle the store would reject anyway is
+	// never sent to a classifier.
+	if err := ValidateUsername(username); err != nil {
+		return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_INVALID_USERNAME}, nil
+	}
+
+	// A reserved word is refused on the handle alone, with no lookup and no
+	// classification: nobody may hold it, so who holds it now does not matter.
+	if IsUsernameReserved(username) {
+		return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_RESERVED_WORD}, nil
+	}
+
+	// Find who holds the handle before moderating, so neither a claim that cannot
+	// succeed nor one that changes nothing pays for a classification. This is not
+	// what makes the claim safe: another user can take the handle in between, which
+	// the store still catches below.
+	holder, err := s.profiles.GetUserIdByUsername(ctx, username)
+	switch {
+	case err == nil && bytes.Equal(holder.Value, userID.Value):
+		// The user already holds this handle, so there is nothing to persist and
+		// nothing new to judge — it was moderated when it was first claimed. A client
+		// retrying a claim it already made lands here.
+		return &profilepb.SetUsernameResponse{}, nil
+	case err == nil:
+		return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_ALREADY_TAKEN}, nil
+	case errors.Is(err, ErrNotFound):
+		// Nobody holds it, so it is the caller's to claim.
+	default:
+		log.Warn("Failed to get user by username", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to set username")
+	}
+
+	if s.moderator != nil {
+		// Moderate before claiming, so a flagged handle is never briefly held — and
+		// never briefly addressable by anyone who guesses it. Both classifiers run:
+		// the username classifier covers what a handle uniquely risks (squatting an
+		// identity, reading as an official role), and the general text classifier
+		// adds what it can on top.
+		textResult, err := s.moderator.ClassifyText(ctx, username)
+		if err != nil && !errors.Is(err, moderation.ErrUnsupportedLanguage) {
+			log.Warn("Failed to classify username as text", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to moderate username")
+		}
+		// ErrUnsupportedLanguage is not fatal here. A handle is at most 15 characters
+		// with no whitespace, so the text classifier frequently has too little to
+		// identify a language from, and the username classifier below still covers it.
+
+		usernameResult, err := s.moderator.ClassifyUsername(ctx, username)
+		if err != nil {
+			// A handle that cannot be classified is never claimed, since allowing it
+			// would leave an unmoderated handle in place.
+			log.Warn("Failed to classify username", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to moderate username")
+		}
+
+		// The username result is checked first so that its handle-specific category
+		// is the one reported when both classifiers flag. Their scores are on
+		// different scales, so they cannot be merged and ranked together.
+		for _, result := range []*moderation.Result{usernameResult, textResult} {
+			if result == nil || !result.Flagged {
+				continue
+			}
+
+			log.Info("Username is flagged", zap.Strings("categories", result.FlaggedCategories))
+			return &profilepb.SetUsernameResponse{
+				Result:          profilepb.SetUsernameResponse_FAILED_MODERATED,
+				FlaggedCategory: moderation.HighestFlaggedCategory(result),
+			}, nil
+		}
+	}
+
+	if err := s.profiles.SetUsername(ctx, userID, username); err != nil {
+		switch {
+		case errors.Is(err, ErrUsernameTaken):
+			return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_ALREADY_TAKEN}, nil
+		case errors.Is(err, ErrInvalidUsername):
+			// Validated above, so this only trips if the store's notion of a valid
+			// handle drifted from ValidateUsername.
+			log.Warn("Store rejected a validated username")
+			return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_INVALID_USERNAME}, nil
+		default:
+			log.Warn("Failed to set username", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to set username")
+		}
+	}
+
+	return &profilepb.SetUsernameResponse{}, nil
 }
 
 func (s *Server) SetProfilePicture(ctx context.Context, req *profilepb.SetProfilePictureRequest) (*profilepb.SetProfilePictureResponse, error) {

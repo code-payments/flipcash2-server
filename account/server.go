@@ -45,6 +45,7 @@ var (
 	DefaultNewCurrencyFeeAmount      = ocp_common.ToCoreMintQuarks(10)
 	DefaulWithdrawalFeeAmount        = ocp_common.ToCoreMintQuarks(5) / 10
 	MinHolderValue                   = ocp_common.ToCoreMintQuarks(10)
+	MinUsernameTotalBalance          = ocp_common.ToCoreMintQuarks(100)
 )
 
 type onRampProviderConfig struct {
@@ -290,6 +291,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			RequireCoinbaseEmailVerification: RequireCoinbaseEmailVerification,
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
 			TipPresets:                       tipPresets,
+			UsernameMinBalance:               MinUsernameTotalBalance,
 		},
 	}, nil
 }
@@ -327,6 +329,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			RequireCoinbaseEmailVerification: RequireCoinbaseEmailVerification,
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
 			TipPresets:                       tipPresets,
+			UsernameMinBalance:               MinUsernameTotalBalance,
 		},
 	}, nil
 }

@@ -57,7 +57,7 @@ func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, p
 }
 
 func (s *Server) GetProfile(ctx context.Context, req *profilepb.GetProfileRequest) (*profilepb.GetProfileResponse, error) {
-	log := s.log.With(zap.String("user_id", model.UserIDString(req.UserId)))
+	log := s.log
 
 	var requestingUserID *commonpb.UserId
 	var err error
@@ -66,12 +66,32 @@ func (s *Server) GetProfile(ctx context.Context, req *profilepb.GetProfileReques
 		if err != nil {
 			return nil, err
 		}
-		log = s.log.With(zap.String("requesting_user_id", model.UserIDString(req.UserId)))
+		log = log.With(zap.String("requesting_user_id", model.UserIDString(requestingUserID)))
 	}
 
-	includePrivateFields := requestingUserID != nil && bytes.Equal(req.UserId.Value, requestingUserID.Value)
+	var userID *commonpb.UserId
+	switch typed := req.Identifier.(type) {
+	case *profilepb.GetProfileRequest_UserId:
+		userID = typed.UserId
+	case *profilepb.GetProfileRequest_Username:
+		log = log.With(zap.String("username", typed.Username.Value))
 
-	profile, err := s.profiles.GetProfile(ctx, req.UserId, includePrivateFields)
+		userID, err = s.profiles.GetUserIdByUsername(ctx, typed.Username.Value)
+		if errors.Is(err, ErrNotFound) {
+			return &profilepb.GetProfileResponse{Result: profilepb.GetProfileResponse_NOT_FOUND}, nil
+		} else if err != nil {
+			log.Warn("Failed to get user by username", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to get profile")
+		}
+	default:
+		return nil, status.Error(codes.InvalidArgument, "unsupported identifier")
+	}
+
+	log = log.With(zap.String("user_id", model.UserIDString(userID)))
+
+	includePrivateFields := requestingUserID != nil && bytes.Equal(userID.Value, requestingUserID.Value)
+
+	profile, err := s.profiles.GetProfile(ctx, userID, includePrivateFields)
 	if errors.Is(err, ErrNotFound) {
 		return &profilepb.GetProfileResponse{Result: profilepb.GetProfileResponse_NOT_FOUND}, nil
 	} else if err != nil {

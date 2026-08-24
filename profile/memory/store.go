@@ -84,6 +84,7 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 	}
 
 	clonedBaseProfile := proto.Clone(baseProfile).(*profilepb.UserProfile)
+	clonedBaseProfile.UserId = proto.Clone(id).(*commonpb.UserId)
 	clonedBaseProfile.JoinTs = timestamppb.New(m.createdAtByUser[key])
 	clonedBaseProfile.TipCardCustomization = m.tipCardCustomization(key)
 	clonedBaseProfile.Username = m.username(key)
@@ -223,6 +224,7 @@ func (m *InMemoryStore) GetPublicProfiles(_ context.Context, userIDs []*commonpb
 		// Only the public fields, and a fresh proto per user so a caller mutating
 		// what it gets back cannot reach into the store.
 		publicProfile := &profilepb.UserProfile{
+			UserId:               proto.Clone(userID).(*commonpb.UserId),
 			DisplayName:          p.DisplayName,
 			Username:             m.username(key),
 			JoinTs:               timestamppb.New(m.createdAtByUser[key]),

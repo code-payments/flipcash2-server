@@ -34,6 +34,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 		testProfilePicture,
 		testTipCardCustomization,
 		testUsernameIsPublic,
+		testGetProfileByUsername,
 		testDisplayNameModeration,
 	} {
 		tf(t, accounts, profiles)
@@ -119,7 +120,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 
 	t.Run("No User", func(t *testing.T) {
 		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{
-			UserId: userID,
+			Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID},
 		})
 		require.NoError(t, err)
 		require.Equal(t, profilepb.GetProfileResponse_NOT_FOUND, getResp.Result)
@@ -141,7 +142,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 		// Binding of a user does not fill in a profile: there is nothing to read
 		// back until one is set.
 		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{
-			UserId: userID,
+			Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID},
 		})
 		require.NoError(t, err)
 		requireProfileUnset(t, getResp)
@@ -155,12 +156,13 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetDisplayNameResponse{Result: profilepb.SetDisplayNameResponse_OK}, setDisplayNameResp))
 
 		expected := &profilepb.UserProfile{
+			UserId:               userID,
 			DisplayName:          "my name",
 			TipCardCustomization: profile.DefaultTipCardCustomization(),
 		}
 
 		getResp, err = client.GetProfile(ctx, &profilepb.GetProfileRequest{
-			UserId: userID,
+			Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID},
 		})
 		require.NoError(t, err)
 
@@ -187,7 +189,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 			},
 		})
 		getResp, err = client.GetProfile(ctx, &profilepb.GetProfileRequest{
-			UserId: userID,
+			Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID},
 		})
 		require.NoError(t, err)
 		require.NoError(t, protoutil.ProtoEqualError(expected, getResp.UserProfile))
@@ -205,7 +207,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 
 		expected.SocialProfiles = nil
 		getResp, err = client.GetProfile(ctx, &profilepb.GetProfileRequest{
-			UserId: userID,
+			Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID},
 		})
 		require.NoError(t, err)
 		require.NoError(t, protoutil.ProtoEqualError(expected, getResp.UserProfile))
@@ -215,7 +217,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 			require.NoError(t, profiles.LinkEmailAddress(ctx, userID, "someone@gmail.com"))
 
 			get := &profilepb.GetProfileRequest{
-				UserId: userID,
+				Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID},
 			}
 
 			getResp, err = client.GetProfile(ctx, get)
@@ -276,7 +278,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 		require.NoError(t, protoutil.ProtoEqualError(&profilepb.LinkSocialAccountResponse{Result: profilepb.LinkSocialAccountResponse_DENIED}, linkXAccountResp))
 
 		get, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{
-			UserId: userID2,
+			Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID2},
 		})
 		require.NoError(t, err)
 		requireProfileUnset(t, get)
@@ -315,7 +317,7 @@ func testTipCardCustomization(t *testing.T, accounts account.Store, profiles pro
 	// what any other user sees on the Tip Card.
 	getColorHex := func() string {
 		t.Helper()
-		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
 		require.NoError(t, err)
 		require.Equal(t, profilepb.GetProfileResponse_OK, resp.Result)
 		return resp.UserProfile.TipCardCustomization.Color.Hex
@@ -325,7 +327,7 @@ func testTipCardCustomization(t *testing.T, accounts account.Store, profiles pro
 		resp := updateTipCard(&commonpb.Color{Hex: "#19191A"})
 		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateTipCardResponse{Result: profilepb.UpdateTipCardResponse_DENIED}, resp))
 
-		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
 		require.NoError(t, err)
 		requireProfileUnset(t, getResp)
 	})
@@ -383,7 +385,7 @@ func testUsernameIsPublic(t *testing.T, accounts account.Store, profiles profile
 	// other user sees.
 	getUsername := func() *commonpb.Username {
 		t.Helper()
-		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
 		require.NoError(t, err)
 		require.Equal(t, profilepb.GetProfileResponse_OK, resp.Result)
 		require.NoError(t, resp.UserProfile.Validate())
@@ -396,6 +398,82 @@ func testUsernameIsPublic(t *testing.T, accounts account.Store, profiles profile
 	// A claim is reflected on the next read.
 	require.NoError(t, profiles.SetUsername(ctx, userID, "my_handle"))
 	require.Equal(t, "my_handle", getUsername().Value)
+}
+
+// testGetProfileByUsername covers fetching a profile by the handle its holder
+// claimed, which is the same profile the holder's user ID returns.
+func testGetProfileByUsername(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+
+	media, _, _ := newMedia()
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient())
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+
+	client := profilepb.NewProfileClient(cc)
+
+	getByUsername := func(username string, keyPair *model.KeyPair) *profilepb.GetProfileResponse {
+		t.Helper()
+		req := &profilepb.GetProfileRequest{
+			Identifier: &profilepb.GetProfileRequest_Username{
+				Username: &commonpb.Username{Value: username},
+			},
+		}
+		if keyPair != nil {
+			require.NoError(t, keyPair.Auth(req, &req.Auth))
+		}
+		resp, err := client.GetProfile(ctx, req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	t.Run("Unclaimed handle", func(t *testing.T) {
+		resp := getByUsername("nobody_holds_me", nil)
+		require.Equal(t, profilepb.GetProfileResponse_NOT_FOUND, resp.Result)
+		require.Nil(t, resp.UserProfile)
+	})
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
+	require.NoError(t, err)
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
+	require.NoError(t, profiles.SetDisplayName(ctx, userID, "my name"))
+	require.NoError(t, profiles.SetUsername(ctx, userID, "by_handle"))
+	require.NoError(t, profiles.LinkPhoneNumber(ctx, userID, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
+
+	t.Run("Claimed handle returns the holder's profile", func(t *testing.T) {
+		byUserID, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{
+			Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID},
+		})
+		require.NoError(t, err)
+		require.Equal(t, profilepb.GetProfileResponse_OK, byUserID.Result)
+
+		resp := getByUsername("by_handle", nil)
+		require.Equal(t, profilepb.GetProfileResponse_OK, resp.Result)
+		require.NoError(t, protoutil.ProtoEqualError(byUserID.UserProfile, resp.UserProfile))
+		require.Equal(t, "by_handle", resp.UserProfile.Username.Value)
+	})
+
+	// Private fields follow who is asking, not which identifier they asked with:
+	// the holder authorizing as themselves sees them, and nobody else does.
+	t.Run("Private fields are scoped to the holder", func(t *testing.T) {
+		otherKeyPair := model.MustGenerateKeyPair()
+		_, err := accounts.Bind(ctx, model.MustGenerateUserID(), otherKeyPair.Proto())
+		require.NoError(t, err)
+
+		resp := getByUsername("by_handle", &otherKeyPair)
+		require.Equal(t, profilepb.GetProfileResponse_OK, resp.Result)
+		require.Nil(t, resp.UserProfile.PhoneNumber)
+
+		resp = getByUsername("by_handle", &keyPair)
+		require.Equal(t, profilepb.GetProfileResponse_OK, resp.Result)
+		require.Equal(t, "+12223334444", resp.UserProfile.PhoneNumber.Value)
+	})
 }
 
 func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.Store) {
@@ -495,7 +573,7 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 		}
 
 		// None of the failures left a picture behind.
-		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
 		require.NoError(t, err)
 		require.Nil(t, getResp.UserProfile.GetProfilePicture())
 	})
@@ -523,7 +601,7 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 
 	t.Run("Get hydrates the picture", func(t *testing.T) {
 		// Unauthenticated: a profile picture is public.
-		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
 		require.NoError(t, err)
 		require.Equal(t, profilepb.GetProfileResponse_OK, getResp.Result)
 
@@ -541,7 +619,7 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 		require.Equal(t, second.Value, resp.ProfilePicture.Renditions[0].BlobId.Value)
 
 		// The profile now serves the new picture.
-		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
 		require.NoError(t, err)
 		require.Equal(t, second.Value, getResp.UserProfile.GetProfilePicture().GetRenditions()[0].BlobId.Value)
 
@@ -592,7 +670,7 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 		requireRenditionSet(t, resp.ProfilePicture.GetRenditions())
 
 		// ...and so does the public Get.
-		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
 		require.NoError(t, err)
 		require.Equal(t, profilepb.GetProfileResponse_OK, getResp.Result)
 		requireRenditionSet(t, getResp.UserProfile.GetProfilePicture().GetRenditions())
@@ -628,7 +706,7 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 
 	displayName := func() string {
 		t.Helper()
-		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{UserId: userID})
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
 		require.NoError(t, err)
 		return resp.GetUserProfile().GetDisplayName()
 	}

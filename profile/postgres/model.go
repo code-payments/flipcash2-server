@@ -8,6 +8,7 @@ import (
 	"github.com/georgysavva/scany/v2/pgxscan"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
@@ -91,6 +92,7 @@ func dbGetPublicProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 	}
 
 	userProfile := &profilepb.UserProfile{
+		UserId:               proto.Clone(userID).(*commonpb.UserId),
 		DisplayName:          *pointer.StringOrDefault(res.DisplayName, ""),
 		JoinTs:               timestamppb.New(res.CreatedAt),
 		TipCardCustomization: profile.TipCardCustomizationFromStored(res.TipCardColor),
@@ -217,6 +219,7 @@ func dbGetPublicProfiles(ctx context.Context, pool *pgxpool.Pool, userIDs []*com
 		}
 
 		userProfile := &profilepb.UserProfile{
+			UserId:               &commonpb.UserId{Value: rawID},
 			DisplayName:          *pointer.StringOrDefault(r.DisplayName, ""),
 			JoinTs:               timestamppb.New(r.CreatedAt),
 			TipCardCustomization: profile.TipCardCustomizationFromStored(r.TipCardColor),

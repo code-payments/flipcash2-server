@@ -1,6 +1,6 @@
 module github.com/code-payments/flipcash2-server
 
-go 1.26.0
+go 1.27.0
 
 require (
 	firebase.google.com/go/v4 v4.20.0
@@ -13,9 +13,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.42.3
 	github.com/aws/smithy-go v1.27.7
 	github.com/buckket/go-blurhash v1.1.0
-	github.com/code-payments/flipcash2-protobuf-api v1.21.1-0.20260824200111-0410e78f0b24
-	github.com/code-payments/ocp-protobuf-api v1.14.1-0.20260818131607-042819236352
-	github.com/code-payments/ocp-server v1.22.1-0.20260819190128-7f9d0f899390
+	github.com/code-payments/flipcash2-protobuf-api v1.22.0
+	github.com/code-payments/ocp-protobuf-api v1.16.0
+	github.com/code-payments/ocp-server v1.24.0
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2
 	github.com/forPelevin/gomoji v1.4.1
 	github.com/gen2brain/webp v0.6.4

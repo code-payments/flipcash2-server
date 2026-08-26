@@ -16,6 +16,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/blob"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/moderation"
@@ -34,6 +35,8 @@ type Server struct {
 
 	moderator moderation.Client
 
+	balances *balance.Client
+
 	xClient *x.Client
 
 	requireStaffForUsername bool
@@ -41,7 +44,7 @@ type Server struct {
 	profilepb.UnimplementedProfileServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, media Media, moderator moderation.Client, xClient *x.Client, requireStaffForUsername bool) *Server {
+func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, media Media, moderator moderation.Client, balances *balance.Client, xClient *x.Client, requireStaffForUsername bool) *Server {
 	return &Server{
 		log: log,
 
@@ -53,6 +56,8 @@ func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, p
 		media: media,
 
 		moderator: moderator,
+
+		balances: balances,
 
 		xClient: xClient,
 
@@ -248,6 +253,30 @@ func (s *Server) SetUsername(ctx context.Context, req *profilepb.SetUsernameRequ
 	default:
 		log.Warn("Failed to get user by username", zap.Error(err))
 		return nil, status.Error(codes.Internal, "failed to set username")
+	}
+
+	// Gate on balance only once the handle is known to be claimable, so a user
+	// re-claiming the handle they already hold is never turned away for a balance
+	// that has since dropped, and a claim that would fail anyway costs no RPC. The
+	// gate sits ahead of moderation so an ineligible user never pays for a
+	// classification.
+	if s.balances != nil {
+		totalBalance, err := s.balances.GetTotalUsdfBalance(ctx, userID)
+		switch {
+		case err == nil:
+			if totalBalance < account.MinUsernameTotalBalance {
+				return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_INSUFFICIENT_BALANCE}, nil
+			}
+		case errors.Is(err, balance.ErrNotFound):
+			// A registered user without an owner account holds nothing, so the gate is
+			// what it would be at a zero balance.
+			return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_INSUFFICIENT_BALANCE}, nil
+		default:
+			// A balance that cannot be read leaves the gate unenforced, so the claim is
+			// refused rather than let through.
+			log.Warn("Failed to get total balance", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to get total balance")
+		}
 	}
 
 	if s.moderator != nil {

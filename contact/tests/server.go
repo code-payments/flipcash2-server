@@ -85,6 +85,8 @@ func newServerFixture(t *testing.T, accounts account.Store, profiles profile.Sto
 }
 
 func testServer_CheckSync(t *testing.T, accounts account.Store, profiles profile.Store, store contact.Store) {
+	t.Skip("contact list service disabled")
+
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 
@@ -111,6 +113,8 @@ func testServer_CheckSync(t *testing.T, accounts account.Store, profiles profile
 }
 
 func testServer_DeltaUpload_Success(t *testing.T, accounts account.Store, profiles profile.Store, store contact.Store) {
+	t.Skip("contact list service disabled")
+
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 
@@ -138,6 +142,8 @@ func testServer_DeltaUpload_Success(t *testing.T, accounts account.Store, profil
 }
 
 func testServer_DeltaUpload_Mismatch(t *testing.T, accounts account.Store, profiles profile.Store, store contact.Store) {
+	t.Skip("contact list service disabled")
+
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 
@@ -164,6 +170,8 @@ func testServer_DeltaUpload_Mismatch(t *testing.T, accounts account.Store, profi
 }
 
 func testServer_DeltaUpload_Drift(t *testing.T, accounts account.Store, profiles profile.Store, store contact.Store) {
+	t.Skip("contact list service disabled")
+
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 
@@ -195,6 +203,8 @@ func testServer_DeltaUpload_Drift(t *testing.T, accounts account.Store, profiles
 }
 
 func testServer_FullUpload_Success(t *testing.T, accounts account.Store, profiles profile.Store, store contact.Store) {
+	t.Skip("contact list service disabled")
+
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 
@@ -224,6 +234,8 @@ func testServer_FullUpload_Success(t *testing.T, accounts account.Store, profile
 }
 
 func testServer_FullUpload_Mismatch(t *testing.T, accounts account.Store, profiles profile.Store, store contact.Store) {
+	t.Skip("contact list service disabled")
+
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 
@@ -253,6 +265,8 @@ func testServer_FullUpload_Mismatch(t *testing.T, accounts account.Store, profil
 }
 
 func testServer_Unauthorized(t *testing.T, accounts account.Store, profiles profile.Store, store contact.Store) {
+	t.Skip("contact list service disabled")
+
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 
@@ -293,6 +307,8 @@ func testServer_Unauthorized(t *testing.T, accounts account.Store, profiles prof
 }
 
 func testServer_Unregistered(t *testing.T, accounts account.Store, profiles profile.Store, store contact.Store) {
+	t.Skip("contact list service disabled")
+
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
@@ -344,6 +360,8 @@ func testServer_Unregistered(t *testing.T, accounts account.Store, profiles prof
 }
 
 func testServer_GetFlipcashContacts_NotFound(t *testing.T, accounts account.Store, profiles profile.Store, store contact.Store) {
+	t.Skip("contact list service disabled")
+
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 
@@ -363,6 +381,8 @@ func testServer_GetFlipcashContacts_NotFound(t *testing.T, accounts account.Stor
 }
 
 func testServer_GetFlipcashContacts_ChecksumDrift(t *testing.T, accounts account.Store, profiles profile.Store, store contact.Store) {
+	t.Skip("contact list service disabled")
+
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 
@@ -385,6 +405,8 @@ func testServer_GetFlipcashContacts_ChecksumDrift(t *testing.T, accounts account
 }
 
 func testServer_GetFlipcashContacts_OK(t *testing.T, accounts account.Store, profiles profile.Store, store contact.Store) {
+	t.Skip("contact list service disabled")
+
 	ctx := context.Background()
 	f := newServerFixture(t, accounts, profiles, store)
 

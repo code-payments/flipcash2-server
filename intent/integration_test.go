@@ -213,6 +213,8 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 }
 
 func TestIntegration_AllowCreation_ContactDmPayment(t *testing.T) {
+	t.Skip("contact send feature disabled")
+
 	e := newIntegrationEnv()
 
 	senderUserID, senderKeys := e.bindUser(t)

@@ -62,6 +62,8 @@ func NewServer(
 }
 
 func (s *Server) CheckSync(ctx context.Context, req *contactpb.CheckSyncRequest) (*contactpb.CheckSyncResponse, error) {
+	return nil, status.Error(codes.Unavailable, "contact list service disabled")
+
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
 		return nil, err
@@ -95,6 +97,8 @@ func (s *Server) CheckSync(ctx context.Context, req *contactpb.CheckSyncRequest)
 }
 
 func (s *Server) DeltaUpload(ctx context.Context, req *contactpb.DeltaUploadRequest) (*contactpb.DeltaUploadResponse, error) {
+	return nil, status.Error(codes.Unavailable, "contact list service disabled")
+
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
 		return nil, err
@@ -137,6 +141,8 @@ func (s *Server) DeltaUpload(ctx context.Context, req *contactpb.DeltaUploadRequ
 }
 
 func (s *Server) FullUpload(stream contactpb.ContactList_FullUploadServer) error {
+	return status.Error(codes.Unavailable, "contact list service disabled")
+
 	ctx := stream.Context()
 
 	var userID *commonpb.UserId
@@ -217,6 +223,8 @@ func (s *Server) FullUpload(stream contactpb.ContactList_FullUploadServer) error
 }
 
 func (s *Server) GetFlipcashContacts(req *contactpb.GetFlipcashContactsRequest, stream contactpb.ContactList_GetFlipcashContactsServer) error {
+	return status.Error(codes.Unavailable, "contact list service disabled")
+
 	ctx := stream.Context()
 
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)

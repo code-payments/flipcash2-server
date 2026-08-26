@@ -71,7 +71,8 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 		case *intentpb.AppMetadata_Chat:
 			switch appMetadata.GetChat().GetType().(type) {
 			case *intentpb.ChatMetadata_ContactDmPayment_:
-				return i.validateContactDmAppMetadata(ctx, intentRecord, &appMetadata)
+				// return i.validateContactDmAppMetadata(ctx, intentRecord, &appMetadata)
+				return ocp_transaction.NewIntentDeniedError("contact send feature is disabled")
 			case *intentpb.ChatMetadata_TipDmPayment_:
 				return i.validateTipDmAppMetadata(ctx, intentRecord, &appMetadata)
 			default:

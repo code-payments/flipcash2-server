@@ -15,9 +15,11 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
+	ocp_balancepb "github.com/code-payments/ocp-protobuf-api/generated/go/balance/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/blob"
 	blobmemory "github.com/code-payments/flipcash2-server/blob/memory"
 	"github.com/code-payments/flipcash2-server/model"
@@ -37,6 +39,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 		testGetProfileByUsername,
 		testSetUsername,
 		testSetUsernameStaffGated,
+		testSetUsernameBalanceGated,
 		testDisplayNameModeration,
 		testUsernameModeration,
 	} {
@@ -112,7 +115,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -295,7 +298,7 @@ func testTipCardCustomization(t *testing.T, accounts account.Store, profiles pro
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -370,7 +373,7 @@ func testUsernameIsPublic(t *testing.T, accounts account.Store, profiles profile
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -415,7 +418,7 @@ func testGetProfileByUsername(t *testing.T, accounts account.Store, profiles pro
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -492,7 +495,7 @@ func testSetUsername(t *testing.T, accounts account.Store, profiles profile.Stor
 
 	media, _, _ := newMedia()
 	moderator := &fakeModerator{}
-	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, nil, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -641,7 +644,7 @@ func testSetUsernameStaffGated(t *testing.T, accounts account.Store, profiles pr
 
 	newClient := func(accounts account.Store) profilepb.ProfileClient {
 		t.Helper()
-		serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), true)
+		serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), true)
 		cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 			profilepb.RegisterProfileServer(s, serv)
 		}))
@@ -696,6 +699,133 @@ func (s *staffAccounts) IsStaff(context.Context, *commonpb.UserId) (bool, error)
 	return true, nil
 }
 
+// testSetUsernameBalanceGated covers the balance gate: a handle is only claimable
+// by a user holding at least MinUsernameTotalBalance, and what OCP reports is what
+// decides it.
+func testSetUsernameBalanceGated(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+	media, _, _ := newMedia()
+
+	ocpBalance := &fakeOcpBalance{}
+	moderator := &fakeModerator{}
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, balance.NewClient(log, accounts, ocpBalance), x.NewClient(), false)
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+	client := profilepb.NewProfileClient(cc)
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
+	require.NoError(t, err)
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
+
+	setUsername := func(username string) *profilepb.SetUsernameResponse {
+		t.Helper()
+		req := &profilepb.SetUsernameRequest{Username: &commonpb.Username{Value: username}}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		resp, err := client.SetUsername(ctx, req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	usernameOf := func(userID *commonpb.UserId) string {
+		t.Helper()
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
+		require.NoError(t, err)
+		return resp.GetUserProfile().GetUsername().GetValue()
+	}
+
+	t.Run("Below the minimum is refused", func(t *testing.T) {
+		ocpBalance.coreMintValue = account.MinUsernameTotalBalance - 1
+		moderator.classifiedUsername = ""
+
+		resp := setUsername("insufficient")
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_INSUFFICIENT_BALANCE}, resp))
+
+		// Nothing was claimed, and the gate sits ahead of moderation so the refusal
+		// costs no classification.
+		require.Empty(t, usernameOf(userID))
+		require.Empty(t, moderator.classifiedUsername)
+	})
+
+	t.Run("An owner OCP does not know holds nothing", func(t *testing.T) {
+		ocpBalance.result = ocp_balancepb.GetBalanceResponse_NOT_FOUND
+		ocpBalance.coreMintValue = 0
+
+		resp := setUsername("no_owner")
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_INSUFFICIENT_BALANCE}, resp))
+		require.Empty(t, usernameOf(userID))
+	})
+
+	// A balance that cannot be read leaves the gate unenforced, so the claim is
+	// refused rather than let through.
+	t.Run("An unreadable balance fails the claim", func(t *testing.T) {
+		ocpBalance.result = ocp_balancepb.GetBalanceResponse_OK
+		ocpBalance.err = errors.New("ocp is down")
+
+		req := &profilepb.SetUsernameRequest{Username: &commonpb.Username{Value: "ocp_is_down"}}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		_, err := client.SetUsername(ctx, req)
+		require.Equal(t, codes.Internal, status.Code(err))
+		require.Empty(t, usernameOf(userID))
+
+		ocpBalance.err = nil
+	})
+
+	t.Run("At the minimum the handle is claimed", func(t *testing.T) {
+		ocpBalance.coreMintValue = account.MinUsernameTotalBalance
+
+		resp := setUsername("enough_balance")
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_OK}, resp))
+		require.Equal(t, "enough_balance", usernameOf(userID))
+	})
+
+	// The gate sits behind the holder lookup, so a client retrying a claim it
+	// already made is answered from the handle it already holds rather than from a
+	// balance that has since dropped.
+	t.Run("Re-claiming a held handle survives a dropped balance", func(t *testing.T) {
+		ocpBalance.coreMintValue = 0
+
+		resp := setUsername("enough_balance")
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_OK}, resp))
+		require.Equal(t, "enough_balance", usernameOf(userID))
+	})
+
+	// A handle nobody may hold is refused on the handle alone, so the gate never
+	// gets a say and the claim costs no RPC.
+	t.Run("A reserved word is refused before the gate", func(t *testing.T) {
+		ocpBalance.calls = 0
+
+		resp := setUsername("flipcash")
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_RESERVED_WORD}, resp))
+		require.Zero(t, ocpBalance.calls)
+	})
+}
+
+// fakeOcpBalance stands in for the OCP Balance service, answering every owner
+// with whatever the test configured.
+type fakeOcpBalance struct {
+	result        ocp_balancepb.GetBalanceResponse_Result
+	coreMintValue uint64
+	err           error
+	calls         int
+}
+
+func (f *fakeOcpBalance) GetBalance(context.Context, *ocp_balancepb.GetBalanceRequest, ...grpc.CallOption) (*ocp_balancepb.GetBalanceResponse, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &ocp_balancepb.GetBalanceResponse{
+		Result:        f.result,
+		CoreMintValue: f.coreMintValue,
+	}, nil
+}
+
 func testUsernameModeration(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
@@ -704,7 +834,7 @@ func testUsernameModeration(t *testing.T, accounts account.Store, profiles profi
 	media, _, _ := newMedia()
 
 	moderator := &fakeModerator{}
-	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, nil, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -836,7 +966,7 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, blobs, access := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -1038,7 +1168,7 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 	media, _, _ := newMedia()
 
 	moderator := &fakeModerator{}
-	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, nil, x.NewClient(), false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))

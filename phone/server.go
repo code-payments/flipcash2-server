@@ -228,6 +228,8 @@ func (s *Server) LinkForPayment(ctx context.Context, req *phonepb.LinkForPayment
 	flipped, err := s.profiles.LinkPhoneNumberForPayment(ctx, userID, req.PhoneNumber.Value)
 	switch {
 	case err == nil:
+		return &phonepb.LinkForPaymentResponse{Result: phonepb.LinkForPaymentResponse_OK}, nil
+
 		if flipped {
 			phoneHash := s.hashPhoneNumber(req.PhoneNumber)
 			go s.notifyContactsOfJoin(context.Background(), log, userID, req.PhoneNumber, phoneHash)

@@ -29,6 +29,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testLinkPhoneNumberForPayment,
 		testProfilePictures,
 		testTipCardColor,
+		testMinDmChatInitFeeStore,
 		testUsername,
 		testJoinTs,
 	} {
@@ -403,6 +404,55 @@ func testTipCardColor(t *testing.T, s profile.Store) {
 	require.NoError(t, got[string(user2.Value)].Validate())
 	require.Equal(t, profile.DefaultTipCardColorHex, got[string(user1.Value)].TipCardCustomization.Color.Hex)
 	require.Equal(t, "#ABCDEF", got[string(user2.Value)].TipCardCustomization.Color.Hex)
+}
+
+func testMinDmChatInitFeeStore(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	user1 := model.MustGenerateUserID()
+	user2 := model.MustGenerateUserID()
+
+	// A user who has set no fee reads back none: the server default applies,
+	// and is not the store's to resolve.
+	require.NoError(t, s.SetDisplayName(ctx, user1, "user one"))
+	p, err := s.GetProfile(ctx, user1, false)
+	require.NoError(t, err)
+	require.Nil(t, p.MinDmChatInitFee)
+
+	// Setting a fee is enough on its own to make the store know a user, the same
+	// way setting any other profile field is.
+	fee := &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: 5}
+	require.NoError(t, s.SetMinDmChatInitFee(ctx, user2, fee))
+	p, err = s.GetProfile(ctx, user2, false)
+	require.NoError(t, err)
+	require.NoError(t, protoutil.ProtoEqualError(fee, p.MinDmChatInitFee))
+
+	// Fees are per user: user2's choice does not reach user1.
+	p, err = s.GetProfile(ctx, user1, false)
+	require.NoError(t, err)
+	require.Nil(t, p.MinDmChatInitFee)
+
+	// A second set replaces the first, currency included, rather than
+	// accumulating.
+	fee = &commonpb.FiatPaymentAmount{Currency: "eur", NativeAmount: 2.5}
+	require.NoError(t, s.SetMinDmChatInitFee(ctx, user2, fee))
+	p, err = s.GetProfile(ctx, user2, false)
+	require.NoError(t, err)
+	require.NoError(t, protoutil.ProtoEqualError(fee, p.MinDmChatInitFee))
+
+	// The fee is public, so it is present on reads that carry no private fields,
+	// through both the single and the batch path.
+	p, err = s.GetProfile(ctx, user2, true)
+	require.NoError(t, err)
+	require.NoError(t, protoutil.ProtoEqualError(fee, p.MinDmChatInitFee))
+
+	got, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{user1, user2})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.NoError(t, got[string(user1.Value)].Validate())
+	require.NoError(t, got[string(user2.Value)].Validate())
+	require.Nil(t, got[string(user1.Value)].MinDmChatInitFee)
+	require.NoError(t, protoutil.ProtoEqualError(fee, got[string(user2.Value)].MinDmChatInitFee))
 }
 
 func testUsername(t *testing.T, s profile.Store) {

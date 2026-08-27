@@ -54,10 +54,10 @@ type Store interface {
 	// fields any viewer may see, carrying no private ones. Unknown users are
 	// absent from the map. It resolves the whole set in a single lookup.
 	//
-	// Display name is empty, and username and profile picture nil, for a user who
-	// has set none of them, while the join timestamp and Tip Card customization are
-	// always set — so a present entry means "this user exists", not "this user
-	// filled in a profile".
+	// Display name is empty, and username, profile picture and minimum DM chat
+	// initialization fee nil, for a user who has set none of them, while the join
+	// timestamp and Tip Card customization are always set — so a present entry
+	// means "this user exists", not "this user filled in a profile".
 	//
 	// The returned picture carries only the blob holding its ORIGINAL rendition;
 	// resolving that blob's metadata is left to the caller.
@@ -71,6 +71,11 @@ type Store interface {
 	// replacing any colour already picked. colorHex is stored as given, so callers
 	// normalize it first.
 	SetTipCardColor(ctx context.Context, id *commonpb.UserId, colorHex string) error
+
+	// SetMinDmChatInitFee sets the minimum fee another user must pay to
+	// initialize a DM chat with the user, provided they exist, replacing any fee
+	// already set. fee is stored as given, so callers validate it first.
+	SetMinDmChatInitFee(ctx context.Context, id *commonpb.UserId, fee *commonpb.FiatPaymentAmount) error
 
 	// LinkPhoneNumber links the phone number and its precomputed hash to a user, provided
 	// they exist. Any other user previously holding the same phone number has both fields

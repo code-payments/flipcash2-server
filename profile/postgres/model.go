@@ -22,7 +22,7 @@ import (
 
 const (
 	usersTableName = "flipcash_users"
-	allUserFields  = `"id", "displayName", "username", "profilePictureBlobId", "tipCardColor", "phoneNumber", "emailAddress", "isStaff", "isRegistered", "isPhoneNumberLinkedForPayment", "region", "locale", "createdAt", "updatedAt"`
+	allUserFields  = `"id", "displayName", "username", "profilePictureBlobId", "tipCardColor", "minDmChatInitFeeCurrency", "minDmChatInitFeeNativeAmount", "phoneNumber", "emailAddress", "isStaff", "isRegistered", "isPhoneNumberLinkedForPayment", "region", "locale", "createdAt", "updatedAt"`
 
 	xProfilesTableName = "flipcash_x_profiles"
 	allXUserFields     = `"id", "username", "name", "description", "profilePicUrl", "followerCount", "verifiedType",  "accessToken", "userId", "createdAt", "updatedAt"`
@@ -70,13 +70,15 @@ func fromXProfileModel(m *xProfileModel) (*profilepb.XProfile, error) {
 
 func dbGetPublicProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (*profilepb.UserProfile, error) {
 	var res struct {
-		DisplayName          *string   `db:"displayName"`
-		Username             *string   `db:"username"`
-		ProfilePictureBlobID *string   `db:"profilePictureBlobId"`
-		TipCardColor         *string   `db:"tipCardColor"`
-		CreatedAt            time.Time `db:"createdAt"`
+		DisplayName                  *string   `db:"displayName"`
+		Username                     *string   `db:"username"`
+		ProfilePictureBlobID         *string   `db:"profilePictureBlobId"`
+		TipCardColor                 *string   `db:"tipCardColor"`
+		MinDmChatInitFeeCurrency     *string   `db:"minDmChatInitFeeCurrency"`
+		MinDmChatInitFeeNativeAmount *float64  `db:"minDmChatInitFeeNativeAmount"`
+		CreatedAt                    time.Time `db:"createdAt"`
 	}
-	query := `SELECT "displayName", "username", "profilePictureBlobId", "tipCardColor", "createdAt" FROM ` + usersTableName + ` WHERE "id" = $1`
+	query := `SELECT "displayName", "username", "profilePictureBlobId", "tipCardColor", "minDmChatInitFeeCurrency", "minDmChatInitFeeNativeAmount", "createdAt" FROM ` + usersTableName + ` WHERE "id" = $1`
 	err := pgxscan.Get(
 		ctx,
 		pool,
@@ -96,6 +98,7 @@ func dbGetPublicProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 		DisplayName:          *pointer.StringOrDefault(res.DisplayName, ""),
 		JoinTs:               timestamppb.New(res.CreatedAt),
 		TipCardCustomization: profile.TipCardCustomizationFromStored(res.TipCardColor),
+		MinDmChatInitFee:     profile.MinDmChatInitFeeFromStored(res.MinDmChatInitFeeCurrency, res.MinDmChatInitFeeNativeAmount),
 	}
 
 	if res.Username != nil {
@@ -119,7 +122,7 @@ func dbGetPublicProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 
 func dbSetDisplayName(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, displayName string) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, $2, NULL, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "displayName" = $2 WHERE ` + usersTableName + `."id" = $1`
+		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, $2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "displayName" = $2 WHERE ` + usersTableName + `."id" = $1`
 		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), displayName)
 		return err
 	})
@@ -131,7 +134,7 @@ func dbSetUsername(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.Use
 	}
 
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, $2, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "username" = $2 WHERE ` + usersTableName + `."id" = $1`
+		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, $2, NULL, NULL, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "username" = $2 WHERE ` + usersTableName + `."id" = $1`
 		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), username)
 		// The id conflict is handled above, so the only unique constraint left to
 		// trip is the one holding a handle to a single user. Letting the constraint
@@ -185,14 +188,16 @@ func dbGetPublicProfiles(ctx context.Context, pool *pgxpool.Pool, userIDs []*com
 	}
 
 	var rows []struct {
-		ID                   string    `db:"id"`
-		DisplayName          *string   `db:"displayName"`
-		Username             *string   `db:"username"`
-		ProfilePictureBlobID *string   `db:"profilePictureBlobId"`
-		TipCardColor         *string   `db:"tipCardColor"`
-		CreatedAt            time.Time `db:"createdAt"`
+		ID                           string    `db:"id"`
+		DisplayName                  *string   `db:"displayName"`
+		Username                     *string   `db:"username"`
+		ProfilePictureBlobID         *string   `db:"profilePictureBlobId"`
+		TipCardColor                 *string   `db:"tipCardColor"`
+		MinDmChatInitFeeCurrency     *string   `db:"minDmChatInitFeeCurrency"`
+		MinDmChatInitFeeNativeAmount *float64  `db:"minDmChatInitFeeNativeAmount"`
+		CreatedAt                    time.Time `db:"createdAt"`
 	}
-	query := `SELECT "id", "displayName", "username", "profilePictureBlobId", "tipCardColor", "createdAt" FROM ` + usersTableName + ` WHERE "id" = ANY($1::text[])`
+	query := `SELECT "id", "displayName", "username", "profilePictureBlobId", "tipCardColor", "minDmChatInitFeeCurrency", "minDmChatInitFeeNativeAmount", "createdAt" FROM ` + usersTableName + ` WHERE "id" = ANY($1::text[])`
 	err := pgxscan.Select(ctx, pool, &rows, query, encoded)
 	if err != nil {
 		if pgxscan.NotFound(err) {
@@ -212,6 +217,7 @@ func dbGetPublicProfiles(ctx context.Context, pool *pgxpool.Pool, userIDs []*com
 			DisplayName:          *pointer.StringOrDefault(r.DisplayName, ""),
 			JoinTs:               timestamppb.New(r.CreatedAt),
 			TipCardCustomization: profile.TipCardCustomizationFromStored(r.TipCardColor),
+			MinDmChatInitFee:     profile.MinDmChatInitFeeFromStored(r.MinDmChatInitFeeCurrency, r.MinDmChatInitFeeNativeAmount),
 		}
 
 		if r.Username != nil {
@@ -238,7 +244,7 @@ func dbGetPublicProfiles(ctx context.Context, pool *pgxpool.Pool, userIDs []*com
 
 func dbSetProfilePicture(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, blobID *blobpb.BlobId) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, NULL, $2, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "profilePictureBlobId" = $2 WHERE ` + usersTableName + `."id" = $1`
+		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, NULL, $2, NULL, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "profilePictureBlobId" = $2 WHERE ` + usersTableName + `."id" = $1`
 		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), pg.Encode(blobID.Value))
 		return err
 	})
@@ -246,8 +252,16 @@ func dbSetProfilePicture(ctx context.Context, pool *pgxpool.Pool, userID *common
 
 func dbSetTipCardColor(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, colorHex string) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, NULL, NULL, $2, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "tipCardColor" = $2 WHERE ` + usersTableName + `."id" = $1`
+		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, NULL, NULL, $2, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "tipCardColor" = $2 WHERE ` + usersTableName + `."id" = $1`
 		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), colorHex)
+		return err
+	})
+}
+
+func dbSetMinDmChatInitFee(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, fee *commonpb.FiatPaymentAmount) error {
+	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
+		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, NULL, NULL, NULL, $2, $3, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "minDmChatInitFeeCurrency" = $2, "minDmChatInitFeeNativeAmount" = $3 WHERE ` + usersTableName + `."id" = $1`
+		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), fee.Currency, fee.NativeAmount)
 		return err
 	})
 }

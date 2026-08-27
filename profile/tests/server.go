@@ -28,6 +28,7 @@ import (
 	"github.com/code-payments/flipcash2-server/protoutil"
 	"github.com/code-payments/flipcash2-server/social/x"
 	"github.com/code-payments/flipcash2-server/testutil"
+	"github.com/code-payments/flipcash2-server/tip"
 )
 
 func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store, teardown func()) {
@@ -35,6 +36,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 		testServer,
 		testProfilePicture,
 		testTipCardCustomization,
+		testMinDmChatInitFee,
 		testUsernameIsPublic,
 		testGetProfileByUsername,
 		testSetUsername,
@@ -102,6 +104,7 @@ func requireProfileUnset(t *testing.T, resp *profilepb.GetProfileResponse) {
 	require.Empty(t, resp.UserProfile.GetSocialProfiles())
 	require.Nil(t, resp.UserProfile.GetPhoneNumber())
 	require.Nil(t, resp.UserProfile.GetEmailAddress())
+	require.Nil(t, resp.UserProfile.GetMinDmChatInitFee())
 
 	if resp.UserProfile != nil {
 		require.NoError(t, protoutil.ProtoEqualError(profile.DefaultTipCardCustomization(), resp.UserProfile.TipCardCustomization))
@@ -360,6 +363,95 @@ func testTipCardCustomization(t *testing.T, accounts account.Store, profiles pro
 		resp := updateTipCard(nil)
 		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateTipCardResponse{Result: profilepb.UpdateTipCardResponse_OK}, resp))
 		require.Equal(t, "#19191A", getColorHex())
+	})
+}
+
+func testMinDmChatInitFee(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+
+	media, _, _ := newMedia()
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+
+	client := profilepb.NewProfileClient(cc)
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
+	require.NoError(t, err)
+
+	setFee := func(fee *commonpb.FiatPaymentAmount) *profilepb.SetMinDmChatInitFeeResponse {
+		t.Helper()
+		req := &profilepb.SetMinDmChatInitFeeRequest{MinDmChatInitFee: fee}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		resp, err := client.SetMinDmChatInitFee(ctx, req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	// Read without auth, since the fee is public: what this returns is what any
+	// other user sees before initializing a DM.
+	getFee := func() *commonpb.FiatPaymentAmount {
+		t.Helper()
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
+		require.NoError(t, err)
+		require.Equal(t, profilepb.GetProfileResponse_OK, resp.Result)
+		return resp.UserProfile.MinDmChatInitFee
+	}
+
+	usdMinimum, ok := tip.PresetsFor("usd")
+	require.True(t, ok)
+
+	t.Run("Unregistered user is denied", func(t *testing.T) {
+		resp := setFee(&commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: 5})
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetMinDmChatInitFeeResponse{Result: profilepb.SetMinDmChatInitFeeResponse_DENIED}, resp))
+
+		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
+		require.NoError(t, err)
+		requireProfileUnset(t, getResp)
+	})
+
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
+
+	t.Run("Fee is set and replaced", func(t *testing.T) {
+		fee := &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: 5}
+		resp := setFee(fee)
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetMinDmChatInitFeeResponse{Result: profilepb.SetMinDmChatInitFeeResponse_OK}, resp))
+		require.NoError(t, protoutil.ProtoEqualError(fee, getFee()))
+
+		// Any currency with tip presets is accepted, and the replacement is whole
+		// rather than per field.
+		fee = &commonpb.FiatPaymentAmount{Currency: "eur", NativeAmount: 100}
+		resp = setFee(fee)
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetMinDmChatInitFeeResponse{Result: profilepb.SetMinDmChatInitFeeResponse_OK}, resp))
+		require.NoError(t, protoutil.ProtoEqualError(fee, getFee()))
+	})
+
+	t.Run("Fee at the currency minimum is accepted", func(t *testing.T) {
+		fee := &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: usdMinimum.Minimum}
+		resp := setFee(fee)
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetMinDmChatInitFeeResponse{Result: profilepb.SetMinDmChatInitFeeResponse_OK}, resp))
+		require.NoError(t, protoutil.ProtoEqualError(fee, getFee()))
+	})
+
+	t.Run("Invalid fee is rejected and leaves the existing one alone", func(t *testing.T) {
+		before := getFee()
+		require.NotNil(t, before)
+
+		for _, fee := range []*commonpb.FiatPaymentAmount{
+			{Currency: "usd", NativeAmount: usdMinimum.Minimum / 2}, // below the currency floor
+			{Currency: "usd", NativeAmount: 0},
+			{Currency: "xyz", NativeAmount: 1_000_000}, // no tip presets for it
+		} {
+			resp := setFee(fee)
+			require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetMinDmChatInitFeeResponse{Result: profilepb.SetMinDmChatInitFeeResponse_INVALID_AMOUNT}, resp), "%v", fee)
+			require.NoError(t, protoutil.ProtoEqualError(before, getFee()))
+		}
 	})
 }
 

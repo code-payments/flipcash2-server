@@ -228,7 +228,9 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 //
 // The payment's location decides which rules apply. A tip from the tip card
 // is what initializes the DM, so it may target a chat that doesn't exist yet,
-// and it must meet the per-currency minimum. A send from within the chat has
+// and it must meet the per-currency minimum. When it is the tip that
+// initializes the chat, it must also meet the recipient's minimum DM chat
+// initialization fee, where they have set one. A send from within the chat has
 // no minimum, but the chat must already be initialized — the client can only
 // be inside a chat that exists, so a send into one that doesn't is denied.
 func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
@@ -261,13 +263,79 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 		return ocp_transaction.NewIntentValidationError("chat id does not match the tip dm between sender and recipient")
 	}
 
+	_, err = i.chats.GetChatByID(ctx, expectedChatID)
+	switch {
+	case err == nil:
+		// An initialized chat has already had its fee paid: sends are any
+		// amount, and tips are held to the preset minimum checked above.
+		return nil
+	case errors.Is(err, chat.ErrChatNotFound):
+	default:
+		return err
+	}
+
 	if !isTip {
-		_, err := i.chats.GetChatByID(ctx, expectedChatID)
-		if errors.Is(err, chat.ErrChatNotFound) {
-			return ocp_transaction.NewIntentDeniedError("tip dm has not been initialized")
-		} else if err != nil {
+		return ocp_transaction.NewIntentDeniedError("tip dm has not been initialized")
+	}
+
+	// This tip is what initializes the chat, so it must clear whatever the
+	// recipient asks of anyone reaching them for the first time.
+	recipientProfile, err := i.profiles.GetProfile(ctx, recipientUserID, false)
+	if errors.Is(err, profile.ErrNotFound) {
+		// A user the profile store doesn't know has set nothing, so only the
+		// preset minimum applies.
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	return i.validateMinDmChatInitFee(ctx, intentRecord.SendPublicPaymentMetadata, recipientProfile.MinDmChatInitFee)
+}
+
+// validateMinDmChatInitFee enforces the recipient's minimum DM chat
+// initialization fee, if they have set one, on the payment initializing the
+// chat. A payment in the fee's currency is compared as is. Any other payment
+// is compared by converting its USD market value into the fee's currency at
+// the latest live exchange rate, so a tipper may pay in whatever currency they
+// hold. A fee in a currency with no live rate cannot be compared against, so
+// the payment is denied rather than let through unchecked.
+func (i *Integration) validateMinDmChatInitFee(ctx context.Context, paymentMetadata *ocp_intent.SendPublicPaymentMetadata, fee *commonpb.FiatPaymentAmount) error {
+	if fee == nil {
+		return nil
+	}
+
+	feeCurrency := currency_lib.Code(fee.Currency)
+
+	var amount float64
+	if paymentMetadata.ExchangeCurrency == feeCurrency {
+		amount = paymentMetadata.NativeAmount
+	} else {
+		liveRates, err := i.mintDataProvider.GetLiveExchangeRates(ctx)
+		if err != nil {
 			return err
 		}
+		// Rates are quoted as fee-currency units per core mint unit, and the
+		// core mint is a USD stablecoin, so this is the rate from USD.
+		rate, ok := liveRates.Rates[string(feeCurrency)]
+		if !ok || rate <= 0 {
+			return ocp_transaction.NewIntentDeniedError(fmt.Sprintf(
+				"no exchange rate available for the recipient's chat initialization fee in %s",
+				strings.ToUpper(string(feeCurrency)),
+			))
+		}
+		amount = paymentMetadata.UsdMarketValue * rate
+	}
+
+	// Same rounding slack as the preset minimum: the fiat amount is derived
+	// from a quoted rate and can land a fraction of a minor unit short.
+	tolerance := 0.5 * math.Pow10(-currency_lib.GetDecimals(feeCurrency))
+
+	if amount < fee.NativeAmount-tolerance {
+		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf(
+			"tip amount is below the recipient's chat initialization fee of %s %s",
+			strconv.FormatFloat(fee.NativeAmount, 'f', -1, 64),
+			strings.ToUpper(string(feeCurrency)),
+		))
 	}
 
 	return nil

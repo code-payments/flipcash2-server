@@ -3,10 +3,12 @@ package intent_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
 	"google.golang.org/protobuf/proto"
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
@@ -22,9 +24,24 @@ import (
 	"github.com/code-payments/flipcash2-server/profile"
 	profilememory "github.com/code-payments/flipcash2-server/profile/memory"
 	currency_lib "github.com/code-payments/ocp-server/currency"
+	ocp_currency_util "github.com/code-payments/ocp-server/ocp/currency"
+	ocp_data "github.com/code-payments/ocp-server/ocp/data"
+	ocp_currency "github.com/code-payments/ocp-server/ocp/data/currency"
+	exchange_memory "github.com/code-payments/ocp-server/ocp/data/currency/exchange/memory"
+	holder_memory "github.com/code-payments/ocp-server/ocp/data/currency/holder/memory"
+	reserve_memory "github.com/code-payments/ocp-server/ocp/data/currency/reserve/memory"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
+	ocp_testutil "github.com/code-payments/ocp-server/testutil"
 )
+
+// testExchangeRates are the live rates the env's mint data provider serves,
+// quoted as fiat units per USD, since the core mint is a USD stablecoin.
+var testExchangeRates = map[string]float64{
+	"usd": 1.0,
+	"jpy": 150.0,
+	"eur": 0.9,
+}
 
 type integrationEnv struct {
 	ctx         context.Context
@@ -34,16 +51,35 @@ type integrationEnv struct {
 	integration ocp_integration.SubmitIntent
 }
 
-func newIntegrationEnv() *integrationEnv {
+func newIntegrationEnv(t *testing.T) *integrationEnv {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
 	accounts := accountmemory.NewInMemory()
 	profiles := profilememory.NewInMemory()
 	chats := chatmemory.NewInMemory()
+
+	// The mint data provider signs the rates it serves with the subsidizer, so
+	// one has to exist before its first poll.
+	ocpData := ocp_data.NewTestDataProvider()
+	ocp_testutil.SetupRandomSubsidizer(t, ocpData)
+
+	exchangeRates := exchange_memory.New()
+	require.NoError(t, exchangeRates.PutExchangeRates(ctx, &ocp_currency.MultiRateRecord{
+		Time:  time.Now(),
+		Rates: testExchangeRates,
+	}))
+
+	mintDataProvider := ocp_currency_util.NewMintDataProvider(log, ocpData, exchangeRates, reserve_memory.New(), holder_memory.New(), 0, time.Second, time.Second)
+	require.NoError(t, mintDataProvider.Start(ctx))
+	t.Cleanup(mintDataProvider.Stop)
+
 	return &integrationEnv{
-		ctx:         context.Background(),
+		ctx:         ctx,
 		accounts:    accounts,
 		chats:       chats,
 		profiles:    profiles,
-		integration: intent.NewIntegration(accounts, chats, profiles),
+		integration: intent.NewIntegration(accounts, chats, profiles, mintDataProvider),
 	}
 }
 
@@ -117,7 +153,7 @@ func contactDmChatMetadata(chatID *commonpb.ChatId, sourcePhone, destinationPhon
 }
 
 func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
-	e := newIntegrationEnv()
+	e := newIntegrationEnv(t)
 
 	senderUserID, senderKeys := e.bindUser(t)
 	recipientUserID, recipientKeys := e.bindUser(t)
@@ -252,12 +288,98 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		tipRecord.SendPublicPaymentMetadata.UsdMarketValue = 0.01
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tipRecord, nil, nil), "below the minimum")
 	})
+
+	// A recipient's minimum DM chat initialization fee applies only to the tip
+	// that initializes the chat. A fresh env keeps the chat uninitialized here.
+	t.Run("min_dm_chat_init_fee", func(t *testing.T) {
+		e := newIntegrationEnv(t)
+		senderUserID, senderKeys := e.bindUser(t)
+		recipientUserID, recipientKeys := e.bindUser(t)
+		tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
+
+		record := func(location intentpb.ChatMetadata_TipDmPayment_Location, currency string, nativeAmount float64) *ocp_intent.Record {
+			record := dmPaymentIntentRecord(t, tipDmChatMetadataFrom(tipChatID, location), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+			record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.Code(currency)
+			record.SendPublicPaymentMetadata.NativeAmount = nativeAmount
+			record.SendPublicPaymentMetadata.UsdMarketValue = nativeAmount
+			if rate, ok := testExchangeRates[currency]; ok {
+				record.SendPublicPaymentMetadata.UsdMarketValue = nativeAmount / rate
+			}
+			return record
+		}
+		tip := func(currency string, nativeAmount float64) *ocp_intent.Record {
+			return record(intentpb.ChatMetadata_TipDmPayment_TIPCARD, currency, nativeAmount)
+		}
+		setFee := func(currency string, nativeAmount float64) {
+			require.NoError(t, e.profiles.SetMinDmChatInitFee(e.ctx, recipientUserID, &commonpb.FiatPaymentAmount{Currency: currency, NativeAmount: nativeAmount}))
+		}
+
+		// No fee set: only the preset minimum applies.
+		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 1.0), nil, nil))
+
+		setFee("usd", 10)
+		for _, tc := range []struct {
+			currency     string
+			nativeAmount float64
+			allowed      bool
+			denial       string
+		}{
+			{"usd", 10.0, true, ""},  // exactly the fee
+			{"usd", 25.0, true, ""},  // above the fee
+			{"usd", 9.995, true, ""}, // within half a cent of the fee
+			{"usd", 9.99, false, "chat initialization fee"},
+			{"usd", 1.0, false, "chat initialization fee"}, // clears the preset minimum, not the fee
+			{"jpy", 1_500, true, ""},                       // cross-currency: converted at the live rate
+			{"jpy", 1_499, false, "chat initialization fee"},
+			{"jpy", 50, false, "below the minimum"}, // preset minimum is checked first
+			{"eur", 9.0, true, ""},
+			{"eur", 8.9, false, "chat initialization fee"},
+		} {
+			err := e.integration.AllowCreation(e.ctx, tip(tc.currency, tc.nativeAmount), nil, nil)
+			if tc.allowed {
+				require.NoError(t, err, "%s %v", tc.currency, tc.nativeAmount)
+			} else {
+				require.ErrorContains(t, err, tc.denial, "%s %v", tc.currency, tc.nativeAmount)
+			}
+		}
+
+		// A fee in a non-USD currency compares natively when paid in it, and
+		// through the live rate otherwise, with the rounding slack in the fee's
+		// currency.
+		setFee("jpy", 1_000)
+		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("jpy", 1_000), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("jpy", 999.5), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("jpy", 999), nil, nil), "chat initialization fee")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 6.67), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("usd", 6.66), nil, nil), "chat initialization fee")
+
+		// A fee in a currency with no live rate cannot be compared against a
+		// payment in another currency, and is denied rather than waved through.
+		setFee("kwd", 1)
+		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("kwd", 1), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("usd", 100), nil, nil), "no exchange rate")
+
+		// A send from within the chat is still denied before initialization,
+		// whatever the amount.
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, "usd", 100), nil, nil), "not been initialized")
+
+		// Once the chat exists the fee no longer applies: tips are held to the
+		// preset minimum only, and sends to nothing.
+		require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+			ID:      tipChatID,
+			Type:    chatpb.ChatType_TIP_DM,
+			Members: []*commonpb.UserId{senderUserID, recipientUserID},
+		}))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 1.0), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("usd", 0.5), nil, nil), "below the minimum")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, "usd", 0.01), nil, nil))
+	})
 }
 
 func TestIntegration_AllowCreation_ContactDmPayment(t *testing.T) {
 	t.Skip("contact send feature disabled")
 
-	e := newIntegrationEnv()
+	e := newIntegrationEnv(t)
 
 	senderUserID, senderKeys := e.bindUser(t)
 	recipientUserID, recipientKeys := e.bindUser(t)
@@ -333,7 +455,7 @@ func TestIntegration_AllowCreation_ContactDmPayment(t *testing.T) {
 }
 
 func TestIntegration_GetTasksToSchedule_TipDmPayment(t *testing.T) {
-	e := newIntegrationEnv()
+	e := newIntegrationEnv(t)
 
 	senderUserID, senderKeys := e.bindUser(t)
 	recipientUserID, recipientKeys := e.bindUser(t)

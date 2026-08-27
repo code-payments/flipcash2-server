@@ -26,6 +26,7 @@ type InMemoryStore struct {
 	createdAtByUser        map[string]time.Time
 	tipCardColorByUser     map[string]string
 	usernameByUser         map[string]string
+	minDmChatInitFeeByUser map[string]*commonpb.FiatPaymentAmount
 }
 
 func NewInMemory() profile.Store {
@@ -37,7 +38,18 @@ func NewInMemory() profile.Store {
 		createdAtByUser:        make(map[string]time.Time),
 		tipCardColorByUser:     make(map[string]string),
 		usernameByUser:         make(map[string]string),
+		minDmChatInitFeeByUser: make(map[string]*commonpb.FiatPaymentAmount),
 	}
+}
+
+// minDmChatInitFee returns a copy of the minimum DM chat initialization fee for
+// key, or nil for a user who has not set one. Callers hold the lock.
+func (m *InMemoryStore) minDmChatInitFee(key string) *commonpb.FiatPaymentAmount {
+	fee, ok := m.minDmChatInitFeeByUser[key]
+	if !ok {
+		return nil
+	}
+	return proto.Clone(fee).(*commonpb.FiatPaymentAmount)
 }
 
 // tipCardCustomization resolves the Tip Card customization for key, filling in
@@ -88,6 +100,7 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 	clonedBaseProfile.JoinTs = timestamppb.New(m.createdAtByUser[key])
 	clonedBaseProfile.TipCardCustomization = m.tipCardCustomization(key)
 	clonedBaseProfile.Username = m.username(key)
+	clonedBaseProfile.MinDmChatInitFee = m.minDmChatInitFee(key)
 
 	xProfile, ok := m.xProfilesByUser[key]
 	if ok {
@@ -131,6 +144,17 @@ func (m *InMemoryStore) SetTipCardColor(_ context.Context, id *commonpb.UserId, 
 	key := userIDCacheKey(id)
 	m.ensureProfile(key)
 	m.tipCardColorByUser[key] = colorHex
+
+	return nil
+}
+
+func (m *InMemoryStore) SetMinDmChatInitFee(_ context.Context, id *commonpb.UserId, fee *commonpb.FiatPaymentAmount) error {
+	m.Lock()
+	defer m.Unlock()
+
+	key := userIDCacheKey(id)
+	m.ensureProfile(key)
+	m.minDmChatInitFeeByUser[key] = proto.Clone(fee).(*commonpb.FiatPaymentAmount)
 
 	return nil
 }
@@ -221,6 +245,7 @@ func (m *InMemoryStore) GetPublicProfiles(_ context.Context, userIDs []*commonpb
 			Username:             m.username(key),
 			JoinTs:               timestamppb.New(m.createdAtByUser[key]),
 			TipCardCustomization: m.tipCardCustomization(key),
+			MinDmChatInitFee:     m.minDmChatInitFee(key),
 		}
 		if blobID := profilePictureBlob(p.ProfilePicture); blobID != nil {
 			publicProfile.ProfilePicture = &blobpb.Media{
@@ -535,6 +560,7 @@ func (m *InMemoryStore) reset() {
 	m.createdAtByUser = make(map[string]time.Time)
 	m.tipCardColorByUser = make(map[string]string)
 	m.usernameByUser = make(map[string]string)
+	m.minDmChatInitFeeByUser = make(map[string]*commonpb.FiatPaymentAmount)
 }
 
 func userIDCacheKey(id *commonpb.UserId) string {

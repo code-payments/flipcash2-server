@@ -9,6 +9,7 @@ import (
 	ocp_transactionpb "github.com/code-payments/ocp-protobuf-api/generated/go/transaction/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
@@ -19,15 +20,18 @@ import (
 
 type Integration struct {
 	accounts account.Store
+	chats    chat.Store
 	profiles profile.Store
 }
 
 func NewIntegration(
 	accounts account.Store,
+	chats chat.Store,
 	profiles profile.Store,
 ) ocp_integration.SubmitIntent {
 	return &Integration{
 		accounts: accounts,
+		chats:    chats,
 		profiles: profiles,
 	}
 }

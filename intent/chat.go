@@ -225,14 +225,25 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 // keyed on user IDs alone — neither party is required to have a phone number
 // linked for payment, since a tip can come from a stranger who only has the
 // recipient's tip card.
+//
+// The payment's location decides which rules apply. A tip from the tip card
+// is what initializes the DM, so it may target a chat that doesn't exist yet,
+// and it must meet the per-currency minimum. A send from within the chat has
+// no minimum, but the chat must already be initialized — the client can only
+// be inside a chat that exists, so a send into one that doesn't is denied.
 func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
 	chatMetadata := appMetadata.GetChat()
-	if chatMetadata.GetTipDmPayment() == nil {
+	tipDmPayment := chatMetadata.GetTipDmPayment()
+	if tipDmPayment == nil {
 		return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
 	}
 
-	if err := validateMinimumTipAmount(intentRecord.SendPublicPaymentMetadata); err != nil {
-		return err
+	isTip := GetDmPaymentVerb(intentRecord.AppMetadata) == messagingpb.CashContent_TIPPED
+
+	if isTip {
+		if err := validateMinimumTipAmount(intentRecord.SendPublicPaymentMetadata); err != nil {
+			return err
+		}
 	}
 
 	senderUserID, recipientUserID, err := i.resolveDirectDmPaymentParties(ctx, intentRecord, "tip dm")
@@ -248,6 +259,15 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 	expectedChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
 	if !bytes.Equal(chatMetadata.GetChatId().GetValue(), expectedChatID.Value) {
 		return ocp_transaction.NewIntentValidationError("chat id does not match the tip dm between sender and recipient")
+	}
+
+	if !isTip {
+		_, err := i.chats.GetChatByID(ctx, expectedChatID)
+		if errors.Is(err, chat.ErrChatNotFound) {
+			return ocp_transaction.NewIntentDeniedError("tip dm has not been initialized")
+		} else if err != nil {
+			return err
+		}
 	}
 
 	return nil

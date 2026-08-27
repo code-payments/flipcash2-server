@@ -112,6 +112,8 @@ model User {
   username                      String?            @unique // the user's handle, lowercase and canonical; null until they claim one
   profilePictureBlobId          String?
   tipCardColor                  String?            // Tip Card colour as a hex string (e.g. "#19191a"); null until the user picks one, in which case the server resolves the default
+  minDmChatInitFeeCurrency      String?            // ISO 4217 code of the minimum DM chat initialization fee; set together with minDmChatInitFeeNativeAmount, null until the user sets one
+  minDmChatInitFeeNativeAmount  Float?             // the minimum DM chat initialization fee in major units of minDmChatInitFeeCurrency
   phoneNumber                   String?            @unique
   phoneNumberHash               String?            @unique
   emailAddress                  String?            @unique

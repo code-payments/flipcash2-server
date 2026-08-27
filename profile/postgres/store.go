@@ -80,6 +80,10 @@ func (s *store) SetTipCardColor(ctx context.Context, id *commonpb.UserId, colorH
 	return dbSetTipCardColor(ctx, s.pool, id, colorHex)
 }
 
+func (s *store) SetMinDmChatInitFee(ctx context.Context, id *commonpb.UserId, fee *commonpb.FiatPaymentAmount) error {
+	return dbSetMinDmChatInitFee(ctx, s.pool, id, fee)
+}
+
 func (s *store) GetPublicProfiles(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
 	return dbGetPublicProfiles(ctx, s.pool, userIDs)
 }
@@ -159,7 +163,7 @@ func (s *store) GetXProfile(ctx context.Context, userID *commonpb.UserId) (*prof
 }
 
 func (s *store) reset() {
-	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "username" = NULL, "profilePictureBlobId" = NULL, "tipCardColor" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL, "isPhoneNumberLinkedForPayment" = FALSE`)
+	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "username" = NULL, "profilePictureBlobId" = NULL, "tipCardColor" = NULL, "minDmChatInitFeeCurrency" = NULL, "minDmChatInitFeeNativeAmount" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL, "isPhoneNumberLinkedForPayment" = FALSE`)
 	if err != nil {
 		panic(err)
 	}

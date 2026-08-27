@@ -436,6 +436,40 @@ func (s *Server) UpdateTipCard(ctx context.Context, req *profilepb.UpdateTipCard
 	return &profilepb.UpdateTipCardResponse{}, nil
 }
 
+func (s *Server) SetMinDmChatInitFee(ctx context.Context, req *profilepb.SetMinDmChatInitFeeRequest) (*profilepb.SetMinDmChatInitFeeResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.String("currency", req.MinDmChatInitFee.GetCurrency()),
+		zap.Float64("native_amount", req.MinDmChatInitFee.GetNativeAmount()),
+	)
+
+	isRegistered, err := s.accounts.IsRegistered(ctx, userID)
+	if err != nil {
+		log.Warn("Failed to get registration flag", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to get registration flag")
+	} else if !isRegistered {
+		return &profilepb.SetMinDmChatInitFeeResponse{Result: profilepb.SetMinDmChatInitFeeResponse_DENIED}, nil
+	}
+
+	// Validate before persisting, so the store only ever holds a fee the server
+	// would enforce: one in a currency it knows, at or above that currency's floor.
+	if err := ValidateMinDmChatInitFee(req.MinDmChatInitFee); err != nil {
+		return &profilepb.SetMinDmChatInitFeeResponse{Result: profilepb.SetMinDmChatInitFeeResponse_INVALID_AMOUNT}, nil
+	}
+
+	if err := s.profiles.SetMinDmChatInitFee(ctx, userID, req.MinDmChatInitFee); err != nil {
+		log.Warn("Failed to set min dm chat init fee", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to set min dm chat init fee")
+	}
+
+	return &profilepb.SetMinDmChatInitFeeResponse{}, nil
+}
+
 func (s *Server) LinkSocialAccount(ctx context.Context, req *profilepb.LinkSocialAccountRequest) (*profilepb.LinkSocialAccountResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {

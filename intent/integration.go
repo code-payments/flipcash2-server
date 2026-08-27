@@ -11,6 +11,7 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/profile"
+	ocp_currency_util "github.com/code-payments/ocp-server/ocp/currency"
 	"github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_task "github.com/code-payments/ocp-server/ocp/data/task"
@@ -22,17 +23,22 @@ type Integration struct {
 	accounts account.Store
 	chats    chat.Store
 	profiles profile.Store
+
+	mintDataProvider *ocp_currency_util.MintDataProvider
 }
 
 func NewIntegration(
 	accounts account.Store,
 	chats chat.Store,
 	profiles profile.Store,
+	mintDataProvider *ocp_currency_util.MintDataProvider,
 ) ocp_integration.SubmitIntent {
 	return &Integration{
 		accounts: accounts,
 		chats:    chats,
 		profiles: profiles,
+
+		mintDataProvider: mintDataProvider,
 	}
 }
 

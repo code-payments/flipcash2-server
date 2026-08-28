@@ -9,26 +9,28 @@ import (
 	"go.uber.org/zap"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-	ocp_commonpb "github.com/code-payments/ocp-protobuf-api/generated/go/common/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/push"
 	"github.com/code-payments/flipcash2-server/settings"
 	ocp_currency_lib "github.com/code-payments/ocp-server/currency"
-	ocp_balance_util "github.com/code-payments/ocp-server/ocp/balance"
+	ocp_query "github.com/code-payments/ocp-server/database/query"
 	"github.com/code-payments/ocp-server/ocp/common"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
-	ocp_currency_util "github.com/code-payments/ocp-server/ocp/currency"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
-	ocp_account "github.com/code-payments/ocp-server/ocp/data/account"
+	ocp_balance "github.com/code-payments/ocp-server/ocp/data/balance"
 	ocp_currency "github.com/code-payments/ocp-server/ocp/data/currency"
 	ocp_currency_exchange "github.com/code-payments/ocp-server/ocp/data/currency/exchange"
 	ocp_currency_reserve "github.com/code-payments/ocp-server/ocp/data/currency/reserve"
 	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
+	"github.com/code-payments/ocp-server/solana/currencycreator"
 	"github.com/code-payments/ocp-server/usdc"
 )
 
-const gainProcessingBatchSize = 256
+const (
+	gainProcessingBatchSize = 256
+	minGainQuarks           = 1
+)
 
 type Integration struct {
 	log *zap.Logger
@@ -205,55 +207,66 @@ func (i *Integration) notifyHoldersOfGain(ctx context.Context, mint *ocp_common.
 		return
 	}
 
-	// Find all PRIMARY account holders for this mint
-	accountInfos, err := i.ocpData.GetAccountInfosByMintAndType(ctx, mintBase58, ocp_commonpb.AccountType_PRIMARY)
-	if err != nil {
-		log.Warn("failed to get account infos by mint", zap.Error(err))
-		return
-	}
-	if len(accountInfos) == 0 {
-		return
-	}
-
-	// Process account infos in batches in parallel
+	// Page over the holders of this mint, which the balance ledger indexes by
+	// mint and balance, so accounts that were opened and emptied are never
+	// walked. Each page is processed while the next is fetched.
 	var wg sync.WaitGroup
-	for start := 0; start < len(accountInfos); start += gainProcessingBatchSize {
-		end := start + gainProcessingBatchSize
-		if end > len(accountInfos) {
-			end = len(accountInfos)
+	defer wg.Wait()
+
+	cursor := ocp_query.EmptyCursor
+	for {
+		balanceRecords, err := i.ocpData.GetAllLockedBalancesByMint(ctx, mintBase58, minGainQuarks, cursor, gainProcessingBatchSize, ocp_query.Ascending)
+		if err == ocp_balance.ErrRecordNotFound {
+			return
+		} else if err != nil {
+			log.Warn("failed to get balances by mint", zap.Error(err))
+			return
 		}
 
-		wg.Add(1)
-		go func(batch []*ocp_account.Record) {
-			defer wg.Done()
-			i.notifyHoldersOfGainBatch(ctx, log, mint, currencyName, exchangeRates, batch, buyer)
-		}(accountInfos[start:end])
+		// Advance off the raw page, so a page that filters down to nothing still
+		// moves the cursor forward.
+		cursor = ocp_query.ToCursor(balanceRecords[len(balanceRecords)-1].Id)
+		isLastPage := len(balanceRecords) < gainProcessingBatchSize
+
+		// A record that isn't backfilled only carries the deltas seen since the
+		// ledger started tracking the account, which is not the holding and can
+		// even be negative, so it's skipped rather than valued off a balance
+		// that's wrong in an unbounded direction.
+		holdings := make([]*ocp_balance.Record, 0, len(balanceRecords))
+		for _, balanceRecord := range balanceRecords {
+			if !balanceRecord.IsBackfilled || !balanceRecord.IsOpen || balanceRecord.Quarks <= 0 {
+				continue
+			}
+			holdings = append(holdings, balanceRecord)
+		}
+
+		if len(holdings) > 0 {
+			wg.Go(func() {
+				i.notifyHoldersOfGainBatch(ctx, log, mint, currencyName, exchangeRates, liveReserve.SupplyFromBonding, holdings, buyer)
+			})
+		}
+
+		if isLastPage {
+			return
+		}
 	}
-	wg.Wait()
 }
 
-func (i *Integration) notifyHoldersOfGainBatch(ctx context.Context, log *zap.Logger, mint *ocp_common.Account, currencyName string, exchangeRates *ocp_currency.MultiRateRecord, accountInfos []*ocp_account.Record, buyer *common.Account) {
-	mintBase58 := mint.PublicKey().ToBase58()
+func (i *Integration) notifyHoldersOfGainBatch(ctx context.Context, log *zap.Logger, mint *ocp_common.Account, currencyName string, exchangeRates *ocp_currency.MultiRateRecord, supplyFromBonding uint64, holdings []*ocp_balance.Record, buyer *common.Account) {
 	protoMint := &commonpb.PublicKey{Value: mint.PublicKey().ToBytes()}
 
-	// Build owner → token account mapping while collecting public keys
-	ownerToTokenAccount := make(map[string]*ocp_common.Account, len(accountInfos))
+	// Build owner → holding mapping while collecting public keys
+	holdingByOwner := make(map[string]*ocp_balance.Record, len(holdings))
 	var pubKeys []*commonpb.PublicKey
-	for _, info := range accountInfos {
-		decoded, err := base58.Decode(info.OwnerAccount)
+	for _, holding := range holdings {
+		decoded, err := base58.Decode(holding.OwnerAccount)
 		if err != nil {
-			log.Warn("failed to decode owner account", zap.String("owner", info.OwnerAccount), zap.Error(err))
-			continue
-		}
-
-		tokenAccount, err := ocp_common.NewAccountFromPublicKeyString(info.TokenAccount)
-		if err != nil {
-			log.Warn("failed to parse token account", zap.String("token_account", info.TokenAccount), zap.Error(err))
+			log.Warn("failed to decode owner account", zap.String("owner", holding.OwnerAccount), zap.Error(err))
 			continue
 		}
 
 		pubKeys = append(pubKeys, &commonpb.PublicKey{Value: decoded})
-		ownerToTokenAccount[info.OwnerAccount] = tokenAccount
+		holdingByOwner[holding.OwnerAccount] = holding
 	}
 	if len(pubKeys) == 0 {
 		return
@@ -289,96 +302,44 @@ func (i *Integration) notifyHoldersOfGainBatch(ctx context.Context, log *zap.Log
 		hasToken[string(userID.Value)] = struct{}{}
 	}
 
-	// Collect owners that have user IDs and push tokens
+	// Collect owners that have user IDs and push tokens, excluding the buyer,
+	// who is notified of the buy itself rather than of a gain
+	buyerBase58 := buyer.PublicKey().ToBase58()
 	var owners []string
 	for ownerBase58, userID := range userIDMap {
+		if ownerBase58 == buyerBase58 {
+			continue
+		}
+		if _, ok := holdingByOwner[ownerBase58]; !ok {
+			continue
+		}
 		if _, ok := hasToken[string(userID.Value)]; ok {
 			owners = append(owners, ownerBase58)
 		}
 	}
-
-	// Batch get USD cost basis for owners with push tokens
-	costBasesByOwner, err := i.ocpData.GetUsdCostBasisBatch(ctx, mintBase58, owners...)
-	if err != nil {
-		log.Warn("failed to batch get cost basis", zap.Error(err))
-		return
-	}
-
-	// Collect token accounts for owners with push tokens and positive cost basis
-	var tokenAccounts []*ocp_common.Account
-	tokenAccountToOwner := make(map[string]string)
-	for _, owner := range owners {
-		_, ok := costBasesByOwner[owner]
-		if !ok {
-			continue
-		}
-		tokenAccount, ok := ownerToTokenAccount[owner]
-		if !ok {
-			continue
-		}
-		tokenAccounts = append(tokenAccounts, tokenAccount)
-		tokenAccountToOwner[tokenAccount.PublicKey().ToBase58()] = owner
-	}
-	if len(tokenAccounts) == 0 {
-		return
-	}
-
-	// Filter out owners whose Timelock account is not in the locked state. The
-	// token account of a PRIMARY account is the Timelock vault address.
-	vaultAddresses := make([]string, len(tokenAccounts))
-	for i, tokenAccount := range tokenAccounts {
-		vaultAddresses[i] = tokenAccount.PublicKey().ToBase58()
-	}
-	timelockRecordsByVault, err := i.ocpData.GetTimelockByVaultBatch(ctx, vaultAddresses...)
-	if err != nil {
-		log.Warn("failed to batch get timelock records", zap.Error(err))
-		return
-	}
-	lockedTokenAccounts := make([]*ocp_common.Account, 0)
-	for _, tokenAccount := range tokenAccounts {
-		record, ok := timelockRecordsByVault[tokenAccount.PublicKey().ToBase58()]
-		if !ok || !record.IsLocked() {
-			continue
-		}
-		lockedTokenAccounts = append(lockedTokenAccounts, tokenAccount)
-	}
-	tokenAccounts = lockedTokenAccounts
-	if len(tokenAccounts) == 0 {
-		return
-	}
-
-	// Batch calculate balances using the default cache-based calculator
-	balances, err := ocp_balance_util.BatchCalculateFromCacheWithTokenAccounts(ctx, i.ocpData, tokenAccounts...)
-	if err != nil {
-		log.Warn("failed to batch calculate balances", zap.Error(err))
+	if len(owners) == 0 {
 		return
 	}
 
 	// Send push to each holder with positive gain
-	now := time.Now()
-	for tokenAccountBase58, quarks := range balances {
-		if quarks == 0 {
-			continue
-		}
-
-		owner := tokenAccountToOwner[tokenAccountBase58]
+	for _, owner := range owners {
+		holding := holdingByOwner[owner]
 		userID := userIDMap[owner]
-		usdCostBasis := costBasesByOwner[owner]
 
 		log := log.With(zap.String("owner", owner))
 
-		// Calculate current USD market value of the balance
-		usdValue, err := ocp_currency_util.CalculateUsdMarketValueFromTokenAmount(ctx, i.ocpData, i.ocpExchangeRates, i.ocpReserveStates, mint, quarks, now)
-		if err != nil {
-			log.Warn("failed to calculate usd market value", zap.Error(err))
-			continue
-		}
-
+		usdfSellValueInQuarks, _ := currencycreator.EstimateSell(&currencycreator.EstimateSellArgs{
+			CurrentSupplyInQuarks: supplyFromBonding,
+			SellAmountInQuarks:    uint64(holding.Quarks),
+			ValueMintDecimals:     uint8(ocp_common.CoreMintDecimals),
+			SellFeeBps:            0,
+		})
+		usdValue := float64(usdfSellValueInQuarks) / float64(ocp_common.CoreMintQuarksPerUnit)
 		if usdValue < 0.01 {
 			continue
 		}
 
-		usdGain := usdValue - usdCostBasis
+		usdGain := usdValue - ocp_balance.UsdCostBasisToFloat(holding.UsdCostBasis)
 		if usdGain <= 0.01 {
 			continue
 		}
@@ -397,8 +358,6 @@ func (i *Integration) notifyHoldersOfGainBatch(ctx context.Context, log *zap.Log
 		}
 		gain := exchangeRate * usdGain
 
-		if owner != buyer.PublicKey().ToBase58() {
-			push.SendFlipcashCurrencyGainPush(ctx, i.pusher, userID, protoMint, currencyName, userRegionSetting, gain)
-		}
+		push.SendFlipcashCurrencyGainPush(ctx, i.pusher, userID, protoMint, currencyName, userRegionSetting, gain)
 	}
 }

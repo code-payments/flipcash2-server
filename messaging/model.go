@@ -135,6 +135,9 @@ func (m *Message) IsDeletable() bool {
 	if len(m.Content) == 0 {
 		return false
 	}
+	if time.Since(m.Timestamp) > 2*24*time.Hour {
+		return false
+	}
 	switch m.Content[0].Type.(type) {
 	case *messagingpb.Content_Text,
 		*messagingpb.Content_Media,
@@ -162,6 +165,9 @@ func (m *Message) IsDeleted() bool {
 // CANNOT_EDIT.
 func (m *Message) IsEditable() bool {
 	if len(m.Content) == 0 {
+		return false
+	}
+	if time.Since(m.Timestamp) > 15*time.Minute {
 		return false
 	}
 	switch m.Content[0].Type.(type) {

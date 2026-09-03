@@ -46,6 +46,8 @@ var (
 	DefaulWithdrawalFeeAmount        = ocp_common.ToCoreMintQuarks(5) / 10
 	MinHolderValue                   = ocp_common.ToCoreMintQuarks(10)
 	MinUsernameTotalBalance          = ocp_common.ToCoreMintQuarks(100)
+	DefaultMessageEditWindow         = 15 * time.Minute
+	DefaultMessageDeleteWindow       = 2 * 24 * time.Hour
 )
 
 type onRampProviderConfig struct {
@@ -292,6 +294,8 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
 			TipPresets:                       tipPresets,
 			UsernameMinBalance:               MinUsernameTotalBalance,
+			MessageEditWindow:                durationpb.New(DefaultMessageEditWindow),
+			MessageDeleteWindow:              durationpb.New(DefaultMessageDeleteWindow),
 		},
 	}, nil
 }
@@ -330,6 +334,8 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
 			TipPresets:                       tipPresets,
 			UsernameMinBalance:               MinUsernameTotalBalance,
+			MessageEditWindow:                durationpb.New(DefaultMessageEditWindow),
+			MessageDeleteWindow:              durationpb.New(DefaultMessageDeleteWindow),
 		},
 	}, nil
 }

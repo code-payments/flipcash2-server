@@ -10,6 +10,7 @@ import (
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	"github.com/code-payments/flipcash2-server/account"
 )
 
 // ClientMessageIDSize is the length, in bytes, of a client message ID.
@@ -135,7 +136,7 @@ func (m *Message) IsDeletable() bool {
 	if len(m.Content) == 0 {
 		return false
 	}
-	if time.Since(m.Timestamp) > 2*24*time.Hour {
+	if time.Since(m.Timestamp) > account.DefaultMessageDeleteWindow {
 		return false
 	}
 	switch m.Content[0].Type.(type) {
@@ -167,7 +168,7 @@ func (m *Message) IsEditable() bool {
 	if len(m.Content) == 0 {
 		return false
 	}
-	if time.Since(m.Timestamp) > 15*time.Minute {
+	if time.Since(m.Timestamp) > account.DefaultMessageEditWindow {
 		return false
 	}
 	switch m.Content[0].Type.(type) {

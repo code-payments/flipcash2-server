@@ -234,7 +234,7 @@ func (i *Integration) notifyHoldersOfGain(ctx context.Context, mint *ocp_common.
 		// that's wrong in an unbounded direction.
 		holdings := make([]*ocp_balance.Record, 0, len(balanceRecords))
 		for _, balanceRecord := range balanceRecords {
-			if !balanceRecord.IsBackfilled || !balanceRecord.IsOpen || balanceRecord.Quarks <= 0 {
+			if !balanceRecord.IsOpen || balanceRecord.Quarks <= 0 {
 				continue
 			}
 			holdings = append(holdings, balanceRecord)

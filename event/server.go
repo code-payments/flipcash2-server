@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -21,11 +20,9 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/badge"
+	"github.com/code-payments/flipcash2-server/cluster/internalrpc"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/protoutil"
-	ocp_headers "github.com/code-payments/ocp-server/grpc/headers"
-	ocp_retry "github.com/code-payments/ocp-server/retry"
-	ocp_backoff "github.com/code-payments/ocp-server/retry/backoff"
 )
 
 const (
@@ -42,8 +39,6 @@ const (
 	rendezvousRefreshInterval = 2 * time.Second
 
 	forwardRpcTimeout = 250 * time.Millisecond
-
-	internalRpcApiKeyHeaderName = "x-flipcash-internal-rpc-api-key"
 )
 
 type StaleEventDetectorCtor[Event any] func() StaleEventDetector[Event]
@@ -68,9 +63,9 @@ type Server struct {
 	streams                 map[string]Stream[[]*eventpb.Event]
 	staleEventDetectorCtors []StaleEventDetectorCtor[*eventpb.Event]
 
-	broadcastAddress      string
-	allInternalRpcApiKeys map[string]any
-	currentRpcApiKey      string
+	broadcastAddress string
+	internalAuth     *internalrpc.Authenticator
+	forwarder        *userEventForwarder
 
 	eventpb.UnimplementedEventStreamingServer
 }
@@ -101,12 +96,18 @@ func NewServer(
 		streams:                 make(map[string]Stream[[]*eventpb.Event]),
 		staleEventDetectorCtors: staleEventDetectorCtors,
 
-		broadcastAddress:      broadcastAddress,
-		currentRpcApiKey:      currentRpcApiKey,
-		allInternalRpcApiKeys: make(map[string]any),
+		broadcastAddress: broadcastAddress,
+		internalAuth:     internalrpc.NewAuthenticator(currentRpcApiKey),
 	}
 
-	s.allInternalRpcApiKeys[currentRpcApiKey] = true
+	s.forwarder = &userEventForwarder{
+		log:          log,
+		events:       events,
+		pool:         sharedForwardingPool(log),
+		apiKey:       currentRpcApiKey,
+		selfAddress:  broadcastAddress,
+		deliverLocal: s.deliverLocal,
+	}
 
 	eventBus.AddHandler(HandlerFunc[*commonpb.UserId, *eventpb.Event](s.OnEvent))
 
@@ -374,12 +375,12 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 }
 
 func (s *Server) ForwardEvents(ctx context.Context, req *eventpb.ForwardEventsRequest) (*eventpb.ForwardEventsResponse, error) {
-	headerValue, err := ocp_headers.GetASCIIHeaderByName(ctx, internalRpcApiKeyHeaderName)
+	allowed, err := s.internalAuth.Allow(ctx)
 	if err != nil {
 		s.log.Warn("Failure getting RPC API key header")
 		return nil, status.Error(codes.Internal, "")
 	}
-	if _, ok := s.allInternalRpcApiKeys[headerValue]; !ok {
+	if !allowed {
 		return &eventpb.ForwardEventsResponse{Result: eventpb.ForwardEventsResponse_DENIED}, nil
 	}
 
@@ -402,109 +403,26 @@ func (s *Server) ForwardEvents(ctx context.Context, req *eventpb.ForwardEventsRe
 	return &eventpb.ForwardEventsResponse{}, nil
 }
 
-// todo: duplicated code with ForwardingClient
 // todo: utilize batching by receiver to optimize internal forwarding RPC calls
 func (s *Server) ForwardUserEvents(ctx context.Context, events ...*eventpb.UserEvent) error {
-	var err error
-	if !ocp_headers.AreHeadersInitialized(ctx) {
-		ctx, err = ocp_headers.ContextWithHeaders(ctx)
-		if err != nil {
-			s.log.With(zap.Error(err)).Warn("Failure initializing headers")
-			return err
-		}
-	}
-
-	err = ocp_headers.SetASCIIHeader(ctx, internalRpcApiKeyHeaderName, s.currentRpcApiKey)
-	if err != nil {
-		s.log.With(zap.Error(err)).Warn("Failure setting RPC API key header")
-		return err
-	}
-
-	for _, event := range events {
-		go func() {
-			ocp_retry.Retry(
-				func() error {
-					return s.forwardUserEvent(ctx, event)
-				},
-				ocp_retry.Limit(3),
-				ocp_retry.Backoff(ocp_backoff.BinaryExponential(100*time.Millisecond), 500*time.Millisecond),
-			)
-		}()
-	}
-	return nil
+	return s.forwarder.ForwardUserEvents(ctx, events...)
 }
 
-// todo: duplicated code with ForwardingClient
-func (s *Server) forwardUserEvent(ctx context.Context, event *eventpb.UserEvent) error {
-	log := s.log.With(
-		zap.String("event_id", EventIDString(event.Event.Id)),
-		zap.String("user_id", model.UserIDString(event.UserId)),
-	)
+// deliverLocal notifies an event onto the user's stream when this server hosts
+// it.
+func (s *Server) deliverLocal(streamKey string, e *eventpb.Event) {
+	s.streamsMu.RLock()
+	stream, exists := s.streams[streamKey]
+	s.streamsMu.RUnlock()
 
-	streamKey := model.UserIDString(event.UserId)
-
-	rendezvous, err := s.events.GetRendezvous(ctx, streamKey)
-	switch err {
-	case nil:
-		log = log.With(zap.String("receiver_address", rendezvous.Address))
-
-		// Expired rendezvous record that likely wasn't cleaned up. Avoid forwarding,
-		// since we expect a broken state.
-		if time.Since(rendezvous.ExpiresAt) >= 0 {
-			log.With(zap.Error(err)).Debug("Dropping event with expired rendezvous record")
-			return nil
-		}
-
-		// This server is hosting the user's event stream, no forwarding required
-		if rendezvous.Address == s.broadcastAddress {
-			s.streamsMu.RLock()
-			stream, exists := s.streams[streamKey]
-			s.streamsMu.RUnlock()
-
-			if exists {
-				cloned := proto.Clone(event.Event).(*eventpb.Event)
-				if err := stream.Notify([]*eventpb.Event{cloned}, streamTimeout); err != nil {
-					log.Warn("Failed to notify event on local stream", zap.Error(err))
-				}
-			}
-
-			return nil
-		}
-
-		// Otherwise, forward it to the server hosting the user's stream
-		forwardingRpcClient, err := getForwardingRpcClient(s.log, rendezvous.Address)
-		if err != nil {
-			log.With(zap.Error(err)).Warn("Failure creating forwarding RPC client")
-			return err
-		}
-
-		ctx, cancel := context.WithTimeout(ctx, forwardRpcTimeout)
-		defer cancel()
-
-		log.Debug("Forwarding events over RPC")
-
-		resp, err := forwardingRpcClient.ForwardEvents(ctx, &eventpb.ForwardEventsRequest{
-			UserEvents: &eventpb.UserEventBatch{
-				Events: []*eventpb.UserEvent{event},
-			},
-		})
-		if err != nil {
-			log.With(zap.Error(err)).Warn("Failure forwarding event over RPC")
-			return err
-		} else if resp.Result != eventpb.ForwardEventsResponse_OK {
-			log.With(zap.String("result", resp.Result.String())).Warn("Failure forwarding event over RPC")
-			return errors.Errorf("rpc forward result %s", resp.Result)
-		}
-
-	case ErrRendezvousNotFound:
-		log.Debug("Dropping event without rendezvous record")
-
-	default:
-		log.With(zap.Error(err)).Warn("Failed to get rendezvous record")
-		return err
+	if !exists {
+		return
 	}
 
-	return nil
+	cloned := proto.Clone(e).(*eventpb.Event)
+	if err := stream.Notify([]*eventpb.Event{cloned}, streamTimeout); err != nil {
+		s.log.With(zap.Error(err)).Warn("Failed to notify event on local stream", zap.String("stream_key", streamKey))
+	}
 }
 
 func (s *Server) OnEvent(userID *commonpb.UserId, e *eventpb.Event) {

@@ -27,11 +27,21 @@ func TestConfigDefaults(t *testing.T) {
 	require.Equal(t, 5*time.Second, o.SuspicionWindow) // Pre-floor; see below.
 	require.Equal(t, time.Second, o.RedirectCacheTTL)
 
+	s := SubscriptionsConfig{}.withDefaults()
+	require.Equal(t, 250*time.Millisecond, s.CacheTTL)
+
 	// The effective production suspicion window is floored at construction to
 	// heartbeat + poll.
 	membership := NewMembership(zap.NewNop(), &fakeRegistry{}, &Member{InstanceID: "a"}, MembershipConfig{})
 	ownership := NewOwnership(zap.NewNop(), membership, nil, nil, OwnershipConfig{})
 	require.Equal(t, 7*time.Second, ownership.cfg.SuspicionWindow)
+
+	// RowGCAfter resolves at construction against the membership's liveness
+	// window (10× by default), and is floored well above it so merely-slow
+	// members are never swept.
+	subscriptions := NewSubscriptions(zap.NewNop(), membership, nil, SubscriptionsConfig{})
+	require.Equal(t, 150*time.Second, subscriptions.cfg.RowGCAfter)
+	require.GreaterOrEqual(t, subscriptions.cfg.RowGCAfter, 2*m.LivenessWindow)
 
 	// The invariants the suspicion hardening rests on: jitter tolerance of at
 	// least one poll interval, and shedding fired no later than displacement

@@ -12,14 +12,15 @@ import (
 )
 
 const (
-	membersTable = "cluster_members_test"
-	claimsTable  = "cluster_claims_test"
+	membersTable       = "cluster_members_test"
+	claimsTable        = "cluster_claims_test"
+	subscriptionsTable = "cluster_subscriptions_test"
 )
 
 func TestCluster_DynamoDBStore(t *testing.T) {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, membersTable, claimsTable))
+	require.NoError(t, CreateTables(context.Background(), testEnv.Client, membersTable, claimsTable, subscriptionsTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, membersTable, claimsTable)
+	testStore := NewInDynamoDB(testEnv.Client, membersTable, claimsTable, subscriptionsTable)
 	teardown := func() {
 		testStore.(*store).reset()
 	}
@@ -27,9 +28,9 @@ func TestCluster_DynamoDBStore(t *testing.T) {
 }
 
 func TestCluster_DynamoDBRuntime(t *testing.T) {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, membersTable, claimsTable))
+	require.NoError(t, CreateTables(context.Background(), testEnv.Client, membersTable, claimsTable, subscriptionsTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, membersTable, claimsTable)
+	testStore := NewInDynamoDB(testEnv.Client, membersTable, claimsTable, subscriptionsTable)
 	teardown := func() {
 		testStore.(*store).reset()
 	}
@@ -37,9 +38,9 @@ func TestCluster_DynamoDBRuntime(t *testing.T) {
 }
 
 func TestCluster_DynamoDBProductionTimings(t *testing.T) {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, membersTable, claimsTable))
+	require.NoError(t, CreateTables(context.Background(), testEnv.Client, membersTable, claimsTable, subscriptionsTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, membersTable, claimsTable)
+	testStore := NewInDynamoDB(testEnv.Client, membersTable, claimsTable, subscriptionsTable)
 	teardown := func() {
 		testStore.(*store).reset()
 	}
@@ -47,9 +48,9 @@ func TestCluster_DynamoDBProductionTimings(t *testing.T) {
 }
 
 func TestCluster_DynamoDBE2E(t *testing.T) {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, membersTable, claimsTable))
+	require.NoError(t, CreateTables(context.Background(), testEnv.Client, membersTable, claimsTable, subscriptionsTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, membersTable, claimsTable)
+	testStore := NewInDynamoDB(testEnv.Client, membersTable, claimsTable, subscriptionsTable)
 	teardown := func() {
 		testStore.(*store).reset()
 	}

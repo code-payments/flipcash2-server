@@ -1,7 +1,8 @@
-// Package cluster provides a generic substrate for consistent routing and
-// exclusive ownership of namespaced keys across a fleet of servers.
+// Package cluster provides a generic substrate for consistent routing,
+// exclusive ownership, and stream-interest tracking of namespaced keys across
+// a fleet of servers.
 //
-// It is built from three decoupled layers:
+// It is built from four decoupled layers:
 //
 //  1. Membership: each process registers a member record with a fresh instance
 //     ID and keeps it alive with a heartbeat counter. Peers poll the registry
@@ -17,9 +18,17 @@
 //     should own; the claim record is the sole arbiter of who does. Non-owners
 //     receive a redirect and forward.
 //
+//  4. Subscriptions: a non-exclusive interest registry per (namespace, key)
+//     topic — which servers currently host live streams for the topic, one
+//     row per interested server no matter how many local streams ride it.
+//     There is no arbitration and no fence; a row simply stops counting the
+//     moment its member stops being live.
+//
 // Ownership is an accelerator, not an availability gate: consumers must keep a
 // store-serialized fallback path so that losing an owner degrades to
-// contention, never to unavailability or corruption.
+// contention, never to unavailability or corruption. Subscription-driven
+// delivery is a hint, not a contract: consumers must keep a pull backstop
+// (e.g. sequence-log delta sync) so a missed delivery is healed, never lost.
 package cluster
 
 import (
@@ -80,6 +89,33 @@ func (c *Claim) Clone() *Claim {
 		OwnerInstanceID: c.OwnerInstanceID,
 		OwnerAddress:    c.OwnerAddress,
 		Fence:           c.Fence,
+	}
+}
+
+// Subscription is one member's registered interest in a (namespace, key)
+// topic: "this server hosts at least one live stream for this topic — deliver
+// the topic's events here". Unlike a Claim it is non-exclusive (a topic holds
+// one row per interested server) and carries no fence: there is nothing to
+// serialize. A subscription counts only while its member is live, judged by
+// the same heartbeat observation as claims — so steady state needs no row
+// refreshes, and a dead member's rows are ignored immediately regardless of
+// when they get swept.
+type Subscription struct {
+	Namespace  string
+	Key        []byte
+	InstanceID string
+	Address    string
+}
+
+// Clone returns a deep copy.
+func (s *Subscription) Clone() *Subscription {
+	key := make([]byte, len(s.Key))
+	copy(key, s.Key)
+	return &Subscription{
+		Namespace:  s.Namespace,
+		Key:        key,
+		InstanceID: s.InstanceID,
+		Address:    s.Address,
 	}
 }
 
@@ -227,5 +263,40 @@ func (c OwnershipConfig) withDefaults() OwnershipConfig {
 	if c.RedirectCacheTTL <= 0 {
 		c.RedirectCacheTTL = time.Second
 	}
+	return c
+}
+
+// SubscriptionsConfig tunes the subscriptions runtime. Zero values take
+// defaults.
+type SubscriptionsConfig struct {
+	// CacheTTL bounds how long a resolved subscriber set is reused without
+	// re-reading the registry, so the publish path pays at most one registry
+	// read per topic per TTL no matter the event rate. Empty results are
+	// cached too — publishes toward offline users must not read per event.
+	// The staleness is covered by the consumer's pull backstop: a just-opened
+	// stream misses at most one TTL of events before its delta sync heals it.
+	// Default 250ms — hot-topic read load at 4 reads/s per publisher is still
+	// orders of magnitude under DynamoDB's per-partition ceiling, so the
+	// freshness is nearly free; shrinking it much further buys latency the
+	// delta sync already covers.
+	CacheTTL time.Duration
+
+	// RowGCAfter is how long a row's member may sit continuously outside this
+	// observer's live view before the row is treated as a crashed instance's
+	// leftover and deleted at resolution time. Graceful drains remove their
+	// own rows; this sweeps what crashes leave behind on topics still being
+	// published to. Floored at construction well above the liveness window so
+	// a merely-slow member is never swept — and a wrongly swept row is
+	// re-asserted by its owner on its next liveness session recovery. Default:
+	// 10 × the membership's LivenessWindow, resolved at construction.
+	RowGCAfter time.Duration
+}
+
+func (c SubscriptionsConfig) withDefaults() SubscriptionsConfig {
+	if c.CacheTTL <= 0 {
+		c.CacheTTL = 250 * time.Millisecond
+	}
+	// RowGCAfter needs the membership's liveness window; NewSubscriptions
+	// resolves it.
 	return c
 }

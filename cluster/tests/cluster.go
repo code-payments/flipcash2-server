@@ -40,6 +40,14 @@ func RunClusterTests(t *testing.T, s cluster.Store, teardown func()) {
 		testSessionGapPurge,
 		testRebalanceOnJoin,
 		testIdleRelease,
+		testSubscribeRefcounting,
+		testSubscriberResolutionAndLiveness,
+		testSubscriberCache,
+		testSubscriptionsDrainAndResume,
+		testSubscriptionStaleHandleAfterResume,
+		testSubscriptionReassertDrainRace,
+		testSubscriptionSessionReassert,
+		testSubscriptionCorpseRowGC,
 	} {
 		tf(t, s)
 		teardown()
@@ -48,10 +56,11 @@ func RunClusterTests(t *testing.T, s cluster.Store, teardown func()) {
 
 // node bundles one simulated server's cluster runtime with hook recorders.
 type node struct {
-	member     *cluster.Member
-	membership *cluster.Membership
-	router     *cluster.Router
-	ownership  *cluster.Ownership
+	member        *cluster.Member
+	membership    *cluster.Membership
+	router        *cluster.Router
+	ownership     *cluster.Ownership
+	subscriptions *cluster.Subscriptions
 
 	mu       sync.Mutex
 	acquired []string
@@ -106,6 +115,14 @@ func fastOwnershipConfig() cluster.OwnershipConfig {
 	}
 }
 
+func fastSubscriptionsConfig() cluster.SubscriptionsConfig {
+	return cluster.SubscriptionsConfig{
+		CacheTTL: 25 * time.Millisecond,
+		// RowGCAfter is resolved against the liveness window at construction;
+		// the corpse-sweep test builds its own runtime with a tight value.
+	}
+}
+
 func startNode(t *testing.T, s cluster.Store, name string, mCfg cluster.MembershipConfig, oCfg cluster.OwnershipConfig) *node {
 	log := zap.NewNop()
 
@@ -119,6 +136,7 @@ func startNode(t *testing.T, s cluster.Store, name string, mCfg cluster.Membersh
 	n.membership = cluster.NewMembership(log, s, n.member, mCfg)
 	n.router = cluster.NewRouter(n.membership, nil)
 	n.ownership = cluster.NewOwnership(log, n.membership, n.router, s, oCfg)
+	n.subscriptions = cluster.NewSubscriptions(log, n.membership, s, fastSubscriptionsConfig())
 	n.ownership.RegisterNamespace(testNamespace, cluster.NamespaceHooks{
 		OnAcquired: n.onAcquired,
 		OnReleased: n.onReleased,
@@ -290,6 +308,17 @@ func testSuspicionTakeover(t *testing.T, s cluster.Store) {
 		require.ErrorAs(t, err, &notOwner)
 		require.NotNil(t, notOwner.Redirect)
 		require.Equal(t, "instance-a", notOwner.Redirect.InstanceID)
+
+		// File the unreachable report only after B has OBSERVED the corpse's
+		// final beat (as production.go does): a beat observed after the report
+		// invalidates it (by design), which would silently push this test onto
+		// the one-minute liveness-window path and past the Eventually budget.
+		final, ok := memberCounter(t, s, "instance-a")
+		require.True(t, ok)
+		require.Eventually(t, func() bool {
+			counter, _, seen := b.membership.LivenessInfo("instance-a")
+			return seen && counter == final
+		}, 5*time.Second, 10*time.Millisecond)
 
 		// The caller's forward fails and it reports the member unreachable.
 		// Corroborated by a heartbeat stale past the suspicion window, B may

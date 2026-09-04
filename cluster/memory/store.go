@@ -25,16 +25,18 @@ type claimRow struct {
 }
 
 type memory struct {
-	mu      sync.Mutex
-	members map[string]*memberRow
-	claims  map[string]*claimRow
+	mu            sync.Mutex
+	members       map[string]*memberRow
+	claims        map[string]*claimRow
+	subscriptions map[string]map[string]*cluster.Subscription // topic id → instance id → row
 }
 
 // NewInMemory returns an in-memory cluster.Store for tests.
 func NewInMemory() cluster.Store {
 	return &memory{
-		members: make(map[string]*memberRow),
-		claims:  make(map[string]*claimRow),
+		members:       make(map[string]*memberRow),
+		claims:        make(map[string]*claimRow),
+		subscriptions: make(map[string]map[string]*cluster.Subscription),
 	}
 }
 
@@ -43,6 +45,7 @@ func (m *memory) reset() {
 	defer m.mu.Unlock()
 	m.members = make(map[string]*memberRow)
 	m.claims = make(map[string]*claimRow)
+	m.subscriptions = make(map[string]map[string]*cluster.Subscription)
 }
 
 func (m *memory) PutMember(_ context.Context, member *cluster.Member, heartbeatCounter uint64) error {
@@ -98,7 +101,8 @@ func (m *memory) GetMembers(_ context.Context) ([]*cluster.MemberRecord, error) 
 }
 
 // claimID hex-encodes the key (matching the DynamoDB pk) so raw key bytes
-// containing the separator can never collide across namespaces.
+// containing the separator can never collide across namespaces. Subscription
+// topics use the same encoding.
 func claimID(namespace string, key []byte) string {
 	return namespace + "#" + hex.EncodeToString(key)
 }
@@ -173,4 +177,48 @@ func (m *memory) ReleaseClaim(_ context.Context, namespace string, key []byte, i
 	row.ownerID = ""
 	row.ownerAddress = ""
 	return nil
+}
+
+func (m *memory) PutSubscription(_ context.Context, namespace string, key []byte, member *cluster.Member) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id := claimID(namespace, key)
+	topic, ok := m.subscriptions[id]
+	if !ok {
+		topic = make(map[string]*cluster.Subscription)
+		m.subscriptions[id] = topic
+	}
+	topic[member.InstanceID] = &cluster.Subscription{
+		Namespace:  namespace,
+		Key:        append([]byte(nil), key...),
+		InstanceID: member.InstanceID,
+		Address:    member.Address,
+	}
+	return nil
+}
+
+func (m *memory) DeleteSubscription(_ context.Context, namespace string, key []byte, instanceID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id := claimID(namespace, key)
+	topic, ok := m.subscriptions[id]
+	if !ok {
+		return nil
+	}
+	delete(topic, instanceID)
+	if len(topic) == 0 {
+		delete(m.subscriptions, id)
+	}
+	return nil
+}
+
+func (m *memory) GetSubscribers(_ context.Context, namespace string, key []byte) ([]*cluster.Subscription, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	topic := m.subscriptions[claimID(namespace, key)]
+	out := make([]*cluster.Subscription, 0, len(topic))
+	for _, sub := range topic {
+		out = append(out, sub.Clone())
+	}
+	return out, nil
 }

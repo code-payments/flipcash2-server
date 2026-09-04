@@ -18,6 +18,7 @@ func RunStoreTests(t *testing.T, s cluster.Store, teardown func()) {
 		testClaimTakeover,
 		testClaimTakeoverAcrossReRegistration,
 		testClaimNamespaceIsolation,
+		testSubscriptionRegistry,
 	} {
 		tf(t, s)
 		teardown()

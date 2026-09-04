@@ -14,7 +14,7 @@ import (
 	"github.com/code-payments/flipcash2-server/cluster"
 )
 
-// The cluster store spans two tables:
+// The cluster store spans three tables:
 //
 //	cluster_members  pk = instance_id (one item per live process incarnation).
 //	          The heartbeat counter is advanced by its owner and observed by
@@ -33,6 +33,16 @@ import (
 //	          with no evidence check and a reset fence. Row count is bounded
 //	          by distinct keys ever claimed; if that ever matters, reclaim
 //	          space with an explicit sweep of vacated rows, never a ttl.
+//
+//	cluster_subscriptions  pk = "<namespace>#<hex key>", sk = instance_id (one
+//	          item per interested server per topic). Non-exclusive interest
+//	          rows: plain upserts and deletes, no conditions, no fence. Like
+//	          claims they carry NO ttl attribute — a row is held for as long
+//	          as its streams live with zero refreshing writes, so a ttl would
+//	          eventually expire a live subscriber's row and silently stop
+//	          delivery to it. Validity is the member's liveness; cleanup is
+//	          explicit (drains delete their own rows, observers sweep crashed
+//	          instances' rows at resolution time).
 //
 // A takeover is a TransactWriteItems pairing the claim update with a
 // ConditionCheck that the displaced owner's heartbeat counter still equals the
@@ -64,21 +74,25 @@ const (
 )
 
 type store struct {
-	client       *dynamodb.Client
-	membersTable string
-	claimsTable  string
+	client             *dynamodb.Client
+	membersTable       string
+	claimsTable        string
+	subscriptionsTable string
 }
 
 // NewInDynamoDB returns a cluster.Store backed by the given DynamoDB tables.
 // Use CreateTables to provision them.
-func NewInDynamoDB(client *dynamodb.Client, membersTable, claimsTable string) cluster.Store {
+func NewInDynamoDB(client *dynamodb.Client, membersTable, claimsTable, subscriptionsTable string) cluster.Store {
 	return &store{
-		client:       client,
-		membersTable: membersTable,
-		claimsTable:  claimsTable,
+		client:             client,
+		membersTable:       membersTable,
+		claimsTable:        claimsTable,
+		subscriptionsTable: subscriptionsTable,
 	}
 }
 
+// claimPK also keys subscription topics — both tables address (namespace,
+// key) with the same encoding.
 func claimPK(namespace string, key []byte) string {
 	return namespace + "#" + hex.EncodeToString(key)
 }
@@ -399,6 +413,85 @@ func (s *store) ReleaseClaim(ctx context.Context, namespace string, key []byte, 
 		return err
 	}
 	return nil
+}
+
+func (s *store) PutSubscription(ctx context.Context, namespace string, key []byte, member *cluster.Member) error {
+	_, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(s.subscriptionsTable),
+		Item: map[string]types.AttributeValue{
+			attrPK:         &types.AttributeValueMemberS{Value: claimPK(namespace, key)},
+			attrInstanceID: &types.AttributeValueMemberS{Value: member.InstanceID},
+			attrNamespace:  &types.AttributeValueMemberS{Value: namespace},
+			attrKey:        &types.AttributeValueMemberB{Value: key},
+			attrAddress:    &types.AttributeValueMemberS{Value: member.Address},
+		},
+	})
+	return err
+}
+
+func (s *store) DeleteSubscription(ctx context.Context, namespace string, key []byte, instanceID string) error {
+	_, err := s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(s.subscriptionsTable),
+		Key: map[string]types.AttributeValue{
+			attrPK:         &types.AttributeValueMemberS{Value: claimPK(namespace, key)},
+			attrInstanceID: &types.AttributeValueMemberS{Value: instanceID},
+		},
+	})
+	return err
+}
+
+func (s *store) GetSubscribers(ctx context.Context, namespace string, key []byte) ([]*cluster.Subscription, error) {
+	var out []*cluster.Subscription
+	var startKey map[string]types.AttributeValue
+	for {
+		resp, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(s.subscriptionsTable),
+			ConsistentRead:         aws.Bool(true),
+			KeyConditionExpression: aws.String("#pk = :pk"),
+			ExpressionAttributeNames: map[string]string{
+				"#pk": attrPK,
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk": &types.AttributeValueMemberS{Value: claimPK(namespace, key)},
+			},
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		for _, item := range resp.Items {
+			sub, err := subscriptionFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, sub)
+		}
+
+		if len(resp.LastEvaluatedKey) == 0 {
+			return out, nil
+		}
+		startKey = resp.LastEvaluatedKey
+	}
+}
+
+func subscriptionFromItem(item map[string]types.AttributeValue) (*cluster.Subscription, error) {
+	sub := &cluster.Subscription{}
+	if v, ok := item[attrInstanceID].(*types.AttributeValueMemberS); ok {
+		sub.InstanceID = v.Value
+	} else {
+		return nil, errors.New("subscription item missing instance_id")
+	}
+	if v, ok := item[attrNamespace].(*types.AttributeValueMemberS); ok {
+		sub.Namespace = v.Value
+	}
+	if v, ok := item[attrKey].(*types.AttributeValueMemberB); ok {
+		sub.Key = append([]byte(nil), v.Value...)
+	}
+	if v, ok := item[attrAddress].(*types.AttributeValueMemberS); ok {
+		sub.Address = v.Value
+	}
+	return sub, nil
 }
 
 // canceledByConditionFailure reports whether any of the transaction's

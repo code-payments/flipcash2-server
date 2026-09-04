@@ -83,9 +83,35 @@ type ClaimStore interface {
 	ReleaseClaim(ctx context.Context, namespace string, key []byte, instanceID string) error
 }
 
-// Store combines the registry and claim stores. Implementations back both from
-// the same technology so the takeover condition can span them atomically.
+// SubscriptionStore persists stream-interest registrations: one row per
+// (namespace, key, instance) meaning "this member hosts live streams for this
+// topic". Rows are non-exclusive and unfenced — there is nothing to arbitrate.
+//
+// A row counts only while its member is live (the same heartbeat-observation
+// rule as claims), so implementations must not attach row-level TTLs: nothing
+// refreshes a held row (steady state is deliberately write-free), and a row
+// expiring under a live subscriber would silently stop delivery to it.
+// Cleanup is explicit instead — drains delete their own rows, and observers
+// sweep crashed instances' rows at resolution time.
+type SubscriptionStore interface {
+	// PutSubscription registers (or reasserts) the member's interest row for
+	// the topic. Idempotent upsert.
+	PutSubscription(ctx context.Context, namespace string, key []byte, member *Member) error
+
+	// DeleteSubscription removes the member's interest row for the topic.
+	// Idempotent.
+	DeleteSubscription(ctx context.Context, namespace string, key []byte, instanceID string) error
+
+	// GetSubscribers returns every interest row for the topic, dead members'
+	// rows included — liveness filtering is the caller's job.
+	GetSubscribers(ctx context.Context, namespace string, key []byte) ([]*Subscription, error)
+}
+
+// Store combines the registry, claim, and subscription stores. Implementations
+// back all three from the same technology so the takeover condition can span
+// registry and claims atomically.
 type Store interface {
 	RegistryStore
 	ClaimStore
+	SubscriptionStore
 }

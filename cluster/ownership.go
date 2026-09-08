@@ -141,7 +141,14 @@ func (o *Ownership) unlockKey(id string, kl *keyLock) {
 
 // NewOwnership creates the ownership runtime. Call Start to begin the idle
 // reaper and membership rescans.
+//
+// Ownership requires a registered membership: a claim's validity is its
+// holder's liveness, which an observer (NewObserver) does not have. Panics on
+// an observer membership — construction-time misuse, not a runtime condition.
 func NewOwnership(log *zap.Logger, membership *Membership, router *Router, claims ClaimStore, cfg OwnershipConfig) *Ownership {
+	if membership.observer() {
+		panic("cluster: Ownership requires a registered membership; an observer cannot hold claims")
+	}
 	cfg = cfg.withDefaults()
 	// A suspicion window below one heartbeat plus one poll leaves zero
 	// tolerance for heartbeat jitter: a peer whose beat merely landed late

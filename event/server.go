@@ -99,6 +99,14 @@ func NewServer(
 	staleEventDetectorCtors []StaleEventDetectorCtor[*eventpb.Event],
 	currentRpcApiKey string,
 ) *Server {
+	// The server hosts streams and registers subscription rows, which requires
+	// a registered cluster member — an observer membership backs forwarding
+	// only (use ForwardingClient for that). Fail construction loudly instead
+	// of nil-dereferencing below.
+	if subscriptions.Self() == nil {
+		panic("event: Server requires a member-backed subscriptions runtime; an observer cannot host streams")
+	}
+
 	s := &Server{
 		log: log,
 

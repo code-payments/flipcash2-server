@@ -13,6 +13,13 @@ import (
 // registration accepted mid-drain would write a row nothing will clean up.
 var ErrSubscriptionsDraining = errors.New("cluster subscriptions are draining")
 
+// ErrObserverMembership is returned by Subscribe on a runtime backed by an
+// observer membership. An observer has no member record, so a row it wrote
+// would never count (a row's validity is its member's liveness) and would
+// eventually be swept as a corpse. Observers resolve and forward; only
+// registered members host streams.
+var ErrObserverMembership = errors.New("observer membership cannot register interest")
+
 // subscriptionOpTimeout bounds the background row writes the runtime performs
 // on its own behalf (sweeps and re-assertions), which carry no caller context.
 const subscriptionOpTimeout = 5 * time.Second
@@ -96,6 +103,11 @@ func (h *SubscriptionHandle) Close(ctx context.Context) error {
 
 // NewSubscriptions creates the subscriptions runtime. It has no background
 // loops; cleanup work rides resolution calls and membership callbacks.
+//
+// An observer membership (NewObserver) is a valid backing for the read side:
+// Subscribers resolves (and sweeps corpse rows) exactly as on a member, so an
+// event-forwarding-only process can publish toward the fleet. Subscribe is
+// refused with ErrObserverMembership — an observer cannot host streams.
 func NewSubscriptions(log *zap.Logger, membership *Membership, store SubscriptionStore, cfg SubscriptionsConfig) *Subscriptions {
 	cfg = cfg.withDefaults()
 	// Floored well above the liveness window: sweeping is judged on this
@@ -142,7 +154,8 @@ func NewSubscriptions(log *zap.Logger, membership *Membership, store Subscriptio
 // Self returns the local member whose interest this runtime registers — the
 // identity carried by every subscriber row this process writes. Consumers use
 // it to recognize their own rows in Subscribers results exactly (by instance
-// ID) instead of comparing separately-configured addresses.
+// ID) instead of comparing separately-configured addresses. Nil on an
+// observer, which writes no rows.
 func (s *Subscriptions) Self() *Member {
 	return s.membership.Self()
 }
@@ -178,8 +191,12 @@ func (s *Subscriptions) unlockTopic(id string, kl *keyLock) {
 
 // Subscribe registers a local stream's interest in the topic. The first local
 // handle writes the topic's registry row; later handles share it. Returns
-// ErrSubscriptionsDraining once Drain has begun.
+// ErrSubscriptionsDraining once Drain has begun, and ErrObserverMembership on
+// a runtime backed by an observer membership.
 func (s *Subscriptions) Subscribe(ctx context.Context, namespace string, key []byte) (*SubscriptionHandle, error) {
+	if s.membership.observer() {
+		return nil, ErrObserverMembership
+	}
 	id := ownedKeyID(namespace, key)
 	kl := s.lockTopic(id)
 	defer s.unlockTopic(id, kl)
@@ -337,7 +354,8 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 	for _, row := range rows {
 		addr, isLive := live[row.InstanceID]
 		switch {
-		case row.InstanceID == self.InstanceID:
+		// self is nil on an observer, which never has rows of its own.
+		case self != nil && row.InstanceID == self.InstanceID:
 			selfInRows = true
 			if locallySubscribed {
 				row.Address = self.Address

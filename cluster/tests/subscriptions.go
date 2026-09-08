@@ -21,17 +21,15 @@ func testSubscriptionRegistry(t *testing.T, s cluster.Store) {
 	t.Run("testSubscriptionRegistry", func(t *testing.T) {
 		ctx := context.Background()
 
-		a := member("instance-a", "10.0.0.1:8085")
-		b := member("instance-b", "10.0.0.2:8085")
 		key := []byte("group-1")
 
 		subs, err := s.GetSubscribers(ctx, subsNamespace, key)
 		require.NoError(t, err)
 		require.Empty(t, subs)
 
-		require.NoError(t, s.PutSubscription(ctx, subsNamespace, key, a))
-		require.NoError(t, s.PutSubscription(ctx, subsNamespace, key, b))
-		require.NoError(t, s.PutSubscription(ctx, subsNamespace, key, a)) // Idempotent upsert.
+		require.NoError(t, s.PutSubscription(ctx, subsNamespace, key, "instance-a"))
+		require.NoError(t, s.PutSubscription(ctx, subsNamespace, key, "instance-b"))
+		require.NoError(t, s.PutSubscription(ctx, subsNamespace, key, "instance-a")) // Idempotent upsert.
 
 		subs, err = s.GetSubscribers(ctx, subsNamespace, key)
 		require.NoError(t, err)
@@ -42,8 +40,8 @@ func testSubscriptionRegistry(t *testing.T, s cluster.Store) {
 		}
 		require.Equal(t, subsNamespace, byID["instance-a"].Namespace)
 		require.Equal(t, key, byID["instance-a"].Key)
-		require.Equal(t, "10.0.0.1:8085", byID["instance-a"].Address)
-		require.Equal(t, "10.0.0.2:8085", byID["instance-b"].Address)
+		// Rows carry identity only; addresses are the runtime's job to resolve.
+		require.Empty(t, byID["instance-a"].Address)
 
 		// Same key in another namespace, and another key in the same
 		// namespace, are different topics.
@@ -54,7 +52,7 @@ func testSubscriptionRegistry(t *testing.T, s cluster.Store) {
 		require.NoError(t, err)
 		require.Empty(t, subs)
 
-		require.NoError(t, s.PutSubscription(ctx, "other", key, a))
+		require.NoError(t, s.PutSubscription(ctx, "other", key, "instance-a"))
 		require.NoError(t, s.DeleteSubscription(ctx, subsNamespace, key, "instance-a"))
 		require.NoError(t, s.DeleteSubscription(ctx, subsNamespace, key, "instance-a")) // Idempotent.
 
@@ -98,7 +96,6 @@ func testSubscribeRefcounting(t *testing.T, s cluster.Store) {
 		require.NoError(t, err)
 		require.Len(t, rows, 1)
 		require.Equal(t, "instance-a", rows[0].InstanceID)
-		require.Equal(t, "instance-a.local:8085", rows[0].Address)
 
 		// The row survives until the last handle closes.
 		require.NoError(t, h1.Close(ctx))
@@ -130,11 +127,13 @@ func testSubscriberResolutionAndLiveness(t *testing.T, s cluster.Store) {
 		_, err := a.subscriptions.Subscribe(ctx, subsNamespace, key)
 		require.NoError(t, err)
 
-		// A peer resolves the subscriber (past its cache TTL).
+		// A peer resolves the subscriber (past its cache TTL), with the dial
+		// address joined in from the membership view — rows don't carry it.
 		require.Eventually(t, func() bool {
 			subs, err := b.subscriptions.Subscribers(ctx, subsNamespace, key)
 			require.NoError(t, err)
-			return len(subs) == 1 && subs[0].InstanceID == "instance-a"
+			return len(subs) == 1 && subs[0].InstanceID == "instance-a" &&
+				subs[0].Address == "instance-a.local:8085"
 		}, 5*time.Second, 10*time.Millisecond)
 
 		// Both subscribed: both resolve both.
@@ -308,13 +307,13 @@ type subscriptionPutGateStore struct {
 	putDone chan struct{}
 }
 
-func (s *subscriptionPutGateStore) PutSubscription(ctx context.Context, namespace string, key []byte, m *cluster.Member) error {
+func (s *subscriptionPutGateStore) PutSubscription(ctx context.Context, namespace string, key []byte, instanceID string) error {
 	gated := s.gate.Load()
 	if gated {
 		s.entered <- struct{}{}
 		<-s.release
 	}
-	err := s.Store.PutSubscription(ctx, namespace, key, m)
+	err := s.Store.PutSubscription(ctx, namespace, key, instanceID)
 	if gated {
 		s.putDone <- struct{}{}
 	}
@@ -577,10 +576,7 @@ func testSubscriptionCorpseRowGC(t *testing.T, s cluster.Store) {
 		require.NoError(t, err)
 
 		// A crashed instance's leftover row: no member record backs it.
-		require.NoError(t, s.PutSubscription(ctx, subsNamespace, key, &cluster.Member{
-			InstanceID: "instance-corpse",
-			Address:    "corpse.local:8085",
-		}))
+		require.NoError(t, s.PutSubscription(ctx, subsNamespace, key, "instance-corpse"))
 
 		// The corpse is excluded from resolution immediately — correctness
 		// never waits on the sweep.

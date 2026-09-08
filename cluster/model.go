@@ -104,7 +104,11 @@ type Subscription struct {
 	Namespace  string
 	Key        []byte
 	InstanceID string
-	Address    string
+	// Address is the member's dialable endpoint, resolved by the Subscriptions
+	// runtime from the membership view at resolution time — rows don't store
+	// it. It is set on every Subscription a live resolution returns, and empty
+	// on raw store reads.
+	Address string
 }
 
 // Clone returns a deep copy.

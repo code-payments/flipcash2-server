@@ -200,7 +200,7 @@ func (s *Subscriptions) Subscribe(ctx context.Context, namespace string, key []b
 	// First local subscriber: the row must exist before the handle does, or a
 	// publish resolved in between would miss a stream the caller believes is
 	// registered.
-	if err := s.store.PutSubscription(ctx, namespace, key, s.membership.Self()); err != nil {
+	if err := s.store.PutSubscription(ctx, namespace, key, s.membership.Self().InstanceID); err != nil {
 		return nil, err
 	}
 
@@ -303,9 +303,12 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 		return nil, err
 	}
 
-	live := make(map[string]bool)
+	// Rows carry identity only; the member's dialable address comes from the
+	// membership view — available for exactly the rows that count, since a row
+	// counts only while its member is in this observer's live view.
+	live := make(map[string]string)
 	for _, m := range s.membership.Live() {
-		live[m.InstanceID] = true
+		live[m.InstanceID] = m.Address
 	}
 	// A row's member being absent from the live view does not make the row a
 	// corpse candidate: only an instance with no membership observation at all
@@ -314,7 +317,7 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 	// before taking the runtime lock.
 	observed := make(map[string]bool, len(rows))
 	for _, row := range rows {
-		if live[row.InstanceID] || observed[row.InstanceID] {
+		if _, isLive := live[row.InstanceID]; isLive || observed[row.InstanceID] {
 			continue
 		}
 		if _, _, ok := s.membership.LivenessInfo(row.InstanceID); ok {
@@ -332,18 +335,21 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 	selfInRows := false
 	staleSelfRow := false
 	for _, row := range rows {
+		addr, isLive := live[row.InstanceID]
 		switch {
 		case row.InstanceID == self.InstanceID:
 			selfInRows = true
 			if locallySubscribed {
+				row.Address = self.Address
 				subs = append(subs, row)
 			} else {
 				// Our own row with no handles behind it: a failed unsubscribe
 				// delete. Swept below (re-checked under the topic lock).
 				staleSelfRow = true
 			}
-		case live[row.InstanceID]:
+		case isLive:
 			delete(s.unknownSince, row.InstanceID)
+			row.Address = addr
 			subs = append(subs, row)
 		default:
 			// Not live: excluded from delivery immediately — correctness
@@ -493,7 +499,7 @@ func (s *Subscriptions) reassertRow(namespace string, key []byte) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), subscriptionOpTimeout)
 	defer cancel()
-	if err := s.store.PutSubscription(ctx, namespace, key, s.membership.Self()); err != nil {
+	if err := s.store.PutSubscription(ctx, namespace, key, s.membership.Self().InstanceID); err != nil {
 		s.log.With(zap.Error(err)).Warn("Failed to re-assert subscription row",
 			zap.String("namespace", namespace),
 		)

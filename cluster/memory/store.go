@@ -179,7 +179,7 @@ func (m *memory) ReleaseClaim(_ context.Context, namespace string, key []byte, i
 	return nil
 }
 
-func (m *memory) PutSubscription(_ context.Context, namespace string, key []byte, member *cluster.Member) error {
+func (m *memory) PutSubscription(_ context.Context, namespace string, key []byte, instanceID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id := claimID(namespace, key)
@@ -188,11 +188,10 @@ func (m *memory) PutSubscription(_ context.Context, namespace string, key []byte
 		topic = make(map[string]*cluster.Subscription)
 		m.subscriptions[id] = topic
 	}
-	topic[member.InstanceID] = &cluster.Subscription{
+	topic[instanceID] = &cluster.Subscription{
 		Namespace:  namespace,
 		Key:        append([]byte(nil), key...),
-		InstanceID: member.InstanceID,
-		Address:    member.Address,
+		InstanceID: instanceID,
 	}
 	return nil
 }

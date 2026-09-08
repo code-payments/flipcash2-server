@@ -70,8 +70,11 @@ type Server struct {
 	// streams fans a topic out to every open local stream: stream key → stream
 	// ID → stream. Multiple streams per key are the point (one per device);
 	// the cluster subscription layer refcounts them into a single registry row.
+	// draining (same lock) refuses new streams once Shutdown has begun, so a
+	// stream can't slip in behind the closing sweep.
 	streamsMu               sync.RWMutex
 	streams                 map[string]map[string]Stream[[]*eventpb.Event]
+	draining                bool
 	staleEventDetectorCtors []StaleEventDetectorCtor[*eventpb.Event]
 
 	// self is the cluster member this process registers subscription rows as:
@@ -243,6 +246,11 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 	// or a publish racing the open could resolve the row yet find no stream
 	// behind it.
 	s.streamsMu.Lock()
+	if s.draining {
+		s.streamsMu.Unlock()
+		log.Debug("Rejecting stream on shut-down server")
+		return status.Error(codes.Unavailable, "server is draining")
+	}
 	byID, ok := s.streams[streamKey]
 	if !ok {
 		byID = make(map[string]Stream[[]*eventpb.Event])
@@ -378,6 +386,29 @@ func (s *Server) ForwardEvents(ctx context.Context, req *eventpb.ForwardEventsRe
 // todo: utilize batching by receiver to optimize internal forwarding RPC calls
 func (s *Server) ForwardUserEvents(ctx context.Context, events ...*eventpb.UserEvent) error {
 	return s.forwarder.ForwardUserEvents(ctx, events...)
+}
+
+// Shutdown closes every open client stream — each StreamEvents handler returns
+// and cleans up its subscription — and refuses new ones. Call it on shutdown
+// after Subscriptions.Drain and before the gRPC server's GracefulStop: the
+// streams are held open indefinitely by connected clients, so a GracefulStop
+// without this never returns. Closed clients reconnect to a healthy server and
+// delta sync. Idempotent.
+func (s *Server) Shutdown() {
+	s.streamsMu.Lock()
+	s.draining = true
+	var targets []Stream[[]*eventpb.Event]
+	for _, byID := range s.streams {
+		for _, stream := range byID {
+			targets = append(targets, stream)
+		}
+	}
+	s.streamsMu.Unlock()
+
+	s.log.Debug("Closing all event streams for shutdown", zap.Int("streams", len(targets)))
+	for _, stream := range targets {
+		stream.Close()
+	}
 }
 
 // deliverLocal notifies an event onto every local stream open for the key.

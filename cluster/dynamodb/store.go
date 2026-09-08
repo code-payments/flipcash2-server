@@ -16,7 +16,7 @@ import (
 
 // The cluster store spans three tables:
 //
-//	cluster_members  pk = instance_id (one item per live process incarnation).
+//	cluster_members  pk = instance ID (one item per live process incarnation).
 //	          The heartbeat counter is advanced by its owner and observed by
 //	          peers; liveness is counter movement against the observer's own
 //	          clock, never a wall-clock comparison.
@@ -34,7 +34,7 @@ import (
 //	          by distinct keys ever claimed; if that ever matters, reclaim
 //	          space with an explicit sweep of vacated rows, never a ttl.
 //
-//	cluster_subscriptions  pk = "<namespace>#<hex key>", sk = instance_id (one
+//	cluster_subscriptions  pk = "<namespace>#<hex key>", sk = instance ID (one
 //	          item per interested server per topic). Non-exclusive interest
 //	          rows: plain upserts and deletes, no conditions, no fence. Like
 //	          claims they carry NO ttl attribute — a row is held for as long
@@ -49,14 +49,18 @@ import (
 // caller's stale observation — the evidence of death must still be true,
 // atomically, at commit time.
 const (
-	attrInstanceID = "instance_id"
-	attrAddress    = "address"
-	attrLabels     = "labels"
-	attrDraining   = "draining"
-	attrHeartbeat  = "heartbeat_counter"
-	attrTTL        = "ttl"
+	// pk is every table's hash key: the instance ID on members, the
+	// namespace#key composite on claims and subscriptions. sk is the
+	// subscriptions range key, holding the subscriber's instance ID.
+	attrPK = "pk"
+	attrSK = "sk"
 
-	attrPK           = "pk"
+	attrAddress   = "address"
+	attrLabels    = "labels"
+	attrDraining  = "draining"
+	attrHeartbeat = "heartbeat_counter"
+	attrTTL       = "ttl"
+
 	attrNamespace    = "ns"
 	attrKey          = "key_bytes"
 	attrOwner        = "owner_instance"
@@ -110,12 +114,12 @@ func (s *store) PutMember(ctx context.Context, member *cluster.Member, heartbeat
 	_, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.membersTable),
 		Item: map[string]types.AttributeValue{
-			attrInstanceID: &types.AttributeValueMemberS{Value: member.InstanceID},
-			attrAddress:    &types.AttributeValueMemberS{Value: member.Address},
-			attrLabels:     &types.AttributeValueMemberM{Value: labels},
-			attrDraining:   &types.AttributeValueMemberBOOL{Value: member.Draining},
-			attrHeartbeat:  &types.AttributeValueMemberN{Value: strconv.FormatUint(heartbeatCounter, 10)},
-			attrTTL:        ttlValue(memberItemTTL),
+			attrPK:        &types.AttributeValueMemberS{Value: member.InstanceID},
+			attrAddress:   &types.AttributeValueMemberS{Value: member.Address},
+			attrLabels:    &types.AttributeValueMemberM{Value: labels},
+			attrDraining:  &types.AttributeValueMemberBOOL{Value: member.Draining},
+			attrHeartbeat: &types.AttributeValueMemberN{Value: strconv.FormatUint(heartbeatCounter, 10)},
+			attrTTL:       ttlValue(memberItemTTL),
 		},
 	})
 	return err
@@ -125,12 +129,12 @@ func (s *store) Heartbeat(ctx context.Context, instanceID string) (uint64, error
 	out, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.membersTable),
 		Key: map[string]types.AttributeValue{
-			attrInstanceID: &types.AttributeValueMemberS{Value: instanceID},
+			attrPK: &types.AttributeValueMemberS{Value: instanceID},
 		},
-		ConditionExpression: aws.String("attribute_exists(#id)"),
+		ConditionExpression: aws.String("attribute_exists(#pk)"),
 		UpdateExpression:    aws.String("ADD #hb :one SET #ttl = :ttl"),
 		ExpressionAttributeNames: map[string]string{
-			"#id":  attrInstanceID,
+			"#pk":  attrPK,
 			"#hb":  attrHeartbeat,
 			"#ttl": attrTTL,
 		},
@@ -154,12 +158,12 @@ func (s *store) SetDraining(ctx context.Context, instanceID string, draining boo
 	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.membersTable),
 		Key: map[string]types.AttributeValue{
-			attrInstanceID: &types.AttributeValueMemberS{Value: instanceID},
+			attrPK: &types.AttributeValueMemberS{Value: instanceID},
 		},
-		ConditionExpression: aws.String("attribute_exists(#id)"),
+		ConditionExpression: aws.String("attribute_exists(#pk)"),
 		UpdateExpression:    aws.String("SET #draining = :draining"),
 		ExpressionAttributeNames: map[string]string{
-			"#id":       attrInstanceID,
+			"#pk":       attrPK,
 			"#draining": attrDraining,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
@@ -180,7 +184,7 @@ func (s *store) DeleteMember(ctx context.Context, instanceID string) error {
 	_, err := s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(s.membersTable),
 		Key: map[string]types.AttributeValue{
-			attrInstanceID: &types.AttributeValueMemberS{Value: instanceID},
+			attrPK: &types.AttributeValueMemberS{Value: instanceID},
 		},
 	})
 	return err
@@ -290,11 +294,11 @@ func (s *store) acquireByTakeover(ctx context.Context, namespace string, key []b
 				ConditionCheck: &types.ConditionCheck{
 					TableName: aws.String(s.membersTable),
 					Key: map[string]types.AttributeValue{
-						attrInstanceID: &types.AttributeValueMemberS{Value: takeover.InstanceID},
+						attrPK: &types.AttributeValueMemberS{Value: takeover.InstanceID},
 					},
-					ConditionExpression: aws.String("attribute_not_exists(#id) OR #hb = :observed"),
+					ConditionExpression: aws.String("attribute_not_exists(#pk) OR #hb = :observed"),
 					ExpressionAttributeNames: map[string]string{
-						"#id": attrInstanceID,
+						"#pk": attrPK,
 						"#hb": attrHeartbeat,
 					},
 					ExpressionAttributeValues: map[string]types.AttributeValue{
@@ -419,11 +423,11 @@ func (s *store) PutSubscription(ctx context.Context, namespace string, key []byt
 	_, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.subscriptionsTable),
 		Item: map[string]types.AttributeValue{
-			attrPK:         &types.AttributeValueMemberS{Value: claimPK(namespace, key)},
-			attrInstanceID: &types.AttributeValueMemberS{Value: member.InstanceID},
-			attrNamespace:  &types.AttributeValueMemberS{Value: namespace},
-			attrKey:        &types.AttributeValueMemberB{Value: key},
-			attrAddress:    &types.AttributeValueMemberS{Value: member.Address},
+			attrPK:        &types.AttributeValueMemberS{Value: claimPK(namespace, key)},
+			attrSK:        &types.AttributeValueMemberS{Value: member.InstanceID},
+			attrNamespace: &types.AttributeValueMemberS{Value: namespace},
+			attrKey:       &types.AttributeValueMemberB{Value: key},
+			attrAddress:   &types.AttributeValueMemberS{Value: member.Address},
 		},
 	})
 	return err
@@ -433,8 +437,8 @@ func (s *store) DeleteSubscription(ctx context.Context, namespace string, key []
 	_, err := s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(s.subscriptionsTable),
 		Key: map[string]types.AttributeValue{
-			attrPK:         &types.AttributeValueMemberS{Value: claimPK(namespace, key)},
-			attrInstanceID: &types.AttributeValueMemberS{Value: instanceID},
+			attrPK: &types.AttributeValueMemberS{Value: claimPK(namespace, key)},
+			attrSK: &types.AttributeValueMemberS{Value: instanceID},
 		},
 	})
 	return err
@@ -477,10 +481,10 @@ func (s *store) GetSubscribers(ctx context.Context, namespace string, key []byte
 
 func subscriptionFromItem(item map[string]types.AttributeValue) (*cluster.Subscription, error) {
 	sub := &cluster.Subscription{}
-	if v, ok := item[attrInstanceID].(*types.AttributeValueMemberS); ok {
+	if v, ok := item[attrSK].(*types.AttributeValueMemberS); ok {
 		sub.InstanceID = v.Value
 	} else {
-		return nil, errors.New("subscription item missing instance_id")
+		return nil, errors.New("subscription item missing instance ID sort key")
 	}
 	if v, ok := item[attrNamespace].(*types.AttributeValueMemberS); ok {
 		sub.Namespace = v.Value
@@ -511,10 +515,10 @@ func memberRecordFromItem(item map[string]types.AttributeValue) (*cluster.Member
 		Member: cluster.Member{Labels: make(map[string]string)},
 	}
 
-	if v, ok := item[attrInstanceID].(*types.AttributeValueMemberS); ok {
+	if v, ok := item[attrPK].(*types.AttributeValueMemberS); ok {
 		record.InstanceID = v.Value
 	} else {
-		return nil, errors.New("member item missing instance_id")
+		return nil, errors.New("member item missing instance ID partition key")
 	}
 	if v, ok := item[attrAddress].(*types.AttributeValueMemberS); ok {
 		record.Address = v.Value

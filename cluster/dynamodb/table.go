@@ -12,12 +12,13 @@ import (
 )
 
 // CreateTables provisions the cluster members, claims, and subscriptions
-// tables with on-demand billing. Members are keyed by instance_id; claims and
-// subscriptions are keyed by a single composite pk (namespace + key) so they
-// spread across partitions instead of piling a whole namespace onto one
-// partition key, with subscriptions additionally range-keyed by instance_id
-// (one row per interested server per topic). It is idempotent and blocks
-// until the tables are ACTIVE.
+// tables with on-demand billing. Every table hashes on pk: the instance ID
+// for members, and a single composite (namespace + key) for claims and
+// subscriptions so they spread across partitions instead of piling a whole
+// namespace onto one partition key. Subscriptions are additionally
+// range-keyed by sk, the subscriber's instance ID (one row per interested
+// server per topic). It is idempotent and blocks until the tables are
+// ACTIVE.
 //
 // Only the members table carries a ttl attribute, garbage-collecting dead
 // members' records (safe because every heartbeat refreshes it — a live row
@@ -34,10 +35,10 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, membersTable, cl
 			TableName:   aws.String(membersTable),
 			BillingMode: types.BillingModePayPerRequest,
 			AttributeDefinitions: []types.AttributeDefinition{
-				{AttributeName: aws.String(attrInstanceID), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
 			},
 			KeySchema: []types.KeySchemaElement{
-				{AttributeName: aws.String(attrInstanceID), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
 			},
 		},
 		{
@@ -55,11 +56,11 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, membersTable, cl
 			BillingMode: types.BillingModePayPerRequest,
 			AttributeDefinitions: []types.AttributeDefinition{
 				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
-				{AttributeName: aws.String(attrInstanceID), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
 			},
 			KeySchema: []types.KeySchemaElement{
 				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
-				{AttributeName: aws.String(attrInstanceID), KeyType: types.KeyTypeRange},
+				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
 			},
 		},
 	}
@@ -84,13 +85,13 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, membersTable, cl
 // reset deletes every item from all tables, for tests.
 func (s *store) reset() {
 	ctx := context.Background()
-	if err := clearTable(ctx, s.client, s.membersTable, attrInstanceID); err != nil {
+	if err := clearTable(ctx, s.client, s.membersTable, attrPK); err != nil {
 		panic(err)
 	}
 	if err := clearTable(ctx, s.client, s.claimsTable, attrPK); err != nil {
 		panic(err)
 	}
-	if err := clearTable(ctx, s.client, s.subscriptionsTable, attrPK, attrInstanceID); err != nil {
+	if err := clearTable(ctx, s.client, s.subscriptionsTable, attrPK, attrSK); err != nil {
 		panic(err)
 	}
 }

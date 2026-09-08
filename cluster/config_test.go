@@ -16,7 +16,7 @@ func TestConfigDefaults(t *testing.T) {
 	require.Equal(t, 5*time.Second, m.HeartbeatInterval)
 	require.Equal(t, 2*time.Second, m.PollInterval)
 	require.Equal(t, 15*time.Second, m.LivenessWindow)
-	require.Equal(t, 15*time.Second, m.SelfUnhealthyAfter)
+	require.Equal(t, 7*time.Second, m.SelfUnhealthyAfter)
 	require.Equal(t, 7*time.Second, m.SessionGapThreshold)
 	require.Equal(t, 150*time.Second, m.MemberGCAfter)
 
@@ -44,8 +44,10 @@ func TestConfigDefaults(t *testing.T) {
 	require.GreaterOrEqual(t, subscriptions.cfg.RowGCAfter, 2*m.LivenessWindow)
 
 	// The invariants the suspicion hardening rests on: jitter tolerance of at
-	// least one poll interval, and shedding fired no later than displacement
-	// becomes possible.
+	// least one poll interval, shedding fired no later than displacement
+	// becomes possible, and Do refusing owned keys (SelfHealthy false) no
+	// later than that same instant.
 	require.GreaterOrEqual(t, ownership.cfg.SuspicionWindow, m.HeartbeatInterval+m.PollInterval)
 	require.LessOrEqual(t, m.SessionGapThreshold, ownership.cfg.SuspicionWindow)
+	require.LessOrEqual(t, m.SelfUnhealthyAfter, ownership.cfg.SuspicionWindow)
 }

@@ -49,9 +49,11 @@ type Subscriptions struct {
 	// delete — a successor registration).
 	nextGen uint64
 	// unknownSince tracks, per instance ID, when this observer first saw a
-	// subscription row whose member was absent from its live view — the
-	// observation timeline behind corpse-row sweeps. Entries clear on any live
-	// sighting; bounded by crashed instances with rows still being resolved.
+	// subscription row whose member was wholly unobserved (no registry record
+	// in the membership view) — the observation timeline behind corpse-row
+	// sweeps. Entries re-anchor while the member's record is still observed,
+	// clear on any live sighting and on live-set convergence, and are bounded
+	// by crashed instances with rows still being resolved.
 	unknownSince map[string]time.Time
 	topicLocks   map[string]*keyLock
 	draining     bool
@@ -120,6 +122,19 @@ func NewSubscriptions(log *zap.Logger, membership *Membership, store Subscriptio
 	// must not stall the beats that re-establish the session.
 	membership.OnSessionLost(func() {
 		go s.reassertLocal(context.Background())
+	})
+	// The corpse clock must measure continuous absence on the membership
+	// timeline, not the gap between the resolutions that happen to touch an
+	// instance's rows: a member returning to the live view clears its anchor
+	// even when no resolution observed the return, so two transient blips
+	// RowGCAfter apart can never add up to sweeping a live subscriber's row.
+	membership.Subscribe(func() {
+		liveNow := membership.Live()
+		s.mu.Lock()
+		for _, m := range liveNow {
+			delete(s.unknownSince, m.InstanceID)
+		}
+		s.mu.Unlock()
 	})
 	return s
 }
@@ -292,6 +307,20 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 	for _, m := range s.membership.Live() {
 		live[m.InstanceID] = true
 	}
+	// A row's member being absent from the live view does not make the row a
+	// corpse candidate: only an instance with no membership observation at all
+	// (its registry record gone from scans) can be a crashed instance's
+	// leftover. Snapshot which not-live row instances are still observed
+	// before taking the runtime lock.
+	observed := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		if live[row.InstanceID] || observed[row.InstanceID] {
+			continue
+		}
+		if _, _, ok := s.membership.LivenessInfo(row.InstanceID); ok {
+			observed[row.InstanceID] = true
+		}
+	}
 	self := s.membership.Self()
 	now := time.Now()
 
@@ -318,10 +347,18 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 			subs = append(subs, row)
 		default:
 			// Not live: excluded from delivery immediately — correctness
-			// never waits on cleanup. Rows whose member stays unknown to this
-			// observer past RowGCAfter are crashed instances' leftovers
+			// never waits on cleanup. Rows whose member stays wholly
+			// unobserved past RowGCAfter are crashed instances' leftovers
 			// (drains clean up after themselves): sweep them so hot topics
 			// don't accumulate garbage.
+			if observed[row.InstanceID] {
+				// A registry record still backs this member: it is slow or
+				// transiently unseen, not dead. Re-anchor so a stale
+				// first-sighting can never age into sweeping a live
+				// subscriber's row.
+				s.unknownSince[row.InstanceID] = now
+				break
+			}
 			first, seen := s.unknownSince[row.InstanceID]
 			if !seen {
 				s.unknownSince[row.InstanceID] = now
@@ -509,6 +546,12 @@ func (s *Subscriptions) sweepSelfRow(namespace string, key []byte) {
 // sweepCorpseRow best-effort deletes a crashed instance's leftover row
 // encountered at resolution time.
 func (s *Subscriptions) sweepCorpseRow(row *Subscription) {
+	// Last look before the delete: the sweep decision was made against one
+	// resolution's snapshot. A member observed again by now is slow, not dead
+	// — its row must stand.
+	if _, _, observed := s.membership.LivenessInfo(row.InstanceID); observed {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), subscriptionOpTimeout)
 	defer cancel()
 	if err := s.store.DeleteSubscription(ctx, row.Namespace, row.Key, row.InstanceID); err != nil {
@@ -525,7 +568,8 @@ func (s *Subscriptions) sweepCorpseRow(row *Subscription) {
 	// Deliberately NOT clearing unknownSince: the instance is still dead, and
 	// other topics may hold more of its rows — their sweeps shouldn't restart
 	// the observation clock. The entry clears if the instance is ever seen
-	// live again, and is bounded meanwhile by distinct crashed instances.
+	// live again (at resolution or via membership convergence), and is bounded
+	// meanwhile by distinct crashed instances.
 }
 
 func cloneSubscriptions(in []*Subscription) []*Subscription {

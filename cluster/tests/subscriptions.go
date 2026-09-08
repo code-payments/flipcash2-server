@@ -402,6 +402,162 @@ func testSubscriptionSessionReassert(t *testing.T, s cluster.Store) {
 	})
 }
 
+// memberFilterStore hides one instance's member record from GetMembers scans
+// while the gate is up, simulating a transient scan miss (an eventually
+// consistent or paginated read dropping a live member for one poll).
+type memberFilterStore struct {
+	cluster.Store
+	hidden string
+	hide   atomic.Bool
+}
+
+func (s *memberFilterStore) GetMembers(ctx context.Context) ([]*cluster.MemberRecord, error) {
+	records, err := s.Store.GetMembers(ctx)
+	if err != nil || !s.hide.Load() {
+		return records, err
+	}
+	filtered := make([]*cluster.MemberRecord, 0, len(records))
+	for _, r := range records {
+		if r.InstanceID != s.hidden {
+			filtered = append(filtered, r)
+		}
+	}
+	return filtered, nil
+}
+
+func testSubscriptionLiveRowSurvivesScanBlips(t *testing.T, s cluster.Store) {
+	t.Run("testSubscriptionLiveRowSurvivesScanBlips", func(t *testing.T) {
+		ctx := context.Background()
+		log := zap.NewNop()
+
+		// The corpse clock must measure CONTINUOUS absence: two transient
+		// scan blips more than RowGCAfter apart — with the member live and
+		// healthy the whole time in between — must not add up to sweeping its
+		// row. The member's own session is never interrupted, so nothing on
+		// its side would ever re-assert the swept row.
+		x := startNode(t, s, "instance-x", fastMembershipConfig(), fastOwnershipConfig())
+		waitForLiveMembers(t, x, 1)
+
+		key := []byte("group-1")
+		_, err := x.subscriptions.Subscribe(ctx, subsNamespace, key)
+		require.NoError(t, err)
+
+		// An observer whose membership scans can transiently miss x.
+		filtered := &memberFilterStore{Store: s, hidden: "instance-x"}
+		obs := cluster.NewMembership(log, filtered, member("instance-o", "10.0.0.9:8085"), fastMembershipConfig())
+		require.NoError(t, obs.Start(ctx))
+		t.Cleanup(obs.Stop)
+		subs := cluster.NewSubscriptions(log, obs, s, cluster.SubscriptionsConfig{
+			CacheTTL:   25 * time.Millisecond,
+			RowGCAfter: time.Second,
+		})
+
+		require.Eventually(t, func() bool {
+			resolved, err := subs.Subscribers(ctx, subsNamespace, key)
+			require.NoError(t, err)
+			return len(resolved) == 1 && resolved[0].InstanceID == "instance-x"
+		}, 5*time.Second, 10*time.Millisecond)
+
+		blip := func() {
+			filtered.hide.Store(true)
+			require.NoError(t, obs.Refresh(ctx))
+			// A resolution lands inside the blip: x is excluded from delivery
+			// (correct) and its unknown-since anchor is touched.
+			require.Eventually(t, func() bool {
+				resolved, err := subs.Subscribers(ctx, subsNamespace, key)
+				require.NoError(t, err)
+				return len(resolved) == 0
+			}, 5*time.Second, 10*time.Millisecond)
+			filtered.hide.Store(false)
+			require.NoError(t, obs.Refresh(ctx))
+		}
+
+		blip()
+
+		// x is live and healthy, but no resolution touches its row for longer
+		// than RowGCAfter.
+		time.Sleep(1200 * time.Millisecond)
+
+		blip()
+
+		// The second blip's resolution must not have swept the live row: give
+		// any (buggy) async sweep time to land, then check the registry.
+		time.Sleep(100 * time.Millisecond)
+		rows, err := s.GetSubscribers(ctx, subsNamespace, key)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		require.Equal(t, "instance-x", rows[0].InstanceID)
+
+		// And delivery resumes on the observer's next fresh resolution.
+		require.Eventually(t, func() bool {
+			resolved, err := subs.Subscribers(ctx, subsNamespace, key)
+			require.NoError(t, err)
+			return len(resolved) == 1 && resolved[0].InstanceID == "instance-x"
+		}, 5*time.Second, 10*time.Millisecond)
+	})
+}
+
+func testSubscriptionSlowMemberRowNotSwept(t *testing.T, s cluster.Store) {
+	t.Run("testSubscriptionSlowMemberRowNotSwept", func(t *testing.T) {
+		ctx := context.Background()
+		log := zap.NewNop()
+
+		// A member whose heartbeat counter freezes but whose registry record
+		// still stands is slow (or wedged), not provably dead: it drops out of
+		// delivery immediately, but its rows must never be swept while the
+		// record is observed — membership GC is the authority on corpsehood.
+		x := startNode(t, s, "instance-x", fastMembershipConfig(), fastOwnershipConfig())
+		waitForLiveMembers(t, x, 1)
+
+		key := []byte("group-1")
+		_, err := x.subscriptions.Subscribe(ctx, subsNamespace, key)
+		require.NoError(t, err)
+
+		// Observer with member GC out of the way, so the record stays put and
+		// only the (potentially buggy) row sweep could remove state.
+		mCfg := fastMembershipConfig()
+		mCfg.MemberGCAfter = time.Minute
+		obs := cluster.NewMembership(log, s, member("instance-o", "10.0.0.9:8085"), mCfg)
+		require.NoError(t, obs.Start(ctx))
+		t.Cleanup(obs.Stop)
+		subs := cluster.NewSubscriptions(log, obs, s, cluster.SubscriptionsConfig{
+			CacheTTL:   25 * time.Millisecond,
+			RowGCAfter: time.Second,
+		})
+
+		require.Eventually(t, func() bool {
+			resolved, err := subs.Subscribers(ctx, subsNamespace, key)
+			require.NoError(t, err)
+			return len(resolved) == 1 && resolved[0].InstanceID == "instance-x"
+		}, 5*time.Second, 10*time.Millisecond)
+
+		// Freeze x: loops stop, record remains, counter never moves again.
+		x.ownership.Stop()
+		x.membership.Stop()
+
+		// x lapses out of delivery once its counter sits still past the
+		// liveness window.
+		require.Eventually(t, func() bool {
+			resolved, err := subs.Subscribers(ctx, subsNamespace, key)
+			require.NoError(t, err)
+			return len(resolved) == 0
+		}, 5*time.Second, 10*time.Millisecond)
+
+		// Keep resolving well past RowGCAfter: the observation timeline spans
+		// it, but the record is still there — the row must survive.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			_, err := subs.Subscribers(ctx, subsNamespace, key)
+			require.NoError(t, err)
+			time.Sleep(25 * time.Millisecond)
+		}
+		rows, err := s.GetSubscribers(ctx, subsNamespace, key)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		require.Equal(t, "instance-x", rows[0].InstanceID)
+	})
+}
+
 func testSubscriptionCorpseRowGC(t *testing.T, s cluster.Store) {
 	t.Run("testSubscriptionCorpseRowGC", func(t *testing.T) {
 		ctx := context.Background()

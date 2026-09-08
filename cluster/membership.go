@@ -31,6 +31,10 @@ type Membership struct {
 	subscribers     []func()
 	sessionLostSubs []func()
 	lastSelfBeat    time.Time
+	// sessionLost latches once a heartbeat gap has fired OnSessionLost so a
+	// sustained write outage sheds session state exactly once, not on every
+	// failed beat. Cleared when a beat lands (or the record is re-registered).
+	sessionLost bool
 	// lastCounter is the highest heartbeat counter this process has written.
 	// A re-registration must resume strictly above it: the takeover guard is
 	// an equality check against observed-stale counters, so a value repeating
@@ -157,8 +161,8 @@ func (m *Membership) Live() []*Member {
 }
 
 // SelfHealthy reports whether this process's own heartbeats are landing. Once
-// they have failed for SelfUnhealthyAfter, the rest of the cluster is about to
-// consider this member dead, so it must stop trusting its owned claims.
+// they have failed for SelfUnhealthyAfter, a suspicious peer may already be
+// able to displace this member's claims, so it must stop trusting them.
 func (m *Membership) SelfHealthy() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -372,6 +376,7 @@ func (m *Membership) run(ctx context.Context) {
 				m.mu.Lock()
 				m.lastSelfBeat = time.Now()
 				m.lastCounter = reborn
+				m.sessionLost = false
 				m.mu.Unlock()
 				m.notifySessionLost()
 				continue
@@ -379,8 +384,25 @@ func (m *Membership) run(ctx context.Context) {
 			cancel()
 			if err != nil {
 				// Failed heartbeats are not fatal here: SelfHealthy going
-				// false is what forces owned keys onto the fallback path.
+				// false is what forces owned keys onto the fallback path. But
+				// the session-gap check must still run — sustained write
+				// failure is exactly the condition under which a suspicious
+				// peer displaces our claims, and the success-path check below
+				// is unreachable until a beat lands again.
 				m.log.With(zap.Error(err)).Warn("Failed to heartbeat cluster member record")
+				m.mu.Lock()
+				gap := time.Since(m.lastSelfBeat)
+				lost := gap >= m.cfg.SessionGapThreshold && !m.sessionLost
+				if lost {
+					m.sessionLost = true
+				}
+				m.mu.Unlock()
+				if lost {
+					m.log.Warn("Heartbeat failures reached session gap threshold; shedding session state",
+						zap.Duration("gap", gap),
+					)
+					m.notifySessionLost()
+				}
 				continue
 			}
 
@@ -388,8 +410,10 @@ func (m *Membership) run(ctx context.Context) {
 			gap := time.Since(m.lastSelfBeat)
 			m.lastSelfBeat = time.Now()
 			m.lastCounter = max(m.lastCounter, counter)
+			alreadyShed := m.sessionLost
+			m.sessionLost = false
 			m.mu.Unlock()
-			if gap >= m.cfg.SessionGapThreshold {
+			if gap >= m.cfg.SessionGapThreshold && !alreadyShed {
 				// The gap reached the suspicion floor: a peer holding a
 				// failed-forward report may have displaced our claims while
 				// we still looked healthy to ourselves. Shed local ownership

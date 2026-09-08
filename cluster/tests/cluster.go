@@ -23,6 +23,8 @@ func RunClusterTests(t *testing.T, s cluster.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, s cluster.Store){
 		testRoutingAgreement,
 		testOwnershipAcquireAndRedirect,
+		testColdAcquireSingleRoundTrip,
+		testHandoffRedirectDamped,
 		testFailover,
 		testSuspicionTakeover,
 		testGracefulDrain,
@@ -30,6 +32,7 @@ func RunClusterTests(t *testing.T, s cluster.Store, teardown func()) {
 		testDrainUnderAcquisition,
 		testDrainWithConcurrentRelease,
 		testDrainAbortAndResume,
+		testReleaseFlushHookDetachedContext,
 		testReleaseAcquireRace,
 		testAcquireHookPanic,
 		testWarmBeforeServe,
@@ -38,8 +41,10 @@ func RunClusterTests(t *testing.T, s cluster.Store, teardown func()) {
 		testMemberGCDeleteFailure,
 		testSessionLostPurge,
 		testSessionGapPurge,
+		testSessionGapPurgeOnHeartbeatFailure,
 		testRebalanceOnJoin,
 		testIdleRelease,
+		testIdleReapReleasesConcurrently,
 		testSubscribeRefcounting,
 		testSubscriberResolutionAndLiveness,
 		testSubscriberCache,
@@ -48,6 +53,8 @@ func RunClusterTests(t *testing.T, s cluster.Store, teardown func()) {
 		testSubscriptionReassertDrainRace,
 		testSubscriptionSessionReassert,
 		testSubscriptionCorpseRowGC,
+		testSubscriptionLiveRowSurvivesScanBlips,
+		testSubscriptionSlowMemberRowNotSwept,
 	} {
 		tf(t, s)
 		teardown()
@@ -239,6 +246,92 @@ func testOwnershipAcquireAndRedirect(t *testing.T, s cluster.Store) {
 		require.NotNil(t, notOwner.Redirect)
 		require.Equal(t, "instance-a", notOwner.Redirect.InstanceID)
 		require.Equal(t, "instance-a.local:8085", notOwner.Redirect.Address)
+		require.Empty(t, b.acquiredKeys())
+	})
+}
+
+// claimOpCountingStore counts claim reads and acquire writes, to pin the
+// acquire path's store cost.
+type claimOpCountingStore struct {
+	cluster.Store
+	gets     atomic.Uint64
+	acquires atomic.Uint64
+}
+
+func (s *claimOpCountingStore) GetClaim(ctx context.Context, namespace string, key []byte) (*cluster.Claim, error) {
+	s.gets.Add(1)
+	return s.Store.GetClaim(ctx, namespace, key)
+}
+
+func (s *claimOpCountingStore) AcquireClaim(ctx context.Context, namespace string, key []byte, self *cluster.Member, takeover *cluster.TakeoverTarget) (*cluster.Claim, error) {
+	s.acquires.Add(1)
+	return s.Store.AcquireClaim(ctx, namespace, key, self, takeover)
+}
+
+func testColdAcquireSingleRoundTrip(t *testing.T, s cluster.Store) {
+	t.Run("testColdAcquireSingleRoundTrip", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Acquiring a genuinely unclaimed key — the common case on every cold
+		// start and after every idle reap — must cost exactly one store round
+		// trip: the conditional write reports the holder on failure, so a
+		// pre-read buys nothing.
+		counting := &claimOpCountingStore{Store: s}
+		a := startNode(t, counting, "instance-a", fastMembershipConfig(), fastOwnershipConfig())
+		waitForLiveMembers(t, a, 1)
+
+		require.NoError(t, a.ownership.Do(ctx, testNamespace, []byte("cold-key"), doNoop))
+		require.EqualValues(t, 1, counting.acquires.Load())
+		require.EqualValues(t, 0, counting.gets.Load())
+	})
+}
+
+func testHandoffRedirectDamped(t *testing.T, s cluster.Store) {
+	t.Run("testHandoffRedirectDamped", func(t *testing.T) {
+		ctx := context.Background()
+
+		// An owner-driven handoff: routing assigns the key here while the
+		// ex-owner still holds the claim. Discovering that costs a failed
+		// conditional write — write-priced — so a hot key must probe the store
+		// once per RedirectCacheTTL, not once per request.
+		oCfg := fastOwnershipConfig()
+		oCfg.RedirectCacheTTL = time.Minute // Damping under test; no expiry mid-test.
+		oCfg.SuspicionWindow = time.Minute  // NoteUnreachable below must not enable takeover.
+
+		counting := &claimOpCountingStore{Store: s}
+		a := startNode(t, s, "instance-a", fastMembershipConfig(), oCfg)
+		b := startNode(t, counting, "instance-b", fastMembershipConfig(), oCfg)
+		waitForLiveMembers(t, a, 2)
+		waitForLiveMembers(t, b, 2)
+
+		// The ex-owner's claim, standing on a key routing now assigns to b.
+		key := keyRoutedTo(t, b, "instance-b")
+		_, err := s.AcquireClaim(ctx, testNamespace, key, a.member, nil)
+		require.NoError(t, err)
+
+		redirectedToA := func(err error) {
+			var notOwner *cluster.NotOwnerError
+			require.ErrorAs(t, err, &notOwner)
+			require.NotNil(t, notOwner.Redirect)
+			require.Equal(t, "instance-a", notOwner.Redirect.InstanceID)
+			require.Equal(t, "instance-a.local:8085", notOwner.Redirect.Address)
+		}
+
+		// The first request probes with one conditional write and loses to the
+		// live holder; followers ride the cached redirect.
+		for range 5 {
+			redirectedToA(b.ownership.Do(ctx, testNamespace, key, doNoop))
+		}
+		require.EqualValues(t, 1, counting.acquires.Load())
+		require.EqualValues(t, 0, counting.gets.Load())
+
+		// A failed forward purges the cached redirect: the next request
+		// re-probes and, with the holder still healthy, re-caches.
+		b.ownership.NoteUnreachable("instance-a")
+		redirectedToA(b.ownership.Do(ctx, testNamespace, key, doNoop))
+		redirectedToA(b.ownership.Do(ctx, testNamespace, key, doNoop))
+		require.EqualValues(t, 2, counting.acquires.Load())
+		require.EqualValues(t, 0, counting.gets.Load())
 		require.Empty(t, b.acquiredKeys())
 	})
 }
@@ -465,6 +558,73 @@ func testDrainWithConcurrentRelease(t *testing.T, s cluster.Store) {
 			_, err := s.GetClaim(ctx, testNamespace, []byte(key))
 			require.ErrorIs(t, err, cluster.ErrClaimNotFound)
 		}
+	})
+}
+
+func testReleaseFlushHookDetachedContext(t *testing.T, s cluster.Store) {
+	t.Run("testReleaseFlushHookDetachedContext", func(t *testing.T) {
+		ctx := context.Background()
+
+		a := startNode(t, s, "instance-a", fastMembershipConfig(), fastOwnershipConfig())
+		waitForLiveMembers(t, a, 1)
+
+		// OnReleased is the flush step — where consumer data integrity lives.
+		// It must run under a context detached from whatever triggered the
+		// release: a drain budget expiring mid-wave must not abort the flush
+		// writes while the (already detached) claim release still succeeds.
+		const flushNS = "flush"
+		type flushObs struct {
+			err         error
+			hasDeadline bool
+		}
+		flushed := make(chan flushObs, 1)
+		a.ownership.RegisterNamespace(flushNS, cluster.NamespaceHooks{
+			OnReleased: func(ctx context.Context, _ []byte) {
+				_, hasDeadline := ctx.Deadline()
+				flushed <- flushObs{err: ctx.Err(), hasDeadline: hasDeadline}
+			},
+		})
+
+		// Hold work in flight so the drain is quiescing this key when its
+		// context dies.
+		key := []byte("flush-key")
+		inWork := make(chan struct{})
+		unblock := make(chan struct{})
+		workDone := make(chan error, 1)
+		go func() {
+			workDone <- a.ownership.Do(ctx, flushNS, key, func(context.Context, *cluster.Claim) error {
+				close(inWork)
+				<-unblock
+				return nil
+			})
+		}()
+		<-inWork
+
+		drainCtx, cancelDrain := context.WithCancel(context.Background())
+		drainDone := make(chan error, 1)
+		go func() { drainDone <- a.ownership.Drain(drainCtx) }()
+
+		// Once the drain has reached the key (new work is refused), kill the
+		// drain context, then let the in-flight work finish so the flush runs.
+		require.Eventually(t, func() bool {
+			return a.ownership.Do(ctx, flushNS, key, doNoop) != nil
+		}, 5*time.Second, 2*time.Millisecond)
+		cancelDrain()
+		close(unblock)
+
+		require.NoError(t, <-workDone)
+		var obs flushObs
+		select {
+		case obs = <-flushed:
+		case <-time.After(5 * time.Second):
+			require.Fail(t, "OnReleased never ran")
+		}
+		require.NoError(t, obs.err, "flush hook received a dead context")
+		require.True(t, obs.hasDeadline, "flush hook context should carry the drain deadline")
+
+		<-drainDone
+		_, err := s.GetClaim(ctx, flushNS, key)
+		require.ErrorIs(t, err, cluster.ErrClaimNotFound)
 	})
 }
 
@@ -1043,6 +1203,70 @@ func testSessionGapPurge(t *testing.T, s cluster.Store) {
 	})
 }
 
+// failableHeartbeatStore lets the test make heartbeat writes fail outright,
+// simulating a member partitioned from the store.
+type failableHeartbeatStore struct {
+	cluster.Store
+	fail atomic.Bool
+}
+
+func (s *failableHeartbeatStore) Heartbeat(ctx context.Context, instanceID string) (uint64, error) {
+	if s.fail.Load() {
+		return 0, errors.New("injected heartbeat failure")
+	}
+	return s.Store.Heartbeat(ctx, instanceID)
+}
+
+func testSessionGapPurgeOnHeartbeatFailure(t *testing.T, s cluster.Store) {
+	t.Run("testSessionGapPurgeOnHeartbeatFailure", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Sustained heartbeat *failure* is the very condition under which a
+		// suspicious peer displaces this member's claims — its writes are not
+		// landing. The session-gap shed must therefore fire from the failure
+		// path itself: a member partitioned from the store never reaches the
+		// success-path gap check.
+		mCfg := fastMembershipConfig()
+		mCfg.SessionGapThreshold = 100 * time.Millisecond
+		// Keep the SelfHealthy backstop out of the way so only the gap check
+		// can shed — mirroring any deployment where SelfUnhealthyAfter is
+		// configured above the suspicion floor.
+		mCfg.SelfUnhealthyAfter = time.Minute
+
+		gated := &failableHeartbeatStore{Store: s}
+		a := startNode(t, gated, "instance-a", mCfg, fastOwnershipConfig())
+		waitForLiveMembers(t, a, 1)
+
+		key := []byte("gap-key")
+		require.NoError(t, a.ownership.Do(ctx, testNamespace, key, doNoop))
+
+		var sheds atomic.Int32
+		a.membership.OnSessionLost(func() { sheds.Add(1) })
+
+		gated.fail.Store(true)
+
+		// The gap crosses the threshold with no successful write in sight;
+		// ownership must shed anyway.
+		require.Eventually(t, func() bool {
+			return len(a.releasedKeys()) == 1 && len(a.ownership.OwnedKeys(testNamespace)) == 0
+		}, 10*time.Second, 5*time.Millisecond)
+		require.Equal(t, []string{string(key)}, a.releasedKeys())
+
+		// One outage, one shed: the latch keeps a persistent failure from
+		// re-firing on every beat.
+		time.Sleep(10 * mCfg.HeartbeatInterval)
+		require.EqualValues(t, 1, sheds.Load())
+
+		// Recovery clears the latch without re-shedding the same gap, and
+		// demand re-acquires cleanly.
+		gated.fail.Store(false)
+		require.Eventually(t, func() bool {
+			return a.ownership.Do(ctx, testNamespace, key, doNoop) == nil
+		}, 10*time.Second, 10*time.Millisecond)
+		require.EqualValues(t, 1, sheds.Load())
+	})
+}
+
 func testRebalanceOnJoin(t *testing.T, s cluster.Store) {
 	t.Run("testRebalanceOnJoin", func(t *testing.T) {
 		ctx := context.Background()
@@ -1128,5 +1352,58 @@ func testIdleRelease(t *testing.T, s cluster.Store) {
 			return nil
 		}))
 		require.EqualValues(t, 2, claim.Fence)
+	})
+}
+
+// concurrentReleaseTrackingStore records the peak number of ReleaseClaim calls
+// in flight at once, with injected latency so overlap is observable.
+type concurrentReleaseTrackingStore struct {
+	cluster.Store
+	delay   time.Duration
+	current atomic.Int32
+	peak    atomic.Int32
+}
+
+func (s *concurrentReleaseTrackingStore) ReleaseClaim(ctx context.Context, namespace string, key []byte, instanceID string) error {
+	cur := s.current.Add(1)
+	defer s.current.Add(-1)
+	for {
+		peak := s.peak.Load()
+		if cur <= peak || s.peak.CompareAndSwap(peak, cur) {
+			break
+		}
+	}
+	time.Sleep(s.delay)
+	return s.Store.ReleaseClaim(ctx, namespace, key, instanceID)
+}
+
+func testIdleReapReleasesConcurrently(t *testing.T, s cluster.Store) {
+	t.Run("testIdleReapReleasesConcurrently", func(t *testing.T) {
+		ctx := context.Background()
+
+		// The reap path has the same shape as a drain: a working set idling
+		// out in one tick must be released in bounded-concurrency waves, not
+		// an N × RTT serial walk on the run-loop goroutine (which would stall
+		// queued rescans behind it).
+		tracking := &concurrentReleaseTrackingStore{Store: s, delay: 50 * time.Millisecond}
+		oCfg := fastOwnershipConfig()
+		oCfg.IdleTTL = 50 * time.Millisecond
+		oCfg.ReapInterval = 25 * time.Millisecond
+
+		a := startNode(t, tracking, "instance-a", fastMembershipConfig(), oCfg)
+		waitForLiveMembers(t, a, 1)
+
+		const keyCount = 8
+		for i := range keyCount {
+			require.NoError(t, a.ownership.Do(ctx, testNamespace, fmt.Appendf(nil, "key-%d", i), doNoop))
+		}
+
+		require.Eventually(t, func() bool {
+			return len(a.releasedKeys()) == keyCount
+		}, 10*time.Second, 10*time.Millisecond)
+
+		// All keys idle out together; a serial walk would never overlap two
+		// releases.
+		require.GreaterOrEqual(t, tracking.peak.Load(), int32(2))
 	})
 }

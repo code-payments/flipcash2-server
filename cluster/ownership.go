@@ -17,6 +17,12 @@ import (
 // exactly once per key: a key can be acquired, idle-released, and re-acquired
 // indefinitely.
 //
+// OnReleased's context is detached from whatever triggered the release and
+// carries a DrainDeadline timeout, so the flush is never aborted by a drain
+// budget expiring or the runtime stopping. Hooks must honor their context:
+// the runtime cannot interrupt a hook that ignores it, and a hung OnReleased
+// blocks its release wave (and therefore Drain) indefinitely.
+//
 // Hooks should not panic. A panicking OnAcquired retires the key's ownership
 // (the half-warmed entry is dropped and the claim handed back for demand to
 // re-acquire) and the panic propagates to Do's caller. A panicking OnReleased
@@ -270,11 +276,26 @@ func (o *Ownership) Do(ctx context.Context, namespace string, key []byte, fn fun
 		return &NotOwnerError{}
 	}
 
+	// Routed to self, but a draining ex-owner may still hold the claim (an
+	// owner-driven handoff: routing moved here before the release landed).
+	// The acquire below discovers that with a failed conditional write — a
+	// write-priced store op — so a hot key mid-handoff must not pay one per
+	// request: a redirect cached by a previous acquire's loss damps the
+	// stampede to one probe per RedirectCacheTTL. Staleness is bounded the
+	// same way as on the forwarded path above: the entry expires within the
+	// TTL, and a failed forward purges it via NoteUnreachable — which also
+	// means a corroborated-suspect holder's entries are already gone by the
+	// time takeover evidence exists, so damping never delays a suspicion
+	// takeover.
+	id := ownedKeyID(namespace, key)
+	if member, ok := o.cachedRedirect(id); ok {
+		return &NotOwnerError{Redirect: member}
+	}
+
 	// The key lock makes {acquire, register} atomic with respect to a
 	// concurrent release's {flush, vacate, delete}: without it, an acquire
 	// evaluated against the not-yet-vacated claim could be registered after
 	// the release completes — a local entry with no claim behind it.
-	id := ownedKeyID(namespace, key)
 	kl := o.lockKey(id)
 	unlocked := false
 	unlock := func() {
@@ -502,27 +523,41 @@ func (ok *ownedKey) exit() {
 // provably dead or corroborated-suspect holder. Returns NotOwnerError when the
 // holder is alive.
 func (o *Ownership) acquire(ctx context.Context, namespace string, key []byte, self *Member) (*Claim, error) {
-	claim, err := o.claims.GetClaim(ctx, namespace, key)
-	var takeover *TakeoverTarget
-	switch {
-	case errors.Is(err, ErrClaimNotFound):
-		// Unclaimed: plain acquire below.
-	case err != nil:
+	// Optimistic single write first: vacant, released, and held-by-self
+	// claims — the common cases on every cold start and after every idle
+	// reap — settle in one round trip. The store reports the current holder
+	// alongside ErrClaimHeld, so losing costs no extra read: takeover
+	// evidence is built from the failure instead of a pre-read.
+	acquired, err := o.claims.AcquireClaim(ctx, namespace, key, self, nil)
+	if err == nil {
+		return acquired, nil
+	}
+	if !errors.Is(err, ErrClaimHeld) {
 		return nil, err
-	case claim.OwnerInstanceID == self.InstanceID:
-		// A claim we hold in the store but not locally (e.g. process-internal
-		// race after a release began): re-acquire below confirms it.
-	default:
-		takeover = o.takeoverEvidence(claim.OwnerInstanceID)
-		if takeover == nil {
-			return nil, &NotOwnerError{Redirect: &Member{
-				InstanceID: claim.OwnerInstanceID,
-				Address:    claim.OwnerAddress,
-			}}
-		}
+	}
+	if acquired == nil {
+		// Holder unknown (the write raced a release): contention — the
+		// caller falls back or retries.
+		return nil, &NotOwnerError{}
 	}
 
-	acquired, err := o.claims.AcquireClaim(ctx, namespace, key, self, takeover)
+	takeover := o.takeoverEvidence(acquired.OwnerInstanceID)
+	if takeover == nil {
+		// The holder is alive and healthy: an owner-driven handoff in
+		// progress. Cache the redirect so followers on this key skip the
+		// failed-write probe until the ex-owner's release. Losses on the
+		// takeover attempt below are deliberately not cached — like the
+		// forwarded path's suspect-holder case, that is a transition whose
+		// outcome the next request should re-resolve.
+		holder := &Member{
+			InstanceID: acquired.OwnerInstanceID,
+			Address:    acquired.OwnerAddress,
+		}
+		o.cacheRedirect(ownedKeyID(namespace, key), holder)
+		return nil, &NotOwnerError{Redirect: holder}
+	}
+
+	acquired, err = o.claims.AcquireClaim(ctx, namespace, key, self, takeover)
 	if errors.Is(err, ErrClaimHeld) {
 		// Lost the race (or the takeover evidence went stale at commit time —
 		// the holder was alive after all).
@@ -720,7 +755,15 @@ func (o *Ownership) release(ctx context.Context, ok *ownedKey) {
 	o.mu.Unlock()
 
 	if hooks.OnReleased != nil {
-		hooks.OnReleased(ctx, ok.key)
+		// The flush is where consumer data integrity lives: detach it from the
+		// triggering caller's lifetime exactly like the claim release below.
+		// Otherwise a drain budget expiring (or Stop cancelling the loops)
+		// mid-wave would fail the flush while the release itself still
+		// succeeds — handing the key to a successor that reads unflushed
+		// state.
+		hookCtx, hookCancel := context.WithTimeout(context.WithoutCancel(ctx), o.cfg.DrainDeadline)
+		hooks.OnReleased(hookCtx, ok.key)
+		hookCancel()
 	}
 
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), o.cfg.DrainDeadline)
@@ -817,9 +860,10 @@ func (o *Ownership) reapIdle(ctx context.Context) {
 	}
 	o.mu.Unlock()
 
-	for _, ok := range idle {
-		o.release(ctx, ok)
-	}
+	// Same shape as a drain: a large working set idling out in one tick would
+	// serially walk N × RTT on the run-loop goroutine, stalling every queued
+	// rescan behind it.
+	o.releaseAll(ctx, idle)
 }
 
 // purgeOwned sheds every locally owned key after a liveness-session

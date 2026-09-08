@@ -166,19 +166,24 @@ type MembershipConfig struct {
 
 	// SelfUnhealthyAfter is how long this process's own heartbeat writes may
 	// fail before it must assume the rest of the cluster considers it dead and
-	// stop serving owned keys. Default: LivenessWindow.
+	// stop serving owned keys. Defaulted to the session-gap floor so Do starts
+	// refusing owned keys no later than a suspicious peer could displace them;
+	// raising it toward LivenessWindow trades a wider potential dual-serving
+	// window for fewer fallback-path detours during store blips. Default:
+	// min(SessionGapThreshold, LivenessWindow).
 	SelfUnhealthyAfter time.Duration
 
 	// SessionGapThreshold is the gap between successful heartbeat writes at
 	// which the member treats its own liveness session as interrupted (firing
-	// OnSessionLost, which sheds local ownership). Aligned by default with the
-	// suspicion floor (HeartbeatInterval + PollInterval, capped at
-	// SelfUnhealthyAfter): a heartbeat delayed past that floor is exactly the
-	// window in which a peer holding a failed-forward report may have
-	// displaced this member's claims while it still looked healthy to itself
-	// — shedding then bounds any such dual ownership at the gap's length
-	// instead of IdleTTL. Default: min(SelfUnhealthyAfter, HeartbeatInterval
-	// + PollInterval).
+	// OnSessionLost, which sheds local ownership) — whether the intervening
+	// beats were merely delayed or failing outright. Aligned by default with
+	// the suspicion floor (HeartbeatInterval + PollInterval, capped at an
+	// explicitly set SelfUnhealthyAfter): a heartbeat gap past that floor is
+	// exactly the window in which a peer holding a failed-forward report may
+	// have displaced this member's claims while it still looked healthy to
+	// itself — shedding then bounds any such dual ownership at the gap's
+	// length instead of IdleTTL. Default: HeartbeatInterval + PollInterval,
+	// capped at SelfUnhealthyAfter when that is set.
 	SessionGapThreshold time.Duration
 
 	// MemberGCAfter is how long a member's heartbeat may sit unchanged before
@@ -201,11 +206,14 @@ func (c MembershipConfig) withDefaults() MembershipConfig {
 	if c.LivenessWindow <= 0 {
 		c.LivenessWindow = 15 * time.Second
 	}
-	if c.SelfUnhealthyAfter <= 0 {
-		c.SelfUnhealthyAfter = c.LivenessWindow
-	}
 	if c.SessionGapThreshold <= 0 {
-		c.SessionGapThreshold = min(c.SelfUnhealthyAfter, c.HeartbeatInterval+c.PollInterval)
+		c.SessionGapThreshold = c.HeartbeatInterval + c.PollInterval
+		if c.SelfUnhealthyAfter > 0 {
+			c.SessionGapThreshold = min(c.SessionGapThreshold, c.SelfUnhealthyAfter)
+		}
+	}
+	if c.SelfUnhealthyAfter <= 0 {
+		c.SelfUnhealthyAfter = min(c.SessionGapThreshold, c.LivenessWindow)
 	}
 	if c.MemberGCAfter < 2*c.LivenessWindow {
 		c.MemberGCAfter = 10 * c.LivenessWindow
@@ -228,7 +236,10 @@ type OwnershipConfig struct {
 	// DrainDeadline bounds how long a key's in-flight work may delay its
 	// release during handoff or shutdown; past it the release proceeds
 	// regardless (the consumer's store-serialized fallback makes a forced
-	// release safe). Default 5s.
+	// release safe). It is also the timeout on the detached contexts handed
+	// to OnReleased flushes and claim-release writes — a context-honoring
+	// hook therefore bounds each release at roughly 3× DrainDeadline
+	// (quiesce, then flush). Default 5s.
 	DrainDeadline time.Duration
 
 	// SuspicionWindow is the minimum heartbeat staleness at which a holder

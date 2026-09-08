@@ -2,7 +2,6 @@ package event
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -31,18 +30,4 @@ func EventIDString(id *eventpb.EventId) string {
 type KeyAndEvent[Key, Event any] struct {
 	Key   Key
 	Event Event
-}
-
-type Rendezvous struct {
-	Key       string
-	Address   string
-	ExpiresAt time.Time
-}
-
-func (r *Rendezvous) Clone() *Rendezvous {
-	return &Rendezvous{
-		Key:       r.Key,
-		Address:   r.Address,
-		ExpiresAt: r.ExpiresAt,
-	}
 }

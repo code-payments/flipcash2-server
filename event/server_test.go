@@ -1,4 +1,4 @@
-package memory
+package event_test
 
 import (
 	"testing"
@@ -7,10 +7,7 @@ import (
 	"github.com/code-payments/flipcash2-server/event/tests"
 )
 
-func TestEvent_MemoryServer(t *testing.T) {
+func TestEvent_Server(t *testing.T) {
 	accounts := account_memory.NewInMemory()
-	events := NewInMemory()
-	teardown := func() {
-	}
-	tests.RunServerTests(t, accounts, events, teardown)
+	tests.RunServerTests(t, accounts, func() {})
 }

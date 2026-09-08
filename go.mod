@@ -13,6 +13,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.42.3
 	github.com/aws/smithy-go v1.27.7
 	github.com/buckket/go-blurhash v1.1.0
+	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/code-payments/flipcash2-protobuf-api v1.22.1-0.20260903175110-0b56e3cd9a9f
 	github.com/code-payments/ocp-protobuf-api v1.16.0
 	github.com/code-payments/ocp-server v1.24.1-0.20260903184009-272d62754fdc
@@ -60,7 +61,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.36 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.19.29 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/code-payments/code-vm-indexer v1.2.0 // indirect
 	github.com/containerd/continuity v0.4.3 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect

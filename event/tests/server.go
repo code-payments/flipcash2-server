@@ -21,27 +21,29 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
 	badgememory "github.com/code-payments/flipcash2-server/badge/memory"
+	"github.com/code-payments/flipcash2-server/cluster"
+	cluster_memory "github.com/code-payments/flipcash2-server/cluster/memory"
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/protoutil"
 	ocp_testutil "github.com/code-payments/ocp-server/testutil"
 )
 
-func RunServerTests(t *testing.T, accounts account.Store, events event.Store, teardown func()) {
-	for _, tf := range []func(t *testing.T, accounts account.Store, events event.Store){
+func RunServerTests(t *testing.T, accounts account.Store, teardown func()) {
+	for _, tf := range []func(t *testing.T, accounts account.Store){
 		testSingleServerHappyPath,
 		testMultiServerHappyPath,
 		testMultipleOpenStreams,
 		testKeepAlive,
-		testRendezvousRecord,
+		testSubscriptionRegistration,
 	} {
-		tf(t, accounts, events)
+		tf(t, accounts)
 		teardown()
 	}
 }
 
-func testSingleServerHappyPath(t *testing.T, accounts account.Store, events event.Store) {
-	testEnv, cleanup := setupTest(t, accounts, events, false)
+func testSingleServerHappyPath(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, false)
 	defer cleanup()
 
 	userID := model.MustGenerateUserID()
@@ -63,8 +65,8 @@ func testSingleServerHappyPath(t *testing.T, accounts account.Store, events even
 	}
 }
 
-func testMultiServerHappyPath(t *testing.T, accounts account.Store, events event.Store) {
-	testEnv, cleanup := setupTest(t, accounts, events, true)
+func testMultiServerHappyPath(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, true)
 	defer cleanup()
 
 	userID := model.MustGenerateUserID()
@@ -90,45 +92,45 @@ func testMultiServerHappyPath(t *testing.T, accounts account.Store, events event
 	}
 }
 
-func testMultipleOpenStreams(t *testing.T, accounts account.Store, events event.Store) {
-	for range 32 {
-		func() {
-			testEnv, cleanup := setupTest(t, accounts, events, true)
-			defer cleanup()
+// testMultipleOpenStreams pins the multi-device contract: any number of
+// streams may be open for the same user — on one server or across several —
+// and every one of them receives every event.
+func testMultipleOpenStreams(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, true)
+	defer cleanup()
 
-			userID := model.MustGenerateUserID()
-			keyPair := model.MustGenerateKeyPair()
-			accounts.Bind(context.Background(), userID, keyPair.Proto())
-			accounts.SetRegistrationFlag(context.Background(), userID, true)
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	accounts.Bind(context.Background(), userID, keyPair.Proto())
+	accounts.SetRegistrationFlag(context.Background(), userID, true)
 
-			for range 10 {
-				testEnv.client1.openUserEventStream(t, userID, keyPair)
-				testEnv.client2.openUserEventStream(t, userID, keyPair)
+	for range 3 {
+		testEnv.client1.openUserEventStream(t, userID, keyPair)
+		testEnv.client2.openUserEventStream(t, userID, keyPair)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	for i := range 20 {
+		sender := testEnv.server1
+		if i%2 == 0 {
+			sender = testEnv.server2
+		}
+
+		expected := sender.sendTestUserEvent(userID)
+
+		for _, client := range []*clientTestEnv{testEnv.client1, testEnv.client2} {
+			for _, streamer := range client.streams[model.UserIDString(userID)] {
+				events := receiveNextEvents(t, streamer)
+				require.Lenf(t, events, 1, "expected[%d]: %s", i, event.EventIDString(expected.Id))
+				assertEquivalentTestEvents(t, expected, events[0])
 			}
-
-			time.Sleep(500 * time.Millisecond)
-
-			for i := range 100 {
-				sender := testEnv.server1
-				if i%2 == 0 {
-					sender = testEnv.server2
-				}
-
-				expected := sender.sendTestUserEvent(userID)
-
-				fromServer1 := testEnv.client1.receiveEventsInRealTime(t, userID)
-				fromServer2 := testEnv.client2.receiveEventsInRealTime(t, userID)
-
-				allActual := append(fromServer1, fromServer2...)
-				require.Lenf(t, allActual, 1, "expected[%d]: %s", i, event.EventIDString(expected.Id))
-				assertEquivalentTestEvents(t, expected, allActual[0])
-			}
-		}()
+		}
 	}
 }
 
-func testKeepAlive(t *testing.T, accounts account.Store, events event.Store) {
-	testEnv, cleanup := setupTest(t, accounts, events, false)
+func testKeepAlive(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, false)
 	defer cleanup()
 
 	userID := model.MustGenerateUserID()
@@ -145,40 +147,58 @@ func testKeepAlive(t *testing.T, accounts account.Store, events event.Store) {
 	require.True(t, pingCount <= 2)
 }
 
-func testRendezvousRecord(t *testing.T, accounts account.Store, events event.Store) {
-	testEnv, cleanup := setupTest(t, accounts, events, false)
+// testSubscriptionRegistration pins the registry lifecycle: a user's streams
+// on one server share a single subscription row, which appears with the first
+// stream and disappears only after the last one closes.
+func testSubscriptionRegistration(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, false)
 	defer cleanup()
+
+	ctx := context.Background()
 
 	userID := model.MustGenerateUserID()
 	keyPair := model.MustGenerateKeyPair()
-	accounts.Bind(context.Background(), userID, keyPair.Proto())
-	accounts.SetRegistrationFlag(context.Background(), userID, true)
+	accounts.Bind(ctx, userID, keyPair.Proto())
+	accounts.SetRegistrationFlag(ctx, userID, true)
 
 	testEnv.client1.openUserEventStream(t, userID, keyPair)
+	testEnv.client1.openUserEventStream(t, userID, keyPair)
 
+	require.Eventually(t, func() bool {
+		rows, err := testEnv.clusterStore.GetSubscribers(ctx, event.UserEventsNamespace, userID.Value)
+		require.NoError(t, err)
+		return len(rows) == 1 && rows[0].Address == testEnv.server1.address
+	}, 5*time.Second, 10*time.Millisecond)
+
+	// Closing one of the two streams must keep the shared row alive.
+	testEnv.client1.closeOneUserEventStream(t, userID)
 	time.Sleep(500 * time.Millisecond)
+	rows, err := testEnv.clusterStore.GetSubscribers(ctx, event.UserEventsNamespace, userID.Value)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
 
-	testEnv.server1.assertRendezvousRecordExists(t, userID)
-
-	testEnv.client1.closeUserEventStream(t, userID)
-
-	time.Sleep(500 * time.Millisecond)
-
-	testEnv.server1.assertNoRendezvousRecord(t, userID)
+	// Closing the last stream removes it.
+	testEnv.client1.closeOneUserEventStream(t, userID)
+	require.Eventually(t, func() bool {
+		rows, err := testEnv.clusterStore.GetSubscribers(ctx, event.UserEventsNamespace, userID.Value)
+		require.NoError(t, err)
+		return len(rows) == 0
+	}, 5*time.Second, 10*time.Millisecond)
 }
 
 type testEnv struct {
-	client1 *clientTestEnv
-	client2 *clientTestEnv
-	server1 *serverTestEnv
-	server2 *serverTestEnv
+	clusterStore cluster.Store
+	client1      *clientTestEnv
+	client2      *clientTestEnv
+	server1      *serverTestEnv
+	server2      *serverTestEnv
 }
 
 type serverTestEnv struct {
-	address  string
-	events   event.Store
-	eventBus *event.Bus[*commonpb.UserId, *eventpb.Event]
-	server   *event.Server
+	address    string
+	membership *cluster.Membership
+	eventBus   *event.Bus[*commonpb.UserId, *eventpb.Event]
+	server     *event.Server
 }
 
 type clientTestEnv struct {
@@ -191,8 +211,20 @@ type cancellableStream struct {
 	cancel func()
 }
 
-func setupTest(t *testing.T, accounts account.Store, events event.Store, enableMultiServer bool) (env testEnv, cleanup func()) {
+// fastMembershipConfig mirrors the cluster suite's test tuning: convergence
+// fast enough for tests, with margin over scheduler jitter.
+func fastMembershipConfig() cluster.MembershipConfig {
+	return cluster.MembershipConfig{
+		HeartbeatInterval:   25 * time.Millisecond,
+		PollInterval:        25 * time.Millisecond,
+		LivenessWindow:      400 * time.Millisecond,
+		SessionGapThreshold: 400 * time.Millisecond,
+	}
+}
+
+func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool) (env testEnv, cleanup func()) {
 	log := zaptest.NewLogger(t)
+	ctx := context.Background()
 
 	conn1, serv1, err := ocp_testutil.NewServer(log)
 	require.NoError(t, err)
@@ -216,44 +248,52 @@ func setupTest(t *testing.T, accounts account.Store, events event.Store, enableM
 
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
-	eventBus1 := event.NewBus[*commonpb.UserId, *eventpb.Event]()
-	eventBus2 := event.NewBus[*commonpb.UserId, *eventpb.Event]()
-
-	// A shared badge store, mirroring the shared events backend; both server
+	// A shared badge store, mirroring the shared cluster backend; both server
 	// instances reset the same user's badge on stream open.
 	badges := badgememory.NewInMemory()
 
-	env.server1 = &serverTestEnv{
-		address:  conn1.Target(),
-		eventBus: eventBus1,
-		events:   events,
-		server: event.NewServer(
-			log,
-			authz,
-			accounts,
-			events,
-			badges,
-			eventBus1,
-			nil,
-			conn1.Target(),
-			internalRpcApiKey,
-		),
+	env.clusterStore = cluster_memory.NewInMemory()
+
+	newServerEnv := func(name string, conn *grpc.ClientConn) *serverTestEnv {
+		membership := cluster.NewMembership(log, env.clusterStore, &cluster.Member{
+			InstanceID: name,
+			Address:    conn.Target(),
+			Labels:     map[string]string{"role": "all"},
+		}, fastMembershipConfig())
+		require.NoError(t, membership.Start(ctx))
+
+		subscriptions := cluster.NewSubscriptions(log, membership, env.clusterStore, cluster.SubscriptionsConfig{
+			CacheTTL: 25 * time.Millisecond,
+		})
+
+		eventBus := event.NewBus[*commonpb.UserId, *eventpb.Event]()
+		return &serverTestEnv{
+			address:    conn.Target(),
+			membership: membership,
+			eventBus:   eventBus,
+			server: event.NewServer(
+				log,
+				authz,
+				accounts,
+				badges,
+				subscriptions,
+				eventBus,
+				nil,
+				internalRpcApiKey,
+			),
+		}
 	}
-	env.server2 = &serverTestEnv{
-		address:  conn2.Target(),
-		events:   events,
-		eventBus: eventBus2,
-		server: event.NewServer(
-			log,
-			authz,
-			accounts,
-			events,
-			badges,
-			eventBus2,
-			nil,
-			conn2.Target(),
-			internalRpcApiKey,
-		),
+
+	env.server1 = newServerEnv("server-1", conn1)
+	env.server2 = newServerEnv("server-2", conn2)
+
+	// Both members must be in both live views before streams open, or a
+	// publisher would discard the other server's subscription rows as
+	// not-yet-live.
+	for _, s := range []*serverTestEnv{env.server1, env.server2} {
+		require.Eventually(t, func() bool {
+			return len(s.membership.Live()) == 2
+		}, 5*time.Second, 10*time.Millisecond)
 	}
 
 	serv1.RegisterService(func(server *grpc.Server) {
@@ -271,6 +311,8 @@ func setupTest(t *testing.T, accounts account.Store, events event.Store, enableM
 	return env, func() {
 		cleanup1()
 		cleanup2()
+		env.server1.membership.Stop()
+		env.server2.membership.Stop()
 	}
 }
 
@@ -287,18 +329,6 @@ func (s *serverTestEnv) sendTestUserEvent(userID *commonpb.UserId) *eventpb.Even
 	}
 	s.eventBus.OnEvent(userID, e)
 	return e
-}
-
-func (s *serverTestEnv) assertRendezvousRecordExists(t *testing.T, userID *commonpb.UserId) {
-	rendezvous, err := s.events.GetRendezvous(context.Background(), model.UserIDString(userID))
-	require.NoError(t, err)
-	require.Equal(t, s.address, rendezvous.Address)
-	require.True(t, rendezvous.ExpiresAt.After(time.Now()))
-}
-
-func (s *serverTestEnv) assertNoRendezvousRecord(t *testing.T, userID *commonpb.UserId) {
-	_, err := s.events.GetRendezvous(t.Context(), model.UserIDString(userID))
-	require.Equal(t, event.ErrRendezvousNotFound, err)
 }
 
 func (c *clientTestEnv) openUserEventStream(t *testing.T, userID *commonpb.UserId, keyPair model.KeyPair) {
@@ -326,48 +356,44 @@ func (c *clientTestEnv) openUserEventStream(t *testing.T, userID *commonpb.UserI
 	})
 }
 
+// receiveNextEvents pumps one stream until it yields an event batch, answering
+// pings along the way.
+func receiveNextEvents(t *testing.T, streamer *cancellableStream) []*eventpb.Event {
+	for {
+		resp, err := streamer.stream.Recv()
+		require.NoError(t, err)
+
+		switch typed := resp.Type.(type) {
+		case *eventpb.StreamEventsResponse_Events:
+			return typed.Events.Events
+		case *eventpb.StreamEventsResponse_Ping:
+			err = streamer.stream.Send(&eventpb.StreamEventsRequest{
+				Type: &eventpb.StreamEventsRequest_Pong{
+					Pong: &eventpb.ClientPong{
+						Timestamp: timestamppb.Now(),
+					},
+				},
+			})
+			// Stream has been terminated
+			if err != io.EOF {
+				require.NoError(t, err)
+			}
+		case *eventpb.StreamEventsResponse_Error:
+			require.Failf(t, "stream result code %s", typed.Error.Code.String())
+		default:
+			require.Fail(t, "events, ping or error wasn't set")
+		}
+	}
+}
+
 func (c *clientTestEnv) receiveEventsInRealTime(t *testing.T, userID *commonpb.UserId) []*eventpb.Event {
 	key := model.UserIDString(userID)
 
 	streamers, ok := c.streams[key]
 	require.True(t, ok)
+	require.Len(t, streamers, 1)
 
-	for _, streamer := range streamers {
-		for {
-			resp, err := streamer.stream.Recv()
-
-			status, ok := status.FromError(err)
-			if ok && status.Code() == codes.Aborted {
-				// Try the next open stream
-				break
-			}
-
-			require.NoError(t, err)
-
-			switch typed := resp.Type.(type) {
-			case *eventpb.StreamEventsResponse_Events:
-				return typed.Events.Events
-			case *eventpb.StreamEventsResponse_Ping:
-				err = streamer.stream.Send(&eventpb.StreamEventsRequest{
-					Type: &eventpb.StreamEventsRequest_Pong{
-						Pong: &eventpb.ClientPong{
-							Timestamp: timestamppb.Now(),
-						},
-					},
-				})
-				// Stream has been terminated
-				if err != io.EOF {
-					require.NoError(t, err)
-				}
-			case *eventpb.StreamEventsResponse_Error:
-				require.Failf(t, "stream result code %s", typed.Error.Code.String())
-			default:
-				require.Fail(t, "events, ping or error wasn't set")
-			}
-		}
-	}
-
-	return nil
+	return receiveNextEvents(t, streamers[0])
 }
 
 func (c *clientTestEnv) waitUntilStreamTerminationOrTimeout(t *testing.T, userID *commonpb.UserId, keepStreamAlive bool, timeout time.Duration) int {
@@ -416,14 +442,19 @@ func (c *clientTestEnv) waitUntilStreamTerminationOrTimeout(t *testing.T, userID
 	}
 }
 
-func (c *clientTestEnv) closeUserEventStream(t *testing.T, userID *commonpb.UserId) {
+// closeOneUserEventStream cancels the user's oldest open stream, leaving any
+// others open.
+func (c *clientTestEnv) closeOneUserEventStream(t *testing.T, userID *commonpb.UserId) {
 	key := model.UserIDString(userID)
 	streamers, ok := c.streams[key]
 	require.True(t, ok)
-	for _, streamer := range streamers {
-		streamer.cancel()
+	require.NotEmpty(t, streamers)
+
+	streamers[0].cancel()
+	c.streams[key] = streamers[1:]
+	if len(c.streams[key]) == 0 {
+		delete(c.streams, key)
 	}
-	delete(c.streams, key)
 }
 
 func assertEquivalentTestEvents(t *testing.T, obj1, obj2 *eventpb.Event) {

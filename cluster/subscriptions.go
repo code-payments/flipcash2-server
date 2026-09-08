@@ -124,6 +124,14 @@ func NewSubscriptions(log *zap.Logger, membership *Membership, store Subscriptio
 	return s
 }
 
+// Self returns the local member whose interest this runtime registers — the
+// identity carried by every subscriber row this process writes. Consumers use
+// it to recognize their own rows in Subscribers results exactly (by instance
+// ID) instead of comparing separately-configured addresses.
+func (s *Subscriptions) Self() *Member {
+	return s.membership.Self()
+}
+
 // lockTopic and unlockTopic mirror Ownership's key locks: they serialize a
 // topic's registry writes so a first-subscribe racing a last-unsubscribe can
 // never interleave as put-then-delete — a live stream with no row behind it,

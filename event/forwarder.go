@@ -6,6 +6,8 @@ import (
 	"go.uber.org/zap"
 
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
+
+	"github.com/code-payments/flipcash2-server/cluster"
 )
 
 type Forwarder interface {
@@ -18,13 +20,13 @@ type ForwardingClient struct {
 	*userEventForwarder
 }
 
-func NewForwardingClient(log *zap.Logger, events Store, currentRpcApiKey string) Forwarder {
+func NewForwardingClient(log *zap.Logger, subscriptions *cluster.Subscriptions, currentRpcApiKey string) Forwarder {
 	return &ForwardingClient{
 		userEventForwarder: &userEventForwarder{
-			log:    log,
-			events: events,
-			pool:   sharedForwardingPool(log),
-			apiKey: currentRpcApiKey,
+			log:           log,
+			subscriptions: subscriptions,
+			pool:          sharedForwardingPool(log),
+			apiKey:        currentRpcApiKey,
 		},
 	}
 }

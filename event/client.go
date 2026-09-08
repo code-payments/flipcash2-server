@@ -10,6 +10,7 @@ import (
 
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 
+	"github.com/code-payments/flipcash2-server/cluster"
 	"github.com/code-payments/flipcash2-server/cluster/internalrpc"
 	"github.com/code-payments/flipcash2-server/model"
 	ocp_retry "github.com/code-payments/ocp-server/retry"
@@ -33,20 +34,27 @@ func sharedForwardingPool(log *zap.Logger) *internalrpc.Pool {
 	return sharedPool
 }
 
-// userEventForwarder routes user events to the server hosting each user's
-// event stream, located via rendezvous records. It is the single
-// implementation shared by Server (which also delivers to its own local
-// streams) and ForwardingClient (which never has local streams).
+// userEventForwarder routes user events to every server hosting one of the
+// user's event streams, resolved through the cluster subscription registry. It
+// is the single implementation shared by Server (which also delivers to its
+// own local streams) and ForwardingClient (which never has local streams).
+//
+// Delivery is best-effort by the subscription layer's contract: a cached
+// resolution may briefly miss a just-opened stream or forward toward a
+// just-closed one. The client's delta sync on stream open is the backstop.
 type userEventForwarder struct {
-	log    *zap.Logger
-	events Store
-	pool   *internalrpc.Pool
-	apiKey string
+	log           *zap.Logger
+	subscriptions *cluster.Subscriptions
+	pool          *internalrpc.Pool
+	apiKey        string
 
-	// selfAddress and deliverLocal short-circuit the RPC when the rendezvous
-	// record points at this process. Zero-valued for pure forwarding clients.
-	selfAddress  string
-	deliverLocal func(streamKey string, e *eventpb.Event)
+	// selfInstanceID and deliverLocal short-circuit the RPC when a subscriber
+	// row names this process. The ID comes from the subscriptions runtime's own
+	// member — the same identity its rows carry — so the match is exact, never
+	// a comparison of separately-configured addresses. Zero-valued for pure
+	// forwarding clients.
+	selfInstanceID string
+	deliverLocal   func(streamKey string, e *eventpb.Event)
 }
 
 func (f *userEventForwarder) ForwardUserEvents(ctx context.Context, events ...*eventpb.UserEvent) error {
@@ -57,77 +65,80 @@ func (f *userEventForwarder) ForwardUserEvents(ctx context.Context, events ...*e
 	}
 
 	for _, event := range events {
-		go func() {
-			ocp_retry.Retry(
-				func() error {
-					return f.forwardUserEvent(ctx, event)
-				},
-				ocp_retry.Limit(3),
-				ocp_retry.Backoff(ocp_backoff.BinaryExponential(100*time.Millisecond), 500*time.Millisecond),
-			)
-		}()
+		go f.fanOutUserEvent(ctx, event)
 	}
 	return nil
 }
 
-func (f *userEventForwarder) forwardUserEvent(ctx context.Context, event *eventpb.UserEvent) error {
+func (f *userEventForwarder) fanOutUserEvent(ctx context.Context, event *eventpb.UserEvent) {
 	log := f.log.With(
 		zap.String("event_id", EventIDString(event.Event.Id)),
 		zap.String("user_id", model.UserIDString(event.UserId)),
 	)
 
-	streamKey := model.UserIDString(event.UserId)
-
-	rendezvous, err := f.events.GetRendezvous(ctx, streamKey)
-	switch err {
-	case nil:
-		log = log.With(zap.String("receiver_address", rendezvous.Address))
-
-		// Expired rendezvous record that likely wasn't cleaned up. Avoid forwarding,
-		// since we expect a broken state.
-		if time.Since(rendezvous.ExpiresAt) >= 0 {
-			log.Debug("Dropping event with expired rendezvous record")
-			return nil
-		}
-
-		// This server is hosting the user's event stream, no forwarding required
-		if f.selfAddress != "" && rendezvous.Address == f.selfAddress {
-			f.deliverLocal(streamKey, event.Event)
-			return nil
-		}
-
-		// Otherwise, forward it to the server hosting the user's stream
-		conn, err := f.pool.Conn(rendezvous.Address)
-		if err != nil {
-			log.With(zap.Error(err)).Warn("Failure creating forwarding RPC client")
+	var subscribers []*cluster.Subscription
+	_, err := ocp_retry.Retry(
+		func() error {
+			var err error
+			subscribers, err = f.subscriptions.Subscribers(ctx, UserEventsNamespace, event.UserId.Value)
 			return err
-		}
-
-		ctx, cancel := context.WithTimeout(ctx, forwardRpcTimeout)
-		defer cancel()
-
-		log.Debug("Forwarding events over RPC")
-
-		resp, err := eventpb.NewEventStreamingClient(conn).ForwardEvents(ctx, &eventpb.ForwardEventsRequest{
-			UserEvents: &eventpb.UserEventBatch{
-				Events: []*eventpb.UserEvent{event},
-			},
-		})
-		if err != nil {
-			log.With(zap.Error(err)).Warn("Failure forwarding event over RPC")
-			return err
-		} else if resp.Result != eventpb.ForwardEventsResponse_OK {
-			log.With(zap.String("result", resp.Result.String())).Warn("Failure forwarding event over RPC")
-			return errors.Errorf("rpc forward result %s", resp.Result)
-		}
-
-	case ErrRendezvousNotFound:
-		log.Debug("Dropping event without rendezvous record")
-
-	default:
-		log.With(zap.Error(err)).Warn("Failed to get rendezvous record")
-		return err
+		},
+		ocp_retry.Limit(3),
+		ocp_retry.Backoff(ocp_backoff.BinaryExponential(100*time.Millisecond), 500*time.Millisecond),
+	)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure resolving event stream subscribers")
+		return
 	}
 
+	if len(subscribers) == 0 {
+		log.Debug("Dropping event without stream subscribers")
+		return
+	}
+
+	for _, subscriber := range subscribers {
+		// This server hosts streams for the user; no RPC required.
+		if f.deliverLocal != nil && subscriber.InstanceID == f.selfInstanceID {
+			f.deliverLocal(model.UserIDString(event.UserId), event.Event)
+			continue
+		}
+
+		go func() {
+			log := log.With(zap.String("receiver_address", subscriber.Address))
+			_, err := ocp_retry.Retry(
+				func() error {
+					return f.forwardUserEvent(ctx, subscriber.Address, event)
+				},
+				ocp_retry.Limit(3),
+				ocp_retry.Backoff(ocp_backoff.BinaryExponential(100*time.Millisecond), 500*time.Millisecond),
+			)
+			if err != nil {
+				log.With(zap.Error(err)).Warn("Failure forwarding event over RPC")
+			}
+		}()
+	}
+}
+
+func (f *userEventForwarder) forwardUserEvent(ctx context.Context, address string, event *eventpb.UserEvent) error {
+	conn, err := f.pool.Conn(address)
+	if err != nil {
+		return errors.Wrap(err, "failure creating forwarding rpc client")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, forwardRpcTimeout)
+	defer cancel()
+
+	f.log.Debug("Forwarding events over RPC", zap.String("receiver_address", address))
+
+	resp, err := eventpb.NewEventStreamingClient(conn).ForwardEvents(ctx, &eventpb.ForwardEventsRequest{
+		UserEvents: &eventpb.UserEventBatch{
+			Events: []*eventpb.UserEvent{event},
+		},
+	})
+	if err != nil {
+		return err
+	} else if resp.Result != eventpb.ForwardEventsResponse_OK {
+		return errors.Errorf("rpc forward result %s", resp.Result)
+	}
 	return nil
 }

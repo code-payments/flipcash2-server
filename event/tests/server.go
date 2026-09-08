@@ -36,6 +36,7 @@ func RunServerTests(t *testing.T, accounts account.Store, teardown func()) {
 		testMultipleOpenStreams,
 		testKeepAlive,
 		testSubscriptionRegistration,
+		testServerShutdown,
 	} {
 		tf(t, accounts)
 		teardown()
@@ -167,7 +168,7 @@ func testSubscriptionRegistration(t *testing.T, accounts account.Store) {
 	require.Eventually(t, func() bool {
 		rows, err := testEnv.clusterStore.GetSubscribers(ctx, event.UserEventsNamespace, userID.Value)
 		require.NoError(t, err)
-		return len(rows) == 1 && rows[0].Address == testEnv.server1.address
+		return len(rows) == 1 && rows[0].InstanceID == testEnv.server1.membership.Self().InstanceID
 	}, 5*time.Second, 10*time.Millisecond)
 
 	// Closing one of the two streams must keep the shared row alive.
@@ -184,6 +185,54 @@ func testSubscriptionRegistration(t *testing.T, accounts account.Store) {
 		require.NoError(t, err)
 		return len(rows) == 0
 	}, 5*time.Second, 10*time.Millisecond)
+}
+
+// testServerShutdown pins the shutdown contract: Shutdown closes every open
+// stream (which is what lets a gRPC GracefulStop return) and refuses new ones,
+// while the user's streams on other servers keep receiving.
+func testServerShutdown(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, true)
+	defer cleanup()
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	accounts.Bind(context.Background(), userID, keyPair.Proto())
+	accounts.SetRegistrationFlag(context.Background(), userID, true)
+
+	testEnv.client1.openUserEventStream(t, userID, keyPair)
+	testEnv.client2.openUserEventStream(t, userID, keyPair)
+
+	time.Sleep(500 * time.Millisecond)
+
+	testEnv.server1.server.Shutdown()
+
+	// The open stream terminates promptly with Aborted (the handler returned).
+	testEnv.client1.waitUntilStreamTerminationOrTimeout(t, userID, true, 5*time.Second)
+
+	// A new stream against the shut-down server is refused.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := &eventpb.StreamEventsRequest{
+		Type: &eventpb.StreamEventsRequest_Params_{
+			Params: &eventpb.StreamEventsRequest_Params{
+				Ts: timestamppb.Now(),
+			},
+		},
+	}
+	require.NoError(t, keyPair.Auth(req.GetParams(), &req.GetParams().Auth))
+	streamer, err := testEnv.client1.client.StreamEvents(ctx)
+	require.NoError(t, err)
+	require.NoError(t, streamer.Send(req))
+	_, err = streamer.Recv()
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
+	// The user's stream on the surviving server still receives — including
+	// events published through the shut-down server's bus, whose forwarder
+	// keeps working until the process exits.
+	expected := testEnv.server1.sendTestUserEvent(userID)
+	actual := testEnv.client2.receiveEventsInRealTime(t, userID)
+	require.Len(t, actual, 1)
+	assertEquivalentTestEvents(t, expected, actual[0])
 }
 
 type testEnv struct {

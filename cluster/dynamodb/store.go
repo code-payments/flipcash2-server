@@ -62,7 +62,6 @@ const (
 	attrTTL       = "ttl"
 
 	attrNamespace    = "ns"
-	attrKey          = "key_bytes"
 	attrOwner        = "owner_instance"
 	attrOwnerAddress = "owner_address"
 	attrFence        = "fence"
@@ -235,18 +234,16 @@ func (s *store) acquireVacant(ctx context.Context, namespace string, key []byte,
 			attrPK: &types.AttributeValueMemberS{Value: claimPK(namespace, key)},
 		},
 		ConditionExpression: aws.String("attribute_not_exists(#pk) OR #owner = :empty"),
-		UpdateExpression:    aws.String("SET #ns = :ns, #key = :key, #owner = :me, #addr = :addr ADD #fence :one"),
+		UpdateExpression:    aws.String("SET #ns = :ns, #owner = :me, #addr = :addr ADD #fence :one"),
 		ExpressionAttributeNames: map[string]string{
 			"#pk":    attrPK,
 			"#ns":    attrNamespace,
-			"#key":   attrKey,
 			"#owner": attrOwner,
 			"#addr":  attrOwnerAddress,
 			"#fence": attrFence,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":ns":    &types.AttributeValueMemberS{Value: namespace},
-			":key":   &types.AttributeValueMemberB{Value: key},
 			":me":    &types.AttributeValueMemberS{Value: self.InstanceID},
 			":addr":  &types.AttributeValueMemberS{Value: self.Address},
 			":empty": &types.AttributeValueMemberS{Value: ""},
@@ -256,7 +253,7 @@ func (s *store) acquireVacant(ctx context.Context, namespace string, key []byte,
 		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 	})
 	if err == nil {
-		return claimFromItem(out.Attributes)
+		return claimFromItem(key, out.Attributes)
 	}
 
 	var conditionFailed *types.ConditionalCheckFailedException
@@ -264,7 +261,7 @@ func (s *store) acquireVacant(ctx context.Context, namespace string, key []byte,
 		return nil, err
 	}
 
-	holder, parseErr := claimFromItem(conditionFailed.Item)
+	holder, parseErr := claimFromItem(key, conditionFailed.Item)
 	if parseErr != nil {
 		// The failed-condition item wasn't returned; fall back to a read.
 		holder, parseErr = s.GetClaim(ctx, namespace, key)
@@ -382,7 +379,7 @@ func (s *store) GetClaim(ctx context.Context, namespace string, key []byte) (*cl
 	if out.Item == nil {
 		return nil, cluster.ErrClaimNotFound
 	}
-	claim, err := claimFromItem(out.Item)
+	claim, err := claimFromItem(key, out.Item)
 	if err != nil {
 		return nil, err
 	}
@@ -419,15 +416,13 @@ func (s *store) ReleaseClaim(ctx context.Context, namespace string, key []byte, 
 	return nil
 }
 
-func (s *store) PutSubscription(ctx context.Context, namespace string, key []byte, member *cluster.Member) error {
+func (s *store) PutSubscription(ctx context.Context, namespace string, key []byte, instanceID string) error {
 	_, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.subscriptionsTable),
 		Item: map[string]types.AttributeValue{
 			attrPK:        &types.AttributeValueMemberS{Value: claimPK(namespace, key)},
-			attrSK:        &types.AttributeValueMemberS{Value: member.InstanceID},
+			attrSK:        &types.AttributeValueMemberS{Value: instanceID},
 			attrNamespace: &types.AttributeValueMemberS{Value: namespace},
-			attrKey:       &types.AttributeValueMemberB{Value: key},
-			attrAddress:   &types.AttributeValueMemberS{Value: member.Address},
 		},
 	})
 	return err
@@ -465,7 +460,7 @@ func (s *store) GetSubscribers(ctx context.Context, namespace string, key []byte
 		}
 
 		for _, item := range resp.Items {
-			sub, err := subscriptionFromItem(item)
+			sub, err := subscriptionFromItem(key, item)
 			if err != nil {
 				return nil, err
 			}
@@ -479,8 +474,12 @@ func (s *store) GetSubscribers(ctx context.Context, namespace string, key []byte
 	}
 }
 
-func subscriptionFromItem(item map[string]types.AttributeValue) (*cluster.Subscription, error) {
-	sub := &cluster.Subscription{}
+// subscriptionFromItem takes the raw key from the caller: rows carry only the
+// composite pk, and every read path already addresses them by (namespace, key).
+func subscriptionFromItem(key []byte, item map[string]types.AttributeValue) (*cluster.Subscription, error) {
+	sub := &cluster.Subscription{
+		Key: append([]byte(nil), key...),
+	}
 	if v, ok := item[attrSK].(*types.AttributeValueMemberS); ok {
 		sub.InstanceID = v.Value
 	} else {
@@ -488,12 +487,6 @@ func subscriptionFromItem(item map[string]types.AttributeValue) (*cluster.Subscr
 	}
 	if v, ok := item[attrNamespace].(*types.AttributeValueMemberS); ok {
 		sub.Namespace = v.Value
-	}
-	if v, ok := item[attrKey].(*types.AttributeValueMemberB); ok {
-		sub.Key = append([]byte(nil), v.Value...)
-	}
-	if v, ok := item[attrAddress].(*types.AttributeValueMemberS); ok {
-		sub.Address = v.Value
 	}
 	return sub, nil
 }
@@ -542,17 +535,18 @@ func memberRecordFromItem(item map[string]types.AttributeValue) (*cluster.Member
 	return record, nil
 }
 
-func claimFromItem(item map[string]types.AttributeValue) (*cluster.Claim, error) {
+// claimFromItem takes the raw key from the caller: rows carry only the
+// composite pk, and every read path already addresses them by (namespace, key).
+func claimFromItem(key []byte, item map[string]types.AttributeValue) (*cluster.Claim, error) {
 	if len(item) == 0 {
 		return nil, cluster.ErrClaimNotFound
 	}
 
-	claim := &cluster.Claim{}
+	claim := &cluster.Claim{
+		Key: append([]byte(nil), key...),
+	}
 	if v, ok := item[attrNamespace].(*types.AttributeValueMemberS); ok {
 		claim.Namespace = v.Value
-	}
-	if v, ok := item[attrKey].(*types.AttributeValueMemberB); ok {
-		claim.Key = append([]byte(nil), v.Value...)
 	}
 	if v, ok := item[attrOwner].(*types.AttributeValueMemberS); ok {
 		claim.OwnerInstanceID = v.Value

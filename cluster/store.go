@@ -94,9 +94,10 @@ type ClaimStore interface {
 // Cleanup is explicit instead — drains delete their own rows, and observers
 // sweep crashed instances' rows at resolution time.
 type SubscriptionStore interface {
-	// PutSubscription registers (or reasserts) the member's interest row for
-	// the topic. Idempotent upsert.
-	PutSubscription(ctx context.Context, namespace string, key []byte, member *Member) error
+	// PutSubscription registers (or reasserts) the instance's interest row for
+	// the topic. Idempotent upsert. Rows carry identity only — consumers
+	// resolve dial addresses through the membership view at resolution time.
+	PutSubscription(ctx context.Context, namespace string, key []byte, instanceID string) error
 
 	// DeleteSubscription removes the member's interest row for the topic.
 	// Idempotent.

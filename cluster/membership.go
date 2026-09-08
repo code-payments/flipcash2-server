@@ -17,11 +17,17 @@ import (
 // while its heartbeat counter keeps moving across this process's own
 // observation timeline — wall clocks are never compared across machines, so
 // clock skew cannot produce false takeovers.
+//
+// A Membership constructed with NewObserver observes without registering: it
+// maintains the same live view but writes no member record (see NewObserver
+// for the exact semantics of the self-referential methods).
 type Membership struct {
 	log   *zap.Logger
 	store RegistryStore
 	cfg   MembershipConfig
 
+	// self is nil in observer mode; the pointer is fixed at construction
+	// (fields behind it are guarded by mu, the pointer itself needs no lock).
 	self *Member
 
 	mu              sync.RWMutex
@@ -41,6 +47,10 @@ type Membership struct {
 	// across registration epochs would let stale evidence displace a live
 	// owner.
 	lastCounter uint64
+	// lastRefresh is when the registry was last successfully re-read. It is an
+	// observer's health signal: with no heartbeat of its own, a stale view is
+	// the only way an observer can be wrong.
+	lastRefresh time.Time
 	started     bool
 
 	cancel context.CancelFunc
@@ -67,18 +77,50 @@ func NewMembership(log *zap.Logger, store RegistryStore, self *Member, cfg Membe
 	}
 }
 
-// Start registers self, performs an initial refresh, and launches the
-// heartbeat and poll loops. The loops run until Stop (or Deregister).
+// NewObserver creates a read-only membership runtime: it polls the registry
+// and maintains the observed live view exactly like a member, but never
+// registers a record of its own — it cannot be routed to, holds no claims or
+// subscriptions, and leaves nothing behind on exit. For processes that consume
+// the cluster without serving it, e.g. an event-streaming-only client that
+// resolves owners and forwards but hosts nothing.
+//
+// On an observer: Self returns nil; SetDraining and Deregister are vacuous
+// no-ops (there is no record to flip or delete); OnSessionLost never fires
+// (there is no liveness session to lose); and SelfHealthy reports whether
+// registry polls are landing — a stale view, not a stale heartbeat, is the
+// failure mode an observer must surface.
+func NewObserver(log *zap.Logger, store RegistryStore, cfg MembershipConfig) *Membership {
+	return &Membership{
+		log:          log,
+		store:        store,
+		cfg:          cfg.withDefaults(),
+		observations: make(map[string]*observation),
+		done:         make(chan struct{}),
+	}
+}
+
+// observer reports whether this runtime observes without registering.
+func (m *Membership) observer() bool {
+	return m.self == nil
+}
+
+// Start registers self (observers skip registration), performs an initial
+// refresh, and launches the heartbeat and poll loops (observers run only the
+// poll loop). The loops run until Stop (or Deregister).
 func (m *Membership) Start(ctx context.Context) error {
-	if err := m.store.PutMember(ctx, m.self, 1); err != nil {
-		return err
+	if !m.observer() {
+		if err := m.store.PutMember(ctx, m.self, 1); err != nil {
+			return err
+		}
 	}
 
 	if err := m.Refresh(ctx); err != nil {
 		// Registered but unable to run: don't leave a corpse record behind,
 		// and don't report healthy — no heartbeat loop will back it.
-		if delErr := m.store.DeleteMember(ctx, m.self.InstanceID); delErr != nil {
-			m.log.With(zap.Error(delErr)).Warn("Failed to remove member record after aborted start")
+		if !m.observer() {
+			if delErr := m.store.DeleteMember(ctx, m.self.InstanceID); delErr != nil {
+				m.log.With(zap.Error(delErr)).Warn("Failed to remove member record after aborted start")
+			}
 		}
 		return err
 	}
@@ -110,24 +152,35 @@ func (m *Membership) Stop() {
 
 // Deregister removes self from the registry and stops the loops. Call only
 // after all owned claims are released: a deregistered member's claims are
-// instantly displaceable.
+// instantly displaceable. On an observer it only stops the poll loop — there
+// is no record to remove.
 func (m *Membership) Deregister(ctx context.Context) error {
 	m.Stop()
+	if m.observer() {
+		return nil
+	}
 	return m.store.DeleteMember(ctx, m.self.InstanceID)
 }
 
 // Self returns this process's member identity (with its current draining
-// flag).
+// flag), or nil on an observer — which has no identity to route to.
 func (m *Membership) Self() *Member {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.self == nil {
+		return nil
+	}
 	return m.self.Clone()
 }
 
 // SetDraining flips this member's draining flag in the registry and locally.
 // Draining removes the member from routing candidacy while its heartbeat keeps
-// held claims valid — the first step of graceful shutdown.
+// held claims valid — the first step of graceful shutdown. On an observer it
+// is a vacuous no-op: an observer was never a routing candidate.
 func (m *Membership) SetDraining(ctx context.Context, draining bool) error {
+	if m.observer() {
+		return nil
+	}
 	if draining {
 		// Fail closed: flip the local flag before the store round-trip so no
 		// acquisition can slip in while the write is in flight — a Do that
@@ -163,11 +216,18 @@ func (m *Membership) Live() []*Member {
 // SelfHealthy reports whether this process's own heartbeats are landing. Once
 // they have failed for SelfUnhealthyAfter, a suspicious peer may already be
 // able to displace this member's claims, so it must stop trusting them.
+//
+// An observer has no heartbeat; for it this reports whether registry polls
+// are landing (last successful refresh within SelfUnhealthyAfter), since a
+// stale view is the observer analogue of a stale heartbeat.
 func (m *Membership) SelfHealthy() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if !m.started {
 		return false
+	}
+	if m.self == nil {
+		return time.Since(m.lastRefresh) < m.cfg.SelfUnhealthyAfter
 	}
 	return time.Since(m.lastSelfBeat) < m.cfg.SelfUnhealthyAfter
 }
@@ -217,6 +277,7 @@ func (m *Membership) Subscribe(fn func()) {
 // past SelfUnhealthyAfter (so peers may have displaced claims via takeover).
 // Local ownership state can no longer be trusted; subscribers should shed it
 // and let demand re-acquire. Called from the heartbeat loop's goroutine.
+// Never fires on an observer: with no registration there is no session.
 func (m *Membership) OnSessionLost(fn func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -244,6 +305,8 @@ func (m *Membership) Refresh(ctx context.Context) error {
 	now := time.Now()
 
 	m.mu.Lock()
+
+	m.lastRefresh = now
 
 	seen := make(map[string]bool, len(records))
 	for _, record := range records {
@@ -281,7 +344,10 @@ func (m *Membership) Refresh(ctx context.Context) error {
 	// Keeping it also retries the delete every poll until it lands.
 	var gc []string
 	for instanceID, obs := range m.observations {
-		if instanceID != m.self.InstanceID && now.Sub(obs.lastChange) >= m.cfg.MemberGCAfter {
+		if m.self != nil && instanceID == m.self.InstanceID {
+			continue
+		}
+		if now.Sub(obs.lastChange) >= m.cfg.MemberGCAfter {
 			gc = append(gc, instanceID)
 		}
 	}
@@ -340,8 +406,14 @@ func liveSignature(live []*Member) string {
 func (m *Membership) run(ctx context.Context) {
 	defer close(m.done)
 
-	heartbeat := time.NewTicker(m.cfg.HeartbeatInterval)
-	defer heartbeat.Stop()
+	// Observers have no record to beat: leave the heartbeat channel nil so its
+	// select arm blocks forever and only the poll loop runs.
+	var heartbeatC <-chan time.Time
+	if !m.observer() {
+		heartbeat := time.NewTicker(m.cfg.HeartbeatInterval)
+		defer heartbeat.Stop()
+		heartbeatC = heartbeat.C
+	}
 	poll := time.NewTicker(m.cfg.PollInterval)
 	defer poll.Stop()
 
@@ -349,7 +421,7 @@ func (m *Membership) run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-heartbeat.C:
+		case <-heartbeatC:
 			opCtx, cancel := context.WithTimeout(ctx, m.cfg.HeartbeatInterval)
 			counter, err := m.store.Heartbeat(opCtx, m.self.InstanceID)
 			if errors.Is(err, ErrMemberNotFound) {

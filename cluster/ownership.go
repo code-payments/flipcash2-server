@@ -33,6 +33,13 @@ type NamespaceHooks struct {
 	OnReleased func(ctx context.Context, key []byte)
 }
 
+// ErrOwnershipLost is the cancellation cause delivered to fn's context when
+// its claim is force-released with the call still in flight (a drain deadline
+// expiring, or a liveness-session purge). It means a successor may now
+// legitimately own the key: fn should stop and not trust its claim further.
+// Retrieve it with context.Cause.
+var ErrOwnershipLost = errors.New("cluster ownership force-released with work in flight")
+
 // Ownership acquires and serves exclusive key ownership on top of routing and
 // claims. Keys are acquired lazily on first demand, held stickily until idle
 // or rerouted, and drained gracefully on shutdown. It never blocks
@@ -64,6 +71,13 @@ type ownedKey struct {
 	namespace string
 	key       []byte
 	claim     *Claim
+
+	// lostCtx is cancelled (cause ErrOwnershipLost) when the claim is
+	// force-released with work still in flight, so every running fn gets an
+	// explicit signal that a successor may now own the key instead of
+	// discovering it only through its own store writes.
+	lostCtx    context.Context
+	lostCancel context.CancelCauseFunc
 
 	mu       sync.Mutex
 	cond     *sync.Cond
@@ -196,6 +210,13 @@ func (o *Ownership) Stop() {
 // non-nil Redirect is the member to forward to; a nil Redirect means no
 // healthy owner is known and the caller should use its store-serialized
 // fallback. Any other error is fn's own.
+//
+// fn's context derives from ctx and is additionally cancelled — with
+// ErrOwnershipLost as its cause — if the claim is force-released while fn is
+// still running (a drain deadline expiring under it, or a liveness-session
+// purge). That cancellation means a successor may already own the key; fn
+// should stop, and any write it must still land needs its own protection
+// (Claim.Fence, or the consumer's store-serialized path).
 func (o *Ownership) Do(ctx context.Context, namespace string, key []byte, fn func(ctx context.Context, claim *Claim) error) error {
 	// Once our own heartbeats have gone stale the cluster is about to displace
 	// our claims: stop trusting them immediately.
@@ -204,8 +225,7 @@ func (o *Ownership) Do(ctx context.Context, namespace string, key []byte, fn fun
 	}
 
 	if ok := o.enterOwned(namespace, key); ok != nil {
-		defer ok.exit()
-		return fn(ctx, ok.claim)
+		return runOwned(ctx, ok, fn)
 	}
 
 	self := o.membership.Self()
@@ -314,8 +334,7 @@ func (o *Ownership) Do(ctx context.Context, namespace string, key []byte, fn fun
 	// followed by its re-acquirer) may have installed the entry meanwhile.
 	if ok := o.enterOwned(namespace, key); ok != nil {
 		unlock()
-		defer ok.exit()
-		return fn(ctx, ok.claim)
+		return runOwned(ctx, ok, fn)
 	}
 
 	claim, err := o.acquire(ctx, namespace, key, self)
@@ -329,8 +348,23 @@ func (o *Ownership) Do(ctx context.Context, namespace string, key []byte, fn fun
 		// Lost a local race with a concurrent release or drain; retriable.
 		return &NotOwnerError{}
 	}
+	return runOwned(ctx, ok, fn)
+}
+
+// runOwned executes fn under an entered key and exits it, deriving fn's
+// context so a force-release of the claim cancels fn (cause ErrOwnershipLost)
+// in addition to the caller's own cancellation. The AfterFunc registration is
+// released on return, so a completed invocation leaves nothing behind on the
+// key's lostCtx.
+func runOwned(ctx context.Context, ok *ownedKey, fn func(ctx context.Context, claim *Claim) error) error {
 	defer ok.exit()
-	return fn(ctx, ok.claim)
+	fnCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stop := context.AfterFunc(ok.lostCtx, func() {
+		cancel(context.Cause(ok.lostCtx))
+	})
+	defer stop()
+	return fn(fnCtx, ok.claim)
 }
 
 // NoteUnreachable records that a forward to the member failed. Combined with a
@@ -663,6 +697,7 @@ func (o *Ownership) registerOwned(ctx context.Context, namespace string, key []b
 		lastUsed:  time.Now(),
 	}
 	ok.cond = sync.NewCond(&ok.mu)
+	ok.lostCtx, ok.lostCancel = context.WithCancelCause(context.Background())
 	o.owned[id] = ok
 	hooks := o.namespaces[namespace]
 	o.mu.Unlock()
@@ -692,6 +727,7 @@ func (o *Ownership) registerOwned(ctx context.Context, namespace string, key []b
 			delete(o.owned, id)
 		}
 		o.mu.Unlock()
+		ok.lostCancel(nil) // Nothing ran under the retired entry.
 
 		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), o.cfg.DrainDeadline)
 		defer cancel()
@@ -737,6 +773,11 @@ func (o *Ownership) release(ctx context.Context, ok *ownedKey) {
 	ok.mu.Unlock()
 
 	if forced {
+		// The stragglers are about to lose their claim to a legitimate
+		// successor: cancel their contexts now, before the flush and release
+		// below, so "stale owner" is an explicit signal rather than something
+		// fn can only infer from its own store writes.
+		ok.lostCancel(ErrOwnershipLost)
 		o.log.Warn("Drain deadline hit; force-releasing claim with work in flight",
 			zap.String("namespace", ok.namespace),
 		)
@@ -782,6 +823,10 @@ func (o *Ownership) release(ctx context.Context, ok *ownedKey) {
 		delete(o.owned, ok.id())
 	}
 	o.mu.Unlock()
+
+	// No-op when forced already cancelled with a cause; otherwise nothing was
+	// in flight and this just retires the context.
+	ok.lostCancel(nil)
 
 	o.log.Debug("Released cluster ownership", zap.String("namespace", ok.namespace))
 }

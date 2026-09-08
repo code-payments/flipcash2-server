@@ -28,6 +28,7 @@ func RunClusterTests(t *testing.T, s cluster.Store, teardown func()) {
 		testFailover,
 		testSuspicionTakeover,
 		testGracefulDrain,
+		testForcedReleaseCancelsInflight,
 		testParallelDrain,
 		testDrainUnderAcquisition,
 		testDrainWithConcurrentRelease,
@@ -466,6 +467,51 @@ func testGracefulDrain(t *testing.T, s cluster.Store) {
 		require.Eventually(t, func() bool {
 			return len(b.membership.Live()) == 1
 		}, 5*time.Second, 10*time.Millisecond)
+	})
+}
+
+func testForcedReleaseCancelsInflight(t *testing.T, s cluster.Store) {
+	t.Run("testForcedReleaseCancelsInflight", func(t *testing.T) {
+		ctx := context.Background()
+
+		// A release that outlasts DrainDeadline force-releases the claim with
+		// work still in flight — a successor can then legitimately acquire the
+		// key. The straggler must get an explicit signal: fn's context is
+		// cancelled with ErrOwnershipLost as its cause.
+		oCfg := fastOwnershipConfig()
+		oCfg.DrainDeadline = 100 * time.Millisecond
+
+		a := startNode(t, s, "instance-a", fastMembershipConfig(), oCfg)
+		waitForLiveMembers(t, a, 1)
+		key := keyRoutedTo(t, a, "instance-a")
+
+		entered := make(chan struct{})
+		cause := make(chan error, 1)
+		doErr := make(chan error, 1)
+		go func() {
+			doErr <- a.ownership.Do(ctx, testNamespace, key, func(fnCtx context.Context, _ *cluster.Claim) error {
+				close(entered)
+				select {
+				case <-fnCtx.Done():
+					cause <- context.Cause(fnCtx)
+				case <-time.After(5 * time.Second):
+					cause <- errors.New("fn context was never cancelled")
+				}
+				return nil
+			})
+		}()
+		<-entered
+
+		// Drain while fn is parked: it waits out DrainDeadline, then forces.
+		require.NoError(t, a.ownership.Drain(context.Background()))
+		require.ErrorIs(t, <-cause, cluster.ErrOwnershipLost)
+		require.NoError(t, <-doErr)
+
+		// The forced release still completed the full handoff: flush hook ran
+		// and the claim was handed back.
+		require.Equal(t, []string{string(key)}, a.releasedKeys())
+		_, err := s.GetClaim(ctx, testNamespace, key)
+		require.ErrorIs(t, err, cluster.ErrClaimNotFound)
 	})
 }
 

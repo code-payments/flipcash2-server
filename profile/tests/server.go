@@ -40,7 +40,6 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 		testUsernameIsPublic,
 		testGetProfileByUsername,
 		testSetUsername,
-		testSetUsernameStaffGated,
 		testSetUsernameBalanceGated,
 		testDisplayNameModeration,
 		testUsernameModeration,
@@ -118,7 +117,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -301,7 +300,7 @@ func testTipCardCustomization(t *testing.T, accounts account.Store, profiles pro
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -373,7 +372,7 @@ func testMinDmChatInitFee(t *testing.T, accounts account.Store, profiles profile
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -465,7 +464,7 @@ func testUsernameIsPublic(t *testing.T, accounts account.Store, profiles profile
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -510,7 +509,7 @@ func testGetProfileByUsername(t *testing.T, accounts account.Store, profiles pro
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, _, _ := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -577,8 +576,8 @@ func testGetProfileByUsername(t *testing.T, accounts account.Store, profiles pro
 	})
 }
 
-// testSetUsername covers claiming a handle over the RPC, with the staff gate off
-// so registration is the only thing standing between a user and a handle.
+// testSetUsername covers claiming a handle over the RPC, where registration is
+// the only thing standing between a user and a handle.
 func testSetUsername(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
@@ -587,7 +586,7 @@ func testSetUsername(t *testing.T, accounts account.Store, profiles profile.Stor
 
 	media, _, _ := newMedia()
 	moderator := &fakeModerator{}
-	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, nil, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, nil, x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -725,72 +724,6 @@ func testSetUsername(t *testing.T, accounts account.Store, profiles profile.Stor
 	})
 }
 
-// testSetUsernameStaffGated covers the rollout gate: while it is on, claiming a
-// handle is staff-only, and everyone else is denied however registered they are.
-func testSetUsernameStaffGated(t *testing.T, accounts account.Store, profiles profile.Store) {
-	ctx := context.Background()
-	log := zaptest.NewLogger(t)
-
-	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
-	media, _, _ := newMedia()
-
-	newClient := func(accounts account.Store) profilepb.ProfileClient {
-		t.Helper()
-		serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), true)
-		cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
-			profilepb.RegisterProfileServer(s, serv)
-		}))
-		return profilepb.NewProfileClient(cc)
-	}
-
-	setUsername := func(client profilepb.ProfileClient, keyPair *model.KeyPair, username string) *profilepb.SetUsernameResponse {
-		t.Helper()
-		req := &profilepb.SetUsernameRequest{Username: &commonpb.Username{Value: username}}
-		require.NoError(t, keyPair.Auth(req, &req.Auth))
-		resp, err := client.SetUsername(ctx, req)
-		require.NoError(t, err)
-		return resp
-	}
-
-	userID := model.MustGenerateUserID()
-	keyPair := model.MustGenerateKeyPair()
-	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
-	require.NoError(t, err)
-	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
-
-	t.Run("Non-staff user is denied", func(t *testing.T) {
-		resp := setUsername(newClient(accounts), &keyPair, "gated_handle")
-		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_DENIED}, resp))
-
-		getResp, err := newClient(accounts).GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
-		require.NoError(t, err)
-		require.Nil(t, getResp.GetUserProfile().GetUsername())
-	})
-
-	// Neither account store lets a test flag a user as staff, so the staff answer is
-	// substituted to cover the other side of the gate.
-	t.Run("Staff user is allowed", func(t *testing.T) {
-		client := newClient(&staffAccounts{Store: accounts})
-
-		resp := setUsername(client, &keyPair, "gated_handle")
-		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_OK}, resp))
-
-		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
-		require.NoError(t, err)
-		require.Equal(t, "gated_handle", getResp.GetUserProfile().GetUsername().GetValue())
-	})
-}
-
-// staffAccounts answers every staff check with yes, leaving the rest of the store
-// as it is. It stands in for a staff flag the account stores expose no setter for.
-type staffAccounts struct {
-	account.Store
-}
-
-func (s *staffAccounts) IsStaff(context.Context, *commonpb.UserId) (bool, error) {
-	return true, nil
-}
-
 // testSetUsernameBalanceGated covers the balance gate: a handle is only claimable
 // by a user holding at least MinUsernameTotalBalance, and what OCP reports is what
 // decides it.
@@ -803,7 +736,7 @@ func testSetUsernameBalanceGated(t *testing.T, accounts account.Store, profiles 
 
 	ocpBalance := &fakeOcpBalance{}
 	moderator := &fakeModerator{}
-	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, balance.NewClient(log, accounts, ocpBalance), x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, balance.NewClient(log, accounts, ocpBalance), x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -926,7 +859,7 @@ func testUsernameModeration(t *testing.T, accounts account.Store, profiles profi
 	media, _, _ := newMedia()
 
 	moderator := &fakeModerator{}
-	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, nil, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, nil, x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -1058,7 +991,7 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	media, blobs, access := newMedia()
-	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))
@@ -1260,7 +1193,7 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 	media, _, _ := newMedia()
 
 	moderator := &fakeModerator{}
-	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, nil, x.NewClient(), false)
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, nil, x.NewClient())
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		profilepb.RegisterProfileServer(s, serv)
 	}))

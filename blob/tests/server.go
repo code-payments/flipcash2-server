@@ -75,7 +75,7 @@ func newHarness(t *testing.T, accounts account.Store, blobs blob.Store, storage 
 	authn := auth.NewKeyPairAuthenticator(log)
 	authz := account.NewAuthorizer(log, accounts, authn)
 	return &harness{
-		server: blob.NewServer(log, authz, accounts, blobs, storage, access, resolver, false),
+		server: blob.NewServer(log, authz, accounts, blobs, storage, access, resolver),
 		worker: blob.NewWorker(log, blobs, blob.NewFinalizer(log, blobs, storage, moderator), blob.ContentKindImage),
 	}
 }

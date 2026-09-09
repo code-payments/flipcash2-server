@@ -33,8 +33,6 @@ type Server struct {
 	access   AccessStore
 	resolver PrincipalResolver
 
-	requireStaff bool
-
 	blobpb.UnimplementedBlobStorageServer
 }
 
@@ -46,17 +44,15 @@ func NewServer(
 	storage ObjectStorage,
 	access AccessStore,
 	resolver PrincipalResolver,
-	requireStaff bool,
 ) *Server {
 	return &Server{
-		log:          log,
-		authz:        authz,
-		accounts:     accounts,
-		blobs:        blobs,
-		storage:      storage,
-		access:       access,
-		resolver:     resolver,
-		requireStaff: requireStaff,
+		log:      log,
+		authz:    authz,
+		accounts: accounts,
+		blobs:    blobs,
+		storage:  storage,
+		access:   access,
+		resolver: resolver,
 	}
 }
 
@@ -99,8 +95,7 @@ func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.Initiat
 		zap.Uint64("size_bytes", req.SizeBytes),
 	)
 
-	// Uploads are gated on registration (and, while the feature is staff-gated, on
-	// staff), like other write paths.
+	// Uploads are gated on registration, like other write paths.
 	allowed, err := s.uploadAllowed(ctx, owner, log)
 	if err != nil {
 		return nil, err
@@ -168,10 +163,9 @@ func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.Initiat
 	}, nil
 }
 
-// uploadAllowed reports whether the caller may upload: they must be registered,
-// and — while the feature is staff-gated — staff. A false with a nil error is a
-// clean denial; a non-nil error is an internal failure already logged and shaped
-// for return to the client.
+// uploadAllowed reports whether the caller may upload: they must be registered.
+// A false with a nil error is a clean denial; a non-nil error is an internal
+// failure already logged and shaped for return to the client.
 func (s *Server) uploadAllowed(ctx context.Context, owner *commonpb.UserId, log *zap.Logger) (bool, error) {
 	isRegistered, err := s.accounts.IsRegistered(ctx, owner)
 	if err != nil {
@@ -180,17 +174,6 @@ func (s *Server) uploadAllowed(ctx context.Context, owner *commonpb.UserId, log 
 	}
 	if !isRegistered {
 		return false, nil
-	}
-
-	if s.requireStaff {
-		isStaff, err := s.accounts.IsStaff(ctx, owner)
-		if err != nil {
-			log.Warn("Failed to get staff flag", zap.Error(err))
-			return false, status.Error(codes.Internal, "failed to get staff flag")
-		}
-		if !isStaff {
-			return false, nil
-		}
 	}
 
 	return true, nil

@@ -39,12 +39,10 @@ type Server struct {
 
 	xClient *x.Client
 
-	requireStaffForUsername bool
-
 	profilepb.UnimplementedProfileServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, media Media, moderator moderation.Client, balances *balance.Client, xClient *x.Client, requireStaffForUsername bool) *Server {
+func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, media Media, moderator moderation.Client, balances *balance.Client, xClient *x.Client) *Server {
 	return &Server{
 		log: log,
 
@@ -60,8 +58,6 @@ func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, p
 		balances: balances,
 
 		xClient: xClient,
-
-		requireStaffForUsername: requireStaffForUsername,
 	}
 }
 
@@ -211,16 +207,6 @@ func (s *Server) SetUsername(ctx context.Context, req *profilepb.SetUsernameRequ
 		return nil, status.Error(codes.Internal, "failed to get registration flag")
 	} else if !isRegistered {
 		return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_DENIED}, nil
-	}
-
-	if s.requireStaffForUsername {
-		isStaff, err := s.accounts.IsStaff(ctx, userID)
-		if err != nil {
-			log.Warn("Failed to get staff flag", zap.Error(err))
-			return nil, status.Error(codes.Internal, "failed to get staff flag")
-		} else if !isStaff {
-			return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_DENIED}, nil
-		}
 	}
 
 	// Validate before moderating, so a handle the store would reject anyway is

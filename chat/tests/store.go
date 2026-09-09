@@ -30,6 +30,7 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_AdvanceLastMessage,
 		testStore_GroupChat_PutAndGet,
 		testStore_GroupChat_Membership,
+		testStore_GroupChat_IDsForUser,
 		testStore_GroupChat_CreationCap,
 		testStore_GroupChat_DuplicateMembers,
 		testStore_GroupChat_AddMembersErrors,
@@ -283,6 +284,50 @@ func testStore_GroupChat_Membership(t *testing.T, s chat.Store) {
 	members, err = s.GetMembers(ctx, c.ID)
 	require.NoError(t, err)
 	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{userA, userB, userC}), userIDValues(members))
+}
+
+// testStore_GroupChat_IDsForUser pins the inverse membership read: exactly the
+// groups the user is currently joined to, tracking joins, departures, and
+// rejoins, with DMs never included.
+func testStore_GroupChat_IDsForUser(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+
+	// No memberships is an empty result, not an error.
+	chatIDs, err := s.GetGroupChatIDsForUser(ctx, userA)
+	require.NoError(t, err)
+	require.Empty(t, chatIDs)
+
+	groupAB := putGroupChat(t, s, "Both", at(1), userA, userB)
+	groupA := putGroupChat(t, s, "Only A", at(2), userA)
+	groupB := putGroupChat(t, s, "Only B", at(3), userB)
+
+	// A DM must never surface as a group membership.
+	putDmChat(t, s, userA, userB, at(4))
+
+	chatIDs, err = s.GetGroupChatIDsForUser(ctx, userA)
+	require.NoError(t, err)
+	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupA}), rawChatIDValues(chatIDs))
+
+	// Departure excludes the group; a tombstoned membership is not a membership.
+	require.NoError(t, s.RemoveGroupMember(ctx, groupAB.ID, userA))
+	chatIDs, err = s.GetGroupChatIDsForUser(ctx, userA)
+	require.NoError(t, err)
+	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupA}), rawChatIDValues(chatIDs))
+
+	// Rejoining restores it; joining another user's group adds it.
+	require.NoError(t, s.AddGroupMembers(ctx, groupAB.ID, []*commonpb.UserId{userA}))
+	require.NoError(t, s.AddGroupMembers(ctx, groupB.ID, []*commonpb.UserId{userA}))
+	chatIDs, err = s.GetGroupChatIDsForUser(ctx, userA)
+	require.NoError(t, err)
+	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupA, groupB}), rawChatIDValues(chatIDs))
+
+	// userB's view was never disturbed by userA's churn.
+	chatIDs, err = s.GetGroupChatIDsForUser(ctx, userB)
+	require.NoError(t, err)
+	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupB}), rawChatIDValues(chatIDs))
 }
 
 // testStore_PutChat_NoMembers pins that a memberless chat of either family is
@@ -622,6 +667,14 @@ func chatIDValues(chats []*chat.Chat) [][]byte {
 	out := make([][]byte, len(chats))
 	for i, c := range chats {
 		out[i] = c.ID.Value
+	}
+	return out
+}
+
+func rawChatIDValues(ids []*commonpb.ChatId) [][]byte {
+	out := make([][]byte, len(ids))
+	for i, id := range ids {
+		out[i] = id.Value
 	}
 	return out
 }

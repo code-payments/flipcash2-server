@@ -182,6 +182,20 @@ func (m *memory) ReleaseClaim(_ context.Context, namespace string, key []byte, i
 func (m *memory) PutSubscription(_ context.Context, namespace string, key []byte, instanceID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.putSubscriptionLocked(namespace, key, instanceID)
+	return nil
+}
+
+func (m *memory) PutSubscriptions(_ context.Context, topics []cluster.SubscriptionTopic, instanceID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range topics {
+		m.putSubscriptionLocked(t.Namespace, t.Key, instanceID)
+	}
+	return nil
+}
+
+func (m *memory) putSubscriptionLocked(namespace string, key []byte, instanceID string) {
 	id := claimID(namespace, key)
 	topic, ok := m.subscriptions[id]
 	if !ok {
@@ -193,22 +207,34 @@ func (m *memory) PutSubscription(_ context.Context, namespace string, key []byte
 		Key:        append([]byte(nil), key...),
 		InstanceID: instanceID,
 	}
-	return nil
 }
 
 func (m *memory) DeleteSubscription(_ context.Context, namespace string, key []byte, instanceID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.deleteSubscriptionLocked(namespace, key, instanceID)
+	return nil
+}
+
+func (m *memory) DeleteSubscriptions(_ context.Context, topics []cluster.SubscriptionTopic, instanceID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range topics {
+		m.deleteSubscriptionLocked(t.Namespace, t.Key, instanceID)
+	}
+	return nil
+}
+
+func (m *memory) deleteSubscriptionLocked(namespace string, key []byte, instanceID string) {
 	id := claimID(namespace, key)
 	topic, ok := m.subscriptions[id]
 	if !ok {
-		return nil
+		return
 	}
 	delete(topic, instanceID)
 	if len(topic) == 0 {
 		delete(m.subscriptions, id)
 	}
-	return nil
 }
 
 func (m *memory) GetSubscribers(_ context.Context, namespace string, key []byte) ([]*cluster.Subscription, error) {

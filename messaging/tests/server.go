@@ -79,12 +79,13 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 }
 
 type serverEnv struct {
-	t        *testing.T
-	ctx      context.Context
-	client   messagingpb.MessagingClient
-	authz    *auth.StaticAuthorizer
-	observer *event.TestEventObserver[*commonpb.UserId, *eventpb.Event]
-	pusher   *capturingPusher
+	t            *testing.T
+	ctx          context.Context
+	client       messagingpb.MessagingClient
+	authz        *auth.StaticAuthorizer
+	observer     *event.TestEventObserver[*commonpb.UserId, *eventpb.Event]
+	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
+	pusher       *capturingPusher
 
 	chatID *commonpb.ChatId
 	userA  *commonpb.UserId
@@ -106,15 +107,19 @@ func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, 
 	bus := event.NewBus[*commonpb.UserId, *eventpb.Event]()
 	observer := event.NewTestEventObserver[*commonpb.UserId, *eventpb.Event]()
 	bus.AddHandler(observer)
+	chatBus := event.NewBus[*commonpb.ChatId, *eventpb.ChatEvent]()
+	chatObserver := event.NewTestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]()
+	chatBus.AddHandler(chatObserver)
 
 	env := &serverEnv{
-		t:         t,
-		ctx:       ctx,
-		authz:     authz,
-		observer:  observer,
-		pusher:    &capturingPusher{},
-		blocklist: blocklists,
-		chatID:    generateChatID(),
+		t:            t,
+		ctx:          ctx,
+		authz:        authz,
+		observer:     observer,
+		chatObserver: chatObserver,
+		pusher:       &capturingPusher{},
+		blocklist:    blocklists,
+		chatID:       generateChatID(),
 	}
 	env.userA, env.keysA = env.addUser()
 	env.userB, env.keysB = env.addUser()
@@ -132,7 +137,7 @@ func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, 
 	env.blobAccess = blobAccess
 	media := blob.NewIntegration(blobStore, blob_memory.NewInMemoryStorage(), blobAccess)
 
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus)
 	server := messaging.NewServer(log, authz, chats, messages, media, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
@@ -345,12 +350,30 @@ func (e *serverEnv) notifyIsTyping(keys model.KeyPair, state messagingpb.IsTypin
 // kind predicate.
 // ============================================================================
 
-// chatUpdatesFor returns every ChatUpdate observed for recipient so far, in
-// observation order.
+// chatUpdatesFor returns every ChatUpdate observed for recipient so far —
+// user-keyed events addressed to them (DM fan-out), plus chat-keyed events
+// that do not exclude them: a chat-keyed publish reaches every member's
+// stream, and these tests only ever ask about members. Per-bus observation
+// order.
 func (e *serverEnv) chatUpdatesFor(recipient *commonpb.UserId) []*eventpb.ChatUpdate {
 	var out []*eventpb.ChatUpdate
 	for _, ev := range e.observer.GetEvents(func(k *commonpb.UserId) bool { return bytes.Equal(k.Value, recipient.Value) }) {
 		if u := ev.Event.GetChatUpdate(); u != nil {
+			out = append(out, u)
+		}
+	}
+	for _, ev := range e.chatObserver.GetEvents(func(*commonpb.ChatId) bool { return true }) {
+		excluded := false
+		for _, ex := range ev.Event.ExcludeUserIds {
+			if bytes.Equal(ex.Value, recipient.Value) {
+				excluded = true
+				break
+			}
+		}
+		if excluded {
+			continue
+		}
+		if u := ev.Event.Event.GetChatUpdate(); u != nil {
 			out = append(out, u)
 		}
 	}
@@ -359,17 +382,14 @@ func (e *serverEnv) chatUpdatesFor(recipient *commonpb.UserId) []*eventpb.ChatUp
 
 // waitForChatUpdate blocks until some ChatUpdate observed for recipient matches.
 func (e *serverEnv) waitForChatUpdate(recipient *commonpb.UserId, match func(*eventpb.ChatUpdate) bool) {
-	e.observer.WaitFor(e.t, func(events []*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
-		for _, ev := range events {
-			if !bytes.Equal(ev.Key.Value, recipient.Value) {
-				continue
-			}
-			if u := ev.Event.GetChatUpdate(); u != nil && match(u) {
+	require.Eventually(e.t, func() bool {
+		for _, u := range e.chatUpdatesFor(recipient) {
+			if match(u) {
 				return true
 			}
 		}
 		return false
-	})
+	}, 250*time.Millisecond, 50*time.Millisecond, "timed out waiting for chat update")
 }
 
 // waitForNewMessage blocks until recipient observes a broadcast carrying msgID.

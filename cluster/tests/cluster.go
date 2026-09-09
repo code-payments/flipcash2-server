@@ -47,6 +47,8 @@ func RunClusterTests(t *testing.T, s cluster.Store, teardown func()) {
 		testIdleRelease,
 		testIdleReapReleasesConcurrently,
 		testSubscribeRefcounting,
+		testSubscribeAll,
+		testCloseAll,
 		testSubscriberResolutionAndLiveness,
 		testSubscriberCache,
 		testSubscriptionsDrainAndResume,

@@ -454,6 +454,44 @@ func (s *store) getGroupMembers(ctx context.Context, chatID *commonpb.ChatId) ([
 	return members, nil
 }
 
+// GetGroupChatIDsForUser lists the user's joined group chats via the inverted
+// gsiByUser. The index is keyed by the sparse user attribute, which tombstones
+// keep (unlike joined_at), so departed memberships are in the user's slice and
+// are filtered out by state here.
+func (s *store) GetGroupChatIDsForUser(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.ChatId, error) {
+	chatIDs := make([]*commonpb.ChatId, 0)
+	var startKey map[string]types.AttributeValue
+	for {
+		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                aws.String(s.groupMembersTable),
+			IndexName:                aws.String(gsiByUser),
+			KeyConditionExpression:   aws.String("#user = :user"),
+			FilterExpression:         aws.String("#state = :joined"),
+			ExpressionAttributeNames: map[string]string{"#user": attrUser, "#state": attrState},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":user":   avS(userIndexKey(userID)),
+				":joined": avN(memberStateJoined),
+			},
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			chatID, err := chatIDFromPK(item)
+			if err != nil {
+				return nil, err
+			}
+			chatIDs = append(chatIDs, chatID)
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		startKey = out.LastEvaluatedKey
+	}
+	return chatIDs, nil
+}
+
 func (s *store) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
 	if chat.IsGroupChatID(chatID) {
 		out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
@@ -682,16 +720,24 @@ func feedPK(userID *commonpb.UserId, chatType chatpb.ChatType) string {
 }
 
 // chatIDFromSK recovers a chat ID from a dm_inbox item's sk ("chat#<hex>"),
-// the inverse of chatSK.
+// the inverse of chatSK; chatIDFromPK does the same for a group_members item's
+// pk, the inverse of chatPK.
 func chatIDFromSK(item map[string]types.AttributeValue) (*commonpb.ChatId, error) {
-	sk := asS(item[attrSK])
-	encoded, ok := strings.CutPrefix(sk, chatKeyPrefix)
+	return chatIDFromKey(asS(item[attrSK]))
+}
+
+func chatIDFromPK(item map[string]types.AttributeValue) (*commonpb.ChatId, error) {
+	return chatIDFromKey(asS(item[attrPK]))
+}
+
+func chatIDFromKey(key string) (*commonpb.ChatId, error) {
+	encoded, ok := strings.CutPrefix(key, chatKeyPrefix)
 	if !ok {
-		return nil, fmt.Errorf("unexpected sk %q", sk)
+		return nil, fmt.Errorf("unexpected chat key %q", key)
 	}
 	id, err := hex.DecodeString(encoded)
 	if err != nil {
-		return nil, fmt.Errorf("decoding chat id from sk %q: %w", sk, err)
+		return nil, fmt.Errorf("decoding chat id from key %q: %w", key, err)
 	}
 	return &commonpb.ChatId{Value: id}, nil
 }

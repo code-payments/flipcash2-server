@@ -24,14 +24,21 @@ import (
 
 const pushTimeout = 3 * time.Second
 
-// publishChatUpdate fans a ChatUpdate out to each member of the chat over the
-// event bus, optionally excluding one user (e.g. the originator of a typing
-// notification). It is best-effort: a failure to load members is logged, not
-// surfaced, so it never fails the originating RPC.
+// publishChatUpdate broadcasts a ChatUpdate to the chat's members, optionally
+// excluding one user (e.g. the originator of a typing notification). It is
+// best-effort: a failure to load members is logged, not surfaced, so it never
+// fails the originating RPC.
+//
+// A DM's update is fanned out per member over the user-keyed event bus. A
+// group's update is published once on its chat topic — the delivery layer
+// resolves the servers hosting subscribed streams from the chat-keyed
+// subscription registry — so publishing costs the same no matter how large
+// the group, and no member read is needed at all unless the update also
+// pushes.
 //
 // members may be supplied by a caller that already has the set in hand (e.g.
-// from AdvanceLastMessage), avoiding a redundant read; when nil, the members are
-// loaded here.
+// from AdvanceLastMessage), avoiding a redundant read; when nil, the members
+// are loaded where they are consumed: DM fan-out here, pushes below.
 func publishChatUpdate(
 	ctx context.Context,
 
@@ -44,14 +51,17 @@ func publishChatUpdate(
 	ocpData ocp_data.Provider,
 
 	pusher push.Pusher,
-	eventBus *event.Bus[*commonpb.UserId, *eventpb.Event],
+	userEventBus *event.Bus[*commonpb.UserId, *eventpb.Event],
+	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent],
 
 	chatID *commonpb.ChatId,
 	update *eventpb.ChatUpdate,
 	exclude *commonpb.UserId,
 	members []*commonpb.UserId,
 ) {
-	if len(members) == 0 {
+	isGroup := chat.IsGroupChatID(chatID)
+
+	if !isGroup && len(members) == 0 {
 		var err error
 		members, err = chats.GetMembers(ctx, chatID)
 		if err != nil {
@@ -66,16 +76,40 @@ func publishChatUpdate(
 		Ts:   timestamppb.Now(),
 		Type: &eventpb.Event_ChatUpdate{ChatUpdate: update},
 	}
-	for _, m := range members {
-		if exclude != nil && bytes.Equal(m.Value, exclude.Value) {
-			continue
+	if isGroup {
+		var excludes []*commonpb.UserId
+		if exclude != nil {
+			excludes = []*commonpb.UserId{exclude}
 		}
-		eventBus.OnEvent(m, e)
+		chatEventBus.OnEvent(chatID, &eventpb.ChatEvent{
+			ChatId:         chatID,
+			Event:          e,
+			ExcludeUserIds: excludes,
+		})
+	} else {
+		for _, m := range members {
+			if exclude != nil && bytes.Equal(m.Value, exclude.Value) {
+				continue
+			}
+			userEventBus.OnEvent(m, e)
+		}
 	}
 
 	// todo: Tie in push to the event bus?
 	if update.NewMessages == nil {
 		return
+	}
+
+	// Pushes address members individually regardless of how the event was
+	// published, so a group's members are read here — the one place the group
+	// path still needs them.
+	if isGroup && len(members) == 0 {
+		var err error
+		members, err = chats.GetMembers(ctx, chatID)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure loading members for message pushes")
+			return
+		}
 	}
 
 	// Pushes identify the sender differently per chat type — a contact DM push
@@ -88,7 +122,7 @@ func publishChatUpdate(
 	// function already has in hand.
 	var chatType chatpb.ChatType
 	var chatTitle string
-	if chat.IsGroupChatID(chatID) {
+	if isGroup {
 		chatType = chatpb.ChatType_GROUP
 		md, err := chats.GetChatByID(ctx, chatID)
 		if err != nil {

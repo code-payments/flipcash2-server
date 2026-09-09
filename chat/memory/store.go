@@ -213,6 +213,19 @@ func (m *memory) IsMember(_ context.Context, chatID *commonpb.ChatId, userID *co
 	return hasInlineMember(m.chats[string(chatID.Value)], userID), nil
 }
 
+func (m *memory) GetGroupChatIDsForUser(_ context.Context, userID *commonpb.UserId) ([]*commonpb.ChatId, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	chatIDs := make([]*commonpb.ChatId, 0)
+	for chatKey, members := range m.groupMembers {
+		if members[string(userID.Value)] {
+			chatIDs = append(chatIDs, &commonpb.ChatId{Value: []byte(chatKey)})
+		}
+	}
+	return chatIDs, nil
+}
+
 // hasInlineMember reports whether userID is in a chat's inline member list — a
 // DM's fixed participants, carried on the canonical record. It is only ever
 // consulted on a DM path: a group's members live in groupMembers and its

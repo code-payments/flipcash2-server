@@ -145,23 +145,27 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 }
 
 func TestExecutor_SendTipDmPaymentMessage(t *testing.T) {
-	// The location the payment was sent from decides the verb: only a payment
-	// from the recipient's tip card is a tip, everything else is a plain send.
+	// The location the payment was sent from decides the verb by default: only
+	// a payment from the recipient's tip card is a tip, everything else is a
+	// plain send. An explicit action overrides that default either way.
 	for _, tc := range []struct {
 		name         string
 		location     intentpb.ChatMetadata_TipDmPayment_Location
+		action       intentpb.ChatMetadata_TipDmPayment_Action
 		expectedVerb messagingpb.CashContent_Verb
 	}{
-		{"tipcard", intentpb.ChatMetadata_TipDmPayment_TIPCARD, messagingpb.CashContent_TIPPED},
-		{"chat", intentpb.ChatMetadata_TipDmPayment_CHAT, messagingpb.CashContent_SENT},
+		{"tipcard", intentpb.ChatMetadata_TipDmPayment_TIPCARD, intentpb.ChatMetadata_TipDmPayment_DEFAULT, messagingpb.CashContent_TIPPED},
+		{"chat", intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_DEFAULT, messagingpb.CashContent_SENT},
+		{"tipcard_send", intentpb.ChatMetadata_TipDmPayment_TIPCARD, intentpb.ChatMetadata_TipDmPayment_SEND, messagingpb.CashContent_SENT},
+		{"chat_tip", intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_TIP, messagingpb.CashContent_TIPPED},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testExecutor_SendTipDmPaymentMessage(t, tc.location, tc.expectedVerb)
+			testExecutor_SendTipDmPaymentMessage(t, tc.location, tc.action, tc.expectedVerb)
 		})
 	}
 }
 
-func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMetadata_TipDmPayment_Location, expectedVerb messagingpb.CashContent_Verb) {
+func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMetadata_TipDmPayment_Location, action intentpb.ChatMetadata_TipDmPayment_Action, expectedVerb messagingpb.CashContent_Verb) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
@@ -202,6 +206,7 @@ func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMe
 				Type: &intentpb.ChatMetadata_TipDmPayment_{
 					TipDmPayment: &intentpb.ChatMetadata_TipDmPayment{
 						Location: location,
+						Action:   action,
 					},
 				},
 			},

@@ -132,10 +132,14 @@ func tipDmChatMetadata(chatID *commonpb.ChatId) *intentpb.ChatMetadata {
 }
 
 func tipDmChatMetadataFrom(chatID *commonpb.ChatId, location intentpb.ChatMetadata_TipDmPayment_Location) *intentpb.ChatMetadata {
+	return tipDmChatMetadataWithAction(chatID, location, intentpb.ChatMetadata_TipDmPayment_DEFAULT)
+}
+
+func tipDmChatMetadataWithAction(chatID *commonpb.ChatId, location intentpb.ChatMetadata_TipDmPayment_Location, action intentpb.ChatMetadata_TipDmPayment_Action) *intentpb.ChatMetadata {
 	return &intentpb.ChatMetadata{
 		ChatId: chatID,
 		Type: &intentpb.ChatMetadata_TipDmPayment_{
-			TipDmPayment: &intentpb.ChatMetadata_TipDmPayment{Location: location},
+			TipDmPayment: &intentpb.ChatMetadata_TipDmPayment{Location: location, Action: action},
 		},
 	}
 }
@@ -287,6 +291,44 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		tipRecord.SendPublicPaymentMetadata.NativeAmount = 0.01
 		tipRecord.SendPublicPaymentMetadata.UsdMarketValue = 0.01
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tipRecord, nil, nil), "below the minimum")
+	})
+
+	// An explicit action overrides the default for the location, and the rules
+	// follow it: a tip from within the chat initializes the DM and is held to
+	// the minimum, a send from the tip card is not. A fresh env keeps the chat
+	// uninitialized here.
+	t.Run("action_overrides_location", func(t *testing.T) {
+		e := newIntegrationEnv(t)
+		senderUserID, senderKeys := e.bindUser(t)
+		recipientUserID, recipientKeys := e.bindUser(t)
+		tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
+
+		record := func(location intentpb.ChatMetadata_TipDmPayment_Location, action intentpb.ChatMetadata_TipDmPayment_Action, nativeAmount float64) *ocp_intent.Record {
+			record := dmPaymentIntentRecord(t, tipDmChatMetadataWithAction(tipChatID, location, action), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+			record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.USD
+			record.SendPublicPaymentMetadata.NativeAmount = nativeAmount
+			record.SendPublicPaymentMetadata.UsdMarketValue = nativeAmount
+			return record
+		}
+
+		// A tip from within the chat may initialize it, but is held to the tip
+		// minimum, where the same location would have no minimum by default.
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_TIP, 0.5), nil, nil), "below the minimum")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_TIP, 1.0), nil, nil))
+
+		// A send from the tip card is still a send, so it cannot initialize the
+		// chat, where the same location would have by default.
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_TIPCARD, intentpb.ChatMetadata_TipDmPayment_SEND, 100), nil, nil), "not been initialized")
+
+		require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+			ID:      tipChatID,
+			Type:    chatpb.ChatType_TIP_DM,
+			Members: []*commonpb.UserId{senderUserID, recipientUserID},
+		}))
+
+		// Initialized: the send carries no minimum, the tip still does.
+		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_TIPCARD, intentpb.ChatMetadata_TipDmPayment_SEND, 0.01), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_TIP, 0.5), nil, nil), "below the minimum")
 	})
 
 	// A recipient's minimum DM chat initialization fee applies only to the tip

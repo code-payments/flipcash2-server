@@ -104,20 +104,33 @@ func GetTipDmPayment(appMetadata []byte) *intentpb.ChatMetadata_TipDmPayment {
 }
 
 // GetDmPaymentVerb reports how a DM payment should be rendered. A tip DM
-// payment is only a tip when it was sent from the recipient's tip card — the
-// same DM also carries ordinary payments sent from within the chat itself.
-// Everything else, contact DM payments included, is a plain send.
+// payment defaults to being a tip only when it was sent from the recipient's
+// tip card — the same DM also carries ordinary payments sent from within the
+// chat itself. An explicit action on the payment overrides that default, since
+// both locations can offer either action. Everything else, contact DM payments
+// included, is a plain send.
 //
 // Both the cash message injected into the DM and the sender's activity feed
-// entry render off this, so they cannot disagree about what a payment was.
+// entry render off this, so they cannot disagree about what a payment was. The
+// tip DM validation rules key off it too, so what a payment is validated as is
+// what it is rendered as.
 func GetDmPaymentVerb(appMetadata []byte) messagingpb.CashContent_Verb {
 	tipDmPayment := GetTipDmPayment(appMetadata)
 	if tipDmPayment == nil {
 		return messagingpb.CashContent_SENT
 	}
 
-	// TIPCARD is the zero value, so a tip DM payment that leaves the location
-	// unset is treated as having come from the tip card.
+	switch tipDmPayment.GetAction() {
+	case intentpb.ChatMetadata_TipDmPayment_SEND:
+		return messagingpb.CashContent_SENT
+	case intentpb.ChatMetadata_TipDmPayment_TIP:
+		return messagingpb.CashContent_TIPPED
+	}
+
+	// DEFAULT is the zero value, so a tip DM payment that leaves the action
+	// unset falls back to the default for its location. TIPCARD is likewise the
+	// zero value, so an unset location is treated as having come from the tip
+	// card.
 	if tipDmPayment.GetLocation() == intentpb.ChatMetadata_TipDmPayment_TIPCARD {
 		return messagingpb.CashContent_TIPPED
 	}
@@ -226,13 +239,15 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 // linked for payment, since a tip can come from a stranger who only has the
 // recipient's tip card.
 //
-// The payment's location decides which rules apply. A tip from the tip card
-// is what initializes the DM, so it may target a chat that doesn't exist yet,
-// and it must meet the per-currency minimum. When it is the tip that
-// initializes the chat, it must also meet the recipient's minimum DM chat
-// initialization fee, where they have set one. A send from within the chat has
-// no minimum, but the chat must already be initialized — the client can only
-// be inside a chat that exists, so a send into one that doesn't is denied.
+// Whether the payment is a tip or a send decides which rules apply — that is
+// the payment's action, or the default for its location where the action is
+// unset (see GetDmPaymentVerb). A tip is what initializes the DM, so it may
+// target a chat that doesn't exist yet, and it must meet the per-currency
+// minimum. When it is the tip that initializes the chat, it must also meet the
+// recipient's minimum DM chat initialization fee, where they have set one. A
+// send has no minimum, but the chat must already be initialized — a send is
+// made from within the chat, and the client can only be inside a chat that
+// exists, so a send into one that doesn't is denied.
 func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
 	chatMetadata := appMetadata.GetChat()
 	tipDmPayment := chatMetadata.GetTipDmPayment()

@@ -77,6 +77,12 @@ func (c *Cache) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *c
 	return isMember, err
 }
 
+// Never cached, for the same reason group IsMember checks are not: group
+// membership is mutable from other processes.
+func (c *Cache) GetGroupChatIDsForUser(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.ChatId, error) {
+	return c.db.GetGroupChatIDsForUser(ctx, userID)
+}
+
 func (c *Cache) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, []*commonpb.UserId, error) {
 	return c.db.AdvanceLastMessage(ctx, chatID, messageID, ts)
 }

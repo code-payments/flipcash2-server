@@ -424,6 +424,82 @@ func (s *store) PutSubscription(ctx context.Context, namespace string, key []byt
 	return err
 }
 
+// maxBatchWriteItems is DynamoDB's per-BatchWriteItem request limit.
+const maxBatchWriteItems = 25
+
+// PutSubscriptions and DeleteSubscriptions write their rows in BatchWriteItem
+// chunks. Subscription rows qualify for batching because they are
+// unconditional key-only writes — claims never do, since their writes are
+// conditional. The partial outcomes a failed call can leave behind are
+// permitted by the SubscriptionStore contract for both directions.
+func (s *store) PutSubscriptions(ctx context.Context, topics []cluster.SubscriptionTopic, instanceID string) error {
+	return s.writeSubscriptionBatch(ctx, topics, func(pk string) types.WriteRequest {
+		return types.WriteRequest{
+			PutRequest: &types.PutRequest{
+				Item: map[string]types.AttributeValue{
+					attrPK: &types.AttributeValueMemberS{Value: pk},
+					attrSK: &types.AttributeValueMemberS{Value: instanceID},
+				},
+			},
+		}
+	})
+}
+
+func (s *store) DeleteSubscriptions(ctx context.Context, topics []cluster.SubscriptionTopic, instanceID string) error {
+	return s.writeSubscriptionBatch(ctx, topics, func(pk string) types.WriteRequest {
+		return types.WriteRequest{
+			DeleteRequest: &types.DeleteRequest{
+				Key: map[string]types.AttributeValue{
+					attrPK: &types.AttributeValueMemberS{Value: pk},
+					attrSK: &types.AttributeValueMemberS{Value: instanceID},
+				},
+			},
+		}
+	})
+}
+
+// writeSubscriptionBatch applies one write per distinct topic. Duplicate
+// topics are collapsed first: DynamoDB rejects a batch naming the same item
+// twice. A batch can partially succeed, handing back the remainder as
+// UnprocessedItems; those are retried with backoff until applied or ctx
+// expires.
+func (s *store) writeSubscriptionBatch(ctx context.Context, topics []cluster.SubscriptionTopic, request func(pk string) types.WriteRequest) error {
+	seen := make(map[string]struct{}, len(topics))
+	requests := make([]types.WriteRequest, 0, len(topics))
+	for _, t := range topics {
+		pk := claimPK(t.Namespace, t.Key)
+		if _, dup := seen[pk]; dup {
+			continue
+		}
+		seen[pk] = struct{}{}
+		requests = append(requests, request(pk))
+	}
+
+	for start := 0; start < len(requests); start += maxBatchWriteItems {
+		chunk := requests[start:min(start+maxBatchWriteItems, len(requests))]
+		backoff := 50 * time.Millisecond
+		for {
+			out, err := s.client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+				RequestItems: map[string][]types.WriteRequest{s.subscriptionsTable: chunk},
+			})
+			if err != nil {
+				return err
+			}
+			chunk = out.UnprocessedItems[s.subscriptionsTable]
+			if len(chunk) == 0 {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff = min(2*backoff, time.Second)
+		}
+	}
+	return nil
+}
+
 func (s *store) DeleteSubscription(ctx context.Context, namespace string, key []byte, instanceID string) error {
 	_, err := s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(s.subscriptionsTable),

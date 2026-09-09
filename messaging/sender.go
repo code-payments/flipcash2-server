@@ -54,7 +54,8 @@ type Sender struct {
 
 	pusher push.Pusher
 
-	eventBus *event.Bus[*commonpb.UserId, *eventpb.Event]
+	userEventBus *event.Bus[*commonpb.UserId, *eventpb.Event]
+	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent]
 }
 
 func NewSender(
@@ -67,19 +68,21 @@ func NewSender(
 	media Media,
 	ocpData ocp_data.Provider,
 	pusher push.Pusher,
-	eventBus *event.Bus[*commonpb.UserId, *eventpb.Event],
+	userEventBus *event.Bus[*commonpb.UserId, *eventpb.Event],
+	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent],
 ) *Sender {
 	return &Sender{
-		log:        log,
-		badges:     badges,
-		chats:      chats,
-		messages:   messages,
-		profiles:   profiles,
-		blocklists: blocklists,
-		media:      media,
-		ocpData:    ocpData,
-		pusher:     pusher,
-		eventBus:   eventBus,
+		log:          log,
+		badges:       badges,
+		chats:        chats,
+		messages:     messages,
+		profiles:     profiles,
+		blocklists:   blocklists,
+		media:        media,
+		ocpData:      ocpData,
+		pusher:       pusher,
+		userEventBus: userEventBus,
+		chatEventBus: chatEventBus,
 	}
 }
 
@@ -214,7 +217,7 @@ func (s *Sender) Send(
 	}
 	// Reuse the members AdvanceLastMessage already loaded (empty for a group
 	// chat or if it failed, in which case publishChatUpdate loads them itself).
-	publishChatUpdate(ctx, log, s.badges, s.chats, s.profiles, s.blocklists, s.ocpData, s.pusher, s.eventBus, chatID, update, nil, members)
+	publishChatUpdate(ctx, log, s.badges, s.chats, s.profiles, s.blocklists, s.ocpData, s.pusher, s.userEventBus, s.chatEventBus, chatID, update, nil, members)
 
 	return msgProto, nil
 }

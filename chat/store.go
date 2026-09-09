@@ -124,6 +124,14 @@ type Store interface {
 	// removed.
 	IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error)
 
+	// GetGroupChatIDsForUser returns the IDs of every group chat userID is
+	// currently a joined member of, in no particular order. Departed
+	// memberships are excluded, and a user with no group memberships gets an
+	// empty result, not an error. It is the inverse of GetMembers over the
+	// membership records alone — no canonical chat metadata is read or
+	// returned; a caller that needs it follows up with GetChatByID.
+	GetGroupChatIDsForUser(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.ChatId, error)
+
 	// AdvanceLastMessage records messageID as the chat's most recent message,
 	// moving last_activity forward to ts and last_message_id to messageID, and
 	// reports whether it advanced. The two fields are two views of the same event

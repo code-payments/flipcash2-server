@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -69,6 +70,88 @@ func testSubscriptionRegistry(t *testing.T, s cluster.Store) {
 	})
 }
 
+// testSubscriptionBatchPut is the store contract for PutSubscriptions: one
+// call registers every listed topic (duplicates collapsed, re-puts idempotent),
+// across enough topics to force chunking in backends with a per-request cap.
+func testSubscriptionBatchPut(t *testing.T, s cluster.Store) {
+	t.Run("testSubscriptionBatchPut", func(t *testing.T) {
+		ctx := context.Background()
+
+		const topicCount = 60 // Comfortably above DynamoDB's 25-item batch cap.
+		topics := make([]cluster.SubscriptionTopic, 0, topicCount+1)
+		for i := range topicCount {
+			topics = append(topics, cluster.SubscriptionTopic{
+				Namespace: subsNamespace,
+				Key:       fmt.Appendf(nil, "group-%d", i),
+			})
+		}
+		// A duplicated topic collapses instead of failing the batch.
+		topics = append(topics, topics[0])
+
+		require.NoError(t, s.PutSubscriptions(ctx, topics, "instance-a"))
+		for i := range topicCount {
+			subs, err := s.GetSubscribers(ctx, subsNamespace, fmt.Appendf(nil, "group-%d", i))
+			require.NoError(t, err)
+			require.Len(t, subs, 1)
+			require.Equal(t, "instance-a", subs[0].InstanceID)
+		}
+
+		// Re-put is an idempotent upsert, exactly as for single rows, and
+		// another instance's batch joins the same topics.
+		require.NoError(t, s.PutSubscriptions(ctx, topics[:2], "instance-a"))
+		require.NoError(t, s.PutSubscriptions(ctx, topics[:1], "instance-b"))
+		subs, err := s.GetSubscribers(ctx, subsNamespace, topics[0].Key)
+		require.NoError(t, err)
+		require.ElementsMatch(t, []string{"instance-a", "instance-b"}, subscriberIDs(subs))
+
+		// An empty batch is a no-op.
+		require.NoError(t, s.PutSubscriptions(ctx, nil, "instance-a"))
+	})
+}
+
+// testSubscriptionBatchDelete is the store contract for DeleteSubscriptions:
+// one call removes every listed topic's row for the instance (duplicates
+// collapsed, absent rows a no-op), across enough topics to force chunking,
+// without disturbing other instances' rows.
+func testSubscriptionBatchDelete(t *testing.T, s cluster.Store) {
+	t.Run("testSubscriptionBatchDelete", func(t *testing.T) {
+		ctx := context.Background()
+
+		const topicCount = 60 // Comfortably above DynamoDB's 25-item batch cap.
+		topics := make([]cluster.SubscriptionTopic, 0, topicCount)
+		for i := range topicCount {
+			topics = append(topics, cluster.SubscriptionTopic{
+				Namespace: subsNamespace,
+				Key:       fmt.Appendf(nil, "group-%d", i),
+			})
+		}
+		require.NoError(t, s.PutSubscriptions(ctx, topics, "instance-a"))
+		require.NoError(t, s.PutSubscription(ctx, subsNamespace, topics[0].Key, "instance-b"))
+
+		// Duplicates collapse; a topic with no row is a no-op, as for single
+		// deletes.
+		batch := append(append([]cluster.SubscriptionTopic{}, topics...),
+			topics[0],
+			cluster.SubscriptionTopic{Namespace: subsNamespace, Key: []byte("group-absent")},
+		)
+		require.NoError(t, s.DeleteSubscriptions(ctx, batch, "instance-a"))
+
+		for i := range topicCount {
+			subs, err := s.GetSubscribers(ctx, subsNamespace, topics[i].Key)
+			require.NoError(t, err)
+			if i == 0 {
+				// Another instance's row on the same topic is untouched.
+				require.Equal(t, []string{"instance-b"}, subscriberIDs(subs))
+			} else {
+				require.Empty(t, subs)
+			}
+		}
+
+		// An empty batch is a no-op.
+		require.NoError(t, s.DeleteSubscriptions(ctx, nil, "instance-a"))
+	})
+}
+
 func subscriberIDs(subs []*cluster.Subscription) []string {
 	out := make([]string, len(subs))
 	for i, sub := range subs {
@@ -110,6 +193,135 @@ func testSubscribeRefcounting(t *testing.T, s cluster.Store) {
 
 		// Close is idempotent.
 		require.NoError(t, h2.Close(ctx))
+	})
+}
+
+// testSubscribeAll pins the batch registration path: one call yields a handle
+// per entry, refcounts interoperate with single Subscribe/Close (including a
+// duplicated topic within the batch), and a draining runtime refuses the batch
+// with nothing registered.
+func testSubscribeAll(t *testing.T, s cluster.Store) {
+	t.Run("testSubscribeAll", func(t *testing.T) {
+		ctx := context.Background()
+
+		a := startNode(t, s, "instance-a", fastMembershipConfig(), fastOwnershipConfig())
+		waitForLiveMembers(t, a, 1)
+
+		keyShared := []byte("group-shared")
+		keyNew1 := []byte("group-new-1")
+		keyNew2 := []byte("group-new-2")
+
+		// A single Subscribe already holds the shared topic; the batch must
+		// ride its row rather than re-write it.
+		hSingle, err := a.subscriptions.Subscribe(ctx, subsNamespace, keyShared)
+		require.NoError(t, err)
+
+		handles, err := a.subscriptions.SubscribeAll(ctx, []cluster.SubscriptionTopic{
+			{Namespace: subsNamespace, Key: keyShared},
+			{Namespace: subsNamespace, Key: keyNew1},
+			{Namespace: subsNamespace, Key: keyNew2},
+			{Namespace: subsNamespace, Key: keyNew1}, // Duplicate: its own handle, same registration.
+		})
+		require.NoError(t, err)
+		require.Len(t, handles, 4)
+
+		for _, key := range [][]byte{keyShared, keyNew1, keyNew2} {
+			rows, err := s.GetSubscribers(ctx, subsNamespace, key)
+			require.NoError(t, err)
+			require.Len(t, rows, 1)
+			require.Equal(t, "instance-a", rows[0].InstanceID)
+		}
+
+		// The shared topic's row is refcounted across both paths: the single
+		// handle's close must not remove it while the batch handle lives.
+		require.NoError(t, hSingle.Close(ctx))
+		rows, err := s.GetSubscribers(ctx, subsNamespace, keyShared)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+
+		// The duplicated topic's handles are two refs: one close keeps the row.
+		require.NoError(t, handles[1].Close(ctx))
+		rows, err = s.GetSubscribers(ctx, subsNamespace, keyNew1)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+
+		// Closing everything (handles[1] a second time — idempotent) removes
+		// every row.
+		for _, h := range handles {
+			require.NoError(t, h.Close(ctx))
+		}
+		for _, key := range [][]byte{keyShared, keyNew1, keyNew2} {
+			rows, err := s.GetSubscribers(ctx, subsNamespace, key)
+			require.NoError(t, err)
+			require.Empty(t, rows)
+		}
+
+		// A draining runtime refuses the batch, registering nothing.
+		require.NoError(t, a.subscriptions.Drain(ctx))
+		_, err = a.subscriptions.SubscribeAll(ctx, []cluster.SubscriptionTopic{
+			{Namespace: subsNamespace, Key: []byte("group-late")},
+		})
+		require.ErrorIs(t, err, cluster.ErrSubscriptionsDraining)
+		rows, err = s.GetSubscribers(ctx, subsNamespace, []byte("group-late"))
+		require.NoError(t, err)
+		require.Empty(t, rows)
+	})
+}
+
+// testCloseAll pins the batch release path: one call releases every handle,
+// deleting rows only for topics whose last local handle was in the batch, and
+// interoperating with single Subscribe/Close in any order — including a
+// handle already closed individually, which CloseAll must skip.
+func testCloseAll(t *testing.T, s cluster.Store) {
+	t.Run("testCloseAll", func(t *testing.T) {
+		ctx := context.Background()
+
+		a := startNode(t, s, "instance-a", fastMembershipConfig(), fastOwnershipConfig())
+		waitForLiveMembers(t, a, 1)
+
+		keyShared := []byte("group-shared")
+		keyNew1 := []byte("group-new-1")
+		keyNew2 := []byte("group-new-2")
+
+		hSingle, err := a.subscriptions.Subscribe(ctx, subsNamespace, keyShared)
+		require.NoError(t, err)
+
+		handles, err := a.subscriptions.SubscribeAll(ctx, []cluster.SubscriptionTopic{
+			{Namespace: subsNamespace, Key: keyShared},
+			{Namespace: subsNamespace, Key: keyNew1},
+			{Namespace: subsNamespace, Key: keyNew2},
+		})
+		require.NoError(t, err)
+
+		// A handle closed individually first is skipped by the batch; its
+		// topic's row is already gone.
+		require.NoError(t, handles[2].Close(ctx))
+		rows, err := s.GetSubscribers(ctx, subsNamespace, keyNew2)
+		require.NoError(t, err)
+		require.Empty(t, rows)
+
+		// The batch releases the rest: keyNew1's row goes (last handle), the
+		// shared topic's row survives on the single handle's refcount.
+		require.NoError(t, a.subscriptions.CloseAll(ctx, handles))
+		rows, err = s.GetSubscribers(ctx, subsNamespace, keyNew1)
+		require.NoError(t, err)
+		require.Empty(t, rows)
+		rows, err = s.GetSubscribers(ctx, subsNamespace, keyShared)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+
+		// Idempotent: a second batch (and a straggling single Close) is a
+		// no-op, not a double decrement against the surviving registration.
+		require.NoError(t, a.subscriptions.CloseAll(ctx, handles))
+		require.NoError(t, handles[0].Close(ctx))
+		rows, err = s.GetSubscribers(ctx, subsNamespace, keyShared)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+
+		require.NoError(t, hSingle.Close(ctx))
+		rows, err = s.GetSubscribers(ctx, subsNamespace, keyShared)
+		require.NoError(t, err)
+		require.Empty(t, rows)
 	})
 }
 

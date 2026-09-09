@@ -83,6 +83,12 @@ type ClaimStore interface {
 	ReleaseClaim(ctx context.Context, namespace string, key []byte, instanceID string) error
 }
 
+// SubscriptionTopic names one (namespace, key) topic, for batch registration.
+type SubscriptionTopic struct {
+	Namespace string
+	Key       []byte
+}
+
 // SubscriptionStore persists stream-interest registrations: one row per
 // (namespace, key, instance) meaning "this member hosts live streams for this
 // topic". Rows are non-exclusive and unfenced — there is nothing to arbitrate.
@@ -99,9 +105,25 @@ type SubscriptionStore interface {
 	// resolve dial addresses through the membership view at resolution time.
 	PutSubscription(ctx context.Context, namespace string, key []byte, instanceID string) error
 
+	// PutSubscriptions registers the instance's interest rows for every listed
+	// topic, as PutSubscription does for one, in as few store round trips as
+	// the backend allows. Duplicate topics collapse. It is not atomic: on
+	// error an arbitrary subset of the rows may have been written — acceptable
+	// because a subscription row is interest, not ownership, and the runtime
+	// sweeps its own refcount-less rows at resolution time.
+	PutSubscriptions(ctx context.Context, topics []SubscriptionTopic, instanceID string) error
+
 	// DeleteSubscription removes the member's interest row for the topic.
 	// Idempotent.
 	DeleteSubscription(ctx context.Context, namespace string, key []byte, instanceID string) error
+
+	// DeleteSubscriptions removes the member's interest rows for every listed
+	// topic, as DeleteSubscription does for one, in as few store round trips
+	// as the backend allows. Duplicate topics collapse; idempotent. Not
+	// atomic: on error an arbitrary subset of the rows may have been deleted
+	// — the survivors stop counting once the member stops heartbeating, and
+	// are swept as corpse rows.
+	DeleteSubscriptions(ctx context.Context, topics []SubscriptionTopic, instanceID string) error
 
 	// GetSubscribers returns every interest row for the topic, dead members'
 	// rows included — liveness filtering is the caller's job.

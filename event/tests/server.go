@@ -15,12 +15,15 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
 	badgememory "github.com/code-payments/flipcash2-server/badge/memory"
+	"github.com/code-payments/flipcash2-server/chat"
+	chat_memory "github.com/code-payments/flipcash2-server/chat/memory"
 	"github.com/code-payments/flipcash2-server/cluster"
 	cluster_memory "github.com/code-payments/flipcash2-server/cluster/memory"
 	"github.com/code-payments/flipcash2-server/event"
@@ -36,12 +39,16 @@ func RunServerTests(t *testing.T, accounts account.Store, teardown func()) {
 		testMultipleOpenStreams,
 		testKeepAlive,
 		testSubscriptionRegistration,
+		testGroupSubscriptionRegistration,
+		testChatEventPublishing,
 		testServerShutdown,
 	} {
 		tf(t, accounts)
 		teardown()
 	}
 }
+
+const internalRpcApiKey = "valid-api-key"
 
 func testSingleServerHappyPath(t *testing.T, accounts account.Store) {
 	testEnv, cleanup := setupTest(t, accounts, false)
@@ -187,6 +194,149 @@ func testSubscriptionRegistration(t *testing.T, accounts account.Store) {
 	}, 5*time.Second, 10*time.Millisecond)
 }
 
+// testGroupSubscriptionRegistration pins the group topic lifecycle: a stream
+// registers one subscription row per group chat its user is joined to, streams
+// on one server share those rows, the rows disappear with the last stream, and
+// a group the user is not a member of is never registered.
+func testGroupSubscriptionRegistration(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, false)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	accounts.Bind(ctx, userID, keyPair.Proto())
+	accounts.SetRegistrationFlag(ctx, userID, true)
+
+	groupA := putGroupChat(t, testEnv.chats, userID)
+	groupB := putGroupChat(t, testEnv.chats, userID)
+	groupOther := putGroupChat(t, testEnv.chats, model.MustGenerateUserID())
+
+	testEnv.client1.openUserEventStream(t, userID, keyPair)
+	testEnv.client1.openUserEventStream(t, userID, keyPair)
+
+	// Both streams share a single row per group topic.
+	for _, chatID := range []*commonpb.ChatId{groupA, groupB} {
+		require.Eventually(t, func() bool {
+			rows, err := testEnv.clusterStore.GetSubscribers(ctx, event.ChatEventsNamespace, chatID.Value)
+			require.NoError(t, err)
+			return len(rows) == 1 && rows[0].InstanceID == testEnv.server1.membership.Self().InstanceID
+		}, 5*time.Second, 10*time.Millisecond)
+	}
+
+	// A group the user is not joined to gets no registration.
+	rows, err := testEnv.clusterStore.GetSubscribers(ctx, event.ChatEventsNamespace, groupOther.Value)
+	require.NoError(t, err)
+	require.Empty(t, rows)
+
+	// Closing one of the two streams keeps the shared rows alive.
+	testEnv.client1.closeOneUserEventStream(t, userID)
+	time.Sleep(500 * time.Millisecond)
+	for _, chatID := range []*commonpb.ChatId{groupA, groupB} {
+		rows, err := testEnv.clusterStore.GetSubscribers(ctx, event.ChatEventsNamespace, chatID.Value)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+	}
+
+	// The last close removes the group rows along with the user's.
+	testEnv.client1.closeOneUserEventStream(t, userID)
+	require.Eventually(t, func() bool {
+		rows, err := testEnv.clusterStore.GetSubscribers(ctx, event.UserEventsNamespace, userID.Value)
+		require.NoError(t, err)
+		if len(rows) != 0 {
+			return false
+		}
+		for _, chatID := range []*commonpb.ChatId{groupA, groupB} {
+			rows, err := testEnv.clusterStore.GetSubscribers(ctx, event.ChatEventsNamespace, chatID.Value)
+			require.NoError(t, err)
+			if len(rows) != 0 {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
+// testChatEventPublishing pins the chat-keyed publish path end to end: one
+// publish on a server's chat bus reaches every subscribed stream across the
+// fleet — delivered locally on the publishing server and over the forwarding
+// RPC to the rest — honoring exclusions on both paths, including selectively
+// among several streams sharing one server's chat topic.
+func testChatEventPublishing(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, true)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	userA := model.MustGenerateUserID()
+	keyPairA := model.MustGenerateKeyPair()
+	accounts.Bind(ctx, userA, keyPairA.Proto())
+	accounts.SetRegistrationFlag(ctx, userA, true)
+
+	userB := model.MustGenerateUserID()
+	keyPairB := model.MustGenerateKeyPair()
+	accounts.Bind(ctx, userB, keyPairB.Proto())
+	accounts.SetRegistrationFlag(ctx, userB, true)
+
+	group := putGroupChat(t, testEnv.chats, userA, userB)
+
+	// The members stream on different servers, so every publish exercises the
+	// local short-circuit for one and the forwarding RPC for the other — and
+	// userB also streams alongside userA on server1, so exclusion must filter
+	// selectively among streams sharing one server's chat topic.
+	testEnv.client1.openUserEventStream(t, userA, keyPairA)
+	testEnv.client1.openUserEventStream(t, userB, keyPairB)
+	testEnv.client2.openUserEventStream(t, userB, keyPairB)
+
+	time.Sleep(500 * time.Millisecond)
+
+	publish := func(sender *serverTestEnv, exclude ...*commonpb.UserId) *eventpb.Event {
+		e := newTestEvent()
+		sender.chatEventBus.OnEvent(group, &eventpb.ChatEvent{
+			ChatId:         group,
+			Event:          e,
+			ExcludeUserIds: exclude,
+		})
+		return e
+	}
+
+	// receiveAll asserts the expected event arrives on userA's stream and, when
+	// includeB is set, on both of userB's.
+	receiveAll := func(expected *eventpb.Event, includeB bool) {
+		got := testEnv.client1.receiveEventsInRealTime(t, userA)
+		require.Len(t, got, 1)
+		assertEquivalentTestEvents(t, expected, got[0])
+		if !includeB {
+			return
+		}
+		got = testEnv.client1.receiveEventsInRealTime(t, userB)
+		require.Len(t, got, 1)
+		assertEquivalentTestEvents(t, expected, got[0])
+		got = testEnv.client2.receiveEventsInRealTime(t, userB)
+		require.Len(t, got, 1)
+		assertEquivalentTestEvents(t, expected, got[0])
+	}
+
+	// Happy path: one publish, every stream receives.
+	receiveAll(publish(testEnv.server2), true)
+
+	// Exclusion on both delivery paths at once: excluding userB suppresses
+	// server2's local short-circuit and, carried in the ChatEvent, the
+	// forwarded copy on server1 — where the filter must skip userB's stream
+	// while still reaching userA's under the same chat key. userB's streams
+	// receiving the follow-up publish as their next event is what proves the
+	// suppression.
+	receiveAll(publish(testEnv.server2, userB), false)
+	receiveAll(publish(testEnv.server2), true)
+
+	// The same, published from the other side: userB's exclusion applies on
+	// server1's local short-circuit (selectively, alongside userA's stream)
+	// and on server2's forwarded copy.
+	receiveAll(publish(testEnv.server1, userB), false)
+	receiveAll(publish(testEnv.server1), true)
+}
+
 // testServerShutdown pins the shutdown contract: Shutdown closes every open
 // stream (which is what lets a gRPC GracefulStop return) and refuses new ones,
 // while the user's streams on other servers keep receiving.
@@ -235,8 +385,20 @@ func testServerShutdown(t *testing.T, accounts account.Store) {
 	assertEquivalentTestEvents(t, expected, actual[0])
 }
 
+// newTestEvent builds a bare test event, with no forwarding hops yet.
+func newTestEvent() *eventpb.Event {
+	return &eventpb.Event{
+		Id: event.MustGenerateEventID(),
+		Ts: timestamppb.Now(),
+		Type: &eventpb.Event_Test{
+			Test: &eventpb.TestEvent{Nonce: uint64(rand.Int64())},
+		},
+	}
+}
+
 type testEnv struct {
 	clusterStore cluster.Store
+	chats        chat.Store
 	client1      *clientTestEnv
 	client2      *clientTestEnv
 	server1      *serverTestEnv
@@ -244,10 +406,11 @@ type testEnv struct {
 }
 
 type serverTestEnv struct {
-	address    string
-	membership *cluster.Membership
-	eventBus   *event.Bus[*commonpb.UserId, *eventpb.Event]
-	server     *event.Server
+	address      string
+	membership   *cluster.Membership
+	userEventBus *event.Bus[*commonpb.UserId, *eventpb.Event]
+	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent]
+	server       *event.Server
 }
 
 type clientTestEnv struct {
@@ -293,8 +456,6 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool) (en
 		env.client2.client = eventpb.NewEventStreamingClient(conn2)
 	}
 
-	internalRpcApiKey := "valid-api-key"
-
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	// A shared badge store, mirroring the shared cluster backend; both server
@@ -302,6 +463,9 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool) (en
 	badges := badgememory.NewInMemory()
 
 	env.clusterStore = cluster_memory.NewInMemory()
+
+	// A shared chat store, so both servers resolve the same group memberships.
+	env.chats = chat_memory.NewInMemory()
 
 	newServerEnv := func(name string, conn *grpc.ClientConn) *serverTestEnv {
 		membership := cluster.NewMembership(log, env.clusterStore, &cluster.Member{
@@ -315,18 +479,22 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool) (en
 			CacheTTL: 25 * time.Millisecond,
 		})
 
-		eventBus := event.NewBus[*commonpb.UserId, *eventpb.Event]()
+		userEventBus := event.NewBus[*commonpb.UserId, *eventpb.Event]()
+		chatEventBus := event.NewBus[*commonpb.ChatId, *eventpb.ChatEvent]()
 		return &serverTestEnv{
-			address:    conn.Target(),
-			membership: membership,
-			eventBus:   eventBus,
+			address:      conn.Target(),
+			membership:   membership,
+			userEventBus: userEventBus,
+			chatEventBus: chatEventBus,
 			server: event.NewServer(
 				log,
 				authz,
 				accounts,
 				badges,
+				env.chats,
 				subscriptions,
-				eventBus,
+				userEventBus,
+				chatEventBus,
 				nil,
 				internalRpcApiKey,
 			),
@@ -366,17 +534,8 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool) (en
 }
 
 func (s *serverTestEnv) sendTestUserEvent(userID *commonpb.UserId) *eventpb.Event {
-	e := &eventpb.Event{
-		Id: event.MustGenerateEventID(),
-		Ts: timestamppb.Now(),
-		Type: &eventpb.Event_Test{
-			Test: &eventpb.TestEvent{
-				Hops:  []string{s.address},
-				Nonce: uint64(rand.Int64()),
-			},
-		},
-	}
-	s.eventBus.OnEvent(userID, e)
+	e := newTestEvent()
+	s.userEventBus.OnEvent(userID, e)
 	return e
 }
 
@@ -504,6 +663,20 @@ func (c *clientTestEnv) closeOneUserEventStream(t *testing.T, userID *commonpb.U
 	if len(c.streams[key]) == 0 {
 		delete(c.streams, key)
 	}
+}
+
+// putGroupChat creates a group chat with the given members joined and returns
+// its ID.
+func putGroupChat(t *testing.T, chats chat.Store, members ...*commonpb.UserId) *commonpb.ChatId {
+	c := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      members,
+		Title:        "Group",
+		LastActivity: time.Now(),
+	}
+	require.NoError(t, chats.PutChat(context.Background(), c))
+	return c.ID
 }
 
 func assertEquivalentTestEvents(t *testing.T, obj1, obj2 *eventpb.Event) {

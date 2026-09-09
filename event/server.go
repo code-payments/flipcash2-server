@@ -1,7 +1,9 @@
 package event
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"sync"
 	"time"
@@ -21,6 +23,7 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/badge"
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/cluster"
 	"github.com/code-payments/flipcash2-server/cluster/internalrpc"
 	"github.com/code-payments/flipcash2-server/model"
@@ -31,6 +34,27 @@ import (
 // stream topics, keyed by the raw user ID bytes. A topic's subscribers are the
 // servers currently hosting at least one of that user's open streams.
 const UserEventsNamespace = "user-events"
+
+// ChatEventsNamespace is the cluster subscription namespace for per-chat
+// event topics, keyed by the raw chat ID bytes. A topic's subscribers are the
+// servers currently hosting at least one open stream belonging to a member of
+// that chat, so a chat publisher resolves the hosting servers in one lookup
+// instead of one per member. Today only group chats register here — DM
+// delivery stays user-keyed — but nothing about the topic shape is
+// group-specific.
+const ChatEventsNamespace = "chat-events"
+
+// userStreamKey and chatStreamKey name a topic's slot in the local streams
+// registry, shared by the registration and delivery paths. The prefixes keep
+// the two key families disjoint: user IDs and group chat IDs are both 16-byte
+// values, so an unprefixed chat ID could alias a user's slot.
+func userStreamKey(userID *commonpb.UserId) string {
+	return "user:" + model.UserIDString(userID)
+}
+
+func chatStreamKey(chatID *commonpb.ChatId) string {
+	return "chat:" + hex.EncodeToString(chatID.GetValue())
+}
 
 const (
 	maxEventBatchSize = 1024
@@ -43,11 +67,23 @@ const (
 	streamInitTsWindow = 2 * time.Minute
 
 	// subscriptionCloseTimeout bounds the registry cleanup on stream teardown,
-	// which runs after the stream's own context is already done.
+	// which runs after the stream's own context is already done. It covers all
+	// of a stream's registrations (user topic plus group topics) at once:
+	// releases are refcount decrements, and the topics this stream was the
+	// last local holder of go out as a single batched delete (CloseAll).
 	subscriptionCloseTimeout = 2 * time.Second
 
 	forwardRpcTimeout = 250 * time.Millisecond
 )
+
+// localStream is one open stream in the local registry, carrying the user it
+// belongs to: a stream appears under several keys (its user's, plus one per
+// chat), and chat-keyed delivery needs the owner to honor per-user exclusions,
+// which the stream object itself cannot say.
+type localStream struct {
+	stream Stream[[]*eventpb.Event]
+	userID *commonpb.UserId
+}
 
 type StaleEventDetectorCtor[Event any] func() StaleEventDetector[Event]
 
@@ -62,10 +98,12 @@ type Server struct {
 
 	accounts account.Store
 	badges   badge.Store
+	chats    chat.Store
 
 	subscriptions *cluster.Subscriptions
 
-	eventBus *Bus[*commonpb.UserId, *eventpb.Event]
+	userEventBus *Bus[*commonpb.UserId, *eventpb.Event]
+	chatEventBus *Bus[*commonpb.ChatId, *eventpb.ChatEvent]
 
 	// streams fans a topic out to every open local stream: stream key → stream
 	// ID → stream. Multiple streams per key are the point (one per device);
@@ -73,7 +111,7 @@ type Server struct {
 	// draining (same lock) refuses new streams once Shutdown has begun, so a
 	// stream can't slip in behind the closing sweep.
 	streamsMu               sync.RWMutex
-	streams                 map[string]map[string]Stream[[]*eventpb.Event]
+	streams                 map[string]map[string]localStream
 	draining                bool
 	staleEventDetectorCtors []StaleEventDetectorCtor[*eventpb.Event]
 
@@ -84,7 +122,7 @@ type Server struct {
 	self *cluster.Member
 
 	internalAuth *internalrpc.Authenticator
-	forwarder    *userEventForwarder
+	forwarder    *eventForwarder
 
 	eventpb.UnimplementedEventStreamingServer
 }
@@ -94,8 +132,10 @@ func NewServer(
 	authz auth.Authorizer,
 	accounts account.Store,
 	badges badge.Store,
+	chats chat.Store,
 	subscriptions *cluster.Subscriptions,
-	eventBus *Bus[*commonpb.UserId, *eventpb.Event],
+	userEventBus *Bus[*commonpb.UserId, *eventpb.Event],
+	chatEventBus *Bus[*commonpb.ChatId, *eventpb.ChatEvent],
 	staleEventDetectorCtors []StaleEventDetectorCtor[*eventpb.Event],
 	currentRpcApiKey string,
 ) *Server {
@@ -114,19 +154,21 @@ func NewServer(
 
 		accounts: accounts,
 		badges:   badges,
+		chats:    chats,
 
 		subscriptions: subscriptions,
 
-		eventBus: eventBus,
+		userEventBus: userEventBus,
+		chatEventBus: chatEventBus,
 
-		streams:                 make(map[string]map[string]Stream[[]*eventpb.Event]),
+		streams:                 make(map[string]map[string]localStream),
 		staleEventDetectorCtors: staleEventDetectorCtors,
 
 		self:         subscriptions.Self(),
 		internalAuth: internalrpc.NewAuthenticator(currentRpcApiKey),
 	}
 
-	s.forwarder = &userEventForwarder{
+	s.forwarder = &eventForwarder{
 		log:            log,
 		subscriptions:  subscriptions,
 		pool:           sharedForwardingPool(log),
@@ -135,7 +177,8 @@ func NewServer(
 		deliverLocal:   s.deliverLocal,
 	}
 
-	eventBus.AddHandler(HandlerFunc[*commonpb.UserId, *eventpb.Event](s.OnEvent))
+	userEventBus.AddHandler(HandlerFunc[*commonpb.UserId, *eventpb.Event](s.OnEvent))
+	chatEventBus.AddHandler(HandlerFunc[*commonpb.ChatId, *eventpb.ChatEvent](s.OnChatEvent))
 
 	return s
 }
@@ -189,7 +232,6 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 	}
 
 	streamID := uuid.New().String()
-	streamKey := model.UserIDString(userID)
 
 	log = log.With(zap.String("stream_id", streamID))
 
@@ -250,46 +292,76 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 		},
 	)
 
-	// The local stream must be resolvable before the topic's registry row is,
-	// or a publish racing the open could resolve the row yet find no stream
-	// behind it.
+	// The stream serves the user's own topic plus one topic per group chat
+	// they are joined to, so group publishers can resolve the hosting servers
+	// by group instead of once per member. The membership set is a snapshot as
+	// of stream open: a group joined or left mid-stream does not adjust the
+	// registration until the client reconnects.
+	groupChatIDs, err := s.chats.GetGroupChatIDsForUser(ctx, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure loading group memberships for stream")
+		return status.Error(codes.Internal, "failure loading group memberships")
+	}
+
+	streamKeys := make([]string, 0, 1+len(groupChatIDs))
+	streamKeys = append(streamKeys, userStreamKey(userID))
+	for _, chatID := range groupChatIDs {
+		streamKeys = append(streamKeys, chatStreamKey(chatID))
+	}
+
+	// The local stream must be resolvable before a topic's registry row is, or
+	// a publish racing the open could resolve the row yet find no stream
+	// behind it — so every key is registered up front, before the first
+	// Subscribe below.
 	s.streamsMu.Lock()
 	if s.draining {
 		s.streamsMu.Unlock()
 		log.Debug("Rejecting stream on shut-down server")
 		return status.Error(codes.Unavailable, "server is draining")
 	}
-	byID, ok := s.streams[streamKey]
-	if !ok {
-		byID = make(map[string]Stream[[]*eventpb.Event])
-		s.streams[streamKey] = byID
+	for _, streamKey := range streamKeys {
+		byID, ok := s.streams[streamKey]
+		if !ok {
+			byID = make(map[string]localStream)
+			s.streams[streamKey] = byID
+		}
+		byID[streamID] = localStream{stream: ss, userID: userID}
 	}
-	byID[streamID] = ss
 	s.streamsMu.Unlock()
 
 	removeLocalStream := func() {
 		s.streamsMu.Lock()
-		if byID, ok := s.streams[streamKey]; ok {
-			delete(byID, streamID)
-			if len(byID) == 0 {
-				delete(s.streams, streamKey)
+		for _, streamKey := range streamKeys {
+			if byID, ok := s.streams[streamKey]; ok {
+				delete(byID, streamID)
+				if len(byID) == 0 {
+					delete(s.streams, streamKey)
+				}
 			}
 		}
 		s.streamsMu.Unlock()
 	}
 
-	// Register this server's interest in the user's events with the cluster,
-	// so publishers on other servers forward here. Non-exclusive: the same
-	// user may hold streams on any number of servers simultaneously.
-	subscription, err := s.subscriptions.Subscribe(ctx, UserEventsNamespace, userID.Value)
+	// Register this server's interest in the stream's topics with the cluster,
+	// so publishers on other servers forward here — one batched registration
+	// covering the user topic and every group topic, so the stream-open path
+	// pays a single store round trip no matter how many groups. Non-exclusive:
+	// the same user (and all the more so the same group) may hold streams on
+	// any number of servers simultaneously.
+	topics := make([]cluster.SubscriptionTopic, 0, 1+len(groupChatIDs))
+	topics = append(topics, cluster.SubscriptionTopic{Namespace: UserEventsNamespace, Key: userID.Value})
+	for _, chatID := range groupChatIDs {
+		topics = append(topics, cluster.SubscriptionTopic{Namespace: ChatEventsNamespace, Key: chatID.Value})
+	}
+	subscriptions, err := s.subscriptions.SubscribeAll(ctx, topics)
 	if err != nil {
 		removeLocalStream()
 		if errors.Is(err, cluster.ErrSubscriptionsDraining) {
 			log.Debug("Rejecting stream on draining server")
 			return status.Error(codes.Unavailable, "server is draining")
 		}
-		log.With(zap.Error(err)).Warn("Failure registering stream subscription")
-		return status.Error(codes.Internal, "failure registering stream subscription")
+		log.With(zap.Error(err)).Warn("Failure registering stream subscriptions")
+		return status.Error(codes.Internal, "failure registering stream subscriptions")
 	}
 
 	defer func() {
@@ -298,8 +370,8 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 		removeLocalStream()
 
 		closeCtx, cancel := context.WithTimeout(context.Background(), subscriptionCloseTimeout)
-		if err := subscription.Close(closeCtx); err != nil {
-			log.With(zap.Error(err)).Warn("Failed to close stream subscription")
+		if err := s.subscriptions.CloseAll(closeCtx, subscriptions); err != nil {
+			log.With(zap.Error(err)).Warn("Failed to close stream subscriptions")
 		}
 		cancel()
 	}()
@@ -380,20 +452,37 @@ func (s *Server) ForwardEvents(ctx context.Context, req *eventpb.ForwardEventsRe
 		return &eventpb.ForwardEventsResponse{Result: eventpb.ForwardEventsResponse_DENIED}, nil
 	}
 
-	for _, event := range req.UserEvents.Events {
-		switch typed := event.Event.Type.(type) {
-		case *eventpb.Event_Test:
-			typed.Test.Hops = append(typed.Test.Hops, s.self.Address)
+	switch batch := req.Type.(type) {
+	case *eventpb.ForwardEventsRequest_UserEvents:
+		for _, event := range batch.UserEvents.Events {
+			s.stampTestHop(event.Event)
+			s.deliverLocal(userStreamKey(event.UserId), event.Event, nil)
 		}
-
-		s.deliverLocal(model.UserIDString(event.UserId), event.Event)
+	case *eventpb.ForwardEventsRequest_ChatEvents:
+		for _, event := range batch.ChatEvents.Events {
+			s.stampTestHop(event.Event)
+			s.deliverLocal(chatStreamKey(event.ChatId), event.Event, event.ExcludeUserIds)
+		}
+	default:
+		return nil, status.Error(codes.InvalidArgument, "missing event batch")
 	}
 	return &eventpb.ForwardEventsResponse{}, nil
+}
+
+// stampTestHop marks this server on a test event's forwarding path.
+func (s *Server) stampTestHop(e *eventpb.Event) {
+	if test := e.GetTest(); test != nil {
+		test.Hops = append(test.Hops, s.self.Address)
+	}
 }
 
 // todo: utilize batching by receiver to optimize internal forwarding RPC calls
 func (s *Server) ForwardUserEvents(ctx context.Context, events ...*eventpb.UserEvent) error {
 	return s.forwarder.ForwardUserEvents(ctx, events...)
+}
+
+func (s *Server) ForwardChatEvents(ctx context.Context, events ...*eventpb.ChatEvent) error {
+	return s.forwarder.ForwardChatEvents(ctx, events...)
 }
 
 // Shutdown closes every open client stream — each StreamEvents handler returns
@@ -407,8 +496,8 @@ func (s *Server) Shutdown() {
 	s.draining = true
 	var targets []Stream[[]*eventpb.Event]
 	for _, byID := range s.streams {
-		for _, stream := range byID {
-			targets = append(targets, stream)
+		for _, ls := range byID {
+			targets = append(targets, ls.stream)
 		}
 	}
 	s.streamsMu.Unlock()
@@ -419,12 +508,18 @@ func (s *Server) Shutdown() {
 	}
 }
 
-// deliverLocal notifies an event onto every local stream open for the key.
-func (s *Server) deliverLocal(streamKey string, e *eventpb.Event) {
+// deliverLocal notifies an event onto every local stream open for the key,
+// skipping streams owned by an excluded user (e.g. the originator of a typing
+// notification on a chat-keyed delivery, where the topic no longer selects
+// recipients per member).
+func (s *Server) deliverLocal(streamKey string, e *eventpb.Event, exclude []*commonpb.UserId) {
 	s.streamsMu.RLock()
 	targets := make([]Stream[[]*eventpb.Event], 0, len(s.streams[streamKey]))
-	for _, stream := range s.streams[streamKey] {
-		targets = append(targets, stream)
+	for _, ls := range s.streams[streamKey] {
+		if isExcluded(ls.userID, exclude) {
+			continue
+		}
+		targets = append(targets, ls.stream)
 	}
 	s.streamsMu.RUnlock()
 
@@ -436,6 +531,21 @@ func (s *Server) deliverLocal(streamKey string, e *eventpb.Event) {
 	}
 }
 
+func isExcluded(userID *commonpb.UserId, exclude []*commonpb.UserId) bool {
+	for _, ex := range exclude {
+		if bytes.Equal(userID.GetValue(), ex.GetValue()) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) OnEvent(userID *commonpb.UserId, e *eventpb.Event) {
 	s.ForwardUserEvents(context.Background(), &eventpb.UserEvent{UserId: userID, Event: e})
+}
+
+// OnChatEvent is the chat bus handler; the payload carries the chat ID and
+// exclusions itself, so the bus key rides along only for the bus's shape.
+func (s *Server) OnChatEvent(_ *commonpb.ChatId, e *eventpb.ChatEvent) {
+	s.ForwardChatEvents(context.Background(), e)
 }

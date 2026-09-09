@@ -12,17 +12,19 @@ import (
 
 type Forwarder interface {
 	ForwardUserEvents(ctx context.Context, events ...*eventpb.UserEvent) error
+	ForwardChatEvents(ctx context.Context, events ...*eventpb.ChatEvent) error
 }
 
-// ForwardingClient forwards user events to the servers hosting their streams,
-// for processes (or code paths) that host no event streams of their own.
+// ForwardingClient forwards events to the servers hosting their subscribed
+// streams, for processes (or code paths) that host no event streams of their
+// own.
 type ForwardingClient struct {
-	*userEventForwarder
+	*eventForwarder
 }
 
 func NewForwardingClient(log *zap.Logger, subscriptions *cluster.Subscriptions, currentRpcApiKey string) Forwarder {
 	return &ForwardingClient{
-		userEventForwarder: &userEventForwarder{
+		eventForwarder: &eventForwarder{
 			log:           log,
 			subscriptions: subscriptions,
 			pool:          sharedForwardingPool(log),

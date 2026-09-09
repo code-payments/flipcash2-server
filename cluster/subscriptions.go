@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -251,6 +252,207 @@ func (s *Subscriptions) Subscribe(ctx context.Context, namespace string, key []b
 	return s.handle(namespace, key, gen), nil
 }
 
+// SubscribeAll registers a local stream's interest in every listed topic, as
+// Subscribe does for one, writing the missing registry rows in a single store
+// batch instead of one round trip per topic. It returns one handle per entry,
+// in input order; a duplicated topic gets distinct handles against the same
+// registration, exactly as two Subscribe calls would.
+//
+// All or nothing at the registration level: on error no handles exist and no
+// refcounts moved. A failed batch may still have landed some rows — they are
+// refcount-less self rows, indistinguishable from a failed unsubscribe delete,
+// and the next local resolution of the topic sweeps them (see Subscribers).
+func (s *Subscriptions) SubscribeAll(ctx context.Context, topics []SubscriptionTopic) ([]*SubscriptionHandle, error) {
+	if len(topics) == 0 {
+		return nil, nil
+	}
+	if s.membership.observer() {
+		return nil, ErrObserverMembership
+	}
+
+	// One lock per distinct topic, acquired in sorted order: concurrent
+	// SubscribeAll calls with overlapping topic sets always contend in the
+	// same order, and the single-topic operations hold at most one of these
+	// locks at a time, so no cycle can form.
+	ids := make([]string, len(topics))
+	for i, t := range topics {
+		ids[i] = ownedKeyID(t.Namespace, t.Key)
+	}
+	seen := make(map[string]struct{}, len(ids))
+	distinct := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		distinct = append(distinct, id)
+	}
+	sort.Strings(distinct)
+	locks := make([]*keyLock, len(distinct))
+	for i, id := range distinct {
+		locks[i] = s.lockTopic(id)
+	}
+	defer func() {
+		for i, id := range distinct {
+			s.unlockTopic(id, locks[i])
+		}
+	}()
+
+	// Holding every topic lock freezes the registrations: a topic present in
+	// local cannot lose its row to a concurrent last-unsubscribe, and an
+	// absent one cannot gain a registration. Classify, then write only what
+	// is missing.
+	s.mu.Lock()
+	if s.draining {
+		s.mu.Unlock()
+		return nil, ErrSubscriptionsDraining
+	}
+	var missing []SubscriptionTopic
+	missingIDs := make(map[string]struct{})
+	for i, t := range topics {
+		if _, ok := s.local[ids[i]]; ok {
+			continue
+		}
+		if _, dup := missingIDs[ids[i]]; dup {
+			continue
+		}
+		missingIDs[ids[i]] = struct{}{}
+		missing = append(missing, t)
+	}
+	s.mu.Unlock()
+
+	// The rows must exist before the handles do, for the same reason as in
+	// Subscribe: a publish resolved in between would miss streams the caller
+	// believes are registered.
+	if len(missing) > 0 {
+		if err := s.store.PutSubscriptions(ctx, missing, s.membership.Self().InstanceID); err != nil {
+			return nil, err
+		}
+	}
+
+	s.mu.Lock()
+	if s.draining {
+		// Lost the race with Drain's cutoff, exactly as in Subscribe: the bulk
+		// delete may have run before the batch landed, so hand the rows back.
+		s.mu.Unlock()
+		deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subscriptionOpTimeout)
+		defer cancel()
+		if err := s.store.DeleteSubscriptions(deleteCtx, missing, s.membership.Self().InstanceID); err != nil {
+			s.log.With(zap.Error(err)).Warn("Failed to hand back subscription rows acquired during drain")
+		}
+		return nil, ErrSubscriptionsDraining
+	}
+	handles := make([]*SubscriptionHandle, len(topics))
+	for i, t := range topics {
+		lt, ok := s.local[ids[i]]
+		if !ok {
+			s.nextGen++
+			lt = &localTopic{
+				namespace: t.Namespace,
+				key:       append([]byte(nil), t.Key...),
+				gen:       s.nextGen,
+			}
+			s.local[ids[i]] = lt
+			// Invalidate so a local publish resolved before the row landed
+			// doesn't keep excluding self for the rest of the cache window.
+			delete(s.cache, ids[i])
+		}
+		lt.refs++
+		handles[i] = s.handle(t.Namespace, t.Key, lt.gen)
+	}
+	s.mu.Unlock()
+
+	return handles, nil
+}
+
+// CloseAll releases every handle in one pass, batching the registry deletes
+// for the topics whose last local handle is among them — the teardown twin of
+// SubscribeAll. Each handle is released exactly once across any mix of
+// CloseAll and Close calls; handles already closed (or nil) are skipped, and a
+// handle from another runtime falls back to its own single-row Close.
+//
+// The batch delete's error is returned from CloseAll rather than attributed
+// to any handle — the registrations are gone locally regardless, and as with
+// Drain, a row that fails to delete stops counting once this member stops
+// heartbeating and is eventually swept.
+func (s *Subscriptions) CloseAll(ctx context.Context, handles []*SubscriptionHandle) error {
+	// Claim each unfired handle: the once latches, so a later Close is a
+	// no-op, exactly as a Close latches against a later CloseAll.
+	pending := make([]*SubscriptionHandle, 0, len(handles))
+	var foreignErr error
+	for _, h := range handles {
+		if h == nil {
+			continue
+		}
+		if h.subs != s {
+			if err := h.Close(ctx); err != nil && foreignErr == nil {
+				foreignErr = err
+			}
+			continue
+		}
+		h.once.Do(func() {
+			pending = append(pending, h)
+		})
+	}
+	if len(pending) == 0 {
+		return foreignErr
+	}
+
+	// Sorted distinct topic locks, as in SubscribeAll and for the same
+	// reason: batches contend in one canonical order.
+	ids := make([]string, len(pending))
+	for i, h := range pending {
+		ids[i] = ownedKeyID(h.namespace, h.key)
+	}
+	seen := make(map[string]struct{}, len(ids))
+	distinct := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		distinct = append(distinct, id)
+	}
+	sort.Strings(distinct)
+	locks := make([]*keyLock, len(distinct))
+	for i, id := range distinct {
+		locks[i] = s.lockTopic(id)
+	}
+	defer func() {
+		for i, id := range distinct {
+			s.unlockTopic(id, locks[i])
+		}
+	}()
+
+	// Decrement every registration, collecting the topics this batch emptied;
+	// the stale-handle guards mirror unsubscribe exactly.
+	s.mu.Lock()
+	var emptied []SubscriptionTopic
+	for i, h := range pending {
+		t, ok := s.local[ids[i]]
+		if !ok || t.gen != h.gen {
+			// Drained out from under the handle, or a successor registration
+			// occupies the slot; nothing of ours to release.
+			continue
+		}
+		t.refs--
+		if t.refs > 0 {
+			continue
+		}
+		delete(s.local, ids[i])
+		delete(s.cache, ids[i])
+		emptied = append(emptied, SubscriptionTopic{Namespace: h.namespace, Key: h.key})
+	}
+	s.mu.Unlock()
+
+	if len(emptied) > 0 {
+		if err := s.store.DeleteSubscriptions(ctx, emptied, s.membership.Self().InstanceID); err != nil {
+			return err
+		}
+	}
+	return foreignErr
+}
+
 func (s *Subscriptions) handle(namespace string, key []byte, gen uint64) *SubscriptionHandle {
 	return &SubscriptionHandle{
 		subs:      s,
@@ -438,21 +640,15 @@ func (s *Subscriptions) Drain(ctx context.Context) error {
 	clear(s.cache)
 	s.mu.Unlock()
 
-	self := s.membership.Self()
-	sem := make(chan struct{}, releaseConcurrency)
-	var wg sync.WaitGroup
-	for _, t := range topics {
-		sem <- struct{}{}
-		wg.Go(func() {
-			defer func() { <-sem }()
-			if err := s.store.DeleteSubscription(ctx, t.namespace, t.key, self.InstanceID); err != nil {
-				s.log.With(zap.Error(err)).Warn("Failed to remove subscription row during drain",
-					zap.String("namespace", t.namespace),
-				)
-			}
-		})
+	if len(topics) > 0 {
+		rows := make([]SubscriptionTopic, len(topics))
+		for i, t := range topics {
+			rows[i] = SubscriptionTopic{Namespace: t.namespace, Key: t.key}
+		}
+		if err := s.store.DeleteSubscriptions(ctx, rows, s.membership.Self().InstanceID); err != nil {
+			s.log.With(zap.Error(err)).Warn("Failed to remove subscription rows during drain")
+		}
 	}
-	wg.Wait()
 	return ctx.Err()
 }
 

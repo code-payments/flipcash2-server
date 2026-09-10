@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/georgysavva/scany/v2/pgxscan"
@@ -66,29 +65,24 @@ func (m *tokenModel) dbAdd(ctx context.Context, pool *pgxpool.Pool) error {
 	)
 }
 
-func dbGetTokensBatch(ctx context.Context, pool *pgxpool.Pool, userIDs ...*commonpb.UserId) ([]*tokenModel, error) {
-	var res []*tokenModel
-
-	queryParameters := make([]any, len(userIDs))
-
-	query := `SELECT ` + allPushTokenFields + ` FROM ` + pushTokensTableName + ` WHERE "userId" IN (`
+// encodeUserIDs encodes user IDs for use as a single text[] bind parameter, so
+// the statement shape is fixed regardless of how many users are looked up.
+func encodeUserIDs(userIDs []*commonpb.UserId) []string {
+	encoded := make([]string, len(userIDs))
 	for i, userID := range userIDs {
-		queryParameters[i] = pg.Encode(userID.Value)
-		if i > 0 {
-			query += fmt.Sprintf(",$%d", i+1)
-		} else {
-			query += fmt.Sprintf("$%d", i+1)
-		}
+		encoded[i] = pg.Encode(userID.Value)
 	}
-	query += ")"
+	return encoded
+}
 
-	err := pgxscan.Select(
-		ctx,
-		pool,
-		&res,
-		query,
-		queryParameters...,
-	)
+func dbGetTokensBatch(ctx context.Context, pool *pgxpool.Pool, userIDs ...*commonpb.UserId) ([]*tokenModel, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+
+	var res []*tokenModel
+	query := `SELECT ` + allPushTokenFields + ` FROM ` + pushTokensTableName + ` WHERE "userId" = ANY($1::text[])`
+	err := pgxscan.Select(ctx, pool, &res, query, encodeUserIDs(userIDs))
 	if err != nil {
 		if pgxscan.NotFound(err) {
 			return nil, nil
@@ -103,20 +97,10 @@ func dbFilterUsersWithTokens(ctx context.Context, pool *pgxpool.Pool, userIDs ..
 		return nil, nil
 	}
 
-	queryParameters := make([]any, len(userIDs))
-	query := `SELECT DISTINCT "userId" FROM ` + pushTokensTableName + ` WHERE "userId" IN (`
-	for i, userID := range userIDs {
-		queryParameters[i] = pg.Encode(userID.Value)
-		if i > 0 {
-			query += fmt.Sprintf(",$%d", i+1)
-		} else {
-			query += fmt.Sprintf("$%d", i+1)
-		}
-	}
-	query += ")"
+	query := `SELECT DISTINCT "userId" FROM ` + pushTokensTableName + ` WHERE "userId" = ANY($1::text[])`
 
 	var encodedUserIDs []string
-	err := pgxscan.Select(ctx, pool, &encodedUserIDs, query, queryParameters...)
+	err := pgxscan.Select(ctx, pool, &encodedUserIDs, query, encodeUserIDs(userIDs))
 	if err != nil {
 		if pgxscan.NotFound(err) {
 			return nil, nil

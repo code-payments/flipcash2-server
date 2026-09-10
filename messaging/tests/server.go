@@ -60,6 +60,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		// Pointers
 		testServer_AdvancePointer,
 		testServer_AdvancePointer_PointerTypes,
+		testServer_AdvancePointer_GroupNotBroadcast,
 		// Reactions
 		testServer_Reactions,
 		testServer_Reactions_Reactors,
@@ -272,7 +273,11 @@ func (e *serverEnv) deleteMessage(keys model.KeyPair, msgID *messagingpb.Message
 // --- pointers ---
 
 func (e *serverEnv) advancePointer(keys model.KeyPair, pointerType messagingpb.Pointer_Type, newValue *messagingpb.MessageId) (*messagingpb.AdvancePointerResponse, error) {
-	req := &messagingpb.AdvancePointerRequest{ChatId: e.chatID, PointerType: pointerType, NewValue: newValue}
+	return e.advancePointerInChat(keys, e.chatID, pointerType, newValue)
+}
+
+func (e *serverEnv) advancePointerInChat(keys model.KeyPair, chatID *commonpb.ChatId, pointerType messagingpb.Pointer_Type, newValue *messagingpb.MessageId) (*messagingpb.AdvancePointerResponse, error) {
+	req := &messagingpb.AdvancePointerRequest{ChatId: chatID, PointerType: pointerType, NewValue: newValue}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.AdvancePointer(e.ctx, req)
 }
@@ -1270,6 +1275,62 @@ func testServer_AdvancePointer_PointerTypes(t *testing.T, badges badge.Store, bl
 	time.Sleep(50 * time.Millisecond)
 	require.Equal(t, 1, e.countPointerUpdates(e.userA, messagingpb.Pointer_DELIVERED, e.userB))
 	require.Equal(t, 1, e.countPointerUpdates(e.userA, messagingpb.Pointer_READ, e.userB))
+}
+
+// testServer_AdvancePointer_GroupNotBroadcast pins that a group chat's pointer
+// advances are stored but never delivered in real time — neither a member's
+// explicit advance nor the sender's auto-advanced READ pointer on a send. A DM
+// in the same env still broadcasts, proving the suppression is group-scoped.
+func testServer_AdvancePointer_GroupNotBroadcast(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	userC, keysC := e.addUser()
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB, userC},
+		Title:        "Pointers",
+		LastActivity: at(1),
+	}))
+
+	sent, err := e.sendContentToChat(e.keysA, groupID, textContent("read me"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	msgID := sent.Message.MessageId
+
+	// The send itself reaches the group, but without the sender's auto-advanced
+	// READ pointer riding along.
+	e.waitForNewMessage(e.userB, msgID.Value)
+	for _, u := range e.chatUpdatesFor(e.userB) {
+		if u.NewMessages != nil && containsMessage(u.NewMessages.Messages, msgID.Value) {
+			require.Nil(t, u.PointerUpdates, "a group send must not carry the sender's pointer")
+		}
+	}
+
+	// An explicit advance succeeds and is persisted, but nothing is broadcast to
+	// any member, the actor included.
+	resp, err := e.advancePointerInChat(keysC, groupID, messagingpb.Pointer_READ, msgID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_OK, resp.Result)
+
+	stored, err := messages.GetPointers(e.ctx, groupID)
+	require.NoError(t, err)
+	require.True(t, hasPointer(stored, messagingpb.Pointer_READ, userC, msgID.Value), "the advance must still be stored")
+
+	time.Sleep(50 * time.Millisecond)
+	for _, member := range []*commonpb.UserId{e.userA, e.userB, userC} {
+		require.Zero(t, e.countPointerUpdates(member, messagingpb.Pointer_READ, userC), "a group pointer advance must not broadcast")
+		require.Zero(t, e.countPointerUpdates(member, messagingpb.Pointer_READ, e.userA), "a group send must not broadcast the sender's pointer")
+	}
+
+	// The env's DM still broadcasts pointer advances.
+	dmSent, err := e.send(e.keysA, "dm", generateClientID())
+	require.NoError(t, err)
+	dmResp, err := e.advancePointer(e.keysB, messagingpb.Pointer_READ, dmSent.Message.MessageId)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_OK, dmResp.Result)
+	e.waitForPointerUpdate(e.userA, messagingpb.Pointer_READ, e.userB, dmSent.Message.MessageId.Value)
 }
 
 // ============================================================================

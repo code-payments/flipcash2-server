@@ -10,6 +10,7 @@ import (
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/model"
 )
 
@@ -39,7 +40,12 @@ func (s *Server) AdvancePointer(ctx context.Context, req *messagingpb.AdvancePoi
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	if advanced {
+	// A group's pointer advances are stored but never broadcast: every member's
+	// advance would otherwise fan out to every other member, so one message read
+	// by N members would cost N² deliveries. Group clients read pointers on
+	// hydration (GetChat) instead. DMs keep real-time pointers, where the fan-out
+	// is one peer.
+	if advanced && !chat.IsGroupChatID(req.ChatId) {
 		publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.blocklists, s.sender.ocpData, s.sender.pusher, s.sender.userEventBus, s.sender.chatEventBus, req.ChatId, &eventpb.ChatUpdate{
 			PointerUpdates: &messagingpb.PointerBatch{Pointers: []*messagingpb.Pointer{pointer}},
 		}, nil, nil)

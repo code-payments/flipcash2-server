@@ -1,7 +1,6 @@
 package tests
 
 import (
-	"bytes"
 	"context"
 	"testing"
 
@@ -11,7 +10,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	accountpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/account/v1"
-	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
@@ -77,15 +75,16 @@ func testAuthorizer(t *testing.T, store account.Store) {
 	t.Run("Unauthenticated - Invalid", func(t *testing.T) {
 		req := &accountpb.GetUserFlagsRequest{
 			UserId: userID,
-			Auth: &commonpb.Auth{
-				Kind: &commonpb.Auth_KeyPair_{
-					KeyPair: &commonpb.Auth_KeyPair{
-						PubKey:    &commonpb.PublicKey{Value: bytes.Repeat([]byte{0}, 32)},
-						Signature: &commonpb.Signature{Value: bytes.Repeat([]byte{0}, 64)},
-					},
-				},
-			},
+			Auth:   nil,
 		}
+
+		// Sign with a different key pair, then present the bound user's public key
+		// so the signature is well-formed but does not verify against the claimed
+		// key. Don't use an all-zero public key here: it decodes to a small-order
+		// Ed25519 point, which ed25519.Verify accepts for an all-zero signature
+		// depending on the message hash, making the test flaky.
+		require.NoError(t, model.MustGenerateKeyPair().Auth(req, &req.Auth))
+		req.Auth.GetKeyPair().PubKey = signer.Proto()
 
 		_, err := authz.Authorize(context.Background(), req, &req.Auth)
 		require.Equal(t, codes.Unauthenticated, status.Code(err))

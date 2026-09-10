@@ -3,7 +3,6 @@ package push
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 
 	"golang.org/x/text/language"
@@ -342,29 +341,22 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 	return body, true, nil
 }
 
-// sendChatMessagePush sends a rendered chat message push and bumps each
-// recipient's badge count.
+// sendChatMessagePush bumps each recipient's badge count and sends the rendered
+// chat message push carrying the new total, so a recipient's icon updates with
+// the same notification that announces the message rather than a second,
+// badge-only push per recipient.
 func sendChatMessagePush(ctx context.Context, pusher Pusher, badges badge.Store, title, body string, customPayload *pushpb.Payload, recipients ...*commonpb.UserId) error {
-	if err := pusher.SendPushes(ctx, title, body, customPayload, recipients...); err != nil {
-		return err
+	// Each recipient now has one more unread message. The pusher asks for counts
+	// only for recipients with an iOS device, so the stored count is bumped only
+	// where a badge can be displayed. The batch is best-effort per recipient: a
+	// failed bump leaves that recipient's badge off this push but must not block
+	// the others, and a missed bump self-heals on the next message.
+	incrementBadges := func(ctx context.Context, users []*commonpb.UserId) (BadgeCounts, error) {
+		counts, err := badges.IncrementBatch(ctx, users, 1)
+		return BadgeCounts(counts), err
 	}
 
-	// Each recipient now has one more unread message. Bump their badge count and
-	// push the new total to their iOS devices (a no-op for non-iOS recipients).
-	// Best-effort per recipient: one failure must not skip the others, and a
-	// missed bump self-heals on the next message.
-	var errs error
-	for _, recipient := range recipients {
-		newCount, err := badges.Increment(ctx, recipient, 1)
-		if err != nil {
-			errs = errors.Join(errs, err)
-			continue
-		}
-		if err := pusher.SendBadgeCountPush(ctx, recipient, newCount); err != nil {
-			errs = errors.Join(errs, err)
-		}
-	}
-	return errs
+	return pusher.SendPushesWithBadges(ctx, title, body, customPayload, incrementBadges, recipients...)
 }
 
 func SendFlipcashCurrencyGainPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string, gainRegion ocp_currency.Code, gainAmount float64) error {

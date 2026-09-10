@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+
 	"github.com/code-payments/flipcash2-server/badge"
 	"github.com/code-payments/flipcash2-server/model"
 )
@@ -17,6 +19,8 @@ func RunStoreTests(t *testing.T, s badge.Store, teardown func()) {
 		testStore_GetEmpty,
 		testStore_Increment,
 		testStore_IncrementAccumulates,
+		testStore_IncrementBatch,
+		testStore_IncrementBatchEmpty,
 		testStore_Reset,
 		testStore_PerUserIsolation,
 	} {
@@ -62,6 +66,60 @@ func testStore_IncrementAccumulates(t *testing.T, s badge.Store) {
 	count, err = s.Get(ctx, user)
 	require.NoError(t, err)
 	require.EqualValues(t, 6, count)
+}
+
+// testStore_IncrementBatch verifies a batch increments every user, reports each
+// user's own post-increment value, and accumulates on top of prior counts —
+// sized past any implementation's concurrency limit so the pool wraps around.
+func testStore_IncrementBatch(t *testing.T, s badge.Store) {
+	ctx := context.Background()
+
+	const numUsers = 100
+	users := make([]*commonpb.UserId, numUsers)
+	for i := range users {
+		users[i] = model.MustGenerateUserID()
+	}
+
+	// One user starts with a prior count, so their result must carry it.
+	_, err := s.Increment(ctx, users[0], 5)
+	require.NoError(t, err)
+
+	counts, err := s.IncrementBatch(ctx, users, 1)
+	require.NoError(t, err)
+	require.Len(t, counts, numUsers)
+
+	for i, user := range users {
+		want := uint64(1)
+		if i == 0 {
+			want = 6
+		}
+		require.EqualValues(t, want, counts[string(user.Value)], "user %d", i)
+
+		stored, err := s.Get(ctx, user)
+		require.NoError(t, err)
+		require.EqualValues(t, want, stored, "user %d", i)
+	}
+
+	// A second batch with a larger delta accumulates, as Increment does.
+	counts, err = s.IncrementBatch(ctx, users[:3], 4)
+	require.NoError(t, err)
+	require.Len(t, counts, 3)
+	require.EqualValues(t, 10, counts[string(users[0].Value)])
+	require.EqualValues(t, 5, counts[string(users[1].Value)])
+	require.EqualValues(t, 5, counts[string(users[2].Value)])
+
+	// Users outside the second batch are untouched.
+	stored, err := s.Get(ctx, users[3])
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stored)
+}
+
+func testStore_IncrementBatchEmpty(t *testing.T, s badge.Store) {
+	ctx := context.Background()
+
+	counts, err := s.IncrementBatch(ctx, nil, 1)
+	require.NoError(t, err)
+	require.Empty(t, counts)
 }
 
 func testStore_Reset(t *testing.T, s badge.Store) {

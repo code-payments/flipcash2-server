@@ -20,6 +20,20 @@ type Store interface {
 	// have been coalesced.
 	Increment(ctx context.Context, userID *commonpb.UserId, delta uint64) (uint64, error)
 
+	// IncrementBatch applies Increment to each of userIDs and returns the
+	// resulting values keyed by string(userID.Value). It exists for a chat's
+	// fan-out, where one message bumps many users at once: implementations run
+	// the per-user increments concurrently, so a batch costs a few round trips
+	// of latency rather than one per user, while each user's increment stays
+	// atomic on its own item.
+	//
+	// Best-effort per user: a failed increment leaves that user out of the
+	// result, and the failures are joined into the returned error alongside the
+	// partial result. userIDs should be distinct — a duplicate is incremented
+	// once per occurrence, and the reported count is that of whichever landed
+	// last.
+	IncrementBatch(ctx context.Context, userIDs []*commonpb.UserId, delta uint64) (map[string]uint64, error)
+
 	// Get returns a user's current badge count, or zero if the user has none.
 	Get(ctx context.Context, userID *commonpb.UserId) (uint64, error)
 

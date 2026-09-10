@@ -31,6 +31,7 @@ import (
 	"github.com/code-payments/flipcash2-server/messaging"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
+	"github.com/code-payments/flipcash2-server/push"
 	"github.com/code-payments/flipcash2-server/testutil"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 )
@@ -174,8 +175,8 @@ func (p *capturingPusher) SendPushes(_ context.Context, title, body string, cust
 	return nil
 }
 
-func (p *capturingPusher) SendBadgeCountPush(_ context.Context, _ *commonpb.UserId, _ uint64) error {
-	return nil
+func (p *capturingPusher) SendPushesWithBadges(ctx context.Context, title, body string, customPayload *pushpb.Payload, _ push.BadgeResolver, users ...*commonpb.UserId) error {
+	return p.SendPushes(ctx, title, body, customPayload, users...)
 }
 
 func (p *capturingPusher) snapshot() []capturedPush {

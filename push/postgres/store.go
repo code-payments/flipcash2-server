@@ -79,6 +79,10 @@ func (s *store) DeleteToken(ctx context.Context, tokenType pushpb.TokenType, tok
 	return dbDeleteToken(ctx, s.pool, tokenType, token)
 }
 
+func (s *store) DeleteTokens(ctx context.Context, tokens ...push.Token) error {
+	return dbDeleteTokens(ctx, s.pool, tokens...)
+}
+
 func (s *store) ClaimGainPush(ctx context.Context, mint *commonpb.PublicKey, supply, slot uint64, cooldown time.Duration) (bool, *push.CurrencyState, error) {
 	return dbClaimGainPush(ctx, s.pool, mint, supply, slot, cooldown)
 }

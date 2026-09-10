@@ -3,8 +3,10 @@ package dynamodb
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -22,6 +24,12 @@ import (
 const (
 	attrPK    = "pk"
 	attrCount = "badge_count" // "count" is a DynamoDB reserved word.
+
+	// incrementBatchConcurrency bounds how many per-user UpdateItems an
+	// IncrementBatch has in flight at once. Wide enough that a group in the
+	// hundreds completes in a handful of round trips, narrow enough that a burst
+	// of chatty groups doesn't fan out into an unbounded number of connections.
+	incrementBatchConcurrency = 32
 )
 
 type store struct {
@@ -52,6 +60,47 @@ func (s *store) Increment(ctx context.Context, userID *commonpb.UserId, delta ui
 	// Read the post-increment value straight off the response — it is always
 	// current, unlike a follow-up eventually-consistent GetItem.
 	return parseN(out.Attributes[attrCount])
+}
+
+// IncrementBatch fans the per-user UpdateItems out over a bounded worker pool.
+// DynamoDB has no multi-item atomic ADD: BatchWriteItem takes only Put and
+// Delete, TransactWriteItems returns no values and fails the whole group on any
+// single-item conflict, and a PartiQL UPDATE won't create a missing item. So
+// the increments stay one UpdateItem each — same write capacity as any batch
+// would cost — and only the latency is collapsed, by overlapping them.
+func (s *store) IncrementBatch(ctx context.Context, userIDs []*commonpb.UserId, delta uint64) (map[string]uint64, error) {
+	counts := make(map[string]uint64, len(userIDs))
+	if len(userIDs) == 0 {
+		return counts, nil
+	}
+
+	var (
+		mu   sync.Mutex
+		errs error
+		wg   sync.WaitGroup
+		sem  = make(chan struct{}, incrementBatchConcurrency)
+	)
+	for _, userID := range userIDs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			count, err := s.Increment(ctx, userID, delta)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = errors.Join(errs, fmt.Errorf("incrementing badge for user %s: %w", hex.EncodeToString(userID.Value), err))
+				return
+			}
+			counts[string(userID.Value)] = count
+		}()
+	}
+	wg.Wait()
+
+	return counts, errs
 }
 
 func (s *store) Get(ctx context.Context, userID *commonpb.UserId) (uint64, error) {

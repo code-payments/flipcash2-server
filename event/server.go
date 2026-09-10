@@ -1,11 +1,9 @@
 package event
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -105,14 +103,10 @@ type Server struct {
 	userEventBus *Bus[*commonpb.UserId, *eventpb.Event]
 	chatEventBus *Bus[*commonpb.ChatId, *eventpb.ChatEvent]
 
-	// streams fans a topic out to every open local stream: stream key → stream
-	// ID → stream. Multiple streams per key are the point (one per device);
-	// the cluster subscription layer refcounts them into a single registry row.
-	// draining (same lock) refuses new streams once Shutdown has begun, so a
-	// stream can't slip in behind the closing sweep.
-	streamsMu               sync.RWMutex
-	streams                 map[string]map[string]localStream
-	draining                bool
+	// streams fans a topic out to every open local stream (see streamRegistry).
+	// It also refuses new streams once Shutdown has begun, so a stream can't
+	// slip in behind the closing sweep.
+	streams                 *streamRegistry
 	staleEventDetectorCtors []StaleEventDetectorCtor[*eventpb.Event]
 
 	// self is the cluster member this process registers subscription rows as:
@@ -161,7 +155,7 @@ func NewServer(
 		userEventBus: userEventBus,
 		chatEventBus: chatEventBus,
 
-		streams:                 make(map[string]map[string]localStream),
+		streams:                 newStreamRegistry(),
 		staleEventDetectorCtors: staleEventDetectorCtors,
 
 		self:         subscriptions.Self(),
@@ -313,33 +307,13 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 	// a publish racing the open could resolve the row yet find no stream
 	// behind it — so every key is registered up front, before the first
 	// Subscribe below.
-	s.streamsMu.Lock()
-	if s.draining {
-		s.streamsMu.Unlock()
+	if !s.streams.add(streamID, localStream{stream: ss, userID: userID}, streamKeys) {
 		log.Debug("Rejecting stream on shut-down server")
 		return status.Error(codes.Unavailable, "server is draining")
 	}
-	for _, streamKey := range streamKeys {
-		byID, ok := s.streams[streamKey]
-		if !ok {
-			byID = make(map[string]localStream)
-			s.streams[streamKey] = byID
-		}
-		byID[streamID] = localStream{stream: ss, userID: userID}
-	}
-	s.streamsMu.Unlock()
 
 	removeLocalStream := func() {
-		s.streamsMu.Lock()
-		for _, streamKey := range streamKeys {
-			if byID, ok := s.streams[streamKey]; ok {
-				delete(byID, streamID)
-				if len(byID) == 0 {
-					delete(s.streams, streamKey)
-				}
-			}
-		}
-		s.streamsMu.Unlock()
+		s.streams.remove(streamID, streamKeys)
 	}
 
 	// Register this server's interest in the stream's topics with the cluster,
@@ -492,15 +466,7 @@ func (s *Server) ForwardChatEvents(ctx context.Context, events ...*eventpb.ChatE
 // without this never returns. Closed clients reconnect to a healthy server and
 // delta sync. Idempotent.
 func (s *Server) Shutdown() {
-	s.streamsMu.Lock()
-	s.draining = true
-	var targets []Stream[[]*eventpb.Event]
-	for _, byID := range s.streams {
-		for _, ls := range byID {
-			targets = append(targets, ls.stream)
-		}
-	}
-	s.streamsMu.Unlock()
+	targets := s.streams.drain()
 
 	s.log.Debug("Closing all event streams for shutdown", zap.Int("streams", len(targets)))
 	for _, stream := range targets {
@@ -513,31 +479,12 @@ func (s *Server) Shutdown() {
 // notification on a chat-keyed delivery, where the topic no longer selects
 // recipients per member).
 func (s *Server) deliverLocal(streamKey string, e *eventpb.Event, exclude []*commonpb.UserId) {
-	s.streamsMu.RLock()
-	targets := make([]Stream[[]*eventpb.Event], 0, len(s.streams[streamKey]))
-	for _, ls := range s.streams[streamKey] {
-		if isExcluded(ls.userID, exclude) {
-			continue
-		}
-		targets = append(targets, ls.stream)
-	}
-	s.streamsMu.RUnlock()
-
-	for _, stream := range targets {
+	for _, stream := range s.streams.targets(streamKey, exclude) {
 		cloned := proto.Clone(e).(*eventpb.Event)
 		if err := stream.Notify([]*eventpb.Event{cloned}, streamTimeout); err != nil {
 			s.log.With(zap.Error(err)).Warn("Failed to notify event on local stream", zap.String("stream_key", streamKey))
 		}
 	}
-}
-
-func isExcluded(userID *commonpb.UserId, exclude []*commonpb.UserId) bool {
-	for _, ex := range exclude {
-		if bytes.Equal(userID.GetValue(), ex.GetValue()) {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) OnEvent(userID *commonpb.UserId, e *eventpb.Event) {

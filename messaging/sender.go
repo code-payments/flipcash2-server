@@ -198,12 +198,15 @@ func (s *Sender) Send(
 	// log (it is deprecated but still populated during the transition). The
 	// sender's read pointer and the new last activity are only included when they
 	// actually advanced — a no-op must not broadcast a stale pointer or timestamp.
-	// msgProto was already built and media-hydrated above.
+	// A group never carries real-time pointers (see AdvancePointer): the sender's
+	// auto-advance is stored, but riding it along here would give group clients a
+	// partial pointer stream they can't rely on. msgProto was already built and
+	// media-hydrated above.
 	update := &eventpb.ChatUpdate{
 		NewMessages: &messagingpb.MessageBatch{Messages: []*messagingpb.Message{msgProto}},
 		Events:      &messagingpb.EventBatch{Events: []*messagingpb.Event{NewMessageSentEvent(msgProto)}},
 	}
-	if pointerAdvanced {
+	if pointerAdvanced && !chat.IsGroupChatID(chatID) {
 		update.PointerUpdates = &messagingpb.PointerBatch{Pointers: []*messagingpb.Pointer{senderPointer}}
 	}
 	if lastMessageAdvanced {

@@ -169,6 +169,7 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 		ChatMetadata: &pushpb.ChatMetadata{
 			SendingUserId: senderID,
 			Type:          chatpb.ChatType_CONTACT_DM,
+			Message:       message,
 		},
 	}
 
@@ -199,6 +200,7 @@ func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpDa
 		ChatMetadata: &pushpb.ChatMetadata{
 			SendingUserId: senderID,
 			Type:          chatpb.ChatType_TIP_DM,
+			Message:       message,
 		},
 	}
 
@@ -235,6 +237,7 @@ func SendGroupChatPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 		ChatMetadata: &pushpb.ChatMetadata{
 			SendingUserId: senderID,
 			Type:          chatpb.ChatType_GROUP,
+			Message:       message,
 		},
 	}
 

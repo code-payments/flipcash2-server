@@ -83,6 +83,7 @@ func (m *memory) AddToken(_ context.Context, userID *commonpb.UserId, appInstall
 	}
 
 	userTokens[appInstallID.Value] = push.Token{
+		UserID:       &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
 		Type:         tokenType,
 		Token:        token,
 		AppInstallID: appInstallID.Value,
@@ -113,6 +114,23 @@ func (m *memory) DeleteToken(_ context.Context, tokenType pushpb.TokenType, toke
 		for appInstallID, existingToken := range userTokens {
 			if existingToken.Type == tokenType && existingToken.Token == token {
 				delete(userTokens, appInstallID)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *memory) DeleteTokens(_ context.Context, tokens ...push.Token) error {
+	m.Lock()
+	defer m.Unlock()
+
+	for _, target := range tokens {
+		for _, userTokens := range m.tokens {
+			for appInstallID, existingToken := range userTokens {
+				if existingToken.Type == target.Type && existingToken.Token == target.Token {
+					delete(userTokens, appInstallID)
+				}
 			}
 		}
 	}

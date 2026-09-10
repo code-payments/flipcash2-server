@@ -40,7 +40,12 @@ func toTokenModel(userID *commonpb.UserId, token push.Token) (*tokenModel, error
 }
 
 func fromTokenModel(m *tokenModel) (push.Token, error) {
+	userID, err := pg.Decode(m.UserID)
+	if err != nil {
+		return push.Token{}, err
+	}
 	return push.Token{
+		UserID:       &commonpb.UserId{Value: userID},
 		Type:         pushpb.TokenType(m.Type),
 		AppInstallID: m.AppInstallID,
 		Token:        m.Token,
@@ -138,6 +143,26 @@ func dbFilterUsersWithTokens(ctx context.Context, pool *pgxpool.Pool, userIDs ..
 func dbDeleteToken(ctx context.Context, pool *pgxpool.Pool, tokenType pushpb.TokenType, token string) error {
 	query := `DELETE FROM ` + pushTokensTableName + ` WHERE "token" = $1 and "type" = $2`
 	_, err := pool.Exec(ctx, query, token, tokenType)
+	return err
+}
+
+// dbDeleteTokens deletes every (type, token) pair in a single statement. The
+// pairs are passed as two parallel arrays and unnested into rows, so the
+// statement shape is fixed regardless of how many tokens are deleted.
+func dbDeleteTokens(ctx context.Context, pool *pgxpool.Pool, tokens ...push.Token) error {
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	types := make([]int, len(tokens))
+	values := make([]string, len(tokens))
+	for i, token := range tokens {
+		types[i] = int(token.Type)
+		values[i] = token.Token
+	}
+
+	query := `DELETE FROM ` + pushTokensTableName + ` WHERE ("type", "token") IN (SELECT * FROM unnest($1::int[], $2::text[]))`
+	_, err := pool.Exec(ctx, query, types, values)
 	return err
 }
 

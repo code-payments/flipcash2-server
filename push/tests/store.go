@@ -19,6 +19,7 @@ func RunStoreTests(t *testing.T, s push.Store, teardown func()) {
 		testAddAndGetTokens,
 		testUpdateExistingToken,
 		testDeleteToken,
+		testDeleteTokens,
 		testMultipleUsers,
 		testFilterUsersWithTokens,
 		testClaimGainPush,
@@ -103,6 +104,43 @@ func testDeleteToken(t *testing.T, store push.Store) {
 	require.NoError(t, err)
 	assert.Len(t, tokens, 1)
 	assert.Equal(t, "token2", tokens[0].Token)
+}
+
+// testDeleteTokens verifies a batched delete removes exactly the given
+// (type, token) pairs across users, matches on type as well as value, and
+// tolerates pairs that don't exist.
+func testDeleteTokens(t *testing.T, store push.Store) {
+	ctx := context.Background()
+
+	user1 := &commonpb.UserId{Value: []byte("user1")}
+	user2 := &commonpb.UserId{Value: []byte("user2")}
+
+	require.NoError(t, store.AddToken(ctx, user1, &commonpb.AppInstallId{Value: "d1"}, pushpb.TokenType_FCM_APNS, "token1"))
+	require.NoError(t, store.AddToken(ctx, user1, &commonpb.AppInstallId{Value: "d2"}, pushpb.TokenType_FCM_APNS, "token2"))
+	require.NoError(t, store.AddToken(ctx, user2, &commonpb.AppInstallId{Value: "d3"}, pushpb.TokenType_FCM_ANDROID, "token3"))
+	// Same token value as token1 but a different type: must survive a delete
+	// that names token1 as APNS.
+	require.NoError(t, store.AddToken(ctx, user2, &commonpb.AppInstallId{Value: "d4"}, pushpb.TokenType_FCM_ANDROID, "token1"))
+
+	// An empty batch is a no-op.
+	require.NoError(t, store.DeleteTokens(ctx))
+
+	require.NoError(t, store.DeleteTokens(ctx,
+		push.Token{Type: pushpb.TokenType_FCM_APNS, Token: "token1"},
+		push.Token{Type: pushpb.TokenType_FCM_ANDROID, Token: "token3"},
+		push.Token{Type: pushpb.TokenType_FCM_APNS, Token: "does_not_exist"},
+	))
+
+	tokens, err := store.GetTokens(ctx, user1)
+	require.NoError(t, err)
+	require.Len(t, tokens, 1)
+	assert.Equal(t, "token2", tokens[0].Token)
+
+	tokens, err = store.GetTokens(ctx, user2)
+	require.NoError(t, err)
+	require.Len(t, tokens, 1)
+	assert.Equal(t, "token1", tokens[0].Token)
+	assert.Equal(t, pushpb.TokenType_FCM_ANDROID, tokens[0].Type)
 }
 
 func testMultipleUsers(t *testing.T, store push.Store) {

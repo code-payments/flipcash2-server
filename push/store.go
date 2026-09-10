@@ -16,6 +16,7 @@ var ErrCurrencyStateNotFound = errors.New("currency state not found")
 //
 // Tokens are bound to a (user, device) pair, identified by the AppInstallID.
 type Token struct {
+	UserID       *commonpb.UserId
 	Type         pushpb.TokenType
 	Token        string
 	AppInstallID string
@@ -35,6 +36,12 @@ type TokenStore interface {
 
 	// DeleteToken deletes a token for a user.
 	DeleteToken(ctx context.Context, tokenType pushpb.TokenType, token string) error
+
+	// DeleteTokens deletes every given (type, token) pair in one operation. It
+	// exists for the pusher's cleanup of tokens FCM reports as unregistered,
+	// which a large send can surface many of at once. A pair that no longer
+	// exists is skipped, not an error.
+	DeleteTokens(ctx context.Context, tokens ...Token) error
 
 	// FilterUsersWithTokens returns the subset of user IDs that have at least one push token.
 	FilterUsersWithTokens(ctx context.Context, userIDs ...*commonpb.UserId) ([]*commonpb.UserId, error)

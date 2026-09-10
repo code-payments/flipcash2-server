@@ -38,6 +38,19 @@ func (m *memory) Increment(_ context.Context, userID *commonpb.UserId, delta uin
 	return updated, nil
 }
 
+func (m *memory) IncrementBatch(_ context.Context, userIDs []*commonpb.UserId, delta uint64) (map[string]uint64, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	counts := make(map[string]uint64, len(userIDs))
+	for _, userID := range userIDs {
+		updated := m.counts[string(userID.Value)] + delta
+		m.counts[string(userID.Value)] = updated
+		counts[string(userID.Value)] = updated
+	}
+	return counts, nil
+}
+
 func (m *memory) Get(_ context.Context, userID *commonpb.UserId) (uint64, error) {
 	m.Lock()
 	defer m.Unlock()

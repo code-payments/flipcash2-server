@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
@@ -1689,7 +1690,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	// The push path recovers the chat type from the canonical DM derivation,
 	// so the chats must live at their derived IDs (unlike the env's default
 	// random-ID chat).
-	send := func(chatType chatpb.ChatType, text string) {
+	send := func(chatType chatpb.ChatType, text string) *messagingpb.Message {
 		chatID := chat.MustDeriveDmChatID(chatType, e.userA, e.userB)
 		require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 			ID:           chatID,
@@ -1700,6 +1701,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 		resp, err := e.sendContentToChat(e.keysA, chatID, textContent(text), generateClientID())
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+		return resp.Message
 	}
 
 	// Pushes are sent asynchronously after the send returns.
@@ -1712,7 +1714,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 		return pushes
 	}
 
-	send(chatpb.ChatType_TIP_DM, "tip message")
+	tipMessage := send(chatpb.ChatType_TIP_DM, "tip message")
 	pushes := waitForPushes(1)
 
 	tipPush := pushes[0]
@@ -1721,12 +1723,17 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	require.Empty(t, tipPush.payload.TitleSubstitutions)
 	require.Len(t, tipPush.users, 1)
 	require.Equal(t, e.userB.Value, tipPush.users[0].Value)
+	// The chat metadata carries the entire sent message, so a client can
+	// render the notification from it without a round trip to the server.
+	require.Equal(t, chatpb.ChatType_TIP_DM, tipPush.payload.ChatMetadata.Type)
+	require.Equal(t, e.userA.Value, tipPush.payload.ChatMetadata.SendingUserId.Value)
+	require.True(t, proto.Equal(tipMessage, tipPush.payload.ChatMetadata.Message))
 	// Nothing in the push may carry the sender's phone number.
 	require.NotContains(t, tipPush.title, senderPhone)
 	require.NotContains(t, tipPush.body, senderPhone)
 	require.NotContains(t, tipPush.payload.String(), strings.TrimPrefix(senderPhone, "+"))
 
-	send(chatpb.ChatType_CONTACT_DM, "contact message")
+	contactMessage := send(chatpb.ChatType_CONTACT_DM, "contact message")
 	pushes = waitForPushes(2)
 
 	contactPush := pushes[1]
@@ -1736,6 +1743,9 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	require.Equal(t, senderPhone, contactPush.payload.TitleSubstitutions[0].GetPhoneNumberToContactName().GetValue())
 	require.Len(t, contactPush.users, 1)
 	require.Equal(t, e.userB.Value, contactPush.users[0].Value)
+	require.Equal(t, chatpb.ChatType_CONTACT_DM, contactPush.payload.ChatMetadata.Type)
+	require.Equal(t, e.userA.Value, contactPush.payload.ChatMetadata.SendingUserId.Value)
+	require.True(t, proto.Equal(contactMessage, contactPush.payload.ChatMetadata.Message))
 }
 
 // testServer_Reactions_GroupSelfReaction pins reacted_by_self in a group, where
@@ -1872,6 +1882,7 @@ func testServer_SendMessage_GroupChatPush(t *testing.T, badges badge.Store, bloc
 	require.Empty(t, groupPush.payload.TitleSubstitutions)
 	require.Equal(t, chatpb.ChatType_GROUP, groupPush.payload.ChatMetadata.Type)
 	require.Equal(t, e.userA.Value, groupPush.payload.ChatMetadata.SendingUserId.Value)
+	require.True(t, proto.Equal(resp.Message, groupPush.payload.ChatMetadata.Message))
 	require.NotContains(t, groupPush.payload.String(), strings.TrimPrefix(senderPhone, "+"))
 	recipients := make([][]byte, len(groupPush.users))
 	for i, u := range groupPush.users {

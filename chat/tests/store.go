@@ -29,6 +29,7 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_IsMember,
 		testStore_AdvanceLastMessage,
 		testStore_GroupChat_PutAndGet,
+		testStore_GroupChat_StaffOnly,
 		testStore_GroupChat_Membership,
 		testStore_GroupChat_IDsForUser,
 		testStore_GroupChat_CreationCap,
@@ -236,6 +237,42 @@ func testStore_GroupChat_PutAndGet(t *testing.T, s chat.Store) {
 	require.ElementsMatch(t, userIDValues(members), userIDValues(gotMembers))
 
 	require.ErrorIs(t, s.PutChat(ctx, c), chat.ErrChatExists)
+}
+
+func testStore_GroupChat_StaffOnly(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// A group is not staff-only unless it was created as such.
+	plain := putGroupChat(t, s, "Weekend Trip", at(100), model.MustGenerateUserID())
+	got, err := s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.False(t, got.IsStaffOnly)
+
+	staff := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:        "Staff",
+		IsStaffOnly:  true,
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, staff))
+
+	got, err = s.GetChatByID(ctx, staff.ID)
+	require.NoError(t, err)
+	require.True(t, got.IsStaffOnly)
+	require.Equal(t, "Staff", got.Title)
+
+	// The flag is part of the canonical record and survives the updates that
+	// touch it.
+	advanced, _, err := s.AdvanceLastMessage(ctx, staff.ID, &messagingpb.MessageId{Value: 1}, at(200))
+	require.NoError(t, err)
+	require.True(t, advanced)
+
+	got, err = s.GetChatByID(ctx, staff.ID)
+	require.NoError(t, err)
+	require.True(t, got.IsStaffOnly)
+	require.True(t, got.LastActivity.Equal(at(200)))
 }
 
 func testStore_GroupChat_Membership(t *testing.T, s chat.Store) {

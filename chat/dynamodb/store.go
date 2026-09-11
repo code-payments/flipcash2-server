@@ -85,6 +85,7 @@ const (
 	attrFeed          = "feed"
 	attrMembers       = "members"
 	attrTitle         = "title"
+	attrIsStaffOnly   = "is_staff_only"
 	attrState         = "state"
 	attrUser          = "user" // member id, bare hex — see userIndexKey
 	attrJoinedAt      = "joined_at"
@@ -606,10 +607,16 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 		attrLastActivity: avN(uint64(c.LastActivity.UnixNano())),
 	}
 	// A group's membership lives in group_members, not on the canonical item —
-	// an inline list could not hold a large group. Title is group-only.
+	// an inline list could not hold a large group. Title and the staff-only
+	// flag are group-only; the flag is written only when set, so an absent
+	// attribute (including on every item written before it existed) reads as
+	// false.
 	if c.Type == chatpb.ChatType_GROUP {
 		if c.Title != "" {
 			item[attrTitle] = avS(c.Title)
+		}
+		if c.IsStaffOnly {
+			item[attrIsStaffOnly] = avBool(true)
 		}
 	} else {
 		item[attrMembers] = membersAttr(c.Members)
@@ -666,6 +673,7 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 		Type:         protoChatType(uint64(typeVal)),
 		Members:      membersFromItem(item),
 		Title:        asS(item[attrTitle]),
+		IsStaffOnly:  asBool(item[attrIsStaffOnly]),
 		LastActivity: time.Unix(0, nanos).UTC(),
 	}
 	// last_message_id is absent until the chat's first message.
@@ -764,12 +772,22 @@ func avB(v []byte) types.AttributeValue {
 func avN(v uint64) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.FormatUint(v, 10)}
 }
+func avBool(v bool) types.AttributeValue { return &types.AttributeValueMemberBOOL{Value: v} }
 
 func asS(av types.AttributeValue) string {
 	if s, ok := av.(*types.AttributeValueMemberS); ok {
 		return s.Value
 	}
 	return ""
+}
+
+// asBool returns the attribute's value, or false when it is absent or not a
+// BOOL.
+func asBool(av types.AttributeValue) bool {
+	if b, ok := av.(*types.AttributeValueMemberBOOL); ok {
+		return b.Value
+	}
+	return false
 }
 
 func asB(av types.AttributeValue) []byte {

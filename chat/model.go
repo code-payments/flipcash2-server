@@ -178,13 +178,18 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // Members is the full, immutable member set for a DM, and is always empty for
 // a group chat: group membership is mutable and lives in its own store records,
 // which no path that reads the canonical record touches. A caller that needs a
-// group's members reads them explicitly via Store.GetMembers. Title is
-// group-only and empty for DMs.
+// group's members reads them explicitly via Store.GetMembers. Title and
+// IsStaffOnly are group-only and zero for DMs.
+//
+// IsStaffOnly marks a group whose membership is restricted to staff users. It
+// is stored state set at creation; enforcing it (on membership changes, reads,
+// and sends) is the server layer's responsibility.
 type Chat struct {
 	ID            *commonpb.ChatId
 	Type          chatpb.ChatType
 	Members       []*commonpb.UserId
 	Title         string
+	IsStaffOnly   bool
 	LastActivity  time.Time
 	LastMessageID *messagingpb.MessageId
 }
@@ -204,6 +209,7 @@ func (c *Chat) Clone() *Chat {
 		Type:          c.Type,
 		Members:       members,
 		Title:         c.Title,
+		IsStaffOnly:   c.IsStaffOnly,
 		LastActivity:  c.LastActivity,
 		LastMessageID: lastMessageID,
 	}

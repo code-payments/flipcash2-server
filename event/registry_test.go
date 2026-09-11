@@ -20,7 +20,7 @@ type fakeStream struct {
 }
 
 func (f *fakeStream) ID() string { return f.id }
-func (f *fakeStream) Notify([]*eventpb.Event, time.Duration) error {
+func (f *fakeStream) Notify(*eventpb.Event) error {
 	return nil
 }
 func (f *fakeStream) Close() {
@@ -33,7 +33,7 @@ func userID(i int) *commonpb.UserId {
 	return &commonpb.UserId{Value: fmt.Appendf(nil, "user-%04d", i)}
 }
 
-func streamIDs(streams []Stream[[]*eventpb.Event]) map[string]bool {
+func streamIDs(streams []Stream[*eventpb.Event]) map[string]bool {
 	ids := make(map[string]bool, len(streams))
 	for _, s := range streams {
 		ids[s.ID()] = true
@@ -62,16 +62,16 @@ func TestStreamRegistry_AddRemoveAcrossShards(t *testing.T) {
 
 	// Every key resolves s1; the first key resolves both.
 	for i, key := range keys {
-		got := streamIDs(r.targets(key, nil))
+		got := streamIDs(targets(r, key, nil))
 		require.True(t, got["s1"], "key %d must resolve s1", i)
 		require.Equal(t, i == 0, got["s2"], "only the first key holds s2")
 	}
 
 	// Removing s1 leaves s2 alone on the shared key and empties the rest.
 	r.remove("s1", keys)
-	require.Equal(t, map[string]bool{"s2": true}, streamIDs(r.targets(keys[0], nil)))
+	require.Equal(t, map[string]bool{"s2": true}, streamIDs(targets(r, keys[0], nil)))
 	for _, key := range keys[1:] {
-		require.Empty(t, r.targets(key, nil))
+		require.Empty(t, targets(r, key, nil))
 	}
 
 	// Emptied keys are dropped from their shards, not left as empty maps.
@@ -86,7 +86,7 @@ func TestStreamRegistry_AddRemoveAcrossShards(t *testing.T) {
 
 	// Removing under keys the stream never held is a no-op.
 	r.remove("s2", keys)
-	require.Empty(t, r.targets(keys[0], nil))
+	require.Empty(t, targets(r, keys[0], nil))
 }
 
 func TestStreamRegistry_TargetsHonorExclusions(t *testing.T) {
@@ -96,12 +96,12 @@ func TestStreamRegistry_TargetsHonorExclusions(t *testing.T) {
 	require.True(t, r.add("a2", localStream{stream: &fakeStream{id: "a2"}, userID: userID(1)}, []string{key}))
 	require.True(t, r.add("b1", localStream{stream: &fakeStream{id: "b1"}, userID: userID(2)}, []string{key}))
 
-	require.Len(t, r.targets(key, nil), 3)
+	require.Len(t, targets(r, key, nil), 3)
 	// Excluding a user drops every one of their streams (multi-device) and no
 	// one else's.
-	require.Equal(t, map[string]bool{"b1": true}, streamIDs(r.targets(key, []*commonpb.UserId{userID(1)})))
-	require.Empty(t, r.targets(key, []*commonpb.UserId{userID(1), userID(2)}))
-	require.Empty(t, r.targets("chat:unknown", nil))
+	require.Equal(t, map[string]bool{"b1": true}, streamIDs(targets(r, key, []*commonpb.UserId{userID(1)})))
+	require.Empty(t, targets(r, key, []*commonpb.UserId{userID(1), userID(2)}))
+	require.Empty(t, targets(r, "chat:unknown", nil))
 }
 
 func TestStreamRegistry_DrainReturnsEachStreamOnceAndRefusesAdds(t *testing.T) {
@@ -120,7 +120,7 @@ func TestStreamRegistry_DrainReturnsEachStreamOnceAndRefusesAdds(t *testing.T) {
 	// A registration after drain is refused and leaves nothing behind.
 	require.False(t, r.add("s3", localStream{stream: &fakeStream{id: "s3"}, userID: userID(3)}, keys))
 	for _, key := range keys {
-		require.False(t, streamIDs(r.targets(key, nil))["s3"])
+		require.False(t, streamIDs(targets(r, key, nil))["s3"])
 	}
 
 	// Existing streams stay resolvable until their handlers remove them, and a
@@ -156,7 +156,7 @@ func TestStreamRegistry_AddRolledBackWhenDrainInterleaves(t *testing.T) {
 
 	require.False(t, <-addDone)
 	for _, key := range keys {
-		require.False(t, streamIDs(r.targets(key, nil))["s1"], "rolled-back add left key %s registered", key)
+		require.False(t, streamIDs(targets(r, key, nil))["s1"], "rolled-back add left key %s registered", key)
 	}
 	require.Equal(t, map[string]bool{"s0": true}, streamIDs(r.drain()))
 }
@@ -177,7 +177,7 @@ func TestStreamRegistry_Concurrent(t *testing.T) {
 			for range 50 {
 				require.True(t, r.add(id, ls, keys))
 				for _, key := range keys[:8] {
-					r.targets(key, []*commonpb.UserId{userID(i)})
+					r.each(key, []*commonpb.UserId{userID(i)}, func(Stream[*eventpb.Event]) {})
 				}
 				r.remove(id, keys)
 			}
@@ -186,7 +186,73 @@ func TestStreamRegistry_Concurrent(t *testing.T) {
 	wg.Wait()
 
 	for _, key := range keys {
-		require.Empty(t, r.targets(key, nil))
+		require.Empty(t, targets(r, key, nil))
 	}
 	require.Empty(t, r.drain())
+}
+
+// targets collects what each visits, so the tests can assert on the set of
+// streams a key resolves to.
+func targets(r *streamRegistry, key string, exclude []*commonpb.UserId) []Stream[*eventpb.Event] {
+	var out []Stream[*eventpb.Event]
+	r.each(key, exclude, func(s Stream[*eventpb.Event]) { out = append(out, s) })
+	return out
+}
+
+// TestStreamRegistry_EachDeliversUnderLock pins the delivery pass: it runs
+// under the shard's read lock with real streams, a Notify that lag-closes a
+// stream mid-pass neither blocks nor deadlocks, and registrations racing the
+// pass (which need the write lock) still complete.
+func TestStreamRegistry_EachDeliversUnderLock(t *testing.T) {
+	r := newStreamRegistry()
+	const key = "chat:hot"
+	e := &eventpb.Event{Id: MustGenerateEventID()}
+
+	// A one-slot stream lag-closes on its second notify; a roomy one never does.
+	laggy := NewEventStream[*eventpb.Event]("laggy", 1)
+	healthy := NewEventStream[*eventpb.Event]("healthy", 8)
+	require.True(t, r.add("laggy", localStream{stream: laggy, userID: userID(1)}, []string{key}))
+	require.True(t, r.add("healthy", localStream{stream: healthy, userID: userID(2)}, []string{key}))
+
+	deliver := func() (errs int) {
+		r.each(key, nil, func(s Stream[*eventpb.Event]) {
+			if err := s.Notify(e); err != nil {
+				errs++
+			}
+		})
+		return errs
+	}
+
+	require.Equal(t, 0, deliver())
+	require.Equal(t, 1, deliver(), "the laggy stream closes on overflow, inside the locked pass")
+	require.Equal(t, 1, deliver(), "a closed stream keeps erroring until its handler removes it")
+
+	// The healthy stream got every event; the laggy one got its one slot then
+	// the close.
+	require.Len(t, healthy.Channel(), 3)
+	<-laggy.Channel()
+	_, ok := <-laggy.Channel()
+	require.False(t, ok)
+
+	// Deliveries and registrations interleave freely.
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				deliver()
+			}
+		}()
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("s%d", i)
+			for range 100 {
+				require.True(t, r.add(id, localStream{stream: NewEventStream[*eventpb.Event](id, 1024), userID: userID(10 + i)}, []string{key}))
+				r.remove(id, []string{key})
+			}
+		}(i)
+	}
+	wg.Wait()
+	require.Equal(t, map[string]bool{"laggy": true, "healthy": true}, streamIDs(targets(r, key, nil)))
 }

@@ -110,33 +110,34 @@ func (r *streamRegistry) remove(streamID string, keys []string) {
 	}
 }
 
-// targets returns every stream open under the key whose owner is not in
-// exclude. The snapshot is taken under the shard's read lock and released
-// before the caller delivers, so a slow stream never blocks registration.
-func (r *streamRegistry) targets(key string, exclude []*commonpb.UserId) []Stream[[]*eventpb.Event] {
+// each calls fn for every stream open under the key whose owner is not in
+// exclude, under the shard's read lock. fn must not block or touch the
+// registry: it runs with the shard held, so a delivery costs the caller no
+// allocation — no per-event snapshot of a key's streams, which for a large
+// chat would be thousands of pointers per event per server — while a
+// registration on the same shard waits only as long as one pass over the key.
+// Stream.Notify qualifies, being non-blocking.
+func (r *streamRegistry) each(key string, exclude []*commonpb.UserId, fn func(Stream[*eventpb.Event])) {
 	shard := r.shardFor(key)
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
 
-	byID := shard.byKey[key]
-	targets := make([]Stream[[]*eventpb.Event], 0, len(byID))
-	for _, ls := range byID {
+	for _, ls := range shard.byKey[key] {
 		if isExcluded(ls.userID, exclude) {
 			continue
 		}
-		targets = append(targets, ls.stream)
+		fn(ls.stream)
 	}
-	return targets
 }
 
 // drain marks the registry as draining, so every subsequent add is refused,
 // and returns every open stream exactly once (a stream is registered under
 // many keys, but is closed once). Idempotent: a second call returns whatever
 // streams are still registered.
-func (r *streamRegistry) drain() []Stream[[]*eventpb.Event] {
+func (r *streamRegistry) drain() []Stream[*eventpb.Event] {
 	r.draining.Store(true)
 
-	seen := make(map[string]Stream[[]*eventpb.Event])
+	seen := make(map[string]Stream[*eventpb.Event])
 	for i := range r.shards {
 		shard := &r.shards[i]
 		shard.mu.RLock()
@@ -150,7 +151,7 @@ func (r *streamRegistry) drain() []Stream[[]*eventpb.Event] {
 		shard.mu.RUnlock()
 	}
 
-	streams := make([]Stream[[]*eventpb.Event], 0, len(seen))
+	streams := make([]Stream[*eventpb.Event], 0, len(seen))
 	for _, stream := range seen {
 		streams = append(streams, stream)
 	}

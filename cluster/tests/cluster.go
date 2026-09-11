@@ -58,6 +58,7 @@ func RunClusterTests(t *testing.T, s cluster.Store, teardown func()) {
 		testSubscriptionCorpseRowGC,
 		testSubscriptionLiveRowSurvivesScanBlips,
 		testSubscriptionSlowMemberRowNotSwept,
+		testSubscriptionsConcurrentChurn,
 	} {
 		tf(t, s)
 		teardown()

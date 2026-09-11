@@ -4,10 +4,13 @@ import (
 	"context"
 	"io"
 	"math/rand/v2"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -37,6 +40,7 @@ func RunServerTests(t *testing.T, accounts account.Store, teardown func()) {
 		testSingleServerHappyPath,
 		testMultiServerHappyPath,
 		testMultipleOpenStreams,
+		testBurstDelivery,
 		testKeepAlive,
 		testSubscriptionRegistration,
 		testGroupSubscriptionRegistration,
@@ -135,6 +139,58 @@ func testMultipleOpenStreams(t *testing.T, accounts account.Store) {
 			}
 		}
 	}
+}
+
+// testBurstDelivery pins delivery under a burst: events published faster than
+// the client reads them all arrive, each exactly once, coalesced into however
+// many batches the handler needed rather than one message per event. The
+// burst stays well under the stream buffer so a slow test client cannot trip
+// the lag close that a larger one would.
+func testBurstDelivery(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, true)
+	defer cleanup()
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	accounts.Bind(context.Background(), userID, keyPair.Proto())
+	accounts.SetRegistrationFlag(context.Background(), userID, true)
+
+	testEnv.client1.openUserEventStream(t, userID, keyPair)
+
+	time.Sleep(500 * time.Millisecond)
+
+	const burst = 50
+	expected := make(map[string]*eventpb.Event, burst)
+	for i := range burst {
+		sender := testEnv.server1
+		if i%2 == 0 {
+			sender = testEnv.server2
+		}
+		e := sender.sendTestUserEvent(userID)
+		expected[event.EventIDString(e.Id)] = e
+	}
+
+	// The bus hands every publish to its own goroutine, so arrival order is
+	// not part of the contract; the set is.
+	got := make(map[string]*eventpb.Event, burst)
+	var batches int
+	for len(got) < burst {
+		batch := testEnv.client1.receiveEventsInRealTime(t, userID)
+		require.NotEmpty(t, batch)
+		require.LessOrEqual(t, len(batch), burst)
+		batches++
+		for _, e := range batch {
+			id := event.EventIDString(e.Id)
+			_, dup := got[id]
+			require.Falsef(t, dup, "event %s delivered twice", id)
+			require.Containsf(t, expected, id, "unexpected event %s", id)
+			assertEquivalentTestEvents(t, expected[id], e)
+			got[id] = e
+		}
+	}
+	require.Len(t, got, burst)
+	require.LessOrEqual(t, batches, burst)
+	t.Logf("received %d events in %d batches", burst, batches)
 }
 
 func testKeepAlive(t *testing.T, accounts account.Store) {
@@ -434,8 +490,32 @@ func fastMembershipConfig() cluster.MembershipConfig {
 	}
 }
 
+// quietAfterCleanup wraps a test logger's core so it drops entries once the
+// test's cleanup has begun. Stream handlers log as they wind down, and the
+// gRPC teardown in cleanup lets them finish asynchronously — a handler's exit
+// log landing after the test function returned is a zaptest panic, not a
+// finding.
+type quietAfterCleanup struct {
+	zapcore.Core
+	quiet *atomic.Bool
+}
+
+func (c quietAfterCleanup) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	if c.quiet.Load() {
+		return ce
+	}
+	return c.Core.Check(e, ce)
+}
+
+func (c quietAfterCleanup) With(fields []zapcore.Field) zapcore.Core {
+	return quietAfterCleanup{Core: c.Core.With(fields), quiet: c.quiet}
+}
+
 func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool) (env testEnv, cleanup func()) {
-	log := zaptest.NewLogger(t)
+	quiet := new(atomic.Bool)
+	log := zaptest.NewLogger(t, zaptest.WrapOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+		return quietAfterCleanup{Core: core, quiet: quiet}
+	})))
 	ctx := context.Background()
 
 	conn1, serv1, err := ocp_testutil.NewServer(log)
@@ -526,6 +606,7 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool) (en
 	require.NoError(t, err)
 
 	return env, func() {
+		quiet.Store(true)
 		cleanup1()
 		cleanup2()
 		env.server1.membership.Stop()

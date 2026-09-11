@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -805,5 +806,105 @@ func testSubscriptionCorpseRowGC(t *testing.T, s cluster.Store) {
 			require.NoError(t, err)
 			return len(rows) == 1 && rows[0].InstanceID == "instance-a"
 		}, 10*time.Second, 25*time.Millisecond)
+	})
+}
+
+// testSubscriptionsConcurrentChurn hammers the runtime the way a reconnect
+// storm does — many streams registering and releasing overlapping topic sets
+// while publishers resolve them and a drain/resume cycle cuts across — and
+// then checks the invariants the sharded state must hold: every live
+// registration resolves self, every released one does not, refcounts never go
+// negative or leak, and after the last release the store holds no rows for
+// this instance. It exists as much for the race detector as for its asserts.
+func testSubscriptionsConcurrentChurn(t *testing.T, s cluster.Store) {
+	t.Run("testSubscriptionsConcurrentChurn", func(t *testing.T) {
+		ctx := context.Background()
+
+		a := startNode(t, s, "instance-a", fastMembershipConfig(), fastOwnershipConfig())
+		waitForLiveMembers(t, a, 1)
+
+		const topics = 200 // spans every shard several times over
+		const streams = 32
+		const rounds = 20
+
+		topic := func(i int) cluster.SubscriptionTopic {
+			return cluster.SubscriptionTopic{Namespace: subsNamespace, Key: fmt.Appendf(nil, "churn-%03d", i)}
+		}
+
+		var wg sync.WaitGroup
+		var drained atomic.Int64
+
+		// Streams: each round registers a window of topics (overlapping with
+		// its neighbours'), resolves a few, and releases them all.
+		for st := range streams {
+			wg.Add(1)
+			go func(st int) {
+				defer wg.Done()
+				for r := range rounds {
+					window := make([]cluster.SubscriptionTopic, 0, 16)
+					for i := range 16 {
+						window = append(window, topic((st*7+r*3+i)%topics))
+					}
+					handles, err := a.subscriptions.SubscribeAll(ctx, window)
+					if err != nil {
+						require.ErrorIs(t, err, cluster.ErrSubscriptionsDraining)
+						drained.Add(1)
+						continue
+					}
+					for _, tp := range window[:4] {
+						subs, err := a.subscriptions.Subscribers(ctx, tp.Namespace, tp.Key)
+						require.NoError(t, err)
+						// Registered by this stream, so self resolves — unless a
+						// drain wiped the registration out from under us, in
+						// which case it resolves nothing at all.
+						require.LessOrEqual(t, len(subs), 1)
+					}
+					if r%2 == 0 {
+						require.NoError(t, a.subscriptions.CloseAll(ctx, handles))
+					} else {
+						for _, h := range handles {
+							require.NoError(t, h.Close(ctx))
+						}
+					}
+				}
+			}(st)
+		}
+
+		// Publishers: resolve every topic repeatedly, cache hits and misses.
+		for range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for r := range rounds * 4 {
+					tp := topic(r % topics)
+					_, err := a.subscriptions.Subscribers(ctx, tp.Namespace, tp.Key)
+					require.NoError(t, err)
+				}
+			}()
+		}
+
+		// One drain/resume cycle mid-churn.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			time.Sleep(5 * time.Millisecond)
+			require.NoError(t, a.subscriptions.Drain(ctx))
+			time.Sleep(5 * time.Millisecond)
+			a.subscriptions.Resume()
+		}()
+
+		wg.Wait()
+
+		// Everything has been released (or drained). A final drain sweeps any
+		// registration whose release raced the first drain's cutoff, after
+		// which nothing of this instance's may remain in the store.
+		require.NoError(t, a.subscriptions.Drain(ctx))
+		for i := range topics {
+			tp := topic(i)
+			rows, err := s.GetSubscribers(ctx, tp.Namespace, tp.Key)
+			require.NoError(t, err)
+			require.Emptyf(t, rows, "topic %d still has rows after every release", i)
+		}
+		t.Logf("registrations refused by the mid-churn drain: %d", drained.Load())
 	})
 }

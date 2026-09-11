@@ -24,11 +24,6 @@ type ForwardingClient struct {
 
 func NewForwardingClient(log *zap.Logger, subscriptions *cluster.Subscriptions, currentRpcApiKey string) Forwarder {
 	return &ForwardingClient{
-		eventForwarder: &eventForwarder{
-			log:           log,
-			subscriptions: subscriptions,
-			pool:          sharedForwardingPool(log),
-			apiKey:        currentRpcApiKey,
-		},
+		eventForwarder: newEventForwarder(log, subscriptions, currentRpcApiKey, "", nil),
 	}
 }

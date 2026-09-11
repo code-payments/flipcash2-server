@@ -117,7 +117,11 @@ func publishChatUpdate(
 	}
 
 	// todo: Tie in push to the event bus?
-	if update.NewMessages == nil {
+	//
+	// Only a freshly sent message earns a push. Edits, deletes, reactions,
+	// pointers and typing all ride the same broadcast and must not.
+	sent := sentMessages(update)
+	if len(sent) == 0 {
 		return
 	}
 
@@ -164,13 +168,29 @@ func publishChatUpdate(
 			chatType = chat.DeriveDmChatType(chatID, members)
 		}
 
-		for _, message := range update.NewMessages.Messages {
+		for _, message := range sent {
 			if message.SenderId == nil {
 				continue
 			}
 			sendMessagePush(ctx, log, badges, profiles, blocklists, ocpData, pusher, chatID, chatType, chatTitle, members, message)
 		}
 	}()
+}
+
+// sentMessages returns the messages an update introduces: the message_sent
+// mutations of its event-log events, in order. This is the broadcast's only
+// carrier of new messages now that the deprecated new_messages field is no
+// longer populated.
+func sentMessages(update *eventpb.ChatUpdate) []*messagingpb.Message {
+	var sent []*messagingpb.Message
+	for _, e := range update.GetEvents().GetEvents() {
+		for _, m := range e.GetMutations() {
+			if msg := m.GetMessageSent(); msg != nil {
+				sent = append(sent, msg)
+			}
+		}
+	}
+	return sent
 }
 
 // sendMessagePush pushes one new message to every member who should hear

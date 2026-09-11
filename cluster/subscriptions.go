@@ -5,8 +5,10 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"go.uber.org/zap"
 )
 
@@ -25,6 +27,15 @@ var ErrObserverMembership = errors.New("observer membership cannot register inte
 // on its own behalf (sweeps and re-assertions), which carry no caller context.
 const subscriptionOpTimeout = 5 * time.Second
 
+// subscriptionShards is the number of independently locked partitions of the
+// per-topic state. A publish resolves under one shard's lock; a stream open
+// or close touches each of its topics' shards once. Contention is therefore
+// between operations on the same shard, not between every publish and every
+// stream on the server — the same partitioning the event stream registry
+// uses, for the same reconnect-storm reason. A power of two keeps the pick a
+// mask.
+const subscriptionShards = 64
+
 // Subscriptions tracks which servers host live streams for each (namespace,
 // key) topic — the non-exclusive sibling of Ownership. A subscription is
 // interest, not ownership: any number of members may subscribe to a topic,
@@ -42,29 +53,50 @@ const subscriptionOpTimeout = 5 * time.Second
 // — a cached resolution may briefly miss a just-opened stream or include a
 // just-closed one, and the consumer's pull backstop (delta sync against its
 // sequenced store) is what makes that safe.
+//
+// Per-topic state (local refcounts, the resolution cache, the topic write
+// locks) is partitioned across subscriptionShards by topic ID, each shard
+// behind its own mutex. Nothing ever holds two shard locks at once, so there
+// is no lock ordering between shards to get wrong. What is not per-topic
+// lives outside the shards: the generation counter and drain latch are
+// atomics, and the corpse-sweep clock (keyed by instance, not topic) has a
+// mutex of its own.
 type Subscriptions struct {
 	log        *zap.Logger
 	membership *Membership
 	store      SubscriptionStore
 	cfg        SubscriptionsConfig
 
-	mu    sync.Mutex
-	local map[string]*localTopic
-	cache map[string]subscriberCacheEntry
+	shards [subscriptionShards]subscriptionShard
+
 	// nextGen numbers topic registrations so a handle can tell its own
 	// registration from a later one occupying the same topic slot (a stale
 	// handle Closed after a Drain+Resume cycle must not decrement — let alone
 	// delete — a successor registration).
-	nextGen uint64
-	// unknownSince tracks, per instance ID, when this observer first saw a
-	// subscription row whose member was wholly unobserved (no registry record
-	// in the membership view) — the observation timeline behind corpse-row
-	// sweeps. Entries re-anchor while the member's record is still observed,
-	// clear on any live sighting and on live-set convergence, and are bounded
-	// by crashed instances with rows still being resolved.
+	nextGen atomic.Uint64
+
+	// draining refuses new registrations once Drain has begun. It is set
+	// before Drain takes any shard lock and checked under the shard lock as
+	// registrations land, so a registration either lands before the drain
+	// sweeps its shard (and is swept) or observes the latch — never neither.
+	draining atomic.Bool
+
+	// sweepMu guards unknownSince, which tracks, per instance ID, when this
+	// observer first saw a subscription row whose member was wholly unobserved
+	// (no registry record in the membership view) — the observation timeline
+	// behind corpse-row sweeps. Entries re-anchor while the member's record is
+	// still observed, clear on any live sighting and on live-set convergence,
+	// and are bounded by crashed instances with rows still being resolved.
+	sweepMu      sync.Mutex
 	unknownSince map[string]time.Time
-	topicLocks   map[string]*keyLock
-	draining     bool
+}
+
+// subscriptionShard is one partition of the per-topic state.
+type subscriptionShard struct {
+	mu         sync.Mutex
+	local      map[string]*localTopic
+	cache      map[string]subscriberCacheEntry
+	topicLocks map[string]*keyLock
 }
 
 // localTopic is one topic's local refcount: how many open handles (streams)
@@ -122,10 +154,14 @@ func NewSubscriptions(log *zap.Logger, membership *Membership, store Subscriptio
 		membership:   membership,
 		store:        store,
 		cfg:          cfg,
-		local:        make(map[string]*localTopic),
-		cache:        make(map[string]subscriberCacheEntry),
 		unknownSince: make(map[string]time.Time),
-		topicLocks:   make(map[string]*keyLock),
+	}
+	for i := range s.shards {
+		s.shards[i] = subscriptionShard{
+			local:      make(map[string]*localTopic),
+			cache:      make(map[string]subscriberCacheEntry),
+			topicLocks: make(map[string]*keyLock),
+		}
 	}
 	// The inverse of Ownership's session-lost shedding: exclusive state might
 	// now be someone else's and must be dropped, but interest rows cannot
@@ -143,11 +179,11 @@ func NewSubscriptions(log *zap.Logger, membership *Membership, store Subscriptio
 	// RowGCAfter apart can never add up to sweeping a live subscriber's row.
 	membership.Subscribe(func() {
 		liveNow := membership.Live()
-		s.mu.Lock()
+		s.sweepMu.Lock()
 		for _, m := range liveNow {
 			delete(s.unknownSince, m.InstanceID)
 		}
-		s.mu.Unlock()
+		s.sweepMu.Unlock()
 	})
 	return s
 }
@@ -161,19 +197,38 @@ func (s *Subscriptions) Self() *Member {
 	return s.membership.Self()
 }
 
+func (s *Subscriptions) shardFor(id string) *subscriptionShard {
+	return &s.shards[xxhash.Sum64String(id)&(subscriptionShards-1)]
+}
+
+// groupByShard buckets topic IDs (given as indices into a caller's slice) by
+// the shard that owns them, so a multi-topic operation locks each shard
+// exactly once.
+func (s *Subscriptions) groupByShard(ids []string) map[*subscriptionShard][]int {
+	grouped := make(map[*subscriptionShard][]int)
+	for i, id := range ids {
+		shard := s.shardFor(id)
+		grouped[shard] = append(grouped[shard], i)
+	}
+	return grouped
+}
+
 // lockTopic and unlockTopic mirror Ownership's key locks: they serialize a
 // topic's registry writes so a first-subscribe racing a last-unsubscribe can
 // never interleave as put-then-delete — a live stream with no row behind it,
-// which would silently stop delivery to this server for the topic.
+// which would silently stop delivery to this server for the topic. The lock
+// objects live in the topic's shard; the shard lock is held only to find or
+// drop them, never while the topic lock is taken.
 func (s *Subscriptions) lockTopic(id string) *keyLock {
-	s.mu.Lock()
-	kl := s.topicLocks[id]
+	shard := s.shardFor(id)
+	shard.mu.Lock()
+	kl := shard.topicLocks[id]
 	if kl == nil {
 		kl = &keyLock{}
-		s.topicLocks[id] = kl
+		shard.topicLocks[id] = kl
 	}
 	kl.refs++
-	s.mu.Unlock()
+	shard.mu.Unlock()
 
 	kl.mu.Lock()
 	return kl
@@ -182,12 +237,40 @@ func (s *Subscriptions) lockTopic(id string) *keyLock {
 func (s *Subscriptions) unlockTopic(id string, kl *keyLock) {
 	kl.mu.Unlock()
 
-	s.mu.Lock()
+	shard := s.shardFor(id)
+	shard.mu.Lock()
 	kl.refs--
 	if kl.refs == 0 {
-		delete(s.topicLocks, id)
+		delete(shard.topicLocks, id)
 	}
-	s.mu.Unlock()
+	shard.mu.Unlock()
+}
+
+// lockTopics takes the distinct topic locks for ids in sorted order:
+// concurrent multi-topic operations with overlapping topic sets always
+// contend in the same order, and the single-topic operations hold at most one
+// of these locks at a time, so no cycle can form. The returned func releases
+// them all.
+func (s *Subscriptions) lockTopics(ids []string) (unlock func()) {
+	seen := make(map[string]struct{}, len(ids))
+	distinct := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		distinct = append(distinct, id)
+	}
+	sort.Strings(distinct)
+	locks := make([]*keyLock, len(distinct))
+	for i, id := range distinct {
+		locks[i] = s.lockTopic(id)
+	}
+	return func() {
+		for i, id := range distinct {
+			s.unlockTopic(id, locks[i])
+		}
+	}
 }
 
 // Subscribe registers a local stream's interest in the topic. The first local
@@ -202,18 +285,19 @@ func (s *Subscriptions) Subscribe(ctx context.Context, namespace string, key []b
 	kl := s.lockTopic(id)
 	defer s.unlockTopic(id, kl)
 
-	s.mu.Lock()
-	if s.draining {
-		s.mu.Unlock()
+	shard := s.shardFor(id)
+	shard.mu.Lock()
+	if s.draining.Load() {
+		shard.mu.Unlock()
 		return nil, ErrSubscriptionsDraining
 	}
-	if t, ok := s.local[id]; ok {
+	if t, ok := shard.local[id]; ok {
 		t.refs++
 		gen := t.gen
-		s.mu.Unlock()
+		shard.mu.Unlock()
 		return s.handle(namespace, key, gen), nil
 	}
-	s.mu.Unlock()
+	shard.mu.Unlock()
 
 	// First local subscriber: the row must exist before the handle does, or a
 	// publish resolved in between would miss a stream the caller believes is
@@ -222,11 +306,11 @@ func (s *Subscriptions) Subscribe(ctx context.Context, namespace string, key []b
 		return nil, err
 	}
 
-	s.mu.Lock()
-	if s.draining {
+	shard.mu.Lock()
+	if s.draining.Load() {
 		// Lost the race with Drain's cutoff: the bulk delete may have run
 		// before our row landed, so hand it back ourselves.
-		s.mu.Unlock()
+		shard.mu.Unlock()
 		deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subscriptionOpTimeout)
 		defer cancel()
 		if err := s.store.DeleteSubscription(deleteCtx, namespace, key, s.membership.Self().InstanceID); err != nil {
@@ -236,18 +320,17 @@ func (s *Subscriptions) Subscribe(ctx context.Context, namespace string, key []b
 		}
 		return nil, ErrSubscriptionsDraining
 	}
-	s.nextGen++
-	s.local[id] = &localTopic{
+	gen := s.nextGen.Add(1)
+	shard.local[id] = &localTopic{
 		namespace: namespace,
 		key:       append([]byte(nil), key...),
 		refs:      1,
-		gen:       s.nextGen,
+		gen:       gen,
 	}
-	gen := s.nextGen
 	// Invalidate so a local publish resolved before the row landed doesn't
 	// keep excluding self for the rest of the cache window.
-	delete(s.cache, id)
-	s.mu.Unlock()
+	delete(shard.cache, id)
+	shard.mu.Unlock()
 
 	return s.handle(namespace, key, gen), nil
 }
@@ -270,56 +353,36 @@ func (s *Subscriptions) SubscribeAll(ctx context.Context, topics []SubscriptionT
 		return nil, ErrObserverMembership
 	}
 
-	// One lock per distinct topic, acquired in sorted order: concurrent
-	// SubscribeAll calls with overlapping topic sets always contend in the
-	// same order, and the single-topic operations hold at most one of these
-	// locks at a time, so no cycle can form.
 	ids := make([]string, len(topics))
 	for i, t := range topics {
 		ids[i] = ownedKeyID(t.Namespace, t.Key)
 	}
-	seen := make(map[string]struct{}, len(ids))
-	distinct := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		distinct = append(distinct, id)
-	}
-	sort.Strings(distinct)
-	locks := make([]*keyLock, len(distinct))
-	for i, id := range distinct {
-		locks[i] = s.lockTopic(id)
-	}
-	defer func() {
-		for i, id := range distinct {
-			s.unlockTopic(id, locks[i])
-		}
-	}()
+	defer s.lockTopics(ids)()
+	byShard := s.groupByShard(ids)
 
 	// Holding every topic lock freezes the registrations: a topic present in
 	// local cannot lose its row to a concurrent last-unsubscribe, and an
-	// absent one cannot gain a registration. Classify, then write only what
-	// is missing.
-	s.mu.Lock()
-	if s.draining {
-		s.mu.Unlock()
+	// absent one cannot gain a registration. Classify — each shard locked
+	// once — then write only what is missing.
+	if s.draining.Load() {
 		return nil, ErrSubscriptionsDraining
 	}
 	var missing []SubscriptionTopic
 	missingIDs := make(map[string]struct{})
-	for i, t := range topics {
-		if _, ok := s.local[ids[i]]; ok {
-			continue
+	for shard, indices := range byShard {
+		shard.mu.Lock()
+		for _, i := range indices {
+			if _, ok := shard.local[ids[i]]; ok {
+				continue
+			}
+			if _, dup := missingIDs[ids[i]]; dup {
+				continue
+			}
+			missingIDs[ids[i]] = struct{}{}
+			missing = append(missing, topics[i])
 		}
-		if _, dup := missingIDs[ids[i]]; dup {
-			continue
-		}
-		missingIDs[ids[i]] = struct{}{}
-		missing = append(missing, t)
+		shard.mu.Unlock()
 	}
-	s.mu.Unlock()
 
 	// The rows must exist before the handles do, for the same reason as in
 	// Subscribe: a publish resolved in between would miss streams the caller
@@ -330,39 +393,74 @@ func (s *Subscriptions) SubscribeAll(ctx context.Context, topics []SubscriptionT
 		}
 	}
 
-	s.mu.Lock()
-	if s.draining {
-		// Lost the race with Drain's cutoff, exactly as in Subscribe: the bulk
-		// delete may have run before the batch landed, so hand the rows back.
-		s.mu.Unlock()
-		deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subscriptionOpTimeout)
-		defer cancel()
-		if err := s.store.DeleteSubscriptions(deleteCtx, missing, s.membership.Self().InstanceID); err != nil {
-			s.log.With(zap.Error(err)).Warn("Failed to hand back subscription rows acquired during drain")
-		}
-		return nil, ErrSubscriptionsDraining
-	}
+	// Register — each shard locked once. Drain's latch is re-checked under
+	// every shard lock, exactly as in Subscribe: a shard registered before the
+	// latch is swept by Drain (which visits every shard after setting it), and
+	// one that observes the latch stops here. Either way no registration
+	// outlives the drain, so on the latch the batch is undone: registrations
+	// already landed are released and every row written above is handed back.
 	handles := make([]*SubscriptionHandle, len(topics))
-	for i, t := range topics {
-		lt, ok := s.local[ids[i]]
-		if !ok {
-			s.nextGen++
-			lt = &localTopic{
-				namespace: t.Namespace,
-				key:       append([]byte(nil), t.Key...),
-				gen:       s.nextGen,
+	var registered []int
+	for shard, indices := range byShard {
+		shard.mu.Lock()
+		if s.draining.Load() {
+			shard.mu.Unlock()
+			s.rollBackRegistrations(ids, registered)
+			deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subscriptionOpTimeout)
+			defer cancel()
+			if err := s.store.DeleteSubscriptions(deleteCtx, missing, s.membership.Self().InstanceID); err != nil {
+				s.log.With(zap.Error(err)).Warn("Failed to hand back subscription rows acquired during drain")
 			}
-			s.local[ids[i]] = lt
-			// Invalidate so a local publish resolved before the row landed
-			// doesn't keep excluding self for the rest of the cache window.
-			delete(s.cache, ids[i])
+			return nil, ErrSubscriptionsDraining
 		}
-		lt.refs++
-		handles[i] = s.handle(t.Namespace, t.Key, lt.gen)
+		for _, i := range indices {
+			lt, ok := shard.local[ids[i]]
+			if !ok {
+				lt = &localTopic{
+					namespace: topics[i].Namespace,
+					key:       append([]byte(nil), topics[i].Key...),
+					gen:       s.nextGen.Add(1),
+				}
+				shard.local[ids[i]] = lt
+				// Invalidate so a local publish resolved before the row landed
+				// doesn't keep excluding self for the rest of the cache window.
+				delete(shard.cache, ids[i])
+			}
+			lt.refs++
+			handles[i] = s.handle(topics[i].Namespace, topics[i].Key, lt.gen)
+		}
+		registered = append(registered, indices...)
+		shard.mu.Unlock()
 	}
-	s.mu.Unlock()
 
 	return handles, nil
+}
+
+// rollBackRegistrations undoes the refcounts SubscribeAll landed before it
+// observed the drain latch. The topic locks are still held, so the only other
+// mutator is Drain, which clears whole shards; a topic it already cleared is
+// simply absent here.
+func (s *Subscriptions) rollBackRegistrations(ids []string, indices []int) {
+	byShard := make(map[*subscriptionShard][]int)
+	for _, i := range indices {
+		shard := s.shardFor(ids[i])
+		byShard[shard] = append(byShard[shard], i)
+	}
+	for shard, shardIndices := range byShard {
+		shard.mu.Lock()
+		for _, i := range shardIndices {
+			t, ok := shard.local[ids[i]]
+			if !ok {
+				continue
+			}
+			t.refs--
+			if t.refs == 0 {
+				delete(shard.local, ids[i])
+				delete(shard.cache, ids[i])
+			}
+		}
+		shard.mu.Unlock()
+	}
 }
 
 // CloseAll releases every handle in one pass, batching the registry deletes
@@ -398,52 +496,36 @@ func (s *Subscriptions) CloseAll(ctx context.Context, handles []*SubscriptionHan
 		return foreignErr
 	}
 
-	// Sorted distinct topic locks, as in SubscribeAll and for the same
-	// reason: batches contend in one canonical order.
 	ids := make([]string, len(pending))
 	for i, h := range pending {
 		ids[i] = ownedKeyID(h.namespace, h.key)
 	}
-	seen := make(map[string]struct{}, len(ids))
-	distinct := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		distinct = append(distinct, id)
-	}
-	sort.Strings(distinct)
-	locks := make([]*keyLock, len(distinct))
-	for i, id := range distinct {
-		locks[i] = s.lockTopic(id)
-	}
-	defer func() {
-		for i, id := range distinct {
-			s.unlockTopic(id, locks[i])
-		}
-	}()
+	defer s.lockTopics(ids)()
 
-	// Decrement every registration, collecting the topics this batch emptied;
-	// the stale-handle guards mirror unsubscribe exactly.
-	s.mu.Lock()
+	// Decrement every registration — each shard locked once — collecting the
+	// topics this batch emptied; the stale-handle guards mirror unsubscribe
+	// exactly.
 	var emptied []SubscriptionTopic
-	for i, h := range pending {
-		t, ok := s.local[ids[i]]
-		if !ok || t.gen != h.gen {
-			// Drained out from under the handle, or a successor registration
-			// occupies the slot; nothing of ours to release.
-			continue
+	for shard, indices := range s.groupByShard(ids) {
+		shard.mu.Lock()
+		for _, i := range indices {
+			h := pending[i]
+			t, ok := shard.local[ids[i]]
+			if !ok || t.gen != h.gen {
+				// Drained out from under the handle, or a successor registration
+				// occupies the slot; nothing of ours to release.
+				continue
+			}
+			t.refs--
+			if t.refs > 0 {
+				continue
+			}
+			delete(shard.local, ids[i])
+			delete(shard.cache, ids[i])
+			emptied = append(emptied, SubscriptionTopic{Namespace: h.namespace, Key: h.key})
 		}
-		t.refs--
-		if t.refs > 0 {
-			continue
-		}
-		delete(s.local, ids[i])
-		delete(s.cache, ids[i])
-		emptied = append(emptied, SubscriptionTopic{Namespace: h.namespace, Key: h.key})
+		shard.mu.Unlock()
 	}
-	s.mu.Unlock()
 
 	if len(emptied) > 0 {
 		if err := s.store.DeleteSubscriptions(ctx, emptied, s.membership.Self().InstanceID); err != nil {
@@ -467,28 +549,29 @@ func (s *Subscriptions) unsubscribe(ctx context.Context, namespace string, key [
 	kl := s.lockTopic(id)
 	defer s.unlockTopic(id, kl)
 
-	s.mu.Lock()
-	t, ok := s.local[id]
+	shard := s.shardFor(id)
+	shard.mu.Lock()
+	t, ok := shard.local[id]
 	if !ok {
 		// Drained out from under the handle; the bulk path removed the row.
-		s.mu.Unlock()
+		shard.mu.Unlock()
 		return nil
 	}
 	if t.gen != gen {
 		// The handle's registration is already gone (drained, then the slot
 		// re-created by a post-Resume Subscribe); the current registration's
 		// refcount belongs to its own handles.
-		s.mu.Unlock()
+		shard.mu.Unlock()
 		return nil
 	}
 	t.refs--
 	if t.refs > 0 {
-		s.mu.Unlock()
+		shard.mu.Unlock()
 		return nil
 	}
-	delete(s.local, id)
-	delete(s.cache, id)
-	s.mu.Unlock()
+	delete(shard.local, id)
+	delete(shard.cache, id)
+	shard.mu.Unlock()
 
 	// A failed delete leaves a stale self row: publishers waste a forward
 	// here until a later local resolution notices the refcount-less row and
@@ -503,19 +586,20 @@ func (s *Subscriptions) unsubscribe(ctx context.Context, namespace string, key [
 // of event rate.
 func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key []byte) ([]*Subscription, error) {
 	id := ownedKeyID(namespace, key)
+	shard := s.shardFor(id)
 
-	s.mu.Lock()
-	if entry, ok := s.cache[id]; ok {
+	shard.mu.Lock()
+	if entry, ok := shard.cache[id]; ok {
 		if time.Now().Before(entry.expires) {
 			out := cloneSubscriptions(entry.subs)
-			s.mu.Unlock()
+			shard.mu.Unlock()
 			return out, nil
 		}
 		// Prune on read, like the redirect cache: leaving expired entries
 		// around would grow the map by every topic resolved in between.
-		delete(s.cache, id)
+		delete(shard.cache, id)
 	}
-	s.mu.Unlock()
+	shard.mu.Unlock()
 
 	rows, err := s.store.GetSubscribers(ctx, namespace, key)
 	if err != nil {
@@ -533,7 +617,7 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 	// corpse candidate: only an instance with no membership observation at all
 	// (its registry record gone from scans) can be a crashed instance's
 	// leftover. Snapshot which not-live row instances are still observed
-	// before taking the runtime lock.
+	// before taking any runtime lock.
 	observed := make(map[string]bool, len(rows))
 	for _, row := range rows {
 		if _, isLive := live[row.InstanceID]; isLive || observed[row.InstanceID] {
@@ -546,11 +630,44 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 	self := s.membership.Self()
 	now := time.Now()
 
-	s.mu.Lock()
-	_, locallySubscribed := s.local[id]
+	// The corpse clock, under its own lock: live members clear their anchor,
+	// not-live ones are excluded from delivery immediately — correctness
+	// never waits on cleanup — and those whose member stays wholly unobserved
+	// past RowGCAfter are crashed instances' leftovers (drains clean up after
+	// themselves), swept so hot topics don't accumulate garbage.
+	var corpseRows []*Subscription
+	s.sweepMu.Lock()
+	for _, row := range rows {
+		if _, isLive := live[row.InstanceID]; isLive {
+			delete(s.unknownSince, row.InstanceID)
+			continue
+		}
+		if self != nil && row.InstanceID == self.InstanceID {
+			continue
+		}
+		if observed[row.InstanceID] {
+			// A registry record still backs this member: it is slow or
+			// transiently unseen, not dead. Re-anchor so a stale first-sighting
+			// can never age into sweeping a live subscriber's row.
+			s.unknownSince[row.InstanceID] = now
+			continue
+		}
+		first, seen := s.unknownSince[row.InstanceID]
+		if !seen {
+			s.unknownSince[row.InstanceID] = now
+		} else if now.Sub(first) >= s.cfg.RowGCAfter {
+			corpseRows = append(corpseRows, row)
+		}
+	}
+	s.sweepMu.Unlock()
+
+	// Self is judged against the local refcounts and the result cached in the
+	// same critical section, so a registration landing in between cannot be
+	// papered over by a cache entry that excludes self for a whole TTL.
+	shard.mu.Lock()
+	_, locallySubscribed := shard.local[id]
 
 	subs := make([]*Subscription, 0, len(rows))
-	var corpseRows []*Subscription
 	selfInRows := false
 	staleSelfRow := false
 	for _, row := range rows {
@@ -568,29 +685,8 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 				staleSelfRow = true
 			}
 		case isLive:
-			delete(s.unknownSince, row.InstanceID)
 			row.Address = addr
 			subs = append(subs, row)
-		default:
-			// Not live: excluded from delivery immediately — correctness
-			// never waits on cleanup. Rows whose member stays wholly
-			// unobserved past RowGCAfter are crashed instances' leftovers
-			// (drains clean up after themselves): sweep them so hot topics
-			// don't accumulate garbage.
-			if observed[row.InstanceID] {
-				// A registry record still backs this member: it is slow or
-				// transiently unseen, not dead. Re-anchor so a stale
-				// first-sighting can never age into sweeping a live
-				// subscriber's row.
-				s.unknownSince[row.InstanceID] = now
-				break
-			}
-			first, seen := s.unknownSince[row.InstanceID]
-			if !seen {
-				s.unknownSince[row.InstanceID] = now
-			} else if now.Sub(first) >= s.cfg.RowGCAfter {
-				corpseRows = append(corpseRows, row)
-			}
 		}
 	}
 	if locallySubscribed && !selfInRows {
@@ -605,11 +701,11 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 		})
 	}
 
-	s.cache[id] = subscriberCacheEntry{
+	shard.cache[id] = subscriberCacheEntry{
 		subs:    cloneSubscriptions(subs),
 		expires: now.Add(s.cfg.CacheTTL),
 	}
-	s.mu.Unlock()
+	shard.mu.Unlock()
 
 	if locallySubscribed && !selfInRows {
 		go s.reassertRow(namespace, key)
@@ -630,15 +726,20 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 // stops counting anyway once this member's heartbeats stop, and is swept as a
 // corpse row after RowGCAfter.
 func (s *Subscriptions) Drain(ctx context.Context) error {
-	s.mu.Lock()
-	s.draining = true
-	topics := make([]*localTopic, 0, len(s.local))
-	for _, t := range s.local {
-		topics = append(topics, t)
+	// The latch goes up before any shard is visited (see draining).
+	s.draining.Store(true)
+
+	var topics []*localTopic
+	for i := range s.shards {
+		shard := &s.shards[i]
+		shard.mu.Lock()
+		for _, t := range shard.local {
+			topics = append(topics, t)
+		}
+		clear(shard.local)
+		clear(shard.cache)
+		shard.mu.Unlock()
 	}
-	clear(s.local)
-	clear(s.cache)
-	s.mu.Unlock()
 
 	if len(topics) > 0 {
 		rows := make([]SubscriptionTopic, len(topics))
@@ -656,22 +757,40 @@ func (s *Subscriptions) Drain(ctx context.Context) error {
 // shutdown after Drain. Drained registrations are gone — consumers re-register
 // as their streams reopen.
 func (s *Subscriptions) Resume() {
-	s.mu.Lock()
-	s.draining = false
-	s.mu.Unlock()
+	s.draining.Store(false)
+}
+
+// localTopics snapshots every registration across the shards.
+func (s *Subscriptions) localTopics() []*localTopic {
+	var topics []*localTopic
+	for i := range s.shards {
+		shard := &s.shards[i]
+		shard.mu.Lock()
+		for _, t := range shard.local {
+			topics = append(topics, t)
+		}
+		shard.mu.Unlock()
+	}
+	return topics
+}
+
+// hasLocal reports whether the topic is registered locally.
+func (s *Subscriptions) hasLocal(id string) bool {
+	shard := s.shardFor(id)
+	shard.mu.Lock()
+	_, ok := shard.local[id]
+	shard.mu.Unlock()
+	return ok
 }
 
 // reassertLocal re-puts every locally held topic's row after a liveness
 // session interruption (see NewSubscriptions).
 func (s *Subscriptions) reassertLocal(ctx context.Context) {
-	s.mu.Lock()
-	draining := s.draining
-	topics := make([]*localTopic, 0, len(s.local))
-	for _, t := range s.local {
-		topics = append(topics, t)
+	if s.draining.Load() {
+		return
 	}
-	s.mu.Unlock()
-	if draining || len(topics) == 0 {
+	topics := s.localTopics()
+	if len(topics) == 0 {
 		return
 	}
 
@@ -703,11 +822,7 @@ func (s *Subscriptions) reassertRow(namespace string, key []byte) {
 	kl := s.lockTopic(id)
 	defer s.unlockTopic(id, kl)
 
-	s.mu.Lock()
-	_, hasLocal := s.local[id]
-	draining := s.draining
-	s.mu.Unlock()
-	if !hasLocal || draining {
+	if !s.hasLocal(id) || s.draining.Load() {
 		return
 	}
 
@@ -725,11 +840,7 @@ func (s *Subscriptions) reassertRow(namespace string, key []byte) {
 	// the process. Same shape as Subscribe's post-write re-check — hand the
 	// row back ourselves. (Under the topic lock local[id] can only go from
 	// present to absent: a re-creating Subscribe is blocked on the lock.)
-	s.mu.Lock()
-	_, hasLocal = s.local[id]
-	draining = s.draining
-	s.mu.Unlock()
-	if hasLocal && !draining {
+	if s.hasLocal(id) && !s.draining.Load() {
 		return
 	}
 	if err := s.store.DeleteSubscription(ctx, namespace, key, s.membership.Self().InstanceID); err != nil {
@@ -747,10 +858,7 @@ func (s *Subscriptions) sweepSelfRow(namespace string, key []byte) {
 	kl := s.lockTopic(id)
 	defer s.unlockTopic(id, kl)
 
-	s.mu.Lock()
-	_, hasLocal := s.local[id]
-	s.mu.Unlock()
-	if hasLocal {
+	if s.hasLocal(id) {
 		return
 	}
 

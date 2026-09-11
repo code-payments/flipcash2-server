@@ -399,16 +399,30 @@ func (e *serverEnv) waitForChatUpdate(recipient *commonpb.UserId, match func(*ev
 	}, 250*time.Millisecond, 50*time.Millisecond, "timed out waiting for chat update")
 }
 
+// carriesSentMessage reports whether the update introduces msgID as a
+// message_sent event. A send rides only the event log — the deprecated
+// new_messages field is no longer populated — so this is the one carrier to
+// assert on.
+func carriesSentMessage(u *eventpb.ChatUpdate, msgID uint64) bool {
+	for _, ev := range u.GetEvents().GetEvents() {
+		for _, mut := range ev.GetMutations() {
+			if s := mut.GetMessageSent(); s != nil && s.MessageId.Value == msgID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // waitForNewMessage blocks until recipient observes a broadcast carrying msgID.
 func (e *serverEnv) waitForNewMessage(recipient *commonpb.UserId, msgID uint64) {
 	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
-		return u.NewMessages != nil && containsMessage(u.NewMessages.Messages, msgID)
+		return carriesSentMessage(u, msgID)
 	})
 }
 
 // waitForMessageDeleted blocks until recipient observes a message_deleted event
-// for msgID. A delete rides only the event log, so this asserts on Events (not the
-// deprecated new_messages, which a delete never populates).
+// for msgID.
 func (e *serverEnv) waitForMessageDeleted(recipient *commonpb.UserId, msgID uint64) {
 	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
 		if u.Events == nil {
@@ -426,8 +440,7 @@ func (e *serverEnv) waitForMessageDeleted(recipient *commonpb.UserId, msgID uint
 }
 
 // waitForMessageEdited blocks until recipient observes a message_edited event for
-// msgID. An edit rides only the event log, so this asserts on Events (not the
-// deprecated new_messages, which an edit never populates).
+// msgID.
 func (e *serverEnv) waitForMessageEdited(recipient *commonpb.UserId, msgID uint64) {
 	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
 		if u.Events == nil {
@@ -448,7 +461,7 @@ func (e *serverEnv) waitForMessageEdited(recipient *commonpb.UserId, msgID uint6
 // recipient — used to assert a retried send doesn't re-broadcast.
 func (e *serverEnv) countNewMessages(recipient *commonpb.UserId, msgID uint64) (n int) {
 	for _, u := range e.chatUpdatesFor(recipient) {
-		if u.NewMessages != nil && containsMessage(u.NewMessages.Messages, msgID) {
+		if carriesSentMessage(u, msgID) {
 			n++
 		}
 	}
@@ -825,10 +838,10 @@ func testServer_SendMessage_Broadcast(t *testing.T, badges badge.Store, blocklis
 	require.Equal(t, id, resp.Message.EventSequence)
 
 	// userB receives a single ChatUpdate carrying the send as a gap-detected,
-	// single-mutation message_sent event (sequenced at its event_sequence) and, for
-	// old clients, the same message in the deprecated new_messages; alongside a
-	// last-activity metadata update and the sender's auto-advanced READ pointer (the
-	// sender has implicitly read their own message).
+	// single-mutation message_sent event (sequenced at its event_sequence) and
+	// nothing in the deprecated new_messages field; alongside a last-activity
+	// metadata update and the sender's auto-advanced READ pointer (the sender has
+	// implicitly read their own message).
 	e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
 		if u.Events == nil || len(u.Events.Events) != 1 {
 			return false
@@ -841,7 +854,7 @@ func testServer_SendMessage_Broadcast(t *testing.T, badges badge.Store, blocklis
 		if sent == nil || sent.MessageId.Value != id || sent.EventSequence != id {
 			return false
 		}
-		return u.NewMessages != nil && containsMessage(u.NewMessages.Messages, id) &&
+		return u.NewMessages == nil &&
 			len(u.MetadataUpdates) > 0 &&
 			u.PointerUpdates != nil && hasPointer(u.PointerUpdates.Pointers, messagingpb.Pointer_READ, e.userA, id)
 	})
@@ -1303,7 +1316,7 @@ func testServer_AdvancePointer_GroupNotBroadcast(t *testing.T, badges badge.Stor
 	// READ pointer riding along.
 	e.waitForNewMessage(e.userB, msgID.Value)
 	for _, u := range e.chatUpdatesFor(e.userB) {
-		if u.NewMessages != nil && containsMessage(u.NewMessages.Messages, msgID.Value) {
+		if carriesSentMessage(u, msgID.Value) {
 			require.Nil(t, u.PointerUpdates, "a group send must not carry the sender's pointer")
 		}
 	}

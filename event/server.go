@@ -55,11 +55,24 @@ func chatStreamKey(chatID *commonpb.ChatId) string {
 }
 
 const (
-	maxEventBatchSize = 1024
+	// maxEventBatchSize and maxEventBatchBytes cap the events coalesced into
+	// one stream message. The count sits under the EventBatch proto limit
+	// (1024); the byte budget keeps a batch of the largest events — a maximal
+	// text message rides twice in its update, ~32KB — well under the 4MB gRPC
+	// default receive limit on clients, which a count cap alone cannot promise.
+	// The drain stops once the budget is reached, so a batch overshoots it by
+	// at most one event.
+	maxEventBatchSize  = 256
+	maxEventBatchBytes = 1 << 20
 
-	streamBufferSize   = 64
+	// streamBufferSize is how far a stream's handler may fall behind the
+	// publish rate before Notify closes it (see EventStream). The buffer holds
+	// shared event pointers — 2KB per stream at this size — so the ceiling is
+	// a burst-headroom choice, not a memory one. It stays under the delta
+	// sync's reset threshold so a lag-closed client catches up on the cheap
+	// path rather than a full reload.
+	streamBufferSize   = 256
 	streamPingDelay    = 5 * time.Second
-	streamTimeout      = time.Second
 	streamSendTimeout  = 5 * time.Second
 	streamPongTimeout  = 2 * streamPingDelay
 	streamInitTsWindow = 2 * time.Minute
@@ -71,7 +84,11 @@ const (
 	// last local holder of go out as a single batched delete (CloseAll).
 	subscriptionCloseTimeout = 2 * time.Second
 
-	forwardRpcTimeout = 250 * time.Millisecond
+	// forwardRpcTimeout bounds one forwarding RPC, which now carries a batch
+	// (see outboxes): the receiver's cost is a non-blocking notify per local
+	// stream per event, so even a full batch across thousands of streams is
+	// tens of milliseconds, and the bound is for a wedged peer, not pacing.
+	forwardRpcTimeout = time.Second
 )
 
 // localStream is one open stream in the local registry, carrying the user it
@@ -79,7 +96,7 @@ const (
 // chat), and chat-keyed delivery needs the owner to honor per-user exclusions,
 // which the stream object itself cannot say.
 type localStream struct {
-	stream Stream[[]*eventpb.Event]
+	stream Stream[*eventpb.Event]
 	userID *commonpb.UserId
 }
 
@@ -162,14 +179,7 @@ func NewServer(
 		internalAuth: internalrpc.NewAuthenticator(currentRpcApiKey),
 	}
 
-	s.forwarder = &eventForwarder{
-		log:            log,
-		subscriptions:  subscriptions,
-		pool:           sharedForwardingPool(log),
-		apiKey:         currentRpcApiKey,
-		selfInstanceID: s.self.InstanceID,
-		deliverLocal:   s.deliverLocal,
-	}
+	s.forwarder = newEventForwarder(log, subscriptions, currentRpcApiKey, s.self.InstanceID, s.deliverLocal)
 
 	userEventBus.AddHandler(HandlerFunc[*commonpb.UserId, *eventpb.Event](s.OnEvent))
 	chatEventBus.AddHandler(HandlerFunc[*commonpb.ChatId, *eventpb.ChatEvent](s.OnChatEvent))
@@ -245,46 +255,7 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 		staleEventDetectors[i] = ctor()
 	}
 
-	ss := NewProtoEventStream(
-		streamID,
-		streamBufferSize,
-		func(events []*eventpb.Event) (*eventpb.EventBatch, bool) {
-			if len(events) > maxEventBatchSize {
-				log.Warn("Event batch size exceeds proto limit")
-				return nil, false
-			}
-
-			if len(events) == 0 {
-				return nil, false
-			}
-
-			var eventsToSend []*eventpb.Event
-			for _, event := range events {
-				log := log.With(zap.String("event_id", EventIDString(event.Id)))
-
-				var isDropped bool
-				for _, staleEventDetector := range staleEventDetectors {
-					if staleEventDetector.ShouldDrop(event) {
-						isDropped = true
-						break
-					}
-				}
-
-				if isDropped {
-					log.Debug("Dropping stale event")
-					continue
-				}
-
-				log.Debug("Sending event to client in batch")
-				eventsToSend = append(eventsToSend, event)
-			}
-
-			if len(eventsToSend) == 0 {
-				return nil, false
-			}
-			return &eventpb.EventBatch{Events: eventsToSend}, true
-		},
-	)
+	ss := NewEventStream[*eventpb.Event](streamID, streamBufferSize)
 
 	// The stream serves the user's own topic plus one topic per group chat
 	// they are joined to, so group publishers can resolve the hosting servers
@@ -350,8 +321,19 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 		cancel()
 	}()
 
-	sendPingCh := time.After(0)
-	streamHealthCh := protoutil.MonitorStreamHealth(ctx, log, stream, streamPongTimeout, func(t *eventpb.StreamEventsRequest) bool {
+	// The stream's steady-state cost is fixed at open: one send goroutine, one
+	// receive goroutine, a ping ticker and a pong deadline timer — nothing is
+	// allocated per event or per ping, however long the stream lives.
+	sender := protoutil.NewSender[eventpb.StreamEventsResponse](stream, streamSendTimeout)
+	defer sender.Close()
+
+	// The pong deadline starts before the first ping goes out, so it is the
+	// earlier of the two whenever a silent client's deadline and a ping tick
+	// coincide (see the ping case below).
+	pongTimer := time.NewTimer(streamPongTimeout)
+	defer pongTimer.Stop()
+
+	pongs := protoutil.Heartbeats(stream, func(t *eventpb.StreamEventsRequest) bool {
 		pong := t.GetPong()
 		if pong == nil {
 			return false
@@ -364,42 +346,74 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 		return true
 	})
 
+	sendPing := func() error {
+		log.Debug("Sending ping to client")
+		return sender.Send(ctx, &eventpb.StreamEventsResponse{
+			Type: &eventpb.StreamEventsResponse_Ping{
+				Ping: &eventpb.ServerPing{
+					Timestamp: timestamppb.Now(),
+					PingDelay: durationpb.New(streamPingDelay),
+				},
+			},
+		})
+	}
+
+	// First ping immediately, then on the tick.
+	if err := sendPing(); err != nil {
+		log.Debug("Stream is unhealthy; aborting")
+		return status.Error(codes.Aborted, "terminating unhealthy stream")
+	}
+	pingTicker := time.NewTicker(streamPingDelay)
+	defer pingTicker.Stop()
+
 	for {
 		select {
-		case batch, ok := <-ss.Channel():
+		case first, ok := <-ss.Channel():
 			if !ok {
 				log.Debug("Stream closed; ending stream")
 				return status.Error(codes.Aborted, "stream closed")
 			}
 
-			log.Debug("Sending events to client stream")
-			err = protoutil.BoundedSend(ctx, stream, &eventpb.StreamEventsResponse{
+			// Everything that queued up during the previous send goes out in
+			// this one message, so a burst costs the client one receive and
+			// the handler one send regardless of how many events it spans.
+			batch := selectEvents(log, staleEventDetectors, drainReady(ss.Channel(), first, maxEventBatchSize, maxEventBatchBytes, eventSize))
+			if batch == nil {
+				continue
+			}
+
+			log.Debug("Sending events to client stream", zap.Int("events", len(batch.Events)))
+			err = sender.Send(ctx, &eventpb.StreamEventsResponse{
 				Type: &eventpb.StreamEventsResponse_Events{
 					Events: batch,
 				},
-			}, streamSendTimeout)
+			})
 			if err != nil {
 				log.Info("Failed to send events to client stream", zap.Error(err))
 				return err
 			}
-		case <-sendPingCh:
-			log.Debug("Sending ping to client")
+		case <-pingTicker.C:
+			// A pong deadline that has already passed takes precedence over
+			// the tick: a client that has gone silent for the whole window is
+			// not owed one more ping.
+			select {
+			case <-pongTimer.C:
+				log.Debug("Stream is unhealthy; aborting")
+				return status.Error(codes.Aborted, "terminating unhealthy stream")
+			default:
+			}
 
-			sendPingCh = time.After(streamPingDelay)
-
-			err := protoutil.BoundedSend(ctx, stream, &eventpb.StreamEventsResponse{
-				Type: &eventpb.StreamEventsResponse_Ping{
-					Ping: &eventpb.ServerPing{
-						Timestamp: timestamppb.Now(),
-						PingDelay: durationpb.New(streamPingDelay),
-					},
-				},
-			}, streamSendTimeout)
-			if err != nil {
+			if err := sendPing(); err != nil {
 				log.Debug("Stream is unhealthy; aborting")
 				return status.Error(codes.Aborted, "terminating unhealthy stream")
 			}
-		case <-streamHealthCh:
+		case _, ok := <-pongs:
+			if !ok {
+				log.Debug("Stream is unhealthy; aborting")
+				return status.Error(codes.Aborted, "terminating unhealthy stream")
+			}
+			pongTimer.Reset(streamPongTimeout)
+		case <-pongTimer.C:
 			log.Debug("Stream is unhealthy; aborting")
 			return status.Error(codes.Aborted, "terminating unhealthy stream")
 		case <-ctx.Done():
@@ -450,7 +464,6 @@ func (s *Server) stampTestHop(e *eventpb.Event) {
 	}
 }
 
-// todo: utilize batching by receiver to optimize internal forwarding RPC calls
 func (s *Server) ForwardUserEvents(ctx context.Context, events ...*eventpb.UserEvent) error {
 	return s.forwarder.ForwardUserEvents(ctx, events...)
 }
@@ -478,13 +491,63 @@ func (s *Server) Shutdown() {
 // skipping streams owned by an excluded user (e.g. the originator of a typing
 // notification on a chat-keyed delivery, where the topic no longer selects
 // recipients per member).
+//
+// The one event pointer is handed to every target: nothing downstream mutates
+// it (the handler only filters and marshals), so a copy per stream would buy
+// nothing but an allocation per member. Notify never blocks, so a chat with
+// thousands of local streams is delivered in one pass whatever any single
+// client is doing — and that pass runs under the registry's read lock rather
+// than over a snapshot, so it allocates nothing per event either.
 func (s *Server) deliverLocal(streamKey string, e *eventpb.Event, exclude []*commonpb.UserId) {
-	for _, stream := range s.streams.targets(streamKey, exclude) {
-		cloned := proto.Clone(e).(*eventpb.Event)
-		if err := stream.Notify([]*eventpb.Event{cloned}, streamTimeout); err != nil {
-			s.log.With(zap.Error(err)).Warn("Failed to notify event on local stream", zap.String("stream_key", streamKey))
+	s.streams.each(streamKey, exclude, func(stream Stream[*eventpb.Event]) {
+		err := stream.Notify(e)
+		switch {
+		case err == nil:
+		case errors.Is(err, errStreamClosed):
+			// Closed (by lag or shutdown) but not yet removed by its handler,
+			// which is winding down: expected, and brief.
+			s.log.Debug("Skipping closed local stream", zap.String("stream_id", stream.ID()))
+		default:
+			s.log.With(zap.Error(err)).Warn(
+				"Failed to notify event on local stream",
+				zap.String("stream_key", streamKey),
+				zap.String("stream_id", stream.ID()),
+			)
+		}
+	})
+}
+
+// selectEvents applies the stream's stale-event detectors to a drained batch
+// and shapes what survives for the wire. It returns nil when nothing does.
+func selectEvents(log *zap.Logger, detectors []StaleEventDetector[*eventpb.Event], events []*eventpb.Event) *eventpb.EventBatch {
+	eventsToSend := make([]*eventpb.Event, 0, len(events))
+	for _, event := range events {
+		if isStale(detectors, event) {
+			log.Debug("Dropping stale event", zap.String("event_id", EventIDString(event.Id)))
+			continue
+		}
+		eventsToSend = append(eventsToSend, event)
+	}
+
+	if len(eventsToSend) == 0 {
+		return nil
+	}
+	return &eventpb.EventBatch{Events: eventsToSend}
+}
+
+// eventSize is the event's wire size. Generated messages cache it, so the
+// marshal that follows reuses the computation rather than repeating it.
+func eventSize(e *eventpb.Event) int {
+	return proto.Size(e)
+}
+
+func isStale(detectors []StaleEventDetector[*eventpb.Event], event *eventpb.Event) bool {
+	for _, detector := range detectors {
+		if detector.ShouldDrop(event) {
+			return true
 		}
 	}
+	return false
 }
 
 func (s *Server) OnEvent(userID *commonpb.UserId, e *eventpb.Event) {

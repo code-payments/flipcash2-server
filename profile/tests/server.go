@@ -1015,7 +1015,7 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 	// The profile principal the pictures are granted to. Asserting on the grant
 	// directly is what proves a picture is actually readable — and, once
 	// superseded, that it is not.
-	principal := blob.PrincipalForProfile(userID)
+	principal := blob.PrincipalForUserProfile(userID)
 	isGranted := func(blobID *blobpb.BlobId) bool {
 		t.Helper()
 		granted, err := access.HasGrant(ctx, blobID, principal, blob.PermissionRead)

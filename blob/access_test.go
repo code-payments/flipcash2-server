@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
@@ -102,8 +103,55 @@ func TestChatResolver_Covers(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok)
 
-	// A non-chat principal is outside this resolver's scope and is never covered.
+	// A non-chat principal is outside this resolver's scope and is never covered
+	// — including the chat's public profile, which is deliberately not a
+	// membership question.
 	ok, err = r.Covers(ctx, PrincipalForUser(member), member)
 	require.NoError(t, err)
 	require.False(t, ok)
+	ok, err = r.Covers(ctx, PrincipalForChatProfile(chatID), member)
+	require.NoError(t, err)
+	require.False(t, ok)
+}
+
+func TestChatProfileResolver_Covers(t *testing.T) {
+	ctx := context.Background()
+
+	member := model.MustGenerateUserID()
+	stranger := model.MustGenerateUserID()
+	chatID := chat.MustGenerateGroupChatID()
+
+	r := NewChatProfileResolver()
+
+	// A chat's profile is public: every caller is covered, member or not, and no
+	// chat store is consulted (the chat need not even exist).
+	for _, user := range []*commonpb.UserId{member, stranger} {
+		ok, err := r.Covers(ctx, PrincipalForChatProfile(chatID), user)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+
+	// Coverage is universal, so the grant must carry the decision: any other
+	// principal type — the chat's members in particular — is outside this
+	// resolver's scope and is never covered through it.
+	for _, principal := range []Principal{PrincipalForChat(chatID), PrincipalForUserProfile(member), PrincipalForUser(member)} {
+		ok, err := r.Covers(ctx, principal, member)
+		require.NoError(t, err)
+		require.False(t, ok)
+	}
+}
+
+func TestGrant_Validate_PrincipalTypes(t *testing.T) {
+	blobID := &blobpb.BlobId{Value: []byte("blob")}
+	chatID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+
+	// Every principal type is a well-formed grant subject.
+	for _, principal := range []Principal{PrincipalForUser(user), PrincipalForChat(chatID), PrincipalForUserProfile(user), PrincipalForChatProfile(chatID)} {
+		require.NoError(t, (&Grant{BlobID: blobID, Principal: principal, Permission: PermissionRead}).Validate())
+	}
+
+	// An unknown type or an empty id is not.
+	require.ErrorIs(t, (&Grant{BlobID: blobID, Principal: Principal{Type: PrincipalTypeUnknown, ID: []byte("x")}, Permission: PermissionRead}).Validate(), ErrInvalidGrant)
+	require.ErrorIs(t, (&Grant{BlobID: blobID, Principal: Principal{Type: PrincipalTypeChatProfile}, Permission: PermissionRead}).Validate(), ErrInvalidGrant)
 }

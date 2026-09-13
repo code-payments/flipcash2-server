@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -178,18 +179,27 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // Members is the full, immutable member set for a DM, and is always empty for
 // a group chat: group membership is mutable and lives in its own store records,
 // which no path that reads the canonical record touches. A caller that needs a
-// group's members reads them explicitly via Store.GetMembers. Title and
-// IsStaffOnly are group-only and zero for DMs.
+// group's members reads them explicitly via Store.GetMembers. Title,
+// IsStaffOnly and PictureBlobID are group-only and zero for DMs.
 //
 // IsStaffOnly marks a group whose membership is restricted to staff users. It
 // is stored state set at creation; enforcing it (on membership changes, reads,
 // and sends) is the server layer's responsibility.
+//
+// PictureBlobID is the blob holding the ORIGINAL rendition of the group's
+// picture, or nil when the group has none. The chat domain stores only that
+// handle: the full rendition set (and its download URLs) is resolved from blob
+// storage by the server layer on read, exactly as a profile picture is. Read
+// access is a blob-domain grant to the chat's members, made when the picture
+// is set (see blob.Integration.SetAsChatPicture), so the record here carries
+// no authorization of its own.
 type Chat struct {
 	ID            *commonpb.ChatId
 	Type          chatpb.ChatType
 	Members       []*commonpb.UserId
 	Title         string
 	IsStaffOnly   bool
+	PictureBlobID *blobpb.BlobId
 	LastActivity  time.Time
 	LastMessageID *messagingpb.MessageId
 }
@@ -199,6 +209,10 @@ func (c *Chat) Clone() *Chat {
 	members := make([]*commonpb.UserId, len(c.Members))
 	for i, m := range c.Members {
 		members[i] = &commonpb.UserId{Value: append([]byte(nil), m.Value...)}
+	}
+	var pictureBlobID *blobpb.BlobId
+	if c.PictureBlobID != nil {
+		pictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), c.PictureBlobID.Value...)}
 	}
 	var lastMessageID *messagingpb.MessageId
 	if c.LastMessageID != nil {
@@ -210,15 +224,18 @@ func (c *Chat) Clone() *Chat {
 		Members:       members,
 		Title:         c.Title,
 		IsStaffOnly:   c.IsStaffOnly,
+		PictureBlobID: pictureBlobID,
 		LastActivity:  c.LastActivity,
 		LastMessageID: lastMessageID,
 	}
 }
 
 // ToProto projects the stored chat onto a chatpb.Metadata. Only the fields
-// owned by the chat domain are populated: chat_id, type, last_activity, and a
-// Member entry per member with just user_id set. The caller is responsible for
-// hydrating member profiles, pointers, and the last message.
+// owned by the chat domain are populated: chat_id, type, title, last_activity,
+// a Member entry per member with just user_id set, and — for a group with a
+// picture — a picture carrying only its ORIGINAL rendition's blob id. The
+// caller is responsible for hydrating member profiles, pointers, the last
+// message, and the picture's resolved rendition set.
 func (c *Chat) ToProto() *chatpb.Metadata {
 	members := make([]*chatpb.Member, len(c.Members))
 	for i, m := range c.Members {
@@ -226,11 +243,20 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 			UserId: &commonpb.UserId{Value: append([]byte(nil), m.Value...)},
 		}
 	}
-	return &chatpb.Metadata{
+	md := &chatpb.Metadata{
 		ChatId:       &commonpb.ChatId{Value: append([]byte(nil), c.ID.Value...)},
 		Type:         c.Type,
 		Members:      members,
 		Title:        c.Title,
 		LastActivity: timestamppb.New(c.LastActivity),
 	}
+	if c.PictureBlobID != nil {
+		md.Picture = &blobpb.Media{
+			Renditions: []*blobpb.Rendition{{
+				Role:   blobpb.Rendition_ORIGINAL,
+				BlobId: &blobpb.BlobId{Value: append([]byte(nil), c.PictureBlobID.Value...)},
+			}},
+		}
+	}
+	return md
 }

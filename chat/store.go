@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -85,6 +86,15 @@ type Store interface {
 	// or unknown user is a no-op. It returns an error if chatID is not a group
 	// chat ID.
 	RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) error
+
+	// SetGroupPicture sets a group chat's picture to the blob holding its
+	// ORIGINAL rendition, replacing any picture already set; a nil blobID clears
+	// it. It touches only the canonical record and performs no validation of the
+	// blob or granting of read access — that is the blob domain's job, done
+	// before this is called (see blob.Integration.SetAsChatPicture). It returns
+	// ErrChatNotFound if the chat does not exist, and an error if chatID is not
+	// a group chat ID.
+	SetGroupPicture(ctx context.Context, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error
 
 	// GetChatByID returns the canonical record for the chat with the given ID,
 	// or ErrChatNotFound. It reads only that record: Members carries a DM's

@@ -111,7 +111,7 @@ func testAccessNoCollision(t *testing.T, store blob.AccessStore) {
 	// authorizes that user alone — conflating them would publish a private blob.
 	userID := model.MustGenerateUserID()
 	selfPrincipal := blob.PrincipalForUser(userID)
-	profilePrincipal := blob.PrincipalForProfile(userID)
+	profilePrincipal := blob.PrincipalForUserProfile(userID)
 	require.NoError(t, store.Grant(ctx, &blob.Grant{BlobID: blobB, Principal: selfPrincipal, Permission: blob.PermissionRead}))
 
 	has, err = store.HasGrant(ctx, blobB, profilePrincipal, blob.PermissionRead)
@@ -128,7 +128,7 @@ func testAccessProfileGrant(t *testing.T, store blob.AccessStore) {
 	ctx := context.Background()
 
 	blobID := blob.MustGenerateID()
-	profilePrincipal := blob.PrincipalForProfile(model.MustGenerateUserID())
+	profilePrincipal := blob.PrincipalForUserProfile(model.MustGenerateUserID())
 
 	has, err := store.HasGrant(ctx, blobID, profilePrincipal, blob.PermissionRead)
 	require.NoError(t, err)

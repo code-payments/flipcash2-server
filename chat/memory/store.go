@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -127,6 +128,26 @@ func (m *memory) RemoveGroupMember(_ context.Context, chatID *commonpb.ChatId, u
 	if _, ok := members[string(userID.Value)]; ok {
 		members[string(userID.Value)] = false
 	}
+	return nil
+}
+
+func (m *memory) SetGroupPicture(_ context.Context, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
+	if !chat.IsGroupChatID(chatID) {
+		return fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	c, ok := m.chats[string(chatID.Value)]
+	if !ok {
+		return chat.ErrChatNotFound
+	}
+	if blobID == nil {
+		c.PictureBlobID = nil
+		return nil
+	}
+	c.PictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), blobID.Value...)}
 	return nil
 }
 

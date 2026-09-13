@@ -36,15 +36,27 @@ const (
 	// grant covers the whole chat and stays correct as membership changes.
 	PrincipalTypeChat
 
-	// PrincipalTypeProfile is a user's public profile, identified by that user's
-	// id. It covers every caller — a profile is public — so the grant alone gates
-	// the read: exactly the blobs granted to the profile are readable through it.
-	PrincipalTypeProfile
+	// PrincipalTypeUserProfile is a user's public profile, identified by that
+	// user's id. It covers every caller — a profile is public — so the grant
+	// alone gates the read: exactly the blobs granted to the profile are
+	// readable through it. It is the user-side counterpart of
+	// PrincipalTypeChatProfile.
+	PrincipalTypeUserProfile
+
+	// PrincipalTypeChatProfile is a chat's public profile — its outward face to
+	// non-members (picture, and whatever a group preview later shows) —
+	// identified by the chat id. Like PrincipalTypeUserProfile it covers every
+	// caller, so the grant alone gates the read. It is distinct from
+	// PrincipalTypeChat, which is the chat's members: a blob granted to the
+	// members is not thereby public, and a blob granted to the profile is
+	// readable without membership.
+	PrincipalTypeChatProfile
 )
 
 // Principal is the typed subject a grant is made to. ID is the type-specific
 // identifier bytes: a user id for PrincipalTypeUser, a chat id for
-// PrincipalTypeChat, and the profile owner's user id for PrincipalTypeProfile.
+// PrincipalTypeChat and PrincipalTypeChatProfile, and the profile owner's user
+// id for PrincipalTypeUserProfile.
 type Principal struct {
 	Type PrincipalType
 	ID   []byte
@@ -60,14 +72,20 @@ func PrincipalForChat(chatID *commonpb.ChatId) Principal {
 	return Principal{Type: PrincipalTypeChat, ID: chatID.Value}
 }
 
-// PrincipalForProfile returns the principal for the public profile of a user.
-func PrincipalForProfile(userID *commonpb.UserId) Principal {
-	return Principal{Type: PrincipalTypeProfile, ID: userID.Value}
+// PrincipalForUserProfile returns the principal for the public profile of a user.
+func PrincipalForUserProfile(userID *commonpb.UserId) Principal {
+	return Principal{Type: PrincipalTypeUserProfile, ID: userID.Value}
+}
+
+// PrincipalForChatProfile returns the principal for the public profile of a
+// chat.
+func PrincipalForChatProfile(chatID *commonpb.ChatId) Principal {
+	return Principal{Type: PrincipalTypeChatProfile, ID: chatID.Value}
 }
 
 func (p Principal) validate() error {
 	switch p.Type {
-	case PrincipalTypeUser, PrincipalTypeChat, PrincipalTypeProfile:
+	case PrincipalTypeUser, PrincipalTypeChat, PrincipalTypeUserProfile, PrincipalTypeChatProfile:
 	default:
 		return fmt.Errorf("%w: unknown principal type %d", ErrInvalidGrant, p.Type)
 	}
@@ -219,29 +237,62 @@ func (r *ChatResolver) Covers(ctx context.Context, principal Principal, user *co
 	}
 }
 
-// ProfileResolver is the PrincipalResolver for profile-scoped grants: a profile
-// is public, so every caller is covered by a PrincipalTypeProfile principal —
-// there is no membership to resolve, and it therefore needs no store.
+// UserProfileResolver is the PrincipalResolver for user-profile-scoped grants: a
+// user's profile is public, so every caller is covered by a
+// PrincipalTypeUserProfile principal — there is no membership to resolve, and
+// it therefore needs no store.
 //
 // Coverage being universal is precisely why the grant carries the whole decision
 // here: only the blobs granted to a profile resolve through it, so a picture
 // stops being readable the moment it is superseded and its grant revoked. Read
 // authorization still requires both halves (see Server.canRead), so this is not a
 // blanket authorization of any blob id.
-type ProfileResolver struct{}
+type UserProfileResolver struct{}
 
-// NewProfileResolver returns a ProfileResolver.
-func NewProfileResolver() PrincipalResolver {
-	return &ProfileResolver{}
+// NewUserProfileResolver returns a UserProfileResolver.
+func NewUserProfileResolver() PrincipalResolver {
+	return &UserProfileResolver{}
 }
 
-// Covers reports whether user is covered by principal. Every user is covered by a
-// PrincipalTypeProfile principal, since a profile is public. Any other principal
-// type is outside this resolver's scope, so it reports not-covered rather than
-// guessing.
-func (r *ProfileResolver) Covers(_ context.Context, principal Principal, _ *commonpb.UserId) (bool, error) {
+// Covers reports whether user is covered by principal. Every user is covered by
+// a PrincipalTypeUserProfile principal, since a user's profile is public. Any
+// other principal type is outside this resolver's scope, so it reports
+// not-covered rather than guessing.
+func (r *UserProfileResolver) Covers(_ context.Context, principal Principal, _ *commonpb.UserId) (bool, error) {
 	switch principal.Type {
-	case PrincipalTypeProfile:
+	case PrincipalTypeUserProfile:
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+// ChatProfileResolver is the PrincipalResolver for chat-profile-scoped grants.
+// A chat's profile is public in the same way a user's is, so every caller is
+// covered by a PrincipalTypeChatProfile principal, and — as with UserProfileResolver
+// — the grant carries the whole decision: only the blobs granted to a chat's
+// profile resolve through it.
+//
+// It deliberately shares nothing with ChatResolver. Membership is what gates the
+// chat principal; the chat profile is the surface that exists precisely so
+// non-members can see a group's picture, so consulting membership here would
+// defeat it. Whether a given deployment exposes chat profiles at all is decided
+// by registering this resolver (and by the read path mapping a scope onto the
+// principal), not by the resolver itself.
+type ChatProfileResolver struct{}
+
+// NewChatProfileResolver returns a ChatProfileResolver.
+func NewChatProfileResolver() PrincipalResolver {
+	return &ChatProfileResolver{}
+}
+
+// Covers reports whether user is covered by principal. Every user is covered by
+// a PrincipalTypeChatProfile principal, since a chat's profile is public. Any
+// other principal type is outside this resolver's scope, so it reports
+// not-covered rather than guessing.
+func (r *ChatProfileResolver) Covers(_ context.Context, principal Principal, _ *commonpb.UserId) (bool, error) {
+	switch principal.Type {
+	case PrincipalTypeChatProfile:
 		return true, nil
 	default:
 		return false, nil

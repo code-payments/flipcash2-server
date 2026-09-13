@@ -500,12 +500,12 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		// authorization, since every caller is covered by a profile principal.
 		_, other := registerUser(t, accounts)
 		require.NoError(t, access.Grant(context.Background(), &blob.Grant{
-			BlobID: readyID, Principal: blob.PrincipalForProfile(ownerID), Permission: blob.PermissionRead,
+			BlobID: readyID, Principal: blob.PrincipalForUserProfile(ownerID), Permission: blob.PermissionRead,
 		}))
 
 		req := &blobpb.GetBlobsRequest{
 			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
-			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Profile{Profile: ownerID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_UserProfile{UserProfile: ownerID}},
 		}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
@@ -518,11 +518,11 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 
 		// Revoking the grant stops it resolving through the profile, even though the
 		// caller is still covered by it — the grant, not coverage, is what authorizes.
-		require.NoError(t, access.Revoke(context.Background(), readyID, blob.PrincipalForProfile(ownerID), blob.PermissionRead))
+		require.NoError(t, access.Revoke(context.Background(), readyID, blob.PrincipalForUserProfile(ownerID), blob.PermissionRead))
 
 		req = &blobpb.GetBlobsRequest{
 			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
-			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Profile{Profile: ownerID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_UserProfile{UserProfile: ownerID}},
 		}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
@@ -539,7 +539,7 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 
 		req := &blobpb.GetBlobsRequest{
 			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
-			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Profile{Profile: ownerID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_UserProfile{UserProfile: ownerID}},
 		}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
@@ -552,19 +552,95 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		// The grant names one profile; naming a different one must not resolve it.
 		strangerID, other := registerUser(t, accounts)
 		require.NoError(t, access.Grant(context.Background(), &blob.Grant{
-			BlobID: readyID, Principal: blob.PrincipalForProfile(ownerID), Permission: blob.PermissionRead,
+			BlobID: readyID, Principal: blob.PrincipalForUserProfile(ownerID), Permission: blob.PermissionRead,
 		}))
 		t.Cleanup(func() {
-			require.NoError(t, access.Revoke(context.Background(), readyID, blob.PrincipalForProfile(ownerID), blob.PermissionRead))
+			require.NoError(t, access.Revoke(context.Background(), readyID, blob.PrincipalForUserProfile(ownerID), blob.PermissionRead))
 		})
 
 		req := &blobpb.GetBlobsRequest{
 			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
-			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Profile{Profile: strangerID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_UserProfile{UserProfile: strangerID}},
 		}
 		require.NoError(t, other.Auth(req, &req.Auth))
 
 		resp, err := h.server.GetBlobs(context.Background(), req)
+		require.NoError(t, err)
+		require.Nil(t, resp.Blobs)
+	})
+
+	t.Run("anyone resolves a blob granted to a chat's profile, member or not", func(t *testing.T) {
+		// A chat's profile is public the way a user's is: the grant to the chat
+		// profile is the whole authorization. The caller here was never made a
+		// member of the chat (the resolver does not cover them for the chat
+		// principal), which is exactly the non-member preview case.
+		_, other := registerUser(t, accounts)
+		chatID := newChatID(t)
+		require.NoError(t, access.Grant(context.Background(), &blob.Grant{
+			BlobID: readyID, Principal: blob.PrincipalForChatProfile(chatID), Permission: blob.PermissionRead,
+		}))
+
+		req := &blobpb.GetBlobsRequest{
+			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_ChatProfile{ChatProfile: chatID}},
+		}
+		require.NoError(t, other.Auth(req, &req.Auth))
+
+		resp, err := h.server.GetBlobs(context.Background(), req)
+		require.NoError(t, err)
+		require.NotNil(t, resp.Blobs)
+		require.Len(t, resp.Blobs.Blobs, 1)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, resp.Blobs.Blobs[0].Status)
+		require.NotNil(t, resp.Blobs.Blobs[0].Metadata)
+
+		// Revoking the grant stops it resolving through the chat profile, even
+		// though the caller is still covered by it.
+		require.NoError(t, access.Revoke(context.Background(), readyID, blob.PrincipalForChatProfile(chatID), blob.PermissionRead))
+
+		req = &blobpb.GetBlobsRequest{
+			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_ChatProfile{ChatProfile: chatID}},
+		}
+		require.NoError(t, other.Auth(req, &req.Auth))
+
+		resp, err = h.server.GetBlobs(context.Background(), req)
+		require.NoError(t, err)
+		require.Nil(t, resp.Blobs)
+	})
+
+	t.Run("a chat profile grant and a chat membership grant do not substitute for each other", func(t *testing.T) {
+		// The two surfaces are distinct principals. A blob shared into the chat
+		// (granted to the members) must not become public through the chat's
+		// profile context, and a blob granted to the chat's profile must not
+		// resolve for a non-member through the membership context.
+		_, other := registerUser(t, accounts)
+		chatID := newChatID(t)
+
+		require.NoError(t, access.Grant(context.Background(), &blob.Grant{
+			BlobID: readyID, Principal: blob.PrincipalForChat(chatID), Permission: blob.PermissionRead,
+		}))
+		req := &blobpb.GetBlobsRequest{
+			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_ChatProfile{ChatProfile: chatID}},
+		}
+		require.NoError(t, other.Auth(req, &req.Auth))
+		resp, err := h.server.GetBlobs(context.Background(), req)
+		require.NoError(t, err)
+		require.Nil(t, resp.Blobs)
+
+		require.NoError(t, access.Revoke(context.Background(), readyID, blob.PrincipalForChat(chatID), blob.PermissionRead))
+		require.NoError(t, access.Grant(context.Background(), &blob.Grant{
+			BlobID: readyID, Principal: blob.PrincipalForChatProfile(chatID), Permission: blob.PermissionRead,
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, access.Revoke(context.Background(), readyID, blob.PrincipalForChatProfile(chatID), blob.PermissionRead))
+		})
+		req = &blobpb.GetBlobsRequest{
+			BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{readyID}},
+			Context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: chatID}},
+		}
+		require.NoError(t, other.Auth(req, &req.Auth))
+		resp, err = h.server.GetBlobs(context.Background(), req)
 		require.NoError(t, err)
 		require.Nil(t, resp.Blobs)
 	})
@@ -907,10 +983,14 @@ func (r *fakeResolver) allow(principal blob.Principal, user *commonpb.UserId) {
 }
 
 func (r *fakeResolver) Covers(ctx context.Context, principal blob.Principal, user *commonpb.UserId) (bool, error) {
-	// A profile is public, so there is no membership to fake: defer to the real
-	// resolver, the way the production CompositeResolver routes it.
-	if principal.Type == blob.PrincipalTypeProfile {
-		return blob.NewProfileResolver().Covers(ctx, principal, user)
+	// A profile — a user's or a chat's — is public, so there is no membership to
+	// fake: defer to the real resolvers, the way the production CompositeResolver
+	// routes them.
+	switch principal.Type {
+	case blob.PrincipalTypeUserProfile:
+		return blob.NewUserProfileResolver().Covers(ctx, principal, user)
+	case blob.PrincipalTypeChatProfile:
+		return blob.NewChatProfileResolver().Covers(ctx, principal, user)
 	}
 	return r.covered[resolverKey(principal, user)], nil
 }

@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -107,6 +108,20 @@ type BlocklistReader interface {
 	GetBlocked(ctx context.Context, ownerID *commonpb.UserId, candidateIDs []*commonpb.UserId) (map[string]bool, error)
 }
 
+// MediaReader is the read slice of the blob domain the Chat service needs to
+// hydrate group pictures. Like the other readers it is declared here (consumer
+// side) so the chat package need not import blob — which imports chat for its
+// membership resolver — and blob.Integration satisfies it directly.
+type MediaReader interface {
+	// ResolveRenditions returns each original's full rendition set — the
+	// ORIGINAL plus every derived rendition, each with a freshly minted,
+	// short-lived download URL — keyed by string(BlobId.Value). Originals that
+	// are unknown or not yet servable are absent from the map. It performs no
+	// authorization: the caller passes only ids it has already established the
+	// reader may see.
+	ResolveRenditions(ctx context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error)
+}
+
 type Server struct {
 	log *zap.Logger
 
@@ -116,12 +131,13 @@ type Server struct {
 	messaging MessagingReader
 	profiles  ProfileReader
 	blocklist BlocklistReader
+	media     MediaReader
 	accounts  account.Store
 
 	chatpb.UnimplementedChatServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, chats Store, messaging MessagingReader, profiles ProfileReader, blocklist BlocklistReader, accounts account.Store) *Server {
+func NewServer(log *zap.Logger, authz auth.Authorizer, chats Store, messaging MessagingReader, profiles ProfileReader, blocklist BlocklistReader, media MediaReader, accounts account.Store) *Server {
 	return &Server{
 		log:       log,
 		authz:     authz,
@@ -129,6 +145,7 @@ func NewServer(log *zap.Logger, authz auth.Authorizer, chats Store, messaging Me
 		messaging: messaging,
 		profiles:  profiles,
 		blocklist: blocklist,
+		media:     media,
 		accounts:  accounts,
 	}
 }
@@ -385,6 +402,15 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatTyp
 // is_hidden is per-viewer: a DM is hidden from viewerID when the DM's peer (the
 // member who is not the viewer) is on the viewer's blocklist. Every DM peer
 // across the set is resolved against the viewer's blocklist in one batched read.
+//
+// A group's picture is stored as the blob holding its ORIGINAL; every picture
+// across the set is expanded to its full rendition set, each with a short-lived
+// download URL, in one batched read — so a client renders the group's avatar
+// without a follow-up GetBlobs. That is safe without an ACL check here because
+// every chat in the set is one the viewer is a member of, and a chat's picture
+// is granted to the chat's members when it is set. A picture whose original no
+// longer resolves is left with its stored ORIGINAL for the client to treat as
+// unavailable, rather than failing the whole read.
 func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
@@ -393,6 +419,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 	uniquePrivateProfileUserIds := make(map[string]*commonpb.UserId)
 	dmPeerByChat := make(map[string]*commonpb.UserId)
 	uniquePeerIDs := make(map[string]*commonpb.UserId)
+	uniquePictureBlobIDs := make(map[string]*blobpb.BlobId)
 	for i, c := range chats {
 		pointerRefs[i] = PointerRef{ChatID: c.ID, Members: c.Members}
 		if c.LastMessageID != nil {
@@ -401,6 +428,9 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 			// exactly when it has a last message ID. Skip the rest: their head is
 			// the proto default 0.
 			seqChatIDs = append(seqChatIDs, c.ID)
+		}
+		if c.PictureBlobID != nil {
+			uniquePictureBlobIDs[string(c.PictureBlobID.Value)] = c.PictureBlobID
 		}
 		for _, m := range c.Members {
 			uniqueUserIDs[string(m.Value)] = m
@@ -430,6 +460,10 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 	for _, u := range uniquePeerIDs {
 		peerIDs = append(peerIDs, u)
 	}
+	pictureBlobIDs := make([]*blobpb.BlobId, 0, len(uniquePictureBlobIDs))
+	for _, id := range uniquePictureBlobIDs {
+		pictureBlobIDs = append(pictureBlobIDs, id)
+	}
 
 	lastMessages, err := s.messaging.LastMessages(ctx, msgRefs)
 	if err != nil {
@@ -455,6 +489,13 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 	if err != nil {
 		return nil, err
 	}
+	var pictureRenditions map[string][]*blobpb.Rendition
+	if len(pictureBlobIDs) > 0 {
+		pictureRenditions, err = s.media.ResolveRenditions(ctx, pictureBlobIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	metadata := make([]*chatpb.Metadata, len(chats))
 	for i, c := range chats {
@@ -464,6 +505,13 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 		md.LatestEventSequence = latestEventSeqs[key]
 		if peer, ok := dmPeerByChat[key]; ok {
 			md.IsHidden = blockedPeers[string(peer.Value)]
+		}
+		if c.PictureBlobID != nil {
+			// ToProto seeds the picture with its stored ORIGINAL; swap in the full
+			// resolved set when the original is servable, else leave that seed.
+			if renditions, ok := pictureRenditions[string(c.PictureBlobID.Value)]; ok {
+				md.Picture.Renditions = renditions
+			}
 		}
 		assignPointers(md, pointers[key])
 		for _, m := range md.Members {

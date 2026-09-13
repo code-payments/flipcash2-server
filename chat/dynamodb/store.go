@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -23,8 +24,8 @@ import (
 // The chat store spans three tables:
 //
 //	chats     pk = "chat#<id>" (one item per chat). Canonical metadata: type,
-//	          members (the DM participants; absent for groups), title (groups
-//	          only), last_activity. GetChat is a point read and
+//	          members (the DM participants; absent for groups), title and
+//	          picture_blob_id (groups only), last_activity. GetChat is a point read and
 //	          AdvanceLastActivity is an O(1) update of the source of truth.
 //
 //	dm_inbox  pk = "user#<id>", sk = "chat#<id>" (one item per (user, DM)). The
@@ -86,6 +87,7 @@ const (
 	attrMembers       = "members"
 	attrTitle         = "title"
 	attrIsStaffOnly   = "is_staff_only"
+	attrPictureBlobID = "picture"
 	attrState         = "state"
 	attrUser          = "user" // member id, bare hex — see userIndexKey
 	attrJoinedAt      = "joined_at"
@@ -326,6 +328,37 @@ func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, 
 		},
 	})
 	if err != nil && !isConditionalCheckFailed(err) {
+		return err
+	}
+	return nil
+}
+
+// SetGroupPicture writes (or, for a nil blobID, removes) the picture attribute
+// on the canonical item. The update is conditioned on the item existing so a
+// typo'd chat ID cannot upsert a picture-only phantom record; the failed
+// condition is what reports ErrChatNotFound.
+func (s *store) SetGroupPicture(ctx context.Context, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
+	if !chat.IsGroupChatID(chatID) {
+		return fmt.Errorf("not a group chat id")
+	}
+
+	input := &dynamodb.UpdateItemInput{
+		TableName:           aws.String(s.chatsTable),
+		Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
+		ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
+	}
+	if blobID == nil {
+		input.UpdateExpression = aws.String(fmt.Sprintf("REMOVE %s", attrPictureBlobID))
+	} else {
+		input.UpdateExpression = aws.String(fmt.Sprintf("SET %s = :picture", attrPictureBlobID))
+		input.ExpressionAttributeValues = map[string]types.AttributeValue{":picture": avB(blobID.Value)}
+	}
+
+	_, err := s.client.UpdateItem(ctx, input)
+	if err != nil {
+		if isConditionalCheckFailed(err) {
+			return chat.ErrChatNotFound
+		}
 		return err
 	}
 	return nil
@@ -607,16 +640,19 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 		attrLastActivity: avN(uint64(c.LastActivity.UnixNano())),
 	}
 	// A group's membership lives in group_members, not on the canonical item —
-	// an inline list could not hold a large group. Title and the staff-only
-	// flag are group-only; the flag is written only when set, so an absent
-	// attribute (including on every item written before it existed) reads as
-	// false.
+	// an inline list could not hold a large group. Title, the staff-only flag
+	// and the picture are group-only; each is written only when set, so an
+	// absent attribute (including on every item written before it existed)
+	// reads as its zero value.
 	if c.Type == chatpb.ChatType_GROUP {
 		if c.Title != "" {
 			item[attrTitle] = avS(c.Title)
 		}
 		if c.IsStaffOnly {
 			item[attrIsStaffOnly] = avBool(true)
+		}
+		if c.PictureBlobID != nil {
+			item[attrPictureBlobID] = avB(c.PictureBlobID.Value)
 		}
 	} else {
 		item[attrMembers] = membersAttr(c.Members)
@@ -675,6 +711,10 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 		Title:        asS(item[attrTitle]),
 		IsStaffOnly:  asBool(item[attrIsStaffOnly]),
 		LastActivity: time.Unix(0, nanos).UTC(),
+	}
+	// picture_blob_id is absent for DMs and for groups without a picture.
+	if picture := asB(item[attrPictureBlobID]); len(picture) > 0 {
+		c.PictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), picture...)}
 	}
 	// last_message_id is absent until the chat's first message.
 	if _, ok := item[attrLastMessageID]; ok {

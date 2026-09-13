@@ -38,6 +38,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_TipDm_HidesPhoneNumbers,
 		testServer_GetChat_HiddenWhenPeerBlocked,
 		testServer_GetChat_Group_Hydrates,
+		testServer_GetChat_Group_Picture,
 		testServer_GetChat_Group_MembershipLifecycle,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
@@ -61,6 +62,7 @@ type serverEnv struct {
 	messaging *fakeMessagingReader
 	profiles  *fakeProfileReader
 	blocklist *fakeBlocklistReader
+	media     *fakeMediaReader
 
 	userID *commonpb.UserId
 	keys   model.KeyPair
@@ -78,8 +80,9 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 	messaging := newFakeMessagingReader()
 	profiles := newFakeProfileReader()
 	blocklist := newFakeBlocklistReader()
+	media := newFakeMediaReader()
 	accounts := accountmemory.NewInMemory()
-	server := chat.NewServer(log, authz, s, messaging, profiles, blocklist, accounts)
+	server := chat.NewServer(log, authz, s, messaging, profiles, blocklist, media, accounts)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
@@ -93,9 +96,67 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 		messaging: messaging,
 		profiles:  profiles,
 		blocklist: blocklist,
+		media:     media,
 		userID:    userID,
 		keys:      keys,
 	}
+}
+
+// fakeMediaReader is a canned chat.MediaReader for server tests: it resolves
+// whatever rendition sets a test registers per ORIGINAL blob ID, and omits the
+// rest the way the real reader omits an unknown or not-yet-servable original.
+type fakeMediaReader struct {
+	renditions map[string][]*blobpb.Rendition
+}
+
+func newFakeMediaReader() *fakeMediaReader {
+	return &fakeMediaReader{renditions: make(map[string][]*blobpb.Rendition)}
+}
+
+// setRenditions registers the resolved rendition set for an original: the
+// ORIGINAL itself plus a THUMBNAIL, each carrying blob metadata and a download
+// URL the way the real reader mints them.
+func (f *fakeMediaReader) setRenditions(originalID *blobpb.BlobId) []*blobpb.Rendition {
+	thumbnailID := &blobpb.BlobId{Value: append([]byte(nil), originalID.Value...)}
+	thumbnailID.Value[0] ^= 0xff
+	renditions := []*blobpb.Rendition{
+		{
+			Role:   blobpb.Rendition_ORIGINAL,
+			BlobId: originalID,
+			Blob: &blobpb.BlobMetadata{
+				MimeType:  "image/jpeg",
+				SizeBytes: 4096,
+				DownloadUrl: &blobpb.DownloadUrl{
+					Url:       "https://cdn.blobs.test/" + hex.EncodeToString(originalID.Value),
+					ExpiresAt: timestamppb.New(at(1).Add(time.Hour)),
+				},
+			},
+		},
+		{
+			Role:   blobpb.Rendition_THUMBNAIL,
+			BlobId: thumbnailID,
+			Blob: &blobpb.BlobMetadata{
+				MimeType:  "image/jpeg",
+				SizeBytes: 256,
+				DownloadUrl: &blobpb.DownloadUrl{
+					Url:       "https://cdn.blobs.test/" + hex.EncodeToString(thumbnailID.Value),
+					ExpiresAt: timestamppb.New(at(1).Add(time.Hour)),
+				},
+			},
+		},
+	}
+	f.renditions[string(originalID.Value)] = renditions
+	return renditions
+}
+
+func (f *fakeMediaReader) ResolveRenditions(_ context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error) {
+	out := make(map[string][]*blobpb.Rendition)
+	for _, id := range ids {
+		if r, ok := f.renditions[string(id.Value)]; ok {
+			out[string(id.Value)] = r
+		}
+	}
+	return out, nil
 }
 
 // fakeMessagingReader is a canned chat.MessagingReader for server tests: it
@@ -283,13 +344,20 @@ func (e *serverEnv) putDMWithPeer(chatType chatpb.ChatType, peer *commonpb.UserI
 // putGroup persists a group chat whose members are the env user and the given
 // others, with the given title and last activity.
 func (e *serverEnv) putGroup(title string, lastActivity time.Time, others ...*commonpb.UserId) *commonpb.ChatId {
+	return e.putGroupWithPicture(title, nil, lastActivity, others...)
+}
+
+// putGroupWithPicture is putGroup with the group's picture set to the blob
+// holding its ORIGINAL rendition (nil for no picture).
+func (e *serverEnv) putGroupWithPicture(title string, pictureBlobID *blobpb.BlobId, lastActivity time.Time, others ...*commonpb.UserId) *commonpb.ChatId {
 	chatID := chat.MustGenerateGroupChatID()
 	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
-		ID:           chatID,
-		Type:         chatpb.ChatType_GROUP,
-		Members:      append([]*commonpb.UserId{e.userID}, others...),
-		Title:        title,
-		LastActivity: lastActivity,
+		ID:            chatID,
+		Type:          chatpb.ChatType_GROUP,
+		Members:       append([]*commonpb.UserId{e.userID}, others...),
+		Title:         title,
+		PictureBlobID: pictureBlobID,
+		LastActivity:  lastActivity,
 	}))
 	return chatID
 }
@@ -327,6 +395,9 @@ func testServer_GetChat_OK(t *testing.T, s chat.Store) {
 	require.Len(t, resp.Metadata.Members, 2)
 	require.Equal(t, e.userID.Value, resp.Metadata.Members[0].UserId.Value)
 	require.True(t, resp.Metadata.LastActivity.AsTime().Equal(at(1)))
+
+	// Pictures are a group-only feature; a DM never carries one.
+	require.Nil(t, resp.Metadata.Picture)
 }
 
 func testServer_GetChat_NotFound(t *testing.T, s chat.Store) {
@@ -597,6 +668,64 @@ func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
 		require.NotNil(t, m.UserProfile)
 		require.Nil(t, m.UserProfile.PhoneNumber)
 	}
+}
+
+func testServer_GetChat_Group_Picture(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// A group with a picture whose original resolves: the metadata carries the
+	// full rendition set — ORIGINAL plus derived — each with its blob metadata
+	// and a download URL, so the client renders the avatar with no follow-up.
+	pictureBlobID := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	want := e.media.setRenditions(pictureBlobID)
+	withPicture := e.putGroupWithPicture("Weekend Trip", pictureBlobID, at(1), model.MustGenerateUserID())
+
+	resp := e.getChat(e.keys, withPicture)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	picture := resp.Metadata.GetPicture()
+	require.NotNil(t, picture)
+	require.Len(t, picture.Renditions, len(want))
+	for i, r := range picture.Renditions {
+		require.Equal(t, want[i].Role, r.Role)
+		require.Equal(t, want[i].BlobId.Value, r.BlobId.Value)
+		require.NotNil(t, r.Blob)
+		require.Equal(t, want[i].Blob.MimeType, r.Blob.MimeType)
+		require.Equal(t, want[i].Blob.GetDownloadUrl().GetUrl(), r.Blob.GetDownloadUrl().GetUrl())
+	}
+
+	// A group without a picture carries none.
+	withoutPicture := e.putGroup("No Picture", at(1), model.MustGenerateUserID())
+	resp = e.getChat(e.keys, withoutPicture)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Nil(t, resp.Metadata.GetPicture())
+
+	// A picture whose original no longer resolves (unknown to blob storage, or
+	// not servable) is not an error: the metadata still names the stored
+	// ORIGINAL, unresolved, for the client to treat as unavailable.
+	unresolvable := &blobpb.BlobId{Value: []byte("group-picture-02")}
+	stale := e.putGroupWithPicture("Stale Picture", unresolvable, at(1), model.MustGenerateUserID())
+	resp = e.getChat(e.keys, stale)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	picture = resp.Metadata.GetPicture()
+	require.NotNil(t, picture)
+	require.Len(t, picture.Renditions, 1)
+	require.Equal(t, blobpb.Rendition_ORIGINAL, picture.Renditions[0].Role)
+	require.Equal(t, unresolvable.Value, picture.Renditions[0].BlobId.Value)
+	require.Nil(t, picture.Renditions[0].Blob)
+
+	// Replacing the picture through the store is what the next read reflects.
+	replacement := &blobpb.BlobId{Value: []byte("group-picture-03")}
+	e.media.setRenditions(replacement)
+	require.NoError(t, s.SetGroupPicture(e.ctx, withPicture, replacement))
+	resp = e.getChat(e.keys, withPicture)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Equal(t, replacement.Value, resp.Metadata.GetPicture().GetRenditions()[0].GetBlobId().GetValue())
+
+	// And clearing it removes it.
+	require.NoError(t, s.SetGroupPicture(e.ctx, withPicture, nil))
+	resp = e.getChat(e.keys, withPicture)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Nil(t, resp.Metadata.GetPicture())
 }
 
 func testServer_GetChat_Group_MembershipLifecycle(t *testing.T, s chat.Store) {

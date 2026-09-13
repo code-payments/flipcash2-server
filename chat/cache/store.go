@@ -6,6 +6,7 @@ import (
 
 	"github.com/ReneKroon/ttlcache"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -40,6 +41,10 @@ func (c *Cache) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 
 func (c *Cache) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) error {
 	return c.db.RemoveGroupMember(ctx, chatID, userID)
+}
+
+func (c *Cache) SetGroupPicture(ctx context.Context, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
+	return c.db.SetGroupPicture(ctx, chatID, blobID)
 }
 
 func (c *Cache) GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*chat.Chat, error) {

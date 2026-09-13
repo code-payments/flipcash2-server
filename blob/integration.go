@@ -44,10 +44,11 @@ var (
 	ErrBlobInvalid = errors.New("blob invalid")
 )
 
-// Integration is the surface other domains (messaging and profile today) use to
-// attach blobs to a resource they own: it validates and grants read access when
-// the blob is attached (ShareIntoChat, SetAsProfilePicture), and resolves the
-// blobs' metadata on read (Resolve).
+// Integration is the surface other domains (messaging, profile and chat today)
+// use to attach blobs to a resource they own: it validates and grants read access
+// when the blob is attached (ShareIntoChat, SetAsProfilePicture,
+// SetAsChatPicture), and resolves the blobs' metadata on read
+// (ResolveRenditions).
 type Integration struct {
 	blobs   Store
 	storage ObjectStorage
@@ -110,7 +111,7 @@ func (i *Integration) ShareIntoChat(ctx context.Context, sharerID *commonpb.User
 // re-grants harmlessly.
 //
 // Granting the profile — rather than each viewer — is what makes a profile picture
-// public: every caller is covered by the profile principal (see ProfileResolver),
+// public: every caller is covered by the user-profile principal (see UserProfileResolver),
 // so exactly the blobs granted to it are readable through it. Grants are never
 // revoked, so a picture stays readable through the profile once set.
 //
@@ -138,9 +139,64 @@ func (i *Integration) SetAsProfilePicture(ctx context.Context, ownerID *commonpb
 
 	return i.access.Grant(ctx, &Grant{
 		BlobID:     blobID,
-		Principal:  PrincipalForProfile(ownerID),
+		Principal:  PrincipalForUserProfile(ownerID),
 		Permission: PermissionRead,
 	})
+}
+
+// SetAsChatPicture attaches a blob to a chat as its picture: it verifies that
+// ownerID owns the blob and that it is a READY image original, then grants read
+// access to it on both surfaces the picture is shown from. It is idempotent, so
+// re-setting the same picture re-grants harmlessly.
+//
+// A chat's picture is shown in two places, and each is its own grant:
+//
+//   - Inside the chat, to its members. That is the chat principal — the same
+//     grant a message attachment gets (see ShareIntoChat) — resolved against live
+//     membership, and fetched with an AccessContext naming the chat.
+//   - On the chat's public profile, to anyone. That is the chat-profile
+//     principal, which covers every caller (see ChatProfileResolver) so the
+//     grant alone decides what is readable through it. It is what lets a
+//     non-member see a group's picture, e.g. in a preview before joining.
+//
+// Granting both is deliberate rather than relying on the public grant alone:
+// the chat grant keeps the picture fetchable from within the chat by the scope
+// clients already use there, and stays correct in a deployment that does not
+// expose chat profiles (no resolver registered, or no scope mapped onto the
+// principal), where the profile grant is simply inert.
+//
+// Grants are never revoked, so a superseded picture stays readable through both
+// surfaces, exactly as a superseded profile picture does.
+//
+// It attaches a single blob, so it reports the granular reasons — one of
+// ErrBlobNotFound, ErrBlobNotReady, ErrBlobRejected, or ErrBlobInvalid — that the
+// caller can act on. Nothing is granted then.
+func (i *Integration) SetAsChatPicture(ctx context.Context, ownerID *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
+	records, err := i.blobs.GetByIDs(ctx, []*blobpb.BlobId{blobID})
+	if err != nil {
+		return err
+	}
+
+	var record *Blob
+	for _, b := range records {
+		if bytes.Equal(b.ID.Value, blobID.Value) {
+			record = b
+		}
+	}
+	if err := validateAttachable(record, ownerID, imagesOnly); err != nil {
+		return err
+	}
+
+	for _, principal := range []Principal{PrincipalForChat(chatID), PrincipalForChatProfile(chatID)} {
+		if err := i.access.Grant(ctx, &Grant{
+			BlobID:     blobID,
+			Principal:  principal,
+			Permission: PermissionRead,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // mimeTypeFilter reports whether a surface accepts content of the given MIME type.
@@ -152,8 +208,8 @@ func (i *Integration) SetAsProfilePicture(ctx context.Context, ownerID *commonpb
 // future "chats support video" from silently making a video an acceptable avatar.
 type mimeTypeFilter func(mimeType string) bool
 
-// imagesOnly accepts still images and nothing else. This is what a profile picture
-// takes, permanently: widening chat media must not widen this.
+// imagesOnly accepts still images and nothing else. This is what a profile or chat
+// picture takes, permanently: widening chat media must not widen this.
 func imagesOnly(mimeType string) bool {
 	return SupportedImageMimeTypes[mimeType]
 }

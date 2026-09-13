@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -30,6 +31,7 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_AdvanceLastMessage,
 		testStore_GroupChat_PutAndGet,
 		testStore_GroupChat_StaffOnly,
+		testStore_GroupChat_Picture,
 		testStore_GroupChat_Membership,
 		testStore_GroupChat_IDsForUser,
 		testStore_GroupChat_CreationCap,
@@ -273,6 +275,77 @@ func testStore_GroupChat_StaffOnly(t *testing.T, s chat.Store) {
 	require.NoError(t, err)
 	require.True(t, got.IsStaffOnly)
 	require.True(t, got.LastActivity.Equal(at(200)))
+}
+
+func testStore_GroupChat_Picture(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// A group has no picture unless one was set.
+	plain := putGroupChat(t, s, "No Picture", at(100), model.MustGenerateUserID())
+	got, err := s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.PictureBlobID)
+
+	// A picture given at creation is on the canonical record.
+	original := &blobpb.BlobId{Value: []byte("picture-blob-0001")}
+	withPicture := &chat.Chat{
+		ID:            chat.MustGenerateGroupChatID(),
+		Type:          chatpb.ChatType_GROUP,
+		Members:       []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:         "With Picture",
+		PictureBlobID: original,
+		LastActivity:  at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, withPicture))
+	got, err = s.GetChatByID(ctx, withPicture.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.PictureBlobID)
+	require.Equal(t, original.Value, got.PictureBlobID.Value)
+
+	// Setting a picture on a group that had none, and replacing one that did.
+	first := &blobpb.BlobId{Value: []byte("picture-blob-0002")}
+	require.NoError(t, s.SetGroupPicture(ctx, plain.ID, first))
+	got, err = s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Equal(t, first.Value, got.PictureBlobID.Value)
+
+	second := &blobpb.BlobId{Value: []byte("picture-blob-0003")}
+	require.NoError(t, s.SetGroupPicture(ctx, plain.ID, second))
+	got, err = s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Equal(t, second.Value, got.PictureBlobID.Value)
+
+	// The picture is part of the canonical record and survives the updates that
+	// touch it; the rest of the record survives the picture update.
+	advanced, _, err := s.AdvanceLastMessage(ctx, plain.ID, &messagingpb.MessageId{Value: 1}, at(200))
+	require.NoError(t, err)
+	require.True(t, advanced)
+	got, err = s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Equal(t, second.Value, got.PictureBlobID.Value)
+	require.Equal(t, "No Picture", got.Title)
+	require.True(t, got.LastActivity.Equal(at(200)))
+
+	// A nil picture clears it.
+	require.NoError(t, s.SetGroupPicture(ctx, plain.ID, nil))
+	got, err = s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.PictureBlobID)
+	require.Equal(t, "No Picture", got.Title)
+
+	// Setting a picture on a group that does not exist is refused, and must not
+	// leave a phantom record behind.
+	unknown := chat.MustGenerateGroupChatID()
+	require.ErrorIs(t, s.SetGroupPicture(ctx, unknown, first), chat.ErrChatNotFound)
+	_, err = s.GetChatByID(ctx, unknown)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+
+	// Pictures are group-only: a DM chat ID is rejected outright.
+	dm := putDmChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(1))
+	require.Error(t, s.SetGroupPicture(ctx, dm.ID, first))
+	got, err = s.GetChatByID(ctx, dm.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.PictureBlobID)
 }
 
 func testStore_GroupChat_Membership(t *testing.T, s chat.Store) {

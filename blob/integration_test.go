@@ -121,6 +121,99 @@ func TestIntegration_ShareIntoChat(t *testing.T) {
 	})
 }
 
+func TestIntegration_SetAsChatPicture(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewInMemory()
+	access := memory.NewInMemoryAccessStore()
+	integration := blob.NewIntegration(store, memory.NewInMemoryStorage(), access)
+
+	owner := model.MustGenerateUserID()
+	chatID := newChatID()
+	chatPrincipal := blob.PrincipalForChat(chatID)
+
+	t.Run("a ready image original owned by the caller is granted to the chat and its profile", func(t *testing.T) {
+		id := putReadyOriginal(t, store, owner)
+		require.NoError(t, integration.SetAsChatPicture(ctx, owner, chatID, id))
+
+		// Readable from within the chat by its members...
+		has, err := access.HasGrant(ctx, id, chatPrincipal, blob.PermissionRead)
+		require.NoError(t, err)
+		require.True(t, has)
+
+		// ...and from the chat's public profile by anyone.
+		has, err = access.HasGrant(ctx, id, blob.PrincipalForChatProfile(chatID), blob.PermissionRead)
+		require.NoError(t, err)
+		require.True(t, has)
+
+		// But not through the owner's own profile: a chat's picture is the chat's,
+		// not the uploader's.
+		has, err = access.HasGrant(ctx, id, blob.PrincipalForUserProfile(owner), blob.PermissionRead)
+		require.NoError(t, err)
+		require.False(t, has)
+
+		// Idempotent: setting again leaves the grants in place, not an error.
+		require.NoError(t, integration.SetAsChatPicture(ctx, owner, chatID, id))
+	})
+
+	t.Run("an unknown blob is not found", func(t *testing.T) {
+		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, newBlobID(t)), blob.ErrBlobNotFound)
+	})
+
+	t.Run("a blob owned by someone else is not found and grants nothing", func(t *testing.T) {
+		theirs := putReadyOriginal(t, store, model.MustGenerateUserID())
+		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, theirs), blob.ErrBlobNotFound)
+
+		for _, principal := range []blob.Principal{chatPrincipal, blob.PrincipalForChatProfile(chatID)} {
+			has, err := access.HasGrant(ctx, theirs, principal, blob.PermissionRead)
+			require.NoError(t, err)
+			require.False(t, has)
+		}
+	})
+
+	t.Run("a pending blob is not ready", func(t *testing.T) {
+		id := newBlobID(t)
+		require.NoError(t, store.CreatePending(ctx, &blob.Blob{
+			ID: id, Rendition: blob.RenditionOriginal, Owner: owner, State: blob.StatePending,
+			StorageKey: "k", MimeType: "image/png", SizeBytes: 1,
+		}))
+		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, id), blob.ErrBlobNotReady)
+	})
+
+	t.Run("a rejected blob is rejected", func(t *testing.T) {
+		id := newBlobID(t)
+		require.NoError(t, store.CreatePending(ctx, &blob.Blob{
+			ID: id, Rendition: blob.RenditionOriginal, Owner: owner, State: blob.StatePending,
+			StorageKey: "k", MimeType: "image/png", SizeBytes: 1,
+		}))
+		_, err := store.Reject(ctx, id, &blob.RejectionMetadata{Reason: blob.RejectionReasonModeration})
+		require.NoError(t, err)
+		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, id), blob.ErrBlobRejected)
+	})
+
+	t.Run("a rendition is invalid (only originals back a picture)", func(t *testing.T) {
+		original := putReadyOriginal(t, store, owner)
+		rendition := newBlobID(t)
+		require.NoError(t, store.CreatePending(ctx, &blob.Blob{
+			ID: rendition, Rendition: blob.RenditionDisplay, ParentID: original, Owner: owner, State: blob.StatePending,
+			StorageKey: "k", MimeType: "image/png", SizeBytes: 1,
+		}))
+		_, err := store.Advance(ctx, rendition, blob.StateReady, nil)
+		require.NoError(t, err)
+		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, rendition), blob.ErrBlobInvalid)
+	})
+
+	t.Run("a non-image blob is invalid", func(t *testing.T) {
+		id := newBlobID(t)
+		require.NoError(t, store.CreatePending(ctx, &blob.Blob{
+			ID: id, Rendition: blob.RenditionOriginal, Owner: owner, State: blob.StatePending,
+			StorageKey: "k", MimeType: "video/mp4", SizeBytes: 1,
+		}))
+		_, err := store.Advance(ctx, id, blob.StateReady, nil)
+		require.NoError(t, err)
+		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, id), blob.ErrBlobInvalid)
+	})
+}
+
 func TestIntegration_ResolveRenditions(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewInMemory()

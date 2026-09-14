@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
@@ -778,23 +779,33 @@ func testSetUsernameBalanceGated(t *testing.T, accounts account.Store, profiles 
 	})
 
 	t.Run("An owner OCP does not know holds nothing", func(t *testing.T) {
-		ocpBalance.result = ocp_balancepb.GetBalanceResponse_NOT_FOUND
-		ocpBalance.coreMintValue = 0
+		ocpBalance.unknownOwners = true
+		ocpBalance.coreMintValue = account.MinUsernameTotalBalance
 
 		resp := setUsername("no_owner")
 		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_INSUFFICIENT_BALANCE}, resp))
 		require.Empty(t, usernameOf(userID))
+
+		ocpBalance.unknownOwners = false
 	})
 
 	// A balance that cannot be read leaves the gate unenforced, so the claim is
 	// refused rather than let through.
 	t.Run("An unreadable balance fails the claim", func(t *testing.T) {
-		ocpBalance.result = ocp_balancepb.GetBalanceResponse_OK
-		ocpBalance.err = errors.New("ocp is down")
+		ocpBalance.result = ocp_balancepb.GetBalancesResponse_DENIED
 
-		req := &profilepb.SetUsernameRequest{Username: &commonpb.Username{Value: "ocp_is_down"}}
+		req := &profilepb.SetUsernameRequest{Username: &commonpb.Username{Value: "ocp_denied"}}
 		require.NoError(t, keyPair.Auth(req, &req.Auth))
 		_, err := client.SetUsername(ctx, req)
+		require.Equal(t, codes.Internal, status.Code(err))
+		require.Empty(t, usernameOf(userID))
+
+		ocpBalance.result = ocp_balancepb.GetBalancesResponse_OK
+		ocpBalance.err = errors.New("ocp is down")
+
+		req = &profilepb.SetUsernameRequest{Username: &commonpb.Username{Value: "ocp_is_down"}}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		_, err = client.SetUsername(ctx, req)
 		require.Equal(t, codes.Internal, status.Code(err))
 		require.Empty(t, usernameOf(userID))
 
@@ -834,21 +845,38 @@ func testSetUsernameBalanceGated(t *testing.T, accounts account.Store, profiles 
 // fakeOcpBalance stands in for the OCP Balance service, answering every owner
 // with whatever the test configured.
 type fakeOcpBalance struct {
-	result        ocp_balancepb.GetBalanceResponse_Result
+	result        ocp_balancepb.GetBalancesResponse_Result
 	coreMintValue uint64
+	// unknownOwners leaves every requested owner out of the response, which is
+	// how OCP answers for an owner it has no accounts for.
+	unknownOwners bool
 	err           error
 	calls         int
 }
 
 func (f *fakeOcpBalance) GetBalance(context.Context, *ocp_balancepb.GetBalanceRequest, ...grpc.CallOption) (*ocp_balancepb.GetBalanceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "balance client is expected to use GetBalances")
+}
+
+func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBalancesRequest, _ ...grpc.CallOption) (*ocp_balancepb.GetBalancesResponse, error) {
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &ocp_balancepb.GetBalanceResponse{
-		Result:        f.result,
-		CoreMintValue: f.coreMintValue,
-	}, nil
+	resp := &ocp_balancepb.GetBalancesResponse{
+		Result:          f.result,
+		BalancesByOwner: make(map[string]*ocp_balancepb.OwnerBalance),
+	}
+	if f.unknownOwners {
+		return resp, nil
+	}
+	for _, owner := range req.Owners {
+		resp.BalancesByOwner[base58.Encode(owner.Value)] = &ocp_balancepb.OwnerBalance{
+			Owner:         owner,
+			CoreMintValue: f.coreMintValue,
+		}
+	}
+	return resp, nil
 }
 
 func testUsernameModeration(t *testing.T, accounts account.Store, profiles profile.Store) {

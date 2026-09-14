@@ -180,7 +180,7 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // a group chat: group membership is mutable and lives in its own store records,
 // which no path that reads the canonical record touches. A caller that needs a
 // group's members reads them explicitly via Store.GetMembers. Title,
-// IsStaffOnly and PictureBlobID are group-only and zero for DMs.
+// IsStaffOnly, CreatorID and PictureBlobID are group-only and zero for DMs.
 //
 // RosterSummary describes the member list without containing it. Like Members,
 // it is complete for a DM on any read and left zero for a group by the
@@ -191,6 +191,12 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // IsStaffOnly marks a group whose membership is restricted to staff users. It
 // is stored state set at creation; enforcing it (on membership changes, reads,
 // and sends) is the server layer's responsibility.
+//
+// CreatorID is the user who created the group, or nil when unknown (a DM has
+// none, and so does any group written before the field existed). It is fixed
+// at creation and records provenance only: creating a group does not by itself
+// make the creator a member, and whether they are is answered by the membership
+// records, never by this field.
 //
 // PictureBlobID is the blob holding the ORIGINAL rendition of the group's
 // picture, or nil when the group has none. The chat domain stores only that
@@ -206,6 +212,7 @@ type Chat struct {
 	RosterSummary RosterSummary
 	Title         string
 	IsStaffOnly   bool
+	CreatorID     *commonpb.UserId
 	PictureBlobID *blobpb.BlobId
 	LastActivity  time.Time
 	LastMessageID *messagingpb.MessageId
@@ -246,6 +253,10 @@ func (c *Chat) Clone() *Chat {
 	for i, m := range c.Members {
 		members[i] = &commonpb.UserId{Value: append([]byte(nil), m.Value...)}
 	}
+	var creatorID *commonpb.UserId
+	if c.CreatorID != nil {
+		creatorID = &commonpb.UserId{Value: append([]byte(nil), c.CreatorID.Value...)}
+	}
 	var pictureBlobID *blobpb.BlobId
 	if c.PictureBlobID != nil {
 		pictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), c.PictureBlobID.Value...)}
@@ -261,6 +272,7 @@ func (c *Chat) Clone() *Chat {
 		RosterSummary: c.RosterSummary,
 		Title:         c.Title,
 		IsStaffOnly:   c.IsStaffOnly,
+		CreatorID:     creatorID,
 		PictureBlobID: pictureBlobID,
 		LastActivity:  c.LastActivity,
 		LastMessageID: lastMessageID,

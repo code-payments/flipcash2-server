@@ -26,8 +26,8 @@ import (
 // The chat store spans three tables:
 //
 //	chats     pk = "chat#<id>" (one item per chat). Canonical metadata: type,
-//	          members (the DM participants; absent for groups), title and
-//	          picture (groups only), last_activity. GetChat is a point read and
+//	          members (the DM participants; absent for groups), title, creator
+//	          and picture (groups only), last_activity. GetChat is a point read and
 //	          AdvanceLastActivity is an O(1) update of the source of truth.
 //
 //	dm_inbox  pk = "user#<id>", sk = "chat#<id>" (one item per (user, DM)). The
@@ -99,6 +99,7 @@ const (
 	attrMembers       = "members"
 	attrTitle         = "title"
 	attrIsStaffOnly   = "is_staff_only"
+	attrCreator       = "creator"
 	attrPictureBlobID = "picture"
 	attrState         = "state"
 	attrUser          = "user" // member id, bare hex — see userIndexKey
@@ -850,16 +851,19 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 		attrLastActivity: avN(uint64(c.LastActivity.UnixNano())),
 	}
 	// A group's membership lives in group_members, not on the canonical item —
-	// an inline list could not hold a large group. Title, the staff-only flag
-	// and the picture are group-only; each is written only when set, so an
-	// absent attribute (including on every item written before it existed)
-	// reads as its zero value.
+	// an inline list could not hold a large group. Title, the staff-only flag,
+	// the creator and the picture are group-only; each is written only when
+	// set, so an absent attribute (including on every item written before it
+	// existed) reads as its zero value.
 	if c.Type == chatpb.ChatType_GROUP {
 		if c.Title != "" {
 			item[attrTitle] = avS(c.Title)
 		}
 		if c.IsStaffOnly {
 			item[attrIsStaffOnly] = avBool(true)
+		}
+		if c.CreatorID != nil {
+			item[attrCreator] = avB(c.CreatorID.Value)
 		}
 		if c.PictureBlobID != nil {
 			item[attrPictureBlobID] = avB(c.PictureBlobID.Value)
@@ -937,6 +941,10 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 		Title:         asS(item[attrTitle]),
 		IsStaffOnly:   asBool(item[attrIsStaffOnly]),
 		LastActivity:  time.Unix(0, nanos).UTC(),
+	}
+	// creator is absent for DMs and for groups written before it was recorded.
+	if creator := asB(item[attrCreator]); len(creator) > 0 {
+		c.CreatorID = &commonpb.UserId{Value: append([]byte(nil), creator...)}
 	}
 	// picture_blob_id is absent for DMs and for groups without a picture.
 	if picture := asB(item[attrPictureBlobID]); len(picture) > 0 {

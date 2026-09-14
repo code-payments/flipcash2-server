@@ -66,6 +66,10 @@ func (c *Cache) GetGroupRosterSummary(ctx context.Context, chatID *commonpb.Chat
 	return c.db.GetGroupRosterSummary(ctx, chatID)
 }
 
+func (c *Cache) GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]chat.RosterSummary, error) {
+	return c.db.GetGroupRosterSummaries(ctx, chatIDs)
+}
+
 // GetGroupRules is cached, including the absence of rules (a nil result), so a
 // group without any is read once too. Rules are fixed at creation (see
 // chat.Store), so a cached entry is never stale: if rules ever become mutable,
@@ -113,6 +117,14 @@ func (c *Cache) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *c
 // membership is mutable from other processes.
 func (c *Cache) GetGroupChatIDsForUser(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.ChatId, error) {
 	return c.db.GetGroupChatIDsForUser(ctx, userID)
+}
+
+func (c *Cache) GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserId) ([]*chat.Chat, error) {
+	return c.db.GetGroupChatsForUser(ctx, userID)
+}
+
+func (c *Cache) GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) ([]*chat.Chat, error) {
+	return c.db.GetGroupChatsForUserByIDs(ctx, userID, chatIDs)
 }
 
 func (c *Cache) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, []*commonpb.UserId, error) {

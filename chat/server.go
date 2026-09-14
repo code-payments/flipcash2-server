@@ -4,12 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"time"
 
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -26,11 +23,6 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 )
 
-// maxDmChatFeedPageSize bounds a single GetDmChatFeed page. It matches the
-// max_items on GetDmChatFeedResponse.chats, so a page never exceeds what the
-// response is allowed to carry.
-const maxDmChatFeedPageSize = 100
-
 // MessageRef identifies a chat's message to hydrate. The feed builds one ref per
 // chat (its last message) to batch the lookup across the page.
 type MessageRef struct {
@@ -39,8 +31,8 @@ type MessageRef struct {
 }
 
 // PointerRef names a chat and the members whose pointers to hydrate. The feed
-// builds one ref per DM chat (with that chat's members) to batch the pointer
-// lookup across the page; group chats get no ref (see hydrate).
+// builds one ref per chat — a DM's members, or the viewer alone in a group
+// (see hydrate) — to batch the pointer lookup across the page.
 type PointerRef struct {
 	ChatID  *commonpb.ChatId
 	Members []*commonpb.UserId
@@ -134,19 +126,25 @@ type Server struct {
 	messaging MessagingReader
 	profiles  ProfileReader
 
+	// maxGroupFeedChats is the most group chats a user's feed may hold (see
+	// feed.go). It is the package constant of the same name in production;
+	// tests lower it to exercise the refusal without thousands of groups.
+	maxGroupFeedChats int
+
 	chatpb.UnimplementedChatServer
 }
 
 func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, blocklist BlocklistReader, chats Store, media MediaReader, messaging MessagingReader, profiles ProfileReader) *Server {
 	return &Server{
-		log:       log,
-		authz:     authz,
-		accounts:  accounts,
-		blocklist: blocklist,
-		chats:     chats,
-		media:     media,
-		messaging: messaging,
-		profiles:  profiles,
+		log:               log,
+		authz:             authz,
+		accounts:          accounts,
+		blocklist:         blocklist,
+		chats:             chats,
+		media:             media,
+		messaging:         messaging,
+		profiles:          profiles,
+		maxGroupFeedChats: maxGroupFeedChats,
 	}
 }
 
@@ -182,15 +180,6 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
 	}
 
-	// A DM's members ride in on the canonical record; a group's are a separate
-	// read, paid for only now that the caller is known to be a member.
-	if IsGroupChatID(req.ChatId) {
-		if err := s.loadGroupMembership(ctx, c); err != nil {
-			log.With(zap.Error(err)).Warn("Failure getting chat members")
-			return nil, status.Error(codes.Internal, "")
-		}
-	}
-
 	metadata, err := s.hydrate(ctx, userID, []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
@@ -203,228 +192,32 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 	}, nil
 }
 
-func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedRequest) (*chatpb.GetDmChatFeedResponse, error) {
-	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
-	if err != nil {
-		return nil, err
-	}
-
-	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
-
-	// Each DM type is its own feed; the request names which one (proto
-	// validation restricts the value to a known DM type).
-	chatType := req.GetDmChatType()
-
-	// For backwards compatiblity for legacy clients
-	if chatType == chatpb.ChatType_UNKNOWN {
-		chatType = chatpb.ChatType_CONTACT_DM
-	}
-
-	limit := maxDmChatFeedPageSize
-	if pageSize := req.GetQueryOptions().GetPageSize(); pageSize > 0 && int(pageSize) < limit {
-		limit = int(pageSize)
-	}
-
-	// The first request (no token) mints a snapshot watermark at the current
-	// time; later requests carry it back in the token so every page is served
-	// against the same point-in-time view. The cursor advances within it. The
-	// token also binds the feed's chat type, so a cursor from one feed cannot
-	// be replayed against another.
-	var snapshot time.Time
-	var cursor *DmFeedCursor
-	if token := req.GetQueryOptions().GetPagingToken(); token != nil {
-		tokenSnapshot, tokenChatType, tokenCursor, ok := decodeDmFeedToken(token)
-		if !ok || tokenChatType != chatType {
-			return nil, status.Error(codes.InvalidArgument, "invalid paging token")
-		}
-		snapshot, cursor = tokenSnapshot, tokenCursor
-	} else {
-		snapshot = time.Now().UTC()
-	}
-
-	// Fetch one extra to detect whether a further page remains.
-	chats, err := s.chats.GetDmFeedPage(ctx, userID, chatType, snapshot, cursor, limit+1)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure getting DM chats")
-		return nil, status.Error(codes.Internal, "")
-	}
-
-	hasMore := len(chats) > limit
-	if hasMore {
-		chats = chats[:limit]
-	}
-
-	// HACK: temporarily pin one group chat to the top of one user's feed, until
-	// there is a real group chat feed to serve it from.
-	pinned := s.pinnedGroupChat(ctx, log, userID, chatType, req.GetQueryOptions().GetPagingToken() == nil)
-	if pinned != nil && len(chats) >= maxDmChatFeedPageSize {
-		// The pinned chat takes a slot, so give up the page's last DM to stay
-		// within max_items. The cursor below is computed from what's retained, so
-		// the next page resumes at the DM that was dropped.
-		chats = chats[:maxDmChatFeedPageSize-1]
-		hasMore = true
-	}
-
-	// Hydrate the pinned chat alongside the page so it shares the batched reads.
-	// The paging token is still derived from the DM page alone: a group chat ID
-	// is not a valid cursor.
-	feed := chats
-	if pinned != nil {
-		feed = append([]*Chat{pinned}, chats...)
-	}
-
-	metadata, err := s.hydrate(ctx, userID, feed)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure hydrating DM feed metadata")
-		return nil, status.Error(codes.Internal, "")
-	}
-
-	resp := &chatpb.GetDmChatFeedResponse{
-		Result:  chatpb.GetDmChatFeedResponse_OK,
-		Chats:   metadata,
-		HasMore: hasMore,
-	}
-	// Carry the snapshot forward and advance the cursor to the last returned
-	// chat. An empty page has nothing to resume from, so the token is omitted.
-	if n := len(chats); n > 0 {
-		last := chats[n-1]
-		resp.PagingToken = encodeDmFeedToken(snapshot, chatType, &DmFeedCursor{
-			LastActivity: last.LastActivity,
-			ChatID:       last.ID,
-		})
-	}
-	return resp, nil
-}
-
-// HACK: the staff group chat gets pinned to the top of the first page of a
-// staff member's tip DM feed.
-var hackStaffChatID = uuid.MustParse("eb62c512-3934-40e0-85f5-9160a20104d0")
-
-// pinnedGroupChat returns the group chat to pin to the top of this feed page,
-// or nil when there is none — which is every case but the hack above: a
-// non-staff user, a staff user who is not a member of the staff chat, another
-// feed type, or a page past the first.
-//
-// A failure anywhere along the way returns nil rather than an error: the hack
-// must never be what breaks a user's feed.
-func (s *Server) pinnedGroupChat(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, chatFeedType chatpb.ChatType, isFirstPage bool) *Chat {
-	if !isFirstPage || chatFeedType != chatpb.ChatType_TIP_DM {
-		return nil
-	}
-
-	// Staff first: it is the cheaper (cached) check, and it keeps the staff
-	// chat's membership from being probed on behalf of everyone else.
-	isStaff, err := s.accounts.IsStaff(ctx, userID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure getting user staff status")
-		return nil
-	}
-	if !isStaff {
-		return nil
-	}
-
-	chatID := &commonpb.ChatId{Value: hackStaffChatID[:]}
-	isMember, err := s.chats.IsMember(ctx, chatID, userID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure checking staff chat membership")
-		return nil
-	}
-	if !isMember {
-		return nil
-	}
-
-	c, err := s.chats.GetChatByID(ctx, chatID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure getting pinned group chat")
-		return nil
-	}
-
-	// A group's members live in their own records, so the canonical read above
-	// leaves them out.
-	if err := s.loadGroupMembership(ctx, c); err != nil {
-		log.With(zap.Error(err)).Warn("Failure getting pinned group chat members")
-		return nil
-	}
-
-	return c
-}
-
-// loadGroupMembership fills in a group chat's Members and RosterSummary, which
-// the canonical record deliberately leaves out. The summary is read on its own
-// rather than derived from the list so that it stays right once the list is a
-// page of the membership rather than all of it.
-//
-// The two reads are deliberately sequential, summary first: a transition that
-// lands during the enumeration is then above the version handed out, so the
-// client sees its copy as stale and refetches. Read concurrently or the other
-// way round, a client could hold a version newer than the list it was given
-// and never learn it (see Store.GetGroupRosterSummary).
-func (s *Server) loadGroupMembership(ctx context.Context, c *Chat) error {
-	roster, err := s.chats.GetGroupRosterSummary(ctx, c.ID)
-	if err != nil {
-		return err
-	}
-	members, err := s.chats.GetMembers(ctx, c.ID)
-	if err != nil {
-		return err
-	}
-	c.Members = members
-	c.RosterSummary = roster
-	return nil
-}
-
-// dmFeedTokenLen is the byte length of an encoded GetDmChatFeed paging token:
-// the snapshot watermark and the cursor's last_activity, each as big-endian
-// int64 unix-nanos, followed by the cursor's chat ID and the feed's chat type
-// as a single byte.
-const dmFeedTokenLen = 8 + 8 + DmChatIDSize + 1
-
-// encodeDmFeedToken serializes the snapshot watermark, feed chat type, and
-// resume cursor into an opaque paging token for the client to echo on the next
-// request.
-func encodeDmFeedToken(snapshot time.Time, chatType chatpb.ChatType, cursor *DmFeedCursor) *commonpb.PagingToken {
-	buf := make([]byte, dmFeedTokenLen)
-	binary.BigEndian.PutUint64(buf[0:8], uint64(snapshot.UnixNano()))
-	binary.BigEndian.PutUint64(buf[8:16], uint64(cursor.LastActivity.UnixNano()))
-	copy(buf[16:16+DmChatIDSize], cursor.ChatID.Value)
-	buf[16+DmChatIDSize] = byte(chatType)
-	return &commonpb.PagingToken{Value: buf}
-}
-
-// decodeDmFeedToken reverses encodeDmFeedToken. ok is false if the token is nil
-// or not the expected length (e.g. a client-fabricated value). The caller must
-// check the returned chat type against the request's, rejecting a token minted
-// for a different feed.
-func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatType chatpb.ChatType, cursor *DmFeedCursor, ok bool) {
-	if token == nil || len(token.Value) != dmFeedTokenLen {
-		return time.Time{}, chatpb.ChatType_UNKNOWN, nil, false
-	}
-	snapshot = time.Unix(0, int64(binary.BigEndian.Uint64(token.Value[0:8]))).UTC()
-	chatType = chatpb.ChatType(token.Value[16+DmChatIDSize])
-	cursor = &DmFeedCursor{
-		LastActivity: time.Unix(0, int64(binary.BigEndian.Uint64(token.Value[8:16]))).UTC(),
-		ChatID:       &commonpb.ChatId{Value: append([]byte(nil), token.Value[16:16+DmChatIDSize]...)},
-	}
-	return snapshot, chatType, cursor, true
-}
-
-// hydrate builds the proto metadata for a set of chats, batching the reads
-// across the whole set: every chat's last message in one call, every DM's
+// hydrate builds the proto metadata for a set of chats the viewer is a member
+// of, batching the reads across the whole set: every chat's last message in
+// one call, every group's roster summary in one call, every hydrated member's
 // pointers in one call, every chat's head event sequence in one call, every
 // member's display name in one call, and every DM member's phone number in one
 // call.
+//
+// A DM's members are its two participants, carried on the canonical record. A
+// group's roster lives in its own records and is not enumerated here: the
+// metadata carries the viewer as its only member, and the group's roster
+// summary — read as a batch across the set — says how large the roster really
+// is. So the cost of a group in the set is fixed, whatever its size, and every
+// caller passes chats straight from the store with no membership read of its
+// own. The roster itself is a separate read.
 //
 // Display names are populated for members of every chat: they are the public
 // identifier a member is known by within the chat. Phone numbers are populated
 // only for members of DM chats, so each party can resolve the other to a
 // contact. Group chats deliberately do not expose member phone numbers.
 //
-// Pointers are populated only for members of DM chats. A group's pointers are
-// stored but never surfaced: they are not broadcast in real time (see
-// messaging.Server.AdvancePointer), and hydrating them here would cost two
-// keyed reads per member on every GetChat, growing with the roster. Group
-// members are left with no pointers rather than a snapshot a client can't keep
-// current.
+// Pointers are populated for every hydrated member: both parties of a DM, and
+// the viewer in a group. The viewer's own READ pointer is what lets a client
+// compute its unread count. Other group members' pointers are stored but never
+// surfaced: they are not broadcast in real time (see
+// messaging.Server.AdvancePointer), and hydrating them would cost two keyed
+// reads per member, growing with the roster.
 //
 // is_hidden is per-viewer: a DM is hidden from viewerID when the DM's peer (the
 // member who is not the viewer) is on the viewer's blocklist. Every DM peer
@@ -442,15 +235,21 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
 	var pointerRefs []PointerRef
+	var groupChatIDs []*commonpb.ChatId
 	uniqueUserIDs := make(map[string]*commonpb.UserId)
 	uniquePrivateProfileUserIds := make(map[string]*commonpb.UserId)
 	dmPeerByChat := make(map[string]*commonpb.UserId)
 	uniquePeerIDs := make(map[string]*commonpb.UserId)
 	uniquePictureBlobIDs := make(map[string]*blobpb.BlobId)
 	for _, c := range chats {
-		if IsDmChatType(c.Type) {
-			pointerRefs = append(pointerRefs, PointerRef{ChatID: c.ID, Members: c.Members})
+		// The members to hydrate: a DM's participants, or the viewer alone in a
+		// group (see above).
+		members := c.Members
+		if IsGroupChatID(c.ID) {
+			members = []*commonpb.UserId{viewerID}
+			groupChatIDs = append(groupChatIDs, c.ID)
 		}
+		pointerRefs = append(pointerRefs, PointerRef{ChatID: c.ID, Members: members})
 		if c.LastMessageID != nil {
 			msgRefs = append(msgRefs, MessageRef{ChatID: c.ID, MessageID: c.LastMessageID})
 			// A chat's head is 0 unless it has at least one message, which is
@@ -461,7 +260,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 		if c.PictureBlobID != nil {
 			uniquePictureBlobIDs[string(c.PictureBlobID.Value)] = c.PictureBlobID
 		}
-		for _, m := range c.Members {
+		for _, m := range members {
 			uniqueUserIDs[string(m.Value)] = m
 			if c.Type == chatpb.ChatType_CONTACT_DM {
 				uniquePrivateProfileUserIds[string(m.Value)] = m
@@ -498,6 +297,10 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 	if err != nil {
 		return nil, err
 	}
+	rosterSummaries, err := s.chats.GetGroupRosterSummaries(ctx, groupChatIDs)
+	if err != nil {
+		return nil, err
+	}
 	pointers, err := s.messaging.Pointers(ctx, pointerRefs)
 	if err != nil {
 		return nil, err
@@ -530,6 +333,13 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 	for i, c := range chats {
 		key := string(c.ID.Value)
 		md := c.ToProto()
+		if IsGroupChatID(c.ID) {
+			// ToProto projects the canonical record, which carries neither a
+			// group's members nor its summary. A group without a summary record
+			// reads as zero, as the single read returns it.
+			md.Members = []*chatpb.Member{{UserId: &commonpb.UserId{Value: append([]byte(nil), viewerID.Value...)}}}
+			md.RosterSummary = rosterSummaries[key].ToProto()
+		}
 		md.LastMessage = lastMessages[key]
 		md.LatestEventSequence = latestEventSeqs[key]
 		if peer, ok := dmPeerByChat[key]; ok {

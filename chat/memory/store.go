@@ -197,6 +197,25 @@ func (m *memory) GetGroupRosterSummary(_ context.Context, chatID *commonpb.ChatI
 	return m.rosterSummaryLocked(chatID), nil
 }
 
+func (m *memory) GetGroupRosterSummaries(_ context.Context, chatIDs []*commonpb.ChatId) (map[string]chat.RosterSummary, error) {
+	for _, chatID := range chatIDs {
+		if !chat.IsGroupChatID(chatID) {
+			return nil, fmt.Errorf("not a group chat id")
+		}
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	out := make(map[string]chat.RosterSummary, len(chatIDs))
+	for _, chatID := range chatIDs {
+		if _, ok := m.chats[string(chatID.Value)]; ok {
+			out[string(chatID.Value)] = m.rosterSummaryLocked(chatID)
+		}
+	}
+	return out, nil
+}
+
 func (m *memory) GetGroupRules(_ context.Context, chatID *commonpb.ChatId) (*chatpb.Rules, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return nil, fmt.Errorf("not a group chat id")
@@ -302,6 +321,49 @@ func (m *memory) GetGroupChatIDsForUser(_ context.Context, userID *commonpb.User
 		}
 	}
 	return chatIDs, nil
+}
+
+func (m *memory) GetGroupChatsForUser(_ context.Context, userID *commonpb.UserId) ([]*chat.Chat, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	chats := make([]*chat.Chat, 0)
+	for chatKey, members := range m.groupMembers {
+		if members[string(userID.Value)] {
+			chats = append(chats, m.chats[chatKey].Clone())
+		}
+	}
+	return chats, nil
+}
+
+func (m *memory) GetGroupChatsForUserByIDs(_ context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) ([]*chat.Chat, error) {
+	for _, chatID := range chatIDs {
+		if !chat.IsGroupChatID(chatID) {
+			return nil, fmt.Errorf("not a group chat id")
+		}
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	chats := make([]*chat.Chat, 0, len(chatIDs))
+	seen := make(map[string]struct{}, len(chatIDs))
+	for _, chatID := range chatIDs {
+		key := string(chatID.Value)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		// Membership first, then the record: a chat that exists but the user is
+		// not joined to is as absent as one that does not exist.
+		if !m.groupMembers[key][string(userID.Value)] {
+			continue
+		}
+		if c, ok := m.chats[key]; ok {
+			chats = append(chats, c.Clone())
+		}
+	}
+	return chats, nil
 }
 
 // hasInlineMember reports whether userID is in a chat's inline member list — a

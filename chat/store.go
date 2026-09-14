@@ -152,6 +152,16 @@ type Store interface {
 	// an error if chatID is not a group chat ID.
 	GetGroupRosterSummary(ctx context.Context, chatID *commonpb.ChatId) (RosterSummary, error)
 
+	// GetGroupRosterSummaries is the cross-chat batch counterpart to
+	// GetGroupRosterSummary: the summary of each given group chat that has one,
+	// keyed by string(chatID.Value), read as a batch rather than one read per
+	// chat. A group without a summary record is absent from the map and reads as
+	// zero, exactly as GetGroupRosterSummary returns it; so is a chat that does
+	// not exist, which callers passing chats they hold never hit. Duplicate IDs
+	// collapse. It returns an error if any ID is not a group chat ID, and an
+	// empty map (no error) when chatIDs is empty.
+	GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]RosterSummary, error)
+
 	// GetGroupRules returns a group chat's participation rules (see
 	// Chat.Rules), or nil when it has none. It reads only what the rules are
 	// projected from, never the full canonical record — and rules are fixed at
@@ -172,6 +182,34 @@ type Store interface {
 	// membership records alone — no canonical chat metadata is read or
 	// returned; a caller that needs it follows up with GetChatByID.
 	GetGroupChatIDsForUser(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.ChatId, error)
+
+	// GetGroupChatsForUser returns the canonical record of every group chat
+	// userID is currently a joined member of, in no particular order. It is
+	// GetGroupChatIDsForUser followed by the canonical read of each ID, and
+	// returns records exactly as GetChatByID does: Members empty and
+	// RosterSummary zero. A user with no group memberships gets an empty result,
+	// not an error.
+	//
+	// It is the group feed's source: with no per-member activity index, a user's
+	// groups are ordered by reading every one of them and sorting — so this is
+	// paid once per feed snapshot, and the order is carried forward from there
+	// (see Server.GetGroupChatFeed).
+	GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserId) ([]*Chat, error)
+
+	// GetGroupChatsForUserByIDs is GetGroupChatsForUser restricted to chatIDs:
+	// the canonical record of each given group chat that exists and that userID
+	// is currently a joined member of, in no particular order. IDs the user is
+	// not a member of (never, or no longer) and IDs of chats that do not exist
+	// are omitted rather than reported; duplicate IDs collapse. It returns an
+	// error if any ID is not a group chat ID, and an empty result (no error) when
+	// chatIDs is empty.
+	//
+	// Membership is checked here, per ID, against the membership records — the
+	// IDs are a caller's hint of what to read, never its authority to read it.
+	// The group feed resumes from IDs a client echoed back in a paging token,
+	// and this is what keeps a tampered token, or one that outlived the caller's
+	// membership, from surfacing a chat they cannot see.
+	GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) ([]*Chat, error)
 
 	// AdvanceLastMessage records messageID as the chat's most recent message,
 	// moving last_activity forward to ts and last_message_id to messageID, and

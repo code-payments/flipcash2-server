@@ -1,6 +1,7 @@
 package dynamodb
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -669,20 +670,39 @@ func (s *store) getGroupMembers(ctx context.Context, chatID *commonpb.ChatId) ([
 // are filtered out by state here.
 
 func (s *store) GetGroupChatIDsForUser(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.ChatId, error) {
+	return s.queryJoinedGroupChatIDs(ctx, userID, nil, nil)
+}
+
+// queryJoinedGroupChatIDs is the gsiByUser query behind GetGroupChatIDsForUser,
+// optionally bounded to chat IDs in [lo, hi]. The index's range key is the
+// chat key, whose hex encoding preserves the ID's byte order, so the bound is
+// a key condition: rows outside it are never scanned, and never billed. Both
+// bounds are nil for the user's whole slice.
+func (s *store) queryJoinedGroupChatIDs(ctx context.Context, userID *commonpb.UserId, lo, hi *commonpb.ChatId) ([]*commonpb.ChatId, error) {
+	keyCondition := "#user = :user"
+	names := map[string]string{"#user": attrUser, "#state": attrState}
+	values := map[string]types.AttributeValue{
+		":user":   avS(userIndexKey(userID)),
+		":joined": avN(memberStateJoined),
+	}
+	if lo != nil && hi != nil {
+		keyCondition += " AND #pk BETWEEN :lo AND :hi"
+		names["#pk"] = attrPK
+		values[":lo"] = avS(chatPK(lo))
+		values[":hi"] = avS(chatPK(hi))
+	}
+
 	chatIDs := make([]*commonpb.ChatId, 0)
 	var startKey map[string]types.AttributeValue
 	for {
 		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
-			TableName:                aws.String(s.groupMembersTable),
-			IndexName:                aws.String(gsiByUser),
-			KeyConditionExpression:   aws.String("#user = :user"),
-			FilterExpression:         aws.String("#state = :joined"),
-			ExpressionAttributeNames: map[string]string{"#user": attrUser, "#state": attrState},
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":user":   avS(userIndexKey(userID)),
-				":joined": avN(memberStateJoined),
-			},
-			ExclusiveStartKey: startKey,
+			TableName:                 aws.String(s.groupMembersTable),
+			IndexName:                 aws.String(gsiByUser),
+			KeyConditionExpression:    aws.String(keyCondition),
+			FilterExpression:          aws.String("#state = :joined"),
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
+			ExclusiveStartKey:         startKey,
 		})
 		if err != nil {
 			return nil, err
@@ -700,6 +720,147 @@ func (s *store) GetGroupChatIDsForUser(ctx context.Context, userID *commonpb.Use
 		startKey = out.LastEvaluatedKey
 	}
 	return chatIDs, nil
+}
+
+func (s *store) GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserId) ([]*chat.Chat, error) {
+	chatIDs, err := s.GetGroupChatIDsForUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return s.batchGetChats(ctx, chatIDs)
+}
+
+// GetGroupChatsForUserByIDs checks membership by querying the user's slice of
+// the inverted membership index — the same read GetGroupChatIDsForUser makes —
+// rather than by a keyed read of each given ID's membership record. A query is
+// billed on the bytes it scans, and membership rows are small, so the user's
+// whole membership costs a fraction of what one keyed read per ID would: a
+// batch get charges every item the full minimum, however small. The query
+// only loses once a user is in thousands of groups, and it is one request
+// either way.
+//
+// The query is bounded to the range of chat IDs asked about, so only the
+// user's memberships that could match are scanned. Group IDs are random, so a
+// page of many IDs spans most of the key space and the bound prunes little;
+// for a few IDs — a refill after a dropped one, say — it prunes nearly
+// everything. It never costs more than the unbounded query.
+//
+// The membership read comes first, and only the given IDs it confirms are
+// then read from the chats table — so nothing is fetched for an ID the user
+// is not (or no longer) in, which is what a stale or tampered feed token asks
+// about.
+func (s *store) GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) ([]*chat.Chat, error) {
+	for _, chatID := range chatIDs {
+		if !chat.IsGroupChatID(chatID) {
+			return nil, fmt.Errorf("not a group chat id")
+		}
+	}
+	if len(chatIDs) == 0 {
+		return []*chat.Chat{}, nil
+	}
+
+	lo, hi := chatIDs[0], chatIDs[0]
+	for _, chatID := range chatIDs[1:] {
+		if bytes.Compare(chatID.Value, lo.Value) < 0 {
+			lo = chatID
+		}
+		if bytes.Compare(chatID.Value, hi.Value) > 0 {
+			hi = chatID
+		}
+	}
+	joinedIDs, err := s.queryJoinedGroupChatIDs(ctx, userID, lo, hi)
+	if err != nil {
+		return nil, err
+	}
+	joined := make(map[string]struct{}, len(joinedIDs))
+	for _, id := range joinedIDs {
+		joined[string(id.Value)] = struct{}{}
+	}
+
+	wanted := make([]*commonpb.ChatId, 0, len(chatIDs))
+	for _, chatID := range chatIDs {
+		if _, ok := joined[string(chatID.Value)]; ok {
+			wanted = append(wanted, chatID)
+		}
+	}
+	return s.batchGetChats(ctx, wanted)
+}
+
+// maxBatchGetKeys is DynamoDB's per-request BatchGetItem key limit.
+const maxBatchGetKeys = 100
+
+// batchGetChats reads the canonical item of each given chat (duplicates
+// collapsed), omitting chats that do not exist, in no particular order.
+func (s *store) batchGetChats(ctx context.Context, chatIDs []*commonpb.ChatId) ([]*chat.Chat, error) {
+	seen := make(map[string]struct{}, len(chatIDs))
+	var keys []map[string]types.AttributeValue
+	for _, chatID := range chatIDs {
+		if _, dup := seen[string(chatID.Value)]; dup {
+			continue
+		}
+		seen[string(chatID.Value)] = struct{}{}
+		keys = append(keys, map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))})
+	}
+
+	chats := make([]*chat.Chat, 0, len(keys))
+	err := s.batchGet(ctx, s.chatsTable, keys, "", nil, func(item map[string]types.AttributeValue) error {
+		chatID, err := chatIDFromPK(item)
+		if err != nil {
+			return err
+		}
+		c, err := chatFromItem(chatID, item)
+		if err != nil {
+			return err
+		}
+		chats = append(chats, c)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return chats, nil
+}
+
+// batchGet reads the given keys from table in BatchGetItem chunks, retrying
+// UnprocessedKeys until each chunk drains, and calls fn on every item found.
+// projection and names are an optional ProjectionExpression and its attribute
+// name aliases; an empty projection reads whole items. Items come back in no
+// particular order.
+func (s *store) batchGet(
+	ctx context.Context,
+	table string,
+	keys []map[string]types.AttributeValue,
+	projection string,
+	names map[string]string,
+	fn func(item map[string]types.AttributeValue) error,
+) error {
+	for start := 0; start < len(keys); start += maxBatchGetKeys {
+		end := min(start+maxBatchGetKeys, len(keys))
+
+		attrs := types.KeysAndAttributes{Keys: keys[start:end]}
+		if projection != "" {
+			attrs.ProjectionExpression = aws.String(projection)
+			attrs.ExpressionAttributeNames = names
+		}
+		req := map[string]types.KeysAndAttributes{table: attrs}
+		for len(req[table].Keys) > 0 {
+			resp, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+			if err != nil {
+				return err
+			}
+			for _, item := range resp.Responses[table] {
+				if err := fn(item); err != nil {
+					return err
+				}
+			}
+			if unprocessed, ok := resp.UnprocessedKeys[table]; ok && len(unprocessed.Keys) > 0 {
+				req = map[string]types.KeysAndAttributes{table: unprocessed}
+			} else {
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // GetGroupRosterSummary is a point read of the group's #meta item. A group that
@@ -725,6 +886,43 @@ func (s *store) GetGroupRosterSummary(ctx context.Context, chatID *commonpb.Chat
 		return chat.RosterSummary{}, nil
 	}
 	return rosterSummaryFromItem(out.Item)
+}
+
+// GetGroupRosterSummaries is one batched keyed read of the given groups' #meta
+// items. A group whose item is absent — one that predates the item, or one
+// that does not exist — is simply absent from the result; unlike the single
+// read, no canonical item is consulted to tell the two apart.
+func (s *store) GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]chat.RosterSummary, error) {
+	seen := make(map[string]struct{}, len(chatIDs))
+	var keys []map[string]types.AttributeValue
+	for _, chatID := range chatIDs {
+		if !chat.IsGroupChatID(chatID) {
+			return nil, fmt.Errorf("not a group chat id")
+		}
+		if _, dup := seen[string(chatID.Value)]; dup {
+			continue
+		}
+		seen[string(chatID.Value)] = struct{}{}
+		keys = append(keys, map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skMeta)})
+	}
+
+	out := make(map[string]chat.RosterSummary, len(keys))
+	err := s.batchGet(ctx, s.groupMembersTable, keys, "", nil, func(item map[string]types.AttributeValue) error {
+		chatID, err := chatIDFromPK(item)
+		if err != nil {
+			return err
+		}
+		summary, err := rosterSummaryFromItem(item)
+		if err != nil {
+			return err
+		}
+		out[string(chatID.Value)] = summary
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (*chatpb.Rules, error) {

@@ -47,6 +47,13 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetDmChatFeed_TypeScoped,
 		testServer_GetDmChatFeed_TokenBoundToType,
 		testServer_GetDmChatFeed_HiddenPerViewer,
+		testServer_GetGroupChatFeed_Empty,
+		testServer_GetGroupChatFeed_OrderAndContent,
+		testServer_GetGroupChatFeed_Paging,
+		testServer_GetGroupChatFeed_Hydrates,
+		testServer_GetGroupChatFeed_SnapshotPinned,
+		testServer_GetGroupChatFeed_DropsDepartedBetweenPages,
+		testServer_GetGroupChatFeed_InvalidToken,
 	} {
 		tf(t, s)
 		teardown()
@@ -385,6 +392,19 @@ func (e *serverEnv) getDmFeedOfType(chatType chatpb.ChatType, opts *commonpb.Que
 	return e.client.GetDmChatFeed(e.ctx, req)
 }
 
+func (e *serverEnv) getGroupFeed(opts *commonpb.QueryOptions) (*chatpb.GetGroupChatFeedResponse, error) {
+	req := &chatpb.GetGroupChatFeedRequest{QueryOptions: opts}
+	require.NoError(e.t, e.keys.Auth(req, &req.Auth))
+	return e.client.GetGroupChatFeed(e.ctx, req)
+}
+
+func (e *serverEnv) mustGetGroupFeed(opts *commonpb.QueryOptions) *chatpb.GetGroupChatFeedResponse {
+	resp, err := e.getGroupFeed(opts)
+	require.NoError(e.t, err)
+	require.Equal(e.t, chatpb.GetGroupChatFeedResponse_OK, resp.Result)
+	return resp
+}
+
 func testServer_GetChat_OK(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
@@ -638,15 +658,16 @@ func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
 	memberC := model.MustGenerateUserID()
 	chatID := e.putGroup("Weekend Trip", at(1), memberB, memberC)
 
-	// Members have full profiles registered — including a phone number, which a
-	// group must never expose.
+	// The viewer has a full profile registered — including a phone number, which
+	// a group must never expose.
+	e.profiles.displayNames[string(e.userID.Value)] = "Viewer"
 	e.profiles.displayNames[string(memberB.Value)] = "Member B"
-	e.profiles.displayNames[string(memberC.Value)] = "Member C"
-	e.profiles.phoneNumbers[string(memberB.Value)] = &commonpb.PhoneNumber{Value: "+15551234567"}
+	e.profiles.phoneNumbers[string(e.userID.Value)] = &commonpb.PhoneNumber{Value: "+15551234567"}
 
-	// A member has a stored pointer. A group's pointers are never surfaced in
-	// its metadata, so it must neither be looked up nor shown.
+	// The viewer and another member each have a stored READ pointer. Only the
+	// viewer's is surfaced: it is what their unread count is computed from.
 	e.messaging.pointers[string(chatID.Value)] = []*messagingpb.Pointer{
+		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 3}, Ts: timestamppb.New(at(3))},
 		{Type: messagingpb.Pointer_READ, UserId: memberB, Value: &messagingpb.MessageId{Value: 4}, Ts: timestamppb.New(at(4))},
 	}
 
@@ -661,27 +682,20 @@ func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
 	require.False(t, resp.Metadata.IsHidden)
 	require.True(t, resp.Metadata.LastActivity.AsTime().Equal(at(1)))
 
-	// Every joined member is present with a hydrated profile, and the count
-	// agrees with them.
-	members := byUserID(resp.Metadata.Members)
-	require.Len(t, members, 3)
+	// The roster is not enumerated: the viewer is the only member carried, with
+	// a hydrated profile, and the summary says how large the roster really is.
+	require.Len(t, resp.Metadata.Members, 1)
 	require.Equal(t, &chatpb.RosterSummary{MemberCount: 3, Version: 0}, resp.Metadata.GetRosterSummary())
-	require.Equal(t, "Member B", members[string(memberB.Value)].UserProfile.DisplayName)
-	require.Equal(t, "Member C", members[string(memberC.Value)].UserProfile.DisplayName)
+	self := resp.Metadata.Members[0]
+	require.Equal(t, e.userID.Value, self.UserId.Value)
+	require.Equal(t, "Viewer", self.UserProfile.DisplayName)
 
-	// No member carries pointers, and the group was never asked about: the
-	// pointer lookup is a per-member keyed read that must not grow with the
-	// roster.
-	for _, m := range members {
-		require.Empty(t, m.Pointers)
-	}
-	require.Zero(t, e.messaging.pointerLookups[string(chatID.Value)])
-
-	// No member's phone number is exposed, registered or not.
-	for _, m := range members {
-		require.NotNil(t, m.UserProfile)
-		require.Nil(t, m.UserProfile.PhoneNumber)
-	}
+	// The viewer's own pointer is surfaced; the other member's is not, and the
+	// viewer's phone number is not, registered or not.
+	require.Len(t, self.Pointers, 1)
+	require.Equal(t, messagingpb.Pointer_READ, self.Pointers[0].Type)
+	require.Equal(t, uint64(3), self.Pointers[0].Value.Value)
+	require.Nil(t, self.UserProfile.PhoneNumber)
 }
 
 func testServer_GetChat_Group_Picture(t *testing.T, s chat.Store) {
@@ -777,7 +791,7 @@ func testServer_GetChat_Group_MembershipLifecycle(t *testing.T, s chat.Store) {
 	require.NoError(t, err)
 	resp = e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-	require.Len(t, resp.Metadata.Members, 2)
+	require.Len(t, resp.Metadata.Members, 1)
 	require.Equal(t, &chatpb.RosterSummary{MemberCount: 2, Version: 2}, resp.Metadata.GetRosterSummary())
 }
 
@@ -869,6 +883,210 @@ func testServer_GetDmChatFeed_Hydrates(t *testing.T, s chat.Store) {
 		members := byUserID(byChat[string(chatID.Value)].Members)
 		require.Equal(t, "Env User", members[string(e.userID.Value)].UserProfile.DisplayName)
 	}
+}
+
+func testServer_GetGroupChatFeed_Empty(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// A DM is not a group: the feed is empty with it.
+	e.putDM(at(1))
+
+	resp := e.mustGetGroupFeed(&commonpb.QueryOptions{})
+	require.Empty(t, resp.Chats)
+	require.False(t, resp.HasMore)
+	require.Nil(t, resp.PagingToken)
+}
+
+func testServer_GetGroupChatFeed_OrderAndContent(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	memberB := model.MustGenerateUserID()
+	e.profiles.displayNames[string(e.userID.Value)] = "Viewer"
+
+	// Persist out of order; the feed must return most-recent activity first.
+	// A DM and a group the viewer is not in must not appear.
+	older := e.putGroup("Older", at(1), memberB)
+	newer := e.putGroup("Newer", at(2), memberB)
+	e.putDM(at(3))
+	_ = putGroupChat(t, s, "Not Mine", at(4), memberB)
+
+	resp := e.mustGetGroupFeed(&commonpb.QueryOptions{})
+	require.False(t, resp.HasMore)
+	require.NotNil(t, resp.PagingToken)
+	require.Len(t, resp.Chats, 2)
+	require.Equal(t, newer.Value, resp.Chats[0].ChatId.Value)
+	require.Equal(t, older.Value, resp.Chats[1].ChatId.Value)
+
+	// Each entry carries the group's metadata, its roster summary, and the
+	// viewer as its only member, as GetChat returns it.
+	first := resp.Chats[0]
+	require.Equal(t, chatpb.ChatType_GROUP, first.Type)
+	require.Equal(t, "Newer", first.Title)
+	require.True(t, first.LastActivity.AsTime().Equal(at(2)))
+	require.False(t, first.IsHidden)
+	require.Equal(t, &chatpb.RosterSummary{MemberCount: 2, Version: 0}, first.GetRosterSummary())
+	require.Len(t, first.Members, 1)
+	require.Equal(t, e.userID.Value, first.Members[0].UserId.Value)
+	require.Equal(t, "Viewer", first.Members[0].UserProfile.DisplayName)
+	require.Nil(t, first.Members[0].UserProfile.PhoneNumber)
+}
+
+func testServer_GetGroupChatFeed_Paging(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	const total = 5
+	want := make([][]byte, total)
+	for i := 0; i < total; i++ {
+		// Increasing activity, so DESC order is the reverse of insertion order.
+		chatID := e.putGroup("", at(int64(i+1)), model.MustGenerateUserID())
+		want[total-1-i] = chatID.Value
+	}
+
+	var got [][]byte
+	var token *commonpb.PagingToken
+	for {
+		resp := e.mustGetGroupFeed(&commonpb.QueryOptions{PageSize: 2, PagingToken: token})
+		require.LessOrEqual(t, len(resp.Chats), 2)
+		for _, c := range resp.Chats {
+			got = append(got, c.ChatId.Value)
+		}
+		if !resp.HasMore {
+			break
+		}
+		require.NotNil(t, resp.PagingToken)
+		token = resp.PagingToken
+	}
+
+	require.Equal(t, want, got)
+}
+
+func testServer_GetGroupChatFeed_Hydrates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// A group with a last message and a picture, and one with neither.
+	pictureBlobID := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	renditions := e.media.setRenditions(pictureBlobID)
+	withMsg := chat.MustGenerateGroupChatID()
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
+		ID:            withMsg,
+		Type:          chatpb.ChatType_GROUP,
+		Members:       []*commonpb.UserId{e.userID, model.MustGenerateUserID()},
+		Title:         "With Message",
+		PictureBlobID: pictureBlobID,
+		LastActivity:  at(2),
+		LastMessageID: &messagingpb.MessageId{Value: 3},
+	}))
+	withoutMsg := e.putGroup("Without", at(1), model.MustGenerateUserID())
+
+	e.messaging.lastMessages[string(withMsg.Value)] = textMessage(3, e.userID, "yo")
+	e.messaging.latestEventSeqs[string(withMsg.Value)] = 3
+	e.messaging.pointers[string(withMsg.Value)] = []*messagingpb.Pointer{
+		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 2}, Ts: timestamppb.New(at(2))},
+	}
+
+	resp := e.mustGetGroupFeed(&commonpb.QueryOptions{})
+	require.Len(t, resp.Chats, 2)
+	byChat := make(map[string]*chatpb.Metadata)
+	for _, md := range resp.Chats {
+		byChat[string(md.ChatId.Value)] = md
+	}
+
+	hydrated := byChat[string(withMsg.Value)]
+	require.NotNil(t, hydrated.LastMessage)
+	require.Equal(t, uint64(3), hydrated.LastMessage.MessageId.Value)
+	require.Equal(t, uint64(3), hydrated.LatestEventSequence)
+	require.NotNil(t, hydrated.Picture)
+	require.Len(t, hydrated.Picture.Renditions, len(renditions))
+	require.NotNil(t, hydrated.Picture.Renditions[0].Blob)
+
+	bare := byChat[string(withoutMsg.Value)]
+	require.Nil(t, bare.LastMessage)
+	require.Zero(t, bare.LatestEventSequence)
+	require.Nil(t, bare.Picture)
+
+	// The viewer's own pointers ride on their member entry; a group with none
+	// stored leaves the entry without any.
+	require.Len(t, hydrated.Members, 1)
+	require.Len(t, hydrated.Members[0].Pointers, 1)
+	require.Equal(t, uint64(2), hydrated.Members[0].Pointers[0].Value.Value)
+	require.Len(t, bare.Members, 1)
+	require.Empty(t, bare.Members[0].Pointers)
+}
+
+// testServer_GetGroupChatFeed_SnapshotPinned verifies the DM feed's snapshot
+// contract holds for groups: a group that becomes active after the first page
+// leaves the window and is not paginated, so the multi-page read stays
+// internally consistent and the group's freshness is the stream's job.
+func testServer_GetGroupChatFeed_SnapshotPinned(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	g1 := e.putGroup("", at(1), model.MustGenerateUserID())
+	g2 := e.putGroup("", at(2), model.MustGenerateUserID())
+	g3 := e.putGroup("", at(3), model.MustGenerateUserID())
+
+	page1 := e.mustGetGroupFeed(&commonpb.QueryOptions{PageSize: 1})
+	require.Equal(t, [][]byte{g3.Value}, metadataChatIDs(page1.Chats))
+	require.True(t, page1.HasMore)
+
+	// g1, not yet paged, becomes active now — after the snapshot the first
+	// request pinned.
+	advanced, _, err := s.AdvanceLastMessage(e.ctx, g1, &messagingpb.MessageId{Value: 1}, time.Now().UTC().Add(time.Hour))
+	require.NoError(t, err)
+	require.True(t, advanced)
+
+	page2 := e.mustGetGroupFeed(&commonpb.QueryOptions{PageSize: 10, PagingToken: page1.PagingToken})
+	require.Equal(t, [][]byte{g2.Value}, metadataChatIDs(page2.Chats))
+	require.False(t, page2.HasMore)
+}
+
+// testServer_GetGroupChatFeed_DropsDepartedBetweenPages verifies that the paging
+// token is a hint, not an authorization: a group the caller leaves between
+// pages — which the token still names — is dropped from the page it would have
+// been on.
+func testServer_GetGroupChatFeed_DropsDepartedBetweenPages(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	g1 := e.putGroup("", at(1), model.MustGenerateUserID())
+	g2 := e.putGroup("", at(2), model.MustGenerateUserID())
+	g3 := e.putGroup("", at(3), model.MustGenerateUserID())
+
+	page1 := e.mustGetGroupFeed(&commonpb.QueryOptions{PageSize: 1})
+	require.Equal(t, [][]byte{g3.Value}, metadataChatIDs(page1.Chats))
+	require.True(t, page1.HasMore)
+
+	_, _, err := s.RemoveGroupMember(e.ctx, g2, e.userID)
+	require.NoError(t, err)
+
+	page2 := e.mustGetGroupFeed(&commonpb.QueryOptions{PageSize: 10, PagingToken: page1.PagingToken})
+	require.Equal(t, [][]byte{g1.Value}, metadataChatIDs(page2.Chats))
+	require.False(t, page2.HasMore)
+}
+
+func testServer_GetGroupChatFeed_InvalidToken(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	e.putGroup("", at(1), model.MustGenerateUserID())
+	e.putDMOfType(chatpb.ChatType_CONTACT_DM, at(1))
+	e.putDMOfType(chatpb.ChatType_CONTACT_DM, at(2))
+
+	// A fabricated token is rejected.
+	_, err := e.getGroupFeed(&commonpb.QueryOptions{PagingToken: &commonpb.PagingToken{Value: []byte("not a token")}})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	// So is a DM feed token: the two feeds' tokens are distinct layouts.
+	dmResp, err := e.getDmFeedOfType(chatpb.ChatType_CONTACT_DM, &commonpb.QueryOptions{PageSize: 1})
+	require.NoError(t, err)
+	require.NotNil(t, dmResp.PagingToken)
+	_, err = e.getGroupFeed(&commonpb.QueryOptions{PagingToken: dmResp.PagingToken})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func metadataChatIDs(chats []*chatpb.Metadata) [][]byte {
+	out := make([][]byte, len(chats))
+	for i, c := range chats {
+		out[i] = c.ChatId.Value
+	}
+	return out
 }
 
 func textMessage(id uint64, sender *commonpb.UserId, text string) *messagingpb.Message {

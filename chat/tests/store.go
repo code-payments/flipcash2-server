@@ -43,6 +43,8 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_GroupChat_RosterSummary,
 		testStore_GroupChat_ConcurrentTransitions,
 		testStore_GroupChat_IDsForUser,
+		testStore_GroupChat_ChatsForUser,
+		testStore_GroupChat_ChatsForUserByIDs,
 		testStore_GroupChat_CreationCap,
 		testStore_GroupChat_DuplicateMembers,
 		testStore_GroupChat_AddMembersErrors,
@@ -696,6 +698,24 @@ func testStore_GroupChat_RosterSummary(t *testing.T, s chat.Store) {
 	require.Equal(t, chat.RosterSummary{MemberCount: 2}, got.RosterSummary)
 	_, err = s.GetGroupRosterSummary(ctx, dm.ID)
 	require.Error(t, err)
+
+	// The batch read agrees with the single read for every group it is given,
+	// collapses a repeated ID, and leaves out an unknown group rather than
+	// failing on it.
+	other := putGroupChat(t, s, "Other", at(6), userA, userB, userC)
+	summaries, err := s.GetGroupRosterSummaries(ctx, []*commonpb.ChatId{c.ID, other.ID, c.ID, chat.MustGenerateGroupChatID()})
+	require.NoError(t, err)
+	require.Equal(t, map[string]chat.RosterSummary{
+		string(c.ID.Value):     {MemberCount: 0, Version: 6},
+		string(other.ID.Value): {MemberCount: 3, Version: 0},
+	}, summaries)
+
+	// No IDs is an empty result; a DM ID is an error.
+	summaries, err = s.GetGroupRosterSummaries(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, summaries)
+	_, err = s.GetGroupRosterSummaries(ctx, []*commonpb.ChatId{c.ID, dm.ID})
+	require.Error(t, err)
 }
 
 // testStore_GroupChat_ConcurrentTransitions pins the summary's exactness under
@@ -796,6 +816,94 @@ func testStore_GroupChat_IDsForUser(t *testing.T, s chat.Store) {
 	chatIDs, err = s.GetGroupChatIDsForUser(ctx, userB)
 	require.NoError(t, err)
 	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupB}), rawChatIDValues(chatIDs))
+}
+
+// testStore_GroupChat_ChatsForUser pins the group feed's source read: the
+// canonical record of exactly the groups the user is currently joined to,
+// tracking departures, with DMs never included.
+func testStore_GroupChat_ChatsForUser(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+
+	// No memberships is an empty result, not an error.
+	chats, err := s.GetGroupChatsForUser(ctx, userA)
+	require.NoError(t, err)
+	require.Empty(t, chats)
+
+	groupAB := putGroupChat(t, s, "Both", at(1), userA, userB)
+	groupA := putGroupChat(t, s, "Only A", at(2), userA)
+	_ = putGroupChat(t, s, "Only B", at(3), userB)
+	putDmChat(t, s, userA, userB, at(4))
+
+	chats, err = s.GetGroupChatsForUser(ctx, userA)
+	require.NoError(t, err)
+	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupA}), chatIDValues(chats))
+
+	// Each is the canonical record as GetChatByID returns it: the group's own
+	// fields, with membership left to its own records.
+	for _, c := range chats {
+		want := groupA
+		if string(c.ID.Value) == string(groupAB.ID.Value) {
+			want = groupAB
+		}
+		require.Equal(t, chatpb.ChatType_GROUP, c.Type)
+		require.Equal(t, want.Title, c.Title)
+		require.True(t, c.LastActivity.Equal(want.LastActivity))
+		require.Empty(t, c.Members)
+		require.Equal(t, chat.RosterSummary{}, c.RosterSummary)
+	}
+
+	// Departure excludes the group.
+	removeGroupMember(t, s, groupAB.ID, userA)
+	chats, err = s.GetGroupChatsForUser(ctx, userA)
+	require.NoError(t, err)
+	require.Equal(t, chatIDValues([]*chat.Chat{groupA}), chatIDValues(chats))
+}
+
+// testStore_GroupChat_ChatsForUserByIDs pins the keyed variant the group feed
+// resumes from: the given IDs are a hint of what to read, and membership is
+// re-checked on each.
+func testStore_GroupChat_ChatsForUserByIDs(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+
+	groupAB := putGroupChat(t, s, "Both", at(1), userA, userB)
+	groupA := putGroupChat(t, s, "Only A", at(2), userA)
+	groupB := putGroupChat(t, s, "Only B", at(3), userB)
+	dm := putDmChat(t, s, userA, userB, at(4))
+
+	// No IDs is an empty result, not an error.
+	chats, err := s.GetGroupChatsForUserByIDs(ctx, userA, nil)
+	require.NoError(t, err)
+	require.Empty(t, chats)
+
+	// A group the user is not in and a group that does not exist are omitted,
+	// not reported; a repeated ID collapses.
+	chats, err = s.GetGroupChatsForUserByIDs(ctx, userA, []*commonpb.ChatId{
+		groupAB.ID, groupB.ID, chat.MustGenerateGroupChatID(), groupAB.ID, groupA.ID,
+	})
+	require.NoError(t, err)
+	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupA}), chatIDValues(chats))
+	for _, c := range chats {
+		require.Equal(t, chatpb.ChatType_GROUP, c.Type)
+		require.Empty(t, c.Members)
+		require.Equal(t, chat.RosterSummary{}, c.RosterSummary)
+	}
+
+	// A tombstoned membership is not a membership: the ID is dropped once the
+	// user has left, even though the chat still exists.
+	removeGroupMember(t, s, groupAB.ID, userA)
+	chats, err = s.GetGroupChatsForUserByIDs(ctx, userA, []*commonpb.ChatId{groupAB.ID, groupA.ID})
+	require.NoError(t, err)
+	require.Equal(t, chatIDValues([]*chat.Chat{groupA}), chatIDValues(chats))
+
+	// A DM ID is the wrong family: an error, not an omission.
+	_, err = s.GetGroupChatsForUserByIDs(ctx, userA, []*commonpb.ChatId{groupA.ID, dm.ID})
+	require.Error(t, err)
 }
 
 // testStore_PutChat_NoMembers pins that a memberless chat of either family is

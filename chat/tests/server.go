@@ -166,6 +166,7 @@ type fakeMessagingReader struct {
 	lastMessages    map[string]*messagingpb.Message
 	pointers        map[string][]*messagingpb.Pointer
 	latestEventSeqs map[string]uint64
+	pointerLookups  map[string]int
 }
 
 func newFakeMessagingReader() *fakeMessagingReader {
@@ -173,6 +174,7 @@ func newFakeMessagingReader() *fakeMessagingReader {
 		lastMessages:    make(map[string]*messagingpb.Message),
 		pointers:        make(map[string][]*messagingpb.Pointer),
 		latestEventSeqs: make(map[string]uint64),
+		pointerLookups:  make(map[string]int),
 	}
 }
 
@@ -189,6 +191,7 @@ func (f *fakeMessagingReader) LastMessages(_ context.Context, refs []chat.Messag
 func (f *fakeMessagingReader) Pointers(_ context.Context, refs []chat.PointerRef) (map[string][]*messagingpb.Pointer, error) {
 	out := make(map[string][]*messagingpb.Pointer)
 	for _, ref := range refs {
+		f.pointerLookups[string(ref.ChatID.Value)]++
 		if p, ok := f.pointers[string(ref.ChatID.Value)]; ok {
 			out[string(ref.ChatID.Value)] = p
 		}
@@ -640,6 +643,9 @@ func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
 	e.profiles.displayNames[string(memberB.Value)] = "Member B"
 	e.profiles.displayNames[string(memberC.Value)] = "Member C"
 	e.profiles.phoneNumbers[string(memberB.Value)] = &commonpb.PhoneNumber{Value: "+15551234567"}
+
+	// A member has a stored pointer. A group's pointers are never surfaced in
+	// its metadata, so it must neither be looked up nor shown.
 	e.messaging.pointers[string(chatID.Value)] = []*messagingpb.Pointer{
 		{Type: messagingpb.Pointer_READ, UserId: memberB, Value: &messagingpb.MessageId{Value: 4}, Ts: timestamppb.New(at(4))},
 	}
@@ -663,9 +669,13 @@ func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
 	require.Equal(t, "Member B", members[string(memberB.Value)].UserProfile.DisplayName)
 	require.Equal(t, "Member C", members[string(memberC.Value)].UserProfile.DisplayName)
 
-	// Pointers are distributed onto the matching member.
-	require.Len(t, members[string(memberB.Value)].Pointers, 1)
-	require.Equal(t, messagingpb.Pointer_READ, members[string(memberB.Value)].Pointers[0].Type)
+	// No member carries pointers, and the group was never asked about: the
+	// pointer lookup is a per-member keyed read that must not grow with the
+	// roster.
+	for _, m := range members {
+		require.Empty(t, m.Pointers)
+	}
+	require.Zero(t, e.messaging.pointerLookups[string(chatID.Value)])
 
 	// No member's phone number is exposed, registered or not.
 	for _, m := range members {

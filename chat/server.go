@@ -39,8 +39,8 @@ type MessageRef struct {
 }
 
 // PointerRef names a chat and the members whose pointers to hydrate. The feed
-// builds one ref per chat (with that chat's members) to batch the pointer lookup
-// across the page.
+// builds one ref per DM chat (with that chat's members) to batch the pointer
+// lookup across the page; group chats get no ref (see hydrate).
 type PointerRef struct {
 	ChatID  *commonpb.ChatId
 	Members []*commonpb.UserId
@@ -409,7 +409,7 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatTyp
 }
 
 // hydrate builds the proto metadata for a set of chats, batching the reads
-// across the whole set: every chat's last message in one call, every chat's
+// across the whole set: every chat's last message in one call, every DM's
 // pointers in one call, every chat's head event sequence in one call, every
 // member's display name in one call, and every DM member's phone number in one
 // call.
@@ -418,6 +418,13 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatTyp
 // identifier a member is known by within the chat. Phone numbers are populated
 // only for members of DM chats, so each party can resolve the other to a
 // contact. Group chats deliberately do not expose member phone numbers.
+//
+// Pointers are populated only for members of DM chats. A group's pointers are
+// stored but never surfaced: they are not broadcast in real time (see
+// messaging.Server.AdvancePointer), and hydrating them here would cost two
+// keyed reads per member on every GetChat, growing with the roster. Group
+// members are left with no pointers rather than a snapshot a client can't keep
+// current.
 //
 // is_hidden is per-viewer: a DM is hidden from viewerID when the DM's peer (the
 // member who is not the viewer) is on the viewer's blocklist. Every DM peer
@@ -434,14 +441,16 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatTyp
 func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
-	pointerRefs := make([]PointerRef, len(chats))
+	var pointerRefs []PointerRef
 	uniqueUserIDs := make(map[string]*commonpb.UserId)
 	uniquePrivateProfileUserIds := make(map[string]*commonpb.UserId)
 	dmPeerByChat := make(map[string]*commonpb.UserId)
 	uniquePeerIDs := make(map[string]*commonpb.UserId)
 	uniquePictureBlobIDs := make(map[string]*blobpb.BlobId)
-	for i, c := range chats {
-		pointerRefs[i] = PointerRef{ChatID: c.ID, Members: c.Members}
+	for _, c := range chats {
+		if IsDmChatType(c.Type) {
+			pointerRefs = append(pointerRefs, PointerRef{ChatID: c.ID, Members: c.Members})
+		}
 		if c.LastMessageID != nil {
 			msgRefs = append(msgRefs, MessageRef{ChatID: c.ID, MessageID: c.LastMessageID})
 			// A chat's head is 0 unless it has at least one message, which is

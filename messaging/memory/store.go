@@ -39,7 +39,7 @@ type chatState struct {
 }
 
 // reactionAgg is a single emoji's aggregate on a message. The entry is retained
-// even after its last reactor leaves (reactors empty) so sequence stays monotonic
+// even after its last reactor leaves (reactors empty) so version stays monotonic
 // across an emoji being removed and re-added; an empty aggregate is treated as
 // inactive (absent from summaries, not counted toward the per-message type cap).
 //
@@ -48,7 +48,7 @@ type chatState struct {
 // least-recent entry once full) and never backfilled on removal — it mirrors the
 // DynamoDB store's sample map so both back ends behave identically.
 type reactionAgg struct {
-	sequence uint64
+	version  uint64
 	reactors map[string]time.Time // string(userID.Value) -> reacted timestamp
 	sample   map[string]time.Time // bounded subset of reactors, string(userID.Value) -> ts
 }
@@ -544,7 +544,7 @@ func (m *memory) AddReaction(
 		agg = &reactionAgg{reactors: make(map[string]time.Time), sample: make(map[string]time.Time)}
 		byEmoji[emoji] = agg
 	}
-	agg.sequence++
+	agg.version++
 	agg.reactors[userKey] = ts
 	// Maintain the recent sample: insert this reactor and, if that pushes the stored
 	// set over its cap, evict the least-recent entry. This keeps the sample the
@@ -586,10 +586,10 @@ func (m *memory) RemoveReaction(
 
 	delete(agg.reactors, userKey)
 	delete(agg.sample, userKey) // no backfill: the sample may shrink below the surfaced size
-	agg.sequence++
+	agg.version++
 
-	// The aggregate is retained (preserving sequence) even when no reactors remain;
-	// buildReaction reports Count 0 and the advanced sequence.
+	// The aggregate is retained (preserving version) even when no reactors remain;
+	// buildReaction reports Count 0 and the advanced version.
 	return buildReaction(emoji, agg), true, nil
 }
 
@@ -787,7 +787,7 @@ func buildReaction(emoji string, agg *reactionAgg) *messaging.Reaction {
 	return &messaging.Reaction{
 		Emoji:          emoji,
 		Count:          uint64(len(agg.reactors)),
-		Sequence:       agg.sequence,
+		Version:        agg.version,
 		SampleReactors: messaging.SampleFromReactors(sample),
 	}
 }

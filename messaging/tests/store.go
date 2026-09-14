@@ -838,7 +838,7 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.True(t, created)
 	require.False(t, tooMany)
 	require.Equal(t, uint64(1), r.Count)
-	require.Equal(t, uint64(1), r.Sequence)
+	require.Equal(t, uint64(1), r.Version)
 	require.False(t, r.ReactedBySelf) // shareable aggregate; the server overlays this
 	require.Len(t, r.SampleReactors, 1)
 	require.Equal(t, userA.Value, r.SampleReactors[0].UserID.Value)
@@ -848,14 +848,14 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	require.False(t, created)
 	require.Equal(t, uint64(1), again.Count)
-	require.Equal(t, uint64(1), again.Sequence)
+	require.Equal(t, uint64(1), again.Version)
 
 	// Second reactor: count 2, sequence advances, sample ordered most-recent-first.
 	r, created, _, err = s.AddReaction(ctx, chatID, msgID, userB, emoji, at(3))
 	require.NoError(t, err)
 	require.True(t, created)
 	require.Equal(t, uint64(2), r.Count)
-	require.Equal(t, uint64(2), r.Sequence)
+	require.Equal(t, uint64(2), r.Version)
 	require.Len(t, r.SampleReactors, 2)
 	require.Equal(t, userB.Value, r.SampleReactors[0].UserID.Value) // most recent first
 	require.Equal(t, userA.Value, r.SampleReactors[1].UserID.Value)
@@ -882,7 +882,7 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	require.True(t, removed)
 	require.Equal(t, uint64(1), r.Count)
-	require.Equal(t, uint64(3), r.Sequence)
+	require.Equal(t, uint64(3), r.Version)
 	require.Len(t, r.SampleReactors, 1)
 	require.Equal(t, userB.Value, r.SampleReactors[0].UserID.Value)
 
@@ -891,7 +891,7 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	require.False(t, removed)
 	require.Equal(t, uint64(1), r.Count)
-	require.Equal(t, uint64(3), r.Sequence)
+	require.Equal(t, uint64(3), r.Version)
 
 	// Remove the last reactor: the aggregate reports count 0 but keeps advancing
 	// its sequence, and the emoji drops out of the summary.
@@ -900,7 +900,7 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.True(t, removed)
 	require.NotNil(t, r)
 	require.Equal(t, uint64(0), r.Count)
-	require.Equal(t, uint64(4), r.Sequence)
+	require.Equal(t, uint64(4), r.Version)
 	require.Empty(t, r.SampleReactors)
 
 	summary, err = s.GetReactionSummary(ctx, chatID, msgID)
@@ -913,7 +913,7 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	require.True(t, created)
 	require.Equal(t, uint64(1), r.Count)
-	require.Equal(t, uint64(5), r.Sequence)
+	require.Equal(t, uint64(5), r.Version)
 	require.Len(t, r.SampleReactors, 1)
 	require.Equal(t, userA.Value, r.SampleReactors[0].UserID.Value)
 }

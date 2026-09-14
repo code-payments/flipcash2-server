@@ -35,11 +35,11 @@ func (c *Cache) PutChat(ctx context.Context, ch *chat.Chat) error {
 	return c.db.PutChat(ctx, ch)
 }
 
-func (c *Cache) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) error {
+func (c *Cache) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (bool, chat.RosterSummary, error) {
 	return c.db.AddGroupMembers(ctx, chatID, userIDs)
 }
 
-func (c *Cache) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) error {
+func (c *Cache) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, chat.RosterSummary, error) {
 	return c.db.RemoveGroupMember(ctx, chatID, userID)
 }
 
@@ -57,6 +57,10 @@ func (c *Cache) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chat
 
 func (c *Cache) GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*commonpb.UserId, error) {
 	return c.db.GetMembers(ctx, chatID)
+}
+
+func (c *Cache) GetGroupRosterSummary(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, error) {
+	return c.db.GetGroupRosterSummary(ctx, chatID)
 }
 
 func (c *Cache) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {

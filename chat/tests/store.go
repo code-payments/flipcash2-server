@@ -3,9 +3,12 @@ package tests
 import (
 	"context"
 	"crypto/rand"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
@@ -33,6 +36,8 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_GroupChat_StaffOnly,
 		testStore_GroupChat_Picture,
 		testStore_GroupChat_Membership,
+		testStore_GroupChat_RosterSummary,
+		testStore_GroupChat_ConcurrentTransitions,
 		testStore_GroupChat_IDsForUser,
 		testStore_GroupChat_CreationCap,
 		testStore_GroupChat_DuplicateMembers,
@@ -70,6 +75,13 @@ func testStore_PutAndGet(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.ChatType_CONTACT_DM, got.Type)
 	require.True(t, got.LastActivity.Equal(at(100)))
 	require.ElementsMatch(t, userIDValues(c.Members), userIDValues(got.Members))
+	require.Equal(t, chat.RosterSummary{MemberCount: 2}, got.RosterSummary)
+
+	// The feed read carries the summary too.
+	feed, err := s.GetDmFeedPage(ctx, userA, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
+	require.NoError(t, err)
+	require.Len(t, feed, 1)
+	require.Equal(t, chat.RosterSummary{MemberCount: 2}, feed[0].RosterSummary)
 }
 
 func testStore_PutChat_Duplicate(t *testing.T, s chat.Store) {
@@ -368,13 +380,13 @@ func testStore_GroupChat_Membership(t *testing.T, s chat.Store) {
 	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{userA, userB}), userIDValues(members))
 
 	// Adding is idempotent for an existing member and joins new ones.
-	require.NoError(t, s.AddGroupMembers(ctx, c.ID, []*commonpb.UserId{userB, userC}))
+	addGroupMembers(t, s, c.ID, userB, userC)
 	members, err = s.GetMembers(ctx, c.ID)
 	require.NoError(t, err)
 	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{userA, userB, userC}), userIDValues(members))
 
 	// Departure: no longer a member, excluded from the member set.
-	require.NoError(t, s.RemoveGroupMember(ctx, c.ID, userB))
+	removeGroupMember(t, s, c.ID, userB)
 	ok, err = s.IsMember(ctx, c.ID, userB)
 	require.NoError(t, err)
 	require.False(t, ok)
@@ -383,17 +395,153 @@ func testStore_GroupChat_Membership(t *testing.T, s chat.Store) {
 	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{userA, userC}), userIDValues(members))
 
 	// Removing an already-departed member or a stranger is a no-op.
-	require.NoError(t, s.RemoveGroupMember(ctx, c.ID, userB))
-	require.NoError(t, s.RemoveGroupMember(ctx, c.ID, model.MustGenerateUserID()))
+	removeGroupMember(t, s, c.ID, userB)
+	removeGroupMember(t, s, c.ID, model.MustGenerateUserID())
 
 	// A departed member can rejoin.
-	require.NoError(t, s.AddGroupMembers(ctx, c.ID, []*commonpb.UserId{userB}))
+	addGroupMembers(t, s, c.ID, userB)
 	ok, err = s.IsMember(ctx, c.ID, userB)
 	require.NoError(t, err)
 	require.True(t, ok)
 	members, err = s.GetMembers(ctx, c.ID)
 	require.NoError(t, err)
 	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{userA, userB, userC}), userIDValues(members))
+}
+
+// testStore_GroupChat_RosterSummary pins the maintained summary against the
+// membership it describes: the count and version move exactly when a
+// membership transition happens — the version by one, the count by the
+// transition's effect — and not on the idempotent no-ops (re-adding a joined
+// member, removing a departed one or a stranger) that leave membership
+// unchanged. Each write reports whether it transitioned and the summary it
+// produced, which is what a subsequent read returns.
+func testStore_GroupChat_RosterSummary(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+	userC := model.MustGenerateUserID()
+
+	// Creation seeds the count from the distinct initial set, at version zero.
+	c := putGroupChat(t, s, "Summarized", at(5), userA, userB, userA)
+	requireRosterSummary(t, s, c.ID, 2, 0)
+
+	// The canonical read carries no group summary, just as it carries no
+	// members.
+	got, err := s.GetChatByID(ctx, c.ID)
+	require.NoError(t, err)
+	require.Zero(t, got.RosterSummary)
+
+	// Adding transitions only the member who actually joins: one bump for two
+	// requested. The write reports the summary it produced.
+	changed, roster := addGroupMembers(t, s, c.ID, userB, userC)
+	require.True(t, changed)
+	require.Equal(t, chat.RosterSummary{MemberCount: 3, Version: 1}, roster)
+	requireRosterSummary(t, s, c.ID, 3, 1)
+
+	// A no-op add reports no change and the summary as it stands.
+	changed, roster = addGroupMembers(t, s, c.ID, userC)
+	require.False(t, changed)
+	require.Equal(t, chat.RosterSummary{MemberCount: 3, Version: 1}, roster)
+	requireRosterSummary(t, s, c.ID, 3, 1)
+
+	// Departure moves the count down and the version up: the version counts
+	// transitions, not members. Repeating it, or removing a stranger, is a
+	// no-op.
+	changed, roster = removeGroupMember(t, s, c.ID, userB)
+	require.True(t, changed)
+	require.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 2}, roster)
+	changed, _ = removeGroupMember(t, s, c.ID, userB)
+	require.False(t, changed)
+	changed, _ = removeGroupMember(t, s, c.ID, model.MustGenerateUserID())
+	require.False(t, changed)
+	requireRosterSummary(t, s, c.ID, 2, 2)
+
+	// A rejoin is a transition like any other. The count is back where it was;
+	// the version says otherwise.
+	changed, roster = addGroupMembers(t, s, c.ID, userB)
+	require.True(t, changed)
+	require.Equal(t, chat.RosterSummary{MemberCount: 3, Version: 3}, roster)
+
+	// Everyone leaving is a count of zero, not an error.
+	for _, u := range []*commonpb.UserId{userA, userB, userC} {
+		removeGroupMember(t, s, c.ID, u)
+	}
+	requireRosterSummary(t, s, c.ID, 0, 6)
+
+	// The count always agrees with the enumeration.
+	members, err := s.GetMembers(ctx, c.ID)
+	require.NoError(t, err)
+	require.Empty(t, members)
+
+	// An unknown group has no summary, as opposed to a zero one...
+	_, err = s.GetGroupRosterSummary(ctx, chat.MustGenerateGroupChatID())
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+
+	// ...and a DM's summary is its inline member list at version zero, never a
+	// group read.
+	dm := putDmChat(t, s, userA, userB, at(1))
+	got, err = s.GetChatByID(ctx, dm.ID)
+	require.NoError(t, err)
+	require.Equal(t, chat.RosterSummary{MemberCount: 2}, got.RosterSummary)
+	_, err = s.GetGroupRosterSummary(ctx, dm.ID)
+	require.Error(t, err)
+}
+
+// testStore_GroupChat_ConcurrentTransitions pins the summary's exactness under
+// contention: concurrent joins to one group each land as their own
+// transition, so the final count and version equal the number of joins, and
+// the summaries the writes report are the distinct versions 1..n — no two
+// writers can observe having produced the same version.
+func testStore_GroupChat_ConcurrentTransitions(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	c := putGroupChat(t, s, "Contended", at(5), model.MustGenerateUserID())
+
+	const joins = 6
+	rosters := make([]chat.RosterSummary, joins)
+	var wg sync.WaitGroup
+	for i := range joins {
+		wg.Go(func() {
+			changed, roster, err := s.AddGroupMembers(ctx, c.ID, []*commonpb.UserId{model.MustGenerateUserID()})
+			assert.NoError(t, err)
+			assert.True(t, changed)
+			rosters[i] = roster
+		})
+	}
+	wg.Wait()
+
+	requireRosterSummary(t, s, c.ID, 1+joins, joins)
+	versions := make([]uint64, joins)
+	for i, r := range rosters {
+		versions[i] = r.Version
+		require.EqualValues(t, 1+r.Version, r.MemberCount, "count tracks version one-for-one under pure joins")
+	}
+	slices.Sort(versions)
+	for i, v := range versions {
+		require.EqualValues(t, i+1, v)
+	}
+}
+
+func requireRosterSummary(t *testing.T, s chat.Store, chatID *commonpb.ChatId, wantCount, wantVersion uint64) {
+	t.Helper()
+	roster, err := s.GetGroupRosterSummary(context.Background(), chatID)
+	require.NoError(t, err)
+	require.Equal(t, chat.RosterSummary{MemberCount: wantCount, Version: wantVersion}, roster)
+}
+
+func addGroupMembers(t *testing.T, s chat.Store, chatID *commonpb.ChatId, userIDs ...*commonpb.UserId) (bool, chat.RosterSummary) {
+	t.Helper()
+	changed, roster, err := s.AddGroupMembers(context.Background(), chatID, userIDs)
+	require.NoError(t, err)
+	return changed, roster
+}
+
+func removeGroupMember(t *testing.T, s chat.Store, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, chat.RosterSummary) {
+	t.Helper()
+	changed, roster, err := s.RemoveGroupMember(context.Background(), chatID, userID)
+	require.NoError(t, err)
+	return changed, roster
 }
 
 // testStore_GroupChat_IDsForUser pins the inverse membership read: exactly the
@@ -422,14 +570,14 @@ func testStore_GroupChat_IDsForUser(t *testing.T, s chat.Store) {
 	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupA}), rawChatIDValues(chatIDs))
 
 	// Departure excludes the group; a tombstoned membership is not a membership.
-	require.NoError(t, s.RemoveGroupMember(ctx, groupAB.ID, userA))
+	removeGroupMember(t, s, groupAB.ID, userA)
 	chatIDs, err = s.GetGroupChatIDsForUser(ctx, userA)
 	require.NoError(t, err)
 	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupA}), rawChatIDValues(chatIDs))
 
 	// Rejoining restores it; joining another user's group adds it.
-	require.NoError(t, s.AddGroupMembers(ctx, groupAB.ID, []*commonpb.UserId{userA}))
-	require.NoError(t, s.AddGroupMembers(ctx, groupB.ID, []*commonpb.UserId{userA}))
+	addGroupMembers(t, s, groupAB.ID, userA)
+	addGroupMembers(t, s, groupB.ID, userA)
 	chatIDs, err = s.GetGroupChatIDsForUser(ctx, userA)
 	require.NoError(t, err)
 	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupA, groupB}), rawChatIDValues(chatIDs))
@@ -534,13 +682,15 @@ func testStore_GroupChat_AddMembersErrors(t *testing.T, s chat.Store) {
 
 	// Membership writes against a chat that does not exist must not accrete
 	// orphaned records.
-	err := s.AddGroupMembers(ctx, chat.MustGenerateGroupChatID(), []*commonpb.UserId{user})
+	_, _, err := s.AddGroupMembers(ctx, chat.MustGenerateGroupChatID(), []*commonpb.UserId{user})
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 
 	// Group membership methods reject DM chat IDs outright.
 	dm := putDmChat(t, s, user, model.MustGenerateUserID(), at(1))
-	require.Error(t, s.AddGroupMembers(ctx, dm.ID, []*commonpb.UserId{user}))
-	require.Error(t, s.RemoveGroupMember(ctx, dm.ID, user))
+	_, _, err = s.AddGroupMembers(ctx, dm.ID, []*commonpb.UserId{user})
+	require.Error(t, err)
+	_, _, err = s.RemoveGroupMember(ctx, dm.ID, user)
+	require.Error(t, err)
 
 	// An unknown group chat has no members, as opposed to an empty set.
 	_, err = s.GetMembers(ctx, chat.MustGenerateGroupChatID())

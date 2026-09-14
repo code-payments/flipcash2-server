@@ -53,12 +53,12 @@ import (
 //
 //	message_reactions  pk = "chat#<id>", sk in { "agg#<padded seq>#<emoji hex>",
 //	                   "rct#<padded seq>#<emoji hex>#<user hex>" }. One agg# row
-//	                   per (message, emoji) holds the count, a monotonic sequence,
+//	                   per (message, emoji) holds the count, a monotonic version,
 //	                   and a bounded sample map (user hex -> reacted_ts, up to
 //	                   MaxStoredSampleReactors of the most-recent reactors, a new
 //	                   reactor evicting the least-recent once full) surfaced as the
 //	                   reaction's sample. The row is retained at
-//	                   count 0 so the sequence survives an emoji being removed and
+//	                   count 0 so the version survives an emoji being removed and
 //	                   re-added. One rct# row per reactor backs idempotency, the
 //	                   self-reaction check, and the reactors_by_recency GSI
 //	                   (reaction_key = chat#<id>#<padded seq>#<emoji hex>,
@@ -103,12 +103,12 @@ const (
 	aggPrefix = "agg#"
 	rctPrefix = "rct#"
 
-	attrEmoji         = "emoji"
-	attrReactionCount = "r_count" // count and sequence are DynamoDB reserved words
-	attrReactionSeq   = "seq"
-	attrSample        = "sample"       // agg# row map: user hex -> reacted_ts (bounded sample)
-	attrReactedTs     = "reacted_ts"   // reactor row attr; reactors_by_recency sort key (nanos)
-	attrReactionKey   = "reaction_key" // reactors_by_recency partition key
+	attrEmoji           = "emoji"
+	attrReactionCount   = "r_count" // count is a DynamoDB reserved word
+	attrReactionVersion = "version"
+	attrSample          = "sample"       // agg# row map: user hex -> reacted_ts (bounded sample)
+	attrReactedTs       = "reacted_ts"   // reactor row attr; reactors_by_recency sort key (nanos)
+	attrReactionKey     = "reaction_key" // reactors_by_recency partition key
 
 	reactorsByRecencyGSI = "reactors_by_recency"
 
@@ -1287,14 +1287,14 @@ func (s *store) AddReaction(
 	for attempt := 0; attempt < maxAddReactionAttempts; attempt++ {
 		// One batched read fetches both the emoji aggregate and the caller's own
 		// reactor row (both share the chat's partition).
-		aggExists, count, sequence, sample, exists, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
+		aggExists, count, version, sample, exists, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
 		if err != nil {
 			return nil, false, false, err
 		}
 
 		// Idempotent: the user already reacted with this emoji.
 		if exists {
-			return buildReaction(emoji, count, sequence, sample), false, false, nil
+			return buildReaction(emoji, count, version, sample), false, false, nil
 		}
 
 		// Activating a (new or previously-emptied) emoji must respect the
@@ -1366,17 +1366,17 @@ func (s *store) AddReaction(
 			case addToSample && evictHex != "":
 				// Atomic evict-and-insert on the sample map alongside the counter bump;
 				// no read-modify-write, so it never contends on the aggregate row.
-				update.UpdateExpression = aws.String(fmt.Sprintf("SET #s.#new = :ts REMOVE #s.#old ADD %s :one, %s :one", attrReactionCount, attrReactionSeq))
+				update.UpdateExpression = aws.String(fmt.Sprintf("SET #s.#new = :ts REMOVE #s.#old ADD %s :one, %s :one", attrReactionCount, attrReactionVersion))
 				update.ExpressionAttributeNames = map[string]string{"#s": attrSample, "#new": newHex, "#old": evictHex}
 				update.ExpressionAttributeValues = map[string]types.AttributeValue{":one": avN(1), ":ts": avN(uint64(ts.UnixNano()))}
 			case addToSample:
 				// Room in the sample: single-key map insert alongside the counter bump.
-				update.UpdateExpression = aws.String(fmt.Sprintf("SET #s.#new = :ts ADD %s :one, %s :one", attrReactionCount, attrReactionSeq))
+				update.UpdateExpression = aws.String(fmt.Sprintf("SET #s.#new = :ts ADD %s :one, %s :one", attrReactionCount, attrReactionVersion))
 				update.ExpressionAttributeNames = map[string]string{"#s": attrSample, "#new": newHex}
 				update.ExpressionAttributeValues = map[string]types.AttributeValue{":one": avN(1), ":ts": avN(uint64(ts.UnixNano()))}
 			default:
 				// Not recent enough to sample: pure counter bump.
-				update.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :one, %s :one", attrReactionCount, attrReactionSeq))
+				update.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :one, %s :one", attrReactionCount, attrReactionVersion))
 				update.ExpressionAttributeValues = map[string]types.AttributeValue{":one": avN(1)}
 			}
 			items = append(items, types.TransactWriteItem{Update: update})
@@ -1384,11 +1384,11 @@ func (s *store) AddReaction(
 			items = append(items, types.TransactWriteItem{Put: &types.Put{
 				TableName: aws.String(s.reactionsTable),
 				Item: map[string]types.AttributeValue{
-					attrPK:            avS(chatPK(chatID)),
-					attrSK:            avS(aggSK(seq, emoji)),
-					attrEmoji:         avS(emoji),
-					attrReactionCount: avN(1),
-					attrReactionSeq:   avN(1),
+					attrPK:              avS(chatPK(chatID)),
+					attrSK:              avS(aggSK(seq, emoji)),
+					attrEmoji:           avS(emoji),
+					attrReactionCount:   avN(1),
+					attrReactionVersion: avN(1),
 					// First reactor seeds the sample map (always has room).
 					attrSample: &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
 						hex.EncodeToString(userID.Value): avN(uint64(ts.UnixNano())),
@@ -1400,13 +1400,13 @@ func (s *store) AddReaction(
 
 		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 		if err == nil {
-			// Read back the authoritative count, sequence, and sample (a concurrent
+			// Read back the authoritative count, version, and sample (a concurrent
 			// add to the same emoji may have advanced them past count+1).
-			_, newCount, newSeq, newSample, err := s.getAggregate(ctx, chatID, seq, emoji)
+			_, newCount, newVersion, newSample, err := s.getAggregate(ctx, chatID, seq, emoji)
 			if err != nil {
 				return nil, false, false, err
 			}
-			return buildReaction(emoji, newCount, newSeq, newSample), true, false, nil
+			return buildReaction(emoji, newCount, newVersion, newSample), true, false, nil
 		}
 
 		reasons, ok := cancellationReasons(err)
@@ -1440,7 +1440,7 @@ func (s *store) RemoveReaction(
 	for attempt := 0; attempt < maxAddReactionAttempts; attempt++ {
 		// One batched read fetches both the emoji aggregate and the caller's own
 		// reactor row (both share the chat's partition).
-		aggExists, count, sequence, sample, exists, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
+		aggExists, count, version, sample, exists, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1449,15 +1449,15 @@ func (s *store) RemoveReaction(
 		// pure no-op when there's no aggregate at all.
 		if !exists {
 			if aggExists {
-				return buildReaction(emoji, count, sequence, sample), false, nil
+				return buildReaction(emoji, count, version, sample), false, nil
 			}
 			return nil, false, nil
 		}
 
 		// [0] delete the reactor (lose to a concurrent identical remove), [1]
-		// decrement the aggregate, advance its sequence, and drop the reactor from
+		// decrement the aggregate, advance its version, and drop the reactor from
 		// the sample map (a no-op if it wasn't sampled; never backfilled). The
-		// aggregate row is retained even at count 0 so sequence survives a re-add.
+		// aggregate row is retained even at count 0 so version survives a re-add.
 		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 			{Delete: &types.Delete{
 				TableName:           aws.String(s.reactionsTable),
@@ -1467,7 +1467,7 @@ func (s *store) RemoveReaction(
 			{Update: &types.Update{
 				TableName:           aws.String(s.reactionsTable),
 				Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(aggSK(seq, emoji))},
-				UpdateExpression:    aws.String(fmt.Sprintf("REMOVE #s.#u ADD %s :negone, %s :one", attrReactionCount, attrReactionSeq)),
+				UpdateExpression:    aws.String(fmt.Sprintf("REMOVE #s.#u ADD %s :negone, %s :one", attrReactionCount, attrReactionVersion)),
 				ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
 				ExpressionAttributeNames: map[string]string{
 					"#s": attrSample,
@@ -1480,13 +1480,13 @@ func (s *store) RemoveReaction(
 			}},
 		}})
 		if err == nil {
-			// Read back the advanced count, sequence, and sample; Count may now be 0,
-			// but the aggregate still carries the sequence the removal broadcast needs.
-			_, newCount, newSeq, newSample, err := s.getAggregate(ctx, chatID, seq, emoji)
+			// Read back the advanced count, version, and sample; Count may now be 0,
+			// but the aggregate still carries the version the removal broadcast needs.
+			_, newCount, newVersion, newSample, err := s.getAggregate(ctx, chatID, seq, emoji)
 			if err != nil {
 				return nil, false, err
 			}
-			return buildReaction(emoji, newCount, newSeq, newSample), true, nil
+			return buildReaction(emoji, newCount, newVersion, newSample), true, nil
 		}
 
 		reasons, ok := cancellationReasons(err)
@@ -1670,7 +1670,7 @@ func (s *store) reactionsForSeqRange(ctx context.Context, chatID *commonpb.ChatI
 		for _, item := range out.Items {
 			count, _ := parseN(item[attrReactionCount])
 			if count == 0 {
-				continue // inactive emoji aggregate, retained only for its sequence
+				continue // inactive emoji aggregate, retained only for its version
 			}
 			seq, err := seqFromAggSK(asS(item[attrSK]))
 			if err != nil {
@@ -1941,10 +1941,10 @@ func (s *store) reactionsForMessage(ctx context.Context, chatID *commonpb.ChatId
 	return reactions, nil
 }
 
-// getAggregate reads an emoji aggregate's count, sequence, and bounded sample map
+// getAggregate reads an emoji aggregate's count, version, and bounded sample map
 // with a strongly consistent read. exists is false when the aggregate row is
 // absent; sample is nil in that case.
-func (s *store) getAggregate(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string) (exists bool, count, sequence uint64, sample map[string]time.Time, err error) {
+func (s *store) getAggregate(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string) (exists bool, count, version uint64, sample map[string]time.Time, err error) {
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:      aws.String(s.reactionsTable),
 		Key:            map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(aggSK(seq, emoji))},
@@ -1957,18 +1957,18 @@ func (s *store) getAggregate(ctx context.Context, chatID *commonpb.ChatId, seq u
 		return false, 0, 0, nil, nil
 	}
 	count, _ = parseN(out.Item[attrReactionCount])
-	sequence, _ = parseN(out.Item[attrReactionSeq])
-	return true, count, sequence, parseSampleMap(out.Item[attrSample]), nil
+	version, _ = parseN(out.Item[attrReactionVersion])
+	return true, count, version, parseSampleMap(out.Item[attrSample]), nil
 }
 
 // readReactionState fetches, in a single strongly-consistent batch read, the two
 // rows the add/remove paths inspect before writing: the emoji's aggregate (count,
-// sequence, bounded sample) and the caller's own reactor row. Both share the
+// version, bounded sample) and the caller's own reactor row. Both share the
 // chat's partition (pk = chat#<id>), so one BatchGetItem covers them, mirroring
 // readSendState on the message path. aggExists is false when the aggregate row is
 // absent (sample is then nil); reacted reports whether userID already has a
 // reactor row for the emoji.
-func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, userID *commonpb.UserId) (aggExists bool, count, sequence uint64, sample map[string]time.Time, reacted bool, err error) {
+func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, userID *commonpb.UserId) (aggExists bool, count, version uint64, sample map[string]time.Time, reacted bool, err error) {
 	aggSKVal := aggSK(seq, emoji)
 	rctSKVal := rctSK(seq, emoji, userID)
 	req := map[string]types.KeysAndAttributes{
@@ -1994,7 +1994,7 @@ func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, 
 			case aggSKVal:
 				aggExists = true
 				count, _ = parseN(item[attrReactionCount])
-				sequence, _ = parseN(item[attrReactionSeq])
+				version, _ = parseN(item[attrReactionVersion])
 				sample = parseSampleMap(item[attrSample])
 			case rctSKVal:
 				reacted = true
@@ -2006,7 +2006,7 @@ func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, 
 			break
 		}
 	}
-	return aggExists, count, sequence, sample, reacted, nil
+	return aggExists, count, version, sample, reacted, nil
 }
 
 // countActiveAggregates counts the distinct emoji on a message that currently
@@ -2044,19 +2044,19 @@ func (s *store) countActiveAggregates(ctx context.Context, chatID *commonpb.Chat
 }
 
 // reactionFromAggItem assembles a Reaction from a full agg# item — count,
-// sequence, and the bounded sample map carried on the row. No query is needed:
+// version, and the bounded sample map carried on the row. No query is needed:
 // the sample lives on the aggregate itself. The per-viewer ReactedBySelf is left
 // false for the server to overlay.
 func reactionFromAggItem(item map[string]types.AttributeValue) *messaging.Reaction {
 	count, _ := parseN(item[attrReactionCount])
-	sequence, _ := parseN(item[attrReactionSeq])
-	return buildReaction(asS(item[attrEmoji]), count, sequence, parseSampleMap(item[attrSample]))
+	version, _ := parseN(item[attrReactionVersion])
+	return buildReaction(asS(item[attrEmoji]), count, version, parseSampleMap(item[attrSample]))
 }
 
-// buildReaction assembles a Reaction from a known count, sequence, and sample map
+// buildReaction assembles a Reaction from a known count, version, and sample map
 // (user hex -> reacted ts). The surfaced sample is the most-recent MaxSampleReactors
 // of the retained set (see messaging.SampleFromReactors).
-func buildReaction(emoji string, count, sequence uint64, sample map[string]time.Time) *messaging.Reaction {
+func buildReaction(emoji string, count, version uint64, sample map[string]time.Time) *messaging.Reaction {
 	reactors := make([]*messaging.Reactor, 0, len(sample))
 	for userHex, ts := range sample {
 		uid, err := hex.DecodeString(userHex)
@@ -2071,7 +2071,7 @@ func buildReaction(emoji string, count, sequence uint64, sample map[string]time.
 	return &messaging.Reaction{
 		Emoji:          emoji,
 		Count:          count,
-		Sequence:       sequence,
+		Version:        version,
 		SampleReactors: messaging.SampleFromReactors(reactors),
 	}
 }

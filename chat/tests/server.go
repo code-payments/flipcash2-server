@@ -393,6 +393,8 @@ func testServer_GetChat_OK(t *testing.T, s chat.Store) {
 	require.Equal(t, chatID.Value, resp.Metadata.ChatId.Value)
 	require.Equal(t, chatpb.ChatType_CONTACT_DM, resp.Metadata.Type)
 	require.Len(t, resp.Metadata.Members, 2)
+	// A DM's roster is fixed at creation: its inline members at version zero.
+	require.Equal(t, &chatpb.RosterSummary{MemberCount: 2, Version: 0}, resp.Metadata.GetRosterSummary())
 	require.Equal(t, e.userID.Value, resp.Metadata.Members[0].UserId.Value)
 	require.True(t, resp.Metadata.LastActivity.AsTime().Equal(at(1)))
 
@@ -653,9 +655,11 @@ func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
 	require.False(t, resp.Metadata.IsHidden)
 	require.True(t, resp.Metadata.LastActivity.AsTime().Equal(at(1)))
 
-	// Every joined member is present with a hydrated profile.
+	// Every joined member is present with a hydrated profile, and the count
+	// agrees with them.
 	members := byUserID(resp.Metadata.Members)
 	require.Len(t, members, 3)
+	require.Equal(t, &chatpb.RosterSummary{MemberCount: 3, Version: 0}, resp.Metadata.GetRosterSummary())
 	require.Equal(t, "Member B", members[string(memberB.Value)].UserProfile.DisplayName)
 	require.Equal(t, "Member C", members[string(memberC.Value)].UserProfile.DisplayName)
 
@@ -735,10 +739,12 @@ func testServer_GetChat_Group_MembershipLifecycle(t *testing.T, s chat.Store) {
 	chatID := e.putGroup("", at(1), member)
 
 	// An untitled group's metadata simply carries an empty title (display
-	// fallbacks are a rendering concern).
+	// fallbacks are a rendering concern). A fresh group's roster is at version
+	// zero.
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.Empty(t, resp.Metadata.Title)
+	require.Equal(t, &chatpb.RosterSummary{MemberCount: 2, Version: 0}, resp.Metadata.GetRosterSummary())
 
 	// A registered non-member is denied.
 	strangerID := model.MustGenerateUserID()
@@ -749,15 +755,20 @@ func testServer_GetChat_Group_MembershipLifecycle(t *testing.T, s chat.Store) {
 	require.Nil(t, resp.Metadata)
 
 	// A removed member loses access — the tombstone is not membership...
-	require.NoError(t, s.RemoveGroupMember(e.ctx, chatID, e.userID))
+	_, _, err := s.RemoveGroupMember(e.ctx, chatID, e.userID)
+	require.NoError(t, err)
 	resp = e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result)
 
-	// ...and a rejoin restores it.
-	require.NoError(t, s.AddGroupMembers(e.ctx, chatID, []*commonpb.UserId{e.userID}))
+	// ...and a rejoin restores it. The count is back where it started; the
+	// version records both transitions, which is what tells a client holding
+	// the original member list that it is stale.
+	_, _, err = s.AddGroupMembers(e.ctx, chatID, []*commonpb.UserId{e.userID})
+	require.NoError(t, err)
 	resp = e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.Len(t, resp.Metadata.Members, 2)
+	require.Equal(t, &chatpb.RosterSummary{MemberCount: 2, Version: 2}, resp.Metadata.GetRosterSummary())
 }
 
 func testServer_GetDmChatFeed_TypeScoped(t *testing.T, s chat.Store) {

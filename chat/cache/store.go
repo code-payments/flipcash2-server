@@ -14,20 +14,23 @@ import (
 	"github.com/code-payments/flipcash2-server/chat"
 )
 
-// Cache wraps a chat.Store, caching DM membership checks. A DM's membership is
-// fixed at chat creation and never changes, so a confirmed DM member is safe to
-// cache. Group membership is mutable — and can be mutated by other processes,
-// which this cache can never observe — so group membership checks always defer
-// to the backing store. The rest of the store is passed straight through.
+// Cache wraps a chat.Store, caching what is fixed at a chat's creation and so
+// can never go stale: DM membership checks and a group's participation rules.
+// A DM's membership never changes, so a confirmed DM member is safe to cache.
+// Group membership is mutable — and can be mutated by other processes, which
+// this cache can never observe — so group membership checks always defer to
+// the backing store. The rest of the store is passed straight through.
 type Cache struct {
 	db          chat.Store
 	memberCache *ttlcache.Cache
+	rulesCache  *ttlcache.Cache
 }
 
 func NewInCache(db chat.Store) chat.Store {
 	return &Cache{
 		db:          db,
 		memberCache: ttlcache.NewCache(),
+		rulesCache:  ttlcache.NewCache(),
 	}
 }
 
@@ -61,6 +64,26 @@ func (c *Cache) GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*com
 
 func (c *Cache) GetGroupRosterSummary(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, error) {
 	return c.db.GetGroupRosterSummary(ctx, chatID)
+}
+
+// GetGroupRules is cached, including the absence of rules (a nil result), so a
+// group without any is read once too. Rules are fixed at creation (see
+// chat.Store), so a cached entry is never stale: if rules ever become mutable,
+// this needs invalidation on write. A cached entry is shared by every caller
+// and must be treated as read-only. Errors — including ErrChatNotFound, since
+// the group may be created later — are not cached.
+func (c *Cache) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (*chatpb.Rules, error) {
+	key := string(chatID.Value)
+	if cached, ok := c.rulesCache.Get(key); ok {
+		return cached.(*chatpb.Rules), nil
+	}
+
+	rules, err := c.db.GetGroupRules(ctx, chatID)
+	if err != nil {
+		return nil, err
+	}
+	c.rulesCache.Set(key, rules)
+	return rules, nil
 }
 
 func (c *Cache) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {

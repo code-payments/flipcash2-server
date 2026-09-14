@@ -19,9 +19,9 @@ func (s *Server) NotifyIsTyping(ctx context.Context, req *messagingpb.NotifyIsTy
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canSpeak(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.NotifyIsTypingResponse{Result: messagingpb.NotifyIsTypingResponse_DENIED}, nil
 	}
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
@@ -34,6 +35,7 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_AdvanceLastMessage,
 		testStore_GroupChat_PutAndGet,
 		testStore_GroupChat_StaffOnly,
+		testStore_GroupChat_Rules,
 		testStore_GroupChat_Creator,
 		testStore_GroupChat_Picture,
 		testStore_GroupChat_Membership,
@@ -288,6 +290,42 @@ func testStore_GroupChat_StaffOnly(t *testing.T, s chat.Store) {
 	require.NoError(t, err)
 	require.True(t, got.IsStaffOnly)
 	require.True(t, got.LastActivity.Equal(at(200)))
+}
+
+func testStore_GroupChat_Rules(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// A group without a requirement has no rules — nil, not an empty set.
+	plain := putGroupChat(t, s, "Weekend Trip", at(100), model.MustGenerateUserID())
+	rules, err := s.GetGroupRules(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Nil(t, rules)
+
+	// A staff-only group's rules are the projection of its record.
+	staff := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:        "Staff",
+		IsStaffOnly:  true,
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, staff))
+
+	rules, err = s.GetGroupRules(ctx, staff.ID)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(staff.Rules(), rules))
+	require.Len(t, rules.GetListener(), 1)
+	require.NotNil(t, rules.GetListener()[0].GetStaff())
+	require.Empty(t, rules.GetSpeaker())
+
+	// An unknown group is not found; a DM ID is not a group.
+	_, err = s.GetGroupRules(ctx, chat.MustGenerateGroupChatID())
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+
+	dm := putDmChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(100))
+	_, err = s.GetGroupRules(ctx, dm.ID)
+	require.Error(t, err)
 }
 
 func testStore_GroupChat_Creator(t *testing.T, s chat.Store) {

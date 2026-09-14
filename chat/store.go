@@ -152,6 +152,14 @@ type Store interface {
 	// an error if chatID is not a group chat ID.
 	GetGroupRosterSummary(ctx context.Context, chatID *commonpb.ChatId) (RosterSummary, error)
 
+	// GetGroupRules returns a group chat's participation rules (see
+	// Chat.Rules), or nil when it has none. It reads only what the rules are
+	// projected from, never the full canonical record — and rules are fixed at
+	// creation, so an implementation is free to cache them indefinitely. It
+	// returns ErrChatNotFound if the chat does not exist, and an error if chatID
+	// is not a group chat ID.
+	GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (*chatpb.Rules, error)
+
 	// IsMember reports whether userID is a member of chatID. It returns false
 	// (no error) when the chat does not exist, or when a group member has been
 	// removed.

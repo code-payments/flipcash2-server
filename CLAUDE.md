@@ -78,8 +78,8 @@ Each package represents a bounded context with clear responsibilities:
 **Core Services (gRPC Servers):**
 - `account/` - User registration, login, public key management, user flags
 - `activity/` - Activity feed for payments, deposits, withdrawals, gift cards
-- `chat/` - Group/DM chat metadata, membership, DM feed pagination (DynamoDB-backed)
-- `messaging/` - Message persistence, delivery/read pointers, typing notifications (DynamoDB-backed); `sender.go` is the engine for server-initiated messages (e.g., payment messages injected into DMs)
+- `chat/` - Group/DM chat metadata, membership, DM feed pagination (DynamoDB-backed); `rules.go` projects a chat's participation rules (e.g., staff-only groups) onto `Metadata.rules` and evaluates them per user via `Store.GetGroupRules`, which `cache/` holds indefinitely (rules are immutable after creation)
+- `messaging/` - Message persistence, delivery/read pointers, typing notifications (DynamoDB-backed); `sender.go` is the engine for server-initiated messages (e.g., payment messages injected into DMs). Every RPC gates on membership plus the chat's rules (`canListen` for reads, `canSpeak` for sends); `GetChat` gates on membership alone
 - `contact/` - Contact list sync (hashed phone numbers, XOR-of-SHA256 checksums, streaming delta/full uploads); maps contacts to Flipcash users and their DM chat IDs
 - `event/` - Real-time event streaming with bidirectional gRPC streams
 - `push/` - Push notification management (FCM for iOS/Android), with category/group-key support

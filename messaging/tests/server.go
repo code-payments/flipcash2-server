@@ -22,6 +22,8 @@ import (
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 
+	"github.com/code-payments/flipcash2-server/account"
+	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/badge"
 	"github.com/code-payments/flipcash2-server/blob"
@@ -71,6 +73,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_NotifyIsTyping,
 		// Cross-cutting
 		testServer_NonMember_Denied,
+		testServer_StaffOnlyGroup_Rules,
 		testServer_Broadcast_IncludesActor,
 		testServer_SendMessage_PushPerChatType,
 		testServer_SendMessage_GroupChatPush,
@@ -97,9 +100,35 @@ type serverEnv struct {
 	keysB  model.KeyPair
 
 	blocklist blocklist.Store
+	accounts  *staffAccounts
 
 	blobStore  blob.Store
 	blobAccess blob.AccessStore
+}
+
+// staffAccounts is an account.Store whose staff flag a test can set: the
+// in-memory store answers IsStaff false for everyone, and has no setter.
+type staffAccounts struct {
+	account.Store
+
+	mu    sync.Mutex
+	staff map[string]bool
+}
+
+func newStaffAccounts(db account.Store) *staffAccounts {
+	return &staffAccounts{Store: db, staff: make(map[string]bool)}
+}
+
+func (a *staffAccounts) setStaff(userID *commonpb.UserId, isStaff bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.staff[string(userID.Value)] = isStaff
+}
+
+func (a *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.staff[string(userID.Value)], nil
 }
 
 func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) *serverEnv {
@@ -140,8 +169,10 @@ func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, 
 	env.blobAccess = blobAccess
 	media := blob.NewIntegration(blobStore, blob_memory.NewInMemoryStorage(), blobAccess)
 
+	env.accounts = newStaffAccounts(accountmemory.NewInMemory())
+
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus)
-	server := messaging.NewServer(log, authz, chats, messages, media, sender)
+	server := messaging.NewServer(log, authz, env.accounts, chats, media, messages, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
 	}))
@@ -1723,6 +1754,106 @@ func testServer_NonMember_Denied(t *testing.T, badges badge.Store, blocklists bl
 	typingResp, err := e.notifyIsTyping(strangerKeys, messagingpb.IsTypingNotification_STARTED_TYPING)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
+}
+
+// testServer_StaffOnlyGroup_Rules pins that a staff-only group's listener rule
+// is enforced on every messaging path, on top of membership: a member who is
+// not staff is denied exactly as a non-member is, and the rule tracks the
+// flag's current value rather than the state at join time.
+func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	const emoji = "👍"
+
+	// userA is staff; userB is a member who is not (added by hand — no path
+	// checks the rule on membership yet).
+	e.accounts.setStaff(e.userA, true)
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		Title:        "Staff",
+		IsStaffOnly:  true,
+		LastActivity: at(1),
+	}))
+
+	// The staff member participates freely.
+	sent, err := e.sendContentToChat(e.keysA, groupID, textContent("staff only"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	msgID := sent.Message.MessageId
+
+	// The non-staff member is denied everywhere, as a non-member would be.
+	denied := func(keys model.KeyPair) {
+		t.Helper()
+
+		sendResp, err := e.sendContentToChat(keys, groupID, textContent("intruder"), generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
+
+		getReq := &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: msgID}
+		require.NoError(t, keys.Auth(getReq, &getReq.Auth))
+		getResp, err := e.client.GetMessage(e.ctx, getReq)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result)
+
+		listReq := &messagingpb.GetMessagesRequest{ChatId: groupID, Query: &messagingpb.GetMessagesRequest_Options{Options: &commonpb.QueryOptions{}}}
+		require.NoError(t, keys.Auth(listReq, &listReq.Auth))
+		listResp, err := e.client.GetMessages(e.ctx, listReq)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_DENIED, listResp.Result)
+
+		deltaReq := &messagingpb.GetDeltaRequest{ChatId: groupID}
+		require.NoError(t, keys.Auth(deltaReq, &deltaReq.Auth))
+		deltaStream, err := e.client.GetDelta(e.ctx, deltaReq)
+		require.NoError(t, err)
+		deltaResp, err := deltaStream.Recv()
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetDeltaResponse_DENIED, deltaResp.Result)
+
+		advResp, err := e.advancePointerInChat(keys, groupID, messagingpb.Pointer_READ, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AdvancePointerResponse_DENIED, advResp.Result)
+
+		addResp, err := e.addReactionInChat(keys, groupID, msgID, emoji)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AddReactionResponse_DENIED, addResp.Result)
+
+		sumResp, err := e.getReactionSummaryInChat(keys, groupID, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummaryResponse_DENIED, sumResp.Result)
+
+		sumsResp, err := e.getReactionSummariesByIDsInChat(keys, groupID, msgID.Value)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummariesResponse_DENIED, sumsResp.Result)
+
+		typingReq := &messagingpb.NotifyIsTypingRequest{ChatId: groupID, State: messagingpb.IsTypingNotification_STARTED_TYPING}
+		require.NoError(t, keys.Auth(typingReq, &typingReq.Auth))
+		typingResp, err := e.client.NotifyIsTyping(e.ctx, typingReq)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
+	}
+	denied(e.keysB)
+
+	// Staff status alone is not membership: a staff non-member is still denied.
+	outsider, outsiderKeys := e.addUser()
+	e.accounts.setStaff(outsider, true)
+	denied(outsiderKeys)
+
+	// The rule tracks the flag: promoted, the member is admitted...
+	e.accounts.setStaff(e.userB, true)
+	resp, err := e.sendContentToChat(e.keysB, groupID, textContent("promoted"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+
+	// ...and revoked, the founding staff member is denied on the next call.
+	e.accounts.setStaff(e.userA, false)
+	denied(e.keysA)
+
+	// A DM in the same env is untouched by any of this: DMs carry no rules.
+	dmResp, err := e.send(e.keysA, "still a dm", generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, dmResp.Result)
 }
 
 func testServer_Broadcast_IncludesActor(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

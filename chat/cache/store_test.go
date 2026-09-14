@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
@@ -37,6 +39,85 @@ func (s *countingStore) callCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls
+}
+
+// countingRulesStore is a chat.Store whose GetGroupRules result is
+// configurable and whose calls are counted.
+type countingRulesStore struct {
+	chat.Store
+
+	mu    sync.Mutex
+	calls int
+	rules *chatpb.Rules
+	err   error
+}
+
+func (s *countingRulesStore) GetGroupRules(_ context.Context, _ *commonpb.ChatId) (*chatpb.Rules, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return s.rules, s.err
+}
+
+func (s *countingRulesStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestCache_GetGroupRules_Cached(t *testing.T) {
+	ctx := context.Background()
+	staffOnly := &chatpb.Rules{Listener: []*chatpb.ListenerRules{{Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}}}}}
+	backing := &countingRulesStore{rules: staffOnly}
+	c := cache.NewInCache(backing)
+
+	chatID := chat.MustGenerateGroupChatID()
+	for i := 0; i < 3; i++ {
+		rules, err := c.GetGroupRules(ctx, chatID)
+		require.NoError(t, err)
+		require.True(t, proto.Equal(staffOnly, rules))
+	}
+	require.Equal(t, 1, backing.callCount())
+
+	// Rules are fixed at creation, so the cache is what answers even once the
+	// backing store would say otherwise.
+	backing.rules = nil
+	rules, err := c.GetGroupRules(ctx, chatID)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(staffOnly, rules))
+	require.Equal(t, 1, backing.callCount())
+
+	// The absence of rules is cached too: a group without any is read once.
+	plainID := chat.MustGenerateGroupChatID()
+	for i := 0; i < 2; i++ {
+		rules, err := c.GetGroupRules(ctx, plainID)
+		require.NoError(t, err)
+		require.Nil(t, rules)
+	}
+	require.Equal(t, 2, backing.callCount())
+}
+
+func TestCache_GetGroupRules_DoesNotCacheErrors(t *testing.T) {
+	ctx := context.Background()
+	backing := &countingRulesStore{err: chat.ErrChatNotFound}
+	c := cache.NewInCache(backing)
+
+	// A not-found is re-queried: the group may be created later.
+	chatID := chat.MustGenerateGroupChatID()
+	for i := 0; i < 2; i++ {
+		_, err := c.GetGroupRules(ctx, chatID)
+		require.ErrorIs(t, err, chat.ErrChatNotFound)
+	}
+	require.Equal(t, 2, backing.callCount())
+
+	// Once it exists, its rules are served and then held.
+	backing.err = nil
+	for i := 0; i < 2; i++ {
+		rules, err := c.GetGroupRules(ctx, chatID)
+		require.NoError(t, err)
+		require.Nil(t, rules)
+	}
+	require.Equal(t, 3, backing.callCount())
 }
 
 func TestCache_IsMember_CachesPositive(t *testing.T) {

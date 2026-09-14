@@ -721,6 +721,37 @@ func (s *store) GetGroupRosterSummary(ctx context.Context, chatID *commonpb.Chat
 	return rosterSummaryFromItem(out.Item)
 }
 
+func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (*chatpb.Rules, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, fmt.Errorf("not a group chat id")
+	}
+
+	// Only the attributes the rules are projected from: the type, and the flags
+	// that stand for a rule. The rest of the record — title, picture, activity —
+	// is neither fetched nor deserialized.
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:                aws.String(s.chatsTable),
+		Key:                      map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
+		ProjectionExpression:     aws.String("#type, #staff"),
+		ExpressionAttributeNames: map[string]string{"#type": attrType, "#staff": attrIsStaffOnly},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(out.Item) == 0 {
+		return nil, chat.ErrChatNotFound
+	}
+	typeVal, err := parseN(out.Item[attrType])
+	if err != nil {
+		return nil, err
+	}
+	c := &chat.Chat{
+		Type:        protoChatType(uint64(typeVal)),
+		IsStaffOnly: asBool(out.Item[attrIsStaffOnly]),
+	}
+	return c.Rules(), nil
+}
+
 // rosterSummaryFromItem reads a #meta item. version is absent on an item
 // backfilled by hand without one, and reads as zero — the value creation seeds.
 func rosterSummaryFromItem(item map[string]types.AttributeValue) (chat.RosterSummary, error) {

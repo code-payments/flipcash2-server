@@ -32,9 +32,9 @@ func (s *Server) AddReaction(ctx context.Context, req *messagingpb.AddReactionRe
 		return &messagingpb.AddReactionResponse{Result: messagingpb.AddReactionResponse_DENIED}, nil
 	}
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.AddReactionResponse{Result: messagingpb.AddReactionResponse_DENIED}, nil
 	}
 
@@ -100,9 +100,9 @@ func (s *Server) RemoveReaction(ctx context.Context, req *messagingpb.RemoveReac
 		return &messagingpb.RemoveReactionResponse{Result: messagingpb.RemoveReactionResponse_DENIED}, nil
 	}
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.RemoveReactionResponse{Result: messagingpb.RemoveReactionResponse_DENIED}, nil
 	}
 
@@ -152,9 +152,9 @@ func (s *Server) GetReactionSummary(ctx context.Context, req *messagingpb.GetRea
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.GetReactionSummaryResponse{Result: messagingpb.GetReactionSummaryResponse_DENIED}, nil
 	}
 
@@ -190,9 +190,9 @@ func (s *Server) GetReactionSummaries(ctx context.Context, req *messagingpb.GetR
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.GetReactionSummariesResponse{Result: messagingpb.GetReactionSummariesResponse_DENIED}, nil
 	}
 
@@ -235,9 +235,9 @@ func (s *Server) GetReactors(ctx context.Context, req *messagingpb.GetReactorsRe
 		return &messagingpb.GetReactorsResponse{Result: messagingpb.GetReactorsResponse_DENIED}, nil
 	}
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.GetReactorsResponse{Result: messagingpb.GetReactorsResponse_DENIED}, nil
 	}
 

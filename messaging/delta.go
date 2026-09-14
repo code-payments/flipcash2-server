@@ -33,9 +33,9 @@ func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.M
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
 		return err
-	} else if !member {
+	} else if !allowed {
 		// A terminal DENIED is a single response that ends the stream.
 		return stream.Send(&messagingpb.GetDeltaResponse{Result: messagingpb.GetDeltaResponse_DENIED})
 	}

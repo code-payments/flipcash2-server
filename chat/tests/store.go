@@ -34,6 +34,7 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_AdvanceLastMessage,
 		testStore_GroupChat_PutAndGet,
 		testStore_GroupChat_StaffOnly,
+		testStore_GroupChat_Creator,
 		testStore_GroupChat_Picture,
 		testStore_GroupChat_Membership,
 		testStore_GroupChat_RosterSummary,
@@ -287,6 +288,57 @@ func testStore_GroupChat_StaffOnly(t *testing.T, s chat.Store) {
 	require.NoError(t, err)
 	require.True(t, got.IsStaffOnly)
 	require.True(t, got.LastActivity.Equal(at(200)))
+}
+
+func testStore_GroupChat_Creator(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// A group written without a creator reads back with none.
+	plain := putGroupChat(t, s, "Weekend Trip", at(100), model.MustGenerateUserID())
+	got, err := s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.CreatorID)
+
+	// The creator is recorded at creation, independently of membership: here
+	// the creator is not among the initial members, and the record still names
+	// them without them appearing in the roster.
+	creator := model.MustGenerateUserID()
+	member := model.MustGenerateUserID()
+	created := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{member},
+		Title:        "Created",
+		CreatorID:    creator,
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, created))
+
+	got, err = s.GetChatByID(ctx, created.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.CreatorID)
+	require.Equal(t, creator.Value, got.CreatorID.Value)
+	members, err := s.GetMembers(ctx, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{member.Value}, userIDValues(members))
+
+	// The creator is part of the canonical record and survives the updates
+	// that touch it.
+	advanced, _, err := s.AdvanceLastMessage(ctx, created.ID, &messagingpb.MessageId{Value: 1}, at(200))
+	require.NoError(t, err)
+	require.True(t, advanced)
+	require.NoError(t, s.SetGroupPicture(ctx, created.ID, &blobpb.BlobId{Value: []byte("picture-blob-creator")}))
+
+	got, err = s.GetChatByID(ctx, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, creator.Value, got.CreatorID.Value)
+	require.True(t, got.LastActivity.Equal(at(200)))
+
+	// A DM has no creator.
+	dm := putDmChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(100))
+	got, err = s.GetChatByID(ctx, dm.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.CreatorID)
 }
 
 func testStore_GroupChat_Picture(t *testing.T, s chat.Store) {

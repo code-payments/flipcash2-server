@@ -11,6 +11,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
 	ocp_balancepb "github.com/code-payments/ocp-protobuf-api/generated/go/balance/v1"
+	ocp_commonpb "github.com/code-payments/ocp-protobuf-api/generated/go/common/v1"
 
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 
@@ -74,47 +75,47 @@ func (c *Client) GetTotalUsdfBalance(ctx context.Context, userID *commonpb.UserI
 	}
 
 	// Users are expected to have a single public key, but the binding is modelled
-	// as a set, so sum across every owner account the user controls.
-	var total uint64
+	// as a set, so fetch every owner account the user controls in one call and
+	// sum across them.
+	owners := make([]*ocp_common.Account, 0, len(pubKeys))
+	ownerProtos := make([]*ocp_commonpb.SolanaAccountId, 0, len(pubKeys))
 	for _, pubKey := range pubKeys {
-		balance, err := c.getOwnerBalance(ctx, log, pubKey)
+		owner, err := ocp_common.NewAccountFromPublicKeyBytes(pubKey.Value)
 		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure parsing owner account")
 			return 0, err
 		}
-		total += balance
-	}
-	return total, nil
-}
-
-// getOwnerBalance returns the core mint value held by a single owner account.
-func (c *Client) getOwnerBalance(ctx context.Context, log *zap.Logger, pubKey *commonpb.PublicKey) (uint64, error) {
-	owner, err := ocp_common.NewAccountFromPublicKeyBytes(pubKey.Value)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure parsing owner account")
-		return 0, err
+		owners = append(owners, owner)
+		ownerProtos = append(ownerProtos, owner.ToProto())
 	}
 
-	log = log.With(zap.String("owner_account", owner.PublicKey().ToBase58()))
-
-	resp, err := c.ocpBalance.GetBalance(ctx, &ocp_balancepb.GetBalanceRequest{
-		Owner: owner.ToProto(),
+	resp, err := c.ocpBalance.GetBalances(ctx, &ocp_balancepb.GetBalancesRequest{
+		Owners: ownerProtos,
 	})
 	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure getting balance from OCP")
+		log.With(zap.Error(err)).Warn("Failure getting balances from OCP")
 		return 0, err
 	}
 
 	switch resp.Result {
-	case ocp_balancepb.GetBalanceResponse_OK:
-		return resp.CoreMintValue, nil
-	case ocp_balancepb.GetBalanceResponse_NOT_FOUND:
-		// The owner account isn't known to OCP, which is the case until the user
-		// opens their accounts. Nothing has been opened, so the balance is zero.
-		return 0, nil
-	case ocp_balancepb.GetBalanceResponse_DENIED:
+	case ocp_balancepb.GetBalancesResponse_OK:
+	case ocp_balancepb.GetBalancesResponse_DENIED:
 		return 0, ErrDenied
 	default:
-		log.With(zap.String("result", resp.Result.String())).Warn("Unexpected result getting balance from OCP")
-		return 0, errors.New("unexpected result getting balance: " + resp.Result.String())
+		log.With(zap.String("result", resp.Result.String())).Warn("Unexpected result getting balances from OCP")
+		return 0, errors.New("unexpected result getting balances: " + resp.Result.String())
 	}
+
+	// Balances come back keyed by owner address. An owner that OCP doesn't know
+	// is left out of the response, which is the case until the user opens their
+	// accounts. Nothing has been opened, so that owner contributes nothing.
+	var total uint64
+	for _, owner := range owners {
+		ownerBalance, ok := resp.BalancesByOwner[owner.PublicKey().ToBase58()]
+		if !ok {
+			continue
+		}
+		total += ownerBalance.CoreMintValue
+	}
+	return total, nil
 }

@@ -22,9 +22,9 @@ func (s *Server) AdvancePointer(ctx context.Context, req *messagingpb.AdvancePoi
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.AdvancePointerResponse{Result: messagingpb.AdvancePointerResponse_DENIED}, nil
 	}
 

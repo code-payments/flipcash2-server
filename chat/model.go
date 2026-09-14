@@ -189,8 +189,11 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // alongside its Members. It is derived state, ignored on PutChat.
 //
 // IsStaffOnly marks a group whose membership is restricted to staff users. It
-// is stored state set at creation; enforcing it (on membership changes, reads,
-// and sends) is the server layer's responsibility.
+// is stored state set at creation, surfaced to clients as a listener rule (see
+// Rules) and enforced by the messaging service through a RuleEvaluator on reads
+// and sends. Chat metadata reads gate on membership alone, so a member the rule
+// excludes can still see the chat and what it requires of them; enforcing it
+// on membership changes is the job of whatever path mutates membership.
 //
 // CreatorID is the user who created the group, or nil when unknown (a DM has
 // none, and so does any group written before the field existed). It is fixed
@@ -281,10 +284,10 @@ func (c *Chat) Clone() *Chat {
 
 // ToProto projects the stored chat onto a chatpb.Metadata. Only the fields
 // owned by the chat domain are populated: chat_id, type, title, last_activity,
-// roster_summary, a Member entry per member with just user_id set, and — for a
-// group with a picture — a picture carrying only its ORIGINAL rendition's blob
-// id. The caller is responsible for hydrating member profiles, pointers, the
-// last message, and the picture's resolved rendition set.
+// roster_summary, rules, a Member entry per member with just user_id set, and —
+// for a group with a picture — a picture carrying only its ORIGINAL rendition's
+// blob id. The caller is responsible for hydrating member profiles, pointers,
+// the last message, and the picture's resolved rendition set.
 func (c *Chat) ToProto() *chatpb.Metadata {
 	members := make([]*chatpb.Member, len(c.Members))
 	for i, m := range c.Members {
@@ -298,6 +301,7 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 		Members:       members,
 		RosterSummary: c.RosterSummary.ToProto(),
 		Title:         c.Title,
+		Rules:         c.Rules(),
 		LastActivity:  timestamppb.New(c.LastActivity),
 	}
 	if c.PictureBlobID != nil {

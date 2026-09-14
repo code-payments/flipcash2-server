@@ -82,7 +82,7 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 	blocklist := newFakeBlocklistReader()
 	media := newFakeMediaReader()
 	accounts := accountmemory.NewInMemory()
-	server := chat.NewServer(log, authz, s, messaging, profiles, blocklist, media, accounts)
+	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, profiles)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))

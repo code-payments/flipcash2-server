@@ -25,9 +25,9 @@ func (s *Server) GetMessage(ctx context.Context, req *messagingpb.GetMessageRequ
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.GetMessageResponse{Result: messagingpb.GetMessageResponse_DENIED}, nil
 	}
 
@@ -59,9 +59,9 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.GetMessagesResponse{Result: messagingpb.GetMessagesResponse_DENIED}, nil
 	}
 
@@ -110,9 +110,9 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
 	}
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canSpeak(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
 	}
 
@@ -167,9 +167,9 @@ func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRe
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
 	}
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canSpeak(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
 	}
 
@@ -269,9 +269,9 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if member, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.canSpeak(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
-	} else if !member {
+	} else if !allowed {
 		return &messagingpb.DeleteMessageResponse{Result: messagingpb.DeleteMessageResponse_DENIED}, nil
 	}
 

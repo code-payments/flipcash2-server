@@ -127,26 +127,26 @@ type Server struct {
 
 	authz auth.Authorizer
 
+	accounts  account.Store
+	blocklist BlocklistReader
 	chats     Store
+	media     MediaReader
 	messaging MessagingReader
 	profiles  ProfileReader
-	blocklist BlocklistReader
-	media     MediaReader
-	accounts  account.Store
 
 	chatpb.UnimplementedChatServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, chats Store, messaging MessagingReader, profiles ProfileReader, blocklist BlocklistReader, media MediaReader, accounts account.Store) *Server {
+func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, blocklist BlocklistReader, chats Store, media MediaReader, messaging MessagingReader, profiles ProfileReader) *Server {
 	return &Server{
 		log:       log,
 		authz:     authz,
+		accounts:  accounts,
+		blocklist: blocklist,
 		chats:     chats,
+		media:     media,
 		messaging: messaging,
 		profiles:  profiles,
-		blocklist: blocklist,
-		media:     media,
-		accounts:  accounts,
 	}
 }
 

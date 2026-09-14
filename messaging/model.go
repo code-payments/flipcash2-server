@@ -203,7 +203,7 @@ func (r *Reactor) ToProto() *messagingpb.Reactor {
 type Reaction struct {
 	Emoji          string
 	Count          uint64
-	Sequence       uint64
+	Version        uint64
 	ReactedBySelf  bool
 	SampleReactors []*Reactor
 }
@@ -219,7 +219,7 @@ func (r *Reaction) ToProto() *messagingpb.EmojiReaction {
 		Count:          r.Count,
 		ReactedBySelf:  r.ReactedBySelf,
 		SampleReactors: sample,
-		Sequence:       r.Sequence,
+		Version:        r.Version,
 	}
 }
 

@@ -33,10 +33,11 @@ var (
 // caller grows the group with AddGroupMembers instead.
 //
 // Creation is all-or-nothing, so the bound is what a single atomic write can
-// cover: a DynamoDB transaction caps at 100 items, and creation spends one on
-// the canonical record. The value is held well under that ceiling so the
-// membership records and the canonical record always commit together — there is
-// no partial-creation state for a caller to reconcile.
+// cover: a DynamoDB transaction caps at 100 items, and creation spends two on
+// the group's own records (the canonical record and its member count). The value
+// is held well under that ceiling so the membership records and the group's
+// records always commit together — there is no partial-creation state for a
+// caller to reconcile.
 const MaxGroupChatCreationMembers = 50
 
 // DmFeedCursor marks a position within a DM feed snapshot read. The next page
@@ -69,23 +70,30 @@ type Store interface {
 	// Duplicate members collapse. A set larger than MaxGroupChatCreationMembers
 	// is rejected with ErrTooManyMembers rather than written non-atomically; a
 	// caller wanting a larger group creates it at the cap and grows it with
-	// AddGroupMembers.
+	// AddGroupMembers. RosterSummary is derived from Members and ignored.
 	PutChat(ctx context.Context, chat *Chat) error
 
 	// AddGroupMembers adds users as joined members of a group chat. It is
 	// idempotent: adding an already-joined member is a no-op that preserves
 	// their original join time, and re-adding a departed member rejoins them
-	// fresh. It returns ErrChatNotFound if the chat does not exist, and an
-	// error if chatID is not a group chat ID.
-	AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) error
+	// fresh. Each member that actually joins is one membership transition,
+	// moving the group's RosterSummary atomically with their record. It
+	// reports whether any member actually joined, and the summary as of the
+	// last write — which may already reflect a concurrent transition by
+	// another writer, and so is what a caller should publish as current. It
+	// returns ErrChatNotFound if the chat does not exist, and an error if chatID
+	// is not a group chat ID.
+	AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (changed bool, roster RosterSummary, err error)
 
 	// RemoveGroupMember ends a user's membership in a group chat. Departure is
 	// a tombstone, not a deletion: the user stops being a member (IsMember
 	// false, excluded from GetMembers) but the record of their former
 	// membership is kept, and they can be re-added later. Removing a non-member
-	// or unknown user is a no-op. It returns an error if chatID is not a group
-	// chat ID.
-	RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) error
+	// or unknown user is a no-op. A departure that actually happens is one
+	// membership transition, moving the group's RosterSummary atomically with
+	// the record; changed and roster are as for AddGroupMembers. It returns an
+	// error if chatID is not a group chat ID.
+	RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (changed bool, roster RosterSummary, err error)
 
 	// SetGroupPicture sets a group chat's picture to the blob holding its
 	// ORIGINAL rendition, replacing any picture already set; a nil blobID clears
@@ -101,7 +109,9 @@ type Store interface {
 	// inline participants and is always empty for a group chat, whose mutable
 	// membership lives in its own records. A caller that needs a group's members
 	// reads them explicitly via GetMembers, so the cost of enumerating a large
-	// group is never paid implicitly by a metadata read.
+	// group is never paid implicitly by a metadata read. Likewise RosterSummary
+	// is a DM's inline summary and zero for a group, whose summary is its own
+	// read (GetGroupRosterSummary).
 	GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*Chat, error)
 
 	// GetDmFeedPage returns one page of userID's DM feed for a single chat type,
@@ -128,6 +138,19 @@ type Store interface {
 	// a DM this is the canonical inline member list; for a group chat it is the
 	// currently joined members.
 	GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*commonpb.UserId, error)
+
+	// GetGroupRosterSummary returns a group chat's RosterSummary, maintained
+	// alongside its membership records rather than computed by enumerating
+	// them — so a group's size and version are known without paying for its
+	// member list, and stay known once GetMembers returns only a subset.
+	//
+	// A caller that hands both the summary and a member list to a client reads
+	// the summary first: any transition that lands during the enumeration is
+	// then above the version handed out, so the client sees it as stale and
+	// refetches. Read the other way round, a client could hold a version newer
+	// than its list. It returns ErrChatNotFound if the chat does not exist, and
+	// an error if chatID is not a group chat ID.
+	GetGroupRosterSummary(ctx context.Context, chatID *commonpb.ChatId) (RosterSummary, error)
 
 	// IsMember reports whether userID is a member of chatID. It returns false
 	// (no error) when the chat does not exist, or when a group member has been

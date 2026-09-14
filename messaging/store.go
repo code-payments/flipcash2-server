@@ -268,7 +268,7 @@ type Store interface {
 	// reaction, so callers can skip the broadcast.
 	//
 	// reaction is the emoji's aggregate after the removal, with Count possibly 0
-	// when the last reactor left (it still carries the advanced Sequence, which
+	// when the last reactor left (it still carries the advanced Version, which
 	// the removal broadcast needs). ReactedBySelf is left false — which is also
 	// the correct overlay for the caller, who just removed their reaction. It is
 	// nil only when the emoji has no aggregate at all (a pure no-op).

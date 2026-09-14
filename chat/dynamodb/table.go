@@ -13,9 +13,10 @@ import (
 // CreateTables provisions the chats, dm_inbox, and group_members tables with
 // on-demand billing. The chats table is keyed by pk only; dm_inbox is keyed by
 // (pk, sk) with a GSI ordering each user's DMs by last_activity; group_members
-// is keyed by (pk, sk) = (chat, user) with an inverted GSI for listing a user's
-// group chats and a sparse GSI enumerating a group's joined members by join
-// time. It is idempotent and blocks until all tables are ACTIVE.
+// is keyed by (pk, sk) = (chat, user) — plus one "#meta" aggregates item per
+// group — with an inverted GSI for listing a user's group chats and a sparse GSI
+// enumerating a group's joined members by join time. It is idempotent and
+// blocks until all tables are ACTIVE.
 func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{

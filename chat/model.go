@@ -182,6 +182,12 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // group's members reads them explicitly via Store.GetMembers. Title,
 // IsStaffOnly and PictureBlobID are group-only and zero for DMs.
 //
+// RosterSummary describes the member list without containing it. Like Members,
+// it is complete for a DM on any read and left zero for a group by the
+// canonical record's reads: a group's summary is maintained alongside its
+// membership records (see Store.GetGroupRosterSummary), filled in by the caller
+// alongside its Members. It is derived state, ignored on PutChat.
+//
 // IsStaffOnly marks a group whose membership is restricted to staff users. It
 // is stored state set at creation; enforcing it (on membership changes, reads,
 // and sends) is the server layer's responsibility.
@@ -197,11 +203,41 @@ type Chat struct {
 	ID            *commonpb.ChatId
 	Type          chatpb.ChatType
 	Members       []*commonpb.UserId
+	RosterSummary RosterSummary
 	Title         string
 	IsStaffOnly   bool
 	PictureBlobID *blobpb.BlobId
 	LastActivity  time.Time
 	LastMessageID *messagingpb.MessageId
+}
+
+// RosterSummary summarizes a chat's roster — its member list — without
+// enumerating it: how many members there are, and a version that moves
+// whenever the membership records do.
+//
+// A DM's roster is fixed at creation, so its summary is the inline member
+// count at version zero, forever. A group's is maintained by the store: every
+// membership transition — a join, a departure, and in future any change to
+// what a membership record holds about its member — moves Version by exactly
+// one, and MemberCount by the transition's effect on the joined set. Idempotent
+// no-ops (re-adding a joined member, removing a departed one) move neither.
+//
+// Version is state, not a sequence of deltas: a client compares it against the
+// value it last saw and refetches members when they differ, and on a stream
+// applies the greater value and drops the rest, so delivery order does not
+// matter. It says nothing about member profiles, which live in their own domain
+// and are hydrated afresh onto every response that carries them.
+type RosterSummary struct {
+	MemberCount uint64
+	Version     uint64
+}
+
+// ToProto projects the summary onto a chatpb.RosterSummary.
+func (r RosterSummary) ToProto() *chatpb.RosterSummary {
+	return &chatpb.RosterSummary{
+		MemberCount: r.MemberCount,
+		Version:     r.Version,
+	}
 }
 
 // Clone returns a deep copy of the chat.
@@ -222,6 +258,7 @@ func (c *Chat) Clone() *Chat {
 		ID:            &commonpb.ChatId{Value: append([]byte(nil), c.ID.Value...)},
 		Type:          c.Type,
 		Members:       members,
+		RosterSummary: c.RosterSummary,
 		Title:         c.Title,
 		IsStaffOnly:   c.IsStaffOnly,
 		PictureBlobID: pictureBlobID,
@@ -232,10 +269,10 @@ func (c *Chat) Clone() *Chat {
 
 // ToProto projects the stored chat onto a chatpb.Metadata. Only the fields
 // owned by the chat domain are populated: chat_id, type, title, last_activity,
-// a Member entry per member with just user_id set, and — for a group with a
-// picture — a picture carrying only its ORIGINAL rendition's blob id. The
-// caller is responsible for hydrating member profiles, pointers, the last
-// message, and the picture's resolved rendition set.
+// roster_summary, a Member entry per member with just user_id set, and — for a
+// group with a picture — a picture carrying only its ORIGINAL rendition's blob
+// id. The caller is responsible for hydrating member profiles, pointers, the
+// last message, and the picture's resolved rendition set.
 func (c *Chat) ToProto() *chatpb.Metadata {
 	members := make([]*chatpb.Member, len(c.Members))
 	for i, m := range c.Members {
@@ -244,11 +281,12 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 		}
 	}
 	md := &chatpb.Metadata{
-		ChatId:       &commonpb.ChatId{Value: append([]byte(nil), c.ID.Value...)},
-		Type:         c.Type,
-		Members:      members,
-		Title:        c.Title,
-		LastActivity: timestamppb.New(c.LastActivity),
+		ChatId:        &commonpb.ChatId{Value: append([]byte(nil), c.ID.Value...)},
+		Type:          c.Type,
+		Members:       members,
+		RosterSummary: c.RosterSummary.ToProto(),
+		Title:         c.Title,
+		LastActivity:  timestamppb.New(c.LastActivity),
 	}
 	if c.PictureBlobID != nil {
 		md.Picture = &blobpb.Media{

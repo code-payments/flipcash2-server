@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,7 +27,7 @@ import (
 //
 //	chats     pk = "chat#<id>" (one item per chat). Canonical metadata: type,
 //	          members (the DM participants; absent for groups), title and
-//	          picture_blob_id (groups only), last_activity. GetChat is a point read and
+//	          picture (groups only), last_activity. GetChat is a point read and
 //	          AdvanceLastActivity is an O(1) update of the source of truth.
 //
 //	dm_inbox  pk = "user#<id>", sk = "chat#<id>" (one item per (user, DM)). The
@@ -45,11 +47,18 @@ import (
 //	          assembled at read time via the inverted gsiByUser. Joined members
 //	          are enumerated densely via the sparse gsiByJoinedAt.
 //
+//	          The partition also holds one aggregates item, sk = "#meta" (see
+//	          skMeta), carrying the group's roster summary: member_count and
+//	          version (see chat.RosterSummary), maintained by compare-and-set
+//	          in the same transaction as every membership transition, so a
+//	          group's size and version are a point read rather than an
+//	          enumeration. "#" sorts before "user#", so it is the head of the
+//	          partition.
+//
 //	          Both GSIs are sparse, keyed by attributes only membership rows
-//	          carry (user, joined_at) — that discipline is load-bearing: any
-//	          new item type added to this table (e.g. a future per-group
-//	          aggregates item) must omit those attributes or it leaks into the
-//	          indexes.
+//	          carry (user, joined_at) — that discipline is load-bearing: the
+//	          #meta item, and any new item type added to this table, must omit
+//	          those attributes or it leaks into the indexes.
 const (
 	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
 	// all of a user's DM types. Superseded by gsiByTypeActivity; retained until
@@ -80,6 +89,9 @@ const (
 	// attribute.
 	chatKeyPrefix = "chat#"
 
+	// skMeta is the sort key of a group's aggregates item in group_members.
+	skMeta = "#meta"
+
 	attrPK            = "pk"
 	attrSK            = "sk"
 	attrType          = "type"
@@ -94,6 +106,26 @@ const (
 	attrLeftAt        = "left_at"
 	attrLastActivity  = "last_activity"
 	attrLastMessageID = "last_message_id"
+	attrMemberCount   = "member_count" // #meta item: joined member count
+	attrVersion       = "version"
+)
+
+// A membership transition is a two-item transaction — the membership record and
+// the group's #meta roster summary — and every transition in a group contends
+// on that one summary item, twice over: DynamoDB cancels the losers of a
+// concurrent write to it with TransactionConflict, which the SDK does not
+// retry, and the summary's compare-and-set fails when a concurrent writer got
+// there first. Both are absorbed here with a bounded number of attempts; the
+// former backs off (short, jittered, doubling), the latter retries at once
+// from the value the failure returned. The ceiling is what one item's
+// transactional throughput allows; a group whose churn exceeds it is the
+// signal to revisit the summary's design.
+const (
+	maxMembershipAttempts = 8
+	membershipBackoffBase = 10 * time.Millisecond
+	membershipBackoffMax  = 250 * time.Millisecond
+
+	codeTransactionConflict = "TransactionConflict"
 )
 
 // Values of a group_members item's numeric state attribute, following the
@@ -132,13 +164,13 @@ func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembe
 // maxTransactWriteItems is DynamoDB's per-transaction item limit.
 const maxTransactWriteItems = 100
 
-// A group chat is created in one transaction covering the canonical item and
-// every membership record, so the domain's cap on the initial member set must
-// leave room for the canonical item within maxTransactWriteItems. Asserted
-// rather than assumed, since the cap lives in the chat package and this is the
-// constraint it exists to respect: raising it past the ceiling fails to compile
-// here, because the difference underflows uint.
-const _ uint = maxTransactWriteItems - (chat.MaxGroupChatCreationMembers + 1)
+// A group chat is created in one transaction covering the canonical item, the
+// #meta counter, and every membership record, so the domain's cap on the initial
+// member set must leave room for those two items within maxTransactWriteItems.
+// Asserted rather than assumed, since the cap lives in the chat package and this
+// is the constraint it exists to respect: raising it past the ceiling fails to
+// compile here, because the difference underflows uint.
+const _ uint = maxTransactWriteItems - (chat.MaxGroupChatCreationMembers + 2)
 
 func (s *store) PutChat(ctx context.Context, c *chat.Chat) error {
 	if chat.IsGroupChatID(c.ID) != (c.Type == chatpb.ChatType_GROUP) {
@@ -186,10 +218,11 @@ func (s *store) putDmChat(ctx context.Context, c *chat.Chat) error {
 	return nil
 }
 
-// putGroupChat creates a group chat: the canonical metadata item plus every
-// initial membership record, in one transaction. The canonical item's condition
-// enforces uniqueness for the whole write, so a duplicate reports ErrChatExists
-// with no membership written.
+// putGroupChat creates a group chat: the canonical metadata item, the #meta
+// counter seeded with the initial member count, and every initial membership
+// record, in one transaction. The canonical item's condition enforces uniqueness
+// for the whole write, so a duplicate reports ErrChatExists with nothing else
+// written.
 func (s *store) putGroupChat(ctx context.Context, c *chat.Chat) error {
 	// Collapse duplicates before building the transaction: two actions on one
 	// item is a validation error, not a cancellation, so a repeated member would
@@ -209,6 +242,10 @@ func (s *store) putGroupChat(ctx context.Context, c *chat.Chat) error {
 			TableName:           aws.String(s.chatsTable),
 			Item:                s.chatItem(c),
 			ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+		}},
+		{Put: &types.Put{
+			TableName: aws.String(s.groupMembersTable),
+			Item:      s.groupMetaItem(c.ID, uint64(len(members))),
 		}},
 	}
 	for _, member := range members {
@@ -245,9 +282,9 @@ func dedupeUserIDs(userIDs []*commonpb.UserId) []*commonpb.UserId {
 	return out
 }
 
-func (s *store) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) error {
+func (s *store) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (bool, chat.RosterSummary, error) {
 	if !chat.IsGroupChatID(chatID) {
-		return fmt.Errorf("not a group chat id")
+		return false, chat.RosterSummary{}, fmt.Errorf("not a group chat id")
 	}
 
 	// Existence gate so a typo'd chat ID can't accrete orphaned membership
@@ -259,31 +296,41 @@ func (s *store) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 		ProjectionExpression: aws.String(attrPK),
 	})
 	if err != nil {
-		return err
+		return false, chat.RosterSummary{}, err
 	}
 	if len(out.Item) == 0 {
-		return chat.ErrChatNotFound
+		return false, chat.RosterSummary{}, chat.ErrChatNotFound
 	}
 
 	return s.addGroupMembers(ctx, chatID, userIDs)
 }
 
 // addGroupMembers upserts joined membership records without checking that the
-// chat exists. Each member is an independent conditional update: an
+// chat exists. Each member is an independent conditional transition: an
 // already-joined member is left untouched (preserving their original
 // joined_at), while a new or departed member is (re)joined with a fresh join
 // time. joined_at is present iff joined — the sparse gsiByJoinedAt keys off its
 // presence — so rejoining also clears the tombstone's left_at.
-func (s *store) addGroupMembers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) error {
+//
+// The roster summary is read once, up front, and threaded through the
+// transitions: each successful one advances the local copy, so a batch costs
+// one read however many members it joins (see transitionMembership).
+func (s *store) addGroupMembers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (bool, chat.RosterSummary, error) {
+	roster, err := s.readRosterSummaryForWrite(ctx, chatID)
+	if err != nil {
+		return false, chat.RosterSummary{}, err
+	}
+
+	changed := false
 	for _, userID := range userIDs {
-		_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		join := &types.Update{
 			TableName: aws.String(s.groupMembersTable),
 			Key: map[string]types.AttributeValue{
 				attrPK: avS(chatPK(chatID)),
 				attrSK: avS(userPK(userID)),
 			},
 			UpdateExpression: aws.String(fmt.Sprintf(
-				"SET #state = :joined, #user = :user, %s = :now REMOVE %s", attrJoinedAt, attrLeftAt,
+				"SET #state = :joined, #user = :user, %s = :now, %s = :version REMOVE %s", attrJoinedAt, attrVersion, attrLeftAt,
 			)),
 			ConditionExpression:      aws.String("attribute_not_exists(#state) OR #state <> :joined"),
 			ExpressionAttributeNames: map[string]string{"#state": attrState, "#user": attrUser},
@@ -292,17 +339,24 @@ func (s *store) addGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 				":user":   avS(userIndexKey(userID)),
 				":now":    avN(uint64(time.Now().UTC().UnixNano())),
 			},
-		})
-		if err != nil && !isConditionalCheckFailed(err) {
-			return err
 		}
+		joined, err := s.transitionMembership(ctx, chatID, join, 1, &roster)
+		if err != nil {
+			return changed, roster, err
+		}
+		changed = changed || joined
 	}
-	return nil
+	return changed, roster, nil
 }
 
-func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) error {
+func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, chat.RosterSummary, error) {
 	if !chat.IsGroupChatID(chatID) {
-		return fmt.Errorf("not a group chat id")
+		return false, chat.RosterSummary{}, fmt.Errorf("not a group chat id")
+	}
+
+	roster, err := s.readRosterSummaryForWrite(ctx, chatID)
+	if err != nil {
+		return false, chat.RosterSummary{}, err
 	}
 
 	// Tombstone, don't delete: the item keeps recording that the user was
@@ -310,14 +364,14 @@ func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, 
 	// removing a non-member (or an unknown user) a no-op rather than an upsert
 	// of a malformed tombstone. Removing joined_at drops the member from the
 	// sparse gsiByJoinedAt.
-	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+	leave := &types.Update{
 		TableName: aws.String(s.groupMembersTable),
 		Key: map[string]types.AttributeValue{
 			attrPK: avS(chatPK(chatID)),
 			attrSK: avS(userPK(userID)),
 		},
 		UpdateExpression: aws.String(fmt.Sprintf(
-			"SET #state = :left, %s = :now REMOVE %s", attrLeftAt, attrJoinedAt,
+			"SET #state = :left, %s = :now, %s = :version REMOVE %s", attrLeftAt, attrVersion, attrJoinedAt,
 		)),
 		ConditionExpression:      aws.String("#state = :joined"),
 		ExpressionAttributeNames: map[string]string{"#state": attrState},
@@ -326,11 +380,125 @@ func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, 
 			":left":   avN(memberStateLeft),
 			":now":    avN(uint64(time.Now().UTC().UnixNano())),
 		},
-	})
-	if err != nil && !isConditionalCheckFailed(err) {
-		return err
 	}
-	return nil
+	changed, err := s.transitionMembership(ctx, chatID, leave, -1, &roster)
+	return changed, roster, err
+}
+
+// readRosterSummaryForWrite is the strongly consistent read of the #meta item
+// that a membership write starts from. Unlike the read path, a missing item is
+// an error here rather than a zero summary: a group that predates the item
+// cannot silently start counting from zero, so its membership writes fail
+// until the item is backfilled by hand (every group created since is seeded
+// at creation).
+func (s *store) readRosterSummaryForWrite(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, error) {
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(s.groupMembersTable),
+		Key:            map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skMeta)},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return chat.RosterSummary{}, err
+	}
+	if len(out.Item) == 0 {
+		return chat.RosterSummary{}, fmt.Errorf("chat %x has no %s item; backfill its roster summary", chatID.Value, skMeta)
+	}
+	return rosterSummaryFromItem(out.Item)
+}
+
+// transitionMembership applies one member's conditional state change together
+// with the group's next roster summary, in a single transaction: the summary
+// moves iff the membership does, so the two can never disagree. The
+// transition's own condition is what decides whether anything happens — when
+// it fails (the member is already in the target state) the whole transaction
+// cancels and that is reported as the no-op it is.
+//
+// The summary is a compare-and-set rather than a blind increment: the #meta
+// item is set to *roster advanced by the transition (count by delta, version
+// by one), conditioned on its version still being roster.Version. That is
+// what lets the row be stamped with the version that moved it and the caller
+// know the exact summary each write produced, with no read afterward. On
+// success *roster is advanced to match; the next transition in a batch chains
+// from it without another read.
+//
+// Cancellation reasons are positional over the transaction's items: [0] is the
+// membership transition and [1] the summary. A failed [1] condition means a
+// concurrent writer moved the version — the failed item is returned with the
+// cancellation, so *roster is refreshed from it and the transition retried
+// with no extra read. Losing the write itself to a concurrent transaction on
+// the same item surfaces as TransactionConflict and is retried with backoff.
+// Both share the attempt budget (see maxMembershipAttempts).
+func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatId, transition *types.Update, delta int64, roster *chat.RosterSummary) (bool, error) {
+	backoff := membershipBackoffBase
+	for attempt := 0; ; attempt++ {
+		next := chat.RosterSummary{
+			MemberCount: uint64(int64(roster.MemberCount) + delta),
+			Version:     roster.Version + 1,
+		}
+		transition.ExpressionAttributeValues[":version"] = avN(next.Version)
+		transactItems := []types.TransactWriteItem{
+			{Update: transition},
+			{Update: &types.Update{
+				TableName: aws.String(s.groupMembersTable),
+				Key: map[string]types.AttributeValue{
+					attrPK: avS(chatPK(chatID)),
+					attrSK: avS(skMeta),
+				},
+				UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :count, %s = :version", attrMemberCount, attrVersion)),
+				ConditionExpression: aws.String(fmt.Sprintf("%s = :expected", attrVersion)),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":count":    avN(next.MemberCount),
+					":version":  avN(next.Version),
+					":expected": avN(roster.Version),
+				},
+				ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+			}},
+		}
+
+		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
+		if err == nil {
+			*roster = next
+			return true, nil
+		}
+		reasons, ok := cancellationReasons(err)
+		if !ok || len(reasons) != len(transactItems) {
+			return false, err
+		}
+		codes := []string{aws.ToString(reasons[0].Code), aws.ToString(reasons[1].Code)}
+
+		if attempt+1 >= maxMembershipAttempts {
+			return false, fmt.Errorf("membership transition for chat %x: %w", chatID.Value, err)
+		}
+		switch {
+		case codes[0] == conditionalCheckFailedCode:
+			// Already in the target state: nothing happened, nothing to record.
+			// Checked first — if the summary is also stale, there is still no
+			// transition, and the summary in hand is what the caller reports.
+			return false, nil
+		case codes[1] == conditionalCheckFailedCode:
+			// A concurrent writer moved the summary. Its current value came back
+			// with the failure; chain from it and go again, immediately — this is
+			// a lost race, not a throttled write. A missing item here means the
+			// group was never seeded and someone removed it since the read above.
+			if len(reasons[1].Item) == 0 {
+				return false, fmt.Errorf("chat %x has no %s item; backfill its roster summary", chatID.Value, skMeta)
+			}
+			current, err := rosterSummaryFromItem(reasons[1].Item)
+			if err != nil {
+				return false, err
+			}
+			*roster = current
+		case isTransactionConflict(codes):
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(backoff + rand.N(backoff)):
+			}
+			backoff = min(2*backoff, membershipBackoffMax)
+		default:
+			return false, err
+		}
+	}
 }
 
 // SetGroupPicture writes (or, for a nil blobID, removes) the picture attribute
@@ -492,6 +660,7 @@ func (s *store) getGroupMembers(ctx context.Context, chatID *commonpb.ChatId) ([
 // gsiByUser. The index is keyed by the sparse user attribute, which tombstones
 // keep (unlike joined_at), so departed memberships are in the user's slice and
 // are filtered out by state here.
+
 func (s *store) GetGroupChatIDsForUser(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.ChatId, error) {
 	chatIDs := make([]*commonpb.ChatId, 0)
 	var startKey map[string]types.AttributeValue
@@ -524,6 +693,47 @@ func (s *store) GetGroupChatIDsForUser(ctx context.Context, userID *commonpb.Use
 		startKey = out.LastEvaluatedKey
 	}
 	return chatIDs, nil
+}
+
+// GetGroupRosterSummary is a point read of the group's #meta item. A group that
+// predates the item has none yet and reads as a zero summary until it is
+// backfilled by hand; a nonexistent chat is distinguished from that only by the
+// canonical item, consulted on that ambiguous path alone.
+func (s *store) GetGroupRosterSummary(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.RosterSummary{}, fmt.Errorf("not a group chat id")
+	}
+
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(s.groupMembersTable),
+		Key:       map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skMeta)},
+	})
+	if err != nil {
+		return chat.RosterSummary{}, err
+	}
+	if len(out.Item) == 0 {
+		if _, err := s.GetChatByID(ctx, chatID); err != nil {
+			return chat.RosterSummary{}, err
+		}
+		return chat.RosterSummary{}, nil
+	}
+	return rosterSummaryFromItem(out.Item)
+}
+
+// rosterSummaryFromItem reads a #meta item. version is absent on an item
+// backfilled by hand without one, and reads as zero — the value creation seeds.
+func rosterSummaryFromItem(item map[string]types.AttributeValue) (chat.RosterSummary, error) {
+	count, err := parseN(item[attrMemberCount])
+	if err != nil {
+		return chat.RosterSummary{}, err
+	}
+	var version uint64
+	if _, ok := item[attrVersion]; ok {
+		if version, err = parseN(item[attrVersion]); err != nil {
+			return chat.RosterSummary{}, err
+		}
+	}
+	return chat.RosterSummary{MemberCount: count, Version: version}, nil
 }
 
 func (s *store) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
@@ -677,6 +887,18 @@ func (s *store) groupMemberItem(chatID *commonpb.ChatId, member *commonpb.UserId
 	}
 }
 
+// groupMetaItem is a group's aggregates item as written at creation: the
+// initial joined member count and a roster version of zero. It carries neither
+// user nor joined_at, so it stays out of both sparse GSIs.
+func (s *store) groupMetaItem(chatID *commonpb.ChatId, memberCount uint64) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		attrPK:          avS(chatPK(chatID)),
+		attrSK:          avS(skMeta),
+		attrMemberCount: avN(memberCount),
+		attrVersion:     avN(0),
+	}
+}
+
 func (s *store) dmInboxItem(c *chat.Chat, member *commonpb.UserId) map[string]types.AttributeValue {
 	item := map[string]types.AttributeValue{
 		attrPK:           avS(userPK(member)),
@@ -694,7 +916,9 @@ func (s *store) dmInboxItem(c *chat.Chat, member *commonpb.UserId) map[string]ty
 
 // chatFromItem builds a Chat from a chats or dm_inbox item. The chat ID is not
 // stored on the item; it is recovered from the item's key by the caller and
-// passed in.
+// passed in. RosterSummary is set from the inline member list, which is
+// complete for a DM and empty for a group — a group's summary is its own read,
+// see GetGroupRosterSummary.
 func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue) (*chat.Chat, error) {
 	typeVal, err := parseN(item[attrType])
 	if err != nil {
@@ -704,13 +928,15 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 	if err != nil {
 		return nil, err
 	}
+	members := membersFromItem(item)
 	c := &chat.Chat{
-		ID:           &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
-		Type:         protoChatType(uint64(typeVal)),
-		Members:      membersFromItem(item),
-		Title:        asS(item[attrTitle]),
-		IsStaffOnly:  asBool(item[attrIsStaffOnly]),
-		LastActivity: time.Unix(0, nanos).UTC(),
+		ID:            &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
+		Type:          protoChatType(uint64(typeVal)),
+		Members:       members,
+		RosterSummary: chat.RosterSummary{MemberCount: uint64(len(members))},
+		Title:         asS(item[attrTitle]),
+		IsStaffOnly:   asBool(item[attrIsStaffOnly]),
+		LastActivity:  time.Unix(0, nanos).UTC(),
 	}
 	// picture_blob_id is absent for DMs and for groups without a picture.
 	if picture := asB(item[attrPictureBlobID]); len(picture) > 0 {
@@ -882,11 +1108,26 @@ const conditionalCheckFailedCode = "ConditionalCheckFailed"
 // creation transaction here puts the canonical item first; items that were fine
 // carry the code "None".
 func isChatExistsCancellation(err error) bool {
+	reasons, ok := cancellationReasons(err)
+	return ok && len(reasons) > 0 && aws.ToString(reasons[0].Code) == conditionalCheckFailedCode
+}
+
+// cancellationReasons returns a cancelled transaction's per-item reasons, in
+// the order of the request's items (code "None" for items that were fine; Item
+// set on a failed condition when that item asked for it), and false when err
+// is not a transaction cancellation.
+func cancellationReasons(err error) ([]types.CancellationReason, bool) {
 	var tce *types.TransactionCanceledException
-	if !errors.As(err, &tce) || len(tce.CancellationReasons) == 0 {
-		return false
+	if !errors.As(err, &tce) {
+		return nil, false
 	}
-	return aws.ToString(tce.CancellationReasons[0].Code) == conditionalCheckFailedCode
+	return tce.CancellationReasons, true
+}
+
+// isTransactionConflict reports whether any item of a cancelled transaction
+// lost to a concurrent write on the same item.
+func isTransactionConflict(codes []string) bool {
+	return slices.Contains(codes, codeTransactionConflict)
 }
 
 func isConditionalCheckFailed(err error) bool {

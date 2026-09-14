@@ -185,12 +185,10 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 	// A DM's members ride in on the canonical record; a group's are a separate
 	// read, paid for only now that the caller is known to be a member.
 	if IsGroupChatID(req.ChatId) {
-		members, err := s.chats.GetMembers(ctx, req.ChatId)
-		if err != nil {
+		if err := s.loadGroupMembership(ctx, c); err != nil {
 			log.With(zap.Error(err)).Warn("Failure getting chat members")
 			return nil, status.Error(codes.Internal, "")
 		}
-		c.Members = members
 	}
 
 	metadata, err := s.hydrate(ctx, userID, []*Chat{c})
@@ -343,14 +341,36 @@ func (s *Server) pinnedGroupChat(ctx context.Context, log *zap.Logger, userID *c
 
 	// A group's members live in their own records, so the canonical read above
 	// leaves them out.
-	members, err := s.chats.GetMembers(ctx, chatID)
-	if err != nil {
+	if err := s.loadGroupMembership(ctx, c); err != nil {
 		log.With(zap.Error(err)).Warn("Failure getting pinned group chat members")
 		return nil
 	}
-	c.Members = members
 
 	return c
+}
+
+// loadGroupMembership fills in a group chat's Members and RosterSummary, which
+// the canonical record deliberately leaves out. The summary is read on its own
+// rather than derived from the list so that it stays right once the list is a
+// page of the membership rather than all of it.
+//
+// The two reads are deliberately sequential, summary first: a transition that
+// lands during the enumeration is then above the version handed out, so the
+// client sees its copy as stale and refetches. Read concurrently or the other
+// way round, a client could hold a version newer than the list it was given
+// and never learn it (see Store.GetGroupRosterSummary).
+func (s *Server) loadGroupMembership(ctx context.Context, c *Chat) error {
+	roster, err := s.chats.GetGroupRosterSummary(ctx, c.ID)
+	if err != nil {
+		return err
+	}
+	members, err := s.chats.GetMembers(ctx, c.ID)
+	if err != nil {
+		return err
+	}
+	c.Members = members
+	c.RosterSummary = roster
+	return nil
 }
 
 // dmFeedTokenLen is the byte length of an encoded GetDmChatFeed paging token:

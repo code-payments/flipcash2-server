@@ -25,13 +25,18 @@ type memory struct {
 	// The value is the member's joined state: a removed member is tombstoned as
 	// false, mirroring the persistent stores, rather than deleted.
 	groupMembers map[string]map[string]bool
+
+	// groupVersions is each group's roster version, keyed by chat ID: the
+	// number of membership transitions it has seen. Absent reads as zero.
+	groupVersions map[string]uint64
 }
 
 // NewInMemory returns an in-memory chat.Store, for tests.
 func NewInMemory() chat.Store {
 	return &memory{
-		chats:        make(map[string]*chat.Chat),
-		groupMembers: make(map[string]map[string]bool),
+		chats:         make(map[string]*chat.Chat),
+		groupMembers:  make(map[string]map[string]bool),
+		groupVersions: make(map[string]uint64),
 	}
 }
 
@@ -41,6 +46,7 @@ func (m *memory) reset() {
 
 	m.chats = make(map[string]*chat.Chat)
 	m.groupMembers = make(map[string]map[string]bool)
+	m.groupVersions = make(map[string]uint64)
 }
 
 func (m *memory) PutChat(_ context.Context, c *chat.Chat) error {
@@ -77,22 +83,25 @@ func (m *memory) PutChat(_ context.Context, c *chat.Chat) error {
 	}
 
 	// Group membership lives in its own records; the canonical chat holds no
-	// member list. DM membership is stored inline and immutable.
+	// member list and no roster summary. DM membership is stored inline and
+	// immutable, so its summary is fixed here.
+	stored := c.Clone()
 	if chat.IsGroupChatID(c.ID) {
-		stored := c.Clone()
 		stored.Members = nil
+		stored.RosterSummary = chat.RosterSummary{}
 		m.chats[key] = stored
 		m.groupMembers[key] = groupMembers
 		return nil
 	}
 
-	m.chats[key] = c.Clone()
+	stored.RosterSummary = chat.RosterSummary{MemberCount: uint64(len(stored.Members))}
+	m.chats[key] = stored
 	return nil
 }
 
-func (m *memory) AddGroupMembers(_ context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) error {
+func (m *memory) AddGroupMembers(_ context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (bool, chat.RosterSummary, error) {
 	if !chat.IsGroupChatID(chatID) {
-		return fmt.Errorf("not a group chat id")
+		return false, chat.RosterSummary{}, fmt.Errorf("not a group chat id")
 	}
 
 	m.Lock()
@@ -100,35 +109,44 @@ func (m *memory) AddGroupMembers(_ context.Context, chatID *commonpb.ChatId, use
 
 	key := string(chatID.Value)
 	if _, ok := m.chats[key]; !ok {
-		return chat.ErrChatNotFound
+		return false, chat.RosterSummary{}, chat.ErrChatNotFound
 	}
 	members := m.groupMembers[key]
 	if members == nil {
 		members = make(map[string]bool)
 		m.groupMembers[key] = members
 	}
+	changed := false
 	for _, userID := range userIDs {
+		if members[string(userID.Value)] {
+			continue // Already joined: no transition.
+		}
 		members[string(userID.Value)] = true
+		m.groupVersions[key]++
+		changed = true
 	}
-	return nil
+	return changed, m.rosterSummaryLocked(chatID), nil
 }
 
-func (m *memory) RemoveGroupMember(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) error {
+func (m *memory) RemoveGroupMember(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, chat.RosterSummary, error) {
 	if !chat.IsGroupChatID(chatID) {
-		return fmt.Errorf("not a group chat id")
+		return false, chat.RosterSummary{}, fmt.Errorf("not a group chat id")
 	}
 
 	m.Lock()
 	defer m.Unlock()
 
-	members, ok := m.groupMembers[string(chatID.Value)]
+	key := string(chatID.Value)
+	members, ok := m.groupMembers[key]
 	if !ok {
-		return nil
+		return false, chat.RosterSummary{}, nil
 	}
-	if _, ok := members[string(userID.Value)]; ok {
-		members[string(userID.Value)] = false
+	if !members[string(userID.Value)] {
+		return false, m.rosterSummaryLocked(chatID), nil // Not joined: no transition.
 	}
-	return nil
+	members[string(userID.Value)] = false
+	m.groupVersions[key]++
+	return true, m.rosterSummaryLocked(chatID), nil
 }
 
 func (m *memory) SetGroupPicture(_ context.Context, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
@@ -160,8 +178,32 @@ func (m *memory) GetChatByID(_ context.Context, chatID *commonpb.ChatId) (*chat.
 		return nil, chat.ErrChatNotFound
 	}
 	// Only the canonical record: a group's membership lives in its own records
-	// and is stored with Members nil, so the clone is already member-free.
+	// and is stored with Members nil and a zero RosterSummary, so the clone is
+	// already member-free.
 	return c.Clone(), nil
+}
+
+func (m *memory) GetGroupRosterSummary(_ context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.RosterSummary{}, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	if _, ok := m.chats[string(chatID.Value)]; !ok {
+		return chat.RosterSummary{}, chat.ErrChatNotFound
+	}
+	return m.rosterSummaryLocked(chatID), nil
+}
+
+// rosterSummaryLocked is a group's summary: the joined count from its records
+// and the version that its transitions have advanced.
+func (m *memory) rosterSummaryLocked(chatID *commonpb.ChatId) chat.RosterSummary {
+	return chat.RosterSummary{
+		MemberCount: uint64(len(m.joinedGroupMembersLocked(chatID))),
+		Version:     m.groupVersions[string(chatID.Value)],
+	}
 }
 
 func (m *memory) GetDmFeedPage(_ context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {

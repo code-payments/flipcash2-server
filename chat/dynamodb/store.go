@@ -92,23 +92,29 @@ const (
 	// skMeta is the sort key of a group's aggregates item in group_members.
 	skMeta = "#meta"
 
-	attrPK            = "pk"
-	attrSK            = "sk"
-	attrType          = "type"
-	attrFeed          = "feed"
-	attrMembers       = "members"
-	attrTitle         = "title"
-	attrIsStaffOnly   = "is_staff_only"
-	attrCreator       = "creator"
-	attrPictureBlobID = "picture"
-	attrState         = "state"
-	attrUser          = "user" // member id, bare hex — see userIndexKey
-	attrJoinedAt      = "joined_at"
-	attrLeftAt        = "left_at"
-	attrLastActivity  = "last_activity"
-	attrLastMessageID = "last_message_id"
-	attrMemberCount   = "member_count" // #meta item: joined member count
-	attrVersion       = "version"
+	attrPK                 = "pk"
+	attrSK                 = "sk"
+	attrType               = "type"
+	attrFeed               = "feed"
+	attrMembers            = "members"
+	attrTitle              = "title"
+	attrIsStaffOnly        = "is_staff_only"
+	attrMinListenerBalance = "min_listener_balance" // map: see minimumBalanceAttr
+	attrCreator            = "creator"
+	attrPictureBlobID      = "picture"
+	attrState              = "state"
+	attrUser               = "user" // member id, bare hex — see userIndexKey
+	attrJoinedAt           = "joined_at"
+	attrLeftAt             = "left_at"
+	attrLastActivity       = "last_activity"
+	attrLastMessageID      = "last_message_id"
+	attrMemberCount        = "member_count" // #meta item: joined member count
+	attrVersion            = "version"
+
+	// Keys of the min_listener_balance map.
+	attrBalanceCurrency     = "currency"
+	attrBalanceNativeAmount = "amount"
+	attrBalanceMints        = "mints"
 )
 
 // A membership transition is a two-item transaction — the membership record and
@@ -726,14 +732,18 @@ func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (*ch
 		return nil, fmt.Errorf("not a group chat id")
 	}
 
-	// Only the attributes the rules are projected from: the type, and the flags
-	// that stand for a rule. The rest of the record — title, picture, activity —
-	// is neither fetched nor deserialized.
+	// Only the attributes the rules are projected from: the type, and the
+	// attributes that stand for a rule. The rest of the record — title, picture,
+	// activity — is neither fetched nor deserialized.
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName:                aws.String(s.chatsTable),
-		Key:                      map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
-		ProjectionExpression:     aws.String("#type, #staff"),
-		ExpressionAttributeNames: map[string]string{"#type": attrType, "#staff": attrIsStaffOnly},
+		TableName:            aws.String(s.chatsTable),
+		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
+		ProjectionExpression: aws.String("#type, #staff, #balance"),
+		ExpressionAttributeNames: map[string]string{
+			"#type":    attrType,
+			"#staff":   attrIsStaffOnly,
+			"#balance": attrMinListenerBalance,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -745,9 +755,14 @@ func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (*ch
 	if err != nil {
 		return nil, err
 	}
+	balance, err := minimumBalanceFromItem(out.Item)
+	if err != nil {
+		return nil, err
+	}
 	c := &chat.Chat{
-		Type:        protoChatType(uint64(typeVal)),
-		IsStaffOnly: asBool(out.Item[attrIsStaffOnly]),
+		Type:                   protoChatType(uint64(typeVal)),
+		IsStaffOnly:            asBool(out.Item[attrIsStaffOnly]),
+		MinimumListenerBalance: balance,
 	}
 	return c.Rules(), nil
 }
@@ -883,15 +898,18 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 	}
 	// A group's membership lives in group_members, not on the canonical item —
 	// an inline list could not hold a large group. Title, the staff-only flag,
-	// the creator and the picture are group-only; each is written only when
-	// set, so an absent attribute (including on every item written before it
-	// existed) reads as its zero value.
+	// the minimum listener balance, the creator and the picture are group-only;
+	// each is written only when set, so an absent attribute (including on every
+	// item written before it existed) reads as its zero value.
 	if c.Type == chatpb.ChatType_GROUP {
 		if c.Title != "" {
 			item[attrTitle] = avS(c.Title)
 		}
 		if c.IsStaffOnly {
 			item[attrIsStaffOnly] = avBool(true)
+		}
+		if c.MinimumListenerBalance != nil {
+			item[attrMinListenerBalance] = minimumBalanceAttr(c.MinimumListenerBalance)
 		}
 		if c.CreatorID != nil {
 			item[attrCreator] = avB(c.CreatorID.Value)
@@ -963,15 +981,21 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 	if err != nil {
 		return nil, err
 	}
+	// min_listener_balance is absent for DMs and for groups without one.
+	balance, err := minimumBalanceFromItem(item)
+	if err != nil {
+		return nil, err
+	}
 	members := membersFromItem(item)
 	c := &chat.Chat{
-		ID:            &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
-		Type:          protoChatType(uint64(typeVal)),
-		Members:       members,
-		RosterSummary: chat.RosterSummary{MemberCount: uint64(len(members))},
-		Title:         asS(item[attrTitle]),
-		IsStaffOnly:   asBool(item[attrIsStaffOnly]),
-		LastActivity:  time.Unix(0, nanos).UTC(),
+		ID:                     &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
+		Type:                   protoChatType(uint64(typeVal)),
+		Members:                members,
+		RosterSummary:          chat.RosterSummary{MemberCount: uint64(len(members))},
+		Title:                  asS(item[attrTitle]),
+		IsStaffOnly:            asBool(item[attrIsStaffOnly]),
+		MinimumListenerBalance: balance,
+		LastActivity:           time.Unix(0, nanos).UTC(),
 	}
 	// creator is absent for DMs and for groups written before it was recorded.
 	if creator := asB(item[attrCreator]); len(creator) > 0 {
@@ -1007,6 +1031,46 @@ func membersAttr(members []*commonpb.UserId) types.AttributeValue {
 		values[i] = avB(m.Value)
 	}
 	return &types.AttributeValueMemberL{Value: values}
+}
+
+// minimumBalanceAttr encodes a group's minimum listener balance as one map
+// attribute, so the requirement is present or absent as a whole: the currency
+// code, the native amount (a decimal number, written at full float precision),
+// and the mint list — omitted when empty, the encoding of "any mint".
+func minimumBalanceAttr(b *chat.MinimumBalance) types.AttributeValue {
+	m := map[string]types.AttributeValue{
+		attrBalanceCurrency:     avS(b.Currency),
+		attrBalanceNativeAmount: avF(b.NativeAmount),
+	}
+	if len(b.Mints) > 0 {
+		mints := make([]types.AttributeValue, len(b.Mints))
+		for i, mint := range b.Mints {
+			mints[i] = avB(mint.Value)
+		}
+		m[attrBalanceMints] = &types.AttributeValueMemberL{Value: mints}
+	}
+	return &types.AttributeValueMemberM{Value: m}
+}
+
+// minimumBalanceFromItem is the inverse of minimumBalanceAttr: nil, without
+// error, when the item carries no requirement.
+func minimumBalanceFromItem(item map[string]types.AttributeValue) (*chat.MinimumBalance, error) {
+	m, ok := item[attrMinListenerBalance].(*types.AttributeValueMemberM)
+	if !ok {
+		return nil, nil
+	}
+	amount, err := parseF(m.Value[attrBalanceNativeAmount])
+	if err != nil {
+		return nil, fmt.Errorf("parsing %s.%s: %w", attrMinListenerBalance, attrBalanceNativeAmount, err)
+	}
+	b := &chat.MinimumBalance{
+		Currency:     asS(m.Value[attrBalanceCurrency]),
+		NativeAmount: amount,
+	}
+	for _, av := range asL(m.Value[attrBalanceMints]) {
+		b.Mints = append(b.Mints, &commonpb.PublicKey{Value: append([]byte(nil), asB(av)...)})
+	}
+	return b, nil
 }
 
 // userKeyPrefix prefixes a user ID in the dm_inbox pk and the group_members
@@ -1079,6 +1143,12 @@ func avN(v uint64) types.AttributeValue {
 }
 func avBool(v bool) types.AttributeValue { return &types.AttributeValueMemberBOOL{Value: v} }
 
+// avF encodes a float as a DynamoDB number: the shortest plain-decimal string
+// that round-trips the value exactly (no exponent, no padding).
+func avF(v float64) types.AttributeValue {
+	return &types.AttributeValueMemberN{Value: strconv.FormatFloat(v, 'f', -1, 64)}
+}
+
 func asS(av types.AttributeValue) string {
 	if s, ok := av.(*types.AttributeValueMemberS); ok {
 		return s.Value
@@ -1123,6 +1193,14 @@ func parseInt(av types.AttributeValue) (int64, error) {
 		return 0, fmt.Errorf("expected number attribute, got %T", av)
 	}
 	return strconv.ParseInt(n.Value, 10, 64)
+}
+
+func parseF(av types.AttributeValue) (float64, error) {
+	n, ok := av.(*types.AttributeValueMemberN)
+	if !ok {
+		return 0, fmt.Errorf("expected number attribute, got %T", av)
+	}
+	return strconv.ParseFloat(n.Value, 64)
 }
 
 func isTransactionCanceled(err error) bool {

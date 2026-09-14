@@ -854,10 +854,6 @@ type fakeOcpBalance struct {
 	calls         int
 }
 
-func (f *fakeOcpBalance) GetBalance(context.Context, *ocp_balancepb.GetBalanceRequest, ...grpc.CallOption) (*ocp_balancepb.GetBalanceResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "balance client is expected to use GetBalances")
-}
-
 func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBalancesRequest, _ ...grpc.CallOption) (*ocp_balancepb.GetBalancesResponse, error) {
 	f.calls++
 	if f.err != nil {

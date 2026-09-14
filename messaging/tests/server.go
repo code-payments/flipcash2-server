@@ -3,6 +3,7 @@ package tests
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -10,9 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
@@ -26,6 +30,7 @@ import (
 	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/badge"
+	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/blob"
 	blob_memory "github.com/code-payments/flipcash2-server/blob/memory"
 	"github.com/code-payments/flipcash2-server/blocklist"
@@ -36,6 +41,8 @@ import (
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/push"
 	"github.com/code-payments/flipcash2-server/testutil"
+	ocp_balancepb "github.com/code-payments/ocp-protobuf-api/generated/go/balance/v1"
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 )
 
@@ -74,6 +81,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		// Cross-cutting
 		testServer_NonMember_Denied,
 		testServer_StaffOnlyGroup_Rules,
+		testServer_BalanceGatedGroup_Rules,
 		testServer_Broadcast_IncludesActor,
 		testServer_SendMessage_PushPerChatType,
 		testServer_SendMessage_GroupChatPush,
@@ -99,11 +107,52 @@ type serverEnv struct {
 	userB  *commonpb.UserId
 	keysB  model.KeyPair
 
-	blocklist blocklist.Store
-	accounts  *staffAccounts
+	blocklist  blocklist.Store
+	accounts   *staffAccounts
+	ocpBalance *fakeOcpBalance
 
 	blobStore  blob.Store
 	blobAccess blob.AccessStore
+}
+
+// fakeOcpBalance is the OCP balance service behind the env's balance client,
+// answering each owner's total from a ledger a test sets in USDF quarks. It
+// ignores the request's mint filter: mint restriction is covered by the rule
+// evaluator's own tests.
+type fakeOcpBalance struct {
+	mu      sync.Mutex
+	byOwner map[string]uint64
+	err     error
+}
+
+func (f *fakeOcpBalance) setBalance(owner *commonpb.PublicKey, quarks uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.byOwner[base58.Encode(owner.Value)] = quarks
+}
+
+func (f *fakeOcpBalance) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBalancesRequest, _ ...grpc.CallOption) (*ocp_balancepb.GetBalancesResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	resp := &ocp_balancepb.GetBalancesResponse{BalancesByOwner: make(map[string]*ocp_balancepb.OwnerBalance)}
+	for _, owner := range req.Owners {
+		key := base58.Encode(owner.Value)
+		quarks, ok := f.byOwner[key]
+		if !ok {
+			continue // An owner OCP has no accounts for is left out.
+		}
+		resp.BalancesByOwner[key] = &ocp_balancepb.OwnerBalance{Owner: owner, CoreMintValue: quarks}
+	}
+	return resp, nil
 }
 
 // staffAccounts is an account.Store whose staff flag a test can set: the
@@ -170,9 +219,11 @@ func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, 
 	media := blob.NewIntegration(blobStore, blob_memory.NewInMemoryStorage(), blobAccess)
 
 	env.accounts = newStaffAccounts(accountmemory.NewInMemory())
+	env.ocpBalance = &fakeOcpBalance{byOwner: make(map[string]uint64)}
+	balances := balance.NewClient(log, env.accounts, env.ocpBalance)
 
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus)
-	server := messaging.NewServer(log, authz, env.accounts, chats, media, messages, sender)
+	server := messaging.NewServer(log, authz, env.accounts, balances, chats, media, messages, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
 	}))
@@ -1757,9 +1808,10 @@ func testServer_NonMember_Denied(t *testing.T, badges badge.Store, blocklists bl
 }
 
 // testServer_StaffOnlyGroup_Rules pins that a staff-only group's listener rule
-// is enforced on every messaging path, on top of membership: a member who is
-// not staff is denied exactly as a non-member is, and the rule tracks the
-// flag's current value rather than the state at join time.
+// is enforced on the send paths, on top of membership — a member who is not
+// staff cannot speak, exactly as a non-member cannot — and that the rule
+// tracks the flag's current value rather than the state at join time. Reads
+// gate on membership alone, so the same member still reads.
 func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
@@ -1783,49 +1835,14 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
 	msgID := sent.Message.MessageId
 
-	// The non-staff member is denied everywhere, as a non-member would be.
-	denied := func(keys model.KeyPair) {
+	// The non-staff member cannot speak — send, or signal typing — as a
+	// non-member cannot...
+	deniedToSpeak := func(keys model.KeyPair) {
 		t.Helper()
 
 		sendResp, err := e.sendContentToChat(keys, groupID, textContent("intruder"), generateClientID())
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
-
-		getReq := &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: msgID}
-		require.NoError(t, keys.Auth(getReq, &getReq.Auth))
-		getResp, err := e.client.GetMessage(e.ctx, getReq)
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result)
-
-		listReq := &messagingpb.GetMessagesRequest{ChatId: groupID, Query: &messagingpb.GetMessagesRequest_Options{Options: &commonpb.QueryOptions{}}}
-		require.NoError(t, keys.Auth(listReq, &listReq.Auth))
-		listResp, err := e.client.GetMessages(e.ctx, listReq)
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.GetMessagesResponse_DENIED, listResp.Result)
-
-		deltaReq := &messagingpb.GetDeltaRequest{ChatId: groupID}
-		require.NoError(t, keys.Auth(deltaReq, &deltaReq.Auth))
-		deltaStream, err := e.client.GetDelta(e.ctx, deltaReq)
-		require.NoError(t, err)
-		deltaResp, err := deltaStream.Recv()
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.GetDeltaResponse_DENIED, deltaResp.Result)
-
-		advResp, err := e.advancePointerInChat(keys, groupID, messagingpb.Pointer_READ, msgID)
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.AdvancePointerResponse_DENIED, advResp.Result)
-
-		addResp, err := e.addReactionInChat(keys, groupID, msgID, emoji)
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.AddReactionResponse_DENIED, addResp.Result)
-
-		sumResp, err := e.getReactionSummaryInChat(keys, groupID, msgID)
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.GetReactionSummaryResponse_DENIED, sumResp.Result)
-
-		sumsResp, err := e.getReactionSummariesByIDsInChat(keys, groupID, msgID.Value)
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.GetReactionSummariesResponse_DENIED, sumsResp.Result)
 
 		typingReq := &messagingpb.NotifyIsTypingRequest{ChatId: groupID, State: messagingpb.IsTypingNotification_STARTED_TYPING}
 		require.NoError(t, keys.Auth(typingReq, &typingReq.Auth))
@@ -1833,12 +1850,61 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
 	}
-	denied(e.keysB)
+	deniedToSpeak(e.keysB)
 
-	// Staff status alone is not membership: a staff non-member is still denied.
+	// ...but, still a member, reads freely: reads gate on membership alone,
+	// and a member the rule no longer admits is meant to be removed from the
+	// group rather than re-checked on every read (see messaging.canListen).
+	canRead := func(keys model.KeyPair) {
+		t.Helper()
+
+		getReq := &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: msgID}
+		require.NoError(t, keys.Auth(getReq, &getReq.Auth))
+		getResp, err := e.client.GetMessage(e.ctx, getReq)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+
+		listReq := &messagingpb.GetMessagesRequest{ChatId: groupID, Query: &messagingpb.GetMessagesRequest_Options{Options: &commonpb.QueryOptions{}}}
+		require.NoError(t, keys.Auth(listReq, &listReq.Auth))
+		listResp, err := e.client.GetMessages(e.ctx, listReq)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_OK, listResp.Result)
+
+		deltaReq := &messagingpb.GetDeltaRequest{ChatId: groupID}
+		require.NoError(t, keys.Auth(deltaReq, &deltaReq.Auth))
+		deltaStream, err := e.client.GetDelta(e.ctx, deltaReq)
+		require.NoError(t, err)
+		deltaResp, err := deltaStream.Recv()
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetDeltaResponse_OK, deltaResp.Result)
+
+		advResp, err := e.advancePointerInChat(keys, groupID, messagingpb.Pointer_READ, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AdvancePointerResponse_OK, advResp.Result)
+
+		sumResp, err := e.getReactionSummaryInChat(keys, groupID, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, sumResp.Result)
+
+		sumsResp, err := e.getReactionSummariesByIDsInChat(keys, groupID, msgID.Value)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummariesResponse_OK, sumsResp.Result)
+	}
+	canRead(e.keysB)
+
+	// Staff status alone is not membership: a staff non-member is denied
+	// everywhere, to read as well as to speak.
 	outsider, outsiderKeys := e.addUser()
 	e.accounts.setStaff(outsider, true)
-	denied(outsiderKeys)
+	deniedToSpeak(outsiderKeys)
+	outsiderGet := &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: msgID}
+	require.NoError(t, outsiderKeys.Auth(outsiderGet, &outsiderGet.Auth))
+	outsiderResp, err := e.client.GetMessage(e.ctx, outsiderGet)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_DENIED, outsiderResp.Result)
+	addResp, err := e.addReactionInChat(outsiderKeys, groupID, msgID, emoji)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_DENIED, addResp.Result)
 
 	// The rule tracks the flag: promoted, the member is admitted...
 	e.accounts.setStaff(e.userB, true)
@@ -1846,9 +1912,104 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
 
-	// ...and revoked, the founding staff member is denied on the next call.
+	// ...and revoked, the founding staff member is silenced on the next call,
+	// though they still read.
 	e.accounts.setStaff(e.userA, false)
-	denied(e.keysA)
+	deniedToSpeak(e.keysA)
+	canRead(e.keysA)
+
+	// A DM in the same env is untouched by any of this: DMs carry no rules.
+	dmResp, err := e.send(e.keysA, "still a dm", generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, dmResp.Result)
+}
+
+// testServer_BalanceGatedGroup_Rules pins that a group's minimum listener
+// balance is enforced on the send paths, on top of membership, against the
+// member's balance as the balance service reports it now: a member under the
+// requirement cannot speak, as a non-member cannot, and a balance that cannot
+// be read fails the send rather than waving it through. Reads gate on
+// membership alone and never consult the balance.
+func testServer_BalanceGatedGroup_Rules(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	// Both members have owner accounts; userA holds the requirement exactly,
+	// userB is one quark short.
+	const requirement = 100
+	_, err := e.accounts.Bind(e.ctx, e.userA, e.keysA.Proto())
+	require.NoError(t, err)
+	_, err = e.accounts.Bind(e.ctx, e.userB, e.keysB.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keysA.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+	e.ocpBalance.setBalance(e.keysB.Proto(), ocp_common.ToCoreMintQuarks(requirement)-1)
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:                     groupID,
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{e.userA, e.userB},
+		Title:                  "Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: requirement},
+		LastActivity:           at(1),
+	}))
+
+	// The member at the requirement participates freely.
+	sent, err := e.sendContentToChat(e.keysA, groupID, textContent("whales only"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	msgID := sent.Message.MessageId
+
+	// The member under it cannot speak, but still reads: reads gate on
+	// membership alone (see messaging.canListen).
+	deniedToSpeak := func(keys model.KeyPair) {
+		t.Helper()
+
+		sendResp, err := e.sendContentToChat(keys, groupID, textContent("intruder"), generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
+	}
+	canRead := func(keys model.KeyPair) {
+		t.Helper()
+
+		getReq := &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: msgID}
+		require.NoError(t, keys.Auth(getReq, &getReq.Auth))
+		getResp, err := e.client.GetMessage(e.ctx, getReq)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+
+		advResp, err := e.advancePointerInChat(keys, groupID, messagingpb.Pointer_READ, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AdvancePointerResponse_OK, advResp.Result)
+	}
+	deniedToSpeak(e.keysB)
+	canRead(e.keysB)
+
+	// A member with no owner account at all holds nothing, and is silenced the
+	// same way — not failed.
+	unfunded, unfundedKeys := e.addUser()
+	_, _, err = chats.AddGroupMembers(e.ctx, groupID, []*commonpb.UserId{unfunded})
+	require.NoError(t, err)
+	deniedToSpeak(unfundedKeys)
+	canRead(unfundedKeys)
+
+	// The rule tracks the balance: topped up, the member is admitted...
+	e.ocpBalance.setBalance(e.keysB.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+	resp, err := e.sendContentToChat(e.keysB, groupID, textContent("topped up"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+
+	// ...and drained, the founding member is silenced on the next call.
+	e.ocpBalance.setBalance(e.keysA.Proto(), 0)
+	deniedToSpeak(e.keysA)
+	canRead(e.keysA)
+
+	// A balance that cannot be read fails a send outright, and is never
+	// consulted by a read.
+	e.ocpBalance.setErr(errors.New("ocp is down"))
+	_, err = e.sendContentToChat(e.keysB, groupID, textContent("blind"), generateClientID())
+	require.Equal(t, codes.Internal, status.Code(err))
+	canRead(e.keysB)
+	e.ocpBalance.setErr(nil)
 
 	// A DM in the same env is untouched by any of this: DMs carry no rules.
 	dmResp, err := e.send(e.keysA, "still a dm", generateClientID())

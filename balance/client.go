@@ -58,11 +58,13 @@ func NewClient(
 // The value is what OCP reports as the owner account's core mint value, which
 // is USDF for Flipcash. It spans every mint the user holds, with non-core mint
 // holdings valued in USDF, so it is the user's total balance and not just the
-// quarks sitting in their USDF accounts.
+// quarks sitting in their USDF accounts. Given mints, it spans only the
+// holdings in those mints, still valued in USDF; a mint the user holds nothing
+// of contributes nothing.
 //
 // A user that hasn't opened OCP accounts yet has a zero balance. ErrNotFound is
 // returned when the user has no public key bound at all.
-func (c *Client) GetTotalUsdfBalance(ctx context.Context, userID *commonpb.UserId) (uint64, error) {
+func (c *Client) GetTotalUsdfBalance(ctx context.Context, userID *commonpb.UserId, mints ...*commonpb.PublicKey) (uint64, error) {
 	log := c.log.With(zap.String("user_id", model.UserIDString(userID)))
 
 	pubKeys, err := c.accounts.GetPubKeys(ctx, userID)
@@ -89,8 +91,21 @@ func (c *Client) GetTotalUsdfBalance(ctx context.Context, userID *commonpb.UserI
 		ownerProtos = append(ownerProtos, owner.ToProto())
 	}
 
+	// The mint filter is OCP's: filtered, the owner's total covers only the
+	// requested mints, so there is nothing to filter client-side.
+	mintProtos := make([]*ocp_commonpb.SolanaAccountId, 0, len(mints))
+	for _, mint := range mints {
+		account, err := ocp_common.NewAccountFromPublicKeyBytes(mint.Value)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure parsing mint account")
+			return 0, err
+		}
+		mintProtos = append(mintProtos, account.ToProto())
+	}
+
 	resp, err := c.ocpBalance.GetBalances(ctx, &ocp_balancepb.GetBalancesRequest{
 		Owners: ownerProtos,
+		Mints:  mintProtos,
 	})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure getting balances from OCP")

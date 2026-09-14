@@ -2,12 +2,18 @@ package chat
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
+	currency_lib "github.com/code-payments/ocp-server/currency"
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
+
 	"github.com/code-payments/flipcash2-server/account"
+	"github.com/code-payments/flipcash2-server/balance"
 )
 
 // Rules projects the chat's stored participation requirements onto a
@@ -17,19 +23,33 @@ import (
 // evaluates (RuleEvaluator), so the two can never disagree about what a chat
 // requires.
 //
-// A staff-only group is one listener rule, StaffRequirement: listener rules
-// gate reading and joining, and a member must be able to listen before they
-// can speak, so restricting the audience to staff restricts the speakers too
-// without repeating the rule in the speaker class.
+// Every requirement a group carries is a listener rule: a StaffRequirement for
+// a staff-only group, a MinimumBalanceRequirement for a group with a minimum
+// listener balance, or both. Listener rules gate reading and joining, and a
+// member must be able to listen before they can speak, so restricting the
+// audience restricts the speakers too without repeating a rule in the speaker
+// class — which no group carries yet. The rules are listed cheapest to evaluate
+// first, since an evaluator stops at the first one a user fails: a staff check
+// is a flag read, a balance check a valuation.
 func (c *Chat) Rules() *chatpb.Rules {
-	if c.Type != chatpb.ChatType_GROUP || !c.IsStaffOnly {
+	if c.Type != chatpb.ChatType_GROUP {
 		return nil
 	}
-	return &chatpb.Rules{
-		Listener: []*chatpb.ListenerRules{{
+	var listener []*chatpb.ListenerRules
+	if c.IsStaffOnly {
+		listener = append(listener, &chatpb.ListenerRules{
 			Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}},
-		}},
+		})
 	}
+	if c.MinimumListenerBalance != nil {
+		listener = append(listener, &chatpb.ListenerRules{
+			Kind: &chatpb.ListenerRules_MinimumBalance{MinimumBalance: c.MinimumListenerBalance.ToProto()},
+		})
+	}
+	if len(listener) == 0 {
+		return nil
+	}
+	return &chatpb.Rules{Listener: listener}
 }
 
 // RuleEvaluator decides whether a user satisfies a chat's participation rules
@@ -39,22 +59,31 @@ func (c *Chat) Rules() *chatpb.Rules {
 // carry rules; a DM's evaluation never touches the store.
 //
 // Rules are read through Store.GetGroupRules — in production the caching
-// store, which holds every group's rules after its first read — and a
-// StaffRequirement is answered by the account store's staff flag.
+// store, which holds every group's rules after its first read. A
+// StaffRequirement is answered by the account store's staff flag, and a
+// MinimumBalanceRequirement by the balance client's valuation of the user's
+// holdings (see satisfiesMinimumBalance).
 //
 // Rules are evaluated against the current state of their subject, not the
 // state at join time: a member who no longer satisfies a listener rule (a
-// staff member whose flag was revoked, say) keeps their membership record but
-// is denied on every gated path until they satisfy it again. Enforcing rules on
-// membership changes — a join gated by listener rules — is the job of whatever
+// staff member whose flag was revoked, a holder whose balance dropped) keeps
+// their membership record but is denied on every path that evaluates the
+// rules until they satisfy it again. Not every path does: the messaging
+// service evaluates rules on sends only, and gates reads on membership alone,
+// so that a read never pays for an evaluation (see messaging.canListen). The
+// intended design is for membership itself to track the listener rules — a
+// member who stops satisfying one is removed — at which point the membership
+// record is the rules' answer everywhere. Enforcing rules on membership
+// changes, a join gated by listener rules included, is the job of whatever
 // path mutates membership.
 type RuleEvaluator struct {
 	accounts account.Store
+	balances *balance.Client
 	chats    Store
 }
 
-func NewRuleEvaluator(accounts account.Store, chats Store) *RuleEvaluator {
-	return &RuleEvaluator{accounts: accounts, chats: chats}
+func NewRuleEvaluator(accounts account.Store, balances *balance.Client, chats Store) *RuleEvaluator {
+	return &RuleEvaluator{accounts: accounts, balances: balances, chats: chats}
 }
 
 // CanListen reports whether userID satisfies every listener rule of chatID —
@@ -119,7 +148,40 @@ func (e *RuleEvaluator) satisfies(ctx context.Context, kind any, userID *commonp
 	switch k := kind.(type) {
 	case *chatpb.ListenerRules_Staff, *chatpb.SpeakerRules_Staff:
 		return e.accounts.IsStaff(ctx, userID)
+	case *chatpb.ListenerRules_MinimumBalance:
+		return e.satisfiesMinimumBalance(ctx, k.MinimumBalance, userID)
+	case *chatpb.SpeakerRules_MinimumBalance:
+		return e.satisfiesMinimumBalance(ctx, k.MinimumBalance, userID)
 	default:
 		return false, fmt.Errorf("unsupported chat rule %T", k)
 	}
+}
+
+// satisfiesMinimumBalance reports whether userID holds at least the required
+// amount, in the required mints, right now.
+//
+// Only a USD requirement can be answered: the balance client values holdings in
+// USDF, a USD stablecoin, so the requirement compares directly against what it
+// returns with no exchange rate in between. A requirement in any other currency
+// is, like an unknown rule kind, an error and never a pass. The comparison is
+// made in quarks, the requirement rounded to the nearest quark, so a balance
+// that is exactly the requirement satisfies it whatever the float arithmetic
+// on the way in.
+//
+// A user with no owner account holds nothing, and fails as a zero balance would;
+// a balance that cannot be read is an error, so the gate is never left
+// unenforced.
+func (e *RuleEvaluator) satisfiesMinimumBalance(ctx context.Context, req *chatpb.MinimumBalanceRequirement, userID *commonpb.UserId) (bool, error) {
+	if currency_lib.Code(req.GetAmount().GetCurrency()) != currency_lib.USD {
+		return false, fmt.Errorf("unsupported minimum balance currency %q", req.GetAmount().GetCurrency())
+	}
+	required := uint64(math.Round(req.GetAmount().GetNativeAmount() * float64(ocp_common.CoreMintQuarksPerUnit)))
+
+	held, err := e.balances.GetTotalUsdfBalance(ctx, userID, req.GetMints()...)
+	if errors.Is(err, balance.ErrNotFound) {
+		held = 0
+	} else if err != nil {
+		return false, err
+	}
+	return held >= required, nil
 }

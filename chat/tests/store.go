@@ -35,6 +35,7 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_AdvanceLastMessage,
 		testStore_GroupChat_PutAndGet,
 		testStore_GroupChat_StaffOnly,
+		testStore_GroupChat_MinimumListenerBalance,
 		testStore_GroupChat_Rules,
 		testStore_GroupChat_Creator,
 		testStore_GroupChat_Picture,
@@ -292,6 +293,87 @@ func testStore_GroupChat_StaffOnly(t *testing.T, s chat.Store) {
 	require.True(t, got.LastActivity.Equal(at(200)))
 }
 
+func testStore_GroupChat_MinimumListenerBalance(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// A group has no minimum listener balance unless it was created with one.
+	plain := putGroupChat(t, s, "Weekend Trip", at(100), model.MustGenerateUserID())
+	got, err := s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.MinimumListenerBalance)
+
+	// The requirement round-trips as stored: currency, an amount that is not a
+	// whole number, and the mint it must be held in.
+	usdfMint := &commonpb.PublicKey{Value: randomBytes(32)}
+	gated := &chat.Chat{
+		ID:      chat.MustGenerateGroupChatID(),
+		Type:    chatpb.ChatType_GROUP,
+		Members: []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:   "Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{
+			Currency:     "usd",
+			NativeAmount: 1234.56,
+			Mints:        []*commonpb.PublicKey{usdfMint},
+		},
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, gated))
+
+	got, err = s.GetChatByID(ctx, gated.ID)
+	require.NoError(t, err)
+	require.Equal(t, gated.MinimumListenerBalance, got.MinimumListenerBalance)
+	require.False(t, got.IsStaffOnly)
+	require.Equal(t, "Whales", got.Title)
+
+	// The stored record is independent of the one read.
+	got.MinimumListenerBalance.Mints[0].Value[0]++
+	again, err := s.GetChatByID(ctx, gated.ID)
+	require.NoError(t, err)
+	require.Equal(t, usdfMint.Value, again.MinimumListenerBalance.Mints[0].Value)
+
+	// No mints reads back as no mints — the encoding of "any mint" — and a
+	// fractional amount with no short decimal form still round-trips exactly.
+	anyMint := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{model.MustGenerateUserID()},
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "eur", NativeAmount: 0.1 + 0.2},
+		LastActivity:           at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, anyMint))
+
+	got, err = s.GetChatByID(ctx, anyMint.ID)
+	require.NoError(t, err)
+	require.Equal(t, "eur", got.MinimumListenerBalance.Currency)
+	require.Equal(t, 0.1+0.2, got.MinimumListenerBalance.NativeAmount)
+	require.Empty(t, got.MinimumListenerBalance.Mints)
+
+	// The requirement is part of the canonical record and survives the updates
+	// that touch it.
+	advanced, _, err := s.AdvanceLastMessage(ctx, gated.ID, &messagingpb.MessageId{Value: 1}, at(200))
+	require.NoError(t, err)
+	require.True(t, advanced)
+	require.NoError(t, s.SetGroupPicture(ctx, gated.ID, &blobpb.BlobId{Value: randomBytes(16)}))
+
+	got, err = s.GetChatByID(ctx, gated.ID)
+	require.NoError(t, err)
+	require.Equal(t, gated.MinimumListenerBalance, got.MinimumListenerBalance)
+	require.True(t, got.LastActivity.Equal(at(200)))
+
+	// A DM never carries one, whatever its record says.
+	dm := &chat.Chat{
+		ID:                     generateDmChatID(),
+		Type:                   chatpb.ChatType_CONTACT_DM,
+		Members:                []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID()},
+		MinimumListenerBalance: gated.MinimumListenerBalance,
+		LastActivity:           at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, dm))
+	got, err = s.GetChatByID(ctx, dm.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.Rules())
+}
+
 func testStore_GroupChat_Rules(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
@@ -317,6 +399,44 @@ func testStore_GroupChat_Rules(t *testing.T, s chat.Store) {
 	require.True(t, proto.Equal(staff.Rules(), rules))
 	require.Len(t, rules.GetListener(), 1)
 	require.NotNil(t, rules.GetListener()[0].GetStaff())
+	require.Empty(t, rules.GetSpeaker())
+
+	// So are a balance-gated group's, and a group with both requirements
+	// projects both, staff first.
+	usdfMint := &commonpb.PublicKey{Value: randomBytes(32)}
+	gated := &chat.Chat{
+		ID:      chat.MustGenerateGroupChatID(),
+		Type:    chatpb.ChatType_GROUP,
+		Members: []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:   "Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{
+			Currency:     "usd",
+			NativeAmount: 1000,
+			Mints:        []*commonpb.PublicKey{usdfMint},
+		},
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, gated))
+
+	rules, err = s.GetGroupRules(ctx, gated.ID)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(gated.Rules(), rules))
+	require.Len(t, rules.GetListener(), 1)
+	require.True(t, proto.Equal(gated.MinimumListenerBalance.ToProto(), rules.GetListener()[0].GetMinimumBalance()))
+	require.Empty(t, rules.GetSpeaker())
+
+	both := gated.Clone()
+	both.ID = chat.MustGenerateGroupChatID()
+	both.Members = []*commonpb.UserId{model.MustGenerateUserID()}
+	both.IsStaffOnly = true
+	require.NoError(t, s.PutChat(ctx, both))
+
+	rules, err = s.GetGroupRules(ctx, both.ID)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(both.Rules(), rules))
+	require.Len(t, rules.GetListener(), 2)
+	require.NotNil(t, rules.GetListener()[0].GetStaff())
+	require.NotNil(t, rules.GetListener()[1].GetMinimumBalance())
 	require.Empty(t, rules.GetSpeaker())
 
 	// An unknown group is not found; a DM ID is not a group.
@@ -1006,11 +1126,15 @@ func at(seconds int64) time.Time {
 }
 
 func generateDmChatID() *commonpb.ChatId {
-	b := make([]byte, chat.DmChatIDSize)
+	return &commonpb.ChatId{Value: randomBytes(chat.DmChatIDSize)}
+}
+
+func randomBytes(n int) []byte {
+	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		panic(err)
 	}
-	return &commonpb.ChatId{Value: b}
+	return b
 }
 
 func chatIDValues(chats []*chat.Chat) [][]byte {

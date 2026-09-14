@@ -188,12 +188,14 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // membership records (see Store.GetGroupRosterSummary), filled in by the caller
 // alongside its Members. It is derived state, ignored on PutChat.
 //
-// IsStaffOnly marks a group whose membership is restricted to staff users. It
-// is stored state set at creation, surfaced to clients as a listener rule (see
-// Rules) and enforced by the messaging service through a RuleEvaluator on reads
-// and sends. Chat metadata reads gate on membership alone, so a member the rule
-// excludes can still see the chat and what it requires of them; enforcing it
-// on membership changes is the job of whatever path mutates membership.
+// IsStaffOnly marks a group whose membership is restricted to staff users, and
+// MinimumListenerBalance a group whose members must hold a balance (nil when
+// the group asks for none). Both are stored state set at creation, surfaced to
+// clients as listener rules (see Rules) and enforced by the messaging service
+// through a RuleEvaluator on sends. Reads, of chat metadata and of messages
+// alike, gate on membership alone, so a member a rule excludes can still see
+// the chat and what it requires of them; enforcing rules on membership changes
+// is the job of whatever path mutates membership.
 //
 // CreatorID is the user who created the group, or nil when unknown (a DM has
 // none, and so does any group written before the field existed). It is fixed
@@ -209,16 +211,57 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // is set (see blob.Integration.SetAsChatPicture), so the record here carries
 // no authorization of its own.
 type Chat struct {
-	ID            *commonpb.ChatId
-	Type          chatpb.ChatType
-	Members       []*commonpb.UserId
-	RosterSummary RosterSummary
-	Title         string
-	IsStaffOnly   bool
-	CreatorID     *commonpb.UserId
-	PictureBlobID *blobpb.BlobId
-	LastActivity  time.Time
-	LastMessageID *messagingpb.MessageId
+	ID                     *commonpb.ChatId
+	Type                   chatpb.ChatType
+	Members                []*commonpb.UserId
+	RosterSummary          RosterSummary
+	Title                  string
+	IsStaffOnly            bool
+	MinimumListenerBalance *MinimumBalance
+	CreatorID              *commonpb.UserId
+	PictureBlobID          *blobpb.BlobId
+	LastActivity           time.Time
+	LastMessageID          *messagingpb.MessageId
+}
+
+// MinimumBalance is a balance a user must hold to satisfy a chat rule: at least
+// NativeAmount of Currency (an ISO 4217 alpha-3 code, lowercase) worth of
+// tokens, valued at the time the rule is evaluated. Mints restricts which mints
+// the balance may be held in; empty means any mint counts. The proto it
+// projects onto allows at most one mint today, and the model mirrors the
+// proto's list so that lifting the cap is not a storage change.
+//
+// It is stored as given: what the amount and mints mean is the proto's contract
+// (see chatpb.MinimumBalanceRequirement), and validating a requirement is the
+// job of the boundary that accepts one, not the record.
+type MinimumBalance struct {
+	Currency     string
+	NativeAmount float64
+	Mints        []*commonpb.PublicKey
+}
+
+// Clone returns a deep copy of the requirement.
+func (m *MinimumBalance) Clone() *MinimumBalance {
+	mints := make([]*commonpb.PublicKey, len(m.Mints))
+	for i, mint := range m.Mints {
+		mints[i] = &commonpb.PublicKey{Value: append([]byte(nil), mint.Value...)}
+	}
+	return &MinimumBalance{
+		Currency:     m.Currency,
+		NativeAmount: m.NativeAmount,
+		Mints:        mints,
+	}
+}
+
+// ToProto projects the requirement onto a chatpb.MinimumBalanceRequirement.
+func (m *MinimumBalance) ToProto() *chatpb.MinimumBalanceRequirement {
+	return &chatpb.MinimumBalanceRequirement{
+		Amount: &commonpb.FiatPaymentAmount{
+			Currency:     m.Currency,
+			NativeAmount: m.NativeAmount,
+		},
+		Mints: m.Clone().Mints,
+	}
 }
 
 // RosterSummary summarizes a chat's roster — its member list — without
@@ -256,6 +299,10 @@ func (c *Chat) Clone() *Chat {
 	for i, m := range c.Members {
 		members[i] = &commonpb.UserId{Value: append([]byte(nil), m.Value...)}
 	}
+	var minimumListenerBalance *MinimumBalance
+	if c.MinimumListenerBalance != nil {
+		minimumListenerBalance = c.MinimumListenerBalance.Clone()
+	}
 	var creatorID *commonpb.UserId
 	if c.CreatorID != nil {
 		creatorID = &commonpb.UserId{Value: append([]byte(nil), c.CreatorID.Value...)}
@@ -269,16 +316,17 @@ func (c *Chat) Clone() *Chat {
 		lastMessageID = &messagingpb.MessageId{Value: c.LastMessageID.Value}
 	}
 	return &Chat{
-		ID:            &commonpb.ChatId{Value: append([]byte(nil), c.ID.Value...)},
-		Type:          c.Type,
-		Members:       members,
-		RosterSummary: c.RosterSummary,
-		Title:         c.Title,
-		IsStaffOnly:   c.IsStaffOnly,
-		CreatorID:     creatorID,
-		PictureBlobID: pictureBlobID,
-		LastActivity:  c.LastActivity,
-		LastMessageID: lastMessageID,
+		ID:                     &commonpb.ChatId{Value: append([]byte(nil), c.ID.Value...)},
+		Type:                   c.Type,
+		Members:                members,
+		RosterSummary:          c.RosterSummary,
+		Title:                  c.Title,
+		IsStaffOnly:            c.IsStaffOnly,
+		MinimumListenerBalance: minimumListenerBalance,
+		CreatorID:              creatorID,
+		PictureBlobID:          pictureBlobID,
+		LastActivity:           c.LastActivity,
+		LastMessageID:          lastMessageID,
 	}
 }
 

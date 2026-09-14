@@ -7,6 +7,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/chat"
 )
 
@@ -32,6 +33,7 @@ func NewServer(
 	authz auth.Authorizer,
 
 	accounts account.Store,
+	balances *balance.Client,
 	chats chat.Store,
 	media Media,
 	messages Store,
@@ -47,7 +49,7 @@ func NewServer(
 		media:    media,
 		messages: messages,
 
-		rules: chat.NewRuleEvaluator(accounts, chats),
+		rules: chat.NewRuleEvaluator(accounts, balances, chats),
 
 		sender: sender,
 	}

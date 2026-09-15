@@ -32,3 +32,7 @@ func (c *client) ClassifyUsername(ctx context.Context, username string) (*modera
 func (c *client) ClassifyDisplayName(ctx context.Context, name string) (*moderation.Result, error) {
 	return &moderation.Result{Flagged: false, CategoryScores: make(map[string]float64)}, nil
 }
+
+func (c *client) ClassifyGroupTitle(ctx context.Context, title string) (*moderation.Result, error) {
+	return &moderation.Result{Flagged: false, CategoryScores: make(map[string]float64)}, nil
+}

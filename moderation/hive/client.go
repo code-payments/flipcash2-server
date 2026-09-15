@@ -206,6 +206,10 @@ func (c *client) ClassifyDisplayName(ctx context.Context, name string) (*moderat
 	return nil, errors.New("not implemented")
 }
 
+func (c *client) ClassifyGroupTitle(ctx context.Context, title string) (*moderation.Result, error) {
+	return nil, errors.New("not implemented")
+}
+
 type response struct {
 	Status []taskStatus `json:"status"`
 }

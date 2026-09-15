@@ -980,6 +980,11 @@ func loadUsernameFixtures(t *testing.T) map[string][]string {
 	return loadFlaggedFixtures(t, usernameFixturesEnv, usernameFixturesPath, usernameHarmCategories)
 }
 
+func loadGroupTitleFixtures(t *testing.T) map[string][]string {
+	t.Helper()
+	return loadFlaggedFixtures(t, groupTitleFixturesEnv, groupTitleFixturesPath, groupTitleCategories)
+}
+
 // TestClassifyDisplayName checks that names which should be flagged are. Its
 // inputs come entirely from displayNameFixturesEnv; without it every category
 // reports itself uncovered, because a moderation suite that quietly stops
@@ -1130,6 +1135,198 @@ func TestClassifyDisplayName_SafeNameNotFlagged(t *testing.T) {
 			assert.False(t, result.Flagged,
 				"expected %q to not be flagged, flagged categories: %v (scores: %v)",
 				name, result.FlaggedCategories, result.CategoryScores)
+		})
+	}
+}
+
+// groupTitleCategories are the categories the group title prompt scores — the
+// same set as the display name prompt, since a title is abused the same ways a
+// name is. It is the authoritative list: TestClassifyGroupTitle reports any
+// category it has no fixtures for, and TestClassifyGroupTitle_AllCategoriesPresent
+// asserts the model returns a score for each.
+var groupTitleCategories = []string{
+	"child_safety",
+	"contact_info",
+	"drugs",
+	"financial_claim",
+	"gibberish",
+	"hate",
+	"profanity",
+	"self_harm",
+	"sexual",
+	"solicitation",
+	"violence",
+}
+
+// A JSON file of {category: [title, ...]} holds the titles TestClassifyGroupTitle
+// expects to be flagged: groupTitleFixturesPath by default, overridden by the
+// groupTitleFixturesEnv environment variable. Every positive fixture lives there
+// rather than in this file, for the reason given at displayNameFixturesEnv.
+const (
+	groupTitleFixturesEnv = "MODERATION_GROUP_TITLE_FIXTURES"
+
+	// Relative to this package's directory, which is the working directory
+	// `go test` runs the test binary in.
+	groupTitleFixturesPath = "testdata/group_title_fixtures.json"
+)
+
+// TestClassifyGroupTitle checks that titles which should be flagged are. Its
+// inputs come entirely from groupTitleFixturesEnv; without it every category
+// reports itself uncovered, because a moderation suite that quietly stops
+// testing is worse than one that is visibly not running.
+func TestClassifyGroupTitle(t *testing.T) {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		t.Fatal("ANTHROPIC_API_KEY environment variable is required")
+	}
+
+	client := NewClient(apiKey)
+	ctx := context.Background()
+
+	byCategory := loadGroupTitleFixtures(t)
+
+	for _, category := range groupTitleCategories {
+		inputs := byCategory[category]
+		if len(inputs) == 0 {
+			t.Run(category, func(t *testing.T) {
+				t.Skipf("no fixtures for %q; put a JSON file of {category: [title, ...]} at %s, or set %s to one elsewhere",
+					category, groupTitleFixturesPath, groupTitleFixturesEnv)
+			})
+			continue
+		}
+
+		for _, input := range inputs {
+			t.Run(category+"/"+input, func(t *testing.T) {
+				result, err := client.ClassifyGroupTitle(ctx, input)
+				require.NoError(t, err)
+
+				assert.True(t, result.Flagged, "expected %q to be flagged (scores: %v)", input, result.CategoryScores)
+			})
+		}
+	}
+}
+
+func TestClassifyGroupTitle_AllCategoriesPresent(t *testing.T) {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		t.Fatal("ANTHROPIC_API_KEY environment variable is required")
+	}
+
+	client := NewClient(apiKey)
+	ctx := context.Background()
+
+	result, err := client.ClassifyGroupTitle(ctx, "Sunday Hikers")
+	require.NoError(t, err)
+
+	for _, category := range groupTitleCategories {
+		_, ok := result.CategoryScores[category]
+		assert.True(t, ok, "missing category %q in response scores", category)
+	}
+}
+
+// TestClassifyGroupTitle_SafeTitleNotFlagged is the false-positive guard. It is
+// weighted toward the titles a group is most likely to actually carry — topics,
+// occasions, brands, and lists of names — and toward the topical titles that
+// merely mention money, trading, or a crude-sounding word: rejecting one of
+// those is the failure that blocks a real group from being made.
+func TestClassifyGroupTitle_SafeTitleNotFlagged(t *testing.T) {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		t.Fatal("ANTHROPIC_API_KEY environment variable is required")
+	}
+
+	client := NewClient(apiKey)
+	ctx := context.Background()
+
+	safeTitles := []string{
+		// Communities, occasions, and places.
+		"Family",
+		"Sunday Hikers",
+		"Book Club",
+		"Team Lunch",
+		"Wedding Planning",
+		"Cabo 2026",
+		"Roommates",
+		"Pickup Basketball",
+		"NYC Runners",
+		"Class of 2019",
+		"Fantasy Football",
+		"Poker Night",
+
+		// Lists of members' names.
+		"Sarah, Mike & Dave",
+		"Priya + Diego",
+		"The Johnsons",
+
+		// Non-Latin scripts. A title must not be flagged merely for being
+		// unfamiliar to the classifier.
+		"家族",
+		"친구들",
+		"Друзья",
+		"أصدقاء",
+		"परिवार",
+		"Οικογένεια",
+
+		// Brands, products, people, and platforms. Impersonation is permitted,
+		// and these are ordinary interest groups besides.
+		"Tesla Owners Club",
+		"Swifties",
+		"Nike Run Club",
+		"iPhone Tips",
+		"Coinbase Users",
+		"Flipcash Fans",
+
+		// Topical titles about money and trading. Naming the topic is not
+		// soliciting it.
+		"Crypto Chat",
+		"Trading Ideas",
+		"Investing 101",
+		"Side Hustles",
+		"Splitting Rent",
+		"Vacation Fund",
+		"Bitcoin Discussion",
+		"Group Expenses",
+
+		// Titles that collide with a crude word in some reading.
+		"Phuc's Birthday",
+		"Cummings Family Reunion",
+		"Dick's Sporting Goods Run",
+		"Bass Fishing",
+
+		// Stylization, emoji, punctuation, and unusual capitalization are not
+		// violations.
+		"✨ girls trip ✨",
+		"🏀🏀🏀",
+		"g a m e  n i g h t",
+		"THE SQUAD!!!",
+		"MoNdAy MoOd",
+
+		// Short titles.
+		"Us",
+		"Fam",
+		"BFFs",
+		"A",
+
+		// Known-ambiguous cases. A year is not a hate code, a film title is not
+		// a violence reference, and a menu item is not a drug reference; if these
+		// start failing, the prompt has become too eager rather than the titles
+		// having changed.
+		"Class of 88",
+		"Killer Queen Fans",
+		"Joint Birthday Party",
+		"Weed Whacker Repair",
+		"Shooting Club",
+		"Happy Hour",
+	}
+
+	for _, title := range safeTitles {
+		t.Run(title, func(t *testing.T) {
+			result, err := client.ClassifyGroupTitle(ctx, title)
+			require.NoError(t, err)
+
+			assert.False(t, result.Flagged,
+				"expected %q to not be flagged, flagged categories: %v (scores: %v)",
+				title, result.FlaggedCategories, result.CategoryScores)
 		})
 	}
 }

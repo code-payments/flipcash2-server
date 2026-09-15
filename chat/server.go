@@ -24,6 +24,7 @@ import (
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/moderation"
 )
 
 // MessageRef identifies a chat's message to hydrate. The feed builds one ref per
@@ -103,11 +104,11 @@ type BlocklistReader interface {
 	GetBlocked(ctx context.Context, ownerID *commonpb.UserId, candidateIDs []*commonpb.UserId) (map[string]bool, error)
 }
 
-// MediaReader is the read slice of the blob domain the Chat service needs to
-// hydrate group pictures. Like the other readers it is declared here (consumer
-// side) so the chat package need not import blob — which imports chat for its
-// membership resolver — and blob.Integration satisfies it directly.
-type MediaReader interface {
+// Media is the slice of the blob domain the Chat service needs: hydrating group
+// pictures on read, and attaching a picture to a group on write. Like the
+// readers it is declared here (consumer side) so the service can be tested
+// against a canned implementation; blob.Integration satisfies it directly.
+type Media interface {
 	// ResolveRenditions returns each original's full rendition set — the
 	// ORIGINAL plus every derived rendition, each with a freshly minted,
 	// short-lived download URL — keyed by string(BlobId.Value). Originals that
@@ -115,6 +116,19 @@ type MediaReader interface {
 	// authorization: the caller passes only ids it has already established the
 	// reader may see.
 	ResolveRenditions(ctx context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error)
+
+	// SetAsChatPicture attaches the blob holding a picture's ORIGINAL to chatID
+	// as its picture: it verifies that ownerID owns the blob and that it is a
+	// READY image original, then grants read access to it on the surfaces the
+	// picture is shown from. It is idempotent. It returns one of
+	// blob.ErrBlobNotFound, blob.ErrBlobNotReady, blob.ErrBlobRejected, or
+	// blob.ErrBlobInvalid when the blob cannot back a picture, having granted
+	// nothing; any other error is a failure to attach.
+	//
+	// It touches only blob-domain state, so it may be called for a chat that
+	// does not exist yet — which is how a group is created with its picture in
+	// place, rather than briefly without one.
+	SetAsChatPicture(ctx context.Context, ownerID *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error
 }
 
 // UserEventPublisher is the write slice of the event domain the Chat service
@@ -141,8 +155,9 @@ type Server struct {
 	accounts  account.Store
 	blocklist BlocklistReader
 	chats     Store
-	media     MediaReader
+	media     Media
 	messaging MessagingReader
+	moderator moderation.Client
 	profiles  ProfileReader
 
 	rules *RuleEvaluator
@@ -171,8 +186,9 @@ func NewServer(
 	balances *balance.Client,
 	blocklist BlocklistReader,
 	chats Store,
-	media MediaReader,
+	media Media,
 	messaging MessagingReader,
+	moderator moderation.Client,
 	profiles ProfileReader,
 
 	userEventBus UserEventPublisher,
@@ -190,6 +206,7 @@ func NewServer(
 		chats:     chats,
 		media:     media,
 		messaging: messaging,
+		moderator: moderator,
 		profiles:  profiles,
 
 		rules: NewRuleEvaluator(accounts, balances, chats),

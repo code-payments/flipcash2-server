@@ -8,8 +8,6 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
-
-	"github.com/code-payments/flipcash2-server/chat"
 )
 
 // ErrInvalidGrant is returned by AccessStore methods when a grant — or the key
@@ -210,15 +208,26 @@ func (r *CompositeResolver) Covers(ctx context.Context, principal Principal, use
 	return resolver.Covers(ctx, principal, user)
 }
 
+// ChatMembership is the slice of the chat domain ChatResolver needs: whether a
+// user is currently a member of a chat. It is declared here (consumer side) so
+// this package need not import chat — which imports this package to attach
+// pictures and match its errors — and the chat store satisfies it directly.
+type ChatMembership interface {
+	// IsMember reports whether userID is a member of chatID. It returns false
+	// (no error) when the chat does not exist.
+	IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error)
+}
+
 // ChatResolver is the PrincipalResolver for chat-scoped grants: a user is
 // covered by a PrincipalTypeChat principal iff they are a member of the chat the
 // principal identifies. It resolves membership directly against the chat store.
 type ChatResolver struct {
-	chats chat.Store
+	chats ChatMembership
 }
 
-// NewChatResolver returns a ChatResolver backed by the given chat store.
-func NewChatResolver(chats chat.Store) PrincipalResolver {
+// NewChatResolver returns a ChatResolver backed by the given chat membership,
+// in production the chat store.
+func NewChatResolver(chats ChatMembership) PrincipalResolver {
 	return &ChatResolver{chats: chats}
 }
 

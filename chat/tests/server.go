@@ -22,6 +22,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 	ocp_balancepb "github.com/code-payments/ocp-protobuf-api/generated/go/balance/v1"
 
@@ -31,9 +32,11 @@ import (
 	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/balance"
+	"github.com/code-payments/flipcash2-server/blob"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/moderation"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/protoutil"
 	"github.com/code-payments/flipcash2-server/testutil"
@@ -80,6 +83,14 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_LeaveChat_NotFound,
 		testServer_LeaveChat_DeniedForDm,
 		testServer_LeaveChat_ThenRejoin,
+		testServer_StartChat_OK,
+		testServer_StartChat_WithPicture,
+		testServer_StartChat_PictureNotAccepted,
+		testServer_StartChat_TitleModerated,
+		testServer_StartChat_ModerationFailureIsInternal,
+		testServer_StartChat_InvalidRules,
+		testServer_StartChat_RulesNotSatisfied,
+		testServer_StartChat_WithRules,
 	} {
 		tf(t, s)
 		teardown()
@@ -97,7 +108,8 @@ type serverEnv struct {
 	messaging  *fakeMessagingReader
 	profiles   *fakeProfileReader
 	blocklist  *fakeBlocklistReader
-	media      *fakeMediaReader
+	media      *fakeMedia
+	moderator  *fakeModerator
 
 	userObserver *event.TestEventObserver[*commonpb.UserId, *eventpb.Event]
 	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
@@ -129,8 +141,9 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 	messaging := newFakeMessagingReader()
 	profiles := newFakeProfileReader()
 	blocklist := newFakeBlocklistReader()
-	media := newFakeMediaReader()
-	server := chat.NewServer(log, authz, accounts, balances, blocklist, s, media, messaging, profiles, userBus, chatBus, false)
+	media := newFakeMedia()
+	moderator := &fakeModerator{}
+	server := chat.NewServer(log, authz, accounts, balances, blocklist, s, media, messaging, moderator, profiles, userBus, chatBus, false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
@@ -145,6 +158,7 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 		profiles:     profiles,
 		blocklist:    blocklist,
 		media:        media,
+		moderator:    moderator,
 		accounts:     accounts,
 		ocpBalance:   ocpBalance,
 		userObserver: userObserver,
@@ -217,21 +231,56 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 	return resp, nil
 }
 
-// fakeMediaReader is a canned chat.MediaReader for server tests: it resolves
+// fakeMedia is a canned chat.Media for server tests: it resolves
 // whatever rendition sets a test registers per ORIGINAL blob ID, and omits the
 // rest the way the real reader omits an unknown or not-yet-servable original.
-type fakeMediaReader struct {
+// It attaches, as a chat picture, only the blobs a test has registered as
+// attachable, and records what it attached to which chat.
+type fakeMedia struct {
 	renditions map[string][]*blobpb.Rendition
+
+	// attachable is the set of blob IDs SetAsChatPicture accepts, standing in
+	// for "a READY image original the caller owns"; any other blob is refused
+	// as blob.ErrBlobNotFound.
+	attachable map[string]bool
+	// chatPictures records the blob attached to each chat, keyed by chat ID.
+	chatPictures map[string]*blobpb.BlobId
+
+	// attachErr, when set, fails every SetAsChatPicture call with it, standing
+	// in for a blob-domain outage.
+	attachErr error
 }
 
-func newFakeMediaReader() *fakeMediaReader {
-	return &fakeMediaReader{renditions: make(map[string][]*blobpb.Rendition)}
+func newFakeMedia() *fakeMedia {
+	return &fakeMedia{
+		renditions:   make(map[string][]*blobpb.Rendition),
+		attachable:   make(map[string]bool),
+		chatPictures: make(map[string]*blobpb.BlobId),
+	}
+}
+
+// setAttachable registers a blob SetAsChatPicture will accept, with its
+// rendition set resolvable the way a READY original's is.
+func (f *fakeMedia) setAttachable(originalID *blobpb.BlobId) []*blobpb.Rendition {
+	f.attachable[string(originalID.Value)] = true
+	return f.setRenditions(originalID)
+}
+
+func (f *fakeMedia) SetAsChatPicture(_ context.Context, _ *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
+	if f.attachErr != nil {
+		return f.attachErr
+	}
+	if !f.attachable[string(blobID.Value)] {
+		return blob.ErrBlobNotFound
+	}
+	f.chatPictures[string(chatID.Value)] = blobID
+	return nil
 }
 
 // setRenditions registers the resolved rendition set for an original: the
 // ORIGINAL itself plus a THUMBNAIL, each carrying blob metadata and a download
 // URL the way the real reader mints them.
-func (f *fakeMediaReader) setRenditions(originalID *blobpb.BlobId) []*blobpb.Rendition {
+func (f *fakeMedia) setRenditions(originalID *blobpb.BlobId) []*blobpb.Rendition {
 	thumbnailID := &blobpb.BlobId{Value: append([]byte(nil), originalID.Value...)}
 	thumbnailID.Value[0] ^= 0xff
 	renditions := []*blobpb.Rendition{
@@ -264,7 +313,7 @@ func (f *fakeMediaReader) setRenditions(originalID *blobpb.BlobId) []*blobpb.Ren
 	return renditions
 }
 
-func (f *fakeMediaReader) ResolveRenditions(_ context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error) {
+func (f *fakeMedia) ResolveRenditions(_ context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error) {
 	out := make(map[string][]*blobpb.Rendition)
 	for _, id := range ids {
 		if r, ok := f.renditions[string(id.Value)]; ok {
@@ -1698,4 +1747,418 @@ func testServer_LeaveChat_ThenRejoin(t *testing.T, s chat.Store) {
 	require.Equal(t, uint64(1), toMembers[0].GetRosterSummary().GetVersion())
 	require.NotNil(t, toMembers[1].GetMemberJoined())
 	require.Equal(t, uint64(2), toMembers[1].GetRosterSummary().GetVersion())
+}
+
+// fakeModerator is a canned moderation.Client for server tests. Only the two
+// classifiers a chat title runs through do anything; the rest satisfy the
+// interface and never flag.
+type fakeModerator struct {
+	textFlagged    bool
+	textCategories []string
+	textErr        error
+
+	titleFlagged    bool
+	titleCategories []string
+	titleErr        error
+
+	// classifiedTitle records the title ClassifyGroupTitle last saw, so a test
+	// can check what reached the classifier.
+	classifiedTitle string
+}
+
+func (m *fakeModerator) ClassifyText(context.Context, string) (*moderation.Result, error) {
+	return fakeModerationResult(m.textFlagged, m.textCategories, m.textErr)
+}
+
+func (m *fakeModerator) ClassifyGroupTitle(_ context.Context, title string) (*moderation.Result, error) {
+	m.classifiedTitle = title
+	return fakeModerationResult(m.titleFlagged, m.titleCategories, m.titleErr)
+}
+
+func (m *fakeModerator) ClassifyImage(context.Context, []byte) (*moderation.Result, error) {
+	return &moderation.Result{}, nil
+}
+
+func (m *fakeModerator) ClassifyCurrencyName(context.Context, string) (*moderation.Result, error) {
+	return &moderation.Result{}, nil
+}
+
+func (m *fakeModerator) ClassifyUsername(context.Context, string) (*moderation.Result, error) {
+	return &moderation.Result{}, nil
+}
+
+func (m *fakeModerator) ClassifyDisplayName(context.Context, string) (*moderation.Result, error) {
+	return &moderation.Result{}, nil
+}
+
+// fakeModerationResult builds a result whose category scores rise in the order
+// the categories are given, so the last one is the highest.
+func fakeModerationResult(flagged bool, categories []string, err error) (*moderation.Result, error) {
+	if err != nil {
+		return nil, err
+	}
+	result := &moderation.Result{Flagged: flagged}
+	if len(categories) > 0 {
+		result.FlaggedCategories = categories
+		result.CategoryScores = make(map[string]float64, len(categories))
+		for i, category := range categories {
+			result.CategoryScores[category] = float64(i + 1)
+		}
+	}
+	return result, nil
+}
+
+func (e *serverEnv) startGroupChat(keys model.KeyPair, params *chatpb.StartChatRequest_GroupChatParameters) (*chatpb.StartChatResponse, error) {
+	req := &chatpb.StartChatRequest{Parameters: &chatpb.StartChatRequest_Group{Group: params}}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.StartChat(e.ctx, req)
+}
+
+func (e *serverEnv) mustStartGroupChat(keys model.KeyPair, params *chatpb.StartChatRequest_GroupChatParameters) *chatpb.StartChatResponse {
+	resp, err := e.startGroupChat(keys, params)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// startChatMinimumBalance is the minimum listener balance, in USD, the
+// StartChat tests ask their groups to carry when the rules are not what is
+// under test. Every group must carry one (see chat.RulesFromProto).
+const startChatMinimumBalance = 100
+
+// minimumBalanceRule builds the listener rule for a USD minimum balance.
+func minimumBalanceRule(currency string, amount float64) *chatpb.ListenerRules {
+	return &chatpb.ListenerRules{Kind: &chatpb.ListenerRules_MinimumBalance{MinimumBalance: &chatpb.MinimumBalanceRequirement{
+		Amount: &commonpb.FiatPaymentAmount{Currency: currency, NativeAmount: amount},
+	}}}
+}
+
+// groupParams builds StartChat parameters for a group with the given title and
+// the default minimum balance rule.
+func groupParams(title string) *chatpb.StartChatRequest_GroupChatParameters {
+	return &chatpb.StartChatRequest_GroupChatParameters{
+		Title: title,
+		Rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", startChatMinimumBalance)}},
+	}
+}
+
+// fundEnvUser gives the env user an owner account holding the given USD
+// amount, so they satisfy a minimum balance rule up to it.
+func (e *serverEnv) fundEnvUser(amount uint64) {
+	bound, err := e.accounts.GetPubKeys(e.ctx, e.userID)
+	require.NoError(e.t, err)
+	if len(bound) == 0 {
+		_, err = e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
+		require.NoError(e.t, err)
+	}
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(amount))
+}
+
+func testServer_StartChat_OK(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	e.profiles.displayNames[string(e.userID.Value)] = "Founder"
+	e.fundEnvUser(startChatMinimumBalance)
+
+	before := time.Now().UTC()
+	resp := e.mustStartGroupChat(e.keys, groupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
+	require.Equal(t, moderationpb.FlaggedCategory_NONE, resp.FlaggedCategory)
+
+	// The response carries the new group as its creator sees it: a fresh
+	// server-minted ID, the title, the rules asked for, no picture, the creator
+	// as its only member, and a roster of one at version zero.
+	md := resp.Chat
+	require.NotNil(t, md)
+	require.True(t, chat.IsGroupChatID(md.ChatId))
+	require.Equal(t, chatpb.ChatType_GROUP, md.Type)
+	require.Equal(t, "Sunday Hikers", md.Title)
+	require.NoError(t, protoutil.ProtoEqualError(groupParams("Sunday Hikers").Rules, md.Rules))
+	require.Nil(t, md.Picture)
+	require.Nil(t, md.LastMessage)
+	require.False(t, md.LastActivity.AsTime().Before(before))
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 0}, md.GetRosterSummary()))
+	require.Len(t, md.Members, 1)
+	require.Equal(t, e.userID.Value, md.Members[0].UserId.Value)
+	require.Equal(t, "Founder", md.Members[0].UserProfile.DisplayName)
+
+	// The title reached the title classifier as given.
+	require.Equal(t, "Sunday Hikers", e.moderator.classifiedTitle)
+
+	// The record is in the store with the creator recorded and joined, and is
+	// readable back through GetChat.
+	stored, err := s.GetChatByID(e.ctx, md.ChatId)
+	require.NoError(t, err)
+	require.Equal(t, "Sunday Hikers", stored.Title)
+	require.Equal(t, e.userID.Value, stored.CreatorID.Value)
+	require.False(t, stored.IsStaffOnly)
+	require.NotNil(t, stored.MinimumListenerBalance)
+	require.Equal(t, float64(startChatMinimumBalance), stored.MinimumListenerBalance.NativeAmount)
+	require.Nil(t, stored.PictureBlobID)
+	members, err := s.GetMembers(e.ctx, md.ChatId)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.Equal(t, e.userID.Value, members[0].Value)
+	require.Equal(t, chatpb.GetChatResponse_OK, e.getChat(e.keys, md.ChatId).Result)
+
+	// The creator's other devices learn of the group as a join carrying the
+	// metadata; there is no one else to tell, so the chat topic is silent.
+	e.userObserver.WaitFor(t, func([]*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
+		return len(e.rosterUpdatesOnUserTopic(e.userID, md.ChatId)) >= 1
+	})
+	toCreator := e.rosterUpdatesOnUserTopic(e.userID, md.ChatId)
+	require.Len(t, toCreator, 1)
+	joined := toCreator[0].GetMemberJoined()
+	require.NotNil(t, joined)
+	require.Equal(t, e.userID.Value, joined.Member.UserId.Value)
+	require.Equal(t, "Founder", joined.Member.UserProfile.DisplayName)
+	require.NotNil(t, joined.Metadata)
+	require.Equal(t, md.ChatId.Value, joined.Metadata.ChatId.Value)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 0}, toCreator[0].GetRosterSummary()))
+	onChatTopic, _ := e.rosterUpdatesOnChatTopic(md.ChatId)
+	require.Empty(t, onChatTopic)
+
+	// Every call mints a distinct group, even with the same title.
+	again := e.mustStartGroupChat(e.keys, groupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, again.Result)
+	require.NotEqual(t, md.ChatId.Value, again.Chat.ChatId.Value)
+}
+
+func testServer_StartChat_WithPicture(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(startChatMinimumBalance)
+
+	pictureBlobID := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	renditions := e.media.setAttachable(pictureBlobID)
+
+	params := groupParams("Picture Group")
+	params.Picture = pictureBlobID
+	resp := e.mustStartGroupChat(e.keys, params)
+	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
+	md := resp.Chat
+
+	// The picture was attached against the new group's ID before the record
+	// was written, and comes back hydrated with its full rendition set.
+	require.Equal(t, pictureBlobID.Value, e.media.chatPictures[string(md.ChatId.Value)].GetValue())
+	require.NotNil(t, md.Picture)
+	require.Len(t, md.Picture.Renditions, len(renditions))
+	require.Equal(t, pictureBlobID.Value, md.Picture.Renditions[0].GetBlobId().GetValue())
+	require.NotNil(t, md.Picture.Renditions[0].Blob)
+
+	stored, err := s.GetChatByID(e.ctx, md.ChatId)
+	require.NoError(t, err)
+	require.Equal(t, pictureBlobID.Value, stored.PictureBlobID.GetValue())
+}
+
+func testServer_StartChat_PictureNotAccepted(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(startChatMinimumBalance)
+
+	// A blob the media domain will not attach — unknown, not the caller's, not
+	// READY, or not an image — refuses the whole creation: no group is written.
+	params := groupParams("Picture Group")
+	params.Picture = &blobpb.BlobId{Value: []byte("not-attachable01")}
+	resp := e.mustStartGroupChat(e.keys, params)
+	require.Equal(t, chatpb.StartChatResponse_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
+	require.Nil(t, resp.Chat)
+
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	require.NoError(t, err)
+	require.Empty(t, groups)
+	require.Empty(t, e.media.chatPictures)
+
+	// A blob domain that cannot attach at all is the server's fault, not the
+	// picture's: the RPC fails rather than telling the client to pick another.
+	e.media.setAttachable(&blobpb.BlobId{Value: []byte("group-picture-01")})
+	e.media.attachErr = errors.New("blob store down")
+	params.Picture = &blobpb.BlobId{Value: []byte("group-picture-01")}
+	_, err = e.startGroupChat(e.keys, params)
+	require.Equal(t, codes.Internal, status.Code(err))
+	groups, err = s.GetGroupChatsForUser(e.ctx, e.userID)
+	require.NoError(t, err)
+	require.Empty(t, groups)
+}
+
+func testServer_StartChat_TitleModerated(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(startChatMinimumBalance)
+
+	noGroups := func() {
+		t.Helper()
+		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+		require.NoError(t, err)
+		require.Empty(t, groups)
+	}
+
+	// The title classifier flags: its best-fit category is reported, and no
+	// group is written.
+	e.moderator.titleFlagged = true
+	e.moderator.titleCategories = []string{"gibberish", "solicitation"}
+	resp := e.mustStartGroupChat(e.keys, groupParams("DM for signals"))
+	require.Equal(t, chatpb.StartChatResponse_TITLE_MODERATED, resp.Result)
+	require.Equal(t, moderationpb.FlaggedCategory_SPAM, resp.FlaggedCategory)
+	require.Nil(t, resp.Chat)
+	noGroups()
+
+	// The general text classifier flags on its own: still refused, with its
+	// category.
+	e.moderator.titleFlagged = false
+	e.moderator.titleCategories = nil
+	e.moderator.textFlagged = true
+	e.moderator.textCategories = []string{"hate"}
+	resp = e.mustStartGroupChat(e.keys, groupParams("flagged prose"))
+	require.Equal(t, chatpb.StartChatResponse_TITLE_MODERATED, resp.Result)
+	require.Equal(t, moderationpb.FlaggedCategory_NSFW, resp.FlaggedCategory)
+	noGroups()
+
+	// Both flag: the title classifier's category wins, being the specific one.
+	e.moderator.titleFlagged = true
+	e.moderator.titleCategories = []string{"financial_claim"}
+	resp = e.mustStartGroupChat(e.keys, groupParams("Guaranteed 10x"))
+	require.Equal(t, chatpb.StartChatResponse_TITLE_MODERATED, resp.Result)
+	require.Equal(t, moderationpb.FlaggedCategory_MISLEADING, resp.FlaggedCategory)
+	noGroups()
+
+	// The text classifier declining a short title for want of a language is
+	// not a refusal: the title classifier still covers it.
+	e.moderator.titleFlagged = false
+	e.moderator.titleCategories = nil
+	e.moderator.textFlagged = false
+	e.moderator.textCategories = nil
+	e.moderator.textErr = moderation.ErrUnsupportedLanguage
+	resp = e.mustStartGroupChat(e.keys, groupParams("Fam"))
+	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
+}
+
+// testServer_StartChat_ModerationFailureIsInternal pins that a title which
+// cannot be classified is never persisted: either classifier failing is the
+// RPC failing, not a pass.
+func testServer_StartChat_ModerationFailureIsInternal(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(startChatMinimumBalance)
+
+	e.moderator.titleErr = errors.New("classifier down")
+	_, err := e.startGroupChat(e.keys, groupParams("Sunday Hikers"))
+	require.Equal(t, codes.Internal, status.Code(err))
+
+	e.moderator.titleErr = nil
+	e.moderator.textErr = errors.New("classifier down")
+	_, err = e.startGroupChat(e.keys, groupParams("Sunday Hikers"))
+	require.Equal(t, codes.Internal, status.Code(err))
+
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	require.NoError(t, err)
+	require.Empty(t, groups)
+}
+
+func testServer_StartChat_InvalidRules(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// The creator satisfies every valid rule below, so a refusal is for the
+	// rules' shape alone.
+	e.accounts.setStaff(e.userID, true)
+	e.fundEnvUser(startChatMinimumBalance)
+
+	staff := &chatpb.ListenerRules{Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}}}
+	minimumBalance := minimumBalanceRule("usd", startChatMinimumBalance)
+
+	for name, rules := range map[string]*chatpb.Rules{
+		// Every group must carry a minimum listener balance.
+		"no rules":   nil,
+		"empty":      {},
+		"staff only": {Listener: []*chatpb.ListenerRules{staff}},
+		// No group carries a speaker rule yet, so none can be asked for.
+		"speaker rule": {
+			Listener: []*chatpb.ListenerRules{minimumBalance},
+			Speaker:  []*chatpb.SpeakerRules{{Kind: &chatpb.SpeakerRules_Staff{Staff: &chatpb.StaffRequirement{}}}},
+		},
+		// The record holds one requirement of each kind.
+		"duplicate staff":           {Listener: []*chatpb.ListenerRules{staff, staff, minimumBalance}},
+		"duplicate minimum balance": {Listener: []*chatpb.ListenerRules{minimumBalance, minimumBalanceRule("usd", 1)}},
+		// Only a USD requirement can be evaluated, and only a positive one
+		// requires anything.
+		"non-usd minimum balance": {Listener: []*chatpb.ListenerRules{minimumBalanceRule("eur", 1)}},
+		"zero minimum balance":    {Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 0)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp := e.mustStartGroupChat(e.keys, &chatpb.StartChatRequest_GroupChatParameters{Title: "Ruled", Rules: rules})
+			require.Equal(t, chatpb.StartChatResponse_INVALID_RULES, resp.Result)
+			require.Nil(t, resp.Chat)
+		})
+	}
+
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	require.NoError(t, err)
+	require.Empty(t, groups)
+}
+
+func testServer_StartChat_RulesNotSatisfied(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// An underfunded creator cannot start a balance-gated group. With no owner
+	// account at all the creator holds nothing, and is refused the same way
+	// rather than failed...
+	resp := e.mustStartGroupChat(e.keys, groupParams("Whales"))
+	require.Equal(t, chatpb.StartChatResponse_RULES_NOT_SATISFIED, resp.Result)
+	require.Nil(t, resp.Chat)
+
+	// ...as is one a quark short.
+	_, err := e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(startChatMinimumBalance)-1)
+	resp = e.mustStartGroupChat(e.keys, groupParams("Whales"))
+	require.Equal(t, chatpb.StartChatResponse_RULES_NOT_SATISFIED, resp.Result)
+
+	// A funded but non-staff creator cannot start a staff-only group.
+	e.fundEnvUser(startChatMinimumBalance)
+	staffOnly := groupParams("Staff Room")
+	staffOnly.Rules.Listener = append(staffOnly.Rules.Listener, &chatpb.ListenerRules{Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}}})
+	resp = e.mustStartGroupChat(e.keys, staffOnly)
+	require.Equal(t, chatpb.StartChatResponse_RULES_NOT_SATISFIED, resp.Result)
+
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	require.NoError(t, err)
+	require.Empty(t, groups)
+}
+
+func testServer_StartChat_WithRules(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	const requirement = 100
+	usdfMint := model.MustGenerateKeyPair().Proto()
+	rules := &chatpb.Rules{Listener: []*chatpb.ListenerRules{
+		{Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}}},
+		{Kind: &chatpb.ListenerRules_MinimumBalance{MinimumBalance: &chatpb.MinimumBalanceRequirement{
+			Amount: &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: requirement},
+			Mints:  []*commonpb.PublicKey{usdfMint},
+		}}},
+	}}
+
+	// A creator who satisfies every rule — staff, and holding the requirement
+	// exactly — gets the group, with the rules stored and shown back.
+	e.accounts.setStaff(e.userID, true)
+	_, err := e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+
+	resp := e.mustStartGroupChat(e.keys, &chatpb.StartChatRequest_GroupChatParameters{Title: "Staff Whales", Rules: rules})
+	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(rules, resp.Chat.GetRules()))
+
+	stored, err := s.GetChatByID(e.ctx, resp.Chat.ChatId)
+	require.NoError(t, err)
+	require.True(t, stored.IsStaffOnly)
+	require.NotNil(t, stored.MinimumListenerBalance)
+	require.Equal(t, "usd", stored.MinimumListenerBalance.Currency)
+	require.Equal(t, float64(requirement), stored.MinimumListenerBalance.NativeAmount)
+	require.Len(t, stored.MinimumListenerBalance.Mints, 1)
+	require.Equal(t, usdfMint.Value, stored.MinimumListenerBalance.Mints[0].Value)
+	require.NoError(t, protoutil.ProtoEqualError(rules, stored.Rules()))
+
+	// The rules then gate the group as any other: a non-staff user cannot join.
+	stranger, strangerKeys := e.addUser()
+	joinResp := e.mustJoinChat(strangerKeys, resp.Chat.ChatId)
+	require.Equal(t, chatpb.JoinChatResponse_RULES_NOT_SATISFIED, joinResp.Result)
+	isMember, err := s.IsMember(e.ctx, resp.Chat.ChatId, stranger)
+	require.NoError(t, err)
+	require.False(t, isMember)
 }

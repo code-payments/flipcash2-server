@@ -52,6 +52,69 @@ func (c *Chat) Rules() *chatpb.Rules {
 	return &chatpb.Rules{Listener: listener}
 }
 
+// ErrInvalidRules is returned by RulesFromProto for a rule set a group cannot
+// carry (see RulesFromProto for what one can).
+var ErrInvalidRules = errors.New("invalid chat rules")
+
+// RulesFromProto validates a rule set a client asked a new group to carry and
+// projects it onto the stored fields Rules projects back from, so that a group
+// created with rules shows exactly the rules it was asked for.
+//
+// It accepts what a group can store today, and nothing more, so that a rule
+// is never accepted and then silently dropped: listener rules only, since no
+// group carries a speaker rule yet; each kind at most once, since the record
+// holds one of each; and a minimum balance in USD only, with a positive amount,
+// since that is the only balance the evaluator can answer (see
+// satisfiesMinimumBalance). The requirement's mints are taken as given: the
+// proto bounds how many, and validation bounds their shape. Anything else is
+// ErrInvalidRules — a rule the server cannot enforce is refused up front rather
+// than stored and failed on every evaluation.
+//
+// It also requires what every group must carry today: a minimum listener
+// balance. A set without one — nil, empty, or staff-only — is ErrInvalidRules,
+// so no group is created that a holder of nothing could join.
+func RulesFromProto(rules *chatpb.Rules) (isStaffOnly bool, minimumListenerBalance *MinimumBalance, err error) {
+	if len(rules.GetSpeaker()) > 0 {
+		return false, nil, fmt.Errorf("%w: speaker rules are not supported", ErrInvalidRules)
+	}
+	for _, rule := range rules.GetListener() {
+		switch k := rule.GetKind().(type) {
+		case *chatpb.ListenerRules_Staff:
+			if isStaffOnly {
+				return false, nil, fmt.Errorf("%w: duplicate staff requirement", ErrInvalidRules)
+			}
+			isStaffOnly = true
+		case *chatpb.ListenerRules_MinimumBalance:
+			if minimumListenerBalance != nil {
+				return false, nil, fmt.Errorf("%w: duplicate minimum balance requirement", ErrInvalidRules)
+			}
+			req := k.MinimumBalance
+			if currency_lib.Code(req.GetAmount().GetCurrency()) != currency_lib.USD {
+				return false, nil, fmt.Errorf("%w: unsupported minimum balance currency %q", ErrInvalidRules, req.GetAmount().GetCurrency())
+			}
+			amount := req.GetAmount().GetNativeAmount()
+			if math.IsNaN(amount) || math.IsInf(amount, 0) || amount <= 0 {
+				return false, nil, fmt.Errorf("%w: minimum balance amount must be positive", ErrInvalidRules)
+			}
+			mints := make([]*commonpb.PublicKey, len(req.GetMints()))
+			for i, mint := range req.GetMints() {
+				mints[i] = &commonpb.PublicKey{Value: append([]byte(nil), mint.GetValue()...)}
+			}
+			minimumListenerBalance = &MinimumBalance{
+				Currency:     string(currency_lib.USD),
+				NativeAmount: amount,
+				Mints:        mints,
+			}
+		default:
+			return false, nil, fmt.Errorf("%w: unsupported listener rule %T", ErrInvalidRules, k)
+		}
+	}
+	if minimumListenerBalance == nil {
+		return false, nil, fmt.Errorf("%w: a minimum listener balance is required", ErrInvalidRules)
+	}
+	return isStaffOnly, minimumListenerBalance, nil
+}
+
 // RuleEvaluator decides whether a user satisfies a chat's participation rules
 // (see Chat.Rules). It evaluates rules only: membership is a separate, cheaper
 // check the caller makes first, so a chat's rules are never evaluated — and

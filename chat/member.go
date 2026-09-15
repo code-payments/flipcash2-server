@@ -229,6 +229,9 @@ func (s *Server) requireStaffForGroupManagementRPC(ctx context.Context, log *zap
 // have open whatever the topic knows. The two updates may differ in payload
 // (a join carries the chat's metadata to the joiner alone); they carry the
 // same roster summary, so either audience converges on the same version.
+//
+// A nil toMembers means there is no one else to tell — a group's creation,
+// where the subject is its only member — and the chat topic is left silent.
 func (s *Server) publishRosterUpdate(chatID *commonpb.ChatId, subject *commonpb.UserId, toMembers, toSubject *chatpb.RosterUpdate) {
 	newEvent := func(update *chatpb.RosterUpdate) *eventpb.Event {
 		return &eventpb.Event{
@@ -241,10 +244,12 @@ func (s *Server) publishRosterUpdate(chatID *commonpb.ChatId, subject *commonpb.
 		}
 	}
 
-	s.chatEventBus.OnEvent(chatID, &eventpb.ChatEvent{
-		ChatId:         chatID,
-		Event:          newEvent(toMembers),
-		ExcludeUserIds: []*commonpb.UserId{subject},
-	})
+	if toMembers != nil {
+		s.chatEventBus.OnEvent(chatID, &eventpb.ChatEvent{
+			ChatId:         chatID,
+			Event:          newEvent(toMembers),
+			ExcludeUserIds: []*commonpb.UserId{subject},
+		})
+	}
 	s.userEventBus.OnEvent(subject, newEvent(toSubject))
 }

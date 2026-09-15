@@ -165,8 +165,9 @@ type Server struct {
 	userEventBus UserEventPublisher
 	chatEventBus ChatEventPublisher
 
-	// requireStaffForGroupManagement gates the self-service membership RPCs
-	// (JoinChat, LeaveChat) to staff users when set (see member.go).
+	// requireStaffForGroupManagement gates the self-service group management
+	// RPCs (StartChat, JoinChat, LeaveChat) to staff users when set (see
+	// requireStaffForGroupManagementRPC).
 	requireStaffForGroupManagement bool
 
 	// maxGroupFeedChats is the most group chats a user's feed may hold (see

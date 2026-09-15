@@ -35,8 +35,9 @@ import (
 // departure that is a no-op broadcasts nothing: the roster did not move, and a
 // client applying updates by version would drop it anyway.
 //
-// Both RPCs can be gated to staff users (see requireStaff), which is how they
-// are held back from the wider user base until they are ready for it. The gate
+// Both RPCs can be gated to staff users (see
+// requireStaffForGroupManagementRPC), which is how they are held back from the
+// wider user base until they are ready for it. The gate
 // is applied before the chat is looked up, so a non-staff caller learns
 // nothing — not even whether the chat exists.
 
@@ -196,9 +197,10 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 	return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_OK}, nil
 }
 
-// requireStaff reports whether userID passes the staff gate on the membership
-// RPCs: everyone does when the server is not configured to require staff, and
-// only staff users otherwise. A staff flag that cannot be read is a gRPC
+// requireStaffForGroupManagementRPC reports whether userID passes the staff
+// gate on the group management RPCs (StartChat, JoinChat, LeaveChat): everyone
+// does when the server is not configured to require staff, and only staff
+// users otherwise. A staff flag that cannot be read is a gRPC
 // Internal error, never a pass: the gate is a restriction, and a restriction
 // the server cannot evaluate admits no one.
 func (s *Server) requireStaffForGroupManagementRPC(ctx context.Context, log *zap.Logger, userID *commonpb.UserId) (bool, error) {

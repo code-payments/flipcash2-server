@@ -64,8 +64,9 @@ func NewIntegration(blobs Store, storage ObjectStorage, access AccessStore) *Int
 // ShareIntoChat attaches blobs to a chat: it verifies that sharerID owns every
 // blob in blobIDs and that each is a READY image original, then grants the chat
 // read access to each. It is all-or-nothing — if any blob fails validation
-// nothing is granted and ErrBlobNotShareable is returned — and idempotent, so a
-// re-sent message re-grants harmlessly. An empty blobIDs is a no-op.
+// nothing is granted and ErrBlobNotShareable is returned, and the grants
+// themselves land as one write — and idempotent, so a re-sent message re-grants
+// harmlessly. An empty blobIDs is a no-op; more than MaxGrantBatch is an error.
 //
 // Only the owner may introduce a blob into a chat: a BlobId is a bearer
 // capability, so without the ownership check a member could attach a blob they
@@ -96,13 +97,17 @@ func (i *Integration) ShareIntoChat(ctx context.Context, sharerID *commonpb.User
 		}
 	}
 
+	// One write for the whole share, so a message's media is granted as a unit
+	// (see AccessStore.Grants). A share is bounded by what a message can carry,
+	// well under the batch cap; one over it is refused as malformed rather than
+	// split, since splitting would give up the all-or-nothing the caller relies
+	// on.
 	chat := PrincipalForChat(chatID)
-	for _, id := range blobIDs {
-		if err := i.access.Grant(ctx, &Grant{BlobID: id, Principal: chat, Permission: PermissionRead}); err != nil {
-			return err
-		}
+	grants := make([]*Grant, len(blobIDs))
+	for j, id := range blobIDs {
+		grants[j] = &Grant{BlobID: id, Principal: chat, Permission: PermissionRead}
 	}
-	return nil
+	return i.access.Grants(ctx, grants)
 }
 
 // SetAsProfilePicture attaches a blob to ownerID's public profile: it verifies
@@ -187,16 +192,12 @@ func (i *Integration) SetAsChatPicture(ctx context.Context, ownerID *commonpb.Us
 		return err
 	}
 
-	for _, principal := range []Principal{PrincipalForChat(chatID), PrincipalForChatProfile(chatID)} {
-		if err := i.access.Grant(ctx, &Grant{
-			BlobID:     blobID,
-			Principal:  principal,
-			Permission: PermissionRead,
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
+	// Both surfaces in one write: the picture is never readable on one and not
+	// the other, and the attach costs a single round trip.
+	return i.access.Grants(ctx, []*Grant{
+		{BlobID: blobID, Principal: PrincipalForChat(chatID), Permission: PermissionRead},
+		{BlobID: blobID, Principal: PrincipalForChatProfile(chatID), Permission: PermissionRead},
+	})
 }
 
 // mimeTypeFilter reports whether a surface accepts content of the given MIME type.

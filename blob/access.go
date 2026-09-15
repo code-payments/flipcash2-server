@@ -139,6 +139,25 @@ func (g *Grant) Validate() error {
 	return g.Permission.validate()
 }
 
+// MaxGrantBatch is the most grants AccessStore.Grants accepts in one call. It
+// is what a single atomic write can cover: a DynamoDB transaction caps at 100
+// items, and every grant in a batch is one.
+const MaxGrantBatch = 100
+
+// ValidateGrants validates every grant of a batch, and its size, before a store
+// writes any of it (see AccessStore.Grants).
+func ValidateGrants(gs []*Grant) error {
+	if len(gs) > MaxGrantBatch {
+		return fmt.Errorf("%w: batch of %d grants exceeds %d", ErrInvalidGrant, len(gs), MaxGrantBatch)
+	}
+	for _, g := range gs {
+		if err := g.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // AccessStore persists blob ACL grants. A grant's existence authorizes its
 // principal to exercise its permission on the blob; there is no other state.
 //
@@ -152,6 +171,15 @@ type AccessStore interface {
 	// blob. It is idempotent: re-granting the same (blob, principal, permission)
 	// is a no-op. It returns ErrInvalidGrant if the grant is not well-formed.
 	Grant(ctx context.Context, g *Grant) error
+
+	// Grants records every grant in the batch as one write: all land or none
+	// do, so a surface that needs several grants to be usable (a chat picture,
+	// readable both inside the chat and on its profile) is never left half
+	// granted. It is idempotent as Grant is, and duplicate grants within a
+	// batch collapse. Every grant is validated before any is written; a
+	// malformed one is ErrInvalidGrant and grants nothing, as is a batch larger
+	// than MaxGrantBatch. An empty batch is a no-op.
+	Grants(ctx context.Context, gs []*Grant) error
 
 	// HasGrant reports whether a grant exists for the exact (blob, principal,
 	// permission) triple. A missing grant is (false, nil), not an error. It

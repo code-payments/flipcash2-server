@@ -20,7 +20,6 @@ import (
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
-	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/model"
@@ -90,8 +89,7 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 	profiles := newFakeProfileReader()
 	blocklist := newFakeBlocklistReader()
 	media := newFakeMediaReader()
-	accounts := accountmemory.NewInMemory()
-	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, profiles)
+	server := chat.NewServer(log, authz, blocklist, s, media, messaging, profiles)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))

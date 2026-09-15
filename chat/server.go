@@ -19,7 +19,6 @@ import (
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
-	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/model"
 )
@@ -120,7 +119,6 @@ type Server struct {
 
 	authz auth.Authorizer
 
-	accounts  account.Store
 	blocklist BlocklistReader
 	chats     Store
 	media     MediaReader
@@ -135,11 +133,10 @@ type Server struct {
 	chatpb.UnimplementedChatServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, blocklist BlocklistReader, chats Store, media MediaReader, messaging MessagingReader, profiles ProfileReader) *Server {
+func NewServer(log *zap.Logger, authz auth.Authorizer, blocklist BlocklistReader, chats Store, media MediaReader, messaging MessagingReader, profiles ProfileReader) *Server {
 	return &Server{
 		log:               log,
 		authz:             authz,
-		accounts:          accounts,
 		blocklist:         blocklist,
 		chats:             chats,
 		media:             media,

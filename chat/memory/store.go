@@ -137,10 +137,10 @@ func (m *memory) RemoveGroupMember(_ context.Context, chatID *commonpb.ChatId, u
 	defer m.Unlock()
 
 	key := string(chatID.Value)
-	members, ok := m.groupMembers[key]
-	if !ok {
-		return false, chat.RosterSummary{}, nil
+	if _, ok := m.chats[key]; !ok {
+		return false, chat.RosterSummary{}, chat.ErrChatNotFound
 	}
+	members := m.groupMembers[key]
 	if !members[string(userID.Value)] {
 		return false, m.rosterSummaryLocked(chatID), nil // Not joined: no transition.
 	}

@@ -73,11 +73,12 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_INVALID_RULES}, nil
 	}
 
-	// The creator must satisfy the group's own listener rules: a group whose
-	// creator cannot read it is a group nobody can reach. The rules are
-	// evaluated from the request rather than a stored record, since there is
-	// no record yet.
-	satisfied, err := s.rules.satisfiesListener(ctx, params.Rules, userID)
+	// The creator must satisfy the group's own rules in full, speaker rules
+	// included: a group whose creator cannot read it is a group nobody can
+	// reach, and one whose creator cannot post in it is a room they opened and
+	// cannot use. The rules are evaluated from the request rather than a
+	// stored record, since there is no record yet.
+	satisfied, err := s.rules.CanSpeakWithRules(ctx, params.Rules, userID)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure evaluating chat rules")
 		return nil, status.Error(codes.Internal, "")

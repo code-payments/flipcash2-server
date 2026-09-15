@@ -84,7 +84,10 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	}
 
 	if !isMember {
-		canListen, err := s.rules.CanListen(ctx, req.ChatId, userID)
+		// The rules come from the canonical record already in hand rather than
+		// a second read through the evaluator: the record is what they are
+		// projected from.
+		canListen, err := s.rules.CanListenWithRules(ctx, c.Rules(), userID)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure evaluating chat rules")
 			return nil, status.Error(codes.Internal, "")
@@ -159,19 +162,12 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_DENIED}, nil
 	}
 
+	// The ID's length is the type check: a group ID names a group or nothing,
+	// so there is no canonical record to read here. Unlike a join, a departure
+	// needs nothing from it — no rules to evaluate, no metadata to return — and
+	// the store's write reports a missing chat itself, so leaving is the one
+	// write and nothing else.
 	if !IsGroupChatID(req.ChatId) {
-		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_DENIED}, nil
-	}
-
-	c, err := s.chats.GetChatByID(ctx, req.ChatId)
-	switch {
-	case errors.Is(err, ErrChatNotFound):
-		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_NOT_FOUND}, nil
-	case err != nil:
-		log.With(zap.Error(err)).Warn("Failure getting chat")
-		return nil, status.Error(codes.Internal, "")
-	}
-	if c.Type != chatpb.ChatType_GROUP {
 		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_DENIED}, nil
 	}
 
@@ -179,7 +175,10 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 	// is a no-op that already holds: the caller asked not to be a member, and
 	// they are not. The store answers it without a transition.
 	changed, roster, err := s.chats.RemoveGroupMember(ctx, req.ChatId, userID)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrChatNotFound):
+		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_NOT_FOUND}, nil
+	case err != nil:
 		log.With(zap.Error(err)).Warn("Failure removing group member")
 		return nil, status.Error(codes.Internal, "")
 	}

@@ -160,6 +160,15 @@ func (e *RuleEvaluator) CanListen(ctx context.Context, chatID *commonpb.ChatId, 
 	return e.satisfiesListener(ctx, rules, userID)
 }
 
+// CanListenWithRules is CanListen for a caller that already holds the chat's
+// rules — read off a canonical record it loaded for its own purposes, or
+// taken from a request for a chat that does not exist yet — so the rules are
+// not read a second time. A nil rules admits everyone, as a chat with none
+// does.
+func (e *RuleEvaluator) CanListenWithRules(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+	return e.satisfiesListener(ctx, rules, userID)
+}
+
 // CanSpeak reports whether userID satisfies every listener and speaker rule of
 // chatID — the requirements to send messages in the chat. Speaker rules apply
 // on top of listener rules: a user who cannot listen cannot speak, whatever the
@@ -169,10 +178,17 @@ func (e *RuleEvaluator) CanSpeak(ctx context.Context, chatID *commonpb.ChatId, u
 	if err != nil {
 		return false, err
 	}
-	if ok, err := e.satisfiesListener(ctx, rules, userID); err != nil || !ok {
-		return false, err
-	}
-	for _, rule := range rules.GetSpeaker() {
+	return e.satisfiesSpeaker(ctx, rules, userID)
+}
+
+// CanSpeakWithRules is CanSpeak for a caller that already holds the chat's
+// rules (see CanListenWithRules). A nil rules admits everyone.
+func (e *RuleEvaluator) CanSpeakWithRules(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+	return e.satisfiesSpeaker(ctx, rules, userID)
+}
+
+func (e *RuleEvaluator) satisfiesListener(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+	for _, rule := range rules.GetListener() {
 		ok, err := e.satisfies(ctx, rule.GetKind(), userID)
 		if err != nil || !ok {
 			return false, err
@@ -181,8 +197,13 @@ func (e *RuleEvaluator) CanSpeak(ctx context.Context, chatID *commonpb.ChatId, u
 	return true, nil
 }
 
-func (e *RuleEvaluator) satisfiesListener(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
-	for _, rule := range rules.GetListener() {
+// satisfiesSpeaker evaluates the listener rules and then the speaker rules,
+// stopping at the first the user fails.
+func (e *RuleEvaluator) satisfiesSpeaker(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+	if ok, err := e.satisfiesListener(ctx, rules, userID); err != nil || !ok {
+		return false, err
+	}
+	for _, rule := range rules.GetSpeaker() {
 		ok, err := e.satisfies(ctx, rule.GetKind(), userID)
 		if err != nil || !ok {
 			return false, err

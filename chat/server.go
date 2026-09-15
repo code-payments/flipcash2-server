@@ -426,8 +426,8 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 		md := c.ToProto()
 		if IsGroupChatID(c.ID) {
 			// ToProto projects the canonical record, which carries neither a
-			// group's members nor its summary. A group without a summary record
-			// reads as zero, as the single read returns it.
+			// group's members nor its summary. Every group in the set exists, so
+			// the batch read has an entry for each.
 			md.Members = []*chatpb.Member{{UserId: &commonpb.UserId{Value: append([]byte(nil), viewerID.Value...)}}}
 			md.RosterSummary = rosterSummaries[key].ToProto()
 		}

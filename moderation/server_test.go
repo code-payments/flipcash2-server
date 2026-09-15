@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -46,6 +47,10 @@ func (m *mockClient) ClassifyUsername(_ context.Context, _ string) (*Result, err
 
 func (m *mockClient) ClassifyDisplayName(_ context.Context, _ string) (*Result, error) {
 	return m.displayNameResult, m.err
+}
+
+func (m *mockClient) ClassifyGroupTitle(_ context.Context, _ string) (*Result, error) {
+	return nil, errors.New("not implemented")
 }
 
 func TestModerateText_Allowed(t *testing.T) {

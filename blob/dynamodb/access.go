@@ -64,6 +64,36 @@ func (s *accessStore) Grant(ctx context.Context, g *blob.Grant) error {
 	return err
 }
 
+// Grants writes the batch as one transaction. Entries are unconditional Puts,
+// as a single Grant is, so the transaction's only way to fail is as a whole.
+// Two actions on one item is a validation error rather than an idempotent
+// overwrite, so duplicates are collapsed by key before the write is built.
+func (s *accessStore) Grants(ctx context.Context, gs []*blob.Grant) error {
+	if err := blob.ValidateGrants(gs); err != nil {
+		return err
+	}
+	if len(gs) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(gs))
+	items := make([]types.TransactWriteItem, 0, len(gs))
+	for _, g := range gs {
+		pk, sk := blobPK(g.BlobID), aceSK(g.Principal, g.Permission)
+		if _, dup := seen[pk+"|"+sk]; dup {
+			continue
+		}
+		seen[pk+"|"+sk] = struct{}{}
+		items = append(items, types.TransactWriteItem{Put: &types.Put{
+			TableName: aws.String(s.table),
+			Item:      map[string]types.AttributeValue{attrPK: avS(pk), attrSK: avS(sk)},
+		}})
+	}
+
+	_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+	return err
+}
+
 func (s *accessStore) HasGrant(ctx context.Context, blobID *blobpb.BlobId, p blob.Principal, perm blob.Permission) (bool, error) {
 	if err := (&blob.Grant{BlobID: blobID, Principal: p, Permission: perm}).Validate(); err != nil {
 		return false, err

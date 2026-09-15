@@ -17,6 +17,7 @@ import (
 	"github.com/code-payments/flipcash2-server/blocklist"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/event"
+	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/push"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
@@ -93,7 +94,7 @@ func publishChatUpdate(
 
 	update.Chat = chatID
 	e := &eventpb.Event{
-		Id:   event.MustGenerateEventID(),
+		Id:   model.MustGenerateEventID(),
 		Ts:   timestamppb.Now(),
 		Type: &eventpb.Event_ChatUpdate{ChatUpdate: update},
 	}

@@ -20,6 +20,7 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/protoutil"
 )
 
 // fakeAccounts is an account.Store that answers IsStaff from a set, records
@@ -157,7 +158,7 @@ func TestChat_Rules(t *testing.T) {
 	require.NoError(t, rules.Validate())
 
 	// The projection onto Metadata carries the same rules.
-	require.Equal(t, rules, staffOnly.ToProto().GetRules())
+	require.NoError(t, protoutil.ProtoEqualError(rules, staffOnly.ToProto().GetRules()))
 
 	// A minimum listener balance is one listener rule too, carrying the
 	// requirement as stored: the fiat amount, and the mints it may be held in.
@@ -177,7 +178,7 @@ func TestChat_Rules(t *testing.T) {
 	require.Equal(t, 250.5, balance.GetAmount().GetNativeAmount())
 	require.Len(t, balance.GetMints(), 1)
 	require.Equal(t, usdfMint.Value, balance.GetMints()[0].GetValue())
-	require.Equal(t, rules, gated.ToProto().GetRules())
+	require.NoError(t, protoutil.ProtoEqualError(rules, gated.ToProto().GetRules()))
 
 	// No mints is "any mint": the projection carries an empty list, not a nil
 	// requirement.

@@ -126,6 +126,37 @@ Rules:
 - Emoji, stylization, and unusual capitalization are not themselves violations.
 
 Respond with only a JSON object mapping each category to its score. No other text. Evaluate the entire text as a display name.`, displayNameFlagThreshold)
+
+	groupTitleFlagThreshold = 0.5
+
+	groupTitleSystemPrompt = fmt.Sprintf(`You are a moderation system that evaluates user-chosen group chat titles for a peer-to-peer payments app. A group chat title labels a shared room: it appears in the chat list of every member, in invitations, and wherever the group is presented to users deciding whether to join, so it is a surface users can abuse to advertise, run scams, or expose others to harmful content.
+
+Users are free to title a group after anything, including the name of a real person, celebrity, company, brand, product, place, event, or topic. That is not a violation and must not be scored. A title normally names what the group is about or who it is for rather than a person, so read it as the label of a community, topic, or occasion.
+
+Evaluate the entire text as the title of one group chat.
+
+Score each category from 0.0 (no match) to 1.0 (clear match):
+
+- financial_claim: Promises returns, giveaways, guarantees, or free money (Free USDC, Guaranteed 10x, Crypto Giveaway, etc.)
+- solicitation: Advertises a service, recruits, or directs the reader elsewhere (DM for signals, Buy followers, Join my channel, etc.)
+- contact_info: Contains a URL, domain, social handle, phone number, email address, or wallet address
+- gibberish: Random characters or filler with no plausible meaning as a title (asdfgh, xxxxxxxx, etc.)
+- sexual: Sexually explicit or graphic
+- hate: Slurs, hate symbols, hate groups, or coded hate references (1488, 88, etc.)
+- violence: Threats, glorification of violence, or terrorism references
+- child_safety: Sexualizes minors or references child exploitation
+- self_harm: References or encourages suicide or self-harm
+- drugs: Advertises or promotes illegal drugs
+- profanity: Obscene or vulgar language
+
+Rules:
+- Ordinary titles in any language or script are NOT violations: a topic, hobby, team, family, workplace, class, neighborhood, event, trip, inside joke, or a list of members' names. Do not flag a title merely because it is non-English, transliterated, or unfamiliar.
+- Naming a topic is not soliciting it. A group about trading, crypto, investing, side hustles, or a brand is an ordinary title; score solicitation and financial_claim only when the title itself advertises a service, promises an outcome, recruits, or sends the reader somewhere else.
+- Score based on the whole title, including obfuscation. Read leetspeak, homoglyphs, inserted spacing, and zero-width characters as the letters they imitate, so that an evaded slur or an obscured URL is scored the same as a plain one.
+- Score %.1f or higher only when the interpretation is clear. Short or ambiguous strings score low.
+- Emoji, stylization, punctuation, and unusual capitalization are not themselves violations.
+
+Respond with only a JSON object mapping each category to its score. No other text. Evaluate the entire text as a group chat title.`, groupTitleFlagThreshold)
 )
 
 type client struct {
@@ -134,7 +165,7 @@ type client struct {
 }
 
 // NewClient creates a moderation client that uses Claude Sonnet for currency
-// name, username, and display name classification.
+// name, username, display name, and group title classification.
 func NewClient(apiKey string) moderation.Client {
 	return &client{
 		apiKey:     apiKey,
@@ -173,6 +204,15 @@ func (c *client) ClassifyDisplayName(ctx context.Context, name string) (*moderat
 	defer tracer.End()
 
 	res, err := c.classifyDisplayName(ctx, name)
+	tracer.OnError(err)
+	return res, err
+}
+
+func (c *client) ClassifyGroupTitle(ctx context.Context, title string) (*moderation.Result, error) {
+	tracer := metrics.TraceMethodCall(ctx, metricsStructName, "ClassifyGroupTitle")
+	defer tracer.End()
+
+	res, err := c.classifyGroupTitle(ctx, title)
 	tracer.OnError(err)
 	return res, err
 }
@@ -225,6 +265,14 @@ func (c *client) classifyDisplayName(ctx context.Context, name string) (*moderat
 		return nil, err
 	}
 	return toResult(scores, displayNameFlagThreshold), nil
+}
+
+func (c *client) classifyGroupTitle(ctx context.Context, title string) (*moderation.Result, error) {
+	scores, err := c.score(ctx, groupTitleSystemPrompt, title)
+	if err != nil {
+		return nil, err
+	}
+	return toResult(scores, groupTitleFlagThreshold), nil
 }
 
 // toResult flags every category scored at or above threshold.

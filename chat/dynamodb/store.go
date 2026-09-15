@@ -295,26 +295,13 @@ func (s *store) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 		return false, chat.RosterSummary{}, fmt.Errorf("not a group chat id")
 	}
 
-	// Existence gate so a typo'd chat ID can't accrete orphaned membership
-	// rows. Non-transactional: the canonical item is never deleted, so a chat
-	// that exists here still exists during the writes below.
-	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName:            aws.String(s.chatsTable),
-		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
-		ProjectionExpression: aws.String(attrPK),
-	})
-	if err != nil {
-		return false, chat.RosterSummary{}, err
-	}
-	if len(out.Item) == 0 {
-		return false, chat.RosterSummary{}, chat.ErrChatNotFound
-	}
-
 	return s.addGroupMembers(ctx, chatID, userIDs)
 }
 
-// addGroupMembers upserts joined membership records without checking that the
-// chat exists. Each member is an independent conditional transition: an
+// addGroupMembers upserts joined membership records. A typo'd chat ID cannot
+// accrete orphaned rows: the roster read the writes start from is the
+// existence gate (see readRosterSummaryForWrite), and the transition below
+// never runs without it. Each member is an independent conditional transition: an
 // already-joined member is left untouched (preserving their original
 // joined_at), while a new or departed member is (re)joined with a fresh join
 // time. joined_at is present iff joined — the sparse gsiByJoinedAt keys off its
@@ -394,11 +381,11 @@ func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, 
 }
 
 // readRosterSummaryForWrite is the strongly consistent read of the #meta item
-// that a membership write starts from. Unlike the read path, a missing item is
-// an error here rather than a zero summary: a group that predates the item
-// cannot silently start counting from zero, so its membership writes fail
-// until the item is backfilled by hand (every group created since is seeded
-// at creation).
+// that a membership write starts from. Every group has one — creation seeds
+// it in the same transaction as the canonical item, and nothing deletes it —
+// so the read is also the write path's existence check: a missing item is a
+// chat that does not exist, and a write against a known group pays no separate
+// read to learn that.
 func (s *store) readRosterSummaryForWrite(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, error) {
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:      aws.String(s.groupMembersTable),
@@ -409,7 +396,7 @@ func (s *store) readRosterSummaryForWrite(ctx context.Context, chatID *commonpb.
 		return chat.RosterSummary{}, err
 	}
 	if len(out.Item) == 0 {
-		return chat.RosterSummary{}, fmt.Errorf("chat %x has no %s item; backfill its roster summary", chatID.Value, skMeta)
+		return chat.RosterSummary{}, chat.ErrChatNotFound
 	}
 	return rosterSummaryFromItem(out.Item)
 }
@@ -486,10 +473,10 @@ func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatI
 		case codes[1] == conditionalCheckFailedCode:
 			// A concurrent writer moved the summary. Its current value came back
 			// with the failure; chain from it and go again, immediately — this is
-			// a lost race, not a throttled write. A missing item here means the
-			// group was never seeded and someone removed it since the read above.
+			// a lost race, not a throttled write. Nothing deletes the item, so
+			// its absence here is a broken invariant, not a state to retry from.
 			if len(reasons[1].Item) == 0 {
-				return false, fmt.Errorf("chat %x has no %s item; backfill its roster summary", chatID.Value, skMeta)
+				return false, fmt.Errorf("chat %x lost its %s item during a membership transition", chatID.Value, skMeta)
 			}
 			current, err := rosterSummaryFromItem(reasons[1].Item)
 			if err != nil {
@@ -863,10 +850,9 @@ func (s *store) batchGet(
 	return nil
 }
 
-// GetGroupRosterSummary is a point read of the group's #meta item. A group that
-// predates the item has none yet and reads as a zero summary until it is
-// backfilled by hand; a nonexistent chat is distinguished from that only by the
-// canonical item, consulted on that ambiguous path alone.
+// GetGroupRosterSummary is a point read of the group's #meta item. Every group
+// has one (see readRosterSummaryForWrite), so a missing item is a chat that
+// does not exist.
 func (s *store) GetGroupRosterSummary(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return chat.RosterSummary{}, fmt.Errorf("not a group chat id")
@@ -880,10 +866,7 @@ func (s *store) GetGroupRosterSummary(ctx context.Context, chatID *commonpb.Chat
 		return chat.RosterSummary{}, err
 	}
 	if len(out.Item) == 0 {
-		if _, err := s.GetChatByID(ctx, chatID); err != nil {
-			return chat.RosterSummary{}, err
-		}
-		return chat.RosterSummary{}, nil
+		return chat.RosterSummary{}, chat.ErrChatNotFound
 	}
 	return rosterSummaryFromItem(out.Item)
 }

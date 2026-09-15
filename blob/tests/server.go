@@ -1033,3 +1033,7 @@ func (m *fakeModerator) ClassifyUsername(context.Context, string) (*moderation.R
 func (m *fakeModerator) ClassifyDisplayName(context.Context, string) (*moderation.Result, error) {
 	return &moderation.Result{}, nil
 }
+
+func (m *fakeModerator) ClassifyGroupTitle(context.Context, string) (*moderation.Result, error) {
+	return &moderation.Result{}, nil
+}

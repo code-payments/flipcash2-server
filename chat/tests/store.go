@@ -999,8 +999,10 @@ func testStore_GroupChat_AddMembersErrors(t *testing.T, s chat.Store) {
 	user := model.MustGenerateUserID()
 
 	// Membership writes against a chat that does not exist must not accrete
-	// orphaned records.
+	// orphaned records, and report the chat missing rather than a no-op.
 	_, _, err := s.AddGroupMembers(ctx, chat.MustGenerateGroupChatID(), []*commonpb.UserId{user})
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+	_, _, err = s.RemoveGroupMember(ctx, chat.MustGenerateGroupChatID(), user)
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 
 	// Group membership methods reject DM chat IDs outright.

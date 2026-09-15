@@ -15,22 +15,25 @@ import (
 )
 
 // Cache wraps a chat.Store, caching what is fixed at a chat's creation and so
-// can never go stale: DM membership checks and a group's participation rules.
-// A DM's membership never changes, so a confirmed DM member is safe to cache.
-// Group membership is mutable — and can be mutated by other processes, which
-// this cache can never observe — so group membership checks always defer to
-// the backing store. The rest of the store is passed straight through.
+// can never go stale: DM membership checks, a DM's member list, and a group's
+// participation rules. A DM's membership never changes, so a confirmed DM
+// member, and the DM's member pair, are safe to cache. Group membership is
+// mutable — and can be mutated by other processes, which this cache can never
+// observe — so group membership checks and member lists always defer to the
+// backing store. The rest of the store is passed straight through.
 type Cache struct {
-	db          chat.Store
-	memberCache *ttlcache.Cache
-	rulesCache  *ttlcache.Cache
+	db             chat.Store
+	memberCache    *ttlcache.Cache
+	dmMembersCache *ttlcache.Cache
+	rulesCache     *ttlcache.Cache
 }
 
 func NewInCache(db chat.Store) chat.Store {
 	return &Cache{
-		db:          db,
-		memberCache: ttlcache.NewCache(),
-		rulesCache:  ttlcache.NewCache(),
+		db:             db,
+		memberCache:    ttlcache.NewCache(),
+		dmMembersCache: ttlcache.NewCache(),
+		rulesCache:     ttlcache.NewCache(),
 	}
 }
 
@@ -58,8 +61,35 @@ func (c *Cache) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chat
 	return c.db.GetDmFeedPage(ctx, userID, chatType, snapshot, cursor, limit)
 }
 
+// GetMembers is cached for a DM: its member pair is fixed at creation, so a
+// list once read is never stale. It is the read behind every DM broadcast (a
+// message, a pointer advance, a reaction, typing), which otherwise costs a
+// store read per event just to find the peer. A group's roster is mutable, so
+// a group's list always defers to the backing store, as IsMember does. Errors
+// — including ErrChatNotFound, since the DM may be created later — are not
+// cached. The caller gets its own copy, so the cached list is never mutated
+// through a result.
 func (c *Cache) GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*commonpb.UserId, error) {
-	return c.db.GetMembers(ctx, chatID)
+	if chat.IsGroupChatID(chatID) {
+		return c.db.GetMembers(ctx, chatID)
+	}
+
+	key := string(chatID.Value)
+	if cached, ok := c.dmMembersCache.Get(key); ok {
+		return copyUserIDs(cached.([]*commonpb.UserId)), nil
+	}
+
+	members, err := c.db.GetMembers(ctx, chatID)
+	if err != nil {
+		return nil, err
+	}
+	c.dmMembersCache.Set(key, copyUserIDs(members))
+	// The list confirms each member's membership, so the membership cache can
+	// be answered from it too.
+	for _, member := range members {
+		c.memberCache.Set(memberCacheKey(chatID, member), true)
+	}
+	return copyUserIDs(members), nil
 }
 
 func (c *Cache) GetGroupRosterSummary(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, error) {
@@ -136,4 +166,14 @@ func (c *Cache) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId,
 // concatenating the raw bytes is unambiguous.
 func memberCacheKey(chatID *commonpb.ChatId, userID *commonpb.UserId) string {
 	return string(chatID.Value) + string(userID.Value)
+}
+
+// copyUserIDs deep-copies a member list, so a cached list and the lists handed
+// to callers share no memory.
+func copyUserIDs(userIDs []*commonpb.UserId) []*commonpb.UserId {
+	out := make([]*commonpb.UserId, len(userIDs))
+	for i, id := range userIDs {
+		out[i] = &commonpb.UserId{Value: append([]byte(nil), id.Value...)}
+	}
+	return out
 }

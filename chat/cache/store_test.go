@@ -65,6 +65,147 @@ func (s *countingRulesStore) callCount() int {
 	return s.calls
 }
 
+// countingMembersStore is a chat.Store whose GetMembers result is configurable
+// and whose calls are counted. IsMember is served from the configured members
+// so the seeding of the membership cache can be observed.
+type countingMembersStore struct {
+	chat.Store
+
+	mu            sync.Mutex
+	calls         int
+	isMemberCalls int
+	members       []*commonpb.UserId
+	err           error
+}
+
+func (s *countingMembersStore) GetMembers(_ context.Context, _ *commonpb.ChatId) ([]*commonpb.UserId, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return s.members, s.err
+}
+
+func (s *countingMembersStore) IsMember(_ context.Context, _ *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.isMemberCalls++
+	for _, m := range s.members {
+		if string(m.Value) == string(userID.Value) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *countingMembersStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestCache_GetMembers_CachesDm(t *testing.T) {
+	ctx := context.Background()
+	userX := model.MustGenerateUserID()
+	userY := model.MustGenerateUserID()
+	backing := &countingMembersStore{members: []*commonpb.UserId{userX, userY}}
+	c := cache.NewInCache(backing)
+
+	chatID := generateDmChatID()
+	for i := 0; i < 3; i++ {
+		members, err := c.GetMembers(ctx, chatID)
+		require.NoError(t, err)
+		require.Len(t, members, 2)
+		require.Equal(t, userX.Value, members[0].Value)
+		require.Equal(t, userY.Value, members[1].Value)
+	}
+	require.Equal(t, 1, backing.callCount())
+
+	// A DM's members are fixed at creation, so the cache is what answers even
+	// once the backing store would say otherwise.
+	backing.members = nil
+	members, err := c.GetMembers(ctx, chatID)
+	require.NoError(t, err)
+	require.Len(t, members, 2)
+	require.Equal(t, 1, backing.callCount())
+
+	// The list confirmed both memberships, so IsMember is answered from the
+	// cache without a backing lookup.
+	for _, u := range []*commonpb.UserId{userX, userY} {
+		ok, err := c.IsMember(ctx, chatID, u)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	require.Equal(t, 0, backing.isMemberCalls)
+
+	// Each distinct DM is cached independently.
+	backing.members = []*commonpb.UserId{userX, userY}
+	_, err = c.GetMembers(ctx, generateDmChatID())
+	require.NoError(t, err)
+	require.Equal(t, 2, backing.callCount())
+}
+
+func TestCache_GetMembers_ReturnsCopies(t *testing.T) {
+	ctx := context.Background()
+	userX := model.MustGenerateUserID()
+	userY := model.MustGenerateUserID()
+	backing := &countingMembersStore{members: []*commonpb.UserId{userX, userY}}
+	c := cache.NewInCache(backing)
+
+	chatID := generateDmChatID()
+	first, err := c.GetMembers(ctx, chatID)
+	require.NoError(t, err)
+
+	// Mutating a result — the slice or an ID's bytes — must not leak into the
+	// cached list or into any later result.
+	first[0], first[1] = first[1], first[0]
+	first[0].Value[0] ^= 0xff
+
+	second, err := c.GetMembers(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, userX.Value, second[0].Value)
+	require.Equal(t, userY.Value, second[1].Value)
+	require.Equal(t, 1, backing.callCount())
+}
+
+func TestCache_GetMembers_DoesNotCacheErrors(t *testing.T) {
+	ctx := context.Background()
+	backing := &countingMembersStore{err: chat.ErrChatNotFound}
+	c := cache.NewInCache(backing)
+
+	// A not-found is re-queried: the DM may be created later.
+	chatID := generateDmChatID()
+	for i := 0; i < 2; i++ {
+		_, err := c.GetMembers(ctx, chatID)
+		require.ErrorIs(t, err, chat.ErrChatNotFound)
+	}
+	require.Equal(t, 2, backing.callCount())
+
+	// Once it exists, its members are served and then held.
+	backing.err = nil
+	backing.members = []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID()}
+	for i := 0; i < 2; i++ {
+		members, err := c.GetMembers(ctx, chatID)
+		require.NoError(t, err)
+		require.Len(t, members, 2)
+	}
+	require.Equal(t, 3, backing.callCount())
+}
+
+func TestCache_GetMembers_GroupNeverCached(t *testing.T) {
+	ctx := context.Background()
+	backing := &countingMembersStore{members: []*commonpb.UserId{model.MustGenerateUserID()}}
+	c := cache.NewInCache(backing)
+
+	// A group's roster is mutable, so every read goes to the backing store.
+	chatID := chat.MustGenerateGroupChatID()
+	for i := 0; i < 3; i++ {
+		members, err := c.GetMembers(ctx, chatID)
+		require.NoError(t, err)
+		require.Len(t, members, 1)
+	}
+	require.Equal(t, 3, backing.callCount())
+}
+
 func TestCache_GetGroupRules_Cached(t *testing.T) {
 	ctx := context.Background()
 	staffOnly := &chatpb.Rules{Listener: []*chatpb.ListenerRules{{Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}}}}}

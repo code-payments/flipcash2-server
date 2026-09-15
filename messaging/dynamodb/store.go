@@ -20,6 +20,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/messaging"
 )
@@ -46,15 +47,32 @@ import (
 //	                   heads (and event_seq vs seq) diverge once edits and deletes
 //	                   append events without minting a seq.
 //
-//	message_pointers   pk = "chat#<id>", sk = "ptr#<user>". One item per (chat,
+//	message_pointers   pk = "chat#<id>". Pointers are kept out of the messages
+//	                   partition so heavy receipt writes don't contend with the
+//	                   send path (they share nothing transactional with messages).
+//	                   The item shape depends on the chat type. The feed hydrates
+//	                   pointers with a keyed batch read that is billed per item
+//	                   however small, so fewer items per chat is a cheaper page:
+//
+//	                   A group keeps sk = "ptr#<user>", one item per (chat,
 //	                   member) carrying every stored pointer type as its own
-//	                   attribute pair (<type>_value, <type>_ts; see pointerAttrs).
-//	                   Pointers are kept out of the messages partition so heavy
-//	                   receipt writes don't contend with the send path (they
-//	                   share nothing transactional with messages). A member's
-//	                   types share one item because the feed hydrates pointers
-//	                   with a keyed batch read, billed per item however small: one
-//	                   item per member is half the read cost of one per pointer.
+//	                   attribute pair (<type>_value, <type>_ts; see
+//	                   memberPointerAttrs). A roster is mutable and unbounded,
+//	                   so the item stays per member.
+//
+//	                   A DM keeps sk = "#ptrs", a single item for the chat
+//	                   carrying both members' pointers, each (member, type) as
+//	                   its own attribute pair: the group item's attribute names
+//	                   with the member appended (delivered_value#<user hex>,
+//	                   delivered_ts#<user hex>, read_value#<user hex>,
+//	                   read_ts#<user hex>; see dmPointerAttrs), so both layouts
+//	                   read as one scheme. A DM's membership is exactly two and
+//	                   immutable, so one item per chat halves the feed's pointer
+//	                   read with no growth risk. Every write names only its own
+//	                   pair and conditions only on it, so the two members never
+//	                   interfere: DynamoDB serializes writes per item, and a
+//	                   member's write leaves the peer's attributes untouched
+//	                   whether it applies or not.
 //
 //	message_reactions  pk = "chat#<id>", sk in { "agg#<padded seq>#<emoji hex>",
 //	                   "rct#<padded seq>#<emoji hex>#<user hex>" }. One agg# row
@@ -99,15 +117,26 @@ const (
 	attrEventType     = "event_type"     // evt# row: the messaging.EventType recorded (create/edit/delete)
 	attrExpiresAt     = "expires_at"     // DynamoDB TTL attribute (epoch seconds)
 
-	// message_pointers table. The member is carried by the sk alone (see
-	// pointerSK / userIDFromPointerSK), as the chat is by the pk.
+	// message_pointers table, group items. The member is carried by the sk
+	// alone (see pointerSK / userIDFromPointerSK), as the chat is by the pk.
 	ptrPrefix = "ptr#"
 	// One attribute pair per stored pointer type on the ptr# item (see
-	// pointerAttrs): the pointer's value and its last-advanced timestamp.
+	// memberPointerAttrs): the pointer's value and its last-advanced timestamp.
 	attrDeliveredVal = "delivered_value"
 	attrDeliveredTS  = "delivered_ts"
 	attrReadVal      = "read_value"
 	attrReadTS       = "read_ts"
+
+	// message_pointers table, DM item. One item per chat; each member's pair for
+	// a type is keyed by the member's hex ID under these prefixes — the group
+	// item's attribute names plus a separator (see dmPointerAttrs). No value
+	// prefix may be a prefix of a timestamp prefix, or vice versa, as
+	// dmPointersFromItem recovers pairs by prefix.
+	skDmPointers         = "#ptrs"
+	dmDeliveredValPrefix = attrDeliveredVal + "#"
+	dmDeliveredTSPrefix  = attrDeliveredTS + "#"
+	dmReadValPrefix      = attrReadVal + "#"
+	dmReadTSPrefix       = attrReadTS + "#"
 
 	// message_reactions table reactor rows (also, historically, pointer items)
 	attrUserID = "user_id"
@@ -853,9 +882,24 @@ func (s *store) GetMessagesByRefs(ctx context.Context, refs []messaging.MessageR
 }
 
 func (s *store) GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*messagingpb.Pointer, error) {
-	// Bound the query to the ptr# range: pointers are all the partition holds
-	// today, and the bound keeps that true of the read if that ever changes.
-	// sk order is member order, so the result is deterministic.
+	if !chat.IsGroupChatID(chatID) {
+		// A DM's pointers are one item: a point read.
+		out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName: aws.String(s.pointersTable),
+			Key: map[string]types.AttributeValue{
+				attrPK: avS(chatPK(chatID)),
+				attrSK: avS(skDmPointers),
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return dmPointersFromItem(out.Item), nil
+	}
+
+	// Bound the query to the ptr# range: pointers are all a group's partition
+	// holds today, and the bound keeps that true of the read if that ever
+	// changes. sk order is member order, so the result is deterministic.
 	var pointers []*messagingpb.Pointer
 	var startKey map[string]types.AttributeValue
 	for {
@@ -872,7 +916,7 @@ func (s *store) GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*me
 			return nil, err
 		}
 		for _, item := range out.Items {
-			pointers = append(pointers, pointersFromItem(item)...)
+			pointers = append(pointers, memberPointersFromItem(item)...)
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			break
@@ -883,23 +927,42 @@ func (s *store) GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*me
 }
 
 func (s *store) GetPointersForChats(ctx context.Context, refs []messaging.PointerRef) (map[string][]*messagingpb.Pointer, error) {
-	// The refs name the members, so each (chat, member) item's key is known up
-	// front: enumerate them and batch-read in one path, mirroring
-	// GetMessagesByRefs — no per-chat partition scan. Dedup so a repeated
-	// (chat, member) pair collapses.
-	type dedupKey struct {
+	// The refs name the members, so every item's key is known up front:
+	// enumerate them and batch-read in one path, mirroring GetMessagesByRefs —
+	// no per-chat partition scan. A group costs one key per named member; a DM
+	// costs one key per chat, its single #ptrs item carrying both members. Dedup
+	// so a repeated (chat, member) pair, or a repeated DM, collapses.
+	type pairKey struct {
 		chat string
 		user string
 	}
-	seen := make(map[dedupKey]struct{})
+	seenPairs := make(map[pairKey]struct{})
+	// The members each DM ref asked for: the #ptrs item carries both members,
+	// but only the named ones are returned, honoring the contract.
+	dmMembers := make(map[string]map[string]struct{})
 	var keys []map[string]types.AttributeValue
 	for _, ref := range refs {
+		chatKey := string(ref.ChatID.Value)
+		isGroup := chat.IsGroupChatID(ref.ChatID)
+		if !isGroup {
+			if _, dup := dmMembers[chatKey]; !dup {
+				dmMembers[chatKey] = make(map[string]struct{})
+				keys = append(keys, map[string]types.AttributeValue{
+					attrPK: avS(chatPK(ref.ChatID)),
+					attrSK: avS(skDmPointers),
+				})
+			}
+		}
 		for _, member := range ref.Members {
-			dk := dedupKey{chat: string(ref.ChatID.Value), user: string(member.Value)}
-			if _, dup := seen[dk]; dup {
+			pk := pairKey{chat: chatKey, user: string(member.Value)}
+			if _, dup := seenPairs[pk]; dup {
 				continue
 			}
-			seen[dk] = struct{}{}
+			seenPairs[pk] = struct{}{}
+			if !isGroup {
+				dmMembers[chatKey][pk.user] = struct{}{}
+				continue
+			}
 			keys = append(keys, map[string]types.AttributeValue{
 				attrPK: avS(chatPK(ref.ChatID)),
 				attrSK: avS(pointerSK(member)),
@@ -927,8 +990,16 @@ func (s *store) GetPointersForChats(ctx context.Context, refs []messaging.Pointe
 				// Items come back unordered and intermixed across chats; the owning
 				// chat is recovered from the item's pk (the pointers table stores no
 				// chat_id attribute of its own).
-				key := string(chatIDFromPK(item).Value)
-				out[key] = append(out[key], pointersFromItem(item)...)
+				chatKey := string(chatIDFromPK(item).Value)
+				if asS(item[attrSK]) != skDmPointers {
+					out[chatKey] = append(out[chatKey], memberPointersFromItem(item)...)
+					continue
+				}
+				for _, p := range dmPointersFromItem(item) {
+					if _, wanted := dmMembers[chatKey][string(p.UserId.Value)]; wanted {
+						out[chatKey] = append(out[chatKey], p)
+					}
+				}
 			}
 			if unprocessed, ok := resp.UnprocessedKeys[s.pointersTable]; ok && len(unprocessed.Keys) > 0 {
 				req = map[string]types.KeysAndAttributes{s.pointersTable: unprocessed}
@@ -947,7 +1018,7 @@ func (s *store) AdvancePointer(
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
 ) (*messagingpb.Pointer, bool, error) {
-	valAttr, tsAttr, err := pointerAttrs(pointerType)
+	sk, valAttr, tsAttr, err := pointerKey(chatID, userID, pointerType)
 	if err != nil {
 		return nil, false, err
 	}
@@ -957,11 +1028,15 @@ func (s *store) AdvancePointer(
 		TableName: aws.String(s.pointersTable),
 		Key: map[string]types.AttributeValue{
 			attrPK: avS(chatPK(chatID)),
-			attrSK: avS(pointerSK(userID)),
+			attrSK: avS(sk),
 		},
+		// The write names only this member's pair for this type: on a DM's
+		// shared item the peer's pairs, and this member's other type, are never
+		// touched.
 		UpdateExpression: aws.String("SET #val = :v, #ts = :ts"),
 		// Monotonic per type: the item may already exist for the member's other
-		// type, so the guard is on this type's value, not the item.
+		// type (or, on a DM, for the peer), so the guard is on this pair's value,
+		// not the item.
 		ConditionExpression: aws.String("attribute_not_exists(#val) OR #val < :v"),
 		ExpressionAttributeNames: map[string]string{
 			"#val": valAttr,
@@ -980,17 +1055,19 @@ func (s *store) AdvancePointer(
 		var ccf *types.ConditionalCheckFailedException
 		if errors.As(err, &ccf) {
 			// Not advanced (already at or past newValue); reconstruct from the
-			// item that failed the condition.
-			return pointerFromItem(ccf.Item, pointerType), false, nil
+			// item that failed the condition. It must carry the pair — the
+			// condition can only fail on a stored value — so its absence is an
+			// integrity error rather than a nil pointer, which the Store contract
+			// returns only alongside an error.
+			p := pointerFromAttrs(ccf.Item, userID, pointerType, valAttr, tsAttr)
+			if p == nil {
+				return nil, false, fmt.Errorf("pointer %s for user %x rejected as a no-op but has no stored value", pointerType, userID.Value)
+			}
+			return p, false, nil
 		}
 		return nil, false, err
 	}
-	return &messagingpb.Pointer{
-		Type:   pointerType,
-		UserId: &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
-		Value:  &messagingpb.MessageId{Value: newValue.Value},
-		Ts:     timestamppb.New(now),
-	}, true, nil
+	return newPointer(pointerType, userID, newValue.Value, now), true, nil
 }
 
 // readSendState fetches, in a single consistent batch read, the two partition
@@ -1140,10 +1217,24 @@ func messageFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeVal
 	return msg, nil
 }
 
-// pointerAttrs names the attribute pair on a ptr# item that holds a type's
-// pointer: its value and its last-advanced timestamp. Only StoredPointerTypes
-// are persisted; any other type is an error rather than a silent write.
-func pointerAttrs(t messagingpb.Pointer_Type) (valAttr, tsAttr string, err error) {
+// pointerKey locates a member's pointer of type t within the chat's partition:
+// the item's sk and the attribute pair on it holding the pointer's value and
+// last-advanced timestamp. A group member's pointers are their own ptr#<user>
+// item with fixed attribute names; a DM member's share the chat's #ptrs item,
+// with the pair keyed by the member.
+func pointerKey(chatID *commonpb.ChatId, userID *commonpb.UserId, t messagingpb.Pointer_Type) (sk, valAttr, tsAttr string, err error) {
+	if chat.IsGroupChatID(chatID) {
+		valAttr, tsAttr, err = memberPointerAttrs(t)
+		return pointerSK(userID), valAttr, tsAttr, err
+	}
+	valAttr, tsAttr, err = dmPointerAttrs(userID, t)
+	return skDmPointers, valAttr, tsAttr, err
+}
+
+// memberPointerAttrs names the attribute pair on a group's ptr#<user> item that
+// holds a type's pointer. Only StoredPointerTypes are persisted; any other type
+// is an error rather than a silent write.
+func memberPointerAttrs(t messagingpb.Pointer_Type) (valAttr, tsAttr string, err error) {
 	switch t {
 	case messagingpb.Pointer_DELIVERED:
 		return attrDeliveredVal, attrDeliveredTS, nil
@@ -1154,23 +1245,40 @@ func pointerAttrs(t messagingpb.Pointer_Type) (valAttr, tsAttr string, err error
 	}
 }
 
-// pointerFromItem rebuilds one type's pointer from a ptr# item, or nil when the
-// item carries no pointer of that type.
-func pointerFromItem(item map[string]types.AttributeValue, t messagingpb.Pointer_Type) *messagingpb.Pointer {
-	valAttr, tsAttr, err := pointerAttrs(t)
-	if err != nil {
-		return nil
+// dmPointerAttrs names the attribute pair on a DM's #ptrs item that holds a
+// member's pointer of a type: the type's value and timestamp prefixes followed
+// by the member's hex ID, the inverse of dmPointersFromItem. Only
+// StoredPointerTypes are persisted; any other type is an error rather than a
+// silent write.
+func dmPointerAttrs(userID *commonpb.UserId, t messagingpb.Pointer_Type) (valAttr, tsAttr string, err error) {
+	user := hex.EncodeToString(userID.Value)
+	switch t {
+	case messagingpb.Pointer_DELIVERED:
+		return dmDeliveredValPrefix + user, dmDeliveredTSPrefix + user, nil
+	case messagingpb.Pointer_READ:
+		return dmReadValPrefix + user, dmReadTSPrefix + user, nil
+	default:
+		return "", "", fmt.Errorf("pointer type %s is not stored", t)
 	}
+}
+
+// pointerFromAttrs rebuilds userID's pointer of type t from the named value
+// and timestamp attributes of item, or nil when item carries no such value.
+func pointerFromAttrs(item map[string]types.AttributeValue, userID *commonpb.UserId, t messagingpb.Pointer_Type, valAttr, tsAttr string) *messagingpb.Pointer {
 	valAV, ok := item[valAttr]
 	if !ok {
 		return nil
 	}
 	value, _ := parseN(valAV)
+	return newPointer(t, userID, value, pointerTS(item[tsAttr]))
+}
+
+func newPointer(t messagingpb.Pointer_Type, userID *commonpb.UserId, value uint64, ts time.Time) *messagingpb.Pointer {
 	return &messagingpb.Pointer{
 		Type:   t,
-		UserId: userIDFromPointerSK(item),
+		UserId: &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
 		Value:  &messagingpb.MessageId{Value: value},
-		Ts:     timestamppb.New(pointerTS(item[tsAttr])),
+		Ts:     timestamppb.New(ts),
 	}
 }
 
@@ -1182,14 +1290,55 @@ func userIDFromPointerSK(item map[string]types.AttributeValue) *commonpb.UserId 
 	return &commonpb.UserId{Value: id}
 }
 
-// pointersFromItem rebuilds every pointer a ptr# item carries.
-func pointersFromItem(item map[string]types.AttributeValue) []*messagingpb.Pointer {
+// memberPointersFromItem rebuilds every pointer a group's ptr#<user> item
+// carries.
+func memberPointersFromItem(item map[string]types.AttributeValue) []*messagingpb.Pointer {
+	userID := userIDFromPointerSK(item)
 	pointers := make([]*messagingpb.Pointer, 0, len(messaging.StoredPointerTypes))
 	for _, t := range messaging.StoredPointerTypes {
-		if p := pointerFromItem(item, t); p != nil {
+		valAttr, tsAttr, err := memberPointerAttrs(t)
+		if err != nil {
+			continue
+		}
+		if p := pointerFromAttrs(item, userID, t, valAttr, tsAttr); p != nil {
 			pointers = append(pointers, p)
 		}
 	}
+	return pointers
+}
+
+// dmPointersFromItem rebuilds every pointer a DM's #ptrs item carries, for
+// every member on it: each value attribute names its member and type by prefix
+// (see dmPointerAttrs). The result is ordered by (member, type) so a read is
+// deterministic despite the item's attributes being a map. An empty item (the
+// DM has no pointers) yields nil.
+func dmPointersFromItem(item map[string]types.AttributeValue) []*messagingpb.Pointer {
+	var pointers []*messagingpb.Pointer
+	for name := range item {
+		var t messagingpb.Pointer_Type
+		var user, tsPrefix string
+		switch {
+		case strings.HasPrefix(name, dmDeliveredValPrefix):
+			t, user, tsPrefix = messagingpb.Pointer_DELIVERED, strings.TrimPrefix(name, dmDeliveredValPrefix), dmDeliveredTSPrefix
+		case strings.HasPrefix(name, dmReadValPrefix):
+			t, user, tsPrefix = messagingpb.Pointer_READ, strings.TrimPrefix(name, dmReadValPrefix), dmReadTSPrefix
+		default:
+			continue
+		}
+		id, err := hex.DecodeString(user)
+		if err != nil {
+			continue
+		}
+		if p := pointerFromAttrs(item, &commonpb.UserId{Value: id}, t, name, tsPrefix+user); p != nil {
+			pointers = append(pointers, p)
+		}
+	}
+	sort.Slice(pointers, func(i, j int) bool {
+		if c := bytes.Compare(pointers[i].UserId.Value, pointers[j].UserId.Value); c != 0 {
+			return c < 0
+		}
+		return pointers[i].Type < pointers[j].Type
+	})
 	return pointers
 }
 
@@ -1268,7 +1417,7 @@ func cmidSK(clientMessageID *messagingpb.ClientMessageId) string {
 	return cmidPrefix + hex.EncodeToString(clientMessageID.Value)
 }
 
-// pointerSK keys a member's pointers item within the chat's partition.
+// pointerSK keys a group member's pointers item within the chat's partition.
 func pointerSK(userID *commonpb.UserId) string {
 	return ptrPrefix + hex.EncodeToString(userID.Value)
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -197,7 +198,8 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 // one call, every group's roster summary in one call, every hydrated member's
 // pointers in one call, every chat's head event sequence in one call, every
 // member's display name in one call, and every DM member's phone number in one
-// call.
+// call. The calls are independent and run concurrently, so a page costs the
+// slowest of them rather than their sum.
 //
 // A DM's members are its two participants, carried on the canonical record. A
 // group's roster lives in its own records and is not enumerated here: the
@@ -293,40 +295,57 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 		pictureBlobIDs = append(pictureBlobIDs, id)
 	}
 
-	lastMessages, err := s.messaging.LastMessages(ctx, msgRefs)
-	if err != nil {
-		return nil, err
-	}
-	rosterSummaries, err := s.chats.GetGroupRosterSummaries(ctx, groupChatIDs)
-	if err != nil {
-		return nil, err
-	}
-	pointers, err := s.messaging.Pointers(ctx, pointerRefs)
-	if err != nil {
-		return nil, err
-	}
-	latestEventSeqs, err := s.messaging.LatestEventSequences(ctx, seqChatIDs)
-	if err != nil {
-		return nil, err
-	}
-	phoneNumbersByUserId, err := s.profiles.GetPhoneNumbers(ctx, privateProfileUserIDs)
-	if err != nil {
-		return nil, err
-	}
-	publicProfilesByUserId, err := s.profiles.GetPublicProfiles(ctx, userIDs)
-	if err != nil {
-		return nil, err
-	}
-	blockedPeers, err := s.blocklist.GetBlocked(ctx, viewerID, peerIDs)
-	if err != nil {
-		return nil, err
-	}
-	var pictureRenditions map[string][]*blobpb.Rendition
+	// The reads are independent of one another, so they run concurrently: the
+	// page waits for the slowest rather than the sum. Each goroutine writes only
+	// its own result, and Wait is the barrier before any is read. The first
+	// failure cancels the rest through the group's context.
+	var (
+		lastMessages           map[string]*messagingpb.Message
+		rosterSummaries        map[string]RosterSummary
+		pointers               map[string][]*messagingpb.Pointer
+		latestEventSeqs        map[string]uint64
+		phoneNumbersByUserId   map[string]*commonpb.PhoneNumber
+		publicProfilesByUserId map[string]*profilepb.UserProfile
+		blockedPeers           map[string]bool
+		pictureRenditions      map[string][]*blobpb.Rendition
+	)
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() (err error) {
+		lastMessages, err = s.messaging.LastMessages(gctx, msgRefs)
+		return err
+	})
+	g.Go(func() (err error) {
+		rosterSummaries, err = s.chats.GetGroupRosterSummaries(gctx, groupChatIDs)
+		return err
+	})
+	g.Go(func() (err error) {
+		pointers, err = s.messaging.Pointers(gctx, pointerRefs)
+		return err
+	})
+	g.Go(func() (err error) {
+		latestEventSeqs, err = s.messaging.LatestEventSequences(gctx, seqChatIDs)
+		return err
+	})
+	g.Go(func() (err error) {
+		phoneNumbersByUserId, err = s.profiles.GetPhoneNumbers(gctx, privateProfileUserIDs)
+		return err
+	})
+	g.Go(func() (err error) {
+		publicProfilesByUserId, err = s.profiles.GetPublicProfiles(gctx, userIDs)
+		return err
+	})
+	g.Go(func() (err error) {
+		blockedPeers, err = s.blocklist.GetBlocked(gctx, viewerID, peerIDs)
+		return err
+	})
 	if len(pictureBlobIDs) > 0 {
-		pictureRenditions, err = s.media.ResolveRenditions(ctx, pictureBlobIDs)
-		if err != nil {
-			return nil, err
-		}
+		g.Go(func() (err error) {
+			pictureRenditions, err = s.media.ResolveRenditions(gctx, pictureBlobIDs)
+			return err
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 
 	metadata := make([]*chatpb.Metadata, len(chats))

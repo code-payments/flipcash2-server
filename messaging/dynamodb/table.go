@@ -46,7 +46,9 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, p
 		return err
 	}
 
-	// The pointers table is a plain (pk, sk) key-value table.
+	// The pointers table is a plain (pk, sk) key-value table: one item per
+	// (chat, member) carrying every stored pointer type (see the layout in
+	// store.go).
 	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
 		TableName:   aws.String(pointersTable),
 		BillingMode: types.BillingModePayPerRequest,

@@ -12,6 +12,8 @@ import (
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
+
+	"github.com/code-payments/flipcash2-server/model"
 )
 
 // recordingSender captures batches per address. Each send blocks until
@@ -56,14 +58,14 @@ func (s *recordingSender) waitForBatches(t *testing.T, address string, n int) []
 func chatItem(chatID byte, n int) forwardItem {
 	return forwardItem{chat: &eventpb.ChatEvent{
 		ChatId: &commonpb.ChatId{Value: []byte{chatID}},
-		Event:  &eventpb.Event{Id: MustGenerateEventID(), Type: &eventpb.Event_Test{Test: &eventpb.TestEvent{Nonce: uint64(n)}}},
+		Event:  &eventpb.Event{Id: model.MustGenerateEventID(), Type: &eventpb.Event_Test{Test: &eventpb.TestEvent{Nonce: uint64(n)}}},
 	}}
 }
 
 func userItem(userID byte, n int) forwardItem {
 	return forwardItem{user: &eventpb.UserEvent{
 		UserId: &commonpb.UserId{Value: []byte{userID}},
-		Event:  &eventpb.Event{Id: MustGenerateEventID(), Type: &eventpb.Event_Test{Test: &eventpb.TestEvent{Nonce: uint64(n)}}},
+		Event:  &eventpb.Event{Id: model.MustGenerateEventID(), Type: &eventpb.Event_Test{Test: &eventpb.TestEvent{Nonce: uint64(n)}}},
 	}}
 }
 

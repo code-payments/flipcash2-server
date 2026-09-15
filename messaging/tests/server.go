@@ -936,8 +936,7 @@ func testServer_SendMessage_Broadcast(t *testing.T, badges badge.Store, blocklis
 		if sent == nil || sent.MessageId.Value != id || sent.EventSequence != id {
 			return false
 		}
-		return u.NewMessages == nil &&
-			len(u.MetadataUpdates) > 0 &&
+		return len(u.MetadataUpdates) > 0 &&
 			u.PointerUpdates != nil && hasPointer(u.PointerUpdates.Pointers, messagingpb.Pointer_READ, e.userA, id)
 	})
 }

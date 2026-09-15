@@ -1,12 +1,15 @@
 package tests
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
@@ -17,13 +20,22 @@ import (
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
+	ocp_balancepb "github.com/code-payments/ocp-protobuf-api/generated/go/balance/v1"
 
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
+
+	"github.com/code-payments/flipcash2-server/account"
+	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/chat"
+	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
+	"github.com/code-payments/flipcash2-server/protoutil"
 	"github.com/code-payments/flipcash2-server/testutil"
 )
 
@@ -55,6 +67,19 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetGroupChatFeed_SnapshotPinned,
 		testServer_GetGroupChatFeed_DropsDepartedBetweenPages,
 		testServer_GetGroupChatFeed_InvalidToken,
+		testServer_JoinChat_OK,
+		testServer_JoinChat_Idempotent,
+		testServer_JoinChat_NotFound,
+		testServer_JoinChat_DeniedForDm,
+		testServer_JoinChat_StaffRule,
+		testServer_JoinChat_MinimumBalanceRule,
+		testServer_JoinChat_MemberSkipsRules,
+		testServer_JoinChat_UnevaluableRuleFails,
+		testServer_LeaveChat_OK,
+		testServer_LeaveChat_Idempotent,
+		testServer_LeaveChat_NotFound,
+		testServer_LeaveChat_DeniedForDm,
+		testServer_LeaveChat_ThenRejoin,
 	} {
 		tf(t, s)
 		teardown()
@@ -62,15 +87,20 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 }
 
 type serverEnv struct {
-	t         *testing.T
-	ctx       context.Context
-	client    chatpb.ChatClient
-	authz     *auth.StaticAuthorizer
-	store     chat.Store
-	messaging *fakeMessagingReader
-	profiles  *fakeProfileReader
-	blocklist *fakeBlocklistReader
-	media     *fakeMediaReader
+	t          *testing.T
+	ctx        context.Context
+	client     chatpb.ChatClient
+	authz      *auth.StaticAuthorizer
+	accounts   *staffAccounts
+	ocpBalance *fakeOcpBalance
+	store      chat.Store
+	messaging  *fakeMessagingReader
+	profiles   *fakeProfileReader
+	blocklist  *fakeBlocklistReader
+	media      *fakeMediaReader
+
+	userObserver *event.TestEventObserver[*commonpb.UserId, *eventpb.Event]
+	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
 
 	userID *commonpb.UserId
 	keys   model.KeyPair
@@ -85,28 +115,106 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 	keys := model.MustGenerateKeyPair()
 	authz.Add(userID, keys)
 
+	accounts := newStaffAccounts(accountmemory.NewInMemory())
+	ocpBalance := &fakeOcpBalance{byOwner: make(map[string]uint64)}
+	balances := balance.NewClient(log, accounts, ocpBalance)
+
+	userBus := event.NewBus[*commonpb.UserId, *eventpb.Event]()
+	userObserver := event.NewTestEventObserver[*commonpb.UserId, *eventpb.Event]()
+	userBus.AddHandler(userObserver)
+	chatBus := event.NewBus[*commonpb.ChatId, *eventpb.ChatEvent]()
+	chatObserver := event.NewTestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]()
+	chatBus.AddHandler(chatObserver)
+
 	messaging := newFakeMessagingReader()
 	profiles := newFakeProfileReader()
 	blocklist := newFakeBlocklistReader()
 	media := newFakeMediaReader()
-	server := chat.NewServer(log, authz, blocklist, s, media, messaging, profiles)
+	server := chat.NewServer(log, authz, accounts, balances, blocklist, s, media, messaging, profiles, userBus, chatBus, false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
 
 	return &serverEnv{
-		t:         t,
-		ctx:       ctx,
-		client:    chatpb.NewChatClient(cc),
-		authz:     authz,
-		store:     s,
-		messaging: messaging,
-		profiles:  profiles,
-		blocklist: blocklist,
-		media:     media,
-		userID:    userID,
-		keys:      keys,
+		t:            t,
+		ctx:          ctx,
+		client:       chatpb.NewChatClient(cc),
+		authz:        authz,
+		store:        s,
+		messaging:    messaging,
+		profiles:     profiles,
+		blocklist:    blocklist,
+		media:        media,
+		accounts:     accounts,
+		ocpBalance:   ocpBalance,
+		userObserver: userObserver,
+		chatObserver: chatObserver,
+		userID:       userID,
+		keys:         keys,
 	}
+}
+
+// addUser registers a second authorized user with the env.
+func (e *serverEnv) addUser() (*commonpb.UserId, model.KeyPair) {
+	userID := model.MustGenerateUserID()
+	keys := model.MustGenerateKeyPair()
+	e.authz.Add(userID, keys)
+	return userID, keys
+}
+
+// staffAccounts is an account.Store whose staff flag a test can set: the
+// in-memory store answers IsStaff false for everyone, and has no setter.
+type staffAccounts struct {
+	account.Store
+
+	mu    sync.Mutex
+	staff map[string]bool
+}
+
+func newStaffAccounts(db account.Store) *staffAccounts {
+	return &staffAccounts{Store: db, staff: make(map[string]bool)}
+}
+
+func (a *staffAccounts) setStaff(userID *commonpb.UserId, isStaff bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.staff[string(userID.Value)] = isStaff
+}
+
+func (a *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.staff[string(userID.Value)], nil
+}
+
+// fakeOcpBalance is the OCP balance service behind the env's balance client,
+// answering each owner's total from a ledger a test sets in USDF quarks. It
+// ignores the request's mint filter: mint restriction is covered by the rule
+// evaluator's own tests.
+type fakeOcpBalance struct {
+	mu      sync.Mutex
+	byOwner map[string]uint64
+}
+
+func (f *fakeOcpBalance) setBalance(owner *commonpb.PublicKey, quarks uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.byOwner[base58.Encode(owner.Value)] = quarks
+}
+
+func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBalancesRequest, _ ...grpc.CallOption) (*ocp_balancepb.GetBalancesResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	resp := &ocp_balancepb.GetBalancesResponse{BalancesByOwner: make(map[string]*ocp_balancepb.OwnerBalance)}
+	for _, owner := range req.Owners {
+		key := base58.Encode(owner.Value)
+		quarks, ok := f.byOwner[key]
+		if !ok {
+			continue // An owner OCP has no accounts for is left out.
+		}
+		resp.BalancesByOwner[key] = &ocp_balancepb.OwnerBalance{Owner: owner, CoreMintValue: quarks}
+	}
+	return resp, nil
 }
 
 // fakeMediaReader is a canned chat.MediaReader for server tests: it resolves
@@ -420,6 +528,81 @@ func (e *serverEnv) mustGetGroupFeed(opts *commonpb.QueryOptions) *chatpb.GetGro
 	return resp
 }
 
+func (e *serverEnv) joinChat(keys model.KeyPair, chatID *commonpb.ChatId) (*chatpb.JoinChatResponse, error) {
+	req := &chatpb.JoinChatRequest{ChatId: chatID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.JoinChat(e.ctx, req)
+}
+
+func (e *serverEnv) mustJoinChat(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.JoinChatResponse {
+	resp, err := e.joinChat(keys, chatID)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) leaveChat(keys model.KeyPair, chatID *commonpb.ChatId) (*chatpb.LeaveChatResponse, error) {
+	req := &chatpb.LeaveChatRequest{ChatId: chatID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.LeaveChat(e.ctx, req)
+}
+
+func (e *serverEnv) mustLeaveChat(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.LeaveChatResponse {
+	resp, err := e.leaveChat(keys, chatID)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// rosterUpdatesOnChatTopic returns every RosterUpdate published on chatID's
+// topic, paired with the users each publish excluded, in publish order.
+func (e *serverEnv) rosterUpdatesOnChatTopic(chatID *commonpb.ChatId) (updates []*chatpb.RosterUpdate, excludes [][]*commonpb.UserId) {
+	for _, ev := range e.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, chatID.Value) }) {
+		require.Equal(e.t, chatID.Value, ev.Event.ChatId.Value)
+		require.Equal(e.t, chatID.Value, ev.Event.Event.GetChatUpdate().GetChat().GetValue())
+		for _, u := range ev.Event.Event.GetChatUpdate().GetRosterUpdates().GetRosterUpdates() {
+			updates = append(updates, u)
+			excludes = append(excludes, ev.Event.ExcludeUserIds)
+		}
+	}
+	return updates, excludes
+}
+
+// rosterUpdatesOnUserTopic returns every RosterUpdate for chatID published on
+// userID's topic, in publish order.
+func (e *serverEnv) rosterUpdatesOnUserTopic(userID *commonpb.UserId, chatID *commonpb.ChatId) []*chatpb.RosterUpdate {
+	var updates []*chatpb.RosterUpdate
+	for _, ev := range e.userObserver.GetEvents(func(k *commonpb.UserId) bool { return bytes.Equal(k.Value, userID.Value) }) {
+		update := ev.Event.GetChatUpdate()
+		if !bytes.Equal(update.GetChat().GetValue(), chatID.Value) {
+			continue
+		}
+		updates = append(updates, update.GetRosterUpdates().GetRosterUpdates()...)
+	}
+	return updates
+}
+
+// waitForRosterUpdates waits for at least n roster updates on chatID's topic
+// and n on userID's, which is what one transition publishes. The bus hands
+// events to observers on their own goroutines, so a test asserts on them only
+// after waiting.
+func (e *serverEnv) waitForRosterUpdates(userID *commonpb.UserId, chatID *commonpb.ChatId, n int) {
+	e.chatObserver.WaitFor(e.t, func([]*event.KeyAndEvent[*commonpb.ChatId, *eventpb.ChatEvent]) bool {
+		updates, _ := e.rosterUpdatesOnChatTopic(chatID)
+		return len(updates) >= n
+	})
+	e.userObserver.WaitFor(e.t, func([]*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
+		return len(e.rosterUpdatesOnUserTopic(userID, chatID)) >= n
+	})
+}
+
+// requireNoRosterUpdates asserts, after giving the bus a moment to deliver,
+// that no roster update was published on chatID's topic or userID's.
+func (e *serverEnv) requireNoRosterUpdates(userID *commonpb.UserId, chatID *commonpb.ChatId) {
+	time.Sleep(100 * time.Millisecond)
+	updates, _ := e.rosterUpdatesOnChatTopic(chatID)
+	require.Empty(e.t, updates)
+	require.Empty(e.t, e.rosterUpdatesOnUserTopic(userID, chatID))
+}
+
 func testServer_GetChat_OK(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
@@ -432,7 +615,7 @@ func testServer_GetChat_OK(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.ChatType_CONTACT_DM, resp.Metadata.Type)
 	require.Len(t, resp.Metadata.Members, 2)
 	// A DM's roster is fixed at creation: its inline members at version zero.
-	require.Equal(t, &chatpb.RosterSummary{MemberCount: 2, Version: 0}, resp.Metadata.GetRosterSummary())
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 0}, resp.Metadata.GetRosterSummary()))
 	require.Equal(t, e.userID.Value, resp.Metadata.Members[0].UserId.Value)
 	require.True(t, resp.Metadata.LastActivity.AsTime().Equal(at(1)))
 
@@ -738,7 +921,7 @@ func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
 	// The roster is not enumerated: the viewer is the only member carried, with
 	// a hydrated profile, and the summary says how large the roster really is.
 	require.Len(t, resp.Metadata.Members, 1)
-	require.Equal(t, &chatpb.RosterSummary{MemberCount: 3, Version: 0}, resp.Metadata.GetRosterSummary())
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 3, Version: 0}, resp.Metadata.GetRosterSummary()))
 	self := resp.Metadata.Members[0]
 	require.Equal(t, e.userID.Value, self.UserId.Value)
 	require.Equal(t, "Viewer", self.UserProfile.DisplayName)
@@ -821,7 +1004,7 @@ func testServer_GetChat_Group_MembershipLifecycle(t *testing.T, s chat.Store) {
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.Empty(t, resp.Metadata.Title)
-	require.Equal(t, &chatpb.RosterSummary{MemberCount: 2, Version: 0}, resp.Metadata.GetRosterSummary())
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 0}, resp.Metadata.GetRosterSummary()))
 
 	// A registered non-member is denied.
 	strangerID := model.MustGenerateUserID()
@@ -845,7 +1028,7 @@ func testServer_GetChat_Group_MembershipLifecycle(t *testing.T, s chat.Store) {
 	resp = e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.Len(t, resp.Metadata.Members, 1)
-	require.Equal(t, &chatpb.RosterSummary{MemberCount: 2, Version: 2}, resp.Metadata.GetRosterSummary())
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 2}, resp.Metadata.GetRosterSummary()))
 }
 
 func testServer_GetDmChatFeed_TypeScoped(t *testing.T, s chat.Store) {
@@ -977,7 +1160,7 @@ func testServer_GetGroupChatFeed_OrderAndContent(t *testing.T, s chat.Store) {
 	require.Equal(t, "Newer", first.Title)
 	require.True(t, first.LastActivity.AsTime().Equal(at(2)))
 	require.False(t, first.IsHidden)
-	require.Equal(t, &chatpb.RosterSummary{MemberCount: 2, Version: 0}, first.GetRosterSummary())
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 0}, first.GetRosterSummary()))
 	require.Len(t, first.Members, 1)
 	require.Equal(t, e.userID.Value, first.Members[0].UserId.Value)
 	require.Equal(t, "Viewer", first.Members[0].UserProfile.DisplayName)
@@ -1160,4 +1343,359 @@ func byUserID(members []*chatpb.Member) map[string]*chatpb.Member {
 		out[string(m.UserId.Value)] = m
 	}
 	return out
+}
+
+func testServer_JoinChat_OK(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	e.profiles.displayNames[string(e.userID.Value)] = "Joiner"
+	e.profiles.joinedAt[string(e.userID.Value)] = at(5)
+
+	// A group the env user is not in, with two existing members.
+	founder := model.MustGenerateUserID()
+	group := putGroupChat(t, s, "Open Group", at(1), founder, model.MustGenerateUserID())
+
+	// Before joining, the group is out of reach.
+	require.Equal(t, chatpb.GetChatResponse_DENIED, e.getChat(e.keys, group.ID).Result)
+
+	resp := e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, resp.Result)
+
+	// The response carries the chat as the joiner sees it: the group's
+	// metadata, the joiner as its only hydrated member, and the roster after
+	// the join — one transition on from creation.
+	md := resp.Chat
+	require.NotNil(t, md)
+	require.Equal(t, group.ID.Value, md.ChatId.Value)
+	require.Equal(t, chatpb.ChatType_GROUP, md.Type)
+	require.Equal(t, "Open Group", md.Title)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 3, Version: 1}, md.GetRosterSummary()))
+	require.Len(t, md.Members, 1)
+	require.Equal(t, e.userID.Value, md.Members[0].UserId.Value)
+	require.Equal(t, "Joiner", md.Members[0].UserProfile.DisplayName)
+
+	// The join has landed in the store...
+	isMember, err := s.IsMember(e.ctx, group.ID, e.userID)
+	require.NoError(t, err)
+	require.True(t, isMember)
+	require.Equal(t, chatpb.GetChatResponse_OK, e.getChat(e.keys, group.ID).Result)
+
+	// ...and been announced. The chat's topic carries the joiner's hydrated
+	// member entry — profile, no pointers, no metadata — with the joiner
+	// excluded, since their streams are not on the topic yet.
+	e.waitForRosterUpdates(e.userID, group.ID, 1)
+	toMembers, excludes := e.rosterUpdatesOnChatTopic(group.ID)
+	require.Len(t, toMembers, 1)
+	require.Len(t, excludes[0], 1)
+	require.Equal(t, e.userID.Value, excludes[0][0].Value)
+	joined := toMembers[0].GetMemberJoined()
+	require.NotNil(t, joined)
+	require.Equal(t, e.userID.Value, joined.Member.UserId.Value)
+	require.Equal(t, "Joiner", joined.Member.UserProfile.DisplayName)
+	require.True(t, joined.Member.UserProfile.JoinTs.AsTime().Equal(at(5)))
+	require.Empty(t, joined.Member.Pointers)
+	require.Nil(t, joined.Metadata)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 3, Version: 1}, toMembers[0].GetRosterSummary()))
+
+	// The joiner's own topic carries the same member plus the full metadata,
+	// so their other devices insert the chat without a refetch.
+	toJoiner := e.rosterUpdatesOnUserTopic(e.userID, group.ID)
+	require.Len(t, toJoiner, 1)
+	joinedSelf := toJoiner[0].GetMemberJoined()
+	require.NotNil(t, joinedSelf)
+	require.Equal(t, e.userID.Value, joinedSelf.Member.UserId.Value)
+	require.Equal(t, "Joiner", joinedSelf.Member.UserProfile.DisplayName)
+	require.NotNil(t, joinedSelf.Metadata)
+	require.Equal(t, group.ID.Value, joinedSelf.Metadata.ChatId.Value)
+	require.Equal(t, "Open Group", joinedSelf.Metadata.Title)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 3, Version: 1}, joinedSelf.Metadata.GetRosterSummary()))
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 3, Version: 1}, toJoiner[0].GetRosterSummary()))
+
+	// The founder's own view was never touched: no event on their user topic.
+	require.Empty(t, e.rosterUpdatesOnUserTopic(founder, group.ID))
+}
+
+func testServer_JoinChat_Idempotent(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	group := putGroupChat(t, s, "Open Group", at(1), model.MustGenerateUserID())
+
+	first := e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, first.Result)
+	e.waitForRosterUpdates(e.userID, group.ID, 1)
+
+	// Joining again is a no-op: OK with the same metadata, no transition, and
+	// nothing announced.
+	again := e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, again.Result)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 1}, again.Chat.GetRosterSummary()))
+	require.Equal(t, first.Chat.ChatId.Value, again.Chat.ChatId.Value)
+
+	time.Sleep(100 * time.Millisecond)
+	toMembers, _ := e.rosterUpdatesOnChatTopic(group.ID)
+	require.Len(t, toMembers, 1)
+	require.Len(t, e.rosterUpdatesOnUserTopic(e.userID, group.ID), 1)
+}
+
+func testServer_JoinChat_NotFound(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	unknown := chat.MustGenerateGroupChatID()
+	resp := e.mustJoinChat(e.keys, unknown)
+	require.Equal(t, chatpb.JoinChatResponse_NOT_FOUND, resp.Result)
+	require.Nil(t, resp.Chat)
+	e.requireNoRosterUpdates(e.userID, unknown)
+}
+
+func testServer_JoinChat_DeniedForDm(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// A DM's roster is fixed: neither a participant nor a stranger can join
+	// one, and the DM is left as it was.
+	mine := e.putDM(at(1))
+	stranger := putDmChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(1))
+	for _, dm := range []*commonpb.ChatId{mine, stranger.ID} {
+		resp := e.mustJoinChat(e.keys, dm)
+		require.Equal(t, chatpb.JoinChatResponse_DENIED, resp.Result)
+		require.Nil(t, resp.Chat)
+		e.requireNoRosterUpdates(e.userID, dm)
+	}
+	members, err := s.GetMembers(e.ctx, stranger.ID)
+	require.NoError(t, err)
+	require.Len(t, members, 2)
+}
+
+func testServer_JoinChat_StaffRule(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	group := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:        "Staff Room",
+		IsStaffOnly:  true,
+		LastActivity: at(1),
+	}
+	require.NoError(t, s.PutChat(e.ctx, group))
+
+	// A non-staff user is refused, and does not become a member.
+	resp := e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_RULES_NOT_SATISFIED, resp.Result)
+	require.Nil(t, resp.Chat)
+	isMember, err := s.IsMember(e.ctx, group.ID, e.userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	e.requireNoRosterUpdates(e.userID, group.ID)
+
+	// Flagged as staff, the same user is admitted; the metadata they get back
+	// shows the rule they satisfied.
+	e.accounts.setStaff(e.userID, true)
+	resp = e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, resp.Result)
+	require.Len(t, resp.Chat.GetRules().GetListener(), 1)
+	require.NotNil(t, resp.Chat.GetRules().GetListener()[0].GetStaff())
+	e.waitForRosterUpdates(e.userID, group.ID, 1)
+}
+
+func testServer_JoinChat_MinimumBalanceRule(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	const requirement = 100
+	group := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:                  "Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: requirement},
+		LastActivity:           at(1),
+	}
+	require.NoError(t, s.PutChat(e.ctx, group))
+
+	// With no owner account at all the user holds nothing, and is refused —
+	// not failed.
+	resp := e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_RULES_NOT_SATISFIED, resp.Result)
+
+	// One quark short is still short.
+	_, err := e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(requirement)-1)
+	resp = e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_RULES_NOT_SATISFIED, resp.Result)
+	e.requireNoRosterUpdates(e.userID, group.ID)
+
+	// At the requirement exactly, the user is admitted.
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+	resp = e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 1}, resp.Chat.GetRosterSummary()))
+	e.waitForRosterUpdates(e.userID, group.ID, 1)
+}
+
+// testServer_JoinChat_MemberSkipsRules pins that a current member re-joining
+// is answered on membership alone: a member who no longer satisfies the
+// group's rules keeps their membership, and a retried join says so.
+func testServer_JoinChat_MemberSkipsRules(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	group := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userID},
+		Title:        "Staff Room",
+		IsStaffOnly:  true,
+		LastActivity: at(1),
+	}
+	require.NoError(t, s.PutChat(e.ctx, group))
+
+	// The env user is not staff, yet is a member: the join is a no-op OK.
+	resp := e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 0}, resp.Chat.GetRosterSummary()))
+	e.requireNoRosterUpdates(e.userID, group.ID)
+}
+
+// testServer_JoinChat_UnevaluableRuleFails pins that a rule the server cannot
+// evaluate fails the join rather than admitting the user: a restriction the
+// server cannot answer admits no one.
+func testServer_JoinChat_UnevaluableRuleFails(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	group := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:                  "Euros",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "eur", NativeAmount: 1},
+		LastActivity:           at(1),
+	}
+	require.NoError(t, s.PutChat(e.ctx, group))
+
+	_, err := e.joinChat(e.keys, group.ID)
+	require.Equal(t, codes.Internal, status.Code(err))
+	isMember, err := s.IsMember(e.ctx, group.ID, e.userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	e.requireNoRosterUpdates(e.userID, group.ID)
+}
+
+func testServer_LeaveChat_OK(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	other := model.MustGenerateUserID()
+	chatID := e.putGroup("Group", at(1), other)
+
+	resp := e.mustLeaveChat(e.keys, chatID)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, resp.Result)
+
+	// The departure has landed: the caller is no longer a member and can no
+	// longer read the chat, while the other member is untouched.
+	isMember, err := s.IsMember(e.ctx, chatID, e.userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	require.Equal(t, chatpb.GetChatResponse_DENIED, e.getChat(e.keys, chatID).Result)
+	members, err := s.GetMembers(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.Equal(t, other.Value, members[0].Value)
+
+	// The departure is announced on the chat's topic with the leaver excluded
+	// — their stream may still be on it — and on the leaver's own topic, so
+	// every device they have open drops the chat.
+	e.waitForRosterUpdates(e.userID, chatID, 1)
+	toMembers, excludes := e.rosterUpdatesOnChatTopic(chatID)
+	require.Len(t, toMembers, 1)
+	require.Len(t, excludes[0], 1)
+	require.Equal(t, e.userID.Value, excludes[0][0].Value)
+	left := toMembers[0].GetMemberLeft()
+	require.NotNil(t, left)
+	require.Equal(t, e.userID.Value, left.UserId.Value)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 1}, toMembers[0].GetRosterSummary()))
+
+	toLeaver := e.rosterUpdatesOnUserTopic(e.userID, chatID)
+	require.Len(t, toLeaver, 1)
+	require.NotNil(t, toLeaver[0].GetMemberLeft())
+	require.Equal(t, e.userID.Value, toLeaver[0].GetMemberLeft().UserId.Value)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 1}, toLeaver[0].GetRosterSummary()))
+	require.Empty(t, e.rosterUpdatesOnUserTopic(other, chatID))
+}
+
+func testServer_LeaveChat_Idempotent(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	chatID := e.putGroup("Group", at(1), model.MustGenerateUserID())
+
+	// Leaving a group the caller was never in already holds: OK, no
+	// transition, nothing announced.
+	stranger, strangerKeys := e.addUser()
+	resp := e.mustLeaveChat(strangerKeys, chatID)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, resp.Result)
+	e.requireNoRosterUpdates(stranger, chatID)
+	roster, err := s.GetGroupRosterSummary(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 0}, roster)
+
+	// So does leaving twice: the second call finds the departure already made.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	e.waitForRosterUpdates(e.userID, chatID, 1)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	time.Sleep(100 * time.Millisecond)
+	toMembers, _ := e.rosterUpdatesOnChatTopic(chatID)
+	require.Len(t, toMembers, 1)
+	require.Len(t, e.rosterUpdatesOnUserTopic(e.userID, chatID), 1)
+	roster, err = s.GetGroupRosterSummary(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, chat.RosterSummary{MemberCount: 1, Version: 1}, roster)
+}
+
+func testServer_LeaveChat_NotFound(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	unknown := chat.MustGenerateGroupChatID()
+	resp := e.mustLeaveChat(e.keys, unknown)
+	require.Equal(t, chatpb.LeaveChatResponse_NOT_FOUND, resp.Result)
+	e.requireNoRosterUpdates(e.userID, unknown)
+}
+
+func testServer_LeaveChat_DeniedForDm(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// A DM cannot be left, by a participant or anyone else, and is left as it
+	// was.
+	mine := e.putDM(at(1))
+	stranger := putDmChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(1))
+	for _, dm := range []*commonpb.ChatId{mine, stranger.ID} {
+		resp := e.mustLeaveChat(e.keys, dm)
+		require.Equal(t, chatpb.LeaveChatResponse_DENIED, resp.Result)
+		e.requireNoRosterUpdates(e.userID, dm)
+	}
+	isMember, err := s.IsMember(e.ctx, mine, e.userID)
+	require.NoError(t, err)
+	require.True(t, isMember)
+}
+
+// testServer_LeaveChat_ThenRejoin pins the round trip: a departure is a
+// tombstone the user can come back from, and the roster's version records
+// every transition along the way.
+func testServer_LeaveChat_ThenRejoin(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	chatID := e.putGroup("Group", at(1), model.MustGenerateUserID())
+
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	require.Equal(t, chatpb.GetChatResponse_DENIED, e.getChat(e.keys, chatID).Result)
+
+	resp := e.mustJoinChat(e.keys, chatID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 2}, resp.Chat.GetRosterSummary()))
+	require.Equal(t, chatpb.GetChatResponse_OK, e.getChat(e.keys, chatID).Result)
+
+	// Two transitions, two announcements on each topic, in order.
+	e.waitForRosterUpdates(e.userID, chatID, 2)
+	toMembers, _ := e.rosterUpdatesOnChatTopic(chatID)
+	require.Len(t, toMembers, 2)
+	require.NotNil(t, toMembers[0].GetMemberLeft())
+	require.Equal(t, uint64(1), toMembers[0].GetRosterSummary().GetVersion())
+	require.NotNil(t, toMembers[1].GetMemberJoined())
+	require.Equal(t, uint64(2), toMembers[1].GetRosterSummary().GetVersion())
 }

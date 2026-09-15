@@ -134,7 +134,7 @@ func testMultipleOpenStreams(t *testing.T, accounts account.Store) {
 		for _, client := range []*clientTestEnv{testEnv.client1, testEnv.client2} {
 			for _, streamer := range client.streams[model.UserIDString(userID)] {
 				events := receiveNextEvents(t, streamer)
-				require.Lenf(t, events, 1, "expected[%d]: %s", i, event.EventIDString(expected.Id))
+				require.Lenf(t, events, 1, "expected[%d]: %s", i, model.EventIDString(expected.Id))
 				assertEquivalentTestEvents(t, expected, events[0])
 			}
 		}
@@ -167,7 +167,7 @@ func testBurstDelivery(t *testing.T, accounts account.Store) {
 			sender = testEnv.server2
 		}
 		e := sender.sendTestUserEvent(userID)
-		expected[event.EventIDString(e.Id)] = e
+		expected[model.EventIDString(e.Id)] = e
 	}
 
 	// The bus hands every publish to its own goroutine, so arrival order is
@@ -180,7 +180,7 @@ func testBurstDelivery(t *testing.T, accounts account.Store) {
 		require.LessOrEqual(t, len(batch), burst)
 		batches++
 		for _, e := range batch {
-			id := event.EventIDString(e.Id)
+			id := model.EventIDString(e.Id)
 			_, dup := got[id]
 			require.Falsef(t, dup, "event %s delivered twice", id)
 			require.Containsf(t, expected, id, "unexpected event %s", id)
@@ -444,7 +444,7 @@ func testServerShutdown(t *testing.T, accounts account.Store) {
 // newTestEvent builds a bare test event, with no forwarding hops yet.
 func newTestEvent() *eventpb.Event {
 	return &eventpb.Event{
-		Id: event.MustGenerateEventID(),
+		Id: model.MustGenerateEventID(),
 		Ts: timestamppb.Now(),
 		Type: &eventpb.Event_Test{
 			Test: &eventpb.TestEvent{Nonce: uint64(rand.Int64())},

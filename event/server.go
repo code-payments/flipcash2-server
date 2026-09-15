@@ -523,7 +523,7 @@ func selectEvents(log *zap.Logger, detectors []StaleEventDetector[*eventpb.Event
 	eventsToSend := make([]*eventpb.Event, 0, len(events))
 	for _, event := range events {
 		if isStale(detectors, event) {
-			log.Debug("Dropping stale event", zap.String("event_id", EventIDString(event.Id)))
+			log.Debug("Dropping stale event", zap.String("event_id", model.EventIDString(event.Id)))
 			continue
 		}
 		eventsToSend = append(eventsToSend, event)

@@ -16,10 +16,13 @@ import (
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
+	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/model"
 )
 
@@ -114,16 +117,42 @@ type MediaReader interface {
 	ResolveRenditions(ctx context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error)
 }
 
+// UserEventPublisher is the write slice of the event domain the Chat service
+// needs to notify one user's streams — the user-keyed event bus. Like the
+// readers it is declared here (consumer side) because the event package
+// imports chat for stream registration, so chat cannot import it back; the
+// event package's Bus satisfies it directly.
+type UserEventPublisher interface {
+	OnEvent(userID *commonpb.UserId, e *eventpb.Event)
+}
+
+// ChatEventPublisher is the write slice of the event domain the Chat service
+// needs to notify every stream subscribed to a group chat's topic — the
+// chat-keyed event bus. See UserEventPublisher for why it is declared here.
+type ChatEventPublisher interface {
+	OnEvent(chatID *commonpb.ChatId, e *eventpb.ChatEvent)
+}
+
 type Server struct {
 	log *zap.Logger
 
 	authz auth.Authorizer
 
+	accounts  account.Store
 	blocklist BlocklistReader
 	chats     Store
 	media     MediaReader
 	messaging MessagingReader
 	profiles  ProfileReader
+
+	rules *RuleEvaluator
+
+	userEventBus UserEventPublisher
+	chatEventBus ChatEventPublisher
+
+	// requireStaffForGroupManagement gates the self-service membership RPCs
+	// (JoinChat, LeaveChat) to staff users when set (see member.go).
+	requireStaffForGroupManagement bool
 
 	// maxGroupFeedChats is the most group chats a user's feed may hold (see
 	// feed.go). It is the package constant of the same name in production;
@@ -133,15 +162,43 @@ type Server struct {
 	chatpb.UnimplementedChatServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, blocklist BlocklistReader, chats Store, media MediaReader, messaging MessagingReader, profiles ProfileReader) *Server {
+func NewServer(
+	log *zap.Logger,
+
+	authz auth.Authorizer,
+
+	accounts account.Store,
+	balances *balance.Client,
+	blocklist BlocklistReader,
+	chats Store,
+	media MediaReader,
+	messaging MessagingReader,
+	profiles ProfileReader,
+
+	userEventBus UserEventPublisher,
+	chatEventBus ChatEventPublisher,
+
+	requireStaffForGroupManagement bool,
+) *Server {
 	return &Server{
-		log:               log,
-		authz:             authz,
-		blocklist:         blocklist,
-		chats:             chats,
-		media:             media,
-		messaging:         messaging,
-		profiles:          profiles,
+		log: log,
+
+		authz: authz,
+
+		accounts:  accounts,
+		blocklist: blocklist,
+		chats:     chats,
+		media:     media,
+		messaging: messaging,
+		profiles:  profiles,
+
+		rules: NewRuleEvaluator(accounts, balances, chats),
+
+		userEventBus: userEventBus,
+		chatEventBus: chatEventBus,
+
+		requireStaffForGroupManagement: requireStaffForGroupManagement,
+
 		maxGroupFeedChats: maxGroupFeedChats,
 	}
 }

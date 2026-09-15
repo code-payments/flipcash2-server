@@ -8,7 +8,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -99,26 +98,7 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 		chats = chats[:limit]
 	}
 
-	// HACK: temporarily pin one group chat to the top of one user's feed, until
-	// there is a real group chat feed to serve it from.
-	pinned := s.pinnedGroupChat(ctx, log, userID, chatType, req.GetQueryOptions().GetPagingToken() == nil)
-	if pinned != nil && len(chats) >= maxDmChatFeedPageSize {
-		// The pinned chat takes a slot, so give up the page's last DM to stay
-		// within max_items. The cursor below is computed from what's retained, so
-		// the next page resumes at the DM that was dropped.
-		chats = chats[:maxDmChatFeedPageSize-1]
-		hasMore = true
-	}
-
-	// Hydrate the pinned chat alongside the page so it shares the batched reads.
-	// The paging token is still derived from the DM page alone: a group chat ID
-	// is not a valid cursor.
-	feed := chats
-	if pinned != nil {
-		feed = append([]*Chat{pinned}, chats...)
-	}
-
-	metadata, err := s.hydrate(ctx, userID, feed)
+	metadata, err := s.hydrate(ctx, userID, chats)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating DM feed metadata")
 		return nil, status.Error(codes.Internal, "")
@@ -139,51 +119,6 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 		})
 	}
 	return resp, nil
-}
-
-// HACK: the staff group chat gets pinned to the top of the first page of a
-// staff member's tip DM feed.
-var hackStaffChatID = uuid.MustParse("eb62c512-3934-40e0-85f5-9160a20104d0")
-
-// pinnedGroupChat returns the group chat to pin to the top of this feed page,
-// or nil when there is none — which is every case but the hack above: a
-// non-staff user, a staff user who is not a member of the staff chat, another
-// feed type, or a page past the first.
-//
-// A failure anywhere along the way returns nil rather than an error: the hack
-// must never be what breaks a user's feed.
-func (s *Server) pinnedGroupChat(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, chatFeedType chatpb.ChatType, isFirstPage bool) *Chat {
-	if !isFirstPage || chatFeedType != chatpb.ChatType_TIP_DM {
-		return nil
-	}
-
-	// Staff first: it is the cheaper (cached) check, and it keeps the staff
-	// chat's membership from being probed on behalf of everyone else.
-	isStaff, err := s.accounts.IsStaff(ctx, userID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure getting user staff status")
-		return nil
-	}
-	if !isStaff {
-		return nil
-	}
-
-	chatID := &commonpb.ChatId{Value: hackStaffChatID[:]}
-	isMember, err := s.chats.IsMember(ctx, chatID, userID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure checking staff chat membership")
-		return nil
-	}
-	if !isMember {
-		return nil
-	}
-
-	c, err := s.chats.GetChatByID(ctx, chatID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure getting pinned group chat")
-		return nil
-	}
-	return c
 }
 
 // dmFeedTokenLen is the byte length of an encoded GetDmChatFeed paging token:

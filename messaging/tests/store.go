@@ -695,13 +695,16 @@ func testStore_GetPointersForChats(t *testing.T, s messaging.Store) {
 		require.NoError(t, err)
 	}
 
-	_, _, err := s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	// userA holds both types in chat A; userB holds one in chat B.
+	_, _, err := s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1})
+	require.NoError(t, err)
+	_, _, err = s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
 	_, _, err = s.AdvancePointer(ctx, chatB, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
 
-	// Batch across chats: A and B return the named members' pointers; C (no
-	// pointers) is absent from the map.
+	// Batch across chats: A and B return the named members' pointers — every
+	// type a member holds — and C (no pointers) is absent from the map.
 	members := []*commonpb.UserId{userA, userB}
 	got, err := s.GetPointersForChats(ctx, []messaging.PointerRef{
 		{ChatID: chatA, Members: members},
@@ -710,10 +713,20 @@ func testStore_GetPointersForChats(t *testing.T, s messaging.Store) {
 	})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
-	require.Len(t, got[string(chatA.Value)], 1)
-	require.Equal(t, messagingpb.Pointer_READ, got[string(chatA.Value)][0].Type)
+	require.Len(t, got[string(chatA.Value)], 2)
+	require.ElementsMatch(t,
+		[]string{
+			pointerKey(messagingpb.Pointer_DELIVERED, userA, 1),
+			pointerKey(messagingpb.Pointer_READ, userA, 1),
+		},
+		[]string{
+			pointerKeyOf(got[string(chatA.Value)][0]),
+			pointerKeyOf(got[string(chatA.Value)][1]),
+		},
+	)
 	require.Len(t, got[string(chatB.Value)], 1)
 	require.Equal(t, messagingpb.Pointer_DELIVERED, got[string(chatB.Value)][0].Type)
+	require.Equal(t, userB.Value, got[string(chatB.Value)][0].UserId.Value)
 	_, ok := got[string(chatC.Value)]
 	require.False(t, ok)
 

@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"testing"
 	"time"
 
@@ -35,6 +36,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_NotFound,
 		testServer_GetChat_Denied,
 		testServer_GetChat_Hydrates,
+		testServer_GetChat_HydrationFailureCancelsSiblings,
 		testServer_GetChat_TipDm_HidesPhoneNumbers,
 		testServer_GetChat_HiddenWhenPeerBlocked,
 		testServer_GetChat_Group_Hydrates,
@@ -174,6 +176,10 @@ type fakeMessagingReader struct {
 	pointers        map[string][]*messagingpb.Pointer
 	latestEventSeqs map[string]uint64
 	pointerLookups  map[string]int
+
+	// beforeLastMessages, when set, runs first in LastMessages with the call's
+	// context, and its error is returned — to hold or fail that one read.
+	beforeLastMessages func(ctx context.Context) error
 }
 
 func newFakeMessagingReader() *fakeMessagingReader {
@@ -185,7 +191,12 @@ func newFakeMessagingReader() *fakeMessagingReader {
 	}
 }
 
-func (f *fakeMessagingReader) LastMessages(_ context.Context, refs []chat.MessageRef) (map[string]*messagingpb.Message, error) {
+func (f *fakeMessagingReader) LastMessages(ctx context.Context, refs []chat.MessageRef) (map[string]*messagingpb.Message, error) {
+	if f.beforeLastMessages != nil {
+		if err := f.beforeLastMessages(ctx); err != nil {
+			return nil, err
+		}
+	}
 	out := make(map[string]*messagingpb.Message)
 	for _, ref := range refs {
 		if m, ok := f.lastMessages[string(ref.ChatID.Value)]; ok {
@@ -224,6 +235,9 @@ type fakeProfileReader struct {
 	displayNames    map[string]string
 	profilePictures map[string]*blobpb.Media
 	joinedAt        map[string]time.Time
+
+	// phoneNumbersErr, when set, fails every GetPhoneNumbers call.
+	phoneNumbersErr error
 }
 
 func newFakeProfileReader() *fakeProfileReader {
@@ -257,6 +271,9 @@ func (f *fakeProfileReader) setProfilePicture(userID *commonpb.UserId, blobID *b
 }
 
 func (f *fakeProfileReader) GetPhoneNumbers(_ context.Context, userIDs []*commonpb.UserId) (map[string]*commonpb.PhoneNumber, error) {
+	if f.phoneNumbersErr != nil {
+		return nil, f.phoneNumbersErr
+	}
 	out := make(map[string]*commonpb.PhoneNumber)
 	for _, userID := range userIDs {
 		if p, ok := f.phoneNumbers[string(userID.Value)]; ok {
@@ -621,6 +638,44 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	require.Nil(t, members[string(e.userID.Value)].UserProfile.PhoneNumber)
 	require.Empty(t, members[string(e.userID.Value)].UserProfile.DisplayName)
 	require.Nil(t, members[string(e.userID.Value)].UserProfile.GetProfilePicture())
+}
+
+// The hydration reads run concurrently, and one failing must not leave the
+// others running to completion for a response that is already an error: the
+// failure cancels their context.
+func testServer_GetChat_HydrationFailureCancelsSiblings(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	peer := model.MustGenerateUserID()
+	chatID := generateDmChatID()
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
+		ID:            chatID,
+		Type:          chatpb.ChatType_CONTACT_DM,
+		Members:       []*commonpb.UserId{e.userID, peer},
+		LastActivity:  at(1),
+		LastMessageID: &messagingpb.MessageId{Value: 1},
+	}))
+
+	// One read fails outright; another holds until its context is cancelled,
+	// and reports whether that happened rather than hanging the test.
+	e.profiles.phoneNumbersErr = errors.New("profiles unavailable")
+	cancelled := make(chan bool, 1)
+	e.messaging.beforeLastMessages = func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			cancelled <- true
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			cancelled <- false
+			return errors.New("never cancelled")
+		}
+	}
+
+	req := &chatpb.GetChatRequest{ChatId: chatID}
+	require.NoError(t, e.keys.Auth(req, &req.Auth))
+	_, err := e.client.GetChat(e.ctx, req)
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.True(t, <-cancelled)
 }
 
 func testServer_GetChat_TipDm_HidesPhoneNumbers(t *testing.T, s chat.Store) {

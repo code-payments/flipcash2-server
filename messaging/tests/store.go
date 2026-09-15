@@ -16,6 +16,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/messaging"
 	"github.com/code-payments/flipcash2-server/model"
@@ -682,53 +683,94 @@ func requireDeleted(t *testing.T, m *messaging.Message, deletedBy *commonpb.User
 	require.True(t, deletedTs.Equal(deleted.DeletedTs.AsTime()))
 }
 
+// chatShapes are the chat ID shapes the pointer tests run against: a store may
+// lay pointers out differently per chat type (the DynamoDB store keeps a DM's
+// on one item and a group's on one item per member), and the Store contract
+// must hold for both.
+var chatShapes = []struct {
+	name       string
+	generateID func() *commonpb.ChatId
+}{
+	{name: "dm", generateID: generateChatID},
+	{name: "group", generateID: chat.MustGenerateGroupChatID},
+}
+
 func testStore_GetPointersForChats(t *testing.T, s messaging.Store) {
 	ctx := context.Background()
-	chatA := generateChatID()
-	chatB := generateChatID()
-	chatC := generateChatID() // no pointers
 	userA := model.MustGenerateUserID()
 	userB := model.MustGenerateUserID()
 
-	for _, c := range []*commonpb.ChatId{chatA, chatB, chatC} {
+	// Mixed shapes in one batch: A and C are DMs, B and D are groups.
+	chatA := generateChatID()
+	chatB := chat.MustGenerateGroupChatID()
+	chatC := generateChatID()               // no pointers
+	chatD := chat.MustGenerateGroupChatID() // no pointers
+
+	for _, c := range []*commonpb.ChatId{chatA, chatB, chatC, chatD} {
 		_, _, err := s.PutMessage(ctx, c, userA, textContent("m"), at(1), generateClientID(), true)
 		require.NoError(t, err)
 	}
 
-	// userA holds both types in chat A; userB holds one in chat B.
+	// userA holds both types in chat A, and userB one; userB holds one in chat B.
 	_, _, err := s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
 	_, _, err = s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	require.NoError(t, err)
+	_, _, err = s.AdvancePointer(ctx, chatA, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
 	_, _, err = s.AdvancePointer(ctx, chatB, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
 
 	// Batch across chats: A and B return the named members' pointers — every
-	// type a member holds — and C (no pointers) is absent from the map.
+	// type a member holds — and C and D (no pointers) are absent from the map.
 	members := []*commonpb.UserId{userA, userB}
 	got, err := s.GetPointersForChats(ctx, []messaging.PointerRef{
 		{ChatID: chatA, Members: members},
 		{ChatID: chatB, Members: members},
 		{ChatID: chatC, Members: members},
+		{ChatID: chatD, Members: members},
 	})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
-	require.Len(t, got[string(chatA.Value)], 2)
 	require.ElementsMatch(t,
 		[]string{
 			pointerKey(messagingpb.Pointer_DELIVERED, userA, 1),
 			pointerKey(messagingpb.Pointer_READ, userA, 1),
+			pointerKey(messagingpb.Pointer_READ, userB, 1),
 		},
-		[]string{
-			pointerKeyOf(got[string(chatA.Value)][0]),
-			pointerKeyOf(got[string(chatA.Value)][1]),
-		},
+		pointerKeysOf(got[string(chatA.Value)]),
 	)
-	require.Len(t, got[string(chatB.Value)], 1)
-	require.Equal(t, messagingpb.Pointer_DELIVERED, got[string(chatB.Value)][0].Type)
-	require.Equal(t, userB.Value, got[string(chatB.Value)][0].UserId.Value)
+	require.Equal(t,
+		[]string{pointerKey(messagingpb.Pointer_DELIVERED, userB, 1)},
+		pointerKeysOf(got[string(chatB.Value)]),
+	)
 	_, ok := got[string(chatC.Value)]
 	require.False(t, ok)
+	_, ok = got[string(chatD.Value)]
+	require.False(t, ok)
+
+	// Only the named members come back, whatever else the chat holds: a ref
+	// naming one DM member returns that member's pointers alone.
+	got, err = s.GetPointersForChats(ctx, []messaging.PointerRef{
+		{ChatID: chatA, Members: []*commonpb.UserId{userB}},
+	})
+	require.NoError(t, err)
+	require.Equal(t,
+		[]string{pointerKey(messagingpb.Pointer_READ, userB, 1)},
+		pointerKeysOf(got[string(chatA.Value)]),
+	)
+
+	// Repeated refs collapse: a chat named twice, and a member named twice,
+	// each return their pointers once.
+	got, err = s.GetPointersForChats(ctx, []messaging.PointerRef{
+		{ChatID: chatA, Members: []*commonpb.UserId{userA, userA}},
+		{ChatID: chatA, Members: []*commonpb.UserId{userB}},
+		{ChatID: chatB, Members: []*commonpb.UserId{userB}},
+		{ChatID: chatB, Members: []*commonpb.UserId{userB}},
+	})
+	require.NoError(t, err)
+	require.Len(t, got[string(chatA.Value)], 3)
+	require.Len(t, got[string(chatB.Value)], 1)
 
 	empty, err := s.GetPointersForChats(ctx, nil)
 	require.NoError(t, err)
@@ -736,8 +778,15 @@ func testStore_GetPointersForChats(t *testing.T, s messaging.Store) {
 }
 
 func testStore_Pointers(t *testing.T, s messaging.Store) {
+	for _, shape := range chatShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			testStore_Pointers_Shape(t, s, shape.generateID())
+		})
+	}
+}
+
+func testStore_Pointers_Shape(t *testing.T, s messaging.Store, chatID *commonpb.ChatId) {
 	ctx := context.Background()
-	chatID := generateChatID()
 	userA := model.MustGenerateUserID()
 	userB := model.MustGenerateUserID()
 
@@ -758,19 +807,23 @@ func testStore_Pointers(t *testing.T, s messaging.Store) {
 	require.True(t, advanced)
 	require.EqualValues(t, 3, pointer.Value.Value)
 	require.NotNil(t, pointer.Ts)
+	advancedTs := pointer.Ts.AsTime()
 
-	// Moving backward is a no-op, but the current pointer (still at 3) is returned.
+	// Moving backward is a no-op, but the current pointer (still at 3) is
+	// returned — with the timestamp of the advance that put it there, not the
+	// no-op's.
 	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 2})
 	require.NoError(t, err)
 	require.False(t, advanced)
 	require.EqualValues(t, 3, pointer.Value.Value)
-	require.NotNil(t, pointer.Ts)
+	require.True(t, pointer.Ts.AsTime().Equal(advancedTs))
 
 	// Moving to the same value is a no-op.
 	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 3})
 	require.NoError(t, err)
 	require.False(t, advanced)
 	require.EqualValues(t, 3, pointer.Value.Value)
+	require.True(t, pointer.Ts.AsTime().Equal(advancedTs))
 
 	// Forward advances.
 	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 5})
@@ -788,24 +841,46 @@ func testStore_Pointers(t *testing.T, s messaging.Store) {
 
 	pointers, err = s.GetPointers(ctx, chatID)
 	require.NoError(t, err)
-	require.Len(t, pointers, 3)
 	require.ElementsMatch(t,
 		[]string{
 			pointerKey(messagingpb.Pointer_DELIVERED, userB, 5),
 			pointerKey(messagingpb.Pointer_READ, userB, 4),
 			pointerKey(messagingpb.Pointer_READ, userA, 5),
 		},
+		pointerKeysOf(pointers),
+	)
+
+	// Members' pointers are independent: a no-op for one member leaves the
+	// other's untouched, and an advance for one member moves only their own.
+	_, advanced, err = s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	require.NoError(t, err)
+	require.False(t, advanced)
+	_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 5})
+	require.NoError(t, err)
+	require.True(t, advanced)
+
+	pointers, err = s.GetPointers(ctx, chatID)
+	require.NoError(t, err)
+	require.ElementsMatch(t,
 		[]string{
-			pointerKeyOf(pointers[0]),
-			pointerKeyOf(pointers[1]),
-			pointerKeyOf(pointers[2]),
+			pointerKey(messagingpb.Pointer_DELIVERED, userB, 5),
+			pointerKey(messagingpb.Pointer_READ, userB, 5),
+			pointerKey(messagingpb.Pointer_READ, userA, 5),
 		},
+		pointerKeysOf(pointers),
 	)
 }
 
 func testStore_AdvancePointer_NoExistenceCheck(t *testing.T, s messaging.Store) {
+	for _, shape := range chatShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			testStore_AdvancePointer_NoExistenceCheck_Shape(t, s, shape.generateID())
+		})
+	}
+}
+
+func testStore_AdvancePointer_NoExistenceCheck_Shape(t *testing.T, s messaging.Store, chatID *commonpb.ChatId) {
 	ctx := context.Background()
-	chatID := generateChatID()
 	user := model.MustGenerateUserID()
 
 	for i := 1; i <= 3; i++ {
@@ -1324,6 +1399,14 @@ func pointerKey(t messagingpb.Pointer_Type, userID *commonpb.UserId, value uint6
 
 func pointerKeyOf(p *messagingpb.Pointer) string {
 	return pointerKey(p.Type, p.UserId, p.Value.Value)
+}
+
+func pointerKeysOf(pointers []*messagingpb.Pointer) []string {
+	out := make([]string, len(pointers))
+	for i, p := range pointers {
+		out[i] = pointerKeyOf(p)
+	}
+	return out
 }
 
 // at returns a deterministic timestamp offset by the given number of seconds

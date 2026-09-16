@@ -135,7 +135,7 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, memberStanding, []*Chat{c})
 	if err != nil {
 		// The group exists; only the read back failed. It will surface on the
 		// creator's next feed read.

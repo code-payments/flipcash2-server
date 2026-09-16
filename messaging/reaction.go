@@ -32,7 +32,9 @@ func (s *Server) AddReaction(ctx context.Context, req *messagingpb.AddReactionRe
 		return &messagingpb.AddReactionResponse{Result: messagingpb.AddReactionResponse_DENIED}, nil
 	}
 
-	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
+	// A reaction is something other members see, so it is a member's alone
+	// (see isMember): a non-member who may read the chat still may not react.
+	if allowed, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
 	} else if !allowed {
 		return &messagingpb.AddReactionResponse{Result: messagingpb.AddReactionResponse_DENIED}, nil
@@ -100,7 +102,7 @@ func (s *Server) RemoveReaction(ctx context.Context, req *messagingpb.RemoveReac
 		return &messagingpb.RemoveReactionResponse{Result: messagingpb.RemoveReactionResponse_DENIED}, nil
 	}
 
-	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
+	if allowed, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
 	} else if !allowed {
 		return &messagingpb.RemoveReactionResponse{Result: messagingpb.RemoveReactionResponse_DENIED}, nil

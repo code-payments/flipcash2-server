@@ -110,18 +110,39 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 }
 
 // fakeChats is a Store that serves rules from a map of group records and
-// counts the reads, so a test can see which evaluations touched the store.
-// Only GetGroupRules is exercised, as above.
+// membership from a set, counting the reads of each, so a test can see which
+// evaluations touched the store. Only GetGroupRules and IsMember are
+// exercised, as above.
 type fakeChats struct {
 	Store
 
 	chats map[string]*Chat
 	reads int
+
+	members         map[string]bool
+	membershipReads int
+}
+
+func newFakeChats() *fakeChats {
+	return &fakeChats{chats: make(map[string]*Chat), members: make(map[string]bool)}
 }
 
 func (f *fakeChats) put(c *Chat) *Chat {
 	f.chats[string(c.ID.Value)] = c
 	return c
+}
+
+func (f *fakeChats) join(chatID *commonpb.ChatId, userID *commonpb.UserId) {
+	f.members[string(chatID.Value)+string(userID.Value)] = true
+}
+
+func (f *fakeChats) leave(chatID *commonpb.ChatId, userID *commonpb.UserId) {
+	delete(f.members, string(chatID.Value)+string(userID.Value))
+}
+
+func (f *fakeChats) IsMember(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
+	f.membershipReads++
+	return f.members[string(chatID.Value)+string(userID.Value)], nil
 }
 
 func (f *fakeChats) GetGroupRules(_ context.Context, chatID *commonpb.ChatId) (*chatpb.Rules, error) {

@@ -133,7 +133,7 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 	}
 
 	// Share any media into the chat — validate the sender owns each blob and it is
-	// a READY original, then grant the chat read access — before the message is
+	// a READY original, then grant the chat listen access — before the message is
 	// persisted and broadcast, so the grants are durable before any recipient can
 	// resolve the blobs.
 	if denied, err := s.shareMessageMedia(ctx, log, userID, req.ChatId, req.Content); err != nil {

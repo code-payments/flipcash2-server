@@ -134,8 +134,9 @@ func minimumTransferValue(code currency_lib.Code) float64 {
 
 // RuleEvaluator decides whether a user satisfies a chat's participation rules
 // (see Chat.Rules). It evaluates rules only: membership is a separate, cheaper
-// check the caller makes first, so a chat's rules are never evaluated — and
-// its requirement never probed — on behalf of a non-member. Only a group can
+// check the caller makes first, so a chat's rules are evaluated on behalf of a
+// non-member only where the rules are what admits them — a join, or a
+// qualifying non-member's read of a group (see Access). Only a group can
 // carry rules; a DM's evaluation never touches the store.
 //
 // Rules are read through Store.GetGroupRules — in production the caching
@@ -148,10 +149,10 @@ func minimumTransferValue(code currency_lib.Code) float64 {
 // state at join time: a member who no longer satisfies a listener rule (a
 // staff member whose flag was revoked, a holder whose balance dropped) keeps
 // their membership record but is denied on every path that evaluates the
-// rules until they satisfy it again. Not every path does: the messaging
-// service evaluates rules on sends only, and gates reads on membership alone,
-// so that a read never pays for an evaluation (see messaging.canListen). The
-// intended design is for membership itself to track the listener rules — a
+// rules until they satisfy it again. Not every path does: a member's read is
+// gated on membership alone, so that it never pays for an evaluation; rules
+// are evaluated on sends, and on a non-member's read of a group (see Access).
+// The intended design is for membership itself to track the listener rules — a
 // member who stops satisfying one is removed — at which point the membership
 // record is the rules' answer everywhere. Enforcing rules on membership
 // changes, a join gated by listener rules included, is the job of whatever

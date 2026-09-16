@@ -57,6 +57,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_Group_Hydrates,
 		testServer_GetChat_Group_Picture,
 		testServer_GetChat_Group_MembershipLifecycle,
+		testServer_GetChat_Group_NonMember,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
 		testServer_GetDmChatFeed_Paging,
@@ -144,7 +145,8 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 	blocklist := newFakeBlocklistReader()
 	media := newFakeMedia()
 	moderator := &fakeModerator{}
-	server := chat.NewServer(log, authz, accounts, balances, blocklist, s, media, messaging, moderator, profiles, userBus, chatBus, false)
+	access := chat.NewAccess(s, chat.NewRuleEvaluator(accounts, balances, s))
+	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, access, userBus, chatBus, false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
@@ -1056,29 +1058,157 @@ func testServer_GetChat_Group_MembershipLifecycle(t *testing.T, s chat.Store) {
 	require.Empty(t, resp.Metadata.Title)
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 0}, resp.Metadata.GetRosterSummary()))
 
-	// A registered non-member is denied.
+	// A registered non-member gets the group's record, with no member hydrated:
+	// they are not on the roster (see testServer_GetChat_Group_NonMember for
+	// what else their standing decides).
 	strangerID := model.MustGenerateUserID()
 	strangerKeys := model.MustGenerateKeyPair()
 	e.authz.Add(strangerID, strangerKeys)
 	resp = e.getChat(strangerKeys, chatID)
-	require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result)
-	require.Nil(t, resp.Metadata)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Empty(t, resp.Metadata.Members)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 0}, resp.Metadata.GetRosterSummary()))
 
-	// A removed member loses access — the tombstone is not membership...
+	// A removed member is a non-member — the tombstone is not membership — and
+	// is shown the group as one...
 	_, _, err := s.RemoveGroupMember(e.ctx, chatID, e.userID)
 	require.NoError(t, err)
 	resp = e.getChat(e.keys, chatID)
-	require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Empty(t, resp.Metadata.Members)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 1}, resp.Metadata.GetRosterSummary()))
 
-	// ...and a rejoin restores it. The count is back where it started; the
-	// version records both transitions, which is what tells a client holding
-	// the original member list that it is stale.
+	// ...and a rejoin restores their membership. The count is back where it
+	// started; the version records both transitions, which is what tells a
+	// client holding the original member list that it is stale.
 	_, _, err = s.AddGroupMembers(e.ctx, chatID, []*commonpb.UserId{e.userID})
 	require.NoError(t, err)
 	resp = e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.Len(t, resp.Metadata.Members, 1)
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 2}, resp.Metadata.GetRosterSummary()))
+}
+
+// testServer_GetChat_Group_NonMember pins what a group's record shows a
+// registered user who is not on its roster, and how the listener rules decide
+// the rest (see chat.Server.GetChat).
+func testServer_GetChat_Group_NonMember(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	const requirement = 100
+	pictureBlobID := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	wantPicture := e.media.setRenditions(pictureBlobID)
+	founder := model.MustGenerateUserID()
+	group := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{founder},
+		Title:                  "Whales",
+		PictureBlobID:          pictureBlobID,
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: requirement},
+		LastActivity:           at(1),
+		LastMessageID:          &messagingpb.MessageId{Value: 7},
+	}
+	require.NoError(t, s.PutChat(e.ctx, group))
+	key := string(group.ID.Value)
+	e.messaging.lastMessages[key] = textMessage(7, founder, "hi")
+	e.messaging.latestEventSeqs[key] = 9
+	// A pointer row stored for the viewer — as a former member's would be —
+	// which a non-member must never be shown as theirs.
+	e.messaging.pointers[key] = []*messagingpb.Pointer{
+		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 3}, Ts: timestamppb.New(at(3))},
+	}
+
+	// With no owner account the env user holds nothing and fails the rules.
+	// They still get the record — what identifies the group and what it takes
+	// to join — but none of its messaging state, and no member. The pointers
+	// are not so much as read.
+	resp := e.getChat(e.keys, group.ID)
+	require.Zero(t, e.messaging.pointerLookups[key])
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	md := resp.Metadata
+	require.Equal(t, group.ID.Value, md.ChatId.Value)
+	require.Equal(t, chatpb.ChatType_GROUP, md.Type)
+	require.Equal(t, "Whales", md.Title)
+	require.True(t, md.LastActivity.AsTime().Equal(at(1)))
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 0}, md.GetRosterSummary()))
+	require.Len(t, md.GetRules().GetListener(), 1)
+	require.Equal(t, float64(requirement), md.GetRules().GetListener()[0].GetMinimumBalance().GetAmount().GetNativeAmount())
+	require.Len(t, md.GetPicture().GetRenditions(), len(wantPicture))
+	require.NotEmpty(t, md.GetPicture().GetRenditions()[0].GetBlob().GetDownloadUrl().GetUrl())
+	require.Empty(t, md.Members)
+	require.Nil(t, md.LastMessage)
+	require.Zero(t, md.LatestEventSequence)
+
+	// Funded to the requirement they satisfy the rules: the messaging state
+	// comes with the record. They are still not on the roster.
+	_, err := e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+	resp = e.getChat(e.keys, group.ID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	md = resp.Metadata
+	require.Equal(t, "Whales", md.Title)
+	require.Empty(t, md.Members)
+	require.Zero(t, e.messaging.pointerLookups[key])
+	require.NotNil(t, md.LastMessage)
+	require.Equal(t, uint64(7), md.LastMessage.MessageId.Value)
+	require.Equal(t, uint64(9), md.LatestEventSequence)
+
+	// Their admission is remembered for a while: drained, they still read
+	// within the window (see chat.Access).
+	e.ocpBalance.setBalance(e.keys.Proto(), 0)
+	resp = e.getChat(e.keys, group.ID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.NotNil(t, resp.Metadata.LastMessage)
+
+	// Joining puts them on the roster, and a member sees everything: their
+	// hydrated entry, their pointer, and the messaging state.
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, group.ID).Result)
+	resp = e.getChat(e.keys, group.ID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	md = resp.Metadata
+	require.Len(t, md.Members, 1)
+	require.Equal(t, e.userID.Value, md.Members[0].UserId.Value)
+	// One lookup by the join's own hydration, one by this read.
+	require.Equal(t, 2, e.messaging.pointerLookups[key])
+	require.Len(t, md.Members[0].Pointers, 1)
+	require.Equal(t, uint64(3), md.Members[0].Pointers[0].Value.Value)
+	require.Equal(t, uint64(7), md.LastMessage.MessageId.Value)
+	require.Equal(t, uint64(9), md.LatestEventSequence)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 1}, md.GetRosterSummary()))
+
+	// A group with no listener rules shows a non-member its record alone,
+	// however funded: only a rule can admit one to the rest (see chat.Access).
+	strangerID, strangerKeys := e.addUser()
+	_, err = e.accounts.Bind(e.ctx, strangerID, strangerKeys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(strangerKeys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+	open := &chat.Chat{
+		ID:            chat.MustGenerateGroupChatID(),
+		Type:          chatpb.ChatType_GROUP,
+		Members:       []*commonpb.UserId{founder},
+		Title:         "Legacy",
+		LastActivity:  at(1),
+		LastMessageID: &messagingpb.MessageId{Value: 2},
+	}
+	require.NoError(t, s.PutChat(e.ctx, open))
+	e.messaging.lastMessages[string(open.ID.Value)] = textMessage(2, founder, "members only")
+	e.messaging.latestEventSeqs[string(open.ID.Value)] = 2
+	resp = e.getChat(strangerKeys, open.ID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Equal(t, "Legacy", resp.Metadata.Title)
+	require.Nil(t, resp.Metadata.Rules)
+	require.Empty(t, resp.Metadata.Members)
+	require.Nil(t, resp.Metadata.LastMessage)
+	require.Zero(t, resp.Metadata.LatestEventSequence)
+
+	// A DM is unchanged: a non-member is denied outright, funded or not.
+	dm := e.putDM(at(1))
+	resp = e.getChat(strangerKeys, dm)
+	require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result)
+	require.Nil(t, resp.Metadata)
 }
 
 func testServer_GetDmChatFeed_TypeScoped(t *testing.T, s chat.Store) {
@@ -1405,8 +1535,10 @@ func testServer_JoinChat_OK(t *testing.T, s chat.Store) {
 	founder := model.MustGenerateUserID()
 	group := putGroupChat(t, s, "Open Group", at(1), founder, model.MustGenerateUserID())
 
-	// Before joining, the group is out of reach.
-	require.Equal(t, chatpb.GetChatResponse_DENIED, e.getChat(e.keys, group.ID).Result)
+	// Before joining, the group's record is visible but the joiner is not on it.
+	before := e.getChat(e.keys, group.ID)
+	require.Equal(t, chatpb.GetChatResponse_OK, before.Result)
+	require.Empty(t, before.Metadata.Members)
 
 	resp := e.mustJoinChat(e.keys, group.ID)
 	require.Equal(t, chatpb.JoinChatResponse_OK, resp.Result)
@@ -1638,12 +1770,14 @@ func testServer_LeaveChat_OK(t *testing.T, s chat.Store) {
 	resp := e.mustLeaveChat(e.keys, chatID)
 	require.Equal(t, chatpb.LeaveChatResponse_OK, resp.Result)
 
-	// The departure has landed: the caller is no longer a member and can no
-	// longer read the chat, while the other member is untouched.
+	// The departure has landed: the caller is no longer a member, and is shown
+	// the group as a non-member, while the other member is untouched.
 	isMember, err := s.IsMember(e.ctx, chatID, e.userID)
 	require.NoError(t, err)
 	require.False(t, isMember)
-	require.Equal(t, chatpb.GetChatResponse_DENIED, e.getChat(e.keys, chatID).Result)
+	after := e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, after.Result)
+	require.Empty(t, after.Metadata.Members)
 	members, err := s.GetMembers(e.ctx, chatID)
 	require.NoError(t, err)
 	require.Len(t, members, 1)
@@ -1733,12 +1867,12 @@ func testServer_LeaveChat_ThenRejoin(t *testing.T, s chat.Store) {
 	chatID := e.putGroup("Group", at(1), model.MustGenerateUserID())
 
 	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
-	require.Equal(t, chatpb.GetChatResponse_DENIED, e.getChat(e.keys, chatID).Result)
+	require.Empty(t, e.getChat(e.keys, chatID).Metadata.Members)
 
 	resp := e.mustJoinChat(e.keys, chatID)
 	require.Equal(t, chatpb.JoinChatResponse_OK, resp.Result)
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 2}, resp.Chat.GetRosterSummary()))
-	require.Equal(t, chatpb.GetChatResponse_OK, e.getChat(e.keys, chatID).Result)
+	require.Len(t, e.getChat(e.keys, chatID).Metadata.Members, 1)
 
 	// Two transitions, two announcements on each topic, in order.
 	e.waitForRosterUpdates(e.userID, chatID, 2)

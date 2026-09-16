@@ -22,7 +22,10 @@ func (s *Server) AdvancePointer(ctx context.Context, req *messagingpb.AdvancePoi
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
+	// A pointer is a per-member item in the chat's partition, so advancing one
+	// is a member's alone (see isMember): a non-member who may read the chat
+	// leaves no record in it.
+	if allowed, err := s.isMember(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
 	} else if !allowed {
 		return &messagingpb.AdvancePointerResponse{Result: messagingpb.AdvancePointerResponse_DENIED}, nil

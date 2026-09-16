@@ -46,7 +46,8 @@ import (
 //	          deliberately have no per-message inbox fan-out: a send touches
 //	          only the canonical chats item, and a user's group feed is
 //	          assembled at read time via the inverted gsiByUser. Joined members
-//	          are enumerated densely via the sparse gsiByJoinedAt.
+//	          are enumerated from the partition itself, which tombstone expiry
+//	          keeps near-dense (see getGroupMembers).
 //
 //	          The partition also holds one aggregates item, sk = "#meta" (see
 //	          skMeta), carrying the group's roster summary: member_count and
@@ -80,9 +81,11 @@ const (
 
 	// gsiByJoinedAt is the sparse (chat, joined_at) index on group_members.
 	// joined_at is present iff the member is currently joined (a left tombstone
-	// carries left_at instead), so only joined members appear in the index:
-	// enumerating a group's members is a dense query — no tombstone filtering,
-	// no matter how churned the group — ordered by join time, newest first.
+	// carries left_at instead), so only joined members appear in the index, in
+	// join order. Nothing queries it today — GetMembers reads the base
+	// partition (see getGroupMembers) — but it is maintained, and kept, for
+	// paging a large group's members newest-first without reading the whole
+	// roster.
 	gsiByJoinedAt = "by_joined_at"
 
 	// chatKeyPrefix prefixes a chat ID in the chats table pk and the dm_inbox
@@ -107,6 +110,7 @@ const (
 	attrUser               = "user" // member id, bare hex — see userIndexKey
 	attrJoinedAt           = "joined_at"
 	attrLeftAt             = "left_at"
+	attrExpiresAt          = "expires_at" // tombstones only: DynamoDB TTL, epoch seconds — see tombstoneTTL
 	attrLastActivity       = "last_activity"
 	attrLastMessageID      = "last_message_id"
 	attrMemberCount        = "member_count" // #meta item: joined member count
@@ -141,14 +145,32 @@ const (
 // reserved as unspecified, per proto enum convention, so a future proto member
 // state enum can adopt these values directly.
 //
-// A left member's item is a tombstone: it records that the user was formerly a
-// member (which "never a member" cannot), and makes re-adding an idempotent
-// update of the same key. Because the (chat, user) key is immutable across
-// state changes, paginating members by sort key stays cursor-stable under
-// concurrent joins and leaves.
+// A left member's item is a tombstone: it makes re-adding an idempotent update
+// of the same key, and carries the version of the departure (see
+// transitionMembership) so a reader following the user's transitions can tell
+// a delayed copy of the join it undid from news. Because the (chat, user) key
+// is immutable across state changes, paginating members by sort key stays
+// cursor-stable under concurrent joins and leaves.
+//
+// Tombstones are short-lived: the departure stamps expires_at and DynamoDB TTL
+// sweeps the item after tombstoneTTL, while a rejoin clears the stamp so an
+// active membership never expires. The version only matters for as long as a
+// copy of the departure's event could still be in flight — seconds, since a
+// forward times out in one and a full outbox drops rather than queues — and
+// the TTL is generous against that, so the user's slice of the table stays
+// bounded by their current memberships plus recent churn, however many groups
+// they have passed through. TTL is garbage collection, not semantics: an
+// expired item is returned until swept, so readers trust state, never the
+// clock. "Formerly a member" is thus not durable here; anything that must
+// outlive a membership belongs in a table of its own.
 const (
 	memberStateJoined = 1
 	memberStateLeft   = 2
+
+	// tombstoneTTL is how long after a departure its tombstone is eligible for
+	// the TTL sweep. The sweep itself runs within a couple of days of that, so
+	// the value states what the mechanism needs rather than when the row goes.
+	tombstoneTTL = time.Hour
 )
 
 type store struct {
@@ -305,7 +327,8 @@ func (s *store) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 // already-joined member is left untouched (preserving their original
 // joined_at), while a new or departed member is (re)joined with a fresh join
 // time. joined_at is present iff joined — the sparse gsiByJoinedAt keys off its
-// presence — so rejoining also clears the tombstone's left_at.
+// presence — so rejoining also clears the tombstone's left_at, and its
+// expires_at, so the rejoined row cannot be swept.
 //
 // The roster summary is read once, up front, and threaded through the
 // transitions: each successful one advances the local copy, so a batch costs
@@ -325,7 +348,7 @@ func (s *store) addGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 				attrSK: avS(userPK(userID)),
 			},
 			UpdateExpression: aws.String(fmt.Sprintf(
-				"SET #state = :joined, #user = :user, %s = :now, %s = :version REMOVE %s", attrJoinedAt, attrVersion, attrLeftAt,
+				"SET #state = :joined, #user = :user, %s = :now, %s = :version REMOVE %s, %s", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
 			)),
 			ConditionExpression:      aws.String("attribute_not_exists(#state) OR #state <> :joined"),
 			ExpressionAttributeNames: map[string]string{"#state": attrState, "#user": attrUser},
@@ -354,11 +377,12 @@ func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, 
 		return false, chat.RosterSummary{}, err
 	}
 
-	// Tombstone, don't delete: the item keeps recording that the user was
-	// formerly a member. Only a joined member transitions — the condition makes
-	// removing a non-member (or an unknown user) a no-op rather than an upsert
-	// of a malformed tombstone. Removing joined_at drops the member from the
-	// sparse gsiByJoinedAt.
+	// Tombstone, don't delete: the item keeps the departure's version for as
+	// long as it could matter, then expires (see tombstoneTTL). Only a joined
+	// member transitions — the condition makes removing a non-member (or an
+	// unknown user) a no-op rather than an upsert of a malformed tombstone.
+	// Removing joined_at drops the member from the sparse gsiByJoinedAt.
+	now := time.Now().UTC()
 	leave := &types.Update{
 		TableName: aws.String(s.groupMembersTable),
 		Key: map[string]types.AttributeValue{
@@ -366,14 +390,15 @@ func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, 
 			attrSK: avS(userPK(userID)),
 		},
 		UpdateExpression: aws.String(fmt.Sprintf(
-			"SET #state = :left, %s = :now, %s = :version REMOVE %s", attrLeftAt, attrVersion, attrJoinedAt,
+			"SET #state = :left, %s = :now, %s = :version, %s = :expires REMOVE %s", attrLeftAt, attrVersion, attrExpiresAt, attrJoinedAt,
 		)),
 		ConditionExpression:      aws.String("#state = :joined"),
 		ExpressionAttributeNames: map[string]string{"#state": attrState},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":joined": avN(memberStateJoined),
-			":left":   avN(memberStateLeft),
-			":now":    avN(uint64(time.Now().UTC().UnixNano())),
+			":joined":  avN(memberStateJoined),
+			":left":    avN(memberStateLeft),
+			":now":     avN(uint64(now.UnixNano())),
+			":expires": avN(uint64(now.Add(tombstoneTTL).Unix())),
 		},
 	}
 	changed, err := s.transitionMembership(ctx, chatID, leave, -1, &roster)
@@ -607,22 +632,31 @@ func (s *store) GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*com
 	return c.Members, nil
 }
 
-// getGroupMembers enumerates a group's joined members via the sparse
-// gsiByJoinedAt: tombstones have no joined_at, so they are not in the index and
-// every page is dense regardless of how churned the group is. Newest joiner
-// first, matching the index's feed ordering.
+// getGroupMembers enumerates a group's joined members from its base-table
+// partition rather than the sparse gsiByJoinedAt. The partition holds the
+// membership rows plus the #meta item, which the key condition's sort-key
+// prefix excludes, and the tombstones, which a filter drops; tombstones
+// expire (see tombstoneTTL), so the partition is dense up to the group's
+// recent churn and the filter scans little. Reading the table leaves a
+// strongly consistent read available if a caller ever needs one; the index
+// stays for paging a large group's members in join order, which this
+// whole-roster read does not need. Members come back in sort-key order —
+// arbitrary, but stable.
 func (s *store) getGroupMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*commonpb.UserId, error) {
 	members := make([]*commonpb.UserId, 0)
 	var startKey map[string]types.AttributeValue
 	for {
 		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
-			TableName:                 aws.String(s.groupMembersTable),
-			IndexName:                 aws.String(gsiByJoinedAt),
-			KeyConditionExpression:    aws.String("#pk = :pk"),
-			ExpressionAttributeNames:  map[string]string{"#pk": attrPK},
-			ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(chatPK(chatID))},
-			ScanIndexForward:          aws.Bool(false),
-			ExclusiveStartKey:         startKey,
+			TableName:                aws.String(s.groupMembersTable),
+			KeyConditionExpression:   aws.String("#pk = :pk AND begins_with(#sk, :user)"),
+			FilterExpression:         aws.String("#state = :joined"),
+			ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#sk": attrSK, "#state": attrState},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk":     avS(chatPK(chatID)),
+				":user":   avS(userKeyPrefix),
+				":joined": avN(memberStateJoined),
+			},
+			ExclusiveStartKey: startKey,
 		})
 		if err != nil {
 			return nil, err

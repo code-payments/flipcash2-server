@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/mr-tron/base58"
@@ -133,6 +134,33 @@ func (f *fakeChats) GetGroupRules(_ context.Context, chatID *commonpb.ChatId) (*
 		return nil, ErrChatNotFound
 	}
 	return c.Rules(), nil
+}
+
+// TestRulesFromProto_MinimumTransferValue pins the floor on a minimum balance
+// requirement to the currency's minimum transfer value: a penny for USD. The
+// floor is inclusive, and it is a floor on what was asked for — not the
+// half-unit rounding slack OCP allows on a fiat amount derived from a rate,
+// since a requirement is chosen, not quoted.
+func TestRulesFromProto_MinimumTransferValue(t *testing.T) {
+	rules := func(amount float64) *chatpb.Rules {
+		return &chatpb.Rules{Listener: []*chatpb.ListenerRules{{Kind: &chatpb.ListenerRules_MinimumBalance{MinimumBalance: &chatpb.MinimumBalanceRequirement{
+			Amount: &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: amount},
+		}}}}}
+	}
+
+	for _, amount := range []float64{0.01, 0.011, 1, 100} {
+		_, minimum, err := RulesFromProto(rules(amount))
+		require.NoError(t, err, "%v", amount)
+		require.Equal(t, amount, minimum.NativeAmount)
+	}
+	for _, amount := range []float64{0.009, 0.005, 0.0099999, 0, -0.01, -1, math.NaN(), math.Inf(1), math.Inf(-1)} {
+		_, _, err := RulesFromProto(rules(amount))
+		require.ErrorIs(t, err, ErrInvalidRules, "%v", amount)
+	}
+
+	require.Equal(t, 0.01, minimumTransferValue("usd"))
+	require.Equal(t, 1.0, minimumTransferValue("jpy"))
+	require.Equal(t, 0.001, minimumTransferValue("kwd"))
 }
 
 func TestChat_Rules(t *testing.T) {

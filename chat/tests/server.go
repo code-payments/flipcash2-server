@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -2074,10 +2075,15 @@ func testServer_StartChat_InvalidRules(t *testing.T, s chat.Store) {
 		// The record holds one requirement of each kind.
 		"duplicate staff":           {Listener: []*chatpb.ListenerRules{staff, staff, minimumBalance}},
 		"duplicate minimum balance": {Listener: []*chatpb.ListenerRules{minimumBalance, minimumBalanceRule("usd", 1)}},
-		// Only a USD requirement can be evaluated, and only a positive one
-		// requires anything.
-		"non-usd minimum balance": {Listener: []*chatpb.ListenerRules{minimumBalanceRule("eur", 1)}},
-		"zero minimum balance":    {Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 0)}},
+		// Only a USD requirement can be evaluated, and only one of at least the
+		// currency's minimum transfer value — a penny — requires anything.
+		// (A negative amount never reaches the server: the proto validator
+		// refuses it as an invalid request.)
+		"non-usd minimum balance":      {Listener: []*chatpb.ListenerRules{minimumBalanceRule("eur", 1)}},
+		"zero minimum balance":         {Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 0)}},
+		"sub-penny minimum balance":    {Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 0.009)}},
+		"half-penny minimum balance":   {Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 0.005)}},
+		"not-a-number minimum balance": {Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", math.NaN())}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			resp := e.mustStartGroupChat(e.keys, &chatpb.StartChatRequest_GroupChatParameters{Title: "Ruled", Rules: rules})

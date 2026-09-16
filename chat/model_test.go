@@ -121,12 +121,29 @@ func TestMustDeriveGroupChatID(t *testing.T) {
 	require.NotEqual(t, id.Value, MustDeriveGroupChatID(model.MustGenerateUserID(), key).Value)
 
 	// The exact derivation: a domain-separated digest over creator then key,
-	// truncated to the group ID width.
+	// truncated to the group ID width, with the version and variant bits
+	// stamped. Every other bit is the digest's.
 	h := sha256.New()
 	h.Write([]byte("flipcash:chat:group"))
 	h.Write(creator.Value)
 	h.Write(key.Value)
-	require.Equal(t, h.Sum(nil)[:GroupChatIDSize], id.Value)
+	digest := h.Sum(nil)[:GroupChatIDSize]
+	for i := range digest {
+		switch i {
+		case 6:
+			require.Equal(t, digest[i]&0x0f, id.Value[i]&0x0f)
+		case 8:
+			require.Equal(t, digest[i]&0x3f, id.Value[i]&0x3f)
+		default:
+			require.Equal(t, digest[i], id.Value[i])
+		}
+	}
+
+	// The result is a well-formed version 8 UUID.
+	parsed, err := uuid.FromBytes(id.Value)
+	require.NoError(t, err)
+	require.Equal(t, uuid.Version(8), parsed.Version())
+	require.Equal(t, uuid.RFC4122, parsed.Variant())
 
 	// A malformed user ID or key is a programming error: callers check the
 	// key's width before deriving.

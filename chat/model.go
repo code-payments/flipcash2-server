@@ -68,11 +68,15 @@ const groupChatIDDomain = "flipcash:chat:group"
 // is never trusted as a chat's identity.
 //
 // The digest is truncated to GroupChatIDSize bytes, which is what makes the
-// result a group ID by length. It panics if either input is not its fixed
-// width, which would be a programming error: all user IDs in the system are
-// UUIDs, and a request's key is checked to width before it reaches here.
-// Fixed-width inputs also make the concatenation unambiguous without length
-// prefixing.
+// result a group ID by length, and then stamped as a version 8 UUID (RFC 9562
+// section 5.8, the custom version, which the spec offers precisely for a
+// truncated hash like this one). Group IDs are opaque and nothing parses them,
+// but every group ID minted before this derivation was a random UUID, and the
+// stamp keeps that shape true of all of them, at a cost of six bits nobody
+// will miss. It panics if either input is not its fixed width, which would be
+// a programming error: all user IDs in the system are UUIDs, and a request's
+// key is checked to width before it reaches here. Fixed-width inputs also make
+// the concatenation unambiguous without length prefixing.
 func MustDeriveGroupChatID(creatorID *commonpb.UserId, key *chatpb.IdempotencyKey) *commonpb.ChatId {
 	if len(creatorID.GetValue()) != model.UserIDSize {
 		panic(fmt.Sprintf("user id must be %d bytes, got %d", model.UserIDSize, len(creatorID.GetValue())))
@@ -86,7 +90,11 @@ func MustDeriveGroupChatID(creatorID *commonpb.UserId, key *chatpb.IdempotencyKe
 	h.Write(creatorID.Value)
 	h.Write(key.Value)
 
-	return &commonpb.ChatId{Value: h.Sum(nil)[:GroupChatIDSize]}
+	id := h.Sum(nil)[:GroupChatIDSize]
+	id[6] = (id[6] & 0x0f) | 0x80 // version 8
+	id[8] = (id[8] & 0x3f) | 0x80 // RFC 9562 variant
+
+	return &commonpb.ChatId{Value: id}
 }
 
 // MustGenerateGroupChatID mints a random group chat ID. StartChat does not use

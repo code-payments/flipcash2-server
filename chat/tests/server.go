@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
@@ -86,6 +87,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_LeaveChat_DeniedForDm,
 		testServer_LeaveChat_ThenRejoin,
 		testServer_StartChat_OK,
+		testServer_StartChat_Idempotent,
 		testServer_StartChat_WithPicture,
 		testServer_StartChat_PictureNotAccepted,
 		testServer_StartChat_TitleModerated,
@@ -1943,14 +1945,36 @@ func fakeModerationResult(flagged bool, categories []string, err error) (*modera
 	return result, nil
 }
 
+// newIdempotencyKey mints a fresh StartChat key, as a client does for each new
+// group it starts.
+func newIdempotencyKey() *chatpb.IdempotencyKey {
+	id := uuid.New()
+	return &chatpb.IdempotencyKey{Value: id[:]}
+}
+
+// startGroupChat starts a new group under a fresh idempotency key. A test
+// exercising retries supplies its own key via startGroupChatWithKey.
 func (e *serverEnv) startGroupChat(keys model.KeyPair, params *chatpb.StartChatRequest_GroupChatParameters) (*chatpb.StartChatResponse, error) {
-	req := &chatpb.StartChatRequest{Parameters: &chatpb.StartChatRequest_Group{Group: params}}
+	return e.startGroupChatWithKey(keys, newIdempotencyKey(), params)
+}
+
+func (e *serverEnv) startGroupChatWithKey(keys model.KeyPair, key *chatpb.IdempotencyKey, params *chatpb.StartChatRequest_GroupChatParameters) (*chatpb.StartChatResponse, error) {
+	req := &chatpb.StartChatRequest{
+		Parameters:     &chatpb.StartChatRequest_Group{Group: params},
+		IdempotencyKey: key,
+	}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.StartChat(e.ctx, req)
 }
 
 func (e *serverEnv) mustStartGroupChat(keys model.KeyPair, params *chatpb.StartChatRequest_GroupChatParameters) *chatpb.StartChatResponse {
 	resp, err := e.startGroupChat(keys, params)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) mustStartGroupChatWithKey(keys model.KeyPair, key *chatpb.IdempotencyKey, params *chatpb.StartChatRequest_GroupChatParameters) *chatpb.StartChatResponse {
+	resp, err := e.startGroupChatWithKey(keys, key, params)
 	require.NoError(e.t, err)
 	return resp
 }
@@ -2052,10 +2076,114 @@ func testServer_StartChat_OK(t *testing.T, s chat.Store) {
 	onChatTopic, _ := e.rosterUpdatesOnChatTopic(md.ChatId)
 	require.Empty(t, onChatTopic)
 
-	// Every call mints a distinct group, even with the same title.
+	// Every call under a fresh key mints a distinct group, even with the same
+	// title; only the same key names the same group (see
+	// testServer_StartChat_Idempotent).
 	again := e.mustStartGroupChat(e.keys, groupParams("Sunday Hikers"))
 	require.Equal(t, chatpb.StartChatResponse_OK, again.Result)
 	require.NotEqual(t, md.ChatId.Value, again.Chat.ChatId.Value)
+}
+
+// testServer_StartChat_Idempotent pins that StartChat is retry-safe: the same
+// key from the same caller names the same group, however the retry differs
+// from the original and whatever has changed since, while a fresh key or
+// another caller gets a group of their own.
+func testServer_StartChat_Idempotent(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(startChatMinimumBalance)
+
+	key := newIdempotencyKey()
+	first := e.mustStartGroupChatWithKey(e.keys, key, groupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, first.Result)
+	chatID := first.Chat.ChatId
+
+	// The group's ID is a pure function of the caller and the key.
+	require.Equal(t, chat.MustDeriveGroupChatID(e.userID, key).Value, chatID.Value)
+	e.userObserver.WaitFor(t, func([]*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
+		return len(e.rosterUpdatesOnUserTopic(e.userID, chatID)) >= 1
+	})
+
+	// A retry is answered with the original: same group, result OK, the record
+	// as it stands.
+	retry := e.mustStartGroupChatWithKey(e.keys, key, groupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, retry.Result)
+	require.Equal(t, chatID.Value, retry.Chat.ChatId.Value)
+	require.Equal(t, "Sunday Hikers", retry.Chat.Title)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 0}, retry.Chat.GetRosterSummary()))
+	require.Len(t, retry.Chat.Members, 1)
+	require.Equal(t, e.userID.Value, retry.Chat.Members[0].UserId.Value)
+
+	// The key is the request's identity, not its parameters: a retry asking
+	// for something else still gets the original, unchanged.
+	renamed := e.mustStartGroupChatWithKey(e.keys, key, groupParams("Renamed"))
+	require.Equal(t, chatpb.StartChatResponse_OK, renamed.Result)
+	require.Equal(t, chatID.Value, renamed.Chat.ChatId.Value)
+	require.Equal(t, "Sunday Hikers", renamed.Chat.Title)
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, "Sunday Hikers", stored.Title)
+
+	// A retry is answered from the record, not re-checked: the moderator has
+	// since learned to flag the title, and the creator no longer holds the
+	// minimum balance, yet the group they already created is still theirs.
+	e.moderator.titleFlagged = true
+	e.moderator.titleCategories = []string{"solicitation"}
+	e.ocpBalance.setBalance(e.keys.Proto(), 0)
+	unchecked := e.mustStartGroupChatWithKey(e.keys, key, groupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, unchecked.Result)
+	require.Equal(t, chatID.Value, unchecked.Chat.ChatId.Value)
+	e.moderator.titleFlagged = false
+	e.moderator.titleCategories = nil
+	e.fundEnvUser(startChatMinimumBalance)
+
+	// One group exists, and only its creation was announced.
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	require.NoError(t, err)
+	require.Len(t, groups, 1)
+	require.Len(t, e.rosterUpdatesOnUserTopic(e.userID, chatID), 1)
+
+	// A fresh key from the same caller is a new group.
+	other := e.mustStartGroupChatWithKey(e.keys, newIdempotencyKey(), groupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, other.Result)
+	require.NotEqual(t, chatID.Value, other.Chat.ChatId.Value)
+
+	// The same key from another caller is that caller's own group: a key
+	// cannot name someone else's chat.
+	strangerID, strangerKeys := e.addUser()
+	_, err = e.accounts.Bind(e.ctx, strangerID, strangerKeys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(strangerKeys.Proto(), ocp_common.ToCoreMintQuarks(startChatMinimumBalance))
+	strangers := e.mustStartGroupChatWithKey(strangerKeys, key, groupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, strangers.Result)
+	require.NotEqual(t, chatID.Value, strangers.Chat.ChatId.Value)
+	require.Equal(t, chat.MustDeriveGroupChatID(strangerID, key).Value, strangers.Chat.ChatId.Value)
+	require.Equal(t, strangerID.Value, strangers.Chat.Members[0].UserId.Value)
+
+	// A creator who has since left still gets their group back on a retry,
+	// seen as the non-member they now are: no hydrated member of their own.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	departed := e.mustStartGroupChatWithKey(e.keys, key, groupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, departed.Result)
+	require.Equal(t, chatID.Value, departed.Chat.ChatId.Value)
+	require.Empty(t, departed.Chat.Members)
+	isMember, err := s.IsMember(e.ctx, chatID, e.userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
+
+	// A request without a key, or with one of the wrong width, is rejected
+	// before anything is read or written.
+	for _, key := range []*chatpb.IdempotencyKey{nil, {Value: []byte("short")}} {
+		req := &chatpb.StartChatRequest{
+			Parameters:     &chatpb.StartChatRequest_Group{Group: groupParams("Keyless")},
+			IdempotencyKey: key,
+		}
+		require.NoError(t, e.keys.Auth(req, &req.Auth))
+		_, err = e.client.StartChat(e.ctx, req)
+		require.Equal(t, codes.InvalidArgument, status.Code(err))
+	}
+	groups, err = s.GetGroupChatsForUser(e.ctx, e.userID)
+	require.NoError(t, err)
+	require.Len(t, groups, 1)
 }
 
 func testServer_StartChat_WithPicture(t *testing.T, s chat.Store) {

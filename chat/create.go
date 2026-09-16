@@ -43,6 +43,17 @@ import (
 // so they insert the new chat without a refetch. There is no one else to
 // tell.
 //
+// The RPC is retry-safe. The group's ID is derived from the caller and the
+// request's idempotency key (see MustDeriveGroupChatID), so a retry names the
+// same group, and one that already exists is answered from its record before
+// any check runs: a title the moderator has since learned to flag, a balance
+// that has since fallen below the minimum, or a staff gate since closed are
+// facts about a new group, not this one. Which parameters the retry carries
+// does not matter either; the key is the request's identity. A retry that
+// loses a race with its twin — both pass the read, one write lands — is caught
+// by the store's uniqueness condition and answered the same way. Nothing is
+// published for a retry: the creation was announced when it happened.
+//
 // The RPC shares the membership RPCs' staff gate (see
 // requireStaffForGroupManagementRPC).
 func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*chatpb.StartChatResponse, error) {
@@ -53,19 +64,35 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
+	// Validation requires the oneof to be set, and GROUP is its only variant, so
+	// anything else here is a proto this server predates.
+	params := req.GetGroup()
+	if params == nil {
+		return nil, status.Error(codes.InvalidArgument, "unsupported chat parameters")
+	}
+
+	// Validation also requires the key, at its fixed width; this is the check
+	// MustDeriveGroupChatID relies on.
+	if len(req.GetIdempotencyKey().GetValue()) != IdempotencyKeySize {
+		return nil, status.Error(codes.InvalidArgument, "idempotency key is required")
+	}
+	chatID := MustDeriveGroupChatID(userID, req.IdempotencyKey)
+
+	existing, err := s.chats.GetChatByID(ctx, chatID)
+	switch {
+	case err == nil:
+		return s.replayStartChat(ctx, log, userID, existing)
+	case !errors.Is(err, ErrChatNotFound):
+		log.With(zap.Error(err)).Warn("Failure getting chat")
+		return nil, status.Error(codes.Internal, "")
+	}
+
 	allowed, err := s.requireStaffForGroupManagementRPC(ctx, log, userID)
 	if err != nil {
 		return nil, err
 	}
 	if !allowed {
 		return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_DENIED}, nil
-	}
-
-	// Validation requires the oneof to be set, and GROUP is its only variant, so
-	// anything else here is a proto this server predates.
-	params := req.GetGroup()
-	if params == nil {
-		return nil, status.Error(codes.InvalidArgument, "unsupported chat parameters")
 	}
 
 	isStaffOnly, minimumListenerBalance, err := RulesFromProto(params.Rules)
@@ -98,12 +125,11 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		}, nil
 	}
 
-	chatID := MustGenerateGroupChatID()
-
 	// Every reason the blob domain gives for refusing the picture reads as one
 	// result: a client's recourse — pick or upload another picture — is the
 	// same for each of them. Anything else is a failure to attach, and the
-	// server's fault.
+	// server's fault. The grant is keyed by the chat ID, so a retry that
+	// reaches here again repeats it rather than orphaning one.
 	if params.Picture != nil {
 		err := s.media.SetAsChatPicture(ctx, userID, chatID, params.Picture)
 		switch {
@@ -130,7 +156,20 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		PictureBlobID:          params.Picture,
 		LastActivity:           time.Now().UTC(),
 	}
-	if err := s.chats.PutChat(ctx, c); err != nil {
+	err = s.chats.PutChat(ctx, c)
+	switch {
+	case errors.Is(err, ErrChatExists):
+		// A concurrent retry won the write since the read above. Its group is
+		// this request's group, so answer with it. The read back can still
+		// miss on a lagging replica; that is an error here, and the client's
+		// next retry finds the record on the way in.
+		existing, err := s.chats.GetChatByID(ctx, chatID)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure getting chat created by concurrent request")
+			return nil, status.Error(codes.Internal, "")
+		}
+		return s.replayStartChat(ctx, log, userID, existing)
+	case err != nil:
 		log.With(zap.Error(err)).Warn("Failure creating chat")
 		return nil, status.Error(codes.Internal, "")
 	}
@@ -165,6 +204,31 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 	return &chatpb.StartChatResponse{
 		Result: chatpb.StartChatResponse_OK,
 		Chat:   md,
+	}, nil
+}
+
+// replayStartChat answers a StartChat whose group c already exists: an earlier
+// attempt by the same caller — the ID embeds them, so it can be no one else —
+// created it, and this request is a retry (see StartChat). The response is the
+// group as GetChat would show the caller now: the roster has moved on since
+// creation, and the creator may even have left, in which case they see it as
+// the non-member they are. Nothing is published; a retry is not news.
+func (s *Server) replayStartChat(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, c *Chat) (*chatpb.StartChatResponse, error) {
+	standing, err := s.access.StandingWithRules(ctx, c.ID, c.Rules(), userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure determining chat standing")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	metadata, err := s.hydrate(ctx, userID, standing, []*Chat{c})
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	return &chatpb.StartChatResponse{
+		Result: chatpb.StartChatResponse_OK,
+		Chat:   metadata[0],
 	}, nil
 }
 

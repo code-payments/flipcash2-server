@@ -5,9 +5,7 @@ import (
 
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
-	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
-	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/chat"
 )
 
@@ -20,7 +18,7 @@ type Server struct {
 	media    Media
 	messages Store
 
-	rules *chat.RuleEvaluator
+	access *chat.Access
 
 	sender *Sender
 
@@ -32,11 +30,11 @@ func NewServer(
 
 	authz auth.Authorizer,
 
-	accounts account.Store,
-	balances *balance.Client,
 	chats chat.Store,
 	media Media,
 	messages Store,
+
+	access *chat.Access,
 
 	sender *Sender,
 ) *Server {
@@ -49,7 +47,7 @@ func NewServer(
 		media:    media,
 		messages: messages,
 
-		rules: chat.NewRuleEvaluator(accounts, balances, chats),
+		access: access,
 
 		sender: sender,
 	}

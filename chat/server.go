@@ -22,7 +22,6 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
-	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/moderation"
 )
@@ -160,7 +159,8 @@ type Server struct {
 	moderator moderation.Client
 	profiles  ProfileReader
 
-	rules *RuleEvaluator
+	rules  *RuleEvaluator
+	access *Access
 
 	userEventBus UserEventPublisher
 	chatEventBus ChatEventPublisher
@@ -184,13 +184,14 @@ func NewServer(
 	authz auth.Authorizer,
 
 	accounts account.Store,
-	balances *balance.Client,
 	blocklist BlocklistReader,
 	chats Store,
 	media Media,
 	messaging MessagingReader,
 	moderator moderation.Client,
 	profiles ProfileReader,
+
+	access *Access,
 
 	userEventBus UserEventPublisher,
 	chatEventBus ChatEventPublisher,
@@ -210,7 +211,8 @@ func NewServer(
 		moderator: moderator,
 		profiles:  profiles,
 
-		rules: NewRuleEvaluator(accounts, balances, chats),
+		rules:  access.Rules(),
+		access: access,
 
 		userEventBus: userEventBus,
 		chatEventBus: chatEventBus,
@@ -221,6 +223,33 @@ func NewServer(
 	}
 }
 
+// GetChat returns one chat's metadata as the caller may see it.
+//
+// A DM is its two members' alone: anyone else is DENIED. A group's record is
+// returned to every registered user, member or not — its title, picture,
+// rules and roster summary are what a user weighs before joining, and what a
+// client renders for a group it was pointed at (see Access for the rules). What
+// the caller's standing decides is how much of the group comes with it:
+//
+//   - A member sees everything, as before: the record, themselves as the
+//     hydrated member with their pointers, and the group's messaging state —
+//     its last message and head event sequence.
+//   - A non-member who satisfies the group's listener rules sees the record
+//     and its messaging state, so a group they may read previews like one they
+//     are in. They are not on the roster, so no member is hydrated: an empty
+//     Members is how the metadata says the viewer is not a member.
+//   - A non-member who does not satisfy the rules sees the record alone. The
+//     messaging state is a member's or a qualifying reader's, and is withheld;
+//     the rules are carried so the client can show what would admit them.
+//
+// The group's picture is returned in every case: it is part of the record, as
+// the title is, and the two are what identify a group — a group's picture is
+// readable by anyone. Its download URLs are resolved here without a blob ACL
+// check on that basis. The blob domain itself still resolves a chat-scoped
+// grant against membership, so a non-member's GetBlobs on the same picture, or
+// on media in a message they previewed, is denied; that is accepted, since a
+// non-member's read access is short-lived by nature and the URLs hydrated here
+// and on the messages are what a previewing client renders from.
 func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chatpb.GetChatResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
@@ -230,8 +259,8 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
 	// The canonical record first: its absence is the only thing that
-	// distinguishes NOT_FOUND from DENIED, since IsMember reports a missing chat
-	// as a plain non-membership.
+	// distinguishes NOT_FOUND from DENIED, since a membership check reports a
+	// missing chat as a plain non-membership.
 	c, err := s.chats.GetChatByID(ctx, req.ChatId)
 	switch {
 	case errors.Is(err, ErrChatNotFound):
@@ -241,19 +270,20 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	// Authorize on a keyed membership check rather than by scanning the member
-	// list, so a group's membership is never enumerated on behalf of a caller who
-	// turns out not to be a member.
-	isMember, err := s.chats.IsMember(ctx, req.ChatId, userID)
+	// The caller's standing is a keyed membership check rather than a scan of
+	// the member list, so a group's membership is never enumerated on behalf of
+	// a caller who turns out not to be a member — and, for a non-member of a
+	// group, the listener rules.
+	standing, err := s.access.StandingWithRules(ctx, c.ID, c.Rules(), userID)
 	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure checking chat membership")
+		log.With(zap.Error(err)).Warn("Failure determining chat standing")
 		return nil, status.Error(codes.Internal, "")
 	}
-	if !isMember {
+	if !standing.IsMember && !IsGroupChatID(c.ID) {
 		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
 	}
 
-	metadata, err := s.hydrate(ctx, userID, []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, standing, []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
 		return nil, status.Error(codes.Internal, "")
@@ -265,13 +295,28 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 	}, nil
 }
 
-// hydrate builds the proto metadata for a set of chats the viewer is a member
-// of, batching the reads across the whole set: every chat's last message in
-// one call, every group's roster summary in one call, every hydrated member's
-// pointers in one call, every chat's head event sequence in one call, every
-// member's display name in one call, and every DM member's phone number in one
-// call. The calls are independent and run concurrently, so a page costs the
-// slowest of them rather than their sum.
+// hydrate builds the proto metadata for a set of chats as a viewer of the given
+// standing sees them, batching the reads across the whole set: every chat's
+// last message in one call, every group's roster summary in one call, every
+// hydrated member's pointers in one call, every chat's head event sequence in
+// one call, every member's display name in one call, and every DM member's
+// phone number in one call. The calls are independent and run concurrently, so
+// a page costs the slowest of them rather than their sum.
+//
+// The standing is the viewer's towards every chat in the set (see Standing),
+// and decides what is hydrated at all: what it withholds is never read, not
+// read and dropped. Most callers hydrate chats the viewer is a member of — a
+// feed built from their memberships, a join or creation that just landed — and
+// pass memberStanding. GetChat hydrates a group for whoever asks, and passes
+// what Access found:
+//
+//   - A non-member has no hydrated member in a group: they are not on the
+//     roster, and a pointer stored for them — a former member's — is not
+//     theirs to see. A DM's members are its record's, whoever the viewer is.
+//   - A viewer who cannot read gets no messaging state: no last message, no
+//     head event sequence, no pointers. The record's own fields — title,
+//     picture, rules, roster summary, last activity — are hydrated for anyone
+//     the caller admits to the record at all.
 //
 // A DM's members are its two participants, carried on the canonical record. A
 // group's roster lives in its own records and is not enumerated here: the
@@ -300,12 +345,13 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 // A group's picture is stored as the blob holding its ORIGINAL; every picture
 // across the set is expanded to its full rendition set, each with a short-lived
 // download URL, in one batched read — so a client renders the group's avatar
-// without a follow-up GetBlobs. That is safe without an ACL check here because
-// every chat in the set is one the viewer is a member of, and a chat's picture
-// is granted to the chat's members when it is set. A picture whose original no
-// longer resolves is left with its stored ORIGINAL for the client to treat as
-// unavailable, rather than failing the whole read.
-func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats []*Chat) ([]*chatpb.Metadata, error) {
+// without a follow-up GetBlobs. That is done without an ACL check here: a
+// chat's picture is granted to the chat's members when it is set, and a
+// non-member is shown it as part of the record that identifies the group (see
+// GetChat). A picture whose original no longer resolves is left with its stored
+// ORIGINAL for the client to treat as unavailable, rather than failing the
+// whole read.
+func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standing Standing, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
 	var pointerRefs []PointerRef
@@ -315,21 +361,32 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 	dmPeerByChat := make(map[string]*commonpb.UserId)
 	uniquePeerIDs := make(map[string]*commonpb.UserId)
 	uniquePictureBlobIDs := make(map[string]*blobpb.BlobId)
-	for _, c := range chats {
+	hydratedMembers := make([][]*commonpb.UserId, len(chats))
+	for i, c := range chats {
 		// The members to hydrate: a DM's participants, or the viewer alone in a
-		// group (see above).
+		// group they are a member of (see above).
 		members := c.Members
 		if IsGroupChatID(c.ID) {
-			members = []*commonpb.UserId{viewerID}
+			members = nil
+			if standing.IsMember {
+				members = []*commonpb.UserId{viewerID}
+			}
 			groupChatIDs = append(groupChatIDs, c.ID)
 		}
-		pointerRefs = append(pointerRefs, PointerRef{ChatID: c.ID, Members: members})
-		if c.LastMessageID != nil {
-			msgRefs = append(msgRefs, MessageRef{ChatID: c.ID, MessageID: c.LastMessageID})
-			// A chat's head is 0 unless it has at least one message, which is
-			// exactly when it has a last message ID. Skip the rest: their head is
-			// the proto default 0.
-			seqChatIDs = append(seqChatIDs, c.ID)
+		hydratedMembers[i] = members
+
+		// Messaging state is a reader's alone (see above).
+		if standing.CanListen {
+			if len(members) > 0 {
+				pointerRefs = append(pointerRefs, PointerRef{ChatID: c.ID, Members: members})
+			}
+			if c.LastMessageID != nil {
+				msgRefs = append(msgRefs, MessageRef{ChatID: c.ID, MessageID: c.LastMessageID})
+				// A chat's head is 0 unless it has at least one message, which is
+				// exactly when it has a last message ID. Skip the rest: their head is
+				// the proto default 0.
+				seqChatIDs = append(seqChatIDs, c.ID)
+			}
 		}
 		if c.PictureBlobID != nil {
 			uniquePictureBlobIDs[string(c.PictureBlobID.Value)] = c.PictureBlobID
@@ -381,23 +438,31 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 		blockedPeers           map[string]bool
 		pictureRenditions      map[string][]*blobpb.Rendition
 	)
+	// A read with nothing to ask for is skipped, not made: a viewer's standing
+	// may have withheld a whole class of state from the set.
 	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() (err error) {
-		lastMessages, err = s.messaging.LastMessages(gctx, msgRefs)
-		return err
-	})
+	if len(msgRefs) > 0 {
+		g.Go(func() (err error) {
+			lastMessages, err = s.messaging.LastMessages(gctx, msgRefs)
+			return err
+		})
+	}
 	g.Go(func() (err error) {
 		rosterSummaries, err = s.chats.GetGroupRosterSummaries(gctx, groupChatIDs)
 		return err
 	})
-	g.Go(func() (err error) {
-		pointers, err = s.messaging.Pointers(gctx, pointerRefs)
-		return err
-	})
-	g.Go(func() (err error) {
-		latestEventSeqs, err = s.messaging.LatestEventSequences(gctx, seqChatIDs)
-		return err
-	})
+	if len(pointerRefs) > 0 {
+		g.Go(func() (err error) {
+			pointers, err = s.messaging.Pointers(gctx, pointerRefs)
+			return err
+		})
+	}
+	if len(seqChatIDs) > 0 {
+		g.Go(func() (err error) {
+			latestEventSeqs, err = s.messaging.LatestEventSequences(gctx, seqChatIDs)
+			return err
+		})
+	}
 	g.Go(func() (err error) {
 		phoneNumbersByUserId, err = s.profiles.GetPhoneNumbers(gctx, privateProfileUserIDs)
 		return err
@@ -426,13 +491,17 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 		md := c.ToProto()
 		if IsGroupChatID(c.ID) {
 			// ToProto projects the canonical record, which carries neither a
-			// group's members nor its summary. Every group in the set exists, but
-			// the batch read is eventually consistent, so a group written moments
-			// ago may be absent and read as a zero summary, and one moved
+			// group's members nor its summary. The members are the hydrated ones
+			// — the viewer, or no one (see above). Every group in the set exists,
+			// but the batch read is eventually consistent, so a group written
+			// moments ago may be absent and read as a zero summary, and one moved
 			// moments ago may read one transition behind. A caller that has
 			// just written the group or its roster holds the authoritative
 			// summary and should overwrite this one with it.
-			md.Members = []*chatpb.Member{{UserId: &commonpb.UserId{Value: append([]byte(nil), viewerID.Value...)}}}
+			md.Members = make([]*chatpb.Member, 0, len(hydratedMembers[i]))
+			for _, m := range hydratedMembers[i] {
+				md.Members = append(md.Members, &chatpb.Member{UserId: &commonpb.UserId{Value: append([]byte(nil), m.Value...)}})
+			}
 			md.RosterSummary = rosterSummaries[key].ToProto()
 		}
 		md.LastMessage = lastMessages[key]

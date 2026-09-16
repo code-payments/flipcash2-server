@@ -27,8 +27,8 @@ import (
 // Joining is where a group's listener rules are enforced (see RuleEvaluator):
 // a user who does not satisfy them is refused, and never becomes a member.
 // Membership is checked first, so the rules are never evaluated on behalf of a
-// current member re-joining — reads gate on membership alone, and so does a
-// no-op join. Leaving has no rule to satisfy.
+// current member re-joining — a member's reads gate on membership alone (see
+// Access), and so does a no-op join. Leaving has no rule to satisfy.
 //
 // Each transition that actually happens is broadcast as a RosterUpdate to the
 // chat's members and to the affected user (see publishRosterUpdate). A join or
@@ -106,7 +106,7 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, memberStanding, []*Chat{c})
 	if err != nil {
 		// The join has landed; only the read back failed. A retry is the
 		// idempotent path above and returns the metadata then.

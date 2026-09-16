@@ -195,6 +195,105 @@ func TestStreamSession_VersionGate(t *testing.T) {
 	require.False(t, on("chat:d"))
 }
 
+// TestStreamSession_RollbackAfterSupersededAttach pins that a rollback is
+// gated on the attach whose registration failed, not on the version last
+// applied: a newer join refused as a duplicate while the registration was in
+// flight — delivered as a transition, or read by the open's seed — shares
+// that registration, so its failure still takes the stream off the key and
+// restores the displaced gate, and the reconcile can then re-attach at the
+// newer version. Gating on the version would leave the key held with no
+// handle and refuse every repair.
+func TestStreamSession_RollbackAfterSupersededAttach(t *testing.T) {
+	// Each case gets its own registry, so a key one leaves attached cannot
+	// stand in for another's.
+	newCase := func(id string, user int) (*streamSession, func(key string) bool) {
+		r := newStreamRegistry()
+		s := newTestSession(id, user, r)
+		require.True(t, s.open())
+		return s, func(key string) bool { return len(targets(r, key, nil)) == 1 }
+	}
+
+	t.Run("transition", func(t *testing.T) {
+		s, on := newCase("s1", 1)
+
+		// A v1 join's registration is in flight when a v3 rejoin arrives (its
+		// v2 leave delayed or lost): refused as a duplicate, v3 recorded.
+		require.True(t, s.attach("chat:a", 1))
+		require.False(t, s.attach("chat:a", 3))
+		require.True(t, on("chat:a"))
+
+		// The v1 registration fails: the stream comes off the key, and the
+		// gate goes back to nothing, so the reconcile's read (joined at v3)
+		// re-attaches and lands its handle.
+		s.rollback("chat:a", 1)
+		require.False(t, on("chat:a"))
+		require.NotContains(t, s.displaced, "chat:a")
+		require.True(t, s.attach("chat:a", 3))
+		require.True(t, on("chat:a"))
+		handle := &cluster.SubscriptionHandle{}
+		require.True(t, s.setHandle("chat:a", handle))
+		require.Same(t, handle, s.detach("chat:a", 4))
+
+		// The delayed v2 leave arriving before the repair is harmless: it
+		// records v2 off the key, and the v3 join still applies over it.
+		require.True(t, s.attach("chat:b", 1))
+		require.False(t, s.attach("chat:b", 3))
+		s.rollback("chat:b", 1)
+		require.Nil(t, s.detach("chat:b", 2))
+		require.False(t, on("chat:b"))
+		require.True(t, s.attach("chat:b", 3))
+		require.True(t, on("chat:b"))
+
+		// A stale copy of the failed v1 join can retry, and a later v3 attach
+		// refused as its duplicate still ends registered by the v1 handle.
+		require.True(t, s.attach("chat:c", 1))
+		require.False(t, s.attach("chat:c", 3))
+		s.rollback("chat:c", 1)
+		require.True(t, s.attach("chat:c", 1))
+		require.False(t, s.attach("chat:c", 3))
+		require.True(t, s.setHandle("chat:c", &cluster.SubscriptionHandle{}))
+		require.True(t, on("chat:c"))
+	})
+
+	t.Run("seed", func(t *testing.T) {
+		s, on := newCase("s2", 2)
+
+		// The open's read reflects a v3 rejoin the v1 transition's in-flight
+		// registration predates: nothing to attach, v3 recorded.
+		require.True(t, s.attach("chat:a", 1))
+		attached, released := s.seed([]topicSeed{{key: "chat:a", version: 3, joined: true}})
+		require.Empty(t, attached)
+		require.Empty(t, released)
+
+		s.rollback("chat:a", 1)
+		require.False(t, on("chat:a"))
+		require.True(t, s.attach("chat:a", 3))
+		require.True(t, on("chat:a"))
+	})
+
+	t.Run("settled key is left alone", func(t *testing.T) {
+		s, on := newCase("s3", 3)
+
+		// Detached meanwhile: the leave's state stands, and its version.
+		require.True(t, s.attach("chat:a", 1))
+		require.Nil(t, s.detach("chat:a", 2))
+		s.rollback("chat:a", 1)
+		require.False(t, on("chat:a"))
+		require.False(t, s.attach("chat:a", 1))
+		require.True(t, s.attach("chat:a", 3))
+
+		// Landed by an earlier registrant meanwhile: the handle stands.
+		handle := &cluster.SubscriptionHandle{}
+		require.True(t, s.attach("chat:b", 1))
+		require.Nil(t, s.detach("chat:b", 2))
+		require.True(t, s.attach("chat:b", 3))
+		require.True(t, s.setHandle("chat:b", handle))
+		s.rollback("chat:b", 3)
+		require.True(t, on("chat:b"))
+		require.Same(t, handle, s.detach("chat:b", 4))
+	})
+}
+
 // TestStreamSession_SeededVersions pins that the versions an open seeds from
 // the membership records gate what follows: a transition the record already
 // reflects is stale from the first event, and a newer one applies. A
@@ -285,6 +384,19 @@ func TestStreamSession_SeedMergesWithTransitions(t *testing.T) {
 	require.Empty(t, attached)
 	require.Equal(t, []*cluster.SubscriptionHandle{handleA}, released)
 	require.False(t, on("chat:a"))
+
+	// So does one that detaches a key whose registration is still in flight:
+	// chat:d departed at v3 takes the stream off with no handle to return,
+	// and settles the key — the attach's displaced watermark goes with it, as
+	// a detach would drop it, so the registrant's rollback has nothing to
+	// restore and the handle it lands is refused.
+	require.Contains(t, s.displaced, "chat:d")
+	attached, released = s.seed([]topicSeed{{key: "chat:d", version: 3, joined: false}})
+	require.Empty(t, attached)
+	require.Empty(t, released)
+	require.False(t, on("chat:d"))
+	require.NotContains(t, s.displaced, "chat:d")
+	require.False(t, s.setHandle("chat:d", &cluster.SubscriptionHandle{}))
 
 	// The batch lands for chat:c — but a leave at v2 detached it meanwhile,
 	// so its handle is refused for the caller to release; the user handle is

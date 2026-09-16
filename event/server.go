@@ -326,21 +326,18 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 	// a publish racing the open could resolve the row yet find no stream
 	// behind it — so the user key is registered up front, before the first
 	// Subscribe below, and each chat key before its own row (see seed).
-	session := newStreamSession(streamID, localStream{stream: ss, userID: userID}, userStreamKey(userID), s.streams)
-	if !session.open() {
-		log.Debug("Rejecting stream on shut-down server")
-		return status.Error(codes.Unavailable, "server is draining")
-	}
-
-	// Into the index before the membership records are read: from here on
-	// every transition delivered on the user's topic moves this stream (see
-	// followMembership), and the records are merged in behind them through
-	// the same version gate (see streamSession.seed), so a record and a
-	// transition that cross — the read reflecting a transition already
-	// applied, or a transition landing on a record that predates it —
-	// resolve to the newer of the two, not the later-arriving. Departed
-	// records seed a version too, so a delayed copy of a join the user has
-	// since undone is stale on arrival rather than news.
+	//
+	// And into the index before even that, so that from the first event the
+	// user key can deliver, every transition on it moves this stream (see
+	// followMembership): indexed after registering, a transition landing in
+	// between would notify the stream and move nothing. The membership
+	// records are then merged in behind the transitions through the same
+	// version gate (see streamSession.seed), so a record and a transition
+	// that cross — the read reflecting a transition already applied, or a
+	// transition landing on a record that predates it — resolve to the newer
+	// of the two, not the later-arriving. Departed records seed a version
+	// too, so a delayed copy of a join the user has since undone is stale on
+	// arrival rather than news.
 	//
 	// What remains uncovered is a transition this server never hears of: one
 	// published before this server's row for the user's topic lands (below)
@@ -348,7 +345,21 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 	// also predates, by its timing or by the inverted membership index's
 	// replication lag. The reconcile sweep re-reads for those (see
 	// reconcileMembership).
+	session := newStreamSession(streamID, localStream{stream: ss, userID: userID}, userStreamKey(userID), s.streams)
 	s.sessions.add(session)
+	if !session.open() {
+		// Indexed but never registered: a transition may still have found the
+		// session and attached a chat key before the registry began draining,
+		// so it is torn down as a closed stream is, not merely unindexed.
+		s.sessions.remove(session)
+		if handles := session.close(); len(handles) > 0 {
+			closeCtx, cancel := context.WithTimeout(context.Background(), subscriptionCloseTimeout)
+			s.releaseHandles(closeCtx, handles)
+			cancel()
+		}
+		log.Debug("Rejecting stream on shut-down server")
+		return status.Error(codes.Unavailable, "server is draining")
+	}
 
 	defer func() {
 		log.Debug("Closing streamer")

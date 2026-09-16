@@ -57,17 +57,21 @@ type streamSession struct {
 	// versions is the roster version of the last transition applied per chat
 	// key, kept after the key is detached (see above). displaced is, per chat
 	// key whose attach has a registration in flight, the watermark that
-	// attach overwrote, for rollback to restore should the registration fail;
-	// it is dropped once the key's fate is settled (see setHandle, detach).
+	// attach overwrote, for rollback to restore should the registration fail,
+	// and the version of the attach itself, which is what names the
+	// registrant entitled to roll it back; it is dropped once the key's fate
+	// is settled (see setHandle, detach).
 	versions  map[string]uint64
 	displaced map[string]watermark
 }
 
-// watermark is a chat key's version gate as it stood before an attach: the
-// version last applied there, or none.
+// watermark is a chat key's version gate as it stood before an attach — the
+// version last applied there, or none — and the version of the attach that
+// displaced it, whose registration is in flight.
 type watermark struct {
-	version uint64
-	seen    bool
+	version    uint64
+	seen       bool
+	attachedAt uint64
 }
 
 func newStreamSession(id string, local localStream, userKey string, registry *streamRegistry) *streamSession {
@@ -131,6 +135,7 @@ func (s *streamSession) seed(seeds []topicSeed) (attached []string, released []*
 			attached = append(attached, seed.key)
 		case !seed.joined && held:
 			delete(s.topics, seed.key)
+			delete(s.displaced, seed.key)
 			removed = append(removed, seed.key)
 			if h != nil {
 				released = append(released, h)
@@ -210,7 +215,7 @@ func (s *streamSession) attach(chatKey string, version uint64) bool {
 		return false
 	}
 	s.topics[chatKey] = nil
-	s.displaced[chatKey] = watermark{version: last, seen: seen}
+	s.displaced[chatKey] = watermark{version: last, seen: seen, attachedAt: version}
 	return true
 }
 
@@ -238,37 +243,42 @@ func (s *streamSession) setHandle(chatKey string, h *cluster.SubscriptionHandle)
 
 // rollback undoes an attach whose cluster registration failed: the stream
 // leaves the key, and the version gate goes back to what the attach
-// displaced, so a later copy of the same join can try again while whatever
-// was stale before it stays stale. Both are gated on the version still being
-// the one the attach recorded: if a newer transition has since moved the key
-// — a leave, or a leave and rejoin whose own registration is in flight — its
-// state stands, and the failed attach has nothing left to undo. Nor is there
-// anything to undo if the key already holds a handle: an earlier registrant
-// for the same key landed it after this attach (see setHandle), so the
-// stream is under the key and registered, which is the join's intent.
-// Undoing would strand that handle. A key already released is a no-op.
+// displaced, so a later copy of the same join — or the reconcile — can try
+// again while whatever was stale before it stays stale. Both are gated on the
+// key's registration in flight still being this attach's (see watermark): if
+// the key has since been settled — detached by a leave, or landed by an
+// earlier registrant for the same key (see setHandle), so the stream is under
+// the key and registered, which is the join's intent — there is nothing left
+// to undo, and undoing would strand a handle or unseat a newer transition's
+// state. A key already released is a no-op.
+//
+// The gate is the attach, not the version last applied: a newer join refused
+// as a duplicate while this registration was in flight (see attach) records
+// its version but shares this attach's registration, so this registration's
+// failure is still the key's failure. Restoring the displaced gate then lets
+// the reconcile re-attach at the newer version; gating on the version instead
+// would leave the key held with no handle and no way to repair it.
 func (s *streamSession) rollback(chatKey string, version uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if last, seen := s.versions[chatKey]; !seen || last != version {
+	prior, inflight := s.displaced[chatKey]
+	if !inflight || prior.attachedAt != version {
 		return
 	}
-	h, attached := s.topics[chatKey]
-	if attached && h != nil {
-		delete(s.displaced, chatKey)
-		return
-	}
-	if attached {
+	delete(s.displaced, chatKey)
+	if h, attached := s.topics[chatKey]; attached {
+		if h != nil {
+			return
+		}
 		delete(s.topics, chatKey)
 		s.registry.remove(s.id, []string{chatKey})
 	}
-	if prior, ok := s.displaced[chatKey]; ok && prior.seen {
+	if prior.seen {
 		s.versions[chatKey] = prior.version
 	} else {
 		delete(s.versions, chatKey)
 	}
-	delete(s.displaced, chatKey)
 }
 
 // detach applies a departure at the given roster version: it takes the

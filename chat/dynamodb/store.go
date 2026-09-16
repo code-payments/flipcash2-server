@@ -486,9 +486,9 @@ func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatI
 		}
 		codes := []string{aws.ToString(reasons[0].Code), aws.ToString(reasons[1].Code)}
 
-		if attempt+1 >= maxMembershipAttempts {
-			return false, fmt.Errorf("membership transition for chat %x: %w", chatID.Value, err)
-		}
+		// The budget applies to the retries alone: a no-op is a no-op on the
+		// last attempt too, and is reported as one, not as an exhausted retry.
+		exhausted := attempt+1 >= maxMembershipAttempts
 		switch {
 		case codes[0] == conditionalCheckFailedCode:
 			// Already in the target state: nothing happened, nothing to record.
@@ -500,6 +500,9 @@ func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatI
 			// with the failure; chain from it and go again, immediately — this is
 			// a lost race, not a throttled write. Nothing deletes the item, so
 			// its absence here is a broken invariant, not a state to retry from.
+			if exhausted {
+				return false, fmt.Errorf("membership transition for chat %x: %w", chatID.Value, err)
+			}
 			if len(reasons[1].Item) == 0 {
 				return false, fmt.Errorf("chat %x lost its %s item during a membership transition", chatID.Value, skMeta)
 			}
@@ -509,6 +512,9 @@ func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatI
 			}
 			*roster = current
 		case isTransactionConflict(codes):
+			if exhausted {
+				return false, fmt.Errorf("membership transition for chat %x: %w", chatID.Value, err)
+			}
 			select {
 			case <-ctx.Done():
 				return false, ctx.Err()

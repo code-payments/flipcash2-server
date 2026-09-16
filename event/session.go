@@ -1,7 +1,9 @@
 package event
 
 import (
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/code-payments/flipcash2-server/cluster"
 )
@@ -53,70 +55,125 @@ type streamSession struct {
 	topics     map[string]*cluster.SubscriptionHandle
 
 	// versions is the roster version of the last transition applied per chat
-	// key, kept after the key is detached (see above).
-	versions map[string]uint64
+	// key, kept after the key is detached (see above). displaced is, per chat
+	// key whose attach has a registration in flight, the watermark that
+	// attach overwrote, for rollback to restore should the registration fail;
+	// it is dropped once the key's fate is settled (see setHandle, detach).
+	versions  map[string]uint64
+	displaced map[string]watermark
+}
+
+// watermark is a chat key's version gate as it stood before an attach: the
+// version last applied there, or none.
+type watermark struct {
+	version uint64
+	seen    bool
 }
 
 func newStreamSession(id string, local localStream, userKey string, registry *streamRegistry) *streamSession {
 	return &streamSession{
-		id:       id,
-		local:    local,
-		userKey:  userKey,
-		registry: registry,
-		topics:   make(map[string]*cluster.SubscriptionHandle),
-		versions: make(map[string]uint64),
+		id:        id,
+		local:     local,
+		userKey:   userKey,
+		registry:  registry,
+		topics:    make(map[string]*cluster.SubscriptionHandle),
+		versions:  make(map[string]uint64),
+		displaced: make(map[string]watermark),
 	}
 }
 
 // topicSeed is one of the user's membership records as read at open: the
 // chat's key, the version of the user's last transition there, and whether
 // that transition left them joined. Every record seeds a version; only a
-// joined one puts the stream under its key.
+// joined one puts the stream under its key (see seed).
 type topicSeed struct {
 	key     string
 	version uint64
 	joined  bool
 }
 
-// open registers the stream in the registry under its user key and the key of
-// every joined seed, with no cluster handles yet (see setHandles), and seeds
-// every seed's version — joined or departed — so that a transition the record
-// already reflects is stale. It reports false, having registered nothing, if
-// the registry is draining.
-func (s *streamSession) open(seeds []topicSeed) bool {
+// open registers the stream in the registry under its user key, with no
+// cluster handle yet (see setHandles) and no chat keys (see seed). It reports
+// false, having registered nothing, if the registry is draining.
+func (s *streamSession) open() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	keys := make([]string, 0, 1+len(seeds))
-	keys = append(keys, s.userKey)
+	return s.registry.add(s.id, s.local, []string{s.userKey})
+}
+
+// seed merges the membership records read at open into the session, each as
+// a transition at its record's version through the same gate live
+// transitions pass (see admitLocked): a joined record puts the stream under
+// its key, a departed one takes it out, and either records its version —
+// which is what makes a transition the record already reflects stale, and a
+// record that a transition applied meanwhile has already superseded stale in
+// turn. It returns the keys it newly attached, for the caller to register
+// with the cluster as one batch (see setHandles), and the handles the
+// detaches freed, for the caller to release. A draining registry attaches
+// nothing; a closed session applies nothing.
+func (s *streamSession) seed(seeds []topicSeed) (attached []string, released []*cluster.SubscriptionHandle) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil, nil
+	}
+
+	var removed []string
 	for _, seed := range seeds {
-		if seed.joined {
-			keys = append(keys, seed.key)
+		if !s.admitLocked(seed.key, seed.version) {
+			continue
+		}
+		h, held := s.topics[seed.key]
+		switch {
+		case seed.joined && !held:
+			attached = append(attached, seed.key)
+		case !seed.joined && held:
+			delete(s.topics, seed.key)
+			removed = append(removed, seed.key)
+			if h != nil {
+				released = append(released, h)
+			}
 		}
 	}
-	if !s.registry.add(s.id, s.local, keys) {
-		return false
+	if len(removed) > 0 {
+		s.registry.remove(s.id, removed)
 	}
-	for _, seed := range seeds {
-		s.versions[seed.key] = seed.version
-		if seed.joined {
-			s.topics[seed.key] = nil
+	if len(attached) > 0 {
+		if !s.registry.add(s.id, s.local, attached) {
+			return nil, released
+		}
+		for _, key := range attached {
+			s.topics[key] = nil
 		}
 	}
-	return true
+	return attached, released
 }
 
 // setHandles takes ownership of the cluster handles an open landed: the user
-// topic's, and one per joined chat key, in the order the caller registered
-// them.
-func (s *streamSession) setHandles(userHandle *cluster.SubscriptionHandle, chatKeys []string, chatHandles []*cluster.SubscriptionHandle) {
+// topic's, and one per chat key the seed attached, in the order the caller
+// registered them. A chat handle is refused on the same terms as setHandle —
+// the key was detached meanwhile, or a transition's own registration landed
+// on it first — and, along with every handle if the session has closed, is
+// returned for the caller to release.
+func (s *streamSession) setHandles(userHandle *cluster.SubscriptionHandle, chatKeys []string, chatHandles []*cluster.SubscriptionHandle) (refused []*cluster.SubscriptionHandle) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.closed {
+		return append([]*cluster.SubscriptionHandle{userHandle}, chatHandles...)
+	}
+
 	s.userHandle = userHandle
 	for i, key := range chatKeys {
+		if existing, held := s.topics[key]; !held || existing != nil {
+			refused = append(refused, chatHandles[i])
+			continue
+		}
 		s.topics[key] = chatHandles[i]
 	}
+	return refused
 }
 
 // admitLocked applies the version gate to a transition on chatKey, recording
@@ -142,6 +199,7 @@ func (s *streamSession) attach(chatKey string, version uint64) bool {
 	if s.closed {
 		return false
 	}
+	last, seen := s.versions[chatKey]
 	if !s.admitLocked(chatKey, version) {
 		return false
 	}
@@ -152,6 +210,7 @@ func (s *streamSession) attach(chatKey string, version uint64) bool {
 		return false
 	}
 	s.topics[chatKey] = nil
+	s.displaced[chatKey] = watermark{version: last, seen: seen}
 	return true
 }
 
@@ -173,16 +232,21 @@ func (s *streamSession) setHandle(chatKey string, h *cluster.SubscriptionHandle)
 		return false
 	}
 	s.topics[chatKey] = h
+	delete(s.displaced, chatKey)
 	return true
 }
 
 // rollback undoes an attach whose cluster registration failed: the stream
-// leaves the key, and the transition's version is forgotten so a later copy
-// of the same join can try again. Both are gated on the version still being
+// leaves the key, and the version gate goes back to what the attach
+// displaced, so a later copy of the same join can try again while whatever
+// was stale before it stays stale. Both are gated on the version still being
 // the one the attach recorded: if a newer transition has since moved the key
 // — a leave, or a leave and rejoin whose own registration is in flight — its
-// state stands, and the failed attach has nothing left to undo. A key already
-// released is a no-op.
+// state stands, and the failed attach has nothing left to undo. Nor is there
+// anything to undo if the key already holds a handle: an earlier registrant
+// for the same key landed it after this attach (see setHandle), so the
+// stream is under the key and registered, which is the join's intent.
+// Undoing would strand that handle. A key already released is a no-op.
 func (s *streamSession) rollback(chatKey string, version uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -190,11 +254,21 @@ func (s *streamSession) rollback(chatKey string, version uint64) {
 	if last, seen := s.versions[chatKey]; !seen || last != version {
 		return
 	}
-	if _, attached := s.topics[chatKey]; attached {
+	h, attached := s.topics[chatKey]
+	if attached && h != nil {
+		delete(s.displaced, chatKey)
+		return
+	}
+	if attached {
 		delete(s.topics, chatKey)
 		s.registry.remove(s.id, []string{chatKey})
 	}
-	delete(s.versions, chatKey)
+	if prior, ok := s.displaced[chatKey]; ok && prior.seen {
+		s.versions[chatKey] = prior.version
+	} else {
+		delete(s.versions, chatKey)
+	}
+	delete(s.displaced, chatKey)
 }
 
 // detach applies a departure at the given roster version: it takes the
@@ -215,6 +289,7 @@ func (s *streamSession) detach(chatKey string, version uint64) *cluster.Subscrip
 		return nil
 	}
 	delete(s.topics, chatKey)
+	delete(s.displaced, chatKey)
 	s.registry.remove(s.id, []string{chatKey})
 	return h
 }
@@ -245,35 +320,51 @@ func (s *streamSession) close() []*cluster.SubscriptionHandle {
 }
 
 // streamSessions indexes the open sessions by user key, so a membership
-// transition can find every local stream of the user it names.
+// transition can find every local stream of the user it names, and keeps
+// per user the time the membership reconcile schedules on (see
+// Server.reconcileMembership): when their memberships were last re-read.
 type streamSessions struct {
 	mu     sync.RWMutex
-	byUser map[string]map[string]*streamSession
+	byUser map[string]*userSessions
+
+	// now stamps a user's first open; tests substitute a clock they control.
+	now func() time.Time
+}
+
+// userSessions is one user's open sessions on this server.
+type userSessions struct {
+	byID map[string]*streamSession
+
+	// reconciledAt is when the read behind the user's last completed
+	// reconcile began — the read's start, since that is when its view of the
+	// store was current — or, until one completes, when their first session
+	// opened here, whose own read of the memberships stands in for it.
+	reconciledAt time.Time
 }
 
 func newStreamSessions() *streamSessions {
-	return &streamSessions{byUser: make(map[string]map[string]*streamSession)}
+	return &streamSessions{byUser: make(map[string]*userSessions), now: time.Now}
 }
 
 func (x *streamSessions) add(s *streamSession) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 
-	byID, ok := x.byUser[s.userKey]
+	u, ok := x.byUser[s.userKey]
 	if !ok {
-		byID = make(map[string]*streamSession)
-		x.byUser[s.userKey] = byID
+		u = &userSessions{byID: make(map[string]*streamSession), reconciledAt: x.now()}
+		x.byUser[s.userKey] = u
 	}
-	byID[s.id] = s
+	u.byID[s.id] = s
 }
 
 func (x *streamSessions) remove(s *streamSession) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 
-	if byID, ok := x.byUser[s.userKey]; ok {
-		delete(byID, s.id)
-		if len(byID) == 0 {
+	if u, ok := x.byUser[s.userKey]; ok {
+		delete(u.byID, s.id)
+		if len(u.byID) == 0 {
 			delete(x.byUser, s.userKey)
 		}
 	}
@@ -284,10 +375,65 @@ func (x *streamSessions) forUser(userKey string) []*streamSession {
 	x.mu.RLock()
 	defer x.mu.RUnlock()
 
-	byID := x.byUser[userKey]
-	sessions := make([]*streamSession, 0, len(byID))
-	for _, s := range byID {
+	u := x.byUser[userKey]
+	if u == nil {
+		return nil
+	}
+	sessions := make([]*streamSession, 0, len(u.byID))
+	for _, s := range u.byID {
 		sessions = append(sessions, s)
 	}
 	return sessions
+}
+
+// count is the number of users with a session open.
+func (x *streamSessions) count() int {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+
+	return len(x.byUser)
+}
+
+// markReconciled records that a reconcile of the user's memberships, whose
+// read began at startedAt, has completed. A user with no sessions left is
+// not resurrected.
+func (x *streamSessions) markReconciled(userKey string, startedAt time.Time) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+
+	if u, ok := x.byUser[userKey]; ok {
+		u.reconciledAt = startedAt
+	}
+}
+
+// due picks the users whose memberships the sweep should re-read now: up to
+// quota of those not reconciled within interval, least recently reconciled
+// first. The quota paces the re-reads across the interval instead of
+// bunching them at its boundary; a fleet of streams that opened together
+// spreads out over its first cycle and stays spread.
+func (x *streamSessions) due(now time.Time, interval time.Duration, quota int) []string {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+
+	var candidates []sweepCandidate
+	for userKey, u := range x.byUser {
+		if !now.Before(u.reconciledAt.Add(interval)) {
+			candidates = append(candidates, sweepCandidate{userKey: userKey, reconciledAt: u.reconciledAt})
+		}
+	}
+
+	if quota < len(candidates) {
+		sort.Slice(candidates, func(i, j int) bool { return candidates[i].reconciledAt.Before(candidates[j].reconciledAt) })
+		candidates = candidates[:quota]
+	}
+	userKeys := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		userKeys = append(userKeys, c.userKey)
+	}
+	return userKeys
+}
+
+type sweepCandidate struct {
+	userKey      string
+	reconciledAt time.Time
 }

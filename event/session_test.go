@@ -2,7 +2,9 @@ package event
 
 import (
 	"fmt"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -22,8 +24,11 @@ func TestStreamSession_TopicsTrackRegistry(t *testing.T) {
 	r := newStreamRegistry()
 	s := newTestSession("s1", 1, r)
 
-	require.True(t, s.open([]topicSeed{{key: "chat:a", joined: true}}))
+	require.True(t, s.open())
 	require.Equal(t, map[string]bool{"s1": true}, streamIDs(targets(r, s.userKey, nil)))
+	attached, released := s.seed([]topicSeed{{key: "chat:a", joined: true}})
+	require.Equal(t, []string{"chat:a"}, attached)
+	require.Empty(t, released)
 	require.Equal(t, map[string]bool{"s1": true}, streamIDs(targets(r, "chat:a", nil)))
 
 	// Attaching registers the key at once, ahead of its cluster handle.
@@ -56,10 +61,10 @@ func TestStreamSession_TopicsTrackRegistry(t *testing.T) {
 func TestStreamSession_HandleOwnership(t *testing.T) {
 	r := newStreamRegistry()
 	s := newTestSession("s1", 1, r)
-	require.True(t, s.open(nil))
+	require.True(t, s.open())
 
 	userHandle := &cluster.SubscriptionHandle{}
-	s.setHandles(userHandle, nil, nil)
+	require.Empty(t, s.setHandles(userHandle, nil, nil))
 
 	// A handle set after the key was detached is refused: the leave won the
 	// race, and the registrant releases it.
@@ -85,6 +90,20 @@ func TestStreamSession_HandleOwnership(t *testing.T) {
 	require.False(t, s.setHandle("chat:e", &cluster.SubscriptionHandle{}))
 	require.Same(t, handleE, s.detach("chat:e", 4))
 
+	// The same two registrations, but the second fails after the first has
+	// landed its handle: the rollback leaves the attachment standing — the
+	// stream is under the key and registered, as the rejoin intends — and
+	// the landed handle is still the session's to release, not stranded.
+	handleF := &cluster.SubscriptionHandle{}
+	require.True(t, s.attach("chat:f", 1))
+	require.Nil(t, s.detach("chat:f", 2))
+	require.True(t, s.attach("chat:f", 3))
+	require.True(t, s.setHandle("chat:f", handleF))
+	s.rollback("chat:f", 3)
+	require.Equal(t, map[string]bool{"s1": true}, streamIDs(targets(r, "chat:f", nil)))
+	require.False(t, s.attach("chat:f", 3))
+	require.Same(t, handleF, s.detach("chat:f", 4))
+
 	// Close returns every handle held — the user's and each attached chat's —
 	// but not one still in flight, which its registrant will find refused.
 	handleC := &cluster.SubscriptionHandle{}
@@ -98,12 +117,13 @@ func TestStreamSession_HandleOwnership(t *testing.T) {
 
 // TestStreamSession_VersionGate pins that transitions apply as state, by
 // roster version: an older one is dropped whatever order it arrives in, a
-// version is remembered across a detach, and a rolled-back attach forgets
-// its version so the same join can be retried.
+// version is remembered across a detach, and a rolled-back attach restores
+// the gate it displaced so the same join can be retried and nothing older
+// can.
 func TestStreamSession_VersionGate(t *testing.T) {
 	r := newStreamRegistry()
 	s := newTestSession("s1", 1, r)
-	require.True(t, s.open(nil))
+	require.True(t, s.open())
 	s.setHandles(&cluster.SubscriptionHandle{}, nil, nil)
 	on := func(key string) bool { return len(targets(r, key, nil)) == 1 }
 
@@ -135,14 +155,29 @@ func TestStreamSession_VersionGate(t *testing.T) {
 	require.True(t, on("chat:a"))
 	require.True(t, s.attach("chat:b", 1))
 
-	// A rollback releases the key and forgets the version, so the same join
-	// can land on a retry; a rollback of a key not held is harmless.
+	// A rollback releases the key and forgets a version nothing preceded, so
+	// the same join can land on a retry; a rollback of a key not held is
+	// harmless.
 	require.True(t, s.attach("chat:c", 2))
 	s.rollback("chat:c", 2)
 	require.False(t, on("chat:c"))
 	require.True(t, s.attach("chat:c", 2))
 	require.True(t, on("chat:c"))
 	s.rollback("chat:zzz", 1)
+
+	// A rollback restores the gate the attach displaced rather than
+	// forgetting it: chat:g was left at v3 (seeded), a join at v7 fails to
+	// register, and afterwards a stale copy of the v2 join it once undid is
+	// still stale, the v3 leave still applied, and the v7 join retryable.
+	_, _ = s.seed([]topicSeed{{key: "chat:g", version: 3, joined: false}})
+	require.True(t, s.attach("chat:g", 7))
+	s.rollback("chat:g", 7)
+	require.False(t, on("chat:g"))
+	require.False(t, s.attach("chat:g", 2))
+	require.Nil(t, s.detach("chat:g", 3))
+	require.False(t, on("chat:g"))
+	require.True(t, s.attach("chat:g", 7))
+	require.True(t, on("chat:g"))
 
 	// A rollback of an attach the key has since moved past does nothing: the
 	// v1 join's registration failed, but a v2 leave and v3 rejoin landed
@@ -169,12 +204,15 @@ func TestStreamSession_VersionGate(t *testing.T) {
 func TestStreamSession_SeededVersions(t *testing.T) {
 	r := newStreamRegistry()
 	s := newTestSession("s1", 1, r)
-	require.True(t, s.open([]topicSeed{
+	require.True(t, s.open())
+	attached, released := s.seed([]topicSeed{
 		{key: "chat:a", version: 3, joined: true},
 		{key: "chat:b", version: 0, joined: true},
 		{key: "chat:c", version: 4, joined: false},
-	}))
-	s.setHandles(&cluster.SubscriptionHandle{}, []string{"chat:a", "chat:b"}, []*cluster.SubscriptionHandle{{}, {}})
+	})
+	require.Equal(t, []string{"chat:a", "chat:b"}, attached)
+	require.Empty(t, released)
+	require.Empty(t, s.setHandles(&cluster.SubscriptionHandle{}, attached, []*cluster.SubscriptionHandle{{}, {}}))
 	on := func(key string) bool { return len(targets(r, key, nil)) == 1 }
 
 	// chat:c was left at v4: the stream is not under it, the v3 join it
@@ -202,18 +240,85 @@ func TestStreamSession_SeededVersions(t *testing.T) {
 	require.False(t, on("chat:b"))
 }
 
+// TestStreamSession_SeedMergesWithTransitions pins that the records read at
+// open merge with the transitions delivered while the read was in flight,
+// through the version gate: a record a transition already superseded is
+// stale, a record newer than what was applied wins — releasing a handle a
+// transition's registration had landed — and the open's batch of handles is
+// refused for any key a transition moved meanwhile.
+func TestStreamSession_SeedMergesWithTransitions(t *testing.T) {
+	r := newStreamRegistry()
+	s := newTestSession("s1", 1, r)
+	require.True(t, s.open())
+	on := func(key string) bool { return len(targets(r, key, nil)) == 1 }
+
+	// Before the read lands: a join on chat:a fully registered (v7), a leave
+	// on chat:b (v4), and a join on chat:d whose registration is in flight.
+	handleA := &cluster.SubscriptionHandle{}
+	require.True(t, s.attach("chat:a", 7))
+	require.True(t, s.setHandle("chat:a", handleA))
+	require.Nil(t, s.detach("chat:b", 4))
+	require.True(t, s.attach("chat:d", 2))
+
+	// The read: chat:a departed at v3 (predates the join: stale), chat:b
+	// joined at v3 (predates the leave: stale), chat:c joined at v1 (news),
+	// chat:d joined at v2 (the same transition: stale), chat:e departed at
+	// v9 (news, but nothing to take off).
+	attached, released := s.seed([]topicSeed{
+		{key: "chat:a", version: 3, joined: false},
+		{key: "chat:b", version: 3, joined: true},
+		{key: "chat:c", version: 1, joined: true},
+		{key: "chat:d", version: 2, joined: true},
+		{key: "chat:e", version: 9, joined: false},
+	})
+	require.Equal(t, []string{"chat:c"}, attached)
+	require.Empty(t, released)
+	require.True(t, on("chat:a"))
+	require.False(t, on("chat:b"))
+	require.True(t, on("chat:c"))
+	require.True(t, on("chat:d"))
+	require.False(t, on("chat:e"))
+
+	// A record newer than the applied transition wins: chat:a departed at v8
+	// takes the stream off and hands back the handle the join had landed.
+	attached, released = s.seed([]topicSeed{{key: "chat:a", version: 8, joined: false}})
+	require.Empty(t, attached)
+	require.Equal(t, []*cluster.SubscriptionHandle{handleA}, released)
+	require.False(t, on("chat:a"))
+
+	// The batch lands for chat:c — but a leave at v2 detached it meanwhile,
+	// so its handle is refused for the caller to release; the user handle is
+	// taken regardless.
+	require.Nil(t, s.detach("chat:c", 2))
+	userHandle, handleC := &cluster.SubscriptionHandle{}, &cluster.SubscriptionHandle{}
+	require.Equal(t, []*cluster.SubscriptionHandle{handleC}, s.setHandles(userHandle, []string{"chat:c"}, []*cluster.SubscriptionHandle{handleC}))
+	require.Same(t, userHandle, s.close()[0])
+
+	// A closed session applies nothing and refuses every handle.
+	attached, released = s.seed([]topicSeed{{key: "chat:f", version: 1, joined: true}})
+	require.Empty(t, attached)
+	require.Empty(t, released)
+	require.False(t, on("chat:f"))
+	require.Len(t, s.setHandles(&cluster.SubscriptionHandle{}, []string{"chat:f"}, []*cluster.SubscriptionHandle{{}}), 2)
+}
+
 // TestStreamSession_OpenRefusedWhenDraining pins that a draining registry
-// refuses an open and an attach alike, with nothing registered either way.
+// refuses an open, a seed and an attach alike, with nothing registered either
+// way.
 func TestStreamSession_OpenRefusedWhenDraining(t *testing.T) {
 	r := newStreamRegistry()
 	live := newTestSession("live", 1, r)
-	require.True(t, live.open(nil))
+	require.True(t, live.open())
 
 	r.drain()
 
 	late := newTestSession("late", 2, r)
-	require.False(t, late.open([]topicSeed{{key: "chat:a", joined: true}}))
+	require.False(t, late.open())
 	require.Empty(t, targets(r, late.userKey, nil))
+
+	attached, released := live.seed([]topicSeed{{key: "chat:a", joined: true}})
+	require.Empty(t, attached)
+	require.Empty(t, released)
 	require.Empty(t, targets(r, "chat:a", nil))
 
 	require.False(t, live.attach("chat:a", 1))
@@ -252,6 +357,76 @@ func TestStreamSessions_Index(t *testing.T) {
 
 	// Removing twice is harmless.
 	x.remove(s2)
+}
+
+// TestStreamSessions_Due pins the reconcile's schedule: a user is due an
+// interval after their first session opened, then an interval after each
+// reconcile's read began, rationed to the quota, least recently reconciled
+// first. A later session of theirs does not reset the schedule.
+func TestStreamSessions_Due(t *testing.T) {
+	r := newStreamRegistry()
+	x := newStreamSessions()
+	clock := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	x.now = func() time.Time { return clock }
+	const interval = time.Minute
+	due := func(quota int) []string {
+		keys := x.due(clock, interval, quota)
+		sort.Strings(keys)
+		return keys
+	}
+
+	// Nothing open: nothing due.
+	require.Empty(t, due(10))
+
+	// Just opened: the open's own read counts, so the user is due an interval
+	// later, not before, and stays due until reconciled.
+	s1 := newTestSession("s1", 1, r)
+	x.add(s1)
+	require.Empty(t, due(10))
+	clock = clock.Add(interval - time.Millisecond)
+	require.Empty(t, due(10))
+	clock = clock.Add(time.Millisecond)
+	require.Equal(t, []string{s1.userKey}, due(10))
+	clock = clock.Add(time.Hour)
+	require.Equal(t, []string{s1.userKey}, due(10))
+
+	// Reconciled: due again an interval after the read began, not before.
+	x.markReconciled(s1.userKey, clock)
+	clock = clock.Add(interval - time.Millisecond)
+	require.Empty(t, due(10))
+	clock = clock.Add(time.Millisecond)
+	require.Equal(t, []string{s1.userKey}, due(10))
+	x.markReconciled(s1.userKey, clock)
+
+	// A second session opening does not move the user's schedule: it reads
+	// its own memberships at open.
+	clock = clock.Add(interval / 2)
+	s2 := newTestSession("s2", 1, r)
+	x.add(s2)
+	clock = clock.Add(interval / 2)
+	require.Equal(t, []string{s1.userKey}, due(10))
+	x.markReconciled(s1.userKey, clock)
+
+	// Rationed, least recently reconciled first.
+	for i := 2; i <= 5; i++ {
+		s := newTestSession(fmt.Sprintf("s%d", i), i, r)
+		clock = clock.Add(time.Second)
+		x.add(s)
+	}
+	clock = clock.Add(interval)
+	require.Equal(t, []string{"user:1", "user:2"}, due(2))
+	require.Equal(t, []string{"user:1", "user:2", "user:3", "user:4", "user:5"}, due(10))
+	x.markReconciled("user:1", clock)
+	x.markReconciled("user:2", clock)
+	require.Equal(t, []string{"user:3", "user:4"}, due(2))
+
+	// A user whose last session closed is gone from the schedule; marking
+	// them reconciled afterwards does not bring them back.
+	s5 := newTestSession("s5", 5, r)
+	x.remove(s5)
+	x.markReconciled(s5.userKey, clock)
+	require.NotContains(t, x.byUser, s5.userKey)
+	require.Equal(t, []string{"user:3", "user:4"}, due(10))
 }
 
 var _ Stream[*eventpb.Event] = (*fakeStream)(nil)

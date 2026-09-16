@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
@@ -101,4 +102,47 @@ func TestMustDeriveDmChatID_Domains(t *testing.T) {
 
 	require.Equal(t, expected("flipcash:chat:dm"), MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, b).Value)
 	require.Equal(t, expected("flipcash:chat:dm:2"), MustDeriveDmChatID(chatpb.ChatType_TIP_DM, a, b).Value)
+}
+
+func TestMustDeriveGroupChatID(t *testing.T) {
+	creator := model.MustGenerateUserID()
+	key := newIdempotencyKey()
+
+	// Deterministic, and a group ID by length.
+	id := MustDeriveGroupChatID(creator, key)
+	require.Equal(t, id.Value, MustDeriveGroupChatID(creator, key).Value)
+	require.Len(t, id.Value, GroupChatIDSize)
+	require.True(t, IsGroupChatID(id))
+
+	// The creator and the key each distinguish the result: another key from
+	// the same creator, and the same key from another creator, are other
+	// groups.
+	require.NotEqual(t, id.Value, MustDeriveGroupChatID(creator, newIdempotencyKey()).Value)
+	require.NotEqual(t, id.Value, MustDeriveGroupChatID(model.MustGenerateUserID(), key).Value)
+
+	// The exact derivation: a domain-separated digest over creator then key,
+	// truncated to the group ID width.
+	h := sha256.New()
+	h.Write([]byte("flipcash:chat:group"))
+	h.Write(creator.Value)
+	h.Write(key.Value)
+	require.Equal(t, h.Sum(nil)[:GroupChatIDSize], id.Value)
+
+	// A malformed user ID or key is a programming error: callers check the
+	// key's width before deriving.
+	require.Panics(t, func() {
+		MustDeriveGroupChatID(&commonpb.UserId{Value: []byte("short")}, key)
+	})
+	require.Panics(t, func() {
+		MustDeriveGroupChatID(creator, &chatpb.IdempotencyKey{Value: []byte("short")})
+	})
+	require.Panics(t, func() {
+		MustDeriveGroupChatID(creator, nil)
+	})
+}
+
+// newIdempotencyKey mints a fresh StartChat key, as a client does.
+func newIdempotencyKey() *chatpb.IdempotencyKey {
+	id := uuid.New()
+	return &chatpb.IdempotencyKey{Value: id[:]}
 }

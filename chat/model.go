@@ -23,9 +23,11 @@ import (
 // the DM's type and members (see MustDeriveDmChatID).
 const DmChatIDSize = 32
 
-// GroupChatIDSize is the length, in bytes, of a group chat ID: a
-// server-generated UUID. Group membership is mutable, so a group's ID cannot be
-// member-derived; it is an opaque random value minted at creation.
+// GroupChatIDSize is the length, in bytes, of a group chat ID: the leading
+// bytes of a SHA-256 digest over the creator and the idempotency key of the
+// request that created it (see MustDeriveGroupChatID). Group membership is
+// mutable, so a group's ID cannot be member-derived; it is an opaque value
+// fixed at creation, and nothing parses it as anything else.
 //
 // The two sizes never overlap, so a chat ID's length is its type family's
 // discriminator: 32 bytes is a DM, 16 bytes is a group. Every DM path must
@@ -34,15 +36,64 @@ const DmChatIDSize = 32
 // as both a derived DM and a group).
 const GroupChatIDSize = 16
 
+// IdempotencyKeySize is the length, in bytes, of a client's IdempotencyKey: a
+// UUID's worth of nonce, which is what a client typically mints for one.
+const IdempotencyKeySize = 16
+
 // IsGroupChatID reports whether chatID is a group chat ID, by length (see
 // GroupChatIDSize).
 func IsGroupChatID(chatID *commonpb.ChatId) bool {
 	return len(chatID.GetValue()) == GroupChatIDSize
 }
 
-// MustGenerateGroupChatID mints the ID for a new group chat: a random UUID.
-// Group chat IDs are always generated server-side — a client-supplied ID is
-// never trusted as a chat's identity.
+// groupChatIDDomain namespaces the group chat ID hash so it can never collide
+// with an ID derived for another purpose. It is distinct from every DM domain
+// (see dmChatIDDomain), and the two families differ in width regardless.
+const groupChatIDDomain = "flipcash:chat:group"
+
+// MustDeriveGroupChatID returns the ID of the group chat that a StartChat from
+// creatorID carrying key creates.
+//
+// A group's ID is derived from its creator and the request's idempotency key
+// rather than minted at random, so that the ID is itself the idempotency
+// record: a retried request derives the same ID, and the store's uniqueness
+// condition on creation turns the duplicate into a read of the original (see
+// Server.StartChat). Nothing else is stored, and the mapping never expires.
+//
+// The creator is part of the input so that no client can derive another
+// user's chat ID: the key is a nonce the client chooses, and two users who
+// choose the same one derive two distinct groups. A client can predict the ID
+// of its own group, which is harmless — group IDs are not secrets (see
+// Server.GetChat). Group chat IDs remain server-derived: a client-supplied ID
+// is never trusted as a chat's identity.
+//
+// The digest is truncated to GroupChatIDSize bytes, which is what makes the
+// result a group ID by length. It panics if either input is not its fixed
+// width, which would be a programming error: all user IDs in the system are
+// UUIDs, and a request's key is checked to width before it reaches here.
+// Fixed-width inputs also make the concatenation unambiguous without length
+// prefixing.
+func MustDeriveGroupChatID(creatorID *commonpb.UserId, key *chatpb.IdempotencyKey) *commonpb.ChatId {
+	if len(creatorID.GetValue()) != model.UserIDSize {
+		panic(fmt.Sprintf("user id must be %d bytes, got %d", model.UserIDSize, len(creatorID.GetValue())))
+	}
+	if len(key.GetValue()) != IdempotencyKeySize {
+		panic(fmt.Sprintf("idempotency key must be %d bytes, got %d", IdempotencyKeySize, len(key.GetValue())))
+	}
+
+	h := sha256.New()
+	h.Write([]byte(groupChatIDDomain))
+	h.Write(creatorID.Value)
+	h.Write(key.Value)
+
+	return &commonpb.ChatId{Value: h.Sum(nil)[:GroupChatIDSize]}
+}
+
+// MustGenerateGroupChatID mints a random group chat ID. StartChat does not use
+// it — a group created by a client request derives its ID from the request
+// (see MustDeriveGroupChatID) — so it is for a group that has no request behind
+// it, which today means tests. Group chat IDs are always produced server-side
+// either way; a client-supplied ID is never trusted as a chat's identity.
 func MustGenerateGroupChatID() *commonpb.ChatId {
 	id, err := uuid.NewRandom()
 	if err != nil {

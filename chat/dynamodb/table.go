@@ -14,9 +14,11 @@ import (
 // on-demand billing. The chats table is keyed by pk only; dm_inbox is keyed by
 // (pk, sk) with a GSI ordering each user's DMs by last_activity; group_members
 // is keyed by (pk, sk) = (chat, user) — plus one "#meta" aggregates item per
-// group — with an inverted GSI for listing a user's group chats and a sparse GSI
-// enumerating a group's joined members by join time. It is idempotent and
-// blocks until all tables are ACTIVE.
+// group — with an inverted GSI for listing a user's group chats, a sparse GSI
+// of a group's joined members by join time (maintained for paging, not read
+// today; see gsiByJoinedAt), and TTL on expires_at sweeping departed members'
+// tombstones (see tombstoneTTL). It is idempotent and blocks until all tables
+// are ACTIVE.
 func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
@@ -61,8 +63,9 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				{
 					// Sparse index of joined members ordered by join time:
 					// joined_at exists only while joined, so tombstones (and the
-					// counter item) never appear and enumeration is dense (see
-					// gsiByJoinedAt).
+					// counter item) never appear. Nothing queries it today —
+					// GetMembers reads the base partition — but it is kept for
+					// paging a large roster newest-first (see gsiByJoinedAt).
 					IndexName: aws.String(gsiByJoinedAt),
 					KeySchema: []types.KeySchemaElement{
 						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
@@ -120,7 +123,35 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 			return err
 		}
 	}
-	return nil
+
+	return ensureTTL(ctx, client, groupMembersTable, attrExpiresAt)
+}
+
+// ensureTTL idempotently enables DynamoDB TTL on table's attr. Enabling TTL when
+// it is already enabled (or enabling) is a no-op, so re-running CreateTables is
+// safe.
+func ensureTTL(ctx context.Context, client *dynamodb.Client, table, attr string) error {
+	desc, err := client.DescribeTimeToLive(ctx, &dynamodb.DescribeTimeToLiveInput{
+		TableName: aws.String(table),
+	})
+	if err != nil {
+		return err
+	}
+	if d := desc.TimeToLiveDescription; d != nil {
+		switch d.TimeToLiveStatus {
+		case types.TimeToLiveStatusEnabled, types.TimeToLiveStatusEnabling:
+			return nil
+		}
+	}
+
+	_, err = client.UpdateTimeToLive(ctx, &dynamodb.UpdateTimeToLiveInput{
+		TableName: aws.String(table),
+		TimeToLiveSpecification: &types.TimeToLiveSpecification{
+			Enabled:       aws.Bool(true),
+			AttributeName: aws.String(attr),
+		},
+	})
+	return err
 }
 
 // reset deletes every item from all tables, for tests.

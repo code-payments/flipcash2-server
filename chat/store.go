@@ -40,6 +40,22 @@ var (
 // caller to reconcile.
 const MaxGroupChatCreationMembers = 50
 
+// GroupMembership is one of a user's group membership records: the chat,
+// whether the record currently has them joined or departed, and the roster
+// version the record was last moved at — the version of the user's own last
+// transition on that group (see RosterSummary), or zero for a membership
+// written at the group's creation, which no transition has touched. Only the
+// user's own transitions move their record, so the version is a per-user
+// watermark on the group: a transition of theirs at or below it is one the
+// record already reflects, whichever way it went. A departed record carries
+// the version of the departure for exactly that reason — without it, a stale
+// copy of the join it superseded would be indistinguishable from news.
+type GroupMembership struct {
+	ChatID  *commonpb.ChatId
+	Joined  bool
+	Version uint64
+}
+
 // DmFeedCursor marks a position within a DM feed snapshot read. The next page
 // resumes at the chat immediately after (LastActivity, ChatID) in the feed's
 // descending (last_activity, chat_id) order.
@@ -91,8 +107,9 @@ type Store interface {
 	// membership is kept, and they can be re-added later. Removing a non-member
 	// or unknown user is a no-op. A departure that actually happens is one
 	// membership transition, moving the group's RosterSummary atomically with
-	// the record; changed and roster are as for AddGroupMembers. It returns an
-	// error if chatID is not a group chat ID.
+	// the record; changed and roster are as for AddGroupMembers. It returns
+	// ErrChatNotFound if the chat does not exist, and an error if chatID is not
+	// a group chat ID.
 	RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (changed bool, roster RosterSummary, err error)
 
 	// SetGroupPicture sets a group chat's picture to the blob holding its
@@ -153,13 +170,12 @@ type Store interface {
 	GetGroupRosterSummary(ctx context.Context, chatID *commonpb.ChatId) (RosterSummary, error)
 
 	// GetGroupRosterSummaries is the cross-chat batch counterpart to
-	// GetGroupRosterSummary: the summary of each given group chat that has one,
-	// keyed by string(chatID.Value), read as a batch rather than one read per
-	// chat. A group without a summary record is absent from the map and reads as
-	// zero, exactly as GetGroupRosterSummary returns it; so is a chat that does
-	// not exist, which callers passing chats they hold never hit. Duplicate IDs
-	// collapse. It returns an error if any ID is not a group chat ID, and an
-	// empty map (no error) when chatIDs is empty.
+	// GetGroupRosterSummary: the summary of each given group chat, keyed by
+	// string(chatID.Value), read as a batch rather than one read per chat. A
+	// chat that does not exist is absent from the map rather than reported —
+	// which callers passing chats they hold never hit. Duplicate IDs collapse.
+	// It returns an error if any ID is not a group chat ID, and an empty map
+	// (no error) when chatIDs is empty.
 	GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]RosterSummary, error)
 
 	// GetGroupRules returns a group chat's participation rules (see
@@ -175,20 +191,22 @@ type Store interface {
 	// removed.
 	IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error)
 
-	// GetGroupChatIDsForUser returns the IDs of every group chat userID is
-	// currently a joined member of, in no particular order. Departed
-	// memberships are excluded, and a user with no group memberships gets an
-	// empty result, not an error. It is the inverse of GetMembers over the
-	// membership records alone — no canonical chat metadata is read or
-	// returned; a caller that needs it follows up with GetChatByID.
-	GetGroupChatIDsForUser(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.ChatId, error)
+	// GetGroupMembershipsForUser returns every group chat userID has a
+	// membership record on — joined or departed — in no particular order, each
+	// with its state and the version of the user's last transition there (see
+	// GroupMembership). A user with no records gets an empty result, not an
+	// error. It is the inverse of GetMembers over the membership records alone
+	// — no canonical chat metadata is read or returned; a caller that needs it
+	// follows up with GetChatByID, and one that wants only current memberships
+	// filters on Joined (see GetGroupChatsForUser).
+	GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId) ([]GroupMembership, error)
 
 	// GetGroupChatsForUser returns the canonical record of every group chat
 	// userID is currently a joined member of, in no particular order. It is
-	// GetGroupChatIDsForUser followed by the canonical read of each ID, and
-	// returns records exactly as GetChatByID does: Members empty and
-	// RosterSummary zero. A user with no group memberships gets an empty result,
-	// not an error.
+	// GetGroupMembershipsForUser, less the departed records, followed by the
+	// canonical read of each ID, and returns records exactly as GetChatByID
+	// does: Members empty and RosterSummary zero. A user with no group
+	// memberships gets an empty result, not an error.
 	//
 	// It is the group feed's source: with no per-member activity index, a user's
 	// groups are ordered by reading every one of them and sorting — so this is

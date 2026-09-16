@@ -71,4 +71,17 @@ type Client interface {
 	// brand. It is also distinct from ClassifyText, which is tuned for prose
 	// and has little to work with in a one- or two-word name.
 	ClassifyDisplayName(ctx context.Context, name string) (*Result, error)
+
+	// ClassifyGroupTitle checks whether a user-chosen group chat title abuses
+	// the title to advertise, solicit, or expose others to harmful content. It
+	// is the group counterpart of ClassifyDisplayName and scores the same
+	// categories (solicitation, contact_info, hate, etc.), but is tuned for what
+	// a title is: a label for a shared room, seen by everyone in the group and
+	// everyone considering joining it, that names a topic, a community, or an
+	// occasion rather than a person.
+	//
+	// Like ClassifyDisplayName it does not score impersonation: a group may be
+	// titled after any brand, person, or topic. It is also distinct from
+	// ClassifyText, which has little to work with in a short title.
+	ClassifyGroupTitle(ctx context.Context, title string) (*Result, error)
 }

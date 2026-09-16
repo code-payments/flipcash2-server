@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
+	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
@@ -45,6 +47,8 @@ func RunServerTests(t *testing.T, accounts account.Store, teardown func()) {
 		testSubscriptionRegistration,
 		testGroupSubscriptionRegistration,
 		testChatEventPublishing,
+		testMembershipFollowsStreams,
+		testMembershipReconciles,
 		testServerShutdown,
 	} {
 		tf(t, accounts)
@@ -134,7 +138,7 @@ func testMultipleOpenStreams(t *testing.T, accounts account.Store) {
 		for _, client := range []*clientTestEnv{testEnv.client1, testEnv.client2} {
 			for _, streamer := range client.streams[model.UserIDString(userID)] {
 				events := receiveNextEvents(t, streamer)
-				require.Lenf(t, events, 1, "expected[%d]: %s", i, event.EventIDString(expected.Id))
+				require.Lenf(t, events, 1, "expected[%d]: %s", i, model.EventIDString(expected.Id))
 				assertEquivalentTestEvents(t, expected, events[0])
 			}
 		}
@@ -167,7 +171,7 @@ func testBurstDelivery(t *testing.T, accounts account.Store) {
 			sender = testEnv.server2
 		}
 		e := sender.sendTestUserEvent(userID)
-		expected[event.EventIDString(e.Id)] = e
+		expected[model.EventIDString(e.Id)] = e
 	}
 
 	// The bus hands every publish to its own goroutine, so arrival order is
@@ -180,7 +184,7 @@ func testBurstDelivery(t *testing.T, accounts account.Store) {
 		require.LessOrEqual(t, len(batch), burst)
 		batches++
 		for _, e := range batch {
-			id := event.EventIDString(e.Id)
+			id := model.EventIDString(e.Id)
 			_, dup := got[id]
 			require.Falsef(t, dup, "event %s delivered twice", id)
 			require.Containsf(t, expected, id, "unexpected event %s", id)
@@ -393,6 +397,347 @@ func testChatEventPublishing(t *testing.T, accounts account.Store) {
 	receiveAll(publish(testEnv.server1), true)
 }
 
+// testMembershipFollowsStreams pins that a stream's chat topics track its
+// user's membership while it is open: the user's own copy of a roster update,
+// delivered on their user topic — forwarded from another server or published
+// locally — puts every stream they have open on the chat's topic when they
+// join, and takes them all off it when they leave, with the cluster rows
+// following.
+func testMembershipFollowsStreams(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, true)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	userA := model.MustGenerateUserID()
+	keyPairA := model.MustGenerateKeyPair()
+	accounts.Bind(ctx, userA, keyPairA.Proto())
+	accounts.SetRegistrationFlag(ctx, userA, true)
+
+	userB := model.MustGenerateUserID()
+	keyPairB := model.MustGenerateKeyPair()
+	accounts.Bind(ctx, userB, keyPairB.Proto())
+	accounts.SetRegistrationFlag(ctx, userB, true)
+
+	// The group starts with userB alone; userA joins and leaves mid-stream.
+	// userA streams from two devices on server1, userB from one on server2, so
+	// every publish from server2 reaches userA over the forwarding RPC.
+	group := putGroupChat(t, testEnv.chats, userB)
+	testEnv.client1.openUserEventStream(t, userA, keyPairA)
+	testEnv.client1.openUserEventStream(t, userA, keyPairA)
+	testEnv.client2.openUserEventStream(t, userB, keyPairB)
+
+	time.Sleep(500 * time.Millisecond)
+
+	self := func(s *serverTestEnv) string { return s.membership.Self().InstanceID }
+	chatSubscribers := func() map[string]bool {
+		rows, err := testEnv.clusterStore.GetSubscribers(ctx, event.ChatEventsNamespace, group.Value)
+		require.NoError(t, err)
+		out := make(map[string]bool, len(rows))
+		for _, row := range rows {
+			out[row.InstanceID] = true
+		}
+		return out
+	}
+	waitForChatSubscribers := func(want map[string]bool) {
+		require.Eventually(t, func() bool { return maps.Equal(chatSubscribers(), want) }, 5*time.Second, 10*time.Millisecond)
+		// Past the publishers' subscriber cache, so the next publish resolves
+		// the rows as they now stand.
+		time.Sleep(100 * time.Millisecond)
+	}
+	publishChat := func(sender *serverTestEnv) *eventpb.Event {
+		e := newTestEvent()
+		sender.chatEventBus.OnEvent(group, &eventpb.ChatEvent{ChatId: group, Event: e})
+		return e
+	}
+	// rosterUpdate builds userA's copy of a transition at the given roster
+	// version.
+	rosterUpdate := func(joined bool, version uint64) *eventpb.Event {
+		update := &chatpb.RosterUpdate{RosterSummary: &chatpb.RosterSummary{MemberCount: 2, Version: version}}
+		if joined {
+			// A valid Member carries a full profile; the stream's validation
+			// interceptor would otherwise refuse the event on its way out, and
+			// the client would wait on it forever.
+			update.Kind = &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{Member: &chatpb.Member{
+				UserId: userA,
+				UserProfile: &profilepb.UserProfile{
+					UserId:               userA,
+					DisplayName:          "Alice",
+					JoinTs:               timestamppb.Now(),
+					TipCardCustomization: &profilepb.TipCardCustomization{Color: &commonpb.Color{Hex: "#19191A"}},
+				},
+			}}}
+		} else {
+			update.Kind = &chatpb.RosterUpdate_MemberLeft_{MemberLeft: &chatpb.RosterUpdate_MemberLeft{UserId: userA}}
+		}
+		e := &eventpb.Event{
+			Id: model.MustGenerateEventID(),
+			Ts: timestamppb.Now(),
+			Type: &eventpb.Event_ChatUpdate{ChatUpdate: &eventpb.ChatUpdate{
+				Chat:          group,
+				RosterUpdates: &chatpb.RosterUpdateBatch{RosterUpdates: []*chatpb.RosterUpdate{update}},
+			}},
+		}
+		require.NoError(t, e.Validate())
+		return e
+	}
+	// receiveA asserts the next event on each of userA's streams. A test
+	// event is compared less its forwarding hops; a roster update as is.
+	receiveA := func(expected *eventpb.Event) {
+		streamers := testEnv.client1.streams[model.UserIDString(userA)]
+		require.Len(t, streamers, 2)
+		for _, streamer := range streamers {
+			got := receiveNextEvents(t, streamer)
+			require.Len(t, got, 1)
+			if expected.GetTest() != nil {
+				assertEquivalentTestEvents(t, expected, got[0])
+			} else {
+				require.NoError(t, protoutil.ProtoEqualError(expected, got[0]))
+			}
+		}
+	}
+	receiveB := func(expected *eventpb.Event) {
+		got := testEnv.client2.receiveEventsInRealTime(t, userB)
+		require.Len(t, got, 1)
+		assertEquivalentTestEvents(t, expected, got[0])
+	}
+
+	// Before the join only server2, hosting userB, is on the chat's topic: a
+	// chat publish reaches userB alone, and userA's next event is the user
+	// event published after it.
+	require.Equal(t, map[string]bool{self(testEnv.server2): true}, chatSubscribers())
+	receiveB(publishChat(testEnv.server2))
+	receiveA(testEnv.server2.sendTestUserEvent(userA))
+
+	// userA's copy of the join, published on server2 so it reaches server1
+	// forwarded: both of userA's streams receive it, server1 registers on the
+	// chat's topic, and the next chat publish reaches everyone.
+	join := rosterUpdate(true, 1)
+	testEnv.server2.userEventBus.OnEvent(userA, join)
+	receiveA(join)
+	waitForChatSubscribers(map[string]bool{self(testEnv.server1): true, self(testEnv.server2): true})
+	e := publishChat(testEnv.server2)
+	receiveA(e)
+	receiveB(e)
+
+	// A second copy of the join — a retry, or the other device's — changes
+	// nothing: still one row, and still delivered once.
+	join = rosterUpdate(true, 1)
+	testEnv.server1.userEventBus.OnEvent(userA, join)
+	receiveA(join)
+	time.Sleep(100 * time.Millisecond)
+	require.Equal(t, map[string]bool{self(testEnv.server1): true, self(testEnv.server2): true}, chatSubscribers())
+	e = publishChat(testEnv.server1)
+	receiveA(e)
+	receiveB(e)
+
+	// userA's copy of the departure, published locally on server1: both
+	// streams receive it and come off the topic at once, server1's row goes,
+	// and a chat publish from either side no longer reaches them — their next
+	// event is the user event that follows.
+	leave := rosterUpdate(false, 2)
+	testEnv.server1.userEventBus.OnEvent(userA, leave)
+	receiveA(leave)
+	waitForChatSubscribers(map[string]bool{self(testEnv.server2): true})
+	receiveB(publishChat(testEnv.server1))
+	receiveB(publishChat(testEnv.server2))
+	receiveA(testEnv.server1.sendTestUserEvent(userA))
+
+	// Leaving again is a no-op.
+	leave = rosterUpdate(false, 2)
+	testEnv.server2.userEventBus.OnEvent(userA, leave)
+	receiveA(leave)
+	require.Equal(t, map[string]bool{self(testEnv.server2): true}, chatSubscribers())
+
+	// Out of order: a rejoin at version 4 arrives before the departure at
+	// version 3 it followed. The stale departure is delivered but moves
+	// nothing — userA's streams stay on the topic, as the roster says.
+	join = rosterUpdate(true, 4)
+	testEnv.server2.userEventBus.OnEvent(userA, join)
+	receiveA(join)
+	waitForChatSubscribers(map[string]bool{self(testEnv.server1): true, self(testEnv.server2): true})
+	leave = rosterUpdate(false, 3)
+	testEnv.server1.userEventBus.OnEvent(userA, leave)
+	receiveA(leave)
+	time.Sleep(100 * time.Millisecond)
+	require.Equal(t, map[string]bool{self(testEnv.server1): true, self(testEnv.server2): true}, chatSubscribers())
+	e = publishChat(testEnv.server2)
+	receiveA(e)
+	receiveB(e)
+
+	// Closed, the streams take their rows with them.
+	testEnv.client1.closeOneUserEventStream(t, userA)
+	testEnv.client1.closeOneUserEventStream(t, userA)
+	waitForChatSubscribers(map[string]bool{self(testEnv.server2): true})
+
+	// A stream opened after userA's membership has churned in the store seeds
+	// its versions from the membership record: userA joins (v1), leaves (v2)
+	// and rejoins (v3) before reopening, so a delayed copy of the v2
+	// departure arriving afterwards is one the snapshot already reflects, and
+	// moves nothing — while a v4 departure is news and does.
+	for _, transition := range []func() (bool, chat.RosterSummary, error){
+		func() (bool, chat.RosterSummary, error) {
+			return testEnv.chats.AddGroupMembers(ctx, group, []*commonpb.UserId{userA})
+		},
+		func() (bool, chat.RosterSummary, error) { return testEnv.chats.RemoveGroupMember(ctx, group, userA) },
+		func() (bool, chat.RosterSummary, error) {
+			return testEnv.chats.AddGroupMembers(ctx, group, []*commonpb.UserId{userA})
+		},
+	} {
+		changed, _, err := transition()
+		require.NoError(t, err)
+		require.True(t, changed)
+	}
+	roster, err := testEnv.chats.GetGroupRosterSummary(ctx, group)
+	require.NoError(t, err)
+	require.EqualValues(t, 3, roster.Version)
+
+	testEnv.client1.openUserEventStream(t, userA, keyPairA)
+	testEnv.client1.openUserEventStream(t, userA, keyPairA)
+	waitForChatSubscribers(map[string]bool{self(testEnv.server1): true, self(testEnv.server2): true})
+
+	leave = rosterUpdate(false, 2)
+	testEnv.server2.userEventBus.OnEvent(userA, leave)
+	receiveA(leave)
+	time.Sleep(100 * time.Millisecond)
+	require.Equal(t, map[string]bool{self(testEnv.server1): true, self(testEnv.server2): true}, chatSubscribers())
+	e = publishChat(testEnv.server1)
+	receiveA(e)
+	receiveB(e)
+
+	leave = rosterUpdate(false, 4)
+	testEnv.server1.userEventBus.OnEvent(userA, leave)
+	receiveA(leave)
+	waitForChatSubscribers(map[string]bool{self(testEnv.server2): true})
+	receiveB(publishChat(testEnv.server2))
+	receiveA(testEnv.server1.sendTestUserEvent(userA))
+}
+
+// testMembershipReconciles pins the sweep behind the transitions a stream
+// never hears about: membership moved in the store with no roster update
+// published at all — the shape of a subject's copy lost to a full outbox or
+// a stale subscriber set — puts the user's open streams on the chat's topic,
+// and takes them off again, within the reconcile's interval.
+func testMembershipReconciles(t *testing.T, accounts account.Store) {
+	const reconcileInterval, reconcileTick = 200 * time.Millisecond, 25 * time.Millisecond
+	testEnv, cleanup := setupTest(t, accounts, true, event.WithMembershipReconcile(reconcileInterval, reconcileTick))
+	defer cleanup()
+
+	ctx := context.Background()
+
+	userA := model.MustGenerateUserID()
+	keyPairA := model.MustGenerateKeyPair()
+	accounts.Bind(ctx, userA, keyPairA.Proto())
+	accounts.SetRegistrationFlag(ctx, userA, true)
+
+	userB := model.MustGenerateUserID()
+	keyPairB := model.MustGenerateKeyPair()
+	accounts.Bind(ctx, userB, keyPairB.Proto())
+	accounts.SetRegistrationFlag(ctx, userB, true)
+
+	// The group starts with userB alone. userA streams from two devices on
+	// server1, userB from one on server2.
+	group := putGroupChat(t, testEnv.chats, userB)
+	testEnv.client1.openUserEventStream(t, userA, keyPairA)
+	testEnv.client1.openUserEventStream(t, userA, keyPairA)
+	testEnv.client2.openUserEventStream(t, userB, keyPairB)
+
+	time.Sleep(500 * time.Millisecond)
+
+	self := func(s *serverTestEnv) string { return s.membership.Self().InstanceID }
+	chatSubscribers := func() map[string]bool {
+		rows, err := testEnv.clusterStore.GetSubscribers(ctx, event.ChatEventsNamespace, group.Value)
+		require.NoError(t, err)
+		out := make(map[string]bool, len(rows))
+		for _, row := range rows {
+			out[row.InstanceID] = true
+		}
+		return out
+	}
+	waitForChatSubscribers := func(want map[string]bool) {
+		require.Eventually(t, func() bool { return maps.Equal(chatSubscribers(), want) }, 5*time.Second, 10*time.Millisecond)
+		// Past the publishers' subscriber cache, so the next publish resolves
+		// the rows as they now stand.
+		time.Sleep(100 * time.Millisecond)
+	}
+	publishChat := func(sender *serverTestEnv) *eventpb.Event {
+		e := newTestEvent()
+		sender.chatEventBus.OnEvent(group, &eventpb.ChatEvent{ChatId: group, Event: e})
+		return e
+	}
+	receiveA := func(expected *eventpb.Event) {
+		streamers := testEnv.client1.streams[model.UserIDString(userA)]
+		require.Len(t, streamers, 2)
+		for _, streamer := range streamers {
+			got := receiveNextEvents(t, streamer)
+			require.Len(t, got, 1)
+			assertEquivalentTestEvents(t, expected, got[0])
+		}
+	}
+	receiveB := func(expected *eventpb.Event) {
+		got := testEnv.client2.receiveEventsInRealTime(t, userB)
+		require.Len(t, got, 1)
+		assertEquivalentTestEvents(t, expected, got[0])
+	}
+
+	// A reconcile has run by now and, the store agreeing with the open, moved
+	// nothing: only server2 is on the chat's topic.
+	require.Equal(t, map[string]bool{self(testEnv.server2): true}, chatSubscribers())
+
+	// userA joins in the store with no event published: the reconcile puts
+	// both streams on the topic, and the next chat publish reaches them.
+	changed, _, err := testEnv.chats.AddGroupMembers(ctx, group, []*commonpb.UserId{userA})
+	require.NoError(t, err)
+	require.True(t, changed)
+	waitForChatSubscribers(map[string]bool{self(testEnv.server1): true, self(testEnv.server2): true})
+	e := publishChat(testEnv.server2)
+	receiveA(e)
+	receiveB(e)
+
+	// A reconcile that finds the store and the streams agreeing moves
+	// nothing: the row stays, and a publish is still delivered once.
+	time.Sleep(2 * reconcileInterval)
+	require.Equal(t, map[string]bool{self(testEnv.server1): true, self(testEnv.server2): true}, chatSubscribers())
+	e = publishChat(testEnv.server1)
+	receiveA(e)
+	receiveB(e)
+
+	// userA leaves in the store, again silently: the reconcile takes both
+	// streams off the topic, server1's row goes, and a chat publish from
+	// either side no longer reaches them — their next event is the user event
+	// that follows.
+	changed, _, err = testEnv.chats.RemoveGroupMember(ctx, group, userA)
+	require.NoError(t, err)
+	require.True(t, changed)
+	waitForChatSubscribers(map[string]bool{self(testEnv.server2): true})
+	receiveB(publishChat(testEnv.server1))
+	receiveB(publishChat(testEnv.server2))
+	receiveA(testEnv.server1.sendTestUserEvent(userA))
+
+	// A stream opened between a store transition and its reconcile is
+	// seeded from the store while the older streams wait on the sweep: userA
+	// rejoins, and a third stream opens at once — its open reads the join,
+	// the two older streams learn it from the sweep — and all three end up
+	// on the topic. The new stream's open is what puts server1's row back,
+	// so the row says nothing about the older streams: the sweep is waited
+	// out instead, the interval being the longest a user goes between reads.
+	changed, _, err = testEnv.chats.AddGroupMembers(ctx, group, []*commonpb.UserId{userA})
+	require.NoError(t, err)
+	require.True(t, changed)
+	testEnv.client1.openUserEventStream(t, userA, keyPairA)
+	waitForChatSubscribers(map[string]bool{self(testEnv.server1): true, self(testEnv.server2): true})
+	time.Sleep(2 * reconcileInterval)
+	e = publishChat(testEnv.server2)
+	streamers := testEnv.client1.streams[model.UserIDString(userA)]
+	require.Len(t, streamers, 3)
+	for _, streamer := range streamers {
+		got := receiveNextEvents(t, streamer)
+		require.Len(t, got, 1)
+		assertEquivalentTestEvents(t, e, got[0])
+	}
+	receiveB(e)
+}
+
 // testServerShutdown pins the shutdown contract: Shutdown closes every open
 // stream (which is what lets a gRPC GracefulStop return) and refuses new ones,
 // while the user's streams on other servers keep receiving.
@@ -444,7 +789,7 @@ func testServerShutdown(t *testing.T, accounts account.Store) {
 // newTestEvent builds a bare test event, with no forwarding hops yet.
 func newTestEvent() *eventpb.Event {
 	return &eventpb.Event{
-		Id: event.MustGenerateEventID(),
+		Id: model.MustGenerateEventID(),
 		Ts: timestamppb.Now(),
 		Type: &eventpb.Event_Test{
 			Test: &eventpb.TestEvent{Nonce: uint64(rand.Int64())},
@@ -511,7 +856,7 @@ func (c quietAfterCleanup) With(fields []zapcore.Field) zapcore.Core {
 	return quietAfterCleanup{Core: c.Core.With(fields), quiet: c.quiet}
 }
 
-func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool) (env testEnv, cleanup func()) {
+func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool, opts ...event.ServerOption) (env testEnv, cleanup func()) {
 	quiet := new(atomic.Bool)
 	log := zaptest.NewLogger(t, zaptest.WrapOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
 		return quietAfterCleanup{Core: core, quiet: quiet}
@@ -577,6 +922,7 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool) (en
 				chatEventBus,
 				nil,
 				internalRpcApiKey,
+				opts...,
 			),
 		}
 	}
@@ -607,6 +953,8 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool) (en
 
 	return env, func() {
 		quiet.Store(true)
+		env.server1.server.Shutdown()
+		env.server2.server.Shutdown()
 		cleanup1()
 		cleanup2()
 		env.server1.membership.Stop()

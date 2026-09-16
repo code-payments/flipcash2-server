@@ -42,7 +42,7 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_GroupChat_Membership,
 		testStore_GroupChat_RosterSummary,
 		testStore_GroupChat_ConcurrentTransitions,
-		testStore_GroupChat_IDsForUser,
+		testStore_GroupChat_MembershipsForUser,
 		testStore_GroupChat_ChatsForUser,
 		testStore_GroupChat_ChatsForUserByIDs,
 		testStore_GroupChat_CreationCap,
@@ -774,19 +774,35 @@ func removeGroupMember(t *testing.T, s chat.Store, chatID *commonpb.ChatId, user
 	return changed, roster
 }
 
-// testStore_GroupChat_IDsForUser pins the inverse membership read: exactly the
-// groups the user is currently joined to, tracking joins, departures, and
-// rejoins, with DMs never included.
-func testStore_GroupChat_IDsForUser(t *testing.T, s chat.Store) {
+// testStore_GroupChat_MembershipsForUser pins the inverse membership read:
+// every group the user has a record on, joined or departed, tracking joins,
+// departures, and rejoins, with DMs never included — each at the version of
+// the user's own last transition there, zero for a membership from creation.
+// A departure does not drop the record; it flips it to departed at the
+// departure's version.
+func testStore_GroupChat_MembershipsForUser(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
 	userA := model.MustGenerateUserID()
 	userB := model.MustGenerateUserID()
 
+	type record struct {
+		joined  bool
+		version uint64
+	}
+	// byChat keys each membership's state and version by its chat ID.
+	byChat := func(memberships []chat.GroupMembership) map[string]record {
+		out := make(map[string]record, len(memberships))
+		for _, m := range memberships {
+			out[string(m.ChatID.Value)] = record{joined: m.Joined, version: m.Version}
+		}
+		return out
+	}
+
 	// No memberships is an empty result, not an error.
-	chatIDs, err := s.GetGroupChatIDsForUser(ctx, userA)
+	memberships, err := s.GetGroupMembershipsForUser(ctx, userA)
 	require.NoError(t, err)
-	require.Empty(t, chatIDs)
+	require.Empty(t, memberships)
 
 	groupAB := putGroupChat(t, s, "Both", at(1), userA, userB)
 	groupA := putGroupChat(t, s, "Only A", at(2), userA)
@@ -795,27 +811,54 @@ func testStore_GroupChat_IDsForUser(t *testing.T, s chat.Store) {
 	// A DM must never surface as a group membership.
 	putDmChat(t, s, userA, userB, at(4))
 
-	chatIDs, err = s.GetGroupChatIDsForUser(ctx, userA)
+	// Memberships from creation are at version zero: no transition has
+	// touched them.
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
 	require.NoError(t, err)
-	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupA}), rawChatIDValues(chatIDs))
+	require.Equal(t, map[string]record{
+		string(groupAB.ID.Value): {joined: true, version: 0},
+		string(groupA.ID.Value):  {joined: true, version: 0},
+	}, byChat(memberships))
 
-	// Departure excludes the group; a tombstoned membership is not a membership.
+	// Departure keeps the record, departed, at the departure's version — the
+	// group's first transition.
 	removeGroupMember(t, s, groupAB.ID, userA)
-	chatIDs, err = s.GetGroupChatIDsForUser(ctx, userA)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
 	require.NoError(t, err)
-	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupA}), rawChatIDValues(chatIDs))
+	require.Equal(t, map[string]record{
+		string(groupAB.ID.Value): {joined: false, version: 1},
+		string(groupA.ID.Value):  {joined: true, version: 0},
+	}, byChat(memberships))
 
-	// Rejoining restores it; joining another user's group adds it.
+	// Rejoining flips it back, stamped with the rejoin's version — the group's
+	// second transition. Joining another user's group adds it at that group's
+	// first. A transition by someone else does not move userA's stamp.
 	addGroupMembers(t, s, groupAB.ID, userA)
 	addGroupMembers(t, s, groupB.ID, userA)
-	chatIDs, err = s.GetGroupChatIDsForUser(ctx, userA)
+	addGroupMembers(t, s, groupAB.ID, model.MustGenerateUserID())
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
 	require.NoError(t, err)
-	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupA, groupB}), rawChatIDValues(chatIDs))
+	require.Equal(t, map[string]record{
+		string(groupAB.ID.Value): {joined: true, version: 2},
+		string(groupA.ID.Value):  {joined: true, version: 0},
+		string(groupB.ID.Value):  {joined: true, version: 1},
+	}, byChat(memberships))
+
+	// A user never in a group has no record on it: leaving groupB again
+	// leaves a departed record, but groupA, which userB never joined, is
+	// absent from userB's slice rather than departed.
+	removeGroupMember(t, s, groupB.ID, userA)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
+	require.NoError(t, err)
+	require.Equal(t, record{joined: false, version: 2}, byChat(memberships)[string(groupB.ID.Value)])
 
 	// userB's view was never disturbed by userA's churn.
-	chatIDs, err = s.GetGroupChatIDsForUser(ctx, userB)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userB)
 	require.NoError(t, err)
-	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupB}), rawChatIDValues(chatIDs))
+	require.Equal(t, map[string]record{
+		string(groupAB.ID.Value): {joined: true, version: 0},
+		string(groupB.ID.Value):  {joined: true, version: 0},
+	}, byChat(memberships))
 }
 
 // testStore_GroupChat_ChatsForUser pins the group feed's source read: the
@@ -999,8 +1042,10 @@ func testStore_GroupChat_AddMembersErrors(t *testing.T, s chat.Store) {
 	user := model.MustGenerateUserID()
 
 	// Membership writes against a chat that does not exist must not accrete
-	// orphaned records.
+	// orphaned records, and report the chat missing rather than a no-op.
 	_, _, err := s.AddGroupMembers(ctx, chat.MustGenerateGroupChatID(), []*commonpb.UserId{user})
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+	_, _, err = s.RemoveGroupMember(ctx, chat.MustGenerateGroupChatID(), user)
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 
 	// Group membership methods reject DM chat IDs outright.
@@ -1249,14 +1294,6 @@ func chatIDValues(chats []*chat.Chat) [][]byte {
 	out := make([][]byte, len(chats))
 	for i, c := range chats {
 		out[i] = c.ID.Value
-	}
-	return out
-}
-
-func rawChatIDValues(ids []*commonpb.ChatId) [][]byte {
-	out := make([][]byte, len(ids))
-	for i, id := range ids {
-		out[i] = id.Value
 	}
 	return out
 }

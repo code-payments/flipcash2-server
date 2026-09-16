@@ -10,6 +10,8 @@ import (
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
+
+	"github.com/code-payments/flipcash2-server/model"
 )
 
 // fakeStream is a Stream that records nothing but identity and closure.
@@ -206,7 +208,7 @@ func targets(r *streamRegistry, key string, exclude []*commonpb.UserId) []Stream
 func TestStreamRegistry_EachDeliversUnderLock(t *testing.T) {
 	r := newStreamRegistry()
 	const key = "chat:hot"
-	e := &eventpb.Event{Id: MustGenerateEventID()}
+	e := &eventpb.Event{Id: model.MustGenerateEventID()}
 
 	// A one-slot stream lag-closes on its second notify; a roomy one never does.
 	laggy := NewEventStream[*eventpb.Event]("laggy", 1)

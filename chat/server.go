@@ -16,11 +16,15 @@ import (
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
+	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/moderation"
 )
 
 // MessageRef identifies a chat's message to hydrate. The feed builds one ref per
@@ -100,11 +104,11 @@ type BlocklistReader interface {
 	GetBlocked(ctx context.Context, ownerID *commonpb.UserId, candidateIDs []*commonpb.UserId) (map[string]bool, error)
 }
 
-// MediaReader is the read slice of the blob domain the Chat service needs to
-// hydrate group pictures. Like the other readers it is declared here (consumer
-// side) so the chat package need not import blob — which imports chat for its
-// membership resolver — and blob.Integration satisfies it directly.
-type MediaReader interface {
+// Media is the slice of the blob domain the Chat service needs: hydrating group
+// pictures on read, and attaching a picture to a group on write. Like the
+// readers it is declared here (consumer side) so the service can be tested
+// against a canned implementation; blob.Integration satisfies it directly.
+type Media interface {
 	// ResolveRenditions returns each original's full rendition set — the
 	// ORIGINAL plus every derived rendition, each with a freshly minted,
 	// short-lived download URL — keyed by string(BlobId.Value). Originals that
@@ -112,6 +116,35 @@ type MediaReader interface {
 	// authorization: the caller passes only ids it has already established the
 	// reader may see.
 	ResolveRenditions(ctx context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error)
+
+	// SetAsChatPicture attaches the blob holding a picture's ORIGINAL to chatID
+	// as its picture: it verifies that ownerID owns the blob and that it is a
+	// READY image original, then grants read access to it on the surfaces the
+	// picture is shown from. It is idempotent. It returns one of
+	// blob.ErrBlobNotFound, blob.ErrBlobNotReady, blob.ErrBlobRejected, or
+	// blob.ErrBlobInvalid when the blob cannot back a picture, having granted
+	// nothing; any other error is a failure to attach.
+	//
+	// It touches only blob-domain state, so it may be called for a chat that
+	// does not exist yet — which is how a group is created with its picture in
+	// place, rather than briefly without one.
+	SetAsChatPicture(ctx context.Context, ownerID *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error
+}
+
+// UserEventPublisher is the write slice of the event domain the Chat service
+// needs to notify one user's streams — the user-keyed event bus. Like the
+// readers it is declared here (consumer side) because the event package
+// imports chat for stream registration, so chat cannot import it back; the
+// event package's Bus satisfies it directly.
+type UserEventPublisher interface {
+	OnEvent(userID *commonpb.UserId, e *eventpb.Event)
+}
+
+// ChatEventPublisher is the write slice of the event domain the Chat service
+// needs to notify every stream subscribed to a group chat's topic — the
+// chat-keyed event bus. See UserEventPublisher for why it is declared here.
+type ChatEventPublisher interface {
+	OnEvent(chatID *commonpb.ChatId, e *eventpb.ChatEvent)
 }
 
 type Server struct {
@@ -119,11 +152,23 @@ type Server struct {
 
 	authz auth.Authorizer
 
+	accounts  account.Store
 	blocklist BlocklistReader
 	chats     Store
-	media     MediaReader
+	media     Media
 	messaging MessagingReader
+	moderator moderation.Client
 	profiles  ProfileReader
+
+	rules *RuleEvaluator
+
+	userEventBus UserEventPublisher
+	chatEventBus ChatEventPublisher
+
+	// requireStaffForGroupManagement gates the self-service group management
+	// RPCs (StartChat, JoinChat, LeaveChat) to staff users when set (see
+	// requireStaffForGroupManagementRPC).
+	requireStaffForGroupManagement bool
 
 	// maxGroupFeedChats is the most group chats a user's feed may hold (see
 	// feed.go). It is the package constant of the same name in production;
@@ -133,15 +178,45 @@ type Server struct {
 	chatpb.UnimplementedChatServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, blocklist BlocklistReader, chats Store, media MediaReader, messaging MessagingReader, profiles ProfileReader) *Server {
+func NewServer(
+	log *zap.Logger,
+
+	authz auth.Authorizer,
+
+	accounts account.Store,
+	balances *balance.Client,
+	blocklist BlocklistReader,
+	chats Store,
+	media Media,
+	messaging MessagingReader,
+	moderator moderation.Client,
+	profiles ProfileReader,
+
+	userEventBus UserEventPublisher,
+	chatEventBus ChatEventPublisher,
+
+	requireStaffForGroupManagement bool,
+) *Server {
 	return &Server{
-		log:               log,
-		authz:             authz,
-		blocklist:         blocklist,
-		chats:             chats,
-		media:             media,
-		messaging:         messaging,
-		profiles:          profiles,
+		log: log,
+
+		authz: authz,
+
+		accounts:  accounts,
+		blocklist: blocklist,
+		chats:     chats,
+		media:     media,
+		messaging: messaging,
+		moderator: moderator,
+		profiles:  profiles,
+
+		rules: NewRuleEvaluator(accounts, balances, chats),
+
+		userEventBus: userEventBus,
+		chatEventBus: chatEventBus,
+
+		requireStaffForGroupManagement: requireStaffForGroupManagement,
+
 		maxGroupFeedChats: maxGroupFeedChats,
 	}
 }
@@ -351,8 +426,12 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 		md := c.ToProto()
 		if IsGroupChatID(c.ID) {
 			// ToProto projects the canonical record, which carries neither a
-			// group's members nor its summary. A group without a summary record
-			// reads as zero, as the single read returns it.
+			// group's members nor its summary. Every group in the set exists, but
+			// the batch read is eventually consistent, so a group written moments
+			// ago may be absent and read as a zero summary, and one moved
+			// moments ago may read one transition behind. A caller that has
+			// just written the group or its roster holds the authoritative
+			// summary and should overwrite this one with it.
 			md.Members = []*chatpb.Member{{UserId: &commonpb.UserId{Value: append([]byte(nil), viewerID.Value...)}}}
 			md.RosterSummary = rosterSummaries[key].ToProto()
 		}

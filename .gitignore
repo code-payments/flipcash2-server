@@ -41,7 +41,8 @@ main.go
 
 # Moderation test fixtures. These hold the names and handles the classifiers
 # must flag — slurs, hate codes, and child-safety terms — so they are
-# deliberately kept out of version control. See MODERATION_DISPLAY_NAME_FIXTURES
-# and MODERATION_USERNAME_FIXTURES in moderation/claude/client_test.go for the
-# format and how to point the tests at a copy.
+# deliberately kept out of version control. See MODERATION_DISPLAY_NAME_FIXTURES,
+# MODERATION_USERNAME_FIXTURES and MODERATION_GROUP_TITLE_FIXTURES in
+# moderation/claude/client_test.go for the format and how to point the tests at
+# a copy.
 moderation/claude/testdata/

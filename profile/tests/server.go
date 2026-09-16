@@ -1371,6 +1371,10 @@ func (m *fakeModerator) ClassifyCurrencyName(context.Context, string) (*moderati
 	return &moderation.Result{}, nil
 }
 
+func (m *fakeModerator) ClassifyGroupTitle(context.Context, string) (*moderation.Result, error) {
+	return &moderation.Result{}, nil
+}
+
 func (m *fakeModerator) ClassifyUsername(_ context.Context, username string) (*moderation.Result, error) {
 	m.classifiedUsername = username
 	return fakeResult(m.usernameFlagged, m.usernameCategories, m.usernameErr)

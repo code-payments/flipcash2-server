@@ -37,6 +37,20 @@ func (m *accessMemory) Grant(_ context.Context, g *blob.Grant) error {
 	return nil
 }
 
+func (m *accessMemory) Grants(_ context.Context, gs []*blob.Grant) error {
+	if err := blob.ValidateGrants(gs); err != nil {
+		return err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	for _, g := range gs {
+		m.grants[grantKey(g.BlobID, g.Principal, g.Permission)] = struct{}{}
+	}
+	return nil
+}
+
 func (m *accessMemory) HasGrant(_ context.Context, blobID *blobpb.BlobId, p blob.Principal, perm blob.Permission) (bool, error) {
 	if err := (&blob.Grant{BlobID: blobID, Principal: p, Permission: perm}).Validate(); err != nil {
 		return false, err

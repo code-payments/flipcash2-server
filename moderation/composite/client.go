@@ -12,17 +12,19 @@ type client struct {
 	currencyNameClient moderation.Client
 	usernameClient     moderation.Client
 	displayNameClient  moderation.Client
+	groupTitleClient   moderation.Client
 }
 
 // NewClient creates a moderation client that delegates each classification
 // method to a dedicated implementation.
-func NewClient(textClient, imageClient, currencyNameClient, usernameClient, displayNameClient moderation.Client) moderation.Client {
+func NewClient(textClient, imageClient, currencyNameClient, usernameClient, displayNameClient, groupTitleClient moderation.Client) moderation.Client {
 	return &client{
 		textClient:         textClient,
 		imageClient:        imageClient,
 		currencyNameClient: currencyNameClient,
 		usernameClient:     usernameClient,
 		displayNameClient:  displayNameClient,
+		groupTitleClient:   groupTitleClient,
 	}
 }
 
@@ -44,4 +46,8 @@ func (c *client) ClassifyUsername(ctx context.Context, username string) (*modera
 
 func (c *client) ClassifyDisplayName(ctx context.Context, name string) (*moderation.Result, error) {
 	return c.displayNameClient.ClassifyDisplayName(ctx, name)
+}
+
+func (c *client) ClassifyGroupTitle(ctx context.Context, title string) (*moderation.Result, error) {
+	return c.groupTitleClient.ClassifyGroupTitle(ctx, title)
 }

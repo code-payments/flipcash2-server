@@ -17,6 +17,7 @@ import (
 func RunAccessStoreTests(t *testing.T, store blob.AccessStore, teardown func()) {
 	for _, tf := range []func(t *testing.T, store blob.AccessStore){
 		testAccessGrantHasRevoke,
+		testAccessGrants,
 		testAccessNoCollision,
 		testAccessProfileGrant,
 		testAccessValidation,
@@ -65,6 +66,51 @@ func testAccessGrantHasRevoke(t *testing.T, store blob.AccessStore) {
 	require.NoError(t, err)
 	require.False(t, has)
 	require.NoError(t, store.Revoke(ctx, blobID, chat, blob.PermissionRead))
+}
+
+func testAccessGrants(t *testing.T, store blob.AccessStore) {
+	ctx := context.Background()
+
+	blobID := blob.MustGenerateID()
+	chatID := newChatID(t)
+	chat := blob.PrincipalForChat(chatID)
+	profile := blob.PrincipalForChatProfile(chatID)
+	read := func(p blob.Principal) *blob.Grant {
+		return &blob.Grant{BlobID: blobID, Principal: p, Permission: blob.PermissionRead}
+	}
+	hasGrant := func(p blob.Principal) bool {
+		has, err := store.HasGrant(ctx, blobID, p, blob.PermissionRead)
+		require.NoError(t, err)
+		return has
+	}
+
+	// An empty batch is a no-op.
+	require.NoError(t, store.Grants(ctx, nil))
+
+	// A batch lands every grant in it; a duplicate within the batch collapses.
+	require.NoError(t, store.Grants(ctx, []*blob.Grant{read(chat), read(profile), read(chat)}))
+	require.True(t, hasGrant(chat))
+	require.True(t, hasGrant(profile))
+
+	// Re-granting a batch is idempotent, as a single grant is.
+	require.NoError(t, store.Grants(ctx, []*blob.Grant{read(chat), read(profile)}))
+	require.True(t, hasGrant(chat))
+	require.True(t, hasGrant(profile))
+
+	// A malformed grant anywhere in the batch grants nothing.
+	other := blob.PrincipalForChat(newChatID(t))
+	err := store.Grants(ctx, []*blob.Grant{read(other), {BlobID: blobID, Principal: other, Permission: blob.PermissionUnknown}})
+	require.ErrorIs(t, err, blob.ErrInvalidGrant)
+	require.False(t, hasGrant(other))
+
+	// So does a batch over the cap.
+	tooMany := make([]*blob.Grant, blob.MaxGrantBatch+1)
+	for i := range tooMany {
+		tooMany[i] = &blob.Grant{BlobID: blob.MustGenerateID(), Principal: other, Permission: blob.PermissionRead}
+	}
+	err = store.Grants(ctx, tooMany)
+	require.ErrorIs(t, err, blob.ErrInvalidGrant)
+	require.False(t, hasGrant(other))
 }
 
 func testAccessNoCollision(t *testing.T, store blob.AccessStore) {

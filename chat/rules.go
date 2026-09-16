@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -52,6 +54,84 @@ func (c *Chat) Rules() *chatpb.Rules {
 	return &chatpb.Rules{Listener: listener}
 }
 
+// ErrInvalidRules is returned by RulesFromProto for a rule set a group cannot
+// carry (see RulesFromProto for what one can).
+var ErrInvalidRules = errors.New("invalid chat rules")
+
+// RulesFromProto validates a rule set a client asked a new group to carry and
+// projects it onto the stored fields Rules projects back from, so that a group
+// created with rules shows exactly the rules it was asked for.
+//
+// It accepts what a group can store today, and nothing more, so that a rule
+// is never accepted and then silently dropped: listener rules only, since no
+// group carries a speaker rule yet; each kind at most once, since the record
+// holds one of each; and a minimum balance in USD only, since that is the only
+// balance the evaluator can answer (see satisfiesMinimumBalance), of at least
+// the currency's minimum transfer value — one unit at its last decimal place,
+// a penny for USD, the smallest amount OCP lets anyone hold or move in that
+// currency (see minimumTransferValue). A requirement below it asks for a
+// balance no one can distinguish from nothing, so the rule would admit
+// everyone, or no one, on rounding alone. The requirement's mints are taken as given: the
+// proto bounds how many, and validation bounds their shape. Anything else is
+// ErrInvalidRules — a rule the server cannot enforce is refused up front rather
+// than stored and failed on every evaluation.
+//
+// It also requires what every group must carry today: a minimum listener
+// balance. A set without one — nil, empty, or staff-only — is ErrInvalidRules,
+// so no group is created that a holder of nothing could join.
+func RulesFromProto(rules *chatpb.Rules) (isStaffOnly bool, minimumListenerBalance *MinimumBalance, err error) {
+	if len(rules.GetSpeaker()) > 0 {
+		return false, nil, fmt.Errorf("%w: speaker rules are not supported", ErrInvalidRules)
+	}
+	for _, rule := range rules.GetListener() {
+		switch k := rule.GetKind().(type) {
+		case *chatpb.ListenerRules_Staff:
+			if isStaffOnly {
+				return false, nil, fmt.Errorf("%w: duplicate staff requirement", ErrInvalidRules)
+			}
+			isStaffOnly = true
+		case *chatpb.ListenerRules_MinimumBalance:
+			if minimumListenerBalance != nil {
+				return false, nil, fmt.Errorf("%w: duplicate minimum balance requirement", ErrInvalidRules)
+			}
+			req := k.MinimumBalance
+			currency := currency_lib.Code(req.GetAmount().GetCurrency())
+			if currency != currency_lib.USD {
+				return false, nil, fmt.Errorf("%w: unsupported minimum balance currency %q", ErrInvalidRules, req.GetAmount().GetCurrency())
+			}
+			amount := req.GetAmount().GetNativeAmount()
+			if minimum := minimumTransferValue(currency); math.IsNaN(amount) || math.IsInf(amount, 0) || amount < minimum {
+				return false, nil, fmt.Errorf("%w: minimum balance amount must be at least %s %s", ErrInvalidRules, strconv.FormatFloat(minimum, 'f', -1, 64), strings.ToUpper(string(currency)))
+			}
+			mints := make([]*commonpb.PublicKey, len(req.GetMints()))
+			for i, mint := range req.GetMints() {
+				mints[i] = &commonpb.PublicKey{Value: append([]byte(nil), mint.GetValue()...)}
+			}
+			minimumListenerBalance = &MinimumBalance{
+				Currency:     string(currency_lib.USD),
+				NativeAmount: amount,
+				Mints:        mints,
+			}
+		default:
+			return false, nil, fmt.Errorf("%w: unsupported listener rule %T", ErrInvalidRules, k)
+		}
+	}
+	if minimumListenerBalance == nil {
+		return false, nil, fmt.Errorf("%w: a minimum listener balance is required", ErrInvalidRules)
+	}
+	return isStaffOnly, minimumListenerBalance, nil
+}
+
+// minimumTransferValue is the smallest amount of a currency OCP transfers: one
+// unit at the currency's last decimal place (currency.GetDecimals), 0.01 for
+// USD and 1 for a currency with no minor unit. It is the floor a minimum
+// balance requirement must meet (see RulesFromProto). OCP's own amount
+// validation is the source of the definition; it is not exported, so the
+// arithmetic is repeated here.
+func minimumTransferValue(code currency_lib.Code) float64 {
+	return math.Pow10(-currency_lib.GetDecimals(code))
+}
+
 // RuleEvaluator decides whether a user satisfies a chat's participation rules
 // (see Chat.Rules). It evaluates rules only: membership is a separate, cheaper
 // check the caller makes first, so a chat's rules are never evaluated — and
@@ -97,6 +177,15 @@ func (e *RuleEvaluator) CanListen(ctx context.Context, chatID *commonpb.ChatId, 
 	return e.satisfiesListener(ctx, rules, userID)
 }
 
+// CanListenWithRules is CanListen for a caller that already holds the chat's
+// rules — read off a canonical record it loaded for its own purposes, or
+// taken from a request for a chat that does not exist yet — so the rules are
+// not read a second time. A nil rules admits everyone, as a chat with none
+// does.
+func (e *RuleEvaluator) CanListenWithRules(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+	return e.satisfiesListener(ctx, rules, userID)
+}
+
 // CanSpeak reports whether userID satisfies every listener and speaker rule of
 // chatID — the requirements to send messages in the chat. Speaker rules apply
 // on top of listener rules: a user who cannot listen cannot speak, whatever the
@@ -106,10 +195,17 @@ func (e *RuleEvaluator) CanSpeak(ctx context.Context, chatID *commonpb.ChatId, u
 	if err != nil {
 		return false, err
 	}
-	if ok, err := e.satisfiesListener(ctx, rules, userID); err != nil || !ok {
-		return false, err
-	}
-	for _, rule := range rules.GetSpeaker() {
+	return e.satisfiesSpeaker(ctx, rules, userID)
+}
+
+// CanSpeakWithRules is CanSpeak for a caller that already holds the chat's
+// rules (see CanListenWithRules). A nil rules admits everyone.
+func (e *RuleEvaluator) CanSpeakWithRules(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+	return e.satisfiesSpeaker(ctx, rules, userID)
+}
+
+func (e *RuleEvaluator) satisfiesListener(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+	for _, rule := range rules.GetListener() {
 		ok, err := e.satisfies(ctx, rule.GetKind(), userID)
 		if err != nil || !ok {
 			return false, err
@@ -118,8 +214,13 @@ func (e *RuleEvaluator) CanSpeak(ctx context.Context, chatID *commonpb.ChatId, u
 	return true, nil
 }
 
-func (e *RuleEvaluator) satisfiesListener(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
-	for _, rule := range rules.GetListener() {
+// satisfiesSpeaker evaluates the listener rules and then the speaker rules,
+// stopping at the first the user fails.
+func (e *RuleEvaluator) satisfiesSpeaker(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+	if ok, err := e.satisfiesListener(ctx, rules, userID); err != nil || !ok {
+		return false, err
+	}
+	for _, rule := range rules.GetSpeaker() {
 		ok, err := e.satisfies(ctx, rule.GetKind(), userID)
 		if err != nil || !ok {
 			return false, err

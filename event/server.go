@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +17,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 
@@ -46,8 +49,10 @@ const ChatEventsNamespace = "chat-events"
 // registry, shared by the registration and delivery paths. The prefixes keep
 // the two key families disjoint: user IDs and group chat IDs are both 16-byte
 // values, so an unprefixed chat ID could alias a user's slot.
+const userStreamKeyPrefix = "user:"
+
 func userStreamKey(userID *commonpb.UserId) string {
-	return "user:" + model.UserIDString(userID)
+	return userStreamKeyPrefix + model.UserIDString(userID)
 }
 
 func chatStreamKey(chatID *commonpb.ChatId) string {
@@ -89,7 +94,38 @@ const (
 	// stream per event, so even a full batch across thousands of streams is
 	// tens of milliseconds, and the bound is for a wedged peer, not pacing.
 	forwardRpcTimeout = time.Second
+
+	// membershipSyncTimeout bounds the cluster registration a membership
+	// transition makes or releases on behalf of a user's open streams (see
+	// followMembership). It runs detached from any request, on its own budget.
+	membershipSyncTimeout = 2 * time.Second
+
+	// The membership reconcile's schedule (see reconcileMembership). The
+	// interval is how often each user's memberships are re-read: the longest
+	// a transition this server never saw can leave a stream on the wrong
+	// topics, and the read rate a server pays for its streams — one index
+	// query per user per interval, so a few thousand users cost a few reads
+	// a second. The tick is the sweep's cadence, and with the interval sets
+	// the per-tick ration of re-reads. Workers bounds the reads in flight at
+	// once, whatever a backlog makes due together.
+	defaultMembershipReconcileInterval = 5 * time.Minute
+	defaultMembershipReconcileTick     = time.Second
+	membershipReconcileWorkers         = 8
 )
+
+// ServerOption tunes a Server at construction.
+type ServerOption func(*Server)
+
+// WithMembershipReconcile overrides the membership reconcile's schedule (see
+// reconcileMembership): how often each user's memberships are re-read, and
+// the sweep's tick. Tests use it to run the reconcile fast; production keeps
+// the defaults.
+func WithMembershipReconcile(interval, tick time.Duration) ServerOption {
+	return func(s *Server) {
+		s.reconcileInterval = interval
+		s.reconcileTick = tick
+	}
+}
 
 // localStream is one open stream in the local registry, carrying the user it
 // belongs to: a stream appears under several keys (its user's, plus one per
@@ -122,9 +158,19 @@ type Server struct {
 
 	// streams fans a topic out to every open local stream (see streamRegistry).
 	// It also refuses new streams once Shutdown has begun, so a stream can't
-	// slip in behind the closing sweep.
+	// slip in behind the closing sweep. sessions is the per-stream view of the
+	// same registrations, by user, for moving a user's streams between chat
+	// topics as their membership changes (see followMembership).
 	streams                 *streamRegistry
+	sessions                *streamSessions
 	staleEventDetectorCtors []StaleEventDetectorCtor[*eventpb.Event]
+
+	// The membership reconcile's schedule (see reconcileMembership) and the
+	// channel closed to stop its sweep, once, on Shutdown.
+	reconcileInterval time.Duration
+	reconcileTick     time.Duration
+	reconcileStop     chan struct{}
+	reconcileStopOnce sync.Once
 
 	// self is the cluster member this process registers subscription rows as:
 	// its instance ID recognizes our own rows on the publish path, its address
@@ -138,6 +184,10 @@ type Server struct {
 	eventpb.UnimplementedEventStreamingServer
 }
 
+// NewServer constructs the event streaming server and starts its membership
+// reconcile sweep (see reconcileMembership) in the background. The sweep runs
+// until Shutdown, which every caller must eventually invoke — a Server that is
+// constructed and dropped without it leaks the sweep's goroutine.
 func NewServer(
 	log *zap.Logger,
 	authz auth.Authorizer,
@@ -149,6 +199,7 @@ func NewServer(
 	chatEventBus *Bus[*commonpb.ChatId, *eventpb.ChatEvent],
 	staleEventDetectorCtors []StaleEventDetectorCtor[*eventpb.Event],
 	currentRpcApiKey string,
+	opts ...ServerOption,
 ) *Server {
 	// The server hosts streams and registers subscription rows, which requires
 	// a registered cluster member — an observer membership backs forwarding
@@ -173,16 +224,26 @@ func NewServer(
 		chatEventBus: chatEventBus,
 
 		streams:                 newStreamRegistry(),
+		sessions:                newStreamSessions(),
 		staleEventDetectorCtors: staleEventDetectorCtors,
+
+		reconcileInterval: defaultMembershipReconcileInterval,
+		reconcileTick:     defaultMembershipReconcileTick,
+		reconcileStop:     make(chan struct{}),
 
 		self:         subscriptions.Self(),
 		internalAuth: internalrpc.NewAuthenticator(currentRpcApiKey),
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 
 	s.forwarder = newEventForwarder(log, subscriptions, currentRpcApiKey, s.self.InstanceID, s.deliverLocal)
 
 	userEventBus.AddHandler(HandlerFunc[*commonpb.UserId, *eventpb.Event](s.OnEvent))
 	chatEventBus.AddHandler(HandlerFunc[*commonpb.ChatId, *eventpb.ChatEvent](s.OnChatEvent))
+
+	go s.reconcileMembership()
 
 	return s
 }
@@ -259,48 +320,94 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 
 	// The stream serves the user's own topic plus one topic per group chat
 	// they are joined to, so group publishers can resolve the hosting servers
-	// by group instead of once per member. The membership set is a snapshot as
-	// of stream open: a group joined or left mid-stream does not adjust the
-	// registration until the client reconnects.
-	groupChatIDs, err := s.chats.GetGroupChatIDsForUser(ctx, userID)
+	// by group instead of once per member.
+	//
+	// The local stream must be resolvable before a topic's registry row is, or
+	// a publish racing the open could resolve the row yet find no stream
+	// behind it — so the user key is registered up front, before the first
+	// Subscribe below, and each chat key before its own row (see seed).
+	//
+	// And into the index before even that, so that from the first event the
+	// user key can deliver, every transition on it moves this stream (see
+	// followMembership): indexed after registering, a transition landing in
+	// between would notify the stream and move nothing. The membership
+	// records are then merged in behind the transitions through the same
+	// version gate (see streamSession.seed), so a record and a transition
+	// that cross — the read reflecting a transition already applied, or a
+	// transition landing on a record that predates it — resolve to the newer
+	// of the two, not the later-arriving. Departed records seed a version
+	// too, so a delayed copy of a join the user has since undone is stale on
+	// arrival rather than news.
+	//
+	// What remains uncovered is a transition this server never hears of: one
+	// published before this server's row for the user's topic lands (below)
+	// — which the user's first stream here cannot receive — that the read
+	// also predates, by its timing or by the inverted membership index's
+	// replication lag. The reconcile sweep re-reads for those (see
+	// reconcileMembership).
+	session := newStreamSession(streamID, localStream{stream: ss, userID: userID}, userStreamKey(userID), s.streams)
+	s.sessions.add(session)
+	if !session.open() {
+		// Indexed but never registered: a transition may still have found the
+		// session and attached a chat key before the registry began draining,
+		// so it is torn down as a closed stream is, not merely unindexed.
+		s.sessions.remove(session)
+		if handles := session.close(); len(handles) > 0 {
+			closeCtx, cancel := context.WithTimeout(context.Background(), subscriptionCloseTimeout)
+			s.releaseHandles(closeCtx, handles)
+			cancel()
+		}
+		log.Debug("Rejecting stream on shut-down server")
+		return status.Error(codes.Unavailable, "server is draining")
+	}
+
+	defer func() {
+		log.Debug("Closing streamer")
+
+		// Out of the index first, so no transition attaches to a stream that
+		// is ending; then out of the registry, releasing every registration
+		// the stream still holds as one batched close.
+		s.sessions.remove(session)
+		handles := session.close()
+
+		closeCtx, cancel := context.WithTimeout(context.Background(), subscriptionCloseTimeout)
+		if err := s.subscriptions.CloseAll(closeCtx, handles); err != nil {
+			log.With(zap.Error(err)).Warn("Failed to close stream subscriptions")
+		}
+		cancel()
+	}()
+
+	memberships, err := s.chats.GetGroupMembershipsForUser(ctx, userID)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure loading group memberships for stream")
 		return status.Error(codes.Internal, "failure loading group memberships")
 	}
 
-	streamKeys := make([]string, 0, 1+len(groupChatIDs))
-	streamKeys = append(streamKeys, userStreamKey(userID))
-	for _, chatID := range groupChatIDs {
-		streamKeys = append(streamKeys, chatStreamKey(chatID))
+	seeds := make([]topicSeed, 0, len(memberships))
+	chatIDs := make(map[string]*commonpb.ChatId, len(memberships))
+	for _, m := range memberships {
+		key := chatStreamKey(m.ChatID)
+		seeds = append(seeds, topicSeed{key: key, version: m.Version, joined: m.Joined})
+		chatIDs[key] = m.ChatID
 	}
-
-	// The local stream must be resolvable before a topic's registry row is, or
-	// a publish racing the open could resolve the row yet find no stream
-	// behind it — so every key is registered up front, before the first
-	// Subscribe below.
-	if !s.streams.add(streamID, localStream{stream: ss, userID: userID}, streamKeys) {
-		log.Debug("Rejecting stream on shut-down server")
-		return status.Error(codes.Unavailable, "server is draining")
-	}
-
-	removeLocalStream := func() {
-		s.streams.remove(streamID, streamKeys)
+	chatKeys, released := session.seed(seeds)
+	if len(released) > 0 {
+		s.releaseHandles(ctx, released)
 	}
 
 	// Register this server's interest in the stream's topics with the cluster,
 	// so publishers on other servers forward here — one batched registration
-	// covering the user topic and every group topic, so the stream-open path
-	// pays a single store round trip no matter how many groups. Non-exclusive:
-	// the same user (and all the more so the same group) may hold streams on
-	// any number of servers simultaneously.
-	topics := make([]cluster.SubscriptionTopic, 0, 1+len(groupChatIDs))
+	// covering the user topic and every group topic the seed attached, so the
+	// stream-open path pays a single store round trip no matter how many
+	// groups. Non-exclusive: the same user (and all the more so the same
+	// group) may hold streams on any number of servers simultaneously.
+	topics := make([]cluster.SubscriptionTopic, 0, 1+len(chatKeys))
 	topics = append(topics, cluster.SubscriptionTopic{Namespace: UserEventsNamespace, Key: userID.Value})
-	for _, chatID := range groupChatIDs {
-		topics = append(topics, cluster.SubscriptionTopic{Namespace: ChatEventsNamespace, Key: chatID.Value})
+	for _, key := range chatKeys {
+		topics = append(topics, cluster.SubscriptionTopic{Namespace: ChatEventsNamespace, Key: chatIDs[key].Value})
 	}
 	subscriptions, err := s.subscriptions.SubscribeAll(ctx, topics)
 	if err != nil {
-		removeLocalStream()
 		if errors.Is(err, cluster.ErrSubscriptionsDraining) {
 			log.Debug("Rejecting stream on draining server")
 			return status.Error(codes.Unavailable, "server is draining")
@@ -308,18 +415,12 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 		log.With(zap.Error(err)).Warn("Failure registering stream subscriptions")
 		return status.Error(codes.Internal, "failure registering stream subscriptions")
 	}
-
-	defer func() {
-		log.Debug("Closing streamer")
-
-		removeLocalStream()
-
-		closeCtx, cancel := context.WithTimeout(context.Background(), subscriptionCloseTimeout)
-		if err := s.subscriptions.CloseAll(closeCtx, subscriptions); err != nil {
-			log.With(zap.Error(err)).Warn("Failed to close stream subscriptions")
-		}
-		cancel()
-	}()
+	// A chat handle the session refuses belongs to a key a transition moved
+	// while the batch was in flight (see setHandles); it is released as a
+	// transition's own would be.
+	if refused := session.setHandles(subscriptions[0], chatKeys, subscriptions[1:]); len(refused) > 0 {
+		s.releaseHandles(ctx, refused)
+	}
 
 	// The stream's steady-state cost is fixed at open: one send goroutine, one
 	// receive goroutine, a ping ticker and a pong deadline timer — nothing is
@@ -477,8 +578,12 @@ func (s *Server) ForwardChatEvents(ctx context.Context, events ...*eventpb.ChatE
 // after Subscriptions.Drain and before the gRPC server's GracefulStop: the
 // streams are held open indefinitely by connected clients, so a GracefulStop
 // without this never returns. Closed clients reconnect to a healthy server and
-// delta sync. Idempotent.
+// delta sync. Idempotent. It also stops the membership reconcile's sweep; a
+// reconcile in flight finishes against sessions that refuse it (see
+// streamSession.close).
 func (s *Server) Shutdown() {
+	s.reconcileStopOnce.Do(func() { close(s.reconcileStop) })
+
 	targets := s.streams.drain()
 
 	s.log.Debug("Closing all event streams for shutdown", zap.Int("streams", len(targets)))
@@ -499,6 +604,14 @@ func (s *Server) Shutdown() {
 // client is doing — and that pass runs under the registry's read lock rather
 // than over a snapshot, so it allocates nothing per event either.
 func (s *Server) deliverLocal(streamKey string, e *eventpb.Event, exclude []*commonpb.UserId) {
+	// A user-keyed delivery may be the user's own copy of a membership
+	// transition, which moves their streams between chat topics. That runs
+	// before the notify, so a departure stops chat-topic delivery to the
+	// leaver's streams from this event on.
+	if strings.HasPrefix(streamKey, userStreamKeyPrefix) {
+		s.followMembership(streamKey, e)
+	}
+
 	s.streams.each(streamKey, exclude, func(stream Stream[*eventpb.Event]) {
 		err := stream.Notify(e)
 		switch {
@@ -517,13 +630,264 @@ func (s *Server) deliverLocal(streamKey string, e *eventpb.Event, exclude []*com
 	})
 }
 
+// followMembership keeps a user's open streams on the chat topics of the
+// groups they are a member of, driven by the user's own copy of each
+// membership transition: a RosterUpdate naming them as the member who joined
+// or left, delivered on their user topic (see chat.Server's publishRosterUpdate).
+// That copy reaches exactly the servers hosting the user's streams — locally
+// off the bus, or forwarded — so every such server adjusts its own streams
+// with no further fan-out.
+//
+// A join puts each of the user's local streams under the chat's key and
+// registers this server's interest in the topic; a departure takes them out
+// from under the key at once and releases the registration. The local
+// registration leads and the cluster one follows on a detached goroutine, as
+// a stream open does, so a publish that resolves this server's row always
+// finds the streams behind it, and a leaver hears nothing further on the
+// topic from the moment their departure is delivered — events published in
+// between the store's transition and this delivery are the only ones that
+// can still reach them.
+//
+// Events on the chat's topic published between the join and the registration
+// landing are not delivered live to the joiner; the MemberJoined carries the
+// chat's metadata, and the client's delta sync from there is the backstop, as
+// it is after any reconnect. A transition addressed to someone else, or on a
+// DM (which has no chat topic), is ignored.
+//
+// Transitions are applied by roster version, not arrival order (see
+// streamSession): a stale copy still reaches the client — which applies it
+// by the same rule — but moves no stream.
+func (s *Server) followMembership(streamKey string, e *eventpb.Event) {
+	update := e.GetChatUpdate()
+	if update == nil || !chat.IsGroupChatID(update.GetChat()) {
+		return
+	}
+	for _, roster := range update.GetRosterUpdates().GetRosterUpdates() {
+		var subject *commonpb.UserId
+		var joined bool
+		switch kind := roster.GetKind().(type) {
+		case *chatpb.RosterUpdate_MemberJoined_:
+			subject, joined = kind.MemberJoined.GetMember().GetUserId(), true
+		case *chatpb.RosterUpdate_MemberLeft_:
+			subject = kind.MemberLeft.GetUserId()
+		default:
+			continue
+		}
+		if subject == nil || userStreamKey(subject) != streamKey {
+			continue
+		}
+		sessions := s.sessions.forUser(streamKey)
+		if len(sessions) == 0 {
+			continue
+		}
+		version := roster.GetRosterSummary().GetVersion()
+		if joined {
+			go s.joinStreams(sessions, update.GetChat(), version)
+		} else {
+			s.leaveStreams(sessions, update.GetChat(), version)
+		}
+	}
+}
+
+// joinStreams attaches the sessions to the chat's topic. One cluster
+// registration per stream: the subscription layer refcounts them, so only the
+// first costs a row write. A registration failure stops the pass: the store
+// is what failed, and the sessions not yet attached recorded nothing, so a
+// later copy of the join — or the reconcile — attaches them.
+func (s *Server) joinStreams(sessions []*streamSession, chatID *commonpb.ChatId, version uint64) {
+	ctx, cancel := context.WithTimeout(context.Background(), membershipSyncTimeout)
+	defer cancel()
+
+	chatKey := chatStreamKey(chatID)
+	for _, session := range sessions {
+		if _, err := s.attachSession(ctx, session, chatID, chatKey, version); err != nil {
+			return
+		}
+	}
+}
+
+// attachSession applies a join at the given roster version to one session:
+// the local registration first (see streamSession.attach), then the cluster
+// one, whose handle the session takes — or, if it ended or left the chat
+// meanwhile, releases. It reports whether the session was attached, and the
+// registration error if there was one, after undoing the attach so the join
+// can be retried.
+func (s *Server) attachSession(ctx context.Context, session *streamSession, chatID *commonpb.ChatId, chatKey string, version uint64) (bool, error) {
+	if !session.attach(chatKey, version) {
+		return false, nil
+	}
+	handle, err := s.subscriptions.Subscribe(ctx, ChatEventsNamespace, chatID.Value)
+	if err != nil {
+		session.rollback(chatKey, version)
+		if !errors.Is(err, cluster.ErrSubscriptionsDraining) {
+			s.log.With(zap.Error(err), zap.String("chat_id", hex.EncodeToString(chatID.GetValue()))).Warn("Failure registering stream subscription for joined chat")
+		}
+		return false, err
+	}
+	if !session.setHandle(chatKey, handle) {
+		if err := handle.Close(ctx); err != nil {
+			s.log.With(zap.Error(err), zap.String("chat_id", hex.EncodeToString(chatID.GetValue()))).Warn("Failed to close orphaned stream subscription")
+		}
+	}
+	return true, nil
+}
+
+// leaveStreams detaches the sessions from the chat's topic synchronously,
+// then releases their registrations together off the caller's path.
+func (s *Server) leaveStreams(sessions []*streamSession, chatID *commonpb.ChatId, version uint64) {
+	chatKey := chatStreamKey(chatID)
+	var handles []*cluster.SubscriptionHandle
+	for _, session := range sessions {
+		if handle := session.detach(chatKey, version); handle != nil {
+			handles = append(handles, handle)
+		}
+	}
+	if len(handles) == 0 {
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), membershipSyncTimeout)
+		defer cancel()
+		s.releaseHandles(ctx, handles)
+	}()
+}
+
+// releaseHandles closes the handles as one batch, logging a failure: the
+// registrations are gone locally either way, and a row that fails to delete
+// is swept once this member stops heartbeating.
+func (s *Server) releaseHandles(ctx context.Context, handles []*cluster.SubscriptionHandle) {
+	if err := s.subscriptions.CloseAll(ctx, handles); err != nil {
+		s.log.With(zap.Error(err)).Warn("Failed to close released stream subscriptions")
+	}
+}
+
+// reconcileMembership is the sweep that re-reads users' memberships from the
+// store and brings their open streams' chat topics into line, the backstop
+// for the transitions followMembership never sees. A stream open merges the
+// records it reads with the transitions delivered to it, but a transition
+// this server was not registered for — published before the row for the
+// user's topic landed — reaches it only through the read, and the read may
+// predate it, by timing or by the inverted membership index's replication
+// lag. And the subject's own copy of a transition is best-effort: it can be
+// dropped by a full outbox, or published to a subscriber set cached before
+// this server's row landed, and then never arrives at all. Either way the
+// stream stays on the wrong topics for its whole life, so every user with a
+// stream open is re-read every interval, counted from their first open here.
+//
+// The sweep runs every tick over the users the index says are due (see
+// streamSessions.due): a read per user, not per stream, applied to all their
+// local sessions through the same version gate the transitions use, so a
+// read older than what a session has already applied moves nothing, and one
+// racing a live transition converges on the newer of the two. Reads are
+// bounded to membershipReconcileWorkers in flight, and a tick's batch
+// finishes before the next begins, so however many users a backlog makes
+// due at once, the store sees at most that many concurrent queries from
+// this server.
+func (s *Server) reconcileMembership() {
+	ticker := time.NewTicker(s.reconcileTick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.reconcileStop:
+			return
+		case now := <-ticker.C:
+			// The ration: enough users per tick to cover the population once
+			// per interval, at least one.
+			population := s.sessions.count()
+			quota := max(1, int((int64(population)*int64(s.reconcileTick)+int64(s.reconcileInterval)-1)/int64(s.reconcileInterval)))
+			userKeys := s.sessions.due(now, s.reconcileInterval, quota)
+			if len(userKeys) == 0 {
+				continue
+			}
+
+			var wg sync.WaitGroup
+			workers := make(chan struct{}, membershipReconcileWorkers)
+			for _, userKey := range userKeys {
+				workers <- struct{}{}
+				wg.Add(1)
+				go func(userKey string) {
+					defer wg.Done()
+					defer func() { <-workers }()
+					s.reconcileUser(userKey)
+				}(userKey)
+			}
+			wg.Wait()
+		}
+	}
+}
+
+// reconcileUser re-reads one user's memberships and applies each record to
+// every local session of theirs as a transition at the record's version:
+// attaching joined ones, detaching departed ones, releasing what the detaches
+// freed as one batch. A chat the read does not mention is left alone — a
+// session cannot hold a key for a membership that never existed, and a
+// record is never deleted from under a key it did. The read failing leaves
+// the user due for the next tick.
+func (s *Server) reconcileUser(userKey string) {
+	// The start is what markReconciled records: the read's view of the store
+	// is current as of then, and the sweep orders users by it.
+	startedAt := time.Now()
+	sessions := s.sessions.forUser(userKey)
+	if len(sessions) == 0 {
+		return
+	}
+	userID := sessions[0].local.userID
+	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
+
+	ctx, cancel := context.WithTimeout(context.Background(), membershipSyncTimeout)
+	defer cancel()
+
+	memberships, err := s.chats.GetGroupMembershipsForUser(ctx, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure reading group memberships for stream reconcile")
+		return
+	}
+
+	var attached, detached int
+	var handles []*cluster.SubscriptionHandle
+	for _, m := range memberships {
+		chatKey := chatStreamKey(m.ChatID)
+		for _, session := range sessions {
+			if m.Joined {
+				ok, err := s.attachSession(ctx, session, m.ChatID, chatKey, m.Version)
+				if err != nil {
+					// The store is failing; what is done stays done, and the
+					// next tick picks the user up again.
+					s.releaseHandles(ctx, handles)
+					return
+				}
+				if ok {
+					attached++
+				}
+			} else if handle := session.detach(chatKey, m.Version); handle != nil {
+				detached++
+				handles = append(handles, handle)
+			}
+		}
+	}
+	s.releaseHandles(ctx, handles)
+	s.sessions.markReconciled(userKey, startedAt)
+
+	// A correction is the signal that a transition went unseen; how often
+	// this logs is what says whether the schedule is right.
+	if attached > 0 || detached > 0 {
+		log.Info("Reconciled stream group memberships",
+			zap.Int("streams", len(sessions)),
+			zap.Int("attached", attached),
+			zap.Int("detached", detached),
+		)
+	}
+}
+
 // selectEvents applies the stream's stale-event detectors to a drained batch
 // and shapes what survives for the wire. It returns nil when nothing does.
 func selectEvents(log *zap.Logger, detectors []StaleEventDetector[*eventpb.Event], events []*eventpb.Event) *eventpb.EventBatch {
 	eventsToSend := make([]*eventpb.Event, 0, len(events))
 	for _, event := range events {
 		if isStale(detectors, event) {
-			log.Debug("Dropping stale event", zap.String("event_id", EventIDString(event.Id)))
+			log.Debug("Dropping stale event", zap.String("event_id", model.EventIDString(event.Id)))
 			continue
 		}
 		eventsToSend = append(eventsToSend, event)

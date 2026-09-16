@@ -97,7 +97,7 @@ func (f *eventForwarder) ForwardUserEvents(ctx context.Context, events ...*event
 
 func (f *eventForwarder) fanOutUserEvent(ctx context.Context, event *eventpb.UserEvent) {
 	log := f.log.With(
-		zap.String("event_id", EventIDString(event.Event.Id)),
+		zap.String("event_id", model.EventIDString(event.Event.Id)),
 		zap.String("user_id", model.UserIDString(event.UserId)),
 	)
 
@@ -127,7 +127,7 @@ func (f *eventForwarder) ForwardChatEvents(ctx context.Context, events ...*event
 
 func (f *eventForwarder) fanOutChatEvent(ctx context.Context, event *eventpb.ChatEvent) {
 	log := f.log.With(
-		zap.String("event_id", EventIDString(event.Event.Id)),
+		zap.String("event_id", model.EventIDString(event.Event.Id)),
 		zap.String("chat_id", hex.EncodeToString(event.ChatId.GetValue())),
 	)
 

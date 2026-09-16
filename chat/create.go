@@ -144,6 +144,11 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 	}
 	md := metadata[0]
 
+	// A new group's roster is known without reading it: one member, no
+	// transitions yet. hydrate's batch read is eventually consistent and can
+	// miss an item written moments ago, which would read as an empty roster.
+	md.RosterSummary = RosterSummary{MemberCount: 1, Version: 0}.ToProto()
+
 	// The creator is the only member, so there is no members-side update: just
 	// the creator's own, carrying the metadata.
 	s.publishRosterUpdate(chatID, userID, nil, &chatpb.RosterUpdate{

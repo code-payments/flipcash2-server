@@ -115,6 +115,13 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	}
 	md := metadata[0]
 
+	// The write returned the roster as it stands after the join, read strongly
+	// consistent; hydrate's batch read is not, and may lag it by the very
+	// transition this call made. The response and the update it announces
+	// carry the same summary, so a client sees one version, not two.
+	rosterSummary := roster.ToProto()
+	md.RosterSummary = rosterSummary
+
 	if changed {
 		// The joiner's own member entry, as hydrate built it, is what the rest of
 		// the chat learns about them — less their pointers, which are never
@@ -123,7 +130,6 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 			UserId:      userID,
 			UserProfile: md.Members[0].UserProfile,
 		}
-		rosterSummary := roster.ToProto()
 		toMembers := &chatpb.RosterUpdate{
 			Kind:          &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{Member: member}},
 			RosterSummary: rosterSummary,

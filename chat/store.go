@@ -203,10 +203,10 @@ type Store interface {
 
 	// GetGroupChatsForUser returns the canonical record of every group chat
 	// userID is currently a joined member of, in no particular order. It is
-	// GetGroupMembershipsForUser, less the departed records, followed by the canonical read of each ID, and
-	// returns records exactly as GetChatByID does: Members empty and
-	// RosterSummary zero. A user with no group memberships gets an empty result,
-	// not an error.
+	// GetGroupMembershipsForUser, less the departed records, followed by the
+	// canonical read of each ID, and returns records exactly as GetChatByID
+	// does: Members empty and RosterSummary zero. A user with no group
+	// memberships gets an empty result, not an error.
 	//
 	// It is the group feed's source: with no per-member activity index, a user's
 	// groups are ordered by reading every one of them and sorting — so this is

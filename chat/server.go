@@ -426,8 +426,12 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, chats [
 		md := c.ToProto()
 		if IsGroupChatID(c.ID) {
 			// ToProto projects the canonical record, which carries neither a
-			// group's members nor its summary. Every group in the set exists, so
-			// the batch read has an entry for each.
+			// group's members nor its summary. Every group in the set exists, but
+			// the batch read is eventually consistent, so a group written moments
+			// ago may be absent and read as a zero summary, and one moved
+			// moments ago may read one transition behind. A caller that has
+			// just written the group or its roster holds the authoritative
+			// summary and should overwrite this one with it.
 			md.Members = []*chatpb.Member{{UserId: &commonpb.UserId{Value: append([]byte(nil), viewerID.Value...)}}}
 			md.RosterSummary = rosterSummaries[key].ToProto()
 		}

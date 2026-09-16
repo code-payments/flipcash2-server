@@ -184,6 +184,10 @@ type Server struct {
 	eventpb.UnimplementedEventStreamingServer
 }
 
+// NewServer constructs the event streaming server and starts its membership
+// reconcile sweep (see reconcileMembership) in the background. The sweep runs
+// until Shutdown, which every caller must eventually invoke — a Server that is
+// constructed and dropped without it leaks the sweep's goroutine.
 func NewServer(
 	log *zap.Logger,
 	authz auth.Authorizer,

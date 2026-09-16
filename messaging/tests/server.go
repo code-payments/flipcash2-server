@@ -920,10 +920,10 @@ func testServer_SendMessage_Broadcast(t *testing.T, badges badge.Store, blocklis
 	require.Equal(t, id, resp.Message.EventSequence)
 
 	// userB receives a single ChatUpdate carrying the send as a gap-detected,
-	// single-mutation message_sent event (sequenced at its event_sequence) and
-	// nothing in the deprecated new_messages field; alongside a last-activity
-	// metadata update and the sender's auto-advanced READ pointer (the sender has
-	// implicitly read their own message).
+	// single-mutation message_sent event (sequenced at its event_sequence),
+	// alongside a last-activity metadata update and the sender's auto-advanced
+	// READ pointer (the sender has implicitly read their own message). The
+	// deprecated new_messages field is not asserted on either way.
 	e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
 		if u.Events == nil || len(u.Events.Events) != 1 {
 			return false

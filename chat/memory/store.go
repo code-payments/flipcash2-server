@@ -29,14 +29,21 @@ type memory struct {
 	// groupVersions is each group's roster version, keyed by chat ID: the
 	// number of membership transitions it has seen. Absent reads as zero.
 	groupVersions map[string]uint64
+
+	// memberVersions stamps each membership record with the roster version of
+	// the transition that last moved it, keyed by chat ID then user ID, as the
+	// persistent stores do. A record written at creation is unstamped and reads
+	// as zero.
+	memberVersions map[string]map[string]uint64
 }
 
 // NewInMemory returns an in-memory chat.Store, for tests.
 func NewInMemory() chat.Store {
 	return &memory{
-		chats:         make(map[string]*chat.Chat),
-		groupMembers:  make(map[string]map[string]bool),
-		groupVersions: make(map[string]uint64),
+		chats:          make(map[string]*chat.Chat),
+		groupMembers:   make(map[string]map[string]bool),
+		groupVersions:  make(map[string]uint64),
+		memberVersions: make(map[string]map[string]uint64),
 	}
 }
 
@@ -47,6 +54,18 @@ func (m *memory) reset() {
 	m.chats = make(map[string]*chat.Chat)
 	m.groupMembers = make(map[string]map[string]bool)
 	m.groupVersions = make(map[string]uint64)
+	m.memberVersions = make(map[string]map[string]uint64)
+}
+
+// stampMemberLocked records the group's current roster version on a member's
+// record, after a transition has advanced it.
+func (m *memory) stampMemberLocked(chatKey, userKey string) {
+	stamps := m.memberVersions[chatKey]
+	if stamps == nil {
+		stamps = make(map[string]uint64)
+		m.memberVersions[chatKey] = stamps
+	}
+	stamps[userKey] = m.groupVersions[chatKey]
 }
 
 func (m *memory) PutChat(_ context.Context, c *chat.Chat) error {
@@ -123,6 +142,7 @@ func (m *memory) AddGroupMembers(_ context.Context, chatID *commonpb.ChatId, use
 		}
 		members[string(userID.Value)] = true
 		m.groupVersions[key]++
+		m.stampMemberLocked(key, string(userID.Value))
 		changed = true
 	}
 	return changed, m.rosterSummaryLocked(chatID), nil
@@ -146,6 +166,7 @@ func (m *memory) RemoveGroupMember(_ context.Context, chatID *commonpb.ChatId, u
 	}
 	members[string(userID.Value)] = false
 	m.groupVersions[key]++
+	m.stampMemberLocked(key, string(userID.Value))
 	return true, m.rosterSummaryLocked(chatID), nil
 }
 
@@ -310,17 +331,25 @@ func (m *memory) IsMember(_ context.Context, chatID *commonpb.ChatId, userID *co
 	return hasInlineMember(m.chats[string(chatID.Value)], userID), nil
 }
 
-func (m *memory) GetGroupChatIDsForUser(_ context.Context, userID *commonpb.UserId) ([]*commonpb.ChatId, error) {
+func (m *memory) GetGroupMembershipsForUser(_ context.Context, userID *commonpb.UserId) ([]chat.GroupMembership, error) {
 	m.Lock()
 	defer m.Unlock()
 
-	chatIDs := make([]*commonpb.ChatId, 0)
+	memberships := make([]chat.GroupMembership, 0)
 	for chatKey, members := range m.groupMembers {
-		if members[string(userID.Value)] {
-			chatIDs = append(chatIDs, &commonpb.ChatId{Value: []byte(chatKey)})
+		// A departed member is a false entry, kept as the persistent stores
+		// keep a tombstone; a user never in the group has no entry.
+		joined, ok := members[string(userID.Value)]
+		if !ok {
+			continue
 		}
+		memberships = append(memberships, chat.GroupMembership{
+			ChatID:  &commonpb.ChatId{Value: []byte(chatKey)},
+			Joined:  joined,
+			Version: m.memberVersions[chatKey][string(userID.Value)],
+		})
 	}
-	return chatIDs, nil
+	return memberships, nil
 }
 
 func (m *memory) GetGroupChatsForUser(_ context.Context, userID *commonpb.UserId) ([]*chat.Chat, error) {

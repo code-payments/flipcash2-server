@@ -221,9 +221,10 @@ func (s *Server) requireStaffForGroupManagementRPC(ctx context.Context, log *zap
 // fails the RPC whose transition it announces.
 //
 // The two audiences are reached over different topics because a stream's
-// group subscriptions are a snapshot as of its open (see event.Server): a
-// joiner's open streams are not yet on the chat's topic, and a leaver's may or
-// may not be, depending on whether they were a member when the stream opened.
+// group subscriptions follow its user's membership, and it is the subject's
+// own copy that moves them (see event.Server.followMembership): a joiner's
+// open streams are not on the chat's topic until their MemberJoined arrives
+// on their user topic, and a leaver's come off it when their MemberLeft does.
 // So the chat topic carries toMembers with the subject excluded — which also
 // keeps a leaver whose stream is still on the topic from hearing it twice —
 // and the subject's user topic carries toSubject, reaching every device they

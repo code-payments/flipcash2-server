@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 
@@ -46,8 +48,10 @@ const ChatEventsNamespace = "chat-events"
 // registry, shared by the registration and delivery paths. The prefixes keep
 // the two key families disjoint: user IDs and group chat IDs are both 16-byte
 // values, so an unprefixed chat ID could alias a user's slot.
+const userStreamKeyPrefix = "user:"
+
 func userStreamKey(userID *commonpb.UserId) string {
-	return "user:" + model.UserIDString(userID)
+	return userStreamKeyPrefix + model.UserIDString(userID)
 }
 
 func chatStreamKey(chatID *commonpb.ChatId) string {
@@ -89,6 +93,11 @@ const (
 	// stream per event, so even a full batch across thousands of streams is
 	// tens of milliseconds, and the bound is for a wedged peer, not pacing.
 	forwardRpcTimeout = time.Second
+
+	// membershipSyncTimeout bounds the cluster registration a membership
+	// transition makes or releases on behalf of a user's open streams (see
+	// followMembership). It runs detached from any request, on its own budget.
+	membershipSyncTimeout = 2 * time.Second
 )
 
 // localStream is one open stream in the local registry, carrying the user it
@@ -122,8 +131,11 @@ type Server struct {
 
 	// streams fans a topic out to every open local stream (see streamRegistry).
 	// It also refuses new streams once Shutdown has begun, so a stream can't
-	// slip in behind the closing sweep.
+	// slip in behind the closing sweep. sessions is the per-stream view of the
+	// same registrations, by user, for moving a user's streams between chat
+	// topics as their membership changes (see followMembership).
 	streams                 *streamRegistry
+	sessions                *streamSessions
 	staleEventDetectorCtors []StaleEventDetectorCtor[*eventpb.Event]
 
 	// self is the cluster member this process registers subscription rows as:
@@ -173,6 +185,7 @@ func NewServer(
 		chatEventBus: chatEventBus,
 
 		streams:                 newStreamRegistry(),
+		sessions:                newStreamSessions(),
 		staleEventDetectorCtors: staleEventDetectorCtors,
 
 		self:         subscriptions.Self(),
@@ -259,32 +272,42 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 
 	// The stream serves the user's own topic plus one topic per group chat
 	// they are joined to, so group publishers can resolve the hosting servers
-	// by group instead of once per member. The membership set is a snapshot as
-	// of stream open: a group joined or left mid-stream does not adjust the
-	// registration until the client reconnects.
-	groupChatIDs, err := s.chats.GetGroupChatIDsForUser(ctx, userID)
+	// by group instead of once per member. The membership records are read
+	// once here, at open, each with its version; from then on the stream's
+	// topics follow the user's membership as it changes (see
+	// followMembership), and a transition at or below a record's version is
+	// one the read already reflects. Departed records seed a version too, so
+	// a delayed copy of a join the user has since undone is stale on arrival
+	// rather than news.
+	memberships, err := s.chats.GetGroupMembershipsForUser(ctx, userID)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure loading group memberships for stream")
 		return status.Error(codes.Internal, "failure loading group memberships")
 	}
 
-	streamKeys := make([]string, 0, 1+len(groupChatIDs))
-	streamKeys = append(streamKeys, userStreamKey(userID))
-	for _, chatID := range groupChatIDs {
-		streamKeys = append(streamKeys, chatStreamKey(chatID))
+	// seeds carries every record; chatKeys and the chat topics carry the
+	// joined ones, aligned with each other.
+	seeds := make([]topicSeed, 0, len(memberships))
+	chatKeys := make([]string, 0, len(memberships))
+	topics := make([]cluster.SubscriptionTopic, 0, 1+len(memberships))
+	topics = append(topics, cluster.SubscriptionTopic{Namespace: UserEventsNamespace, Key: userID.Value})
+	for _, m := range memberships {
+		key := chatStreamKey(m.ChatID)
+		seeds = append(seeds, topicSeed{key: key, version: m.Version, joined: m.Joined})
+		if m.Joined {
+			chatKeys = append(chatKeys, key)
+			topics = append(topics, cluster.SubscriptionTopic{Namespace: ChatEventsNamespace, Key: m.ChatID.Value})
+		}
 	}
 
 	// The local stream must be resolvable before a topic's registry row is, or
 	// a publish racing the open could resolve the row yet find no stream
 	// behind it — so every key is registered up front, before the first
 	// Subscribe below.
-	if !s.streams.add(streamID, localStream{stream: ss, userID: userID}, streamKeys) {
+	session := newStreamSession(streamID, localStream{stream: ss, userID: userID}, userStreamKey(userID), s.streams)
+	if !session.open(seeds) {
 		log.Debug("Rejecting stream on shut-down server")
 		return status.Error(codes.Unavailable, "server is draining")
-	}
-
-	removeLocalStream := func() {
-		s.streams.remove(streamID, streamKeys)
 	}
 
 	// Register this server's interest in the stream's topics with the cluster,
@@ -293,14 +316,9 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 	// pays a single store round trip no matter how many groups. Non-exclusive:
 	// the same user (and all the more so the same group) may hold streams on
 	// any number of servers simultaneously.
-	topics := make([]cluster.SubscriptionTopic, 0, 1+len(groupChatIDs))
-	topics = append(topics, cluster.SubscriptionTopic{Namespace: UserEventsNamespace, Key: userID.Value})
-	for _, chatID := range groupChatIDs {
-		topics = append(topics, cluster.SubscriptionTopic{Namespace: ChatEventsNamespace, Key: chatID.Value})
-	}
 	subscriptions, err := s.subscriptions.SubscribeAll(ctx, topics)
 	if err != nil {
-		removeLocalStream()
+		session.close()
 		if errors.Is(err, cluster.ErrSubscriptionsDraining) {
 			log.Debug("Rejecting stream on draining server")
 			return status.Error(codes.Unavailable, "server is draining")
@@ -308,14 +326,24 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 		log.With(zap.Error(err)).Warn("Failure registering stream subscriptions")
 		return status.Error(codes.Internal, "failure registering stream subscriptions")
 	}
+	session.setHandles(subscriptions[0], chatKeys, subscriptions[1:])
+
+	// Only now is the session reachable by membership transitions: its opening
+	// registrations are complete, so a transition can neither race them nor
+	// be overwritten by them.
+	s.sessions.add(session)
 
 	defer func() {
 		log.Debug("Closing streamer")
 
-		removeLocalStream()
+		// Out of the index first, so no transition attaches to a stream that
+		// is ending; then out of the registry, releasing every registration
+		// the stream still holds as one batched close.
+		s.sessions.remove(session)
+		handles := session.close()
 
 		closeCtx, cancel := context.WithTimeout(context.Background(), subscriptionCloseTimeout)
-		if err := s.subscriptions.CloseAll(closeCtx, subscriptions); err != nil {
+		if err := s.subscriptions.CloseAll(closeCtx, handles); err != nil {
 			log.With(zap.Error(err)).Warn("Failed to close stream subscriptions")
 		}
 		cancel()
@@ -499,6 +527,14 @@ func (s *Server) Shutdown() {
 // client is doing — and that pass runs under the registry's read lock rather
 // than over a snapshot, so it allocates nothing per event either.
 func (s *Server) deliverLocal(streamKey string, e *eventpb.Event, exclude []*commonpb.UserId) {
+	// A user-keyed delivery may be the user's own copy of a membership
+	// transition, which moves their streams between chat topics. That runs
+	// before the notify, so a departure stops chat-topic delivery to the
+	// leaver's streams from this event on.
+	if strings.HasPrefix(streamKey, userStreamKeyPrefix) {
+		s.followMembership(streamKey, e)
+	}
+
 	s.streams.each(streamKey, exclude, func(stream Stream[*eventpb.Event]) {
 		err := stream.Notify(e)
 		switch {
@@ -515,6 +551,119 @@ func (s *Server) deliverLocal(streamKey string, e *eventpb.Event, exclude []*com
 			)
 		}
 	})
+}
+
+// followMembership keeps a user's open streams on the chat topics of the
+// groups they are a member of, driven by the user's own copy of each
+// membership transition: a RosterUpdate naming them as the member who joined
+// or left, delivered on their user topic (see chat.Server's publishRosterUpdate).
+// That copy reaches exactly the servers hosting the user's streams — locally
+// off the bus, or forwarded — so every such server adjusts its own streams
+// with no further fan-out.
+//
+// A join puts each of the user's local streams under the chat's key and
+// registers this server's interest in the topic; a departure takes them out
+// from under the key at once and releases the registration. The local
+// registration leads and the cluster one follows on a detached goroutine, as
+// a stream open does, so a publish that resolves this server's row always
+// finds the streams behind it, and a leaver hears nothing further on the
+// topic from the moment their departure is delivered — events published in
+// between the store's transition and this delivery are the only ones that
+// can still reach them.
+//
+// Events on the chat's topic published between the join and the registration
+// landing are not delivered live to the joiner; the MemberJoined carries the
+// chat's metadata, and the client's delta sync from there is the backstop, as
+// it is after any reconnect. A transition addressed to someone else, or on a
+// DM (which has no chat topic), is ignored.
+//
+// Transitions are applied by roster version, not arrival order (see
+// streamSession): a stale copy still reaches the client — which applies it
+// by the same rule — but moves no stream.
+func (s *Server) followMembership(streamKey string, e *eventpb.Event) {
+	update := e.GetChatUpdate()
+	if update == nil || !chat.IsGroupChatID(update.GetChat()) {
+		return
+	}
+	for _, roster := range update.GetRosterUpdates().GetRosterUpdates() {
+		var subject *commonpb.UserId
+		var joined bool
+		switch kind := roster.GetKind().(type) {
+		case *chatpb.RosterUpdate_MemberJoined_:
+			subject, joined = kind.MemberJoined.GetMember().GetUserId(), true
+		case *chatpb.RosterUpdate_MemberLeft_:
+			subject = kind.MemberLeft.GetUserId()
+		default:
+			continue
+		}
+		if subject == nil || userStreamKey(subject) != streamKey {
+			continue
+		}
+		sessions := s.sessions.forUser(streamKey)
+		if len(sessions) == 0 {
+			continue
+		}
+		version := roster.GetRosterSummary().GetVersion()
+		if joined {
+			go s.joinStreams(sessions, update.GetChat(), version)
+		} else {
+			s.leaveStreams(sessions, update.GetChat(), version)
+		}
+	}
+}
+
+// joinStreams attaches the sessions to the chat's topic. One cluster
+// registration per stream: the subscription layer refcounts them, so only the
+// first costs a row write. A registration that cannot be attached — the
+// stream ended or left the chat meanwhile — is released again.
+func (s *Server) joinStreams(sessions []*streamSession, chatID *commonpb.ChatId, version uint64) {
+	log := s.log.With(zap.String("chat_id", hex.EncodeToString(chatID.GetValue())))
+	ctx, cancel := context.WithTimeout(context.Background(), membershipSyncTimeout)
+	defer cancel()
+
+	chatKey := chatStreamKey(chatID)
+	for _, session := range sessions {
+		if !session.attach(chatKey, version) {
+			continue
+		}
+		handle, err := s.subscriptions.Subscribe(ctx, ChatEventsNamespace, chatID.Value)
+		if err != nil {
+			session.rollback(chatKey, version)
+			if errors.Is(err, cluster.ErrSubscriptionsDraining) {
+				return
+			}
+			log.With(zap.Error(err)).Warn("Failure registering stream subscription for joined chat")
+			return
+		}
+		if !session.setHandle(chatKey, handle) {
+			if err := handle.Close(ctx); err != nil {
+				log.With(zap.Error(err)).Warn("Failed to close orphaned stream subscription")
+			}
+		}
+	}
+}
+
+// leaveStreams detaches the sessions from the chat's topic synchronously,
+// then releases their registrations together off the caller's path.
+func (s *Server) leaveStreams(sessions []*streamSession, chatID *commonpb.ChatId, version uint64) {
+	chatKey := chatStreamKey(chatID)
+	var handles []*cluster.SubscriptionHandle
+	for _, session := range sessions {
+		if handle := session.detach(chatKey, version); handle != nil {
+			handles = append(handles, handle)
+		}
+	}
+	if len(handles) == 0 {
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), membershipSyncTimeout)
+		defer cancel()
+		if err := s.subscriptions.CloseAll(ctx, handles); err != nil {
+			s.log.With(zap.Error(err), zap.String("chat_id", hex.EncodeToString(chatID.GetValue()))).Warn("Failed to close stream subscriptions for left chat")
+		}
+	}()
 }
 
 // selectEvents applies the stream's stale-event detectors to a drained batch

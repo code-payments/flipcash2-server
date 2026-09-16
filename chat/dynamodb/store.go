@@ -651,42 +651,54 @@ func (s *store) getGroupMembers(ctx context.Context, chatID *commonpb.ChatId) ([
 	return members, nil
 }
 
-// GetGroupChatIDsForUser lists the user's joined group chats via the inverted
-// gsiByUser. The index is keyed by the sparse user attribute, which tombstones
-// keep (unlike joined_at), so departed memberships are in the user's slice and
-// are filtered out by state here.
-
-func (s *store) GetGroupChatIDsForUser(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.ChatId, error) {
-	return s.queryJoinedGroupChatIDs(ctx, userID, nil, nil)
+// GetGroupMembershipsForUser lists the user's membership records via the
+// inverted gsiByUser. The index is keyed by the sparse user attribute, which
+// tombstones keep (unlike joined_at), so departed memberships are in the user's
+// slice alongside joined ones, and come back with their state.
+func (s *store) GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId) ([]chat.GroupMembership, error) {
+	return s.queryGroupMemberships(ctx, userID, nil, nil, false)
 }
 
-// queryJoinedGroupChatIDs is the gsiByUser query behind GetGroupChatIDsForUser,
-// optionally bounded to chat IDs in [lo, hi]. The index's range key is the
-// chat key, whose hex encoding preserves the ID's byte order, so the bound is
-// a key condition: rows outside it are never scanned, and never billed. Both
-// bounds are nil for the user's whole slice.
-func (s *store) queryJoinedGroupChatIDs(ctx context.Context, userID *commonpb.UserId, lo, hi *commonpb.ChatId) ([]*commonpb.ChatId, error) {
+// queryGroupMemberships is the gsiByUser query behind
+// GetGroupMembershipsForUser, optionally bounded to chat IDs in [lo, hi]. The
+// index's range key is the chat key, whose hex encoding preserves the ID's
+// byte order, so the bound is a key condition: rows outside it are never
+// scanned, and never billed. Both bounds are nil for the user's whole slice.
+//
+// joinedOnly drops the tombstones with a filter expression. A filter runs
+// after the scan, so it changes nothing about what is read or billed — only
+// what comes back over the wire — which is why a caller after current
+// memberships alone (the feed) asks for it, and a caller following the user's
+// transitions does not: a tombstone's version is what tells a delayed copy of
+// the join it undid from news (see chat.GroupMembership). The index projects
+// every attribute, so each row's state and version stamp (see
+// transitionMembership) come back with it at no extra cost. A row written at
+// the group's creation carries no stamp and reads as version zero.
+func (s *store) queryGroupMemberships(ctx context.Context, userID *commonpb.UserId, lo, hi *commonpb.ChatId, joinedOnly bool) ([]chat.GroupMembership, error) {
 	keyCondition := "#user = :user"
-	names := map[string]string{"#user": attrUser, "#state": attrState}
-	values := map[string]types.AttributeValue{
-		":user":   avS(userIndexKey(userID)),
-		":joined": avN(memberStateJoined),
-	}
+	names := map[string]string{"#user": attrUser}
+	values := map[string]types.AttributeValue{":user": avS(userIndexKey(userID))}
 	if lo != nil && hi != nil {
 		keyCondition += " AND #pk BETWEEN :lo AND :hi"
 		names["#pk"] = attrPK
 		values[":lo"] = avS(chatPK(lo))
 		values[":hi"] = avS(chatPK(hi))
 	}
+	var filter *string
+	if joinedOnly {
+		filter = aws.String("#state = :joined")
+		names["#state"] = attrState
+		values[":joined"] = avN(memberStateJoined)
+	}
 
-	chatIDs := make([]*commonpb.ChatId, 0)
+	memberships := make([]chat.GroupMembership, 0)
 	var startKey map[string]types.AttributeValue
 	for {
 		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
 			TableName:                 aws.String(s.groupMembersTable),
 			IndexName:                 aws.String(gsiByUser),
 			KeyConditionExpression:    aws.String(keyCondition),
-			FilterExpression:          aws.String("#state = :joined"),
+			FilterExpression:          filter,
 			ExpressionAttributeNames:  names,
 			ExpressionAttributeValues: values,
 			ExclusiveStartKey:         startKey,
@@ -699,26 +711,52 @@ func (s *store) queryJoinedGroupChatIDs(ctx context.Context, userID *commonpb.Us
 			if err != nil {
 				return nil, err
 			}
-			chatIDs = append(chatIDs, chatID)
+			state, err := parseN(item[attrState])
+			if err != nil {
+				return nil, err
+			}
+			var version uint64
+			if _, ok := item[attrVersion]; ok {
+				if version, err = parseN(item[attrVersion]); err != nil {
+					return nil, err
+				}
+			}
+			memberships = append(memberships, chat.GroupMembership{
+				ChatID:  chatID,
+				Joined:  state == memberStateJoined,
+				Version: version,
+			})
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			break
 		}
 		startKey = out.LastEvaluatedKey
 	}
-	return chatIDs, nil
+	return memberships, nil
 }
 
+// membershipChatIDs projects memberships onto their chat IDs.
+func membershipChatIDs(memberships []chat.GroupMembership) []*commonpb.ChatId {
+	chatIDs := make([]*commonpb.ChatId, len(memberships))
+	for i, m := range memberships {
+		chatIDs[i] = m.ChatID
+	}
+	return chatIDs
+}
+
+// GetGroupChatsForUser is the joined-only membership query followed by the
+// canonical read of each ID: the feed wants current memberships alone, so the
+// tombstones are dropped in the store rather than carried back to be skipped.
 func (s *store) GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserId) ([]*chat.Chat, error) {
-	chatIDs, err := s.GetGroupChatIDsForUser(ctx, userID)
+	memberships, err := s.queryGroupMemberships(ctx, userID, nil, nil, true)
 	if err != nil {
 		return nil, err
 	}
-	return s.batchGetChats(ctx, chatIDs)
+	return s.batchGetChats(ctx, membershipChatIDs(memberships))
 }
 
 // GetGroupChatsForUserByIDs checks membership by querying the user's slice of
-// the inverted membership index — the same read GetGroupChatIDsForUser makes —
+// the inverted membership index — the same read GetGroupMembershipsForUser makes —
 // rather than by a keyed read of each given ID's membership record. A query is
 // billed on the bytes it scans, and membership rows are small, so the user's
 // whole membership costs a fraction of what one keyed read per ID would: a
@@ -755,13 +793,13 @@ func (s *store) GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.
 			hi = chatID
 		}
 	}
-	joinedIDs, err := s.queryJoinedGroupChatIDs(ctx, userID, lo, hi)
+	memberships, err := s.queryGroupMemberships(ctx, userID, lo, hi, true)
 	if err != nil {
 		return nil, err
 	}
-	joined := make(map[string]struct{}, len(joinedIDs))
-	for _, id := range joinedIDs {
-		joined[string(id.Value)] = struct{}{}
+	joined := make(map[string]struct{}, len(memberships))
+	for _, m := range memberships {
+		joined[string(m.ChatID.Value)] = struct{}{}
 	}
 
 	wanted := make([]*commonpb.ChatId, 0, len(chatIDs))

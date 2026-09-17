@@ -1466,7 +1466,7 @@ func testServer_AdvancePointer_GroupNotBroadcast(t *testing.T, badges badge.Stor
 // ============================================================================
 
 // testServer_Reactions covers the core add/remove lifecycle: the aggregate and
-// its per-viewer reacted_by_self bit, idempotent re-add, a second reactor, the
+// its per-viewer self_reactor entry, idempotent re-add, a second reactor, the
 // ADDED/REMOVED broadcasts to the other member, and removal down to empty (the
 // aggregate is retained while a reactor remains, then omitted).
 func testServer_Reactions(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
@@ -1483,21 +1483,21 @@ func testServer_Reactions(t *testing.T, badges badge.Store, blocklists blocklist
 	require.Equal(t, messagingpb.AddReactionResponse_OK, addResp.Result)
 	require.Equal(t, emoji, addResp.Reaction.Emoji.Value)
 	require.Equal(t, uint64(1), addResp.Reaction.Count)
-	require.True(t, addResp.Reaction.ReactedBySelf)
+	require.NotNil(t, addResp.Reaction.SelfReactor)
 
 	// The add is broadcast to the other member (userA) as an ADDED update.
 	e.waitForReactionUpdate(e.userA, messagingpb.ReactionUpdate_ADDED, msgID.Value, emoji, e.userB)
 
-	// reacted_by_self is per-viewer: true for the reactor, false for the other.
+	// self_reactor is per-viewer: set for the reactor, absent for the other.
 	sumB, err := e.getReactionSummary(e.keysB, msgID)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, sumB.Result)
 	require.Len(t, sumB.Summary.Reactions, 1)
-	require.True(t, sumB.Summary.Reactions[0].ReactedBySelf)
+	require.NotNil(t, sumB.Summary.Reactions[0].SelfReactor)
 	sumA, err := e.getReactionSummary(e.keysA, msgID)
 	require.NoError(t, err)
 	require.Len(t, sumA.Summary.Reactions, 1)
-	require.False(t, sumA.Summary.Reactions[0].ReactedBySelf)
+	require.Nil(t, sumA.Summary.Reactions[0].SelfReactor)
 
 	// Re-adding the same emoji is idempotent: the count holds at 1.
 	again, err := e.addReaction(e.keysB, msgID, emoji)
@@ -1509,16 +1509,16 @@ func testServer_Reactions(t *testing.T, badges badge.Store, blocklists blocklist
 	addA, err := e.addReaction(e.keysA, msgID, emoji)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), addA.Reaction.Count)
-	require.True(t, addA.Reaction.ReactedBySelf)
+	require.NotNil(t, addA.Reaction.SelfReactor)
 
 	// userB removes: one reactor (userA) remains, so the aggregate still stands
-	// (count 1), with reacted_by_self false for the now-removed userB.
+	// (count 1), with no self entry for the now-removed userB.
 	rmB, err := e.removeReaction(e.keysB, msgID, emoji)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.RemoveReactionResponse_OK, rmB.Result)
 	require.NotNil(t, rmB.Reaction)
 	require.Equal(t, uint64(1), rmB.Reaction.Count)
-	require.False(t, rmB.Reaction.ReactedBySelf)
+	require.Nil(t, rmB.Reaction.SelfReactor)
 
 	// The removal is broadcast to the other member (userA) as a REMOVED update.
 	e.waitForReactionUpdate(e.userA, messagingpb.ReactionUpdate_REMOVED, msgID.Value, emoji, e.userB)
@@ -1612,7 +1612,7 @@ func testServer_Reactions_Reactors(t *testing.T, badges badge.Store, blocklists 
 
 // testServer_Reactions_Summaries covers GetReactionSummaries across both request
 // branches (paged query options and an explicit message-ID batch): the per-viewer
-// reacted_by_self overlay is resolved correctly across messages, and a message
+// self_reactor overlay is resolved correctly across messages, and a message
 // with no reactions is returned with an empty summary rather than omitted.
 func testServer_Reactions_Summaries(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
@@ -1644,7 +1644,7 @@ func testServer_Reactions_Summaries(t *testing.T, badges badge.Store, blocklists
 			}
 			for _, r := range sm.Reactions {
 				if r.Emoji.Value == emoji {
-					return true, r.ReactedBySelf
+					return true, r.SelfReactor != nil
 				}
 			}
 		}
@@ -2354,7 +2354,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	require.True(t, proto.Equal(contactMessage, contactPush.payload.ChatMetadata.Message))
 }
 
-// testServer_Reactions_GroupSelfReaction pins reacted_by_self in a group, where
+// testServer_Reactions_GroupSelfReaction pins self_reactor in a group, where
 // an emoji's reactor set outgrows the sample surfaced on its aggregate. The
 // viewer reacts first and is then pushed out of that sample by later reactors:
 // the flag must still come back true, resolved against the per-reactor records
@@ -2396,7 +2396,11 @@ func testServer_Reactions_GroupSelfReaction(t *testing.T, badges badge.Store, bl
 	addResp, err := e.addReactionInChat(e.keysA, chatID, msgID, emoji)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.AddReactionResponse_OK, addResp.Result)
-	require.True(t, addResp.Reaction.ReactedBySelf)
+	// The add's own view carries the reactor's entry at the aggregate's version.
+	require.NotNil(t, addResp.Reaction.SelfReactor)
+	require.Equal(t, e.userA.Value, addResp.Reaction.SelfReactor.UserId.Value)
+	require.Equal(t, addResp.Reaction.Version, addResp.Reaction.SelfReactor.Version)
+	require.NotNil(t, addResp.Reaction.SelfReactor.ReactedTs)
 
 	for _, keys := range others {
 		resp, err := e.addReactionInChat(keys, chatID, msgID, emoji)
@@ -2413,7 +2417,12 @@ func testServer_Reactions_GroupSelfReaction(t *testing.T, badges badge.Store, bl
 		for _, reactor := range reaction.SampleReactors {
 			require.NotEqual(t, e.userA.Value, reactor.UserId.Value)
 		}
-		require.True(t, reaction.ReactedBySelf)
+		// The entry is the viewer's own reactor row: first to react, so version 1,
+		// stamped with the add's time.
+		require.NotNil(t, reaction.SelfReactor)
+		require.Equal(t, e.userA.Value, reaction.SelfReactor.UserId.Value)
+		require.Equal(t, uint64(1), reaction.SelfReactor.Version)
+		require.True(t, proto.Equal(addResp.Reaction.SelfReactor.ReactedTs, reaction.SelfReactor.ReactedTs))
 	}
 
 	sum, err := e.getReactionSummaryInChat(e.keysA, chatID, msgID)
@@ -2435,14 +2444,14 @@ func testServer_Reactions_GroupSelfReaction(t *testing.T, badges badge.Store, bl
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, bystanderSum.Result)
 	require.Len(t, bystanderSum.Summary.Reactions, 1)
-	require.False(t, bystanderSum.Summary.Reactions[0].ReactedBySelf)
+	require.Nil(t, bystanderSum.Summary.Reactions[0].SelfReactor)
 
 	// A reactor who is inside the sample is unaffected by the group path.
 	recentSum, err := e.getReactionSummaryInChat(others[len(others)-1], chatID, msgID)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, recentSum.Result)
 	require.Len(t, recentSum.Summary.Reactions, 1)
-	require.True(t, recentSum.Summary.Reactions[0].ReactedBySelf)
+	require.NotNil(t, recentSum.Summary.Reactions[0].SelfReactor)
 }
 
 func testServer_SendMessage_GroupChatPush(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

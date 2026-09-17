@@ -50,8 +50,8 @@ type PointerRef struct {
 // SelfReaction is one reaction a viewer currently holds in a chat, as the
 // per-viewer overlay read reports it (see Store.GetSelfReactions): the (message,
 // emoji) it sits on, the version that added it and when — the viewer's own
-// Reactor.Version and Reactor.ReactedTs, which the caller stamps onto
-// Reaction.ReactedBySelfVersion and Reaction.ReactedBySelfTs.
+// Reactor.Version and Reactor.ReactedTs, from which the caller builds
+// Reaction.Self.
 type SelfReaction struct {
 	MessageID *messagingpb.MessageId
 	Emoji     string
@@ -255,10 +255,10 @@ type Store interface {
 	// AddReaction records userID's reaction with emoji on a message and returns
 	// the emoji's aggregate after the add. The result goes back to the reactor
 	// alone, so unlike the summary reads it is already the caller's view:
-	// ReactedBySelf is set, ReactedBySelfVersion is the version that added the
-	// caller's reaction — the new Version on a real add, the earlier one on a
-	// re-add — and ReactedBySelfTs is when: ts on a real add, the original add's
-	// time on a re-add (ts is ignored). It is idempotent on (chat, message, emoji, user): a re-add
+	// Self is the caller's own entry, at the version that added their reaction
+	// — the new Version on a real add, the earlier one on a re-add — and when:
+	// ts on a real add, the original add's time on a re-add (ts is ignored). It
+	// is idempotent on (chat, message, emoji, user): a re-add
 	// returns the current aggregate with created false and changes nothing.
 	// created reports whether this call actually added the reaction (false on a
 	// re-add), so callers can skip the broadcast.
@@ -285,7 +285,7 @@ type Store interface {
 	//
 	// reaction is the emoji's aggregate after the removal, with Count possibly 0
 	// when the last reactor left (it still carries the advanced Version, which
-	// the removal broadcast needs). ReactedBySelf is left false — which is also
+	// the removal broadcast needs). Self is left nil — which is also
 	// the correct overlay for the caller, who just removed their reaction. It is
 	// nil only when the emoji has no aggregate at all (a pure no-op).
 	RemoveReaction(
@@ -298,7 +298,7 @@ type Store interface {
 
 	// GetReactionSummary returns the per-emoji aggregates for a single message,
 	// one entry per distinct emoji that currently has at least one reactor. The
-	// aggregates are shareable: ReactedBySelf is left false for the caller to
+	// aggregates are shareable: Self is left nil for the caller to
 	// overlay (see GetSelfReactions). Returns an empty result (no error) when the
 	// message has no reactions.
 	//
@@ -318,7 +318,7 @@ type Store interface {
 	// deduplicated and ordered by message ID. A message with no reactions (or
 	// unknown) is echoed with an empty Reactions slice rather than omitted, so the
 	// caller gets an answer for every requested ID. Aggregates are shareable
-	// (ReactedBySelf left false) and the read is strongly consistent (see
+	// (Self left nil) and the read is strongly consistent (see
 	// GetReactionSummary). Returns an empty result (no error) when messageIDs is
 	// empty.
 	GetReactionSummariesByRefs(
@@ -331,7 +331,7 @@ type Store interface {
 	// messages, ordered by message ID and paged via the query options (the paging
 	// token is a message ID, as in GetMessages). The page spans messages, not just
 	// reacted ones: a message with no reactions is returned with an empty Reactions
-	// slice rather than skipped. Aggregates are shareable (ReactedBySelf left
+	// slice rather than skipped. Aggregates are shareable (Self left
 	// false) and the read is strongly consistent (see GetReactionSummary).
 	// Returns an empty result (no error) when the page is empty.
 	GetReactionSummaries(
@@ -342,10 +342,9 @@ type Store interface {
 
 	// GetSelfReactions returns every reaction userID currently holds on the given
 	// messages of a group, each with the version that added it and when — the
-	// per-viewer data behind EmojiReaction.reacted_by_self,
-	// Reaction.ReactedBySelfVersion and Reaction.ReactedBySelfTs.
-	// It is the viewer's half of a summary read: the aggregates are shareable and
-	// leave ReactedBySelf unset, and this answers it for one viewer across a
+	// per-viewer data behind Reaction.Self and EmojiReaction.self_reactor. It is
+	// the viewer's half of a summary read: the aggregates are shareable and
+	// leave Self unset, and this answers it for one viewer across a
 	// whole page. The read is addressed by the viewer, not by every (message,
 	// emoji) on the page, so its cost follows how much the viewer reacted rather
 	// than how reacted the page is, and it depends on nothing but the message

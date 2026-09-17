@@ -282,9 +282,8 @@ func (s *Server) GetReactors(ctx context.Context, req *messagingpb.GetReactorsRe
 	return resp, nil
 }
 
-// applySelfReactions sets ReactedBySelf, ReactedBySelfVersion and
-// ReactedBySelfTs on the given summaries' aggregates for the viewer, choosing
-// its strategy by chat type.
+// applySelfReactions sets Self on the given summaries' aggregates for the
+// viewer, choosing its strategy by chat type.
 //
 // A DM answers from the sample already in hand: it has at most two members, so an
 // emoji's reactor set can never outgrow the surfaced sample (MaxSampleReactors)
@@ -334,9 +333,7 @@ func (s *Server) applySelfReactions(ctx context.Context, chatID *commonpb.ChatId
 		for _, reaction := range summary.Reactions {
 			key := selfReactionKey{messageID: summary.MessageID.Value, emoji: reaction.Emoji}
 			if self, ok := reacted[key]; ok {
-				reaction.ReactedBySelf = true
-				reaction.ReactedBySelfVersion = self.Version
-				reaction.ReactedBySelfTs = self.ReactedTs
+				reaction.Self = &Reactor{UserID: userID, ReactedTs: self.ReactedTs, Version: self.Version}
 			}
 		}
 	}
@@ -352,19 +349,16 @@ type selfReactionKey struct {
 	emoji     string
 }
 
-// overlaySelfReactions sets ReactedBySelf, ReactedBySelfVersion and
-// ReactedBySelfTs on the given summaries' aggregates for userID by scanning each
-// aggregate's surfaced sample. It is exact only where the sample is guaranteed
-// to hold every reactor — DMs — and applySelfReactions is what enforces that;
-// see there for why a group must not use it.
+// overlaySelfReactions sets Self on the given summaries' aggregates for userID
+// by scanning each aggregate's surfaced sample. It is exact only where the
+// sample is guaranteed to hold every reactor — DMs — and applySelfReactions is
+// what enforces that; see there for why a group must not use it.
 func overlaySelfReactions(userID *commonpb.UserId, summaries []*ReactionSummary) {
 	for _, summary := range summaries {
 		for _, reaction := range summary.Reactions {
 			for _, reactor := range reaction.SampleReactors {
 				if bytes.Equal(reactor.UserID.Value, userID.Value) {
-					reaction.ReactedBySelf = true
-					reaction.ReactedBySelfVersion = reactor.Version
-					reaction.ReactedBySelfTs = reactor.ReactedTs
+					reaction.Self = reactor
 					break
 				}
 			}

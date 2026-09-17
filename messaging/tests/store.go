@@ -930,11 +930,12 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.False(t, tooMany)
 	require.Equal(t, uint64(1), r.Count)
 	require.Equal(t, uint64(1), r.Version)
-	// The add's result is the reactor's own view: reacted, at the version the
-	// add produced and when.
-	require.True(t, r.ReactedBySelf)
-	require.Equal(t, uint64(1), r.ReactedBySelfVersion)
-	require.Equal(t, at(1), r.ReactedBySelfTs)
+	// The add's result is the reactor's own view: their own entry, at the
+	// version the add produced and when.
+	require.NotNil(t, r.Self)
+	require.Equal(t, userA.Value, r.Self.UserID.Value)
+	require.Equal(t, uint64(1), r.Self.Version)
+	require.Equal(t, at(1), r.Self.ReactedTs)
 	require.Len(t, r.SampleReactors, 1)
 	require.Equal(t, userA.Value, r.SampleReactors[0].UserID.Value)
 
@@ -945,9 +946,10 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.False(t, created)
 	require.Equal(t, uint64(1), again.Count)
 	require.Equal(t, uint64(1), again.Version)
-	require.True(t, again.ReactedBySelf)
-	require.Equal(t, uint64(1), again.ReactedBySelfVersion)
-	require.Equal(t, at(1), again.ReactedBySelfTs)
+	require.NotNil(t, again.Self)
+	require.Equal(t, userA.Value, again.Self.UserID.Value)
+	require.Equal(t, uint64(1), again.Self.Version)
+	require.Equal(t, at(1), again.Self.ReactedTs)
 
 	// Second reactor: count 2, sequence advances, sample ordered most-recent-first.
 	r, created, _, err = s.AddReaction(ctx, chatID, msgID, userB, emoji, at(3))
@@ -963,14 +965,14 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.Equal(t, uint64(1), r.SampleReactors[1].Version)
 	require.True(t, at(3).Equal(r.SampleReactors[0].ReactedTs))
 
-	// Summary reports the emoji with the shared aggregate; ReactedBySelf is left
+	// Summary reports the emoji with the shared aggregate; Self is left
 	// false for the server to overlay.
 	summary, err := s.GetReactionSummary(ctx, chatID, msgID)
 	require.NoError(t, err)
 	require.Len(t, summary, 1)
 	require.Equal(t, emoji, summary[0].Emoji)
 	require.Equal(t, uint64(2), summary[0].Count)
-	require.False(t, summary[0].ReactedBySelf)
+	require.Nil(t, summary[0].Self)
 
 	// Self-reaction lookup is per-user, and reports the version that added it
 	// and when.
@@ -1075,7 +1077,7 @@ func testStore_Reactions_SelfReactions(t *testing.T, s messaging.Store) {
 	require.True(t, removed)
 	readd := add(viewer, ids[3], "🎉", at(106))
 	require.Equal(t, uint64(3), readd.Version)
-	require.Equal(t, at(106), readd.ReactedBySelfTs)
+	require.Equal(t, at(106), readd.Self.ReactedTs)
 	// Message 70: viewer reacted, in the far window.
 	add(viewer, ids[69], "👍", at(107))
 	// Message 5: viewer reacted, but it won't be asked about.
@@ -1131,7 +1133,7 @@ func testStore_Reactions_SelfReactions(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	require.True(t, created)
 	require.False(t, tooMany)
-	require.True(t, r.ReactedBySelf)
+	require.NotNil(t, r.Self)
 	_, err = s.GetSelfReactions(ctx, dmID, viewer, []*messagingpb.MessageId{msg.ID})
 	require.ErrorIs(t, err, messaging.ErrSelfReactionsGroupOnly)
 	// The DM's add and remove are otherwise whole: the reactor is listed, and

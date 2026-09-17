@@ -49,12 +49,14 @@ type PointerRef struct {
 
 // SelfReaction is one reaction a viewer currently holds in a chat, as the
 // per-viewer overlay read reports it (see Store.GetSelfReactions): the (message,
-// emoji) it sits on and the version that added it (Reactor.Version), which the
-// caller stamps onto Reaction.ReactedBySelfVersion.
+// emoji) it sits on, the version that added it and when — the viewer's own
+// Reactor.Version and Reactor.ReactedTs, which the caller stamps onto
+// Reaction.ReactedBySelfVersion and Reaction.ReactedBySelfTs.
 type SelfReaction struct {
 	MessageID *messagingpb.MessageId
 	Emoji     string
 	Version   uint64
+	ReactedTs time.Time
 }
 
 // StoredPointerTypes are the only pointer types persisted, for any chat type:
@@ -253,9 +255,10 @@ type Store interface {
 	// AddReaction records userID's reaction with emoji on a message and returns
 	// the emoji's aggregate after the add. The result goes back to the reactor
 	// alone, so unlike the summary reads it is already the caller's view:
-	// ReactedBySelf is set and ReactedBySelfVersion is the version that added
-	// the caller's reaction — the new Version on a real add, the earlier one on
-	// a re-add. It is idempotent on (chat, message, emoji, user): a re-add
+	// ReactedBySelf is set, ReactedBySelfVersion is the version that added the
+	// caller's reaction — the new Version on a real add, the earlier one on a
+	// re-add — and ReactedBySelfTs is when: ts on a real add, the original add's
+	// time on a re-add (ts is ignored). It is idempotent on (chat, message, emoji, user): a re-add
 	// returns the current aggregate with created false and changes nothing.
 	// created reports whether this call actually added the reaction (false on a
 	// re-add), so callers can skip the broadcast.
@@ -338,8 +341,9 @@ type Store interface {
 	) ([]*ReactionSummary, error)
 
 	// GetSelfReactions returns every reaction userID currently holds on the given
-	// messages of a group, each with the version that added it — the per-viewer
-	// data behind EmojiReaction.reacted_by_self and Reaction.ReactedBySelfVersion.
+	// messages of a group, each with the version that added it and when — the
+	// per-viewer data behind EmojiReaction.reacted_by_self,
+	// Reaction.ReactedBySelfVersion and Reaction.ReactedBySelfTs.
 	// It is the viewer's half of a summary read: the aggregates are shareable and
 	// leave ReactedBySelf unset, and this answers it for one viewer across a
 	// whole page. The read is addressed by the viewer, not by every (message,

@@ -225,22 +225,33 @@ func (r *Reactor) ToProto() *messagingpb.Reactor {
 // independently. A store keeps it across the emoji emptying and being re-added,
 // so a re-add can never look stale.
 //
-// ReactedBySelfVersion is the version at which the viewer's current reaction
-// was added (their Reactor.Version), 0 when ReactedBySelf is false; it never
-// exceeds Version, and in an AddReaction result it equals Version. The self
-// overlay is read separately from the aggregate but strongly consistently and
-// from rows written in the add's own transaction, so the two never disagree
-// about a completed transition; what the version adds is the viewer's place
-// in the emoji's order — where they sit among the reactors, and which
-// ReactionUpdate for the emoji was theirs — without a second read. Not yet on
-// the proto: EmojiReaction carries only the bool today, so ToProto leaves it
-// behind.
+// ReactedBySelfVersion and ReactedBySelfTs are the viewer's own Reactor.Version
+// and Reactor.ReactedTs: the version at which their current reaction was added
+// and when; both zero when ReactedBySelf is false. They are the viewer's entry
+// in the emoji's reactor order whether or not they still sit in the sample —
+// where they rank among the reactors, which ReactionUpdate for the emoji was
+// theirs — so a client can render itself among the reactors without a second
+// read. They are not the watermark for the reacted_by_self toggle: a summary
+// is a snapshot at Version, and every transition of the viewer's at or below
+// it is already folded into the bool, so Version is the value to gate live
+// updates by.
+//
+// In an AddReaction result ReactedBySelfVersion equals Version. In a summary
+// read the two come from separate strongly consistent reads, aggregate first,
+// so ReactedBySelfVersion is normally at most Version but can exceed it by the
+// viewer's own add landing between the two reads; then the bool is the newer
+// truth and the aggregate is a transition behind, which the add's
+// ReactionUpdate (or the next refresh) reconciles. The rows behind the overlay
+// are written in the add's own transaction, so the two never disagree about a
+// completed transition. Not yet on the proto: EmojiReaction carries only the
+// bool today, so ToProto leaves both behind.
 type Reaction struct {
 	Emoji                string
 	Count                uint64
 	Version              uint64
 	ReactedBySelf        bool
 	ReactedBySelfVersion uint64
+	ReactedBySelfTs      time.Time
 	SampleReactors       []*Reactor
 }
 

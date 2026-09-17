@@ -931,13 +931,15 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.Equal(t, uint64(1), r.Count)
 	require.Equal(t, uint64(1), r.Version)
 	// The add's result is the reactor's own view: reacted, at the version the
-	// add produced.
+	// add produced and when.
 	require.True(t, r.ReactedBySelf)
 	require.Equal(t, uint64(1), r.ReactedBySelfVersion)
+	require.Equal(t, at(1), r.ReactedBySelfTs)
 	require.Len(t, r.SampleReactors, 1)
 	require.Equal(t, userA.Value, r.SampleReactors[0].UserID.Value)
 
-	// Re-adding the same emoji is an idempotent no-op: nothing advances.
+	// Re-adding the same emoji is an idempotent no-op: nothing advances, and the
+	// self view is the original add's, not the retry's time.
 	again, created, _, err := s.AddReaction(ctx, chatID, msgID, userA, emoji, at(2))
 	require.NoError(t, err)
 	require.False(t, created)
@@ -945,6 +947,7 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.Equal(t, uint64(1), again.Version)
 	require.True(t, again.ReactedBySelf)
 	require.Equal(t, uint64(1), again.ReactedBySelfVersion)
+	require.Equal(t, at(1), again.ReactedBySelfTs)
 
 	// Second reactor: count 2, sequence advances, sample ordered most-recent-first.
 	r, created, _, err = s.AddReaction(ctx, chatID, msgID, userB, emoji, at(3))
@@ -969,13 +972,15 @@ func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
 	require.Equal(t, uint64(2), summary[0].Count)
 	require.False(t, summary[0].ReactedBySelf)
 
-	// Self-reaction lookup is per-user, and reports the version that added it.
+	// Self-reaction lookup is per-user, and reports the version that added it
+	// and when.
 	present, err := s.GetSelfReactions(ctx, chatID, userA, []*messagingpb.MessageId{msgID})
 	require.NoError(t, err)
 	require.Len(t, present, 1)
 	require.Equal(t, msgID.Value, present[0].MessageID.Value)
 	require.Equal(t, emoji, present[0].Emoji)
 	require.Equal(t, uint64(1), present[0].Version)
+	require.Equal(t, at(1), present[0].ReactedTs)
 	present, err = s.GetSelfReactions(ctx, chatID, userC, []*messagingpb.MessageId{msgID})
 	require.NoError(t, err)
 	require.Empty(t, present)
@@ -1040,8 +1045,10 @@ func testStore_Reactions_SelfReactions(t *testing.T, s messaging.Store) {
 		require.NoError(t, err)
 		ids = append(ids, msg.ID)
 	}
-	add := func(user *commonpb.UserId, id *messagingpb.MessageId, emoji string) *messaging.Reaction {
-		r, created, tooMany, err := s.AddReaction(ctx, chatID, id, user, emoji, at(100))
+	// Every add gets its own time, so the overlay's timestamps are checkable
+	// per reaction rather than all one value.
+	add := func(user *commonpb.UserId, id *messagingpb.MessageId, emoji string, ts time.Time) *messaging.Reaction {
+		r, created, tooMany, err := s.AddReaction(ctx, chatID, id, user, emoji, ts)
 		require.NoError(t, err)
 		require.True(t, created)
 		require.False(t, tooMany)
@@ -1050,60 +1057,65 @@ func testStore_Reactions_SelfReactions(t *testing.T, s messaging.Store) {
 
 	// Message 1: viewer holds two emoji, other holds one of them (added first,
 	// so the viewer's 👍 is version 2 while their ❤️ is version 1).
-	add(other, ids[0], "👍")
-	add(viewer, ids[0], "❤️")
-	add(viewer, ids[0], "👍")
+	add(other, ids[0], "👍", at(100))
+	add(viewer, ids[0], "❤️", at(101))
+	add(viewer, ids[0], "👍", at(102))
 	// Message 2: only the other user reacted.
-	add(other, ids[1], "🔥")
+	add(other, ids[1], "🔥", at(103))
 	// Message 3: the viewer reacted, then removed — nothing to report.
-	add(viewer, ids[2], "🔥")
+	add(viewer, ids[2], "🔥", at(104))
 	_, removed, err := s.RemoveReaction(ctx, chatID, ids[2], viewer, "🔥")
 	require.NoError(t, err)
 	require.True(t, removed)
 	// Message 4: the viewer removed and re-added, so their reaction sits at the
-	// re-add's version (3), not the original's (1).
-	add(viewer, ids[3], "🎉")
+	// re-add's version (3) and time, not the original's (1).
+	add(viewer, ids[3], "🎉", at(105))
 	_, removed, err = s.RemoveReaction(ctx, chatID, ids[3], viewer, "🎉")
 	require.NoError(t, err)
 	require.True(t, removed)
-	readd := add(viewer, ids[3], "🎉")
+	readd := add(viewer, ids[3], "🎉", at(106))
 	require.Equal(t, uint64(3), readd.Version)
+	require.Equal(t, at(106), readd.ReactedBySelfTs)
 	// Message 70: viewer reacted, in the far window.
-	add(viewer, ids[69], "👍")
+	add(viewer, ids[69], "👍", at(107))
 	// Message 5: viewer reacted, but it won't be asked about.
-	add(viewer, ids[4], "👍")
+	add(viewer, ids[4], "👍", at(108))
 
 	type key struct {
 		seq   uint64
 		emoji string
 	}
+	type entry struct {
+		version uint64
+		ts      time.Time
+	}
+	collect := func(present []messaging.SelfReaction) map[key]entry {
+		got := make(map[key]entry, len(present))
+		for _, self := range present {
+			got[key{self.MessageID.Value, self.Emoji}] = entry{self.Version, self.ReactedTs}
+		}
+		return got
+	}
 	// Ask about 1..4 and 70 (plus a duplicate and an unknown ID): the answer is
 	// exactly the viewer's live reactions on those, not message 5's, not the
-	// removed one, and not the other user's.
+	// removed one, and not the other user's — each at the version and time of
+	// the add that holds.
 	present, err := s.GetSelfReactions(ctx, chatID, viewer, []*messagingpb.MessageId{ids[69], ids[0], ids[1], ids[2], ids[3], ids[0], {Value: 999}})
 	require.NoError(t, err)
-	got := make(map[key]uint64, len(present))
-	for _, self := range present {
-		got[key{self.MessageID.Value, self.Emoji}] = self.Version
-	}
-	require.Equal(t, map[key]uint64{
-		{ids[0].Value, "❤️"}: 1,
-		{ids[0].Value, "👍"}:  2,
-		{ids[3].Value, "🎉"}:  3,
-		{ids[69].Value, "👍"}: 1,
-	}, got)
+	require.Equal(t, map[key]entry{
+		{ids[0].Value, "❤️"}: {1, at(101)},
+		{ids[0].Value, "👍"}:  {2, at(102)},
+		{ids[3].Value, "🎉"}:  {3, at(106)},
+		{ids[69].Value, "👍"}: {1, at(107)},
+	}, collect(present))
 
 	// The other user's view of the same messages is theirs alone.
 	present, err = s.GetSelfReactions(ctx, chatID, other, []*messagingpb.MessageId{ids[0], ids[1], ids[3]})
 	require.NoError(t, err)
-	got = make(map[key]uint64, len(present))
-	for _, self := range present {
-		got[key{self.MessageID.Value, self.Emoji}] = self.Version
-	}
-	require.Equal(t, map[key]uint64{
-		{ids[0].Value, "👍"}: 1,
-		{ids[1].Value, "🔥"}: 1,
-	}, got)
+	require.Equal(t, map[key]entry{
+		{ids[0].Value, "👍"}: {1, at(100)},
+		{ids[1].Value, "🔥"}: {1, at(103)},
+	}, collect(present))
 
 	// Nothing asked, nothing answered.
 	present, err = s.GetSelfReactions(ctx, chatID, viewer, nil)

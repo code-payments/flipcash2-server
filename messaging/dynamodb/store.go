@@ -98,10 +98,13 @@ import (
 //	                   for a tombstone to remember (contrast group_members).
 //
 //	message_self_reactions  pk = "chat#<id>#<user hex>", sk = "<padded seq>#<emoji
-//	                   hex>", version. A group's reactions keyed by viewer: one
-//	                   row per current reaction, written and deleted in the
-//	                   reactor row's transaction, carrying the version that
-//	                   added it. A viewer's reactions across a page of messages
+//	                   hex>", version, reacted_ts. A group's reactions keyed by
+//	                   viewer: one row per current reaction, written and deleted
+//	                   in the reactor row's transaction, carrying the version
+//	                   that added it and when — the viewer's own reactor row,
+//	                   so the overlay can hand back their full Reactor entry
+//	                   even once the sample has evicted them. A viewer's
+//	                   reactions across a page of messages
 //	                   — the reacted_by_self overlay on a summary read — are
 //	                   one strongly consistent sort-key range on the viewer's
 //	                   own partition, billed by what the viewer reacted rather
@@ -208,7 +211,8 @@ const (
 	// message_self_reactions table (one row per current reaction, keyed by
 	// viewer). The version that added the reaction is the row's one attribute
 	// beyond its keys.
-	attrSelfVersion = "version"
+	attrSelfVersion   = "version"
+	attrSelfReactedTs = "reacted_ts" // the reactor row's reacted_ts, copied
 
 	// maxSummaryRefGap bounds how far apart two requested message IDs may be for
 	// GetReactionSummariesByRefs to cover both with one range query. Refs usually
@@ -1658,8 +1662,10 @@ type reactionState struct {
 	agg     aggState
 	meta    metaState
 	reacted bool
-	// reactedAt is the version that added the caller's reaction, when reacted.
+	// reactedAt is the version that added the caller's reaction, and reactedTs
+	// when, both when reacted.
 	reactedAt uint64
+	reactedTs time.Time
 }
 
 func (s *store) AddReaction(
@@ -1685,7 +1691,7 @@ func (s *store) AddReaction(
 
 		// Idempotent: the user already reacted with this emoji.
 		if state.reacted {
-			return selfReaction(reactionFromAgg(emoji, state.agg), state.reactedAt), false, false, nil
+			return selfReaction(reactionFromAgg(emoji, state.agg), state.reactedAt, state.reactedTs), false, false, nil
 		}
 
 		// Activating a new or emptied emoji must respect the per-message type cap.
@@ -1728,9 +1734,10 @@ func (s *store) AddReaction(
 			items = append(items, types.TransactWriteItem{Put: &types.Put{
 				TableName: aws.String(s.selfReactionsTable),
 				Item: map[string]types.AttributeValue{
-					attrPK:          avS(viewerPK(chatID, userID)),
-					attrSK:          avS(seqEmojiSK(seq, emoji)),
-					attrSelfVersion: avN(next.version),
+					attrPK:            avS(viewerPK(chatID, userID)),
+					attrSK:            avS(seqEmojiSK(seq, emoji)),
+					attrSelfVersion:   avN(next.version),
+					attrSelfReactedTs: avN(uint64(ts.UnixNano())),
 				},
 			}})
 		}
@@ -1740,7 +1747,7 @@ func (s *store) AddReaction(
 		}
 		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 		if err == nil {
-			return selfReaction(reactionFromAgg(emoji, next), next.version), true, false, nil
+			return selfReaction(reactionFromAgg(emoji, next), next.version, ts), true, false, nil
 		}
 
 		retry, err := s.absorbReactionFailure(ctx, err, items, metaIdx, &state, attempt, &backoff)
@@ -2023,7 +2030,7 @@ func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, 
 				{attrPK: avS(reactorPK(chatID, seq)), attrSK: avS(userSK(userID, emoji))},
 			},
 			ConsistentRead:       aws.Bool(true),
-			ProjectionExpression: aws.String(attrSK + ", " + attrEmojiVersion),
+			ProjectionExpression: aws.String(attrSK + ", " + attrEmojiVersion + ", " + attrReactedTs),
 		},
 	}
 
@@ -2048,7 +2055,11 @@ func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, 
 			if err != nil {
 				return reactionState{}, err
 			}
-			state.reacted, state.reactedAt = true, version
+			nanos, err := parseInt(item[attrReactedTs])
+			if err != nil {
+				return reactionState{}, err
+			}
+			state.reacted, state.reactedAt, state.reactedTs = true, version, time.Unix(0, nanos).UTC()
 		}
 		req = make(map[string]types.KeysAndAttributes)
 		for table, unprocessed := range resp.UnprocessedKeys {
@@ -2325,10 +2336,15 @@ func (s *store) GetSelfReactions(
 				if err != nil {
 					return nil, err
 				}
+				nanos, err := parseInt(item[attrSelfReactedTs])
+				if err != nil {
+					return nil, err
+				}
 				present = append(present, messaging.SelfReaction{
 					MessageID: &messagingpb.MessageId{Value: seq},
 					Emoji:     emoji,
 					Version:   version,
+					ReactedTs: time.Unix(0, nanos).UTC(),
 				})
 			}
 			if len(out.LastEvaluatedKey) == 0 {
@@ -2608,10 +2624,11 @@ func seqEmojiFromSK(sk string) (uint64, string, error) {
 }
 
 // selfReaction marks an AddReaction result as the reactor's own view: reacted,
-// at the version that added their reaction.
-func selfReaction(r *messaging.Reaction, addedAt uint64) *messaging.Reaction {
+// at the version that added their reaction and when.
+func selfReaction(r *messaging.Reaction, addedAt uint64, reactedTs time.Time) *messaging.Reaction {
 	r.ReactedBySelf = true
 	r.ReactedBySelfVersion = addedAt
+	r.ReactedBySelfTs = reactedTs
 	return r
 }
 

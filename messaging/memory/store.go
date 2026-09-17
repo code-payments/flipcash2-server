@@ -537,7 +537,7 @@ func (m *memory) AddReaction(
 	// Idempotent: the user already reacted with this emoji.
 	if agg != nil {
 		if existing, ok := agg.reactors[userKey]; ok {
-			return selfReaction(buildReaction(emoji, agg), existing.version), false, false, nil
+			return selfReaction(buildReaction(emoji, agg), existing.version, existing.ts), false, false, nil
 		}
 	}
 
@@ -565,14 +565,15 @@ func (m *memory) AddReaction(
 		evictLeastRecentSample(agg.sample)
 	}
 
-	return selfReaction(buildReaction(emoji, agg), entry.version), true, false, nil
+	return selfReaction(buildReaction(emoji, agg), entry.version, entry.ts), true, false, nil
 }
 
 // selfReaction marks an AddReaction result as the reactor's own view: reacted,
-// at the version that added their reaction.
-func selfReaction(r *messaging.Reaction, addedAt uint64) *messaging.Reaction {
+// at the version that added their reaction and when.
+func selfReaction(r *messaging.Reaction, addedAt uint64, reactedTs time.Time) *messaging.Reaction {
 	r.ReactedBySelf = true
 	r.ReactedBySelfVersion = addedAt
+	r.ReactedBySelfTs = reactedTs
 	return r
 }
 
@@ -749,6 +750,7 @@ func (m *memory) GetSelfReactions(
 					MessageID: &messagingpb.MessageId{Value: id.Value},
 					Emoji:     emoji,
 					Version:   entry.version,
+					ReactedTs: entry.ts,
 				})
 			}
 		}

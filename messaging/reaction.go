@@ -282,8 +282,9 @@ func (s *Server) GetReactors(ctx context.Context, req *messagingpb.GetReactorsRe
 	return resp, nil
 }
 
-// applySelfReactions sets ReactedBySelf and ReactedBySelfVersion on the given
-// summaries' aggregates for the viewer, choosing its strategy by chat type.
+// applySelfReactions sets ReactedBySelf, ReactedBySelfVersion and
+// ReactedBySelfTs on the given summaries' aggregates for the viewer, choosing
+// its strategy by chat type.
 //
 // A DM answers from the sample already in hand: it has at most two members, so an
 // emoji's reactor set can never outgrow the surfaced sample (MaxSampleReactors)
@@ -325,16 +326,17 @@ func (s *Server) applySelfReactions(ctx context.Context, chatID *commonpb.ChatId
 		return nil
 	}
 
-	reacted := make(map[selfReactionKey]uint64, len(present))
+	reacted := make(map[selfReactionKey]SelfReaction, len(present))
 	for _, self := range present {
-		reacted[selfReactionKey{messageID: self.MessageID.Value, emoji: self.Emoji}] = self.Version
+		reacted[selfReactionKey{messageID: self.MessageID.Value, emoji: self.Emoji}] = self
 	}
 	for _, summary := range summaries {
 		for _, reaction := range summary.Reactions {
 			key := selfReactionKey{messageID: summary.MessageID.Value, emoji: reaction.Emoji}
-			if version, ok := reacted[key]; ok {
+			if self, ok := reacted[key]; ok {
 				reaction.ReactedBySelf = true
-				reaction.ReactedBySelfVersion = version
+				reaction.ReactedBySelfVersion = self.Version
+				reaction.ReactedBySelfTs = self.ReactedTs
 			}
 		}
 	}
@@ -350,10 +352,11 @@ type selfReactionKey struct {
 	emoji     string
 }
 
-// overlaySelfReactions sets ReactedBySelf and ReactedBySelfVersion on the given
-// summaries' aggregates for userID by scanning each aggregate's surfaced sample. It is exact only where the
-// sample is guaranteed to hold every reactor — DMs — and applySelfReactions is
-// what enforces that; see there for why a group must not use it.
+// overlaySelfReactions sets ReactedBySelf, ReactedBySelfVersion and
+// ReactedBySelfTs on the given summaries' aggregates for userID by scanning each
+// aggregate's surfaced sample. It is exact only where the sample is guaranteed
+// to hold every reactor — DMs — and applySelfReactions is what enforces that;
+// see there for why a group must not use it.
 func overlaySelfReactions(userID *commonpb.UserId, summaries []*ReactionSummary) {
 	for _, summary := range summaries {
 		for _, reaction := range summary.Reactions {
@@ -361,6 +364,7 @@ func overlaySelfReactions(userID *commonpb.UserId, summaries []*ReactionSummary)
 				if bytes.Equal(reactor.UserID.Value, userID.Value) {
 					reaction.ReactedBySelf = true
 					reaction.ReactedBySelfVersion = reactor.Version
+					reaction.ReactedBySelfTs = reactor.ReactedTs
 					break
 				}
 			}

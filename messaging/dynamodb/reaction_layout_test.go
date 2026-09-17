@@ -45,7 +45,7 @@ func TestMessaging_DynamoDBStore_SelfReactionLayout(t *testing.T) {
 		require.False(t, tooMany)
 		return msg.ID
 	}
-	selfRows := func(chatID *commonpb.ChatId) int {
+	selfRows := func(chatID *commonpb.ChatId) []map[string]types.AttributeValue {
 		out, err := testEnv.Client.Query(ctx, &dynamodb.QueryInput{
 			TableName:                 aws.String(selfReactionsTable),
 			KeyConditionExpression:    aws.String(attrPK + " = :pk"),
@@ -53,22 +53,27 @@ func TestMessaging_DynamoDBStore_SelfReactionLayout(t *testing.T) {
 			ConsistentRead:            aws.Bool(true),
 		})
 		require.NoError(t, err)
-		return len(out.Items)
+		return out.Items
 	}
 
 	groupID := &commonpb.ChatId{Value: make([]byte, chat.GroupChatIDSize)}
 	groupMsg := react(groupID)
-	require.Equal(t, 1, selfRows(groupID), "a group reaction keeps its viewer-keyed row")
+	rows := selfRows(groupID)
+	require.Len(t, rows, 1, "a group reaction keeps its viewer-keyed row")
+	// The row is the viewer's own reactor entry: the add's version and time,
+	// stored the way the reactor row stores them.
+	require.Equal(t, avN(1), rows[0][attrSelfVersion])
+	require.Equal(t, avN(uint64(ts.UnixNano())), rows[0][attrSelfReactedTs])
 
 	dmID := &commonpb.ChatId{Value: make([]byte, 32)}
 	dmMsg := react(dmID)
-	require.Equal(t, 0, selfRows(dmID), "a DM reaction writes no viewer-keyed row")
+	require.Empty(t, selfRows(dmID), "a DM reaction writes no viewer-keyed row")
 
 	// Both removals are whole transactions; the group's takes its row with it.
 	_, removed, err := s.RemoveReaction(ctx, groupID, groupMsg, user, "👍")
 	require.NoError(t, err)
 	require.True(t, removed)
-	require.Equal(t, 0, selfRows(groupID))
+	require.Empty(t, selfRows(groupID))
 	_, removed, err = s.RemoveReaction(ctx, dmID, dmMsg, user, "👍")
 	require.NoError(t, err)
 	require.True(t, removed)

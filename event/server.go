@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -151,6 +150,12 @@ type Server struct {
 	badges   badge.Store
 	chats    chat.Store
 
+	// access answers a chat preview's viewer's standing in the chat it names
+	// (see chatPreview) — the one Access the chat and messaging servers share,
+	// so a non-member's admission is evaluated and remembered once whichever
+	// service they read through.
+	access *chat.Access
+
 	subscriptions *cluster.Subscriptions
 
 	userEventBus *Bus[*commonpb.UserId, *eventpb.Event]
@@ -172,6 +177,10 @@ type Server struct {
 	reconcileStop     chan struct{}
 	reconcileStopOnce sync.Once
 
+	// chatPreviewLifetime is how long a chat preview stream lives (see
+	// chatPreview).
+	chatPreviewLifetime time.Duration
+
 	// self is the cluster member this process registers subscription rows as:
 	// its instance ID recognizes our own rows on the publish path, its address
 	// labels forwarded test events. Single-sourced from the cluster runtime so
@@ -188,12 +197,17 @@ type Server struct {
 // reconcile sweep (see reconcileMembership) in the background. The sweep runs
 // until Shutdown, which every caller must eventually invoke — a Server that is
 // constructed and dropped without it leaks the sweep's goroutine.
+//
+// access should be the one chat.Access the chat and messaging servers are
+// built on (see chat.NewAccess): a chat stream's viewer is admitted by the
+// same standing, remembered in the same window, as their reads.
 func NewServer(
 	log *zap.Logger,
 	authz auth.Authorizer,
 	accounts account.Store,
 	badges badge.Store,
 	chats chat.Store,
+	access *chat.Access,
 	subscriptions *cluster.Subscriptions,
 	userEventBus *Bus[*commonpb.UserId, *eventpb.Event],
 	chatEventBus *Bus[*commonpb.ChatId, *eventpb.ChatEvent],
@@ -217,6 +231,7 @@ func NewServer(
 		accounts: accounts,
 		badges:   badges,
 		chats:    chats,
+		access:   access,
 
 		subscriptions: subscriptions,
 
@@ -230,6 +245,8 @@ func NewServer(
 		reconcileInterval: defaultMembershipReconcileInterval,
 		reconcileTick:     defaultMembershipReconcileTick,
 		reconcileStop:     make(chan struct{}),
+
+		chatPreviewLifetime: defaultChatPreviewLifetime,
 
 		self:         subscriptions.Self(),
 		internalAuth: internalrpc.NewAuthenticator(currentRpcApiKey),
@@ -289,137 +306,26 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 		}})
 	}
 
-	// A stream open is the client coming to the foreground (guaranteed on app
-	// open), which is when the badge resets to zero. Best-effort: a failure here
-	// must not block streaming.
-	if err := s.badges.Reset(ctx, userID); err != nil {
-		log.With(zap.Error(err)).Warn("Failed to reset badge count on stream open")
+	// Params selects what the stream is for: the signing user's every event,
+	// the contract that predates the target, or a time-bounded preview of one
+	// group chat under a ViewMode (see chatPreview).
+	if preview := params.GetChatPreview(); preview != nil {
+		return s.streamChatPreview(ctx, log, stream, userID, preview)
 	}
+	return s.streamUserEvents(ctx, log, stream, userID)
+}
 
-	streamID := uuid.New().String()
-
-	log = log.With(zap.String("stream_id", streamID))
-
-	// Sanity check whether the stream is still valid before doing expensive
-	// operations
-	select {
-	case <-ctx.Done():
-		log.Debug("Stream context cancelled; ending stream")
-		return status.Error(codes.Canceled, "")
-	default:
-	}
-
-	log.Debug("Initializing stream")
-
+// run drives an open, registered stream to its end: it batches what the
+// delivery path notifies onto ss out to the client, keeps the stream alive
+// with pings and ends it when the client stops answering, and returns when
+// the stream is closed, the client goes, or the send fails. A chat preview
+// (preview non-nil) additionally shapes every event for its viewer (see
+// chatPreview.shape) and ends with STREAM_EXPIRED when its window closes,
+// whatever the client is doing: pongs keep the stream healthy, not alive.
+func (s *Server) run(ctx context.Context, log *zap.Logger, stream grpc.BidiStreamingServer[eventpb.StreamEventsRequest, eventpb.StreamEventsResponse], ss *EventStream[*eventpb.Event], preview *chatPreview) error {
 	staleEventDetectors := make([]StaleEventDetector[*eventpb.Event], len(s.staleEventDetectorCtors))
 	for i, ctor := range s.staleEventDetectorCtors {
 		staleEventDetectors[i] = ctor()
-	}
-
-	ss := NewEventStream[*eventpb.Event](streamID, streamBufferSize)
-
-	// The stream serves the user's own topic plus one topic per group chat
-	// they are joined to, so group publishers can resolve the hosting servers
-	// by group instead of once per member.
-	//
-	// The local stream must be resolvable before a topic's registry row is, or
-	// a publish racing the open could resolve the row yet find no stream
-	// behind it — so the user key is registered up front, before the first
-	// Subscribe below, and each chat key before its own row (see seed).
-	//
-	// And into the index before even that, so that from the first event the
-	// user key can deliver, every transition on it moves this stream (see
-	// followMembership): indexed after registering, a transition landing in
-	// between would notify the stream and move nothing. The membership
-	// records are then merged in behind the transitions through the same
-	// version gate (see streamSession.seed), so a record and a transition
-	// that cross — the read reflecting a transition already applied, or a
-	// transition landing on a record that predates it — resolve to the newer
-	// of the two, not the later-arriving. Departed records seed a version
-	// too, so a delayed copy of a join the user has since undone is stale on
-	// arrival rather than news.
-	//
-	// What remains uncovered is a transition this server never hears of: one
-	// published before this server's row for the user's topic lands (below)
-	// — which the user's first stream here cannot receive — that the read
-	// also predates, by its timing or by the inverted membership index's
-	// replication lag. The reconcile sweep re-reads for those (see
-	// reconcileMembership).
-	session := newStreamSession(streamID, localStream{stream: ss, userID: userID}, userStreamKey(userID), s.streams)
-	s.sessions.add(session)
-	if !session.open() {
-		// Indexed but never registered: a transition may still have found the
-		// session and attached a chat key before the registry began draining,
-		// so it is torn down as a closed stream is, not merely unindexed.
-		s.sessions.remove(session)
-		if handles := session.close(); len(handles) > 0 {
-			closeCtx, cancel := context.WithTimeout(context.Background(), subscriptionCloseTimeout)
-			s.releaseHandles(closeCtx, handles)
-			cancel()
-		}
-		log.Debug("Rejecting stream on shut-down server")
-		return status.Error(codes.Unavailable, "server is draining")
-	}
-
-	defer func() {
-		log.Debug("Closing streamer")
-
-		// Out of the index first, so no transition attaches to a stream that
-		// is ending; then out of the registry, releasing every registration
-		// the stream still holds as one batched close.
-		s.sessions.remove(session)
-		handles := session.close()
-
-		closeCtx, cancel := context.WithTimeout(context.Background(), subscriptionCloseTimeout)
-		if err := s.subscriptions.CloseAll(closeCtx, handles); err != nil {
-			log.With(zap.Error(err)).Warn("Failed to close stream subscriptions")
-		}
-		cancel()
-	}()
-
-	memberships, err := s.chats.GetGroupMembershipsForUser(ctx, userID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure loading group memberships for stream")
-		return status.Error(codes.Internal, "failure loading group memberships")
-	}
-
-	seeds := make([]topicSeed, 0, len(memberships))
-	chatIDs := make(map[string]*commonpb.ChatId, len(memberships))
-	for _, m := range memberships {
-		key := chatStreamKey(m.ChatID)
-		seeds = append(seeds, topicSeed{key: key, version: m.Version, joined: m.Joined})
-		chatIDs[key] = m.ChatID
-	}
-	chatKeys, released := session.seed(seeds)
-	if len(released) > 0 {
-		s.releaseHandles(ctx, released)
-	}
-
-	// Register this server's interest in the stream's topics with the cluster,
-	// so publishers on other servers forward here — one batched registration
-	// covering the user topic and every group topic the seed attached, so the
-	// stream-open path pays a single store round trip no matter how many
-	// groups. Non-exclusive: the same user (and all the more so the same
-	// group) may hold streams on any number of servers simultaneously.
-	topics := make([]cluster.SubscriptionTopic, 0, 1+len(chatKeys))
-	topics = append(topics, cluster.SubscriptionTopic{Namespace: UserEventsNamespace, Key: userID.Value})
-	for _, key := range chatKeys {
-		topics = append(topics, cluster.SubscriptionTopic{Namespace: ChatEventsNamespace, Key: chatIDs[key].Value})
-	}
-	subscriptions, err := s.subscriptions.SubscribeAll(ctx, topics)
-	if err != nil {
-		if errors.Is(err, cluster.ErrSubscriptionsDraining) {
-			log.Debug("Rejecting stream on draining server")
-			return status.Error(codes.Unavailable, "server is draining")
-		}
-		log.With(zap.Error(err)).Warn("Failure registering stream subscriptions")
-		return status.Error(codes.Internal, "failure registering stream subscriptions")
-	}
-	// A chat handle the session refuses belongs to a key a transition moved
-	// while the batch was in flight (see setHandles); it is released as a
-	// transition's own would be.
-	if refused := session.setHandles(subscriptions[0], chatKeys, subscriptions[1:]); len(refused) > 0 {
-		s.releaseHandles(ctx, refused)
 	}
 
 	// The stream's steady-state cost is fixed at open: one send goroutine, one
@@ -427,6 +333,17 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 	// allocated per event or per ping, however long the stream lives.
 	sender := protoutil.NewSender[eventpb.StreamEventsResponse](stream, streamSendTimeout)
 	defer sender.Close()
+
+	// A preview's window; a user stream has none, and a nil channel never
+	// fires.
+	var expired <-chan time.Time
+	var shape func(*eventpb.Event) (*eventpb.Event, error)
+	if preview != nil {
+		expiry := time.NewTimer(time.Until(preview.expiresAt))
+		defer expiry.Stop()
+		expired = expiry.C
+		shape = preview.shape
+	}
 
 	// The pong deadline starts before the first ping goes out, so it is the
 	// earlier of the two whenever a silent client's deadline and a ping tick
@@ -478,7 +395,10 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 			// Everything that queued up during the previous send goes out in
 			// this one message, so a burst costs the client one receive and
 			// the handler one send regardless of how many events it spans.
-			batch := selectEvents(log, staleEventDetectors, drainReady(ss.Channel(), first, maxEventBatchSize, maxEventBatchBytes, eventSize))
+			batch, err := selectEvents(log, staleEventDetectors, shape, drainReady(ss.Channel(), first, maxEventBatchSize, maxEventBatchBytes, eventSize))
+			if err != nil {
+				return status.Error(codes.Internal, "failure shaping events for stream")
+			}
 			if batch == nil {
 				continue
 			}
@@ -493,6 +413,11 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 				log.Info("Failed to send events to client stream", zap.Error(err))
 				return err
 			}
+		case <-expired:
+			log.Debug("Chat preview window closed; ending stream")
+			return sender.Send(ctx, &eventpb.StreamEventsResponse{Type: &eventpb.StreamEventsResponse_Error{
+				Error: &eventpb.StreamEventsResponse_StreamError{Code: eventpb.StreamEventsResponse_StreamError_STREAM_EXPIRED},
+			}})
 		case <-pingTicker.C:
 			// A pong deadline that has already passed takes precedence over
 			// the tick: a client that has gone silent for the whole window is
@@ -881,22 +806,37 @@ func (s *Server) reconcileUser(userKey string) {
 	}
 }
 
-// selectEvents applies the stream's stale-event detectors to a drained batch
-// and shapes what survives for the wire. It returns nil when nothing does.
-func selectEvents(log *zap.Logger, detectors []StaleEventDetector[*eventpb.Event], events []*eventpb.Event) *eventpb.EventBatch {
+// selectEvents applies the stream's stale-event detectors to a drained batch,
+// then the stream's shape to what survives — the event as the stream delivers
+// it, or nil to drop it (see chatPreview.shape); a nil shape delivers every
+// event as published — and gathers the result for the wire. It returns nil
+// when nothing remains, and an error when shape fails on an event, which
+// ends the stream: nothing the stream cannot shape for its viewer is sent.
+func selectEvents(log *zap.Logger, detectors []StaleEventDetector[*eventpb.Event], shape func(*eventpb.Event) (*eventpb.Event, error), events []*eventpb.Event) (*eventpb.EventBatch, error) {
 	eventsToSend := make([]*eventpb.Event, 0, len(events))
 	for _, event := range events {
 		if isStale(detectors, event) {
 			log.Debug("Dropping stale event", zap.String("event_id", model.EventIDString(event.Id)))
 			continue
 		}
+		if shape != nil {
+			shaped, err := shape(event)
+			if err != nil {
+				log.With(zap.Error(err)).Warn("Failure shaping event for stream", zap.String("event_id", model.EventIDString(event.Id)))
+				return nil, err
+			}
+			if shaped == nil {
+				continue
+			}
+			event = shaped
+		}
 		eventsToSend = append(eventsToSend, event)
 	}
 
 	if len(eventsToSend) == 0 {
-		return nil
+		return nil, nil
 	}
-	return &eventpb.EventBatch{Events: eventsToSend}
+	return &eventpb.EventBatch{Events: eventsToSend}, nil
 }
 
 // eventSize is the event's wire size. Generated messages cache it, so the

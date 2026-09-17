@@ -1878,8 +1878,11 @@ func testServer_NonMember_Denied(t *testing.T, badges badge.Store, blocklists bl
 // testServer_NonMember_Group_Reads pins that a non-member who satisfies a
 // group's listener rules reads it — every read path — and nothing more: no
 // send, no pointer advance, no reaction. One who does not satisfy them is
-// denied everything, as any non-member of a DM is (see
-// testServer_NonMember_Denied). See chat.Access for the gates.
+// denied the messages but still reads the reaction overlay, which is any
+// reader's (see messaging.Server's overlayStanding), with no self entry; a
+// non-member of a group with no listener rules is denied everything, as any
+// non-member of a DM is (see testServer_NonMember_Denied). See chat.Access
+// for the gates.
 func testServer_NonMember_Group_Reads(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
@@ -1994,7 +1997,7 @@ func testServer_NonMember_Group_Reads(t *testing.T, badges badge.Store, blocklis
 	require.False(t, isMember)
 
 	// A non-member who does not satisfy the rules — here, one with no owner
-	// account, who holds nothing — is denied everything.
+	// account, who holds nothing — is denied the messages...
 	_, unfundedKeys := e.addUser()
 	deniedToRead := func(keys model.KeyPair) {
 		t.Helper()
@@ -2011,21 +2014,44 @@ func testServer_NonMember_Group_Reads(t *testing.T, badges badge.Store, blocklis
 		require.NoError(t, err)
 		require.Len(t, deltaResps, 1)
 		require.Equal(t, messagingpb.GetDeltaResponse_DENIED, deltaResps[0].Result)
-
-		sumResp, err := e.getReactionSummaryInChat(keys, groupID, msgID)
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.GetReactionSummaryResponse_DENIED, sumResp.Result)
-
-		sumsResp, err := e.getReactionSummariesByIDsInChat(keys, groupID, msgID.Value)
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.GetReactionSummariesResponse_DENIED, sumsResp.Result)
-
-		reactorsResp, err := e.getReactorsInChat(keys, groupID, msgID, emoji, &commonpb.QueryOptions{})
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.GetReactorsResponse_DENIED, reactorsResp.Result)
 	}
 	deniedToRead(unfundedKeys)
 	deniedToWrite(unfundedKeys)
+
+	// ...but reads the reaction overlay as any reader of the group does: the
+	// group carries a listener rule, so they may read it at all, and the
+	// overlay is the same whatever the reading. No rule is evaluated for it
+	// — a balance that cannot be read does not fail it — and a non-member has
+	// no self entry to find.
+	readsOverlay := func(keys model.KeyPair) {
+		t.Helper()
+
+		sumResp, err := e.getReactionSummaryInChat(keys, groupID, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, sumResp.Result)
+		require.Len(t, sumResp.Summary.Reactions, 1)
+		require.Equal(t, emoji, sumResp.Summary.Reactions[0].Emoji.Value)
+		require.Equal(t, uint64(1), sumResp.Summary.Reactions[0].Count)
+		require.Nil(t, sumResp.Summary.Reactions[0].SelfReactor)
+
+		sumsResp, err := e.getReactionSummariesByIDsInChat(keys, groupID, msgID.Value)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummariesResponse_OK, sumsResp.Result)
+		require.Len(t, sumsResp.Summaries, 1)
+		require.Len(t, sumsResp.Summaries[0].Reactions, 1)
+		require.Nil(t, sumsResp.Summaries[0].Reactions[0].SelfReactor)
+
+		reactorsResp, err := e.getReactorsInChat(keys, groupID, msgID, emoji, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactorsResponse_OK, reactorsResp.Result)
+		require.Len(t, reactorsResp.Reactors, 1)
+		require.Equal(t, e.userA.Value, reactorsResp.Reactors[0].UserId.Value)
+	}
+	readsOverlay(unfundedKeys)
+	e.ocpBalance.setErr(errors.New("ocp is down"))
+	readsOverlay(unfundedKeys)
+	readsOverlay(strangerKeys)
+	e.ocpBalance.setErr(nil)
 
 	// A group with no listener rules admits no non-member, however funded:
 	// only a rule can admit one (see chat.Access). Its member still reads.
@@ -2050,6 +2076,15 @@ func testServer_NonMember_Group_Reads(t *testing.T, badges badge.Store, blocklis
 	require.NoError(t, err)
 	require.Len(t, openDelta, 1)
 	require.Equal(t, messagingpb.GetDeltaResponse_DENIED, openDelta[0].Result)
+	openSum, err := e.getReactionSummaryInChat(strangerKeys, openID, openSent.Message.MessageId)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactionSummaryResponse_DENIED, openSum.Result)
+	openSums, err := e.getReactionSummariesByIDsInChat(strangerKeys, openID, openSent.Message.MessageId.Value)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactionSummariesResponse_DENIED, openSums.Result)
+	openReactors, err := e.getReactorsInChat(strangerKeys, openID, openSent.Message.MessageId, emoji, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactorsResponse_DENIED, openReactors.Result)
 	openGet, err = e.getMessageInChat(e.keysA, openID, openSent.Message.MessageId)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessageResponse_OK, openGet.Result)
@@ -2072,8 +2107,8 @@ func testServer_NonMember_Group_Reads(t *testing.T, badges badge.Store, blocklis
 // and reads the group redacted under FULL_OR_REDACTED and REDACTED — every
 // message path, one placeholder per message, stable across paths and viewers —
 // while REDACTED gives a placeholder to anyone who may read the chat at all,
-// a member included. The reaction reads carry no mode and stay a full
-// reader's.
+// a member included. The reaction reads carry no mode and answer a redacted
+// reader too (see testServer_NonMember_Group_Reads).
 func testServer_ViewMode(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	every := []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED}
@@ -2224,10 +2259,12 @@ func testServer_ViewMode(t *testing.T, badges badge.Store, blocklists blocklist.
 		require.Equal(t, 3, delivered, mode)
 	}
 
-	// The reaction reads take no mode and stay DENIED; so do the writes.
+	// The reaction reads take no mode and answer a redacted reader as they
+	// answer a full one; the writes stay DENIED.
 	sumResp, err := e.getReactionSummaryInChat(strangerKeys, groupID, textID)
 	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetReactionSummaryResponse_DENIED, sumResp.Result)
+	require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, sumResp.Result)
+	require.Empty(t, sumResp.Summary.Reactions)
 	sendResp, err := e.sendContentToChat(strangerKeys, groupID, textContent("intruder"), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)

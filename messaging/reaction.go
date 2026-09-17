@@ -156,9 +156,10 @@ func (s *Server) GetReactionSummary(ctx context.Context, req *messagingpb.GetRea
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
+	standing, err := s.overlayStanding(ctx, log, req.ChatId, userID)
+	if err != nil {
 		return nil, err
-	} else if !allowed {
+	} else if !standing.CanPreview {
 		return &messagingpb.GetReactionSummaryResponse{Result: messagingpb.GetReactionSummaryResponse_DENIED}, nil
 	}
 
@@ -175,7 +176,7 @@ func (s *Server) GetReactionSummary(ctx context.Context, req *messagingpb.GetRea
 	}
 
 	summary := &ReactionSummary{MessageID: req.MessageId, Reactions: reactions}
-	if err := s.applySelfReactions(ctx, req.ChatId, userID, []*ReactionSummary{summary}); err != nil {
+	if err := s.applySelfReactions(ctx, req.ChatId, userID, standing.IsMember, []*ReactionSummary{summary}); err != nil {
 		log.With(zap.Error(err)).Warn("Failure resolving self reactions")
 		return nil, status.Error(codes.Internal, "")
 	}
@@ -194,9 +195,10 @@ func (s *Server) GetReactionSummaries(ctx context.Context, req *messagingpb.GetR
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
+	standing, err := s.overlayStanding(ctx, log, req.ChatId, userID)
+	if err != nil {
 		return nil, err
-	} else if !allowed {
+	} else if !standing.CanPreview {
 		return &messagingpb.GetReactionSummariesResponse{Result: messagingpb.GetReactionSummariesResponse_DENIED}, nil
 	}
 
@@ -212,7 +214,7 @@ func (s *Server) GetReactionSummaries(ctx context.Context, req *messagingpb.GetR
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	if err := s.applySelfReactions(ctx, req.ChatId, userID, summaries); err != nil {
+	if err := s.applySelfReactions(ctx, req.ChatId, userID, standing.IsMember, summaries); err != nil {
 		log.With(zap.Error(err)).Warn("Failure resolving self reactions")
 		return nil, status.Error(codes.Internal, "")
 	}
@@ -239,9 +241,10 @@ func (s *Server) GetReactors(ctx context.Context, req *messagingpb.GetReactorsRe
 		return &messagingpb.GetReactorsResponse{Result: messagingpb.GetReactorsResponse_DENIED}, nil
 	}
 
-	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
+	standing, err := s.overlayStanding(ctx, log, req.ChatId, userID)
+	if err != nil {
 		return nil, err
-	} else if !allowed {
+	} else if !standing.CanPreview {
 		return &messagingpb.GetReactorsResponse{Result: messagingpb.GetReactorsResponse_DENIED}, nil
 	}
 
@@ -283,7 +286,9 @@ func (s *Server) GetReactors(ctx context.Context, req *messagingpb.GetReactorsRe
 }
 
 // applySelfReactions sets Self on the given summaries' aggregates for the
-// viewer, choosing its strategy by chat type.
+// viewer, choosing its strategy by chat type. A viewer who is not a member
+// has no entry to find — a reaction is a member's write (see AddReaction) —
+// so their summaries are left as they are without a read.
 //
 // A DM answers from the sample already in hand: it has at most two members, so an
 // emoji's reactor set can never outgrow the surfaced sample (MaxSampleReactors)
@@ -299,7 +304,10 @@ func (s *Server) GetReactors(ctx context.Context, req *messagingpb.GetReactorsRe
 // is the store's too: it keeps those viewer-keyed records for groups alone and
 // refuses the read for a DM (messaging.ErrSelfReactionsGroupOnly), so this is
 // the only place a DM's overlay can be answered.
-func (s *Server) applySelfReactions(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, summaries []*ReactionSummary) error {
+func (s *Server) applySelfReactions(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, isMember bool, summaries []*ReactionSummary) error {
+	if !isMember {
+		return nil
+	}
 	if !chat.IsGroupChatID(chatID) {
 		overlaySelfReactions(userID, summaries)
 		return nil

@@ -26,9 +26,16 @@ import (
 //     listener rules, so a qualifying user can preview a group before joining,
 //     and redacted otherwise if the group carries a listener rule at all, so
 //     any registered user can see a gated group's shape (see present).
-//   - canListen: every other read — the reaction summaries and reactor lists,
-//     which carry no ViewMode and are a full reader's alone (see
-//     redact.Message on reactions).
+//   - overlayStanding: the reaction summaries and reactor lists. They carry
+//     no ViewMode, since they return no message, and are answered for anyone
+//     who may read the chat at all — a member, or a non-member of a group
+//     that carries a listener rule, whatever the rules say of them (see
+//     chat.Standing.CanPreview). Reactions are an overlay: who reacted, with
+//     what, on which message is the conversation's movement, which a
+//     redacted view shows, not its words, and the event stream delivers the
+//     same overlay to a redacted preview (see redact.ChatUpdate). The gate is
+//     found without evaluating a rule, the way a REDACTED read is, so it
+//     costs a membership read and the group's rules, never a valuation.
 //   - isMember: every write that is not a send but is still a member's alone.
 //     A pointer advance leaves a per-user item in the chat's partition, and a
 //     reaction is something other members see, so neither is open to a
@@ -58,13 +65,20 @@ func (s *Server) reading(ctx context.Context, log *zap.Logger, chatID *commonpb.
 	return standing.Reading(mode), nil
 }
 
-func (s *Server) canListen(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
-	ok, err := s.access.CanListen(ctx, chatID, userID)
+// overlayStanding is the caller's standing in the chat as needed to answer a
+// read of its reaction overlay: CanPreview says whether they are answered at
+// all, IsMember whether they can have an overlay entry of their own (see
+// applySelfReactions). It is found under ViewMode REDACTED so that no rule is
+// evaluated and no admission remembered (see chat.Access.Standing): a
+// redacted reader and a full one see the same overlay, so its verdict is
+// never needed.
+func (s *Server) overlayStanding(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.Standing, error) {
+	standing, err := s.access.Standing(ctx, chatID, userID, messagingpb.ViewMode_REDACTED)
 	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure checking chat listen access")
-		return false, status.Error(codes.Internal, "")
+		log.With(zap.Error(err)).Warn("Failure determining chat standing")
+		return chat.Standing{}, status.Error(codes.Internal, "")
 	}
-	return ok, nil
+	return standing, nil
 }
 
 func (s *Server) isMember(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {

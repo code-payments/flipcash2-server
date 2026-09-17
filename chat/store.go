@@ -188,7 +188,11 @@ type Store interface {
 
 	// IsMember reports whether userID is a member of chatID. It returns false
 	// (no error) when the chat does not exist, or when a group member has been
-	// removed.
+	// removed. The read is strongly consistent: it reflects every join, leave
+	// and creation that completed before it. It is the authority behind every
+	// access gate (see Access), and the first thing a user does after joining
+	// or creating a chat is act in it, so a read that could lag the write
+	// would deny exactly that action.
 	IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error)
 
 	// GetGroupMembershipsForUser returns every group chat userID has a

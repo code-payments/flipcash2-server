@@ -1042,6 +1042,11 @@ func rosterSummaryFromItem(item map[string]types.AttributeValue) (chat.RosterSum
 	return chat.RosterSummary{MemberCount: count, Version: version}, nil
 }
 
+// IsMember is a strongly consistent point read in both layouts: the group's
+// membership row, or the user's DM inbox row. It is the membership authority
+// behind every access gate and is asked about a chat the user just joined or
+// created more often than any other — the join's response is the cue to open
+// the chat — so it must see that write, not a replica that has yet to.
 func (s *store) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
 	if chat.IsGroupChatID(chatID) {
 		out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
@@ -1052,6 +1057,7 @@ func (s *store) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *c
 			},
 			ProjectionExpression:     aws.String("#state"),
 			ExpressionAttributeNames: map[string]string{"#state": attrState},
+			ConsistentRead:           aws.Bool(true),
 		})
 		if err != nil {
 			return false, err
@@ -1070,6 +1076,7 @@ func (s *store) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *c
 		TableName:            aws.String(s.dmInboxTable),
 		Key:                  map[string]types.AttributeValue{attrPK: avS(userPK(userID)), attrSK: avS(chatSK(chatID))},
 		ProjectionExpression: aws.String(attrPK),
+		ConsistentRead:       aws.Bool(true),
 	})
 	if err != nil {
 		return false, err

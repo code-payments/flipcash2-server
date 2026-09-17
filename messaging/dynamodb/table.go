@@ -149,7 +149,7 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, p
 
 	// The self-reactions table is the same rows keyed by viewer (chat, user) and
 	// sorted by message: a viewer's reactions across a page of messages — the
-	// reacted_by_self overlay on a summary read — are one strongly consistent
+	// self_reactor overlay on a summary read — are one strongly consistent
 	// range query on their own partition. It is a third table rather than a
 	// GSI on the reactors table (which is eventually consistent and not part
 	// of the write's transaction) or a prefix in the reactions table (whose

@@ -105,7 +105,7 @@ import (
 //	                   so the overlay can hand back their full Reactor entry
 //	                   even once the sample has evicted them. A viewer's
 //	                   reactions across a page of messages
-//	                   — the reacted_by_self overlay on a summary read — are
+//	                   — the self_reactor overlay on a summary read — are
 //	                   one strongly consistent sort-key range on the viewer's
 //	                   own partition, billed by what the viewer reacted rather
 //	                   than a key probe per aggregate on the page. It is its
@@ -1691,7 +1691,7 @@ func (s *store) AddReaction(
 
 		// Idempotent: the user already reacted with this emoji.
 		if state.reacted {
-			return selfReaction(reactionFromAgg(emoji, state.agg), state.reactedAt, state.reactedTs), false, false, nil
+			return selfReaction(reactionFromAgg(emoji, state.agg), userID, state.reactedAt, state.reactedTs), false, false, nil
 		}
 
 		// Activating a new or emptied emoji must respect the per-message type cap.
@@ -1747,7 +1747,7 @@ func (s *store) AddReaction(
 		}
 		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 		if err == nil {
-			return selfReaction(reactionFromAgg(emoji, next), next.version, ts), true, false, nil
+			return selfReaction(reactionFromAgg(emoji, next), userID, next.version, ts), true, false, nil
 		}
 
 		retry, err := s.absorbReactionFailure(ctx, err, items, metaIdx, &state, attempt, &backoff)
@@ -2495,7 +2495,7 @@ func metaStateFromItem(item map[string]types.AttributeValue) metaState {
 
 // reactionFromAgg projects an aggregate onto a Reaction. The surfaced sample is
 // the most-recent MaxSampleReactors of the retained set (see
-// messaging.SampleFromReactors). The per-viewer ReactedBySelf is left false for
+// messaging.SampleFromReactors). The per-viewer Self is left nil for
 // the server to overlay.
 func reactionFromAgg(emoji string, agg aggState) *messaging.Reaction {
 	reactors := make([]*messaging.Reactor, 0, len(agg.sample))
@@ -2623,12 +2623,14 @@ func seqEmojiFromSK(sk string) (uint64, string, error) {
 	return seq, string(emoji), nil
 }
 
-// selfReaction marks an AddReaction result as the reactor's own view: reacted,
-// at the version that added their reaction and when.
-func selfReaction(r *messaging.Reaction, addedAt uint64, reactedTs time.Time) *messaging.Reaction {
-	r.ReactedBySelf = true
-	r.ReactedBySelfVersion = addedAt
-	r.ReactedBySelfTs = reactedTs
+// selfReaction marks an AddReaction result as the reactor's own view: their
+// own entry, at the version that added their reaction and when.
+func selfReaction(r *messaging.Reaction, userID *commonpb.UserId, addedAt uint64, reactedTs time.Time) *messaging.Reaction {
+	r.Self = &messaging.Reactor{
+		UserID:    &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
+		ReactedTs: reactedTs,
+		Version:   addedAt,
+	}
 	return r
 }
 

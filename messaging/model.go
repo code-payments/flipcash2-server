@@ -215,8 +215,8 @@ func (r *Reactor) ToProto() *messagingpb.Reactor {
 // Reaction is the aggregate state of a single emoji on a message: how many users
 // reacted with it, a monotonic version that advances on every change to it, and a
 // bounded sample of reactors (the most recent by reaction order, see
-// SampleFromReactors). ReactedBySelf is per-viewer and set by the read path for
-// the requesting user; the rest of the aggregate is shareable.
+// SampleFromReactors). Self is per-viewer and set by the read path for the
+// requesting user; the rest of the aggregate is shareable.
 //
 // Version is state, not a sequence of deltas, in the sense of chat.RosterSummary:
 // every real transition on the emoji — a reactor added or removed — moves it by
@@ -225,34 +225,30 @@ func (r *Reactor) ToProto() *messagingpb.Reactor {
 // independently. A store keeps it across the emoji emptying and being re-added,
 // so a re-add can never look stale.
 //
-// ReactedBySelfVersion and ReactedBySelfTs are the viewer's own Reactor.Version
-// and Reactor.ReactedTs: the version at which their current reaction was added
-// and when; both zero when ReactedBySelf is false. They are the viewer's entry
-// in the emoji's reactor order whether or not they still sit in the sample —
-// where they rank among the reactors, which ReactionUpdate for the emoji was
-// theirs — so a client can render itself among the reactors without a second
-// read. They are not the watermark for the reacted_by_self toggle: a summary
-// is a snapshot at Version, and every transition of the viewer's at or below
-// it is already folded into the bool, so Version is the value to gate live
-// updates by.
+// Self is the viewer's own Reactor entry — the version at which their current
+// reaction was added and when — nil when they do not react with the emoji. It
+// is their entry in the emoji's reactor order whether or not they still sit in
+// the sample — where they rank among the reactors, which ReactionUpdate for the
+// emoji was theirs — so a client can render itself among the reactors without a
+// second read. Its presence answers "did I react"; its version is not the
+// watermark for that toggle: a summary is a snapshot at Version, and every
+// transition of the viewer's at or below it is already folded into Self, so
+// Version is the value to gate live updates by.
 //
-// In an AddReaction result ReactedBySelfVersion equals Version. In a summary
-// read the two come from separate strongly consistent reads, aggregate first,
-// so ReactedBySelfVersion is normally at most Version but can exceed it by the
-// viewer's own add landing between the two reads; then the bool is the newer
-// truth and the aggregate is a transition behind, which the add's
-// ReactionUpdate (or the next refresh) reconciles. The rows behind the overlay
-// are written in the add's own transaction, so the two never disagree about a
-// completed transition. Not yet on the proto: EmojiReaction carries only the
-// bool today, so ToProto leaves both behind.
+// In an AddReaction result Self.Version equals Version. In a summary read the
+// two come from separate strongly consistent reads, aggregate first, so
+// Self.Version is normally at most Version but can exceed it by the viewer's
+// own add landing between the two reads; then Self is the newer truth and the
+// aggregate is a transition behind, which the add's ReactionUpdate (or the
+// next refresh) reconciles. The rows behind the overlay are written in the
+// add's own transaction, so the two never disagree about a completed
+// transition. It projects onto EmojiReaction.self_reactor.
 type Reaction struct {
-	Emoji                string
-	Count                uint64
-	Version              uint64
-	ReactedBySelf        bool
-	ReactedBySelfVersion uint64
-	ReactedBySelfTs      time.Time
-	SampleReactors       []*Reactor
+	Emoji          string
+	Count          uint64
+	Version        uint64
+	Self           *Reactor
+	SampleReactors []*Reactor
 }
 
 // ToProto projects the aggregate onto a messagingpb.EmojiReaction.
@@ -261,13 +257,16 @@ func (r *Reaction) ToProto() *messagingpb.EmojiReaction {
 	for i, reactor := range r.SampleReactors {
 		sample[i] = reactor.ToProto()
 	}
-	return &messagingpb.EmojiReaction{
+	out := &messagingpb.EmojiReaction{
 		Emoji:          &messagingpb.Emoji{Value: r.Emoji},
 		Count:          r.Count,
-		ReactedBySelf:  r.ReactedBySelf,
 		SampleReactors: sample,
 		Version:        r.Version,
 	}
+	if r.Self != nil {
+		out.SelfReactor = r.Self.ToProto()
+	}
+	return out
 }
 
 // ReactionSummary pairs a message with its non-empty reaction aggregates, the

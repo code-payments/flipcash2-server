@@ -537,7 +537,7 @@ func (m *memory) AddReaction(
 	// Idempotent: the user already reacted with this emoji.
 	if agg != nil {
 		if existing, ok := agg.reactors[userKey]; ok {
-			return selfReaction(buildReaction(emoji, agg), existing.version, existing.ts), false, false, nil
+			return selfReaction(buildReaction(emoji, agg), userID, existing.version, existing.ts), false, false, nil
 		}
 	}
 
@@ -565,15 +565,17 @@ func (m *memory) AddReaction(
 		evictLeastRecentSample(agg.sample)
 	}
 
-	return selfReaction(buildReaction(emoji, agg), entry.version, entry.ts), true, false, nil
+	return selfReaction(buildReaction(emoji, agg), userID, entry.version, entry.ts), true, false, nil
 }
 
-// selfReaction marks an AddReaction result as the reactor's own view: reacted,
-// at the version that added their reaction and when.
-func selfReaction(r *messaging.Reaction, addedAt uint64, reactedTs time.Time) *messaging.Reaction {
-	r.ReactedBySelf = true
-	r.ReactedBySelfVersion = addedAt
-	r.ReactedBySelfTs = reactedTs
+// selfReaction marks an AddReaction result as the reactor's own view: their
+// own entry, at the version that added their reaction and when.
+func selfReaction(r *messaging.Reaction, userID *commonpb.UserId, addedAt uint64, reactedTs time.Time) *messaging.Reaction {
+	r.Self = &messaging.Reactor{
+		UserID:    &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
+		ReactedTs: reactedTs,
+		Version:   addedAt,
+	}
 	return r
 }
 
@@ -808,7 +810,7 @@ func (m *memory) GetReactors(
 
 // buildReaction projects an in-memory aggregate onto a messaging.Reaction. The
 // surfaced sample is the most-recent MaxSampleReactors of the retained sample set
-// (see messaging.SampleFromReactors). The per-viewer ReactedBySelf is left false
+// (see messaging.SampleFromReactors). The per-viewer Self is left nil
 // for the server to overlay.
 func buildReaction(emoji string, agg *reactionAgg) *messaging.Reaction {
 	sample := make([]*messaging.Reactor, 0, len(agg.sample))
@@ -847,7 +849,7 @@ func evictLeastRecentSample(sample map[string]reactorEntry) {
 }
 
 // summarize returns the active emoji aggregates for one message, ordered by
-// emoji for determinism. ReactedBySelf is left false for the caller to overlay.
+// emoji for determinism. Self is left nil for the caller to overlay.
 func summarize(byEmoji map[string]*reactionAgg) []*messaging.Reaction {
 	var emojis []string
 	for emoji, agg := range byEmoji {

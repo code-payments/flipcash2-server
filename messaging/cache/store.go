@@ -272,9 +272,9 @@ func (c *Cache) GetSelfReactions(
 	ctx context.Context,
 	chatID *commonpb.ChatId,
 	userID *commonpb.UserId,
-	refs []messaging.ReactionRef,
-) ([]messaging.ReactionRef, error) {
-	return c.db.GetSelfReactions(ctx, chatID, userID, refs)
+	messageIDs []*messagingpb.MessageId,
+) ([]messaging.SelfReaction, error) {
+	return c.db.GetSelfReactions(ctx, chatID, userID, messageIDs)
 }
 
 func (c *Cache) GetReactors(
@@ -282,10 +282,9 @@ func (c *Cache) GetReactors(
 	chatID *commonpb.ChatId,
 	messageID *messagingpb.MessageId,
 	emoji string,
-	consistent bool,
 	opts ...database.QueryOption,
-) ([]*messaging.Reactor, bool, error) {
-	return c.db.GetReactors(ctx, chatID, messageID, emoji, consistent, opts...)
+) ([]*messaging.Reactor, uint64, bool, error) {
+	return c.db.GetReactors(ctx, chatID, messageID, emoji, opts...)
 }
 
 // largestKey keys the largest-message-ID cache by chat. Chat IDs are fixed width,

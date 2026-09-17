@@ -21,11 +21,19 @@ const (
 	// MaxReactionTypesPerMessage caps how many distinct emoji may react to a
 	// single message. The (N+1)th distinct emoji is rejected with
 	// TOO_MANY_REACTION_TYPES; a re-add of an already-present emoji is unaffected.
-	MaxReactionTypesPerMessage = 100
+	//
+	// The cap bounds what one message can cost every reader: a page of
+	// summaries carries every active emoji of every message in it, with a
+	// sample each, and the viewer's self overlay resolves one key per (message,
+	// emoji). Twenty is what the largest chat products render under a message
+	// and keeps a full page of capped messages well inside a gRPC response.
+	// Lowering it later is safe: the cap blocks activating a new emoji and
+	// never touches what a message already has.
+	MaxReactionTypesPerMessage = 20
 
 	// MaxSampleReactors bounds the sample of reactors surfaced inline on an
 	// EmojiReaction (e.g. for rendering a few avatars). The sample is the most
-	// recent reactors by reaction time (see SampleFromReactors), so a viewer sees
+	// recent reactors by reaction order (see SampleFromReactors), so a viewer sees
 	// who reacted most recently. The full reactor list is fetched on demand via
 	// GetReactors.
 	MaxSampleReactors = 8
@@ -182,9 +190,17 @@ func (m *Message) IsEditable() bool {
 }
 
 // Reactor is a single user's reaction to a message, with the time they reacted.
+//
+// Version is the emoji aggregate's version at which this reaction was added —
+// the transition that created it (see Reaction.Version). Within one (message,
+// emoji) it is unique, so it is the reactor list's ordering key and paging
+// cursor: "most recent first" means descending Version, which is reaction order
+// by definition and involves no wall clock. ReactedTs is a display value only;
+// a store assigns it from the server clock at the add and never orders by it.
 type Reactor struct {
 	UserID    *commonpb.UserId
 	ReactedTs time.Time
+	Version   uint64
 }
 
 // ToProto projects the reactor onto a messagingpb.Reactor.
@@ -192,19 +208,46 @@ func (r *Reactor) ToProto() *messagingpb.Reactor {
 	return &messagingpb.Reactor{
 		UserId:    &commonpb.UserId{Value: append([]byte(nil), r.UserID.Value...)},
 		ReactedTs: timestamppb.New(r.ReactedTs),
+		Version:   r.Version,
 	}
 }
 
 // Reaction is the aggregate state of a single emoji on a message: how many users
 // reacted with it, a monotonic version that advances on every change to it, and a
-// bounded sample of reactors (the most recent by reaction time, see
-// SampleFromReactors). ReactedBySelf is per-viewer and set by the read path for
-// the requesting user; the rest of the aggregate is shareable.
+// bounded sample of reactors (the most recent by reaction order, see
+// SampleFromReactors). Self is per-viewer and set by the read path for the
+// requesting user; the rest of the aggregate is shareable.
+//
+// Version is state, not a sequence of deltas, in the sense of chat.RosterSummary:
+// every real transition on the emoji — a reactor added or removed — moves it by
+// exactly one, an idempotent no-op leaves it alone, and a client keeps the
+// greater value. It is per emoji, so a client watermarks each (message, emoji)
+// independently. A store keeps it across the emoji emptying and being re-added,
+// so a re-add can never look stale.
+//
+// Self is the viewer's own Reactor entry — the version at which their current
+// reaction was added and when — nil when they do not react with the emoji. It
+// is their entry in the emoji's reactor order whether or not they still sit in
+// the sample — where they rank among the reactors, which ReactionUpdate for the
+// emoji was theirs — so a client can render itself among the reactors without a
+// second read. Its presence answers "did I react"; its version is not the
+// watermark for that toggle: a summary is a snapshot at Version, and every
+// transition of the viewer's at or below it is already folded into Self, so
+// Version is the value to gate live updates by.
+//
+// In an AddReaction result Self.Version equals Version. In a summary read the
+// two come from separate strongly consistent reads, aggregate first, so
+// Self.Version is normally at most Version but can exceed it by the viewer's
+// own add landing between the two reads; then Self is the newer truth and the
+// aggregate is a transition behind, which the add's ReactionUpdate (or the
+// next refresh) reconciles. The rows behind the overlay are written in the
+// add's own transaction, so the two never disagree about a completed
+// transition. It projects onto EmojiReaction.self_reactor.
 type Reaction struct {
 	Emoji          string
 	Count          uint64
 	Version        uint64
-	ReactedBySelf  bool
+	Self           *Reactor
 	SampleReactors []*Reactor
 }
 
@@ -214,13 +257,16 @@ func (r *Reaction) ToProto() *messagingpb.EmojiReaction {
 	for i, reactor := range r.SampleReactors {
 		sample[i] = reactor.ToProto()
 	}
-	return &messagingpb.EmojiReaction{
+	out := &messagingpb.EmojiReaction{
 		Emoji:          &messagingpb.Emoji{Value: r.Emoji},
 		Count:          r.Count,
-		ReactedBySelf:  r.ReactedBySelf,
 		SampleReactors: sample,
 		Version:        r.Version,
 	}
+	if r.Self != nil {
+		out.SelfReactor = r.Self.ToProto()
+	}
+	return out
 }
 
 // ReactionSummary pairs a message with its non-empty reaction aggregates, the
@@ -329,21 +375,27 @@ func NewMessageEditedEvent(msg *messagingpb.Message) *messagingpb.Event {
 	}
 }
 
-// SampleFromReactors orders reactors by descending reaction time (ties broken by
-// ascending user ID, for a total and stable order) and returns the first
-// MaxSampleReactors — the deterministic, most-recent sample surfaced on a reaction
-// aggregate even when a store retains up to MaxStoredSampleReactors. The ordering
-// matches the most-recent-first order of GetReactors. It mutates the given slice's
-// order; callers pass a slice they own.
+// SampleFromReactors orders reactors most-recent-first (see ReactorLess) and
+// returns the first MaxSampleReactors — the deterministic, most-recent sample
+// surfaced on a reaction aggregate even when a store retains up to
+// MaxStoredSampleReactors. The ordering matches GetReactors. It mutates the given
+// slice's order; callers pass a slice they own.
 func SampleFromReactors(reactors []*Reactor) []*Reactor {
-	sort.Slice(reactors, func(i, j int) bool {
-		if !reactors[i].ReactedTs.Equal(reactors[j].ReactedTs) {
-			return reactors[i].ReactedTs.After(reactors[j].ReactedTs)
-		}
-		return bytes.Compare(reactors[i].UserID.Value, reactors[j].UserID.Value) < 0
-	})
+	sort.Slice(reactors, func(i, j int) bool { return ReactorLess(reactors[i], reactors[j]) })
 	if len(reactors) > MaxSampleReactors {
 		reactors = reactors[:MaxSampleReactors]
 	}
 	return reactors
+}
+
+// ReactorLess orders reactors most-recent-first: descending Version, the order in
+// which they reacted. Versions are unique within an emoji, so the tie-break on
+// ascending user ID only ever decides between reactors of different emoji (or
+// malformed input) and exists to keep the order total. Shared by the stores and
+// the sample so every reactor list agrees.
+func ReactorLess(a, b *Reactor) bool {
+	if a.Version != b.Version {
+		return a.Version > b.Version
+	}
+	return bytes.Compare(a.UserID.Value, b.UserID.Value) < 0
 }

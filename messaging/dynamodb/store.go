@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,7 +27,7 @@ import (
 	"github.com/code-payments/flipcash2-server/messaging"
 )
 
-// The messaging store spans three tables:
+// The messaging store spans five tables:
 //
 //	messages           pk = "chat#<id>", sk in { "#counter", "msg#<padded seq>",
 //	                   "evt#<padded event_seq>", "cmid#<client id>" }. All of a
@@ -75,18 +77,59 @@ import (
 //	                   whether it applies or not.
 //
 //	message_reactions  pk = "chat#<id>", sk in { "agg#<padded seq>#<emoji hex>",
-//	                   "rct#<padded seq>#<emoji hex>#<user hex>" }. One agg# row
-//	                   per (message, emoji) holds the count, a monotonic version,
-//	                   and a bounded sample map (user hex -> reacted_ts, up to
-//	                   MaxStoredSampleReactors of the most-recent reactors, a new
-//	                   reactor evicting the least-recent once full) surfaced as the
-//	                   reaction's sample. The row is retained at
-//	                   count 0 so the version survives an emoji being removed and
-//	                   re-added. One rct# row per reactor backs idempotency, the
-//	                   self-reaction check, and the reactors_by_recency GSI
-//	                   (reaction_key = chat#<id>#<padded seq>#<emoji hex>,
-//	                   reacted_ts), which orders an emoji's reactors
-//	                   most-recent-first for GetReactors (the full paged list).
+//	                   "meta#<padded seq>" }. The aggregates. One agg# row per
+//	                   (message, emoji) holds the reactor count, the emoji's
+//	                   version, and a bounded sample of its most recent reactors.
+//	                   One meta# row per reacted message holds the message's
+//	                   own reaction state, today the count of emoji currently
+//	                   active on it, for the type cap. Aggregates are keyed by
+//	                   chat so that a page of messages' summaries is one
+//	                   sort-key range query (see reactionsForSeqRange), the
+//	                   read every history page pays.
+//
+//	message_reactors   pk = "chat#<id>#<padded seq>", sk = "user#<user hex>#<emoji
+//	                   hex>". One row per current reaction, keyed by message so
+//	                   that the by_version LSI can be queried with a
+//	                   strongly consistent read (a GSI never can), and so that
+//	                   the item-collection size cap an LSI imposes applies per
+//	                   message rather than per chat. A row is deleted, not
+//	                   tombstoned, when the reaction is removed: no reader
+//	                   follows a reactor row's transitions, so there is nothing
+//	                   for a tombstone to remember (contrast group_members).
+//
+//	message_self_reactions  pk = "chat#<id>#<user hex>", sk = "<padded seq>#<emoji
+//	                   hex>", version, reacted_ts. A group's reactions keyed by
+//	                   viewer: one row per current reaction, written and deleted
+//	                   in the reactor row's transaction, carrying the version
+//	                   that added it and when — the viewer's own reactor row,
+//	                   so the overlay can hand back their full Reactor entry
+//	                   even once the sample has evicted them. A viewer's
+//	                   reactions across a page of messages
+//	                   — the self_reactor overlay on a summary read — are
+//	                   one strongly consistent sort-key range on the viewer's
+//	                   own partition, billed by what the viewer reacted rather
+//	                   than a key probe per aggregate on the page. It is its
+//	                   own table so that this per-reaction write lands on the
+//	                   viewer's partition, not the chat partition that already
+//	                   takes every aggregate write in the chat. A DM writes no
+//	                   row here: its two members can never outgrow an emoji's
+//	                   sample, so its overlay is answered from the aggregate
+//	                   (see messaging.Server.applySelfReactions) and a row
+//	                   would be a transactional write nothing reads.
+//
+//	                   The design follows the group_members roster summary. The
+//	                   agg# row is the emoji's "#meta": every add or remove is
+//	                   one transaction that writes the reactor row and
+//	                   compare-and-sets the aggregate to the exact next state the
+//	                   writer computed (count, version + 1, sample), conditioned
+//	                   on the version it read. The writer therefore knows the
+//	                   outcome with no read afterward, the sample's eviction and
+//	                   the type cap are exact rather than best-effort, and a lost
+//	                   race hands back the current row for a read-free retry. The
+//	                   reactor row is stamped with the version that added it,
+//	                   which is what the LSI orders by: unique per transition
+//	                   within an emoji, so the order is total, the paging cursor
+//	                   is the bare version, and no wall clock is involved.
 const (
 	skCounter   = "#counter"
 	msgPrefix   = "msg#"
@@ -138,46 +181,97 @@ const (
 	dmReadValPrefix      = attrReadVal + "#"
 	dmReadTSPrefix       = attrReadTS + "#"
 
-	// message_reactions table reactor rows (also, historically, pointer items)
-	attrUserID = "user_id"
-
-	// message_reactions table attributes
-	aggPrefix = "agg#"
-	rctPrefix = "rct#"
+	// message_reactions table (aggregates, keyed by chat)
+	aggPrefix  = "agg#"
+	metaPrefix = "meta#"
 
 	attrEmoji           = "emoji"
-	attrReactionCount   = "r_count" // count is a DynamoDB reserved word
+	attrReactorCount    = "reactor_count"
 	attrReactionVersion = "version"
-	attrSample          = "sample"       // agg# row map: user hex -> reacted_ts (bounded sample)
-	attrReactedTs       = "reacted_ts"   // reactor row attr; reactors_by_recency sort key (nanos)
-	attrReactionKey     = "reaction_key" // reactors_by_recency partition key
+	attrSample          = "sample" // agg# row map: user hex -> { version: added at, ts: reacted nanos }; a reserved word, so always named through a placeholder
+	attrSampleVersion   = "version"
+	attrSampleTs        = "ts"
+	attrTypeCount       = "type_count" // meta# row: emoji currently active on the message
 
-	reactorsByRecencyGSI = "reactors_by_recency"
+	// message_reactors table (one row per current reaction, keyed by message).
+	// The member is carried by the sk under the same prefix the chat store uses
+	// for its membership rows.
+	userPrefix = "user#"
+
+	attrReactedTs    = "reacted_ts"    // display timestamp, projected into the LSI
+	attrEmojiVersion = "emoji_version" // "<emoji hex>#<padded version>": the LSI sort key
+
+	// lsiByVersion orders a message's reactor rows by emoji_version (emoji, then
+	// the version that added the reactor). Queried under one emoji's prefix it
+	// yields that emoji's reactors in reaction order, and being local it can be
+	// read strongly consistently. The aggregate rows live in the other table,
+	// so nothing but reactor rows can ever carry emoji_version and leak into it.
+	lsiByVersion = "by_version"
+
+	// message_self_reactions table (one row per current reaction, keyed by
+	// viewer). The version that added the reaction is the row's one attribute
+	// beyond its keys.
+	attrSelfVersion   = "version"
+	attrSelfReactedTs = "reacted_ts" // the reactor row's reacted_ts, copied
+
+	// maxSummaryRefGap bounds how far apart two requested message IDs may be for
+	// GetReactionSummariesByRefs to cover both with one range query. Refs usually
+	// arrive as a page of consecutive IDs, which is one query; a scattered batch is
+	// split into runs so that no query reads a long stretch of aggregates nobody
+	// asked for.
+	maxSummaryRefGap = 64
 
 	// DynamoDB transaction cancellation / condition codes
 	codeConditionalCheckFailed = "ConditionalCheckFailed"
 	codeTransactionConflict    = "TransactionConflict"
 
-	maxPutMessageAttempts  = 32
-	maxAddReactionAttempts = 32
-	maxBatchGetKeys        = 100
+	maxPutMessageAttempts = 32
+	maxBatchGetKeys       = 100
+
+	// A reaction transition is a transaction of two to four items — the reactor
+	// row, the emoji's aggregate, (when an emoji activates or empties) the
+	// message's type-count row, and (in a group) the viewer-keyed copy — and
+	// every transition on an emoji contends on its aggregate, as membership
+	// transitions contend on a group's #meta (see chat/dynamodb). Both failures
+	// that contention produces are absorbed with a bounded number of attempts:
+	// a lost compare-and-set retries from the value the failure returned, with
+	// no extra read, and a transaction conflict after a fresh read (see
+	// absorbReactionFailure). Unlike membership, both wait before retrying (short,
+	// jittered, doubling): a roster changes rarely, so an immediate retry there
+	// wins, but a popular message draws many writers to one row at once, and a
+	// writer that retries immediately keeps landing behind the next winner until
+	// its budget is gone. The ceiling is what one aggregate's transactional
+	// throughput allows; an emoji whose reaction rate exceeds it is the signal to
+	// revisit.
+	maxReactionAttempts = 16
+	reactionBackoffBase = 2 * time.Millisecond
+	reactionBackoffMax  = 100 * time.Millisecond
 )
 
 type store struct {
-	client         *dynamodb.Client
-	messagesTable  string
-	pointersTable  string
-	reactionsTable string
+	client             *dynamodb.Client
+	messagesTable      string
+	pointersTable      string
+	reactionsTable     string
+	reactorsTable      string
+	selfReactionsTable string
+
+	// beforeReactionWrite, when set, runs between a reaction write's state read
+	// and its transaction. Tests use it to land a concurrent write in that gap;
+	// it is nil in production.
+	beforeReactionWrite func()
 }
 
 // NewInDynamoDB returns a messaging.Store backed by the given DynamoDB tables.
 // Use CreateTables to provision them.
-func NewInDynamoDB(client *dynamodb.Client, messagesTable, pointersTable, reactionsTable string) messaging.Store {
+func NewInDynamoDB(client *dynamodb.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable string) messaging.Store {
 	return &store{
-		client:         client,
-		messagesTable:  messagesTable,
-		pointersTable:  pointersTable,
-		reactionsTable: reactionsTable,
+		client:             client,
+		messagesTable:      messagesTable,
+		pointersTable:      pointersTable,
+		reactionsTable:     reactionsTable,
+		reactorsTable:      reactorsTable,
+		selfReactionsTable: selfReactionsTable,
 	}
 }
 
@@ -767,11 +861,14 @@ func (s *store) getMessage(ctx context.Context, chatID *commonpb.ChatId, message
 }
 
 func (s *store) MessageExists(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (bool, error) {
-	// Project to pk only so the content blobs are never read or decoded.
+	// Project to pk only so the content blobs are never read or decoded. The
+	// read is strong: the message being asked about was, as often as not, just
+	// delivered on the stream (see the Store contract).
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:            aws.String(s.messagesTable),
 		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(msgSK(messageID.Value))},
 		ProjectionExpression: aws.String(attrPK),
+		ConsistentRead:       aws.Bool(true),
 	})
 	if err != nil {
 		return false, err
@@ -1490,6 +1587,87 @@ func isRetryable(reasons []string) bool {
 	return false
 }
 
+// sampleEntry is one retained reactor in an aggregate's sample: the version that
+// added them (the ordering key) and when, for display.
+type sampleEntry struct {
+	version uint64
+	ts      time.Time
+}
+
+// aggState is an agg# row as read for a write, or the next state a writer
+// intends to commit. exists distinguishes a retained count-0 row (which keeps
+// its version) from no row at all.
+type aggState struct {
+	exists  bool
+	count   uint64
+	version uint64
+	sample  map[string]sampleEntry // user hex -> entry, at most MaxStoredSampleReactors
+}
+
+// advance is the state after userID reacts: count and version each move by one
+// and the reactor joins the sample. The new reactor carries the highest version
+// the emoji has seen, so it always belongs in a most-recent sample; when the
+// retained set is full the lowest-version entry is evicted to make room.
+func (a aggState) advance(userID *commonpb.UserId, ts time.Time) aggState {
+	next := aggState{
+		exists:  true,
+		count:   a.count + 1,
+		version: a.version + 1,
+		sample:  make(map[string]sampleEntry, len(a.sample)+1),
+	}
+	for k, v := range a.sample {
+		next.sample[k] = v
+	}
+	if len(next.sample) >= messaging.MaxStoredSampleReactors {
+		var evict string
+		var lowest uint64
+		for k, v := range next.sample {
+			if evict == "" || v.version < lowest || (v.version == lowest && k > evict) {
+				evict, lowest = k, v.version
+			}
+		}
+		delete(next.sample, evict)
+	}
+	next.sample[hex.EncodeToString(userID.Value)] = sampleEntry{version: next.version, ts: ts}
+	return next
+}
+
+// retract is the state after userID's reaction is removed: count down by one,
+// version up by one, and the reactor dropped from the sample if present. The
+// sample is not backfilled — see messaging.MaxStoredSampleReactors.
+func (a aggState) retract(userID *commonpb.UserId) aggState {
+	next := aggState{
+		exists:  true,
+		count:   a.count - 1,
+		version: a.version + 1,
+		sample:  make(map[string]sampleEntry, len(a.sample)),
+	}
+	for k, v := range a.sample {
+		next.sample[k] = v
+	}
+	delete(next.sample, hex.EncodeToString(userID.Value))
+	return next
+}
+
+// metaState is a meta# row as read for a write.
+type metaState struct {
+	exists bool
+	types  uint64
+}
+
+// reactionState is everything a reaction write inspects before deciding what to
+// commit: the emoji's aggregate, the message's type count, and whether the
+// caller already holds a reaction row for the emoji.
+type reactionState struct {
+	agg     aggState
+	meta    metaState
+	reacted bool
+	// reactedAt is the version that added the caller's reaction, and reactedTs
+	// when, both when reacted.
+	reactedAt uint64
+	reactedTs time.Time
+}
+
 func (s *store) AddReaction(
 	ctx context.Context,
 	chatID *commonpb.ChatId,
@@ -1499,149 +1677,93 @@ func (s *store) AddReaction(
 	ts time.Time,
 ) (*messaging.Reaction, bool, bool, error) {
 	seq := messageID.Value
-
-	for attempt := 0; attempt < maxAddReactionAttempts; attempt++ {
-		// One batched read fetches both the emoji aggregate and the caller's own
-		// reactor row (both share the chat's partition).
-		aggExists, count, version, sample, exists, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
-		if err != nil {
-			return nil, false, false, err
+	backoff := reactionBackoffBase
+	var state reactionState
+	needRead := true
+	for attempt := 0; ; attempt++ {
+		if needRead {
+			st, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
+			if err != nil {
+				return nil, false, false, err
+			}
+			state, needRead = st, false
 		}
 
 		// Idempotent: the user already reacted with this emoji.
-		if exists {
-			return buildReaction(emoji, count, version, sample), false, false, nil
+		if state.reacted {
+			return selfReaction(reactionFromAgg(emoji, state.agg), userID, state.reactedAt, state.reactedTs), false, false, nil
 		}
 
-		// Activating a (new or previously-emptied) emoji must respect the
-		// per-message distinct-type cap; re-adding never trips it.
-		//
-		// This is a soft cap: the count is read here, not enforced inside the
-		// write transaction below, so concurrent activations of distinct emoji can
-		// each pass the check and land a few over MaxReactionTypesPerMessage. The
-		// overshoot is rare (it needs simultaneous distinct-emoji adds right at the
-		// limit), bounded, self-limiting (further activations are then rejected),
-		// and harms nothing — counts and sequences stay correct. Enforcing it
-		// exactly would require a per-message counter in the transaction plus an
-		// optimistic condition on the aggregate bump; not worth the added
-		// contention for an anti-abuse limit.
-		if !aggExists || count == 0 {
-			active, err := s.countActiveAggregates(ctx, chatID, seq)
-			if err != nil {
-				return nil, false, false, err
-			}
-			if active >= messaging.MaxReactionTypesPerMessage {
-				return nil, false, true, nil
-			}
+		// Activating a new or emptied emoji must respect the per-message type cap.
+		// The meta row is compare-and-set in the same transaction, so the check is
+		// exact: a concurrent activation of a different emoji fails this write's
+		// condition and it re-decides against the count that won. Re-adding an
+		// active emoji never touches the meta row.
+		activating := !state.agg.exists || state.agg.count == 0
+		if activating && state.meta.types >= messaging.MaxReactionTypesPerMessage {
+			return nil, false, true, nil
 		}
 
-		// [0] the reactor row, conditioned so a concurrent identical add (same
-		// user, same emoji) loses and is treated as idempotent.
+		next := state.agg.advance(userID, ts)
 		items := []types.TransactWriteItem{
+			// [0] the reactor row, conditioned so a concurrent identical add loses
+			// and is reported as the idempotent no-op it is.
 			{Put: &types.Put{
-				TableName: aws.String(s.reactionsTable),
+				TableName: aws.String(s.reactorsTable),
 				Item: map[string]types.AttributeValue{
-					attrPK:          avS(chatPK(chatID)),
-					attrSK:          avS(rctSK(seq, emoji, userID)),
-					attrUserID:      avB(userID.Value),
-					attrReactedTs:   avN(uint64(ts.UnixNano())),
-					attrReactionKey: avS(reactionKey(chatID, seq, emoji)),
+					attrPK:           avS(reactorPK(chatID, seq)),
+					attrSK:           avS(userSK(userID, emoji)),
+					attrReactedTs:    avN(uint64(ts.UnixNano())),
+					attrEmojiVersion: avS(emojiVersionKey(emoji, next.version)),
 				},
 				ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 			}},
+			// [1] the aggregate, set to exactly next.
+			s.aggregateWrite(chatID, seq, emoji, state.agg, next),
 		}
-		// Maintain the recent sample on the aggregate: insert this reactor while the
-		// stored set has room, otherwise evict the least-recent entry to make room —
-		// but only when this reactor is itself more recent than that entry. This keeps
-		// the stored sample the most-recent MaxStoredSampleReactors; reads surface only
-		// the most-recent MaxSampleReactors of it (see messaging.SampleFromReactors).
-		//
-		// The decision uses the sample read above, not a transactional condition, so it
-		// is soft. But every sample mutation targets this one agg# item, and DynamoDB
-		// serializes transactions on a shared item: a conflicting concurrent add is
-		// cancelled and retried against a fresh strongly-consistent read, so eviction
-		// targets the true current least-recent entry rather than a stale one.
-		newHex := hex.EncodeToString(userID.Value)
-		addToSample := false
-		evictHex := ""
-		if len(sample) < messaging.MaxStoredSampleReactors {
-			addToSample = true
-		} else if oldHex, oldTs, ok := leastRecentInSample(sample); ok && moreRecent(ts, newHex, oldTs, oldHex) {
-			addToSample = true
-			evictHex = oldHex
+		metaIdx := -1
+		if activating {
+			// The type count, set to exactly one more.
+			metaIdx = len(items)
+			items = append(items, s.metaWrite(chatID, seq, state.meta, state.meta.types+1))
 		}
-
-		// [1] the emoji aggregate: bump an existing one, or create it. A create
-		// races with a concurrent first-reactor; the loser retries as a bump.
-		if aggExists {
-			update := &types.Update{
-				TableName: aws.String(s.reactionsTable),
-				Key:       map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(aggSK(seq, emoji))},
-			}
-			switch {
-			case addToSample && evictHex != "":
-				// Atomic evict-and-insert on the sample map alongside the counter bump;
-				// no read-modify-write, so it never contends on the aggregate row.
-				update.UpdateExpression = aws.String(fmt.Sprintf("SET #s.#new = :ts REMOVE #s.#old ADD %s :one, %s :one", attrReactionCount, attrReactionVersion))
-				update.ExpressionAttributeNames = map[string]string{"#s": attrSample, "#new": newHex, "#old": evictHex}
-				update.ExpressionAttributeValues = map[string]types.AttributeValue{":one": avN(1), ":ts": avN(uint64(ts.UnixNano()))}
-			case addToSample:
-				// Room in the sample: single-key map insert alongside the counter bump.
-				update.UpdateExpression = aws.String(fmt.Sprintf("SET #s.#new = :ts ADD %s :one, %s :one", attrReactionCount, attrReactionVersion))
-				update.ExpressionAttributeNames = map[string]string{"#s": attrSample, "#new": newHex}
-				update.ExpressionAttributeValues = map[string]types.AttributeValue{":one": avN(1), ":ts": avN(uint64(ts.UnixNano()))}
-			default:
-				// Not recent enough to sample: pure counter bump.
-				update.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :one, %s :one", attrReactionCount, attrReactionVersion))
-				update.ExpressionAttributeValues = map[string]types.AttributeValue{":one": avN(1)}
-			}
-			items = append(items, types.TransactWriteItem{Update: update})
-		} else {
+		if chat.IsGroupChatID(chatID) {
+			// The viewer-keyed copy, groups only (see the table comment).
+			// Unconditioned: it exists exactly when the reactor row does, and [0]
+			// already decides that.
 			items = append(items, types.TransactWriteItem{Put: &types.Put{
-				TableName: aws.String(s.reactionsTable),
+				TableName: aws.String(s.selfReactionsTable),
 				Item: map[string]types.AttributeValue{
-					attrPK:              avS(chatPK(chatID)),
-					attrSK:              avS(aggSK(seq, emoji)),
-					attrEmoji:           avS(emoji),
-					attrReactionCount:   avN(1),
-					attrReactionVersion: avN(1),
-					// First reactor seeds the sample map (always has room).
-					attrSample: &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
-						hex.EncodeToString(userID.Value): avN(uint64(ts.UnixNano())),
-					}},
+					attrPK:            avS(viewerPK(chatID, userID)),
+					attrSK:            avS(seqEmojiSK(seq, emoji)),
+					attrSelfVersion:   avN(next.version),
+					attrSelfReactedTs: avN(uint64(ts.UnixNano())),
 				},
-				ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 			}})
 		}
 
-		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+		if s.beforeReactionWrite != nil {
+			s.beforeReactionWrite()
+		}
+		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 		if err == nil {
-			// Read back the authoritative count, version, and sample (a concurrent
-			// add to the same emoji may have advanced them past count+1).
-			_, newCount, newVersion, newSample, err := s.getAggregate(ctx, chatID, seq, emoji)
-			if err != nil {
-				return nil, false, false, err
-			}
-			return buildReaction(emoji, newCount, newVersion, newSample), true, false, nil
+			return selfReaction(reactionFromAgg(emoji, next), userID, next.version, ts), true, false, nil
 		}
 
-		reasons, ok := cancellationReasons(err)
-		if !ok {
-			return nil, false, false, err
+		retry, err := s.absorbReactionFailure(ctx, err, items, metaIdx, &state, attempt, &backoff)
+		if err != nil {
+			return nil, false, false, fmt.Errorf("add reaction for chat %s: %w", hex.EncodeToString(chatID.Value), err)
 		}
-		// reasons index matches TransactItems order: [0]=reactor, [1]=aggregate.
-		// A failed reactor condition means a concurrent identical add won: re-read
-		// and return the idempotent result. A failed aggregate create means a
-		// concurrent first-reactor created it: retry as a bump.
-		if len(reasons) >= 1 && reasons[0] == codeConditionalCheckFailed {
-			continue
+		// A non-activating add carries no meta item, so a cancellation refreshes
+		// the aggregate but not the meta row. If the refresh shows the emoji emptied
+		// under us (its last reactor left), the retry activates it and must
+		// decide the cap against a fresh read: the meta row in hand predates that
+		// removal and would refuse a slot it just freed.
+		if !activating && state.agg.exists && state.agg.count == 0 {
+			retry = retryAfterRead
 		}
-		if isRetryable(reasons) {
-			continue
-		}
-		return nil, false, false, err
+		needRead = retry == retryAfterRead
 	}
-	return nil, false, false, fmt.Errorf("add reaction exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
 }
 
 func (s *store) RemoveReaction(
@@ -1652,74 +1774,301 @@ func (s *store) RemoveReaction(
 	emoji string,
 ) (*messaging.Reaction, bool, error) {
 	seq := messageID.Value
-
-	for attempt := 0; attempt < maxAddReactionAttempts; attempt++ {
-		// One batched read fetches both the emoji aggregate and the caller's own
-		// reactor row (both share the chat's partition).
-		aggExists, count, version, sample, exists, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
-		if err != nil {
-			return nil, false, err
-		}
-
-		// Idempotent: the user didn't react. Reflect the current state, or report a
-		// pure no-op when there's no aggregate at all.
-		if !exists {
-			if aggExists {
-				return buildReaction(emoji, count, version, sample), false, nil
-			}
-			return nil, false, nil
-		}
-
-		// [0] delete the reactor (lose to a concurrent identical remove), [1]
-		// decrement the aggregate, advance its version, and drop the reactor from
-		// the sample map (a no-op if it wasn't sampled; never backfilled). The
-		// aggregate row is retained even at count 0 so version survives a re-add.
-		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
-			{Delete: &types.Delete{
-				TableName:           aws.String(s.reactionsTable),
-				Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(rctSK(seq, emoji, userID))},
-				ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
-			}},
-			{Update: &types.Update{
-				TableName:           aws.String(s.reactionsTable),
-				Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(aggSK(seq, emoji))},
-				UpdateExpression:    aws.String(fmt.Sprintf("REMOVE #s.#u ADD %s :negone, %s :one", attrReactionCount, attrReactionVersion)),
-				ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
-				ExpressionAttributeNames: map[string]string{
-					"#s": attrSample,
-					"#u": hex.EncodeToString(userID.Value),
-				},
-				ExpressionAttributeValues: map[string]types.AttributeValue{
-					":negone": &types.AttributeValueMemberN{Value: "-1"},
-					":one":    avN(1),
-				},
-			}},
-		}})
-		if err == nil {
-			// Read back the advanced count, version, and sample; Count may now be 0,
-			// but the aggregate still carries the version the removal broadcast needs.
-			_, newCount, newVersion, newSample, err := s.getAggregate(ctx, chatID, seq, emoji)
+	backoff := reactionBackoffBase
+	var state reactionState
+	needRead := true
+	for attempt := 0; ; attempt++ {
+		if needRead {
+			st, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
 			if err != nil {
 				return nil, false, err
 			}
-			return buildReaction(emoji, newCount, newVersion, newSample), true, nil
+			state, needRead = st, false
 		}
 
-		reasons, ok := cancellationReasons(err)
-		if !ok {
-			return nil, false, err
+		// Idempotent: the user didn't react. Reflect the current state, or report
+		// a pure no-op when there's no aggregate at all.
+		if !state.reacted {
+			if state.agg.exists {
+				return reactionFromAgg(emoji, state.agg), false, nil
+			}
+			return nil, false, nil
 		}
-		// A failed reactor delete means a concurrent identical remove won: re-read
-		// and return the idempotent result.
-		if len(reasons) >= 1 && reasons[0] == codeConditionalCheckFailed {
-			continue
+		// A reactor row exists only alongside its aggregate, and an active
+		// aggregate only alongside its message's meta row counting it: all are
+		// written in the reactor's transaction and nothing deletes any of them.
+		if !state.agg.exists || state.agg.count == 0 || !state.meta.exists || state.meta.types == 0 {
+			return nil, false, fmt.Errorf("chat %s message %d emoji %q has a reactor but no active aggregate", hex.EncodeToString(chatID.Value), seq, emoji)
 		}
-		if isRetryable(reasons) {
-			continue
+
+		next := state.agg.retract(userID)
+		items := []types.TransactWriteItem{
+			// [0] delete the reactor row; a concurrent identical remove wins the
+			// condition and this call reports the no-op.
+			{Delete: &types.Delete{
+				TableName: aws.String(s.reactorsTable),
+				Key: map[string]types.AttributeValue{
+					attrPK: avS(reactorPK(chatID, seq)),
+					attrSK: avS(userSK(userID, emoji)),
+				},
+				ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
+			}},
+			// [1] the aggregate, set to exactly next. The row is retained at count
+			// 0 so the version survives the emoji being re-added.
+			s.aggregateWrite(chatID, seq, emoji, state.agg, next),
 		}
-		return nil, false, err
+		metaIdx := -1
+		if next.count == 0 {
+			// The last reactor left: the emoji no longer counts toward the cap.
+			metaIdx = len(items)
+			items = append(items, s.metaWrite(chatID, seq, state.meta, state.meta.types-1))
+		}
+		if chat.IsGroupChatID(chatID) {
+			// The viewer-keyed copy goes with the reactor row (groups only, as
+			// on the add).
+			items = append(items, types.TransactWriteItem{Delete: &types.Delete{
+				TableName: aws.String(s.selfReactionsTable),
+				Key: map[string]types.AttributeValue{
+					attrPK: avS(viewerPK(chatID, userID)),
+					attrSK: avS(seqEmojiSK(seq, emoji)),
+				},
+			}})
+		}
+
+		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+		if err == nil {
+			return reactionFromAgg(emoji, next), true, nil
+		}
+
+		retry, err := s.absorbReactionFailure(ctx, err, items, metaIdx, &state, attempt, &backoff)
+		if err != nil {
+			return nil, false, fmt.Errorf("remove reaction for chat %s: %w", hex.EncodeToString(chatID.Value), err)
+		}
+		needRead = retry == retryAfterRead
 	}
-	return nil, false, fmt.Errorf("remove reaction exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
+}
+
+// reactionRetry says how a cancelled reaction transaction is retried.
+type reactionRetry int
+
+const (
+	// retryFromState retries against the state in hand, refreshed from what the
+	// cancellation returned; no read is needed.
+	retryFromState reactionRetry = iota
+	// retryAfterRead re-reads the state first: either the reactor row's own
+	// condition failed, so a concurrent identical write landed and the
+	// idempotent answer is whatever it produced, or the transaction collided
+	// with another and learned nothing about what it left behind.
+	retryAfterRead
+)
+
+// absorbReactionFailure classifies a failed reaction transaction and prepares
+// the retry, or returns the error when the failure is not one to retry or the
+// attempt budget is spent. Cancellation reasons are positional over items: [0]
+// is the reactor row, [1] the aggregate, metaIdx (-1 when the write carries
+// none) the meta row. Any other item is the viewer-keyed copy, which carries no
+// condition and so never fails one.
+//
+// A failed [0] condition means a concurrent identical add or remove won, so the
+// caller re-reads and reports the no-op; that is not a retry of the write, so
+// it is taken even when the budget is spent. A failed [1] or meta condition
+// means a concurrent writer moved the aggregate or the type count; the failed
+// item is returned with the cancellation, so the state is refreshed from it and
+// the write retried with no extra read. Losing the write itself to a concurrent
+// transaction on the same item surfaces as TransactionConflict: no condition
+// was evaluated and no item comes back, and the transaction it collided with
+// was all but certainly a write to this emoji's aggregate (every transition on
+// the emoji writes it), so the state in hand is stale and a retry from it would
+// only fail the version check to learn as much. It re-reads instead, spending
+// a batch read rather than a doomed transaction. Every retry waits first (see
+// reactionBackoffBase) and they share the attempt budget (see
+// maxReactionAttempts).
+func (s *store) absorbReactionFailure(ctx context.Context, err error, items []types.TransactWriteItem, metaIdx int, state *reactionState, attempt int, backoff *time.Duration) (reactionRetry, error) {
+	reasons, ok := cancellationDetails(err)
+	if !ok || len(reasons) != len(items) {
+		return 0, err
+	}
+	codes := make([]string, len(reasons))
+	for i, r := range reasons {
+		codes[i] = aws.ToString(r.Code)
+	}
+	metaFailed := metaIdx >= 0 && codes[metaIdx] == codeConditionalCheckFailed
+
+	var retry reactionRetry
+	switch {
+	case codes[0] == codeConditionalCheckFailed:
+		retry = retryAfterRead
+	case attempt+1 >= maxReactionAttempts:
+		return 0, err
+	case codes[1] == codeConditionalCheckFailed || metaFailed:
+		if codes[1] == codeConditionalCheckFailed {
+			// Nothing deletes an aggregate row, so a failed condition always
+			// returns one — whether the loss was a create racing another create
+			// (the row now exists) or a stale version.
+			if len(reasons[1].Item) == 0 {
+				return 0, errors.New("aggregate condition failed without returning the row")
+			}
+			state.agg = aggStateFromItem(reasons[1].Item)
+		}
+		if metaFailed {
+			if len(reasons[metaIdx].Item) == 0 {
+				return 0, errors.New("meta condition failed without returning the row")
+			}
+			state.meta = metaStateFromItem(reasons[metaIdx].Item)
+		}
+		retry = retryFromState
+	case slices.Contains(codes, codeTransactionConflict):
+		retry = retryAfterRead
+	default:
+		return 0, err
+	}
+
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-time.After(*backoff + rand.N(*backoff)):
+	}
+	*backoff = min(2**backoff, reactionBackoffMax)
+	return retry, nil
+}
+
+// aggregateWrite is the transaction item that sets an emoji's aggregate from
+// current to next: a create conditioned on absence when no row exists, else an
+// update conditioned on the version read. Either way the row is returned on a
+// failed condition so the writer can retry from it.
+func (s *store) aggregateWrite(chatID *commonpb.ChatId, seq uint64, emoji string, current, next aggState) types.TransactWriteItem {
+	key := map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(aggSK(seq, emoji))}
+	if !current.exists {
+		return types.TransactWriteItem{Put: &types.Put{
+			TableName: aws.String(s.reactionsTable),
+			Item: map[string]types.AttributeValue{
+				attrPK:              key[attrPK],
+				attrSK:              key[attrSK],
+				attrEmoji:           avS(emoji),
+				attrReactorCount:    avN(next.count),
+				attrReactionVersion: avN(next.version),
+				attrSample:          sampleAttr(next.sample),
+			},
+			ConditionExpression:                 aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		}}
+	}
+	// The emoji is fixed by the key and written once by the create above, so the
+	// update sets only what moves. Attribute names go through placeholders:
+	// "sample" is a DynamoDB reserved word, and naming the rest the same way
+	// keeps the expression uniform.
+	return types.TransactWriteItem{Update: &types.Update{
+		TableName:           aws.String(s.reactionsTable),
+		Key:                 key,
+		UpdateExpression:    aws.String("SET #count = :count, #version = :version, #sample = :sample"),
+		ConditionExpression: aws.String("#version = :expected"),
+		ExpressionAttributeNames: map[string]string{
+			"#count":   attrReactorCount,
+			"#version": attrReactionVersion,
+			"#sample":  attrSample,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":count":    avN(next.count),
+			":version":  avN(next.version),
+			":sample":   sampleAttr(next.sample),
+			":expected": avN(current.version),
+		},
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	}}
+}
+
+// metaWrite is the transaction item that sets a message's active type count from
+// current to activeTypes, on the same create-or-compare-and-set terms as
+// aggregateWrite.
+func (s *store) metaWrite(chatID *commonpb.ChatId, seq uint64, current metaState, activeTypes uint64) types.TransactWriteItem {
+	key := map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(metaSK(seq))}
+	if !current.exists {
+		return types.TransactWriteItem{Put: &types.Put{
+			TableName: aws.String(s.reactionsTable),
+			Item: map[string]types.AttributeValue{
+				attrPK:        key[attrPK],
+				attrSK:        key[attrSK],
+				attrTypeCount: avN(activeTypes),
+			},
+			ConditionExpression:                 aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		}}
+	}
+	return types.TransactWriteItem{Update: &types.Update{
+		TableName:                aws.String(s.reactionsTable),
+		Key:                      key,
+		UpdateExpression:         aws.String("SET #types = :types"),
+		ConditionExpression:      aws.String("#types = :expected"),
+		ExpressionAttributeNames: map[string]string{"#types": attrTypeCount},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":types":    avN(activeTypes),
+			":expected": avN(current.types),
+		},
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	}}
+}
+
+// readReactionState fetches, in one strongly consistent batch read spanning both
+// tables, the three items a reaction write decides from: the emoji's aggregate
+// and the message's meta row (message_reactions) and the caller's own reactor row
+// (message_reactors, with the version that added it, for a re-add's result).
+// Absent keys are simply omitted from the response, so a missing row leaves its
+// flag false.
+func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, userID *commonpb.UserId) (reactionState, error) {
+	aggKey := aggSK(seq, emoji)
+	metaKey := metaSK(seq)
+	req := map[string]types.KeysAndAttributes{
+		s.reactionsTable: {
+			Keys: []map[string]types.AttributeValue{
+				{attrPK: avS(chatPK(chatID)), attrSK: avS(aggKey)},
+				{attrPK: avS(chatPK(chatID)), attrSK: avS(metaKey)},
+			},
+			ConsistentRead: aws.Bool(true),
+		},
+		s.reactorsTable: {
+			Keys: []map[string]types.AttributeValue{
+				{attrPK: avS(reactorPK(chatID, seq)), attrSK: avS(userSK(userID, emoji))},
+			},
+			ConsistentRead:       aws.Bool(true),
+			ProjectionExpression: aws.String(attrSK + ", " + attrEmojiVersion + ", " + attrReactedTs),
+		},
+	}
+
+	var state reactionState
+	// Drain UnprocessedKeys; a resolved item is retained while a throttled one is
+	// retried (as in readSendState).
+	for len(req) > 0 {
+		resp, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+		if err != nil {
+			return reactionState{}, err
+		}
+		for _, item := range resp.Responses[s.reactionsTable] {
+			switch asS(item[attrSK]) {
+			case aggKey:
+				state.agg = aggStateFromItem(item)
+			case metaKey:
+				state.meta = metaStateFromItem(item)
+			}
+		}
+		for _, item := range resp.Responses[s.reactorsTable] {
+			version, err := versionFromEmojiVersionKey(asS(item[attrEmojiVersion]))
+			if err != nil {
+				return reactionState{}, err
+			}
+			nanos, err := parseInt(item[attrReactedTs])
+			if err != nil {
+				return reactionState{}, err
+			}
+			state.reacted, state.reactedAt, state.reactedTs = true, version, time.Unix(0, nanos).UTC()
+		}
+		req = make(map[string]types.KeysAndAttributes)
+		for table, unprocessed := range resp.UnprocessedKeys {
+			if len(unprocessed.Keys) > 0 {
+				req[table] = unprocessed
+			}
+		}
+	}
+	return state, nil
 }
 
 func (s *store) GetReactionSummary(
@@ -1727,7 +2076,11 @@ func (s *store) GetReactionSummary(
 	chatID *commonpb.ChatId,
 	messageID *messagingpb.MessageId,
 ) ([]*messaging.Reaction, error) {
-	return s.reactionsForMessage(ctx, chatID, messageID.Value)
+	groups, err := s.reactionsForSeqRange(ctx, chatID, messageID.Value, messageID.Value)
+	if err != nil {
+		return nil, err
+	}
+	return groups[messageID.Value], nil
 }
 
 func (s *store) GetReactionSummariesByRefs(
@@ -1735,25 +2088,31 @@ func (s *store) GetReactionSummariesByRefs(
 	chatID *commonpb.ChatId,
 	messageIDs []*messagingpb.MessageId,
 ) ([]*messaging.ReactionSummary, error) {
-	seen := make(map[uint64]struct{}, len(messageIDs))
-	var out []*messaging.ReactionSummary
-	for _, id := range messageIDs {
-		if _, dup := seen[id.Value]; dup {
-			continue
-		}
-		seen[id.Value] = struct{}{}
-		reactions, err := s.reactionsForMessage(ctx, chatID, id.Value)
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	seqs := sortedSeqs(messageIDs)
+
+	// Query each run's window once; a message with no reactions (or unknown) has
+	// no aggregates in the window and is echoed with an empty summary below.
+	groups := make(map[uint64][]*messaging.Reaction)
+	for _, run := range seqRuns(seqs) {
+		window, err := s.reactionsForSeqRange(ctx, chatID, run[0], run[1])
 		if err != nil {
 			return nil, err
 		}
-		// Every requested message is echoed; one with no reactions (or unknown)
-		// comes back with an empty summary rather than being omitted.
+		for seq, reactions := range window {
+			groups[seq] = reactions
+		}
+	}
+
+	out := make([]*messaging.ReactionSummary, 0, len(seqs))
+	for _, seq := range seqs {
 		out = append(out, &messaging.ReactionSummary{
-			MessageID: &messagingpb.MessageId{Value: id.Value},
-			Reactions: reactions,
+			MessageID: &messagingpb.MessageId{Value: seq},
+			Reactions: groups[seq],
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].MessageID.Value < out[j].MessageID.Value })
 	return out, nil
 }
 
@@ -1863,7 +2222,19 @@ func (s *store) lastMessageSeq(ctx context.Context, chatID *commonpb.ChatId) (ui
 // the contiguous window [lo, hi], grouped by seq and ordered by emoji within each
 // group, via one agg# range query. Every seq in the window is a real message (the
 // sequence is gapless), so any aggregate the query returns belongs to the page.
-// Messages with no reactions are absent from the returned map.
+// Messages with no reactions are absent from the returned map; so is any emoji
+// retained at count 0 for its version. The meta# rows share the partition but not
+// the prefix, so the range never sees them.
+//
+// The read is strongly consistent (see messaging.Store.GetReactionSummary for
+// the client-facing reason). It is the one reaction read whose volume follows
+// viewers × pages rather than reactions, and it lands on the chat partition
+// that takes every aggregate CAS, so the doubled RCU of a strong read is spent
+// here of all places; on a typical page (a few agg# rows) that is a couple of
+// units. Should a hot chat's partition ever throttle, the lever is to keep the
+// single-message and by-refs reads strong — the refresh after a reaction —
+// and let only the paged history walk go eventual, where the version
+// watermark already makes a lagging count harmless.
 func (s *store) reactionsForSeqRange(ctx context.Context, chatID *commonpb.ChatId, lo, hi uint64) (map[uint64][]*messaging.Reaction, error) {
 	groups := make(map[uint64][]*messaging.Reaction)
 	from := aggPrefix + seqPad(lo) + "#"
@@ -1878,22 +2249,22 @@ func (s *store) reactionsForSeqRange(ctx context.Context, chatID *commonpb.ChatI
 				":from": avS(from),
 				":to":   avS(to),
 			},
+			ConsistentRead:    aws.Bool(true),
 			ExclusiveStartKey: startKey,
 		})
 		if err != nil {
 			return nil, err
 		}
 		for _, item := range out.Items {
-			count, _ := parseN(item[attrReactionCount])
-			if count == 0 {
+			agg := aggStateFromItem(item)
+			if agg.count == 0 {
 				continue // inactive emoji aggregate, retained only for its version
 			}
 			seq, err := seqFromAggSK(asS(item[attrSK]))
 			if err != nil {
 				return nil, err
 			}
-			// The sample is carried on the agg# item itself — no per-emoji query.
-			groups[seq] = append(groups[seq], reactionFromAggItem(item))
+			groups[seq] = append(groups[seq], reactionFromAgg(asS(item[attrEmoji]), agg))
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			break
@@ -1913,50 +2284,102 @@ func (s *store) GetSelfReactions(
 	ctx context.Context,
 	chatID *commonpb.ChatId,
 	userID *commonpb.UserId,
-	refs []messaging.ReactionRef,
-) ([]messaging.ReactionRef, error) {
-	// Dedup to exact reactor-row keys, remembering which ref each key maps back to.
-	byKey := make(map[string]messaging.ReactionRef, len(refs))
-	var keys []map[string]types.AttributeValue
-	for _, ref := range refs {
-		sk := rctSK(ref.MessageID.Value, ref.Emoji, userID)
-		if _, dup := byKey[sk]; dup {
-			continue
-		}
-		byKey[sk] = ref
-		keys = append(keys, map[string]types.AttributeValue{
-			attrPK: avS(chatPK(chatID)),
-			attrSK: avS(sk),
-		})
+	messageIDs []*messagingpb.MessageId,
+) ([]messaging.SelfReaction, error) {
+	// A DM writes no viewer-keyed rows (see the table comment), so a DM read
+	// here would answer "nothing" for a viewer who did react. Refuse it rather
+	// than mislead: the caller owns the DM overlay.
+	if !chat.IsGroupChatID(chatID) {
+		return nil, messaging.ErrSelfReactionsGroupOnly
+	}
+	seqs := sortedSeqs(messageIDs)
+	if len(seqs) == 0 {
+		return nil, nil
+	}
+	wanted := make(map[uint64]struct{}, len(seqs))
+	for _, seq := range seqs {
+		wanted[seq] = struct{}{}
 	}
 
-	var present []messaging.ReactionRef
-	for start := 0; start < len(keys); start += maxBatchGetKeys {
-		end := start + maxBatchGetKeys
-		if end > len(keys) {
-			end = len(keys)
-		}
-		req := map[string]types.KeysAndAttributes{
-			s.reactionsTable: {Keys: keys[start:end], ProjectionExpression: aws.String(attrSK)},
-		}
-		for len(req[s.reactionsTable].Keys) > 0 {
-			resp, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+	// One strongly consistent range query on the viewer's partition per run of
+	// message IDs, the same grouping as the aggregate read (see
+	// maxSummaryRefGap). A run's window can cover IDs nobody asked about; the
+	// rows are tiny and the viewer's own, so reading past them is cheap, but
+	// they are filtered out so the answer is exactly the messages requested.
+	var present []messaging.SelfReaction
+	for _, run := range seqRuns(seqs) {
+		var startKey map[string]types.AttributeValue
+		for {
+			out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+				TableName:              aws.String(s.selfReactionsTable),
+				KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND %s BETWEEN :from AND :to", attrPK, attrSK)),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":pk":   avS(viewerPK(chatID, userID)),
+					":from": avS(seqPad(run[0]) + "#"),
+					":to":   avS(seqPad(run[1]) + "#~"),
+				},
+				ConsistentRead:    aws.Bool(true),
+				ExclusiveStartKey: startKey,
+			})
 			if err != nil {
 				return nil, err
 			}
-			for _, item := range resp.Responses[s.reactionsTable] {
-				if ref, ok := byKey[asS(item[attrSK])]; ok {
-					present = append(present, ref)
+			for _, item := range out.Items {
+				seq, emoji, err := seqEmojiFromSK(asS(item[attrSK]))
+				if err != nil {
+					return nil, err
 				}
+				if _, ok := wanted[seq]; !ok {
+					continue
+				}
+				version, err := parseN(item[attrSelfVersion])
+				if err != nil {
+					return nil, err
+				}
+				nanos, err := parseInt(item[attrSelfReactedTs])
+				if err != nil {
+					return nil, err
+				}
+				present = append(present, messaging.SelfReaction{
+					MessageID: &messagingpb.MessageId{Value: seq},
+					Emoji:     emoji,
+					Version:   version,
+					ReactedTs: time.Unix(0, nanos).UTC(),
+				})
 			}
-			if unprocessed, ok := resp.UnprocessedKeys[s.reactionsTable]; ok && len(unprocessed.Keys) > 0 {
-				req = map[string]types.KeysAndAttributes{s.reactionsTable: unprocessed}
-			} else {
+			if len(out.LastEvaluatedKey) == 0 {
 				break
 			}
+			startKey = out.LastEvaluatedKey
 		}
 	}
 	return present, nil
+}
+
+// sortedSeqs is the message IDs as sorted, deduplicated seqs.
+func sortedSeqs(messageIDs []*messagingpb.MessageId) []uint64 {
+	seqs := make([]uint64, 0, len(messageIDs))
+	for _, id := range messageIDs {
+		seqs = append(seqs, id.Value)
+	}
+	slices.Sort(seqs)
+	return slices.Compact(seqs)
+}
+
+// seqRuns groups sorted seqs into [lo, hi] windows in which no two neighbours
+// are further apart than maxSummaryRefGap, so each window is one range query
+// that reads no long stretch nobody asked for.
+func seqRuns(seqs []uint64) [][2]uint64 {
+	var runs [][2]uint64
+	for start := 0; start < len(seqs); {
+		end := start
+		for end+1 < len(seqs) && seqs[end+1]-seqs[end] <= maxSummaryRefGap {
+			end++
+		}
+		runs = append(runs, [2]uint64{seqs[start], seqs[end]})
+		start = end + 1
+	}
+	return runs
 }
 
 func (s *store) GetReactors(
@@ -1964,56 +2387,66 @@ func (s *store) GetReactors(
 	chatID *commonpb.ChatId,
 	messageID *messagingpb.MessageId,
 	emoji string,
-	consistent bool,
 	opts ...database.QueryOption,
-) ([]*messaging.Reactor, bool, error) {
+) ([]*messaging.Reactor, uint64, bool, error) {
+	seq := messageID.Value
 	q := database.ApplyQueryOptions(opts...)
-	if consistent {
-		return s.getReactorsConsistent(ctx, chatID, messageID.Value, emoji, q)
-	}
-	return s.getReactorsEventuallyConsistent(ctx, chatID, messageID.Value, emoji, q)
-}
 
-// getReactorsEventuallyConsistent pages an emoji's reactors most-recent-first
-// off the reactors_by_recency index. The index is eventually consistent but
-// supports deep paging without reading the whole reactor set.
-func (s *store) getReactorsEventuallyConsistent(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, q database.QueryOptions) ([]*messaging.Reactor, bool, error) {
+	// The version first, then the page, so the page is never older than the
+	// version reported with it (see the Store contract). An emoji with no
+	// reactors has no rows to page.
+	agg, err := s.getAggregate(ctx, chatID, seq, emoji)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if agg.count == 0 {
+		return nil, agg.version, false, nil
+	}
+
+	// Page the emoji's reactors off the version index, newest first, under a
+	// strongly consistent read. The cursor resumes strictly below the last
+	// version returned, expressed as a key range rather than an ExclusiveStartKey
+	// so the token need carry nothing but the version.
 	input := &dynamodb.QueryInput{
-		TableName:              aws.String(s.reactionsTable),
-		IndexName:              aws.String(reactorsByRecencyGSI),
-		KeyConditionExpression: aws.String("#g = :g"),
-		ExpressionAttributeNames: map[string]string{
-			"#g": attrReactionKey,
-		},
+		TableName:                aws.String(s.reactorsTable),
+		IndexName:                aws.String(lsiByVersion),
+		ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#version": attrEmojiVersion},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":g": avS(reactionKey(chatID, seq, emoji)),
+			":pk": avS(reactorPK(chatID, seq)),
 		},
-		ScanIndexForward: aws.Bool(false), // most-recent-first
+		ScanIndexForward: aws.Bool(false),
+		ConsistentRead:   aws.Bool(true),
+	}
+	if cursor, ok := messaging.ReactorFromPageToken(q.PagingToken); ok {
+		if cursor <= 1 {
+			return nil, agg.version, false, nil // nothing lies below the first version
+		}
+		input.KeyConditionExpression = aws.String("#pk = :pk AND #version BETWEEN :lo AND :hi")
+		input.ExpressionAttributeValues[":lo"] = avS(emojiVersionKey(emoji, 0))
+		input.ExpressionAttributeValues[":hi"] = avS(emojiVersionKey(emoji, cursor-1))
+	} else {
+		input.KeyConditionExpression = aws.String("#pk = :pk AND begins_with(#version, :prefix)")
+		input.ExpressionAttributeValues[":prefix"] = avS(emojiHex(emoji) + "#")
 	}
 	// Over-fetch one row beyond the page so hasMore can be determined exactly.
 	// DynamoDB sets LastEvaluatedKey whenever a query stops at Limit — even when it
 	// landed on the last matching row — so the key alone can't distinguish "exactly
-	// a page" from "more remain". Fetching limit+1 does: getting the extra row means
-	// a next page exists; getting fewer means the partition is exhausted.
+	// a page" from "more remain". Fetching limit+1 does.
 	if q.Limit > 0 {
 		input.Limit = aws.Int32(int32(q.Limit) + 1)
-	}
-	if ts, userID, ok := messaging.ReactorFromPageToken(q.PagingToken); ok {
-		input.ExclusiveStartKey = map[string]types.AttributeValue{
-			attrReactionKey: avS(reactionKey(chatID, seq, emoji)),
-			attrReactedTs:   avN(uint64(ts.UnixNano())),
-			attrPK:          avS(chatPK(chatID)),
-			attrSK:          avS(rctSK(seq, emoji, userID)),
-		}
 	}
 
 	out, err := s.client.Query(ctx, input)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 	reactors := make([]*messaging.Reactor, 0, len(out.Items))
 	for _, item := range out.Items {
-		reactors = append(reactors, reactorFromItem(item))
+		r, err := reactorFromItem(item)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		reactors = append(reactors, r)
 	}
 
 	// Trim the over-fetched row and report hasMore. The dropped row isn't lost: the
@@ -2027,308 +2460,185 @@ func (s *store) getReactorsEventuallyConsistent(ctx context.Context, chatID *com
 	} else {
 		hasMore = len(out.LastEvaluatedKey) > 0
 	}
-
-	return reactors, hasMore, nil
+	return reactors, agg.version, hasMore, nil
 }
 
-// getReactorsConsistent reads an emoji's reactor rows directly from the message
-// partition under one strongly consistent query, then orders and pages them in
-// memory. It reads the whole reactor set, so it suits small sets (e.g. DM
-// reactions); larger lists should page the recency index instead. Ordering and
-// paging match getReactorsEventuallyConsistent exactly.
-func (s *store) getReactorsConsistent(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, q database.QueryOptions) ([]*messaging.Reactor, bool, error) {
-	prefix := rctPrefix + seqPad(seq) + "#" + emojiHex(emoji) + "#"
-	var reactors []*messaging.Reactor
-	var startKey map[string]types.AttributeValue
-	for {
-		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(s.reactionsTable),
-			KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND begins_with(%s, :prefix)", attrPK, attrSK)),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":pk":     avS(chatPK(chatID)),
-				":prefix": avS(prefix),
-			},
-			ConsistentRead:    aws.Bool(true),
-			ExclusiveStartKey: startKey,
-		})
-		if err != nil {
-			return nil, false, err
-		}
-		for _, item := range out.Items {
-			reactors = append(reactors, reactorFromItem(item))
-		}
-		if len(out.LastEvaluatedKey) == 0 {
-			break
-		}
-		startKey = out.LastEvaluatedKey
-	}
-
-	// Rows come back keyed by user, so order them most-recent-first here.
-	sort.Slice(reactors, func(i, j int) bool { return reactorLess(reactors[i], reactors[j]) })
-
-	// Resume strictly after the cursor reactor, in the same order.
-	if ts, userID, ok := messaging.ReactorFromPageToken(q.PagingToken); ok {
-		cursor := &messaging.Reactor{UserID: userID, ReactedTs: ts}
-		filtered := reactors[:0]
-		for _, r := range reactors {
-			if reactorLess(cursor, r) {
-				filtered = append(filtered, r)
-			}
-		}
-		reactors = filtered
-	}
-
-	limit := q.Limit
-	if limit <= 0 {
-		limit = len(reactors)
-	}
-	hasMore := len(reactors) > limit
-	if hasMore {
-		reactors = reactors[:limit]
-	}
-	return reactors, hasMore, nil
-}
-
-// reactorLess orders reactors most-recent-first, breaking ties by ascending user
-// ID so the ordering is total and stable for paging.
-func reactorLess(a, b *messaging.Reactor) bool {
-	if !a.ReactedTs.Equal(b.ReactedTs) {
-		return a.ReactedTs.After(b.ReactedTs)
-	}
-	return bytes.Compare(a.UserID.Value, b.UserID.Value) < 0
-}
-
-// moreRecent reports whether reactor (tsA, userHexA) ranks ahead of
-// (tsB, userHexB) under the most-recent-first ordering used for samples and
-// GetReactors: later reaction time first, ties broken by smaller user ID. The keys
-// are hex, whose lexicographic order matches the raw-byte order used elsewhere
-// (see reactorLess).
-func moreRecent(tsA time.Time, userHexA string, tsB time.Time, userHexB string) bool {
-	if !tsA.Equal(tsB) {
-		return tsA.After(tsB)
-	}
-	return userHexA < userHexB
-}
-
-// leastRecentInSample returns the sample entry that ranks last under the
-// most-recent-first ordering (earliest reaction time; ties broken by larger user
-// hex) — the entry a recent-sample eviction drops. ok is false for an empty map.
-func leastRecentInSample(sample map[string]time.Time) (userHex string, ts time.Time, ok bool) {
-	for k, t := range sample {
-		if !ok || t.Before(ts) || (t.Equal(ts) && k > userHex) {
-			userHex, ts, ok = k, t, true
-		}
-	}
-	return userHex, ts, ok
-}
-
-// reactionsForMessage returns a message's active emoji aggregates, ordered by
-// emoji. ReactedBySelf is left false for the caller to overlay.
-func (s *store) reactionsForMessage(ctx context.Context, chatID *commonpb.ChatId, seq uint64) ([]*messaging.Reaction, error) {
-	var reactions []*messaging.Reaction
-	var startKey map[string]types.AttributeValue
-	prefix := aggPrefix + seqPad(seq) + "#"
-	for {
-		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(s.reactionsTable),
-			KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND begins_with(%s, :prefix)", attrPK, attrSK)),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":pk":     avS(chatPK(chatID)),
-				":prefix": avS(prefix),
-			},
-			ExclusiveStartKey: startKey,
-		})
-		if err != nil {
-			return nil, err
-		}
-		for _, item := range out.Items {
-			count, _ := parseN(item[attrReactionCount])
-			if count == 0 {
-				continue
-			}
-			reactions = append(reactions, reactionFromAggItem(item))
-		}
-		if len(out.LastEvaluatedKey) == 0 {
-			break
-		}
-		startKey = out.LastEvaluatedKey
-	}
-	sort.Slice(reactions, func(i, j int) bool { return reactions[i].Emoji < reactions[j].Emoji })
-	return reactions, nil
-}
-
-// getAggregate reads an emoji aggregate's count, version, and bounded sample map
-// with a strongly consistent read. exists is false when the aggregate row is
-// absent; sample is nil in that case.
-func (s *store) getAggregate(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string) (exists bool, count, version uint64, sample map[string]time.Time, err error) {
+// getAggregate reads an emoji's agg# row with a strongly consistent read. The
+// zero aggState (exists false) is returned when there is no row.
+func (s *store) getAggregate(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string) (aggState, error) {
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:      aws.String(s.reactionsTable),
 		Key:            map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(aggSK(seq, emoji))},
 		ConsistentRead: aws.Bool(true),
 	})
 	if err != nil {
-		return false, 0, 0, nil, err
+		return aggState{}, err
 	}
 	if len(out.Item) == 0 {
-		return false, 0, 0, nil, nil
+		return aggState{}, nil
 	}
-	count, _ = parseN(out.Item[attrReactionCount])
-	version, _ = parseN(out.Item[attrReactionVersion])
-	return true, count, version, parseSampleMap(out.Item[attrSample]), nil
+	return aggStateFromItem(out.Item), nil
 }
 
-// readReactionState fetches, in a single strongly-consistent batch read, the two
-// rows the add/remove paths inspect before writing: the emoji's aggregate (count,
-// version, bounded sample) and the caller's own reactor row. Both share the
-// chat's partition (pk = chat#<id>), so one BatchGetItem covers them, mirroring
-// readSendState on the message path. aggExists is false when the aggregate row is
-// absent (sample is then nil); reacted reports whether userID already has a
-// reactor row for the emoji.
-func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, userID *commonpb.UserId) (aggExists bool, count, version uint64, sample map[string]time.Time, reacted bool, err error) {
-	aggSKVal := aggSK(seq, emoji)
-	rctSKVal := rctSK(seq, emoji, userID)
-	req := map[string]types.KeysAndAttributes{
-		s.reactionsTable: {
-			Keys: []map[string]types.AttributeValue{
-				{attrPK: avS(chatPK(chatID)), attrSK: avS(aggSKVal)},
-				{attrPK: avS(chatPK(chatID)), attrSK: avS(rctSKVal)},
-			},
-			ConsistentRead: aws.Bool(true),
-		},
-	}
-
-	// Drain UnprocessedKeys; a resolved item is retained while a throttled one is
-	// retried (as in readSendState). Absent keys are simply omitted from the
-	// response, so a missing aggregate or reactor row leaves its flag false.
-	for len(req[s.reactionsTable].Keys) > 0 {
-		resp, batchErr := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
-		if batchErr != nil {
-			return false, 0, 0, nil, false, batchErr
-		}
-		for _, item := range resp.Responses[s.reactionsTable] {
-			switch asS(item[attrSK]) {
-			case aggSKVal:
-				aggExists = true
-				count, _ = parseN(item[attrReactionCount])
-				version, _ = parseN(item[attrReactionVersion])
-				sample = parseSampleMap(item[attrSample])
-			case rctSKVal:
-				reacted = true
-			}
-		}
-		if unprocessed, ok := resp.UnprocessedKeys[s.reactionsTable]; ok && len(unprocessed.Keys) > 0 {
-			req = map[string]types.KeysAndAttributes{s.reactionsTable: unprocessed}
-		} else {
-			break
-		}
-	}
-	return aggExists, count, version, sample, reacted, nil
-}
-
-// countActiveAggregates counts the distinct emoji on a message that currently
-// have at least one reactor, for the per-message type cap.
-func (s *store) countActiveAggregates(ctx context.Context, chatID *commonpb.ChatId, seq uint64) (int, error) {
-	active := 0
-	var startKey map[string]types.AttributeValue
-	prefix := aggPrefix + seqPad(seq) + "#"
-	for {
-		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(s.reactionsTable),
-			KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND begins_with(%s, :prefix)", attrPK, attrSK)),
-			ProjectionExpression:   aws.String(attrReactionCount),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":pk":     avS(chatPK(chatID)),
-				":prefix": avS(prefix),
-			},
-			ConsistentRead:    aws.Bool(true),
-			ExclusiveStartKey: startKey,
-		})
-		if err != nil {
-			return 0, err
-		}
-		for _, item := range out.Items {
-			if count, _ := parseN(item[attrReactionCount]); count > 0 {
-				active++
-			}
-		}
-		if len(out.LastEvaluatedKey) == 0 {
-			break
-		}
-		startKey = out.LastEvaluatedKey
-	}
-	return active, nil
-}
-
-// reactionFromAggItem assembles a Reaction from a full agg# item — count,
-// version, and the bounded sample map carried on the row. No query is needed:
-// the sample lives on the aggregate itself. The per-viewer ReactedBySelf is left
-// false for the server to overlay.
-func reactionFromAggItem(item map[string]types.AttributeValue) *messaging.Reaction {
-	count, _ := parseN(item[attrReactionCount])
+// aggStateFromItem decodes an agg# row. Malformed numbers decode as zero: the
+// store writes every attribute itself, so this is defensive, not a code path.
+func aggStateFromItem(item map[string]types.AttributeValue) aggState {
+	count, _ := parseN(item[attrReactorCount])
 	version, _ := parseN(item[attrReactionVersion])
-	return buildReaction(asS(item[attrEmoji]), count, version, parseSampleMap(item[attrSample]))
+	return aggState{exists: true, count: count, version: version, sample: parseSampleMap(item[attrSample])}
 }
 
-// buildReaction assembles a Reaction from a known count, version, and sample map
-// (user hex -> reacted ts). The surfaced sample is the most-recent MaxSampleReactors
-// of the retained set (see messaging.SampleFromReactors).
-func buildReaction(emoji string, count, version uint64, sample map[string]time.Time) *messaging.Reaction {
-	reactors := make([]*messaging.Reactor, 0, len(sample))
-	for userHex, ts := range sample {
+func metaStateFromItem(item map[string]types.AttributeValue) metaState {
+	activeTypes, _ := parseN(item[attrTypeCount])
+	return metaState{exists: true, types: activeTypes}
+}
+
+// reactionFromAgg projects an aggregate onto a Reaction. The surfaced sample is
+// the most-recent MaxSampleReactors of the retained set (see
+// messaging.SampleFromReactors). The per-viewer Self is left nil for
+// the server to overlay.
+func reactionFromAgg(emoji string, agg aggState) *messaging.Reaction {
+	reactors := make([]*messaging.Reactor, 0, len(agg.sample))
+	for userHex, entry := range agg.sample {
 		uid, err := hex.DecodeString(userHex)
 		if err != nil {
 			continue // sample keys are store-written hex; skip anything malformed
 		}
 		reactors = append(reactors, &messaging.Reactor{
 			UserID:    &commonpb.UserId{Value: uid},
-			ReactedTs: ts,
+			ReactedTs: entry.ts,
+			Version:   entry.version,
 		})
 	}
 	return &messaging.Reaction{
 		Emoji:          emoji,
-		Count:          count,
-		Version:        version,
+		Count:          agg.count,
+		Version:        agg.version,
 		SampleReactors: messaging.SampleFromReactors(reactors),
 	}
 }
 
-// parseSampleMap decodes an agg# row's sample map (user hex -> reacted_ts nanos)
-// into a map of the same shape buildReaction consumes. A missing or non-map
-// attribute yields nil.
-func parseSampleMap(av types.AttributeValue) map[string]time.Time {
+// sampleAttr encodes a sample as the agg# row's map attribute: user hex -> {
+// version: added at, ts: reacted nanos }.
+func sampleAttr(sample map[string]sampleEntry) types.AttributeValue {
+	m := make(map[string]types.AttributeValue, len(sample))
+	for userHex, entry := range sample {
+		m[userHex] = &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
+			attrSampleVersion: avN(entry.version),
+			attrSampleTs:      avN(uint64(entry.ts.UnixNano())),
+		}}
+	}
+	return &types.AttributeValueMemberM{Value: m}
+}
+
+// parseSampleMap decodes an agg# row's sample attribute, the inverse of
+// sampleAttr. A missing or non-map attribute yields an empty sample.
+func parseSampleMap(av types.AttributeValue) map[string]sampleEntry {
+	out := make(map[string]sampleEntry)
 	m, ok := av.(*types.AttributeValueMemberM)
 	if !ok {
-		return nil
+		return out
 	}
-	out := make(map[string]time.Time, len(m.Value))
 	for userHex, v := range m.Value {
-		nanos, _ := parseInt(v)
-		out[userHex] = time.Unix(0, nanos).UTC()
+		entry, ok := v.(*types.AttributeValueMemberM)
+		if !ok {
+			continue
+		}
+		version, _ := parseN(entry.Value[attrSampleVersion])
+		nanos, _ := parseInt(entry.Value[attrSampleTs])
+		out[userHex] = sampleEntry{version: version, ts: time.Unix(0, nanos).UTC()}
 	}
 	return out
 }
 
-func reactorFromItem(item map[string]types.AttributeValue) *messaging.Reactor {
+// reactorFromItem decodes a reactor row (or its LSI projection): the user from
+// the sort key, the version from emoji_version, and the display timestamp.
+func reactorFromItem(item map[string]types.AttributeValue) (*messaging.Reactor, error) {
+	userID, err := userIDFromUserSK(asS(item[attrSK]))
+	if err != nil {
+		return nil, err
+	}
+	version, err := versionFromEmojiVersionKey(asS(item[attrEmojiVersion]))
+	if err != nil {
+		return nil, err
+	}
 	nanos, _ := parseInt(item[attrReactedTs])
 	return &messaging.Reactor{
-		UserID:    &commonpb.UserId{Value: append([]byte(nil), asB(item[attrUserID])...)},
+		UserID:    userID,
 		ReactedTs: time.Unix(0, nanos).UTC(),
+		Version:   version,
+	}, nil
+}
+
+// cancellationDetails extracts the per-item cancellation reasons — code and, when
+// the write asked for it, the item that failed its condition — from a
+// TransactWriteItems error, if it is a TransactionCanceledException.
+func cancellationDetails(err error) ([]types.CancellationReason, bool) {
+	var tce *types.TransactionCanceledException
+	if !errors.As(err, &tce) {
+		return nil, false
 	}
+	return tce.CancellationReasons, true
 }
 
-func aggSK(seq uint64, emoji string) string {
-	return aggPrefix + seqPad(seq) + "#" + emojiHex(emoji)
+func aggSK(seq uint64, emoji string) string { return aggPrefix + seqPad(seq) + "#" + emojiHex(emoji) }
+
+func metaSK(seq uint64) string { return metaPrefix + seqPad(seq) }
+
+// reactorPK keys a message's partition in message_reactors: the chat's key
+// extended by the message seq, so no two messages share an item collection.
+func reactorPK(chatID *commonpb.ChatId, seq uint64) string { return chatPK(chatID) + "#" + seqPad(seq) }
+
+func userSK(userID *commonpb.UserId, emoji string) string {
+	return userPrefix + hex.EncodeToString(userID.Value) + "#" + emojiHex(emoji)
 }
 
-func rctSK(seq uint64, emoji string, userID *commonpb.UserId) string {
-	return rctPrefix + seqPad(seq) + "#" + emojiHex(emoji) + "#" + hex.EncodeToString(userID.Value)
+// viewerPK keys a viewer's partition in message_self_reactions: the chat's key
+// extended by the user, so one partition holds a user's reactions in a chat.
+func viewerPK(chatID *commonpb.ChatId, userID *commonpb.UserId) string {
+	return chatPK(chatID) + "#" + hex.EncodeToString(userID.Value)
 }
 
-// reactionKey is the recency GSI partition for one (message, emoji): it includes
-// the chat so reactors of identically-keyed messages in different chats never
-// share a GSI partition.
-func reactionKey(chatID *commonpb.ChatId, seq uint64, emoji string) string {
-	return chatPK(chatID) + "#" + seqPad(seq) + "#" + emojiHex(emoji)
+// seqEmojiSK is a self-reaction row's sk: the padded message seq then the
+// emoji, so a viewer's rows sort by message and a window of messages is a key
+// range.
+func seqEmojiSK(seq uint64, emoji string) string {
+	return seqPad(seq) + "#" + emojiHex(emoji)
+}
+
+// seqEmojiFromSK recovers the message seq and emoji from a self-reaction sk.
+func seqEmojiFromSK(sk string) (uint64, string, error) {
+	padded, emojiHex, ok := strings.Cut(sk, "#")
+	if !ok {
+		return 0, "", fmt.Errorf("unexpected self-reaction sk %q", sk)
+	}
+	seq, err := strconv.ParseUint(padded, 10, 64)
+	if err != nil {
+		return 0, "", fmt.Errorf("unexpected self-reaction sk %q: %w", sk, err)
+	}
+	emoji, err := hex.DecodeString(emojiHex)
+	if err != nil {
+		return 0, "", fmt.Errorf("unexpected self-reaction sk %q: %w", sk, err)
+	}
+	return seq, string(emoji), nil
+}
+
+// selfReaction marks an AddReaction result as the reactor's own view: their
+// own entry, at the version that added their reaction and when.
+func selfReaction(r *messaging.Reaction, userID *commonpb.UserId, addedAt uint64, reactedTs time.Time) *messaging.Reaction {
+	r.Self = &messaging.Reactor{
+		UserID:    &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
+		ReactedTs: reactedTs,
+		Version:   addedAt,
+	}
+	return r
+}
+
+// emojiVersionKey is a reactor row's emoji_version: the emoji then the zero-padded version
+// that added the reactor, so one emoji's rows sort by version under a common
+// prefix in the LSI.
+func emojiVersionKey(emoji string, version uint64) string {
+	return emojiHex(emoji) + "#" + seqPad(version)
 }
 
 func emojiHex(emoji string) string { return hex.EncodeToString([]byte(emoji)) }
@@ -2345,6 +2655,34 @@ func seqFromAggSK(sk string) (uint64, error) {
 	padded, _, ok := strings.Cut(rest, "#")
 	if !ok {
 		return 0, fmt.Errorf("unexpected agg sk %q", sk)
+	}
+	return strconv.ParseUint(padded, 10, 64)
+}
+
+// userIDFromUserSK recovers the reactor from a reactor row's sk
+// ("user#<user hex>#<emoji hex>").
+func userIDFromUserSK(sk string) (*commonpb.UserId, error) {
+	rest, ok := strings.CutPrefix(sk, userPrefix)
+	if !ok {
+		return nil, fmt.Errorf("unexpected reactor sk %q", sk)
+	}
+	userHex, _, ok := strings.Cut(rest, "#")
+	if !ok {
+		return nil, fmt.Errorf("unexpected reactor sk %q", sk)
+	}
+	id, err := hex.DecodeString(userHex)
+	if err != nil {
+		return nil, fmt.Errorf("unexpected reactor sk %q: %w", sk, err)
+	}
+	return &commonpb.UserId{Value: id}, nil
+}
+
+// versionFromEmojiVersionKey recovers the version from a reactor row's emoji_version
+// ("<emoji hex>#<padded version>").
+func versionFromEmojiVersionKey(key string) (uint64, error) {
+	_, padded, ok := strings.Cut(key, "#")
+	if !ok {
+		return 0, fmt.Errorf("unexpected emoji version key %q", key)
 	}
 	return strconv.ParseUint(padded, 10, 64)
 }

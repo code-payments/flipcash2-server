@@ -32,7 +32,13 @@ type Store interface {
 	// is not on the list is a no-op. It reports whether an entry was removed.
 	Unblock(ctx context.Context, ownerID, blockedID *commonpb.UserId) (removed bool, err error)
 
-	// IsBlocked reports whether blockedID is on ownerID's blocklist.
+	// IsBlocked reports whether blockedID is on ownerID's blocklist. The read is
+	// strongly consistent: it reflects every Block and Unblock that completed
+	// before it. Its one caller is the owner asking about their own list, and
+	// they ask right after changing it — a read-your-own-write a lagging replica
+	// would contradict. The batch forms below stay eventually consistent: they
+	// serve fan-out and feed filtering, where a moment's lag on someone else's
+	// list is harmless.
 	IsBlocked(ctx context.Context, ownerID, blockedID *commonpb.UserId) (bool, error)
 
 	// GetBlockedCount returns the number of users on ownerID's blocklist. It is a

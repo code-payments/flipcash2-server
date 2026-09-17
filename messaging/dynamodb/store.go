@@ -857,11 +857,14 @@ func (s *store) getMessage(ctx context.Context, chatID *commonpb.ChatId, message
 }
 
 func (s *store) MessageExists(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (bool, error) {
-	// Project to pk only so the content blobs are never read or decoded.
+	// Project to pk only so the content blobs are never read or decoded. The
+	// read is strong: the message being asked about was, as often as not, just
+	// delivered on the stream (see the Store contract).
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:            aws.String(s.messagesTable),
 		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(msgSK(messageID.Value))},
 		ProjectionExpression: aws.String(attrPK),
+		ConsistentRead:       aws.Bool(true),
 	})
 	if err != nil {
 		return false, err

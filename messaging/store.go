@@ -149,7 +149,11 @@ type Store interface {
 	// MessageExists reports whether a message exists in the chat. It is a
 	// lightweight existence check that does not read or decode the message body,
 	// for callers (e.g. the reaction read paths) that only need to distinguish a
-	// missing message and don't need its content.
+	// missing message and don't need its content. The read is strongly
+	// consistent: it reflects every send that completed before it. Its callers
+	// gate an action on a message the user is looking at, and a message just
+	// delivered on the stream is one another server committed moments ago —
+	// the case a lagging read would report as missing.
 	MessageExists(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (bool, error)
 
 	// GetMessages returns a page of messages for a chat ordered by message ID

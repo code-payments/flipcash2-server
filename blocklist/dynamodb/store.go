@@ -179,10 +179,13 @@ func (s *store) countDelta(ownerID *commonpb.UserId, delta int64) types.Transact
 }
 
 func (s *store) IsBlocked(ctx context.Context, ownerID, blockedID *commonpb.UserId) (bool, error) {
+	// Strong: the owner is reading their own list, usually just after writing
+	// it (see the Store contract).
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:            aws.String(s.table),
 		Key:                  map[string]types.AttributeValue{attrPK: avS(ownerPK(ownerID)), attrSK: avS(blockedSK(blockedID))},
 		ProjectionExpression: aws.String(attrPK),
+		ConsistentRead:       aws.Bool(true),
 	})
 	if err != nil {
 		return false, err

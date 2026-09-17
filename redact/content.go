@@ -38,11 +38,14 @@ import (
 //   - Deleted: kept as is. It carries no content, and who deleted a message
 //     is the same kind of fact as who sent one, which is not this
 //     function's to hide.
-//   - System: ErrUnsupportedContent. A system message says what happened
-//     in the chat, and its structure is still settling, so no placeholder
-//     is defined for it yet.
+//   - System: kept as is. A system message is the server's account of what
+//     happened in the chat — a join, a departure — not something a member
+//     said, and the proto contract (Message.redacted) lists it with cash
+//     and deleted content as never redacted. Its structure is still
+//     settling; a variant that carries member-authored text is a new
+//     decision here, not a pass-through.
 //
-// A nil content, or one of a kind this function does not know, is also
+// A nil content, or one of a kind this function does not know, is
 // ErrUnsupportedContent: nothing unknown is passed through, and the caller
 // decides what to do with a message it cannot show.
 //
@@ -91,6 +94,10 @@ func content(seed []byte, c *messagingpb.Content) (*messagingpb.Content, error) 
 	case *messagingpb.Content_Deleted:
 		return &messagingpb.Content{Type: &messagingpb.Content_Deleted{
 			Deleted: proto.Clone(t.Deleted).(*messagingpb.DeletedContent),
+		}}, nil
+	case *messagingpb.Content_System:
+		return &messagingpb.Content{Type: &messagingpb.Content_System{
+			System: proto.Clone(t.System).(*messagingpb.SystemContent),
 		}}, nil
 	default:
 		return nil, ErrUnsupportedContent

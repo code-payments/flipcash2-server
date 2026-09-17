@@ -24,6 +24,7 @@ import (
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/moderation"
+	"github.com/code-payments/flipcash2-server/redact"
 )
 
 // MessageRef identifies a chat's message to hydrate. The feed builds one ref per
@@ -229,7 +230,8 @@ func NewServer(
 // returned to every registered user, member or not — its title, picture,
 // rules and roster summary are what a user weighs before joining, and what a
 // client renders for a group it was pointed at (see Access for the rules). What
-// the caller's standing decides is how much of the group comes with it:
+// the caller's standing decides, combined with the view mode they asked for
+// (see Standing.Reading), is how much of the group comes with it:
 //
 //   - A member sees everything, as before: the record, themselves as the
 //     hydrated member with their pointers, and the group's messaging state —
@@ -238,9 +240,16 @@ func NewServer(
 //     and its messaging state, so a group they may read previews like one they
 //     are in. They are not on the roster, so no member is hydrated: an empty
 //     Members is how the metadata says the viewer is not a member.
-//   - A non-member who does not satisfy the rules sees the record alone. The
-//     messaging state is a member's or a qualifying reader's, and is withheld;
-//     the rules are carried so the client can show what would admit them.
+//   - A non-member who does not satisfy the rules sees the record alone under
+//     FULL, the mode a client that does not know redaction asks for. Under
+//     FULL_OR_REDACTED they see the messaging state redacted: the last message
+//     as a placeholder (see redact.Message) and the head event sequence, so a
+//     client can show that the group is alive and how much, without what was
+//     said. The rules are carried in every case so the client can show what
+//     would admit them.
+//   - Under REDACTED anyone who may read the group at all — a member too —
+//     sees its last message redacted, and the rules are not evaluated for a
+//     non-member (see Access.Standing).
 //
 // The group's picture is returned in every case: it is part of the record, as
 // the title is, and the two are what identify a group — a group's picture is
@@ -274,7 +283,7 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 	// the member list, so a group's membership is never enumerated on behalf of
 	// a caller who turns out not to be a member — and, for a non-member of a
 	// group, the listener rules.
-	standing, err := s.access.StandingWithRules(ctx, c.ID, c.Rules(), userID)
+	standing, err := s.access.StandingWithRules(ctx, c.ID, c.Rules(), userID, req.GetViewMode())
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure determining chat standing")
 		return nil, status.Error(codes.Internal, "")
@@ -283,7 +292,7 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
 	}
 
-	metadata, err := s.hydrate(ctx, userID, standing, []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, standing, standing.Reading(req.GetViewMode()), []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
 		return nil, status.Error(codes.Internal, "")
@@ -304,19 +313,25 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 // a page costs the slowest of them rather than their sum.
 //
 // The standing is the viewer's towards every chat in the set (see Standing),
-// and decides what is hydrated at all: what it withholds is never read, not
-// read and dropped. Most callers hydrate chats the viewer is a member of — a
-// feed built from their memberships, a join or creation that just landed — and
-// pass memberStanding. GetChat hydrates a group for whoever asks, and passes
-// what Access found:
+// and the reading is what the viewer's read of every chat in the set is
+// answered with (see Standing.Reading). Together they decide what is hydrated
+// at all: what they withhold is never read, not read and dropped. Most
+// callers hydrate chats the viewer is a member of — a feed built from their
+// memberships, a join or creation that just landed — and pass memberStanding
+// and ReadingFull. GetChat hydrates a group for whoever asks, and passes what
+// Access found under the mode the client asked for:
 //
 //   - A non-member has no hydrated member in a group: they are not on the
 //     roster, and a pointer stored for them — a former member's — is not
 //     theirs to see. A DM's members are its record's, whoever the viewer is.
-//   - A viewer who cannot read gets no messaging state: no last message, no
-//     head event sequence, no pointers. The record's own fields — title,
-//     picture, rules, roster summary, last activity — are hydrated for anyone
-//     the caller admits to the record at all.
+//   - A viewer whose reading is denied gets no messaging state: no last
+//     message, no head event sequence, no pointers. The record's own fields —
+//     title, picture, rules, roster summary, last activity — are hydrated for
+//     anyone the caller admits to the record at all.
+//   - A viewer whose reading is redacted gets the messaging state with the
+//     last message redacted (see redact.Message), after its media is
+//     resolved, so the placeholder carries the blurhash a client renders. The
+//     read fails rather than returning a message that cannot be redacted.
 //
 // A DM's members are its two participants, carried on the canonical record. A
 // group's roster lives in its own records and is not enumerated here: the
@@ -351,7 +366,7 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 // GetChat). A picture whose original no longer resolves is left with its stored
 // ORIGINAL for the client to treat as unavailable, rather than failing the
 // whole read.
-func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standing Standing, chats []*Chat) ([]*chatpb.Metadata, error) {
+func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standing Standing, reading Reading, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
 	var pointerRefs []PointerRef
@@ -376,7 +391,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		hydratedMembers[i] = members
 
 		// Messaging state is a reader's alone (see above).
-		if standing.CanListen {
+		if reading != ReadingDenied {
 			if len(members) > 0 {
 				pointerRefs = append(pointerRefs, PointerRef{ChatID: c.ID, Members: members})
 			}
@@ -505,6 +520,13 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 			md.RosterSummary = rosterSummaries[key].ToProto()
 		}
 		md.LastMessage = lastMessages[key]
+		if reading == ReadingRedacted && md.LastMessage != nil {
+			redacted, err := redact.Message(c.ID, md.LastMessage)
+			if err != nil {
+				return nil, fmt.Errorf("redacting last message of chat %s: %w", base64.StdEncoding.EncodeToString(c.ID.Value), err)
+			}
+			md.LastMessage = redacted
+		}
 		md.LatestEventSequence = latestEventSeqs[key]
 		if peer, ok := dmPeerByChat[key]; ok {
 			md.IsHidden = blockedPeers[string(peer.Value)]

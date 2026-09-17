@@ -9,6 +9,7 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 )
 
 // DefaultListenerAdmissionTTL is how long Access remembers that a non-member
@@ -63,6 +64,17 @@ const DefaultListenerAdmissionTTL = 30 * time.Second
 // group stays its members' alone rather than becoming readable by every
 // registered user. If an open group is ever wanted, it is an explicit rule to
 // add here, not the absence of one.
+//
+// A non-member of a group whose listener rules they do not satisfy is not
+// nothing to the group: they may read it redacted (see Standing.CanPreview and
+// redact.Message) — that the messages exist and their shape, never what they
+// say — provided the group carries a listener rule at all, on the same basis
+// as above: a rule is what opens a group to non-members, and its absence
+// keeps the group its members' alone in every form. What a read is answered
+// with — full, redacted, or nothing — is the viewer's standing combined with
+// what the client asked for (see Standing.Reading and messagingpb.ViewMode):
+// a client that wants a group blurred asks for REDACTED, and is answered from
+// membership and the rules' existence without the rules being evaluated.
 //
 // A chat that does not exist admits no one: IsMember, CanListen and CanSpeak all
 // report false, not ErrChatNotFound, for a chat ID nothing is stored under. A
@@ -135,61 +147,123 @@ func (a *Access) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *
 }
 
 // Standing is a user's relation to a chat as Access sees it: whether they are
-// on its roster, and whether they may read it (see Access.CanListen). A member
-// may always read; a non-member with CanListen is a group's qualifying
-// non-member, admitted by its listener rules.
+// on its roster, whether they may read it in full (see Access.CanListen), and
+// whether they may read it redacted (see Access). A member may always read; a
+// non-member with CanListen is a group's qualifying non-member, admitted by
+// its listener rules; a non-member with CanPreview alone is a non-member of a
+// group that carries a listener rule, who may see that it has messages and
+// their shape. CanListen implies CanPreview: whoever may read in full may
+// read redacted (see Reading).
+//
+// A standing found under ViewMode REDACTED (see Access.Standing) never
+// evaluates the rules, so its CanListen is false for a non-member whether or
+// not they satisfy them. Such a standing answers only the question it was
+// asked; a caller that needs CanListen asks under a mode that evaluates it.
 type Standing struct {
-	IsMember  bool
-	CanListen bool
+	IsMember   bool
+	CanListen  bool
+	CanPreview bool
 }
 
 // memberStanding is a member's standing, for a caller that has established
 // membership by other means — a feed built from the viewer's own memberships, a
 // join that just landed.
-var memberStanding = Standing{IsMember: true, CanListen: true}
+var memberStanding = Standing{IsMember: true, CanListen: true, CanPreview: true}
 
-// CanListen reports whether userID may read chatID: they are a member, or chatID
-// is a group whose listener rules they satisfy (see Access). It is false, not
-// an error, for a chat that does not exist.
+// Reading is what a read of a chat is answered with: nothing, the messages in
+// full, or the messages redacted (see redact.Message). It is the viewer's
+// standing combined with the client's ViewMode (see Standing.Reading).
+type Reading uint8
+
+const (
+	// ReadingDenied: the viewer may not read the chat under the mode asked.
+	ReadingDenied Reading = iota
+	// ReadingFull: the messages as sent.
+	ReadingFull
+	// ReadingRedacted: the messages redacted, with Message.redacted set.
+	ReadingRedacted
+)
+
+// Reading resolves the standing against what the client asked for (see
+// messagingpb.ViewMode for the contract): FULL is full content or nothing,
+// FULL_OR_REDACTED the most the standing allows, REDACTED a placeholder for
+// anyone who may read the chat at all — including a member. A mode this
+// version does not know denies, on the same footing as an unknown rule: what
+// the client wants is not understood, so nothing is shown. The mode never
+// widens the standing: a redacted reader is never answered in full.
+func (s Standing) Reading(mode messagingpb.ViewMode) Reading {
+	switch mode {
+	case messagingpb.ViewMode_FULL:
+		if s.CanListen {
+			return ReadingFull
+		}
+	case messagingpb.ViewMode_FULL_OR_REDACTED:
+		if s.CanListen {
+			return ReadingFull
+		}
+		if s.CanPreview {
+			return ReadingRedacted
+		}
+	case messagingpb.ViewMode_REDACTED:
+		if s.CanPreview {
+			return ReadingRedacted
+		}
+	}
+	return ReadingDenied
+}
+
+// CanListen reports whether userID may read chatID in full: they are a member,
+// or chatID is a group whose listener rules they satisfy (see Access). It is
+// false, not an error, for a chat that does not exist.
 func (a *Access) CanListen(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
-	standing, err := a.standing(ctx, chatID, userID, func(ctx context.Context) (*chatpb.Rules, error) {
-		return a.chats.GetGroupRules(ctx, chatID)
-	})
+	standing, err := a.Standing(ctx, chatID, userID, messagingpb.ViewMode_FULL)
 	return standing.CanListen, err
 }
 
 // CanListenWithRules is CanListen for a caller already holding the chat's rules
 // (see StandingWithRules).
 func (a *Access) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
-	standing, err := a.StandingWithRules(ctx, chatID, rules, userID)
+	standing, err := a.StandingWithRules(ctx, chatID, rules, userID, messagingpb.ViewMode_FULL)
 	return standing.CanListen, err
 }
 
-// StandingWithRules answers both of CanListen's questions — is userID a member,
-// and may they read — in one membership read, for a caller already holding the
-// chat's rules (read off a canonical record it loaded for its own purposes,
-// see Chat.Rules), so they are not read a second time. The chat is taken as
+// Standing is userID's standing in chatID (see Standing) as needed to answer
+// a read under mode: membership, then for a non-member of a group only, the
+// group's listener rules — whether it has any, and unless mode is REDACTED,
+// whether userID satisfies them. Under REDACTED the rules are not evaluated,
+// since a placeholder is the answer either way, so a client that wants a group
+// blurred never pays a valuation for it. The standing is zero, not an error,
+// for a chat that does not exist.
+func (a *Access) Standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (Standing, error) {
+	return a.standing(ctx, chatID, userID, mode, func(ctx context.Context) (*chatpb.Rules, error) {
+		return a.chats.GetGroupRules(ctx, chatID)
+	})
+}
+
+// StandingWithRules is Standing for a caller already holding the chat's rules
+// (read off a canonical record it loaded for its own purposes, see
+// Chat.Rules), so they are not read a second time. The chat is taken as
 // existing: a caller that has its rules has already told NOT_FOUND from
 // everything else. A nil rules is a chat with none, which admits no
-// non-member (see Access). On error the standing is zero.
-func (a *Access) StandingWithRules(ctx context.Context, chatID *commonpb.ChatId, rules *chatpb.Rules, userID *commonpb.UserId) (Standing, error) {
-	return a.standing(ctx, chatID, userID, func(context.Context) (*chatpb.Rules, error) {
+// non-member in any form (see Access). On error the standing is zero.
+func (a *Access) StandingWithRules(ctx context.Context, chatID *commonpb.ChatId, rules *chatpb.Rules, userID *commonpb.UserId, mode messagingpb.ViewMode) (Standing, error) {
+	return a.standing(ctx, chatID, userID, mode, func(context.Context) (*chatpb.Rules, error) {
 		return rules, nil
 	})
 }
 
-// standing is the shared shape of CanListen and StandingWithRules: membership,
+// standing is the shared shape of Standing and StandingWithRules: membership,
 // then for a non-member of a group only, the remembered or freshly evaluated
 // listener rules. loadRules supplies the group's rules — from the store, or
 // off a record the caller holds — and is called only when they decide the
 // answer; ErrChatNotFound from it is a plain refusal.
-func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, loadRules func(context.Context) (*chatpb.Rules, error)) (Standing, error) {
+func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode, loadRules func(context.Context) (*chatpb.Rules, error)) (Standing, error) {
 	isMember, err := a.chats.IsMember(ctx, chatID, userID)
 	if err != nil {
 		return Standing{}, err
 	}
 	if isMember {
-		return Standing{IsMember: true, CanListen: true}, nil
+		return memberStanding, nil
 	}
 
 	// Only a group admits a non-member. A DM's rules are nil and would admit
@@ -198,10 +272,14 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 		return Standing{}, nil
 	}
 
+	// A redacted read is answered without the rules' verdict, so a remembered
+	// admission is neither consulted nor made for it.
+	evaluate := mode != messagingpb.ViewMode_REDACTED
+
 	key := admissionKey(chatID, userID)
-	if a.admitted != nil {
+	if evaluate && a.admitted != nil {
 		if _, ok := a.admitted.Get(key); ok {
-			return Standing{CanListen: true}, nil
+			return Standing{CanListen: true, CanPreview: true}, nil
 		}
 	}
 
@@ -212,19 +290,25 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 	if err != nil {
 		return Standing{}, err
 	}
-	// No listener rules, no admission: only a rule can admit a non-member
-	// (see above).
+	// No listener rules, no admission of any kind: only a rule can admit a
+	// non-member (see above).
 	if len(rules.GetListener()) == 0 {
 		return Standing{}, nil
 	}
+	if !evaluate {
+		return Standing{CanPreview: true}, nil
+	}
 	ok, err := a.rules.CanListenWithRules(ctx, rules, userID)
-	if err != nil || !ok {
+	if err != nil {
 		return Standing{}, err
+	}
+	if !ok {
+		return Standing{CanPreview: true}, nil
 	}
 	if a.admitted != nil {
 		a.admitted.SetWithTTL(key, struct{}{}, a.admittedTTL)
 	}
-	return Standing{CanListen: true}, nil
+	return Standing{CanListen: true, CanPreview: true}, nil
 }
 
 // CanSpeak reports whether userID may send in chatID: they are a member, and

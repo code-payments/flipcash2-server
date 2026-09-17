@@ -124,8 +124,6 @@ func TestContent_Reply(t *testing.T) {
 	// so nothing is passed through.
 	_, err := Content(chatID, messageID, replyFixture(&messagingpb.Content{}))
 	assert.ErrorIs(t, err, ErrUnsupportedContent)
-	_, err = Content(chatID, messageID, replyFixture(systemFixture()))
-	assert.ErrorIs(t, err, ErrUnsupportedContent)
 }
 
 func TestContent_Media(t *testing.T) {
@@ -168,12 +166,13 @@ func TestContent_Cash(t *testing.T) {
 	assert.NotSame(t, in.GetCash(), out.GetCash())
 }
 
-// TestContent_System: no placeholder is defined for a system message yet,
-// so it is refused rather than guessed at.
+// TestContent_System: a system message is the server's, not a member's, and
+// passes through unchanged, as the proto contract says it does.
 func TestContent_System(t *testing.T) {
-	out, err := Content(chatID, messageID, systemFixture())
-	assert.ErrorIs(t, err, ErrUnsupportedContent)
-	assert.Nil(t, out)
+	in := systemFixture()
+	out := mustContent(t, chatID, messageID, in)
+	assert.True(t, proto.Equal(in, out))
+	assert.NotSame(t, in.GetSystem(), out.GetSystem())
 }
 
 func TestContent_Deleted(t *testing.T) {
@@ -224,7 +223,7 @@ func TestContent_LeavesInputAlone(t *testing.T) {
 		before := proto.Clone(in)
 		out := mustContent(t, chatID, messageID, in)
 		assert.True(t, proto.Equal(before, in), "%v", in)
-		if in.GetDeleted() == nil && in.GetCash() == nil {
+		if in.GetDeleted() == nil && in.GetCash() == nil && in.GetSystem() == nil {
 			assert.False(t, proto.Equal(in, out), "%v", in)
 		}
 	}
@@ -237,6 +236,7 @@ func fixturesForAllKinds() []*messagingpb.Content {
 		replyFixture(mediaFixture()),
 		mediaFixture(),
 		cashFixture(),
+		systemFixture(),
 		deletedFixture(),
 	}
 }

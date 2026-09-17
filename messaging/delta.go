@@ -7,6 +7,7 @@ import (
 
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/model"
 )
 
@@ -33,9 +34,14 @@ func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.M
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
+	// The reading is fixed at stream open, like the head below: every batch is
+	// answered under it, so a delta is wholly full or wholly redacted however
+	// the viewer's standing moves while it streams.
+	reading, err := s.reading(ctx, log, req.ChatId, userID, req.GetViewMode())
+	if err != nil {
 		return err
-	} else if !allowed {
+	}
+	if reading == chat.ReadingDenied {
 		// A terminal DENIED is a single response that ends the stream.
 		return stream.Send(&messagingpb.GetDeltaResponse{Result: messagingpb.GetDeltaResponse_DENIED})
 	}
@@ -101,12 +107,9 @@ func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.M
 		// A page may carry no surviving messages (all superseded) yet still advance
 		// the checkpoint, so only attach a batch when there's something to apply.
 		if len(msgs) > 0 {
-			batch := make([]*messagingpb.Message, len(msgs))
-			for i, m := range msgs {
-				batch[i] = m.ToProto()
-			}
-			if err := hydrateMedia(ctx, s.media, batch); err != nil {
-				log.With(zap.Error(err)).Warn("Failure resolving media metadata")
+			batch, err := s.present(ctx, log, req.ChatId, reading, msgs)
+			if err != nil {
+				return err
 			}
 			resp.Messages = &messagingpb.MessageBatch{Messages: batch}
 		}

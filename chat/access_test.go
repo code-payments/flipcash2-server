@@ -11,6 +11,7 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 
@@ -340,4 +341,144 @@ func TestAccess_Errors(t *testing.T) {
 	ok, err = a.CanListen(ctx, f.gated.ID, f.funded)
 	require.NoError(t, err)
 	require.True(t, ok)
+}
+
+// TestAccess_ViewMode pins the third standing — a non-member who may preview a
+// gated group but not read it — and that asking for REDACTED never evaluates
+// the rules, so a client that wants a group blurred pays no valuation for it.
+func TestAccess_ViewMode(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	a := NewAccess(f.chats, f.rules)
+
+	preview := Standing{CanPreview: true}
+	full := Standing{CanListen: true, CanPreview: true}
+	evaluating := []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED}
+	every := append(evaluating, messagingpb.ViewMode_REDACTED)
+
+	// A non-member who fails the rules may preview the gated group and no more.
+	// Under the modes that may answer in full the rules are evaluated to find
+	// that out; under REDACTED the answer is the same without the valuation.
+	for _, mode := range evaluating {
+		asked := f.ocpBalance.asked
+		standing, err := a.Standing(ctx, f.gated.ID, f.unfunded, mode)
+		require.NoError(t, err)
+		require.Equal(t, preview, standing, mode)
+		require.Equal(t, asked+1, f.ocpBalance.asked, mode)
+	}
+	asked := f.ocpBalance.asked
+	standing, err := a.Standing(ctx, f.gated.ID, f.unfunded, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, preview, standing)
+	require.Equal(t, asked, f.ocpBalance.asked)
+
+	// A qualifying non-member is not evaluated under REDACTED either — a
+	// placeholder is the answer whatever the rules say — so their admission is
+	// neither found nor remembered by it: the next evaluating read still pays,
+	// and only then is remembered.
+	standing, err = a.Standing(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, preview, standing)
+	require.Equal(t, asked, f.ocpBalance.asked)
+	standing, err = a.Standing(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_FULL_OR_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, full, standing)
+	require.Equal(t, asked+1, f.ocpBalance.asked)
+	standing, err = a.Standing(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_FULL)
+	require.NoError(t, err)
+	require.Equal(t, full, standing)
+	require.Equal(t, asked+1, f.ocpBalance.asked)
+	standing, err = a.Standing(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, preview, standing)
+	require.Equal(t, asked+1, f.ocpBalance.asked)
+
+	// A member is a member under every mode, with nothing evaluated.
+	f.chats.join(f.gated.ID, f.unfunded)
+	asked = f.ocpBalance.asked
+	for _, mode := range every {
+		standing, err := a.Standing(ctx, f.gated.ID, f.unfunded, mode)
+		require.NoError(t, err)
+		require.Equal(t, memberStanding, standing, mode)
+	}
+	require.Equal(t, asked, f.ocpBalance.asked)
+
+	// A group without listener rules admits no non-member in any form, a DM no
+	// third party, and a group that does not exist no one — and none of them
+	// are valued.
+	open := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP})
+	peer := model.MustGenerateUserID()
+	dm := MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, f.funded, peer)
+	f.chats.join(dm, f.funded)
+	f.chats.join(dm, peer)
+	third := model.MustGenerateUserID()
+	f.ocpBalance.set(f.accounts.bind(third), f.usdf, ocp_common.ToCoreMintQuarks(1_000_000))
+	for _, mode := range every {
+		for _, chatID := range []*commonpb.ChatId{open.ID, dm, MustGenerateGroupChatID()} {
+			standing, err := a.Standing(ctx, chatID, third, mode)
+			require.NoError(t, err)
+			require.Equal(t, Standing{}, standing, mode)
+		}
+	}
+	require.Equal(t, asked, f.ocpBalance.asked)
+
+	// With the rules in hand the answer is the same, without a store read.
+	reads := f.chats.reads
+	standing, err = a.StandingWithRules(ctx, f.gated.ID, f.gated.Rules(), third, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, preview, standing)
+	require.Equal(t, reads, f.chats.reads)
+	require.Equal(t, asked, f.ocpBalance.asked)
+	standing, err = a.StandingWithRules(ctx, f.gated.ID, f.gated.Rules(), third, messagingpb.ViewMode_FULL_OR_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, full, standing)
+	require.Equal(t, reads, f.chats.reads)
+	require.Equal(t, asked+1, f.ocpBalance.asked)
+
+	// A rule that cannot be evaluated fails an evaluating read and is no
+	// obstacle to a redacted one, which never asks it. (A reader whose
+	// admission is not yet remembered, so the rule is actually asked.)
+	fourth := model.MustGenerateUserID()
+	f.accounts.bind(fourth)
+	f.ocpBalance.err = errors.New("unavailable")
+	_, err = a.Standing(ctx, f.gated.ID, fourth, messagingpb.ViewMode_FULL_OR_REDACTED)
+	require.Error(t, err)
+	standing, err = a.Standing(ctx, f.gated.ID, fourth, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, preview, standing)
+}
+
+// TestStanding_Reading pins the mode table (see messagingpb.ViewMode): the
+// mode never widens a standing, and a mode this version does not know denies.
+func TestStanding_Reading(t *testing.T) {
+	none := Standing{}
+	preview := Standing{CanPreview: true}
+	full := Standing{CanListen: true, CanPreview: true}
+	for _, tc := range []struct {
+		standing Standing
+		mode     messagingpb.ViewMode
+		want     Reading
+	}{
+		{none, messagingpb.ViewMode_FULL, ReadingDenied},
+		{preview, messagingpb.ViewMode_FULL, ReadingDenied},
+		{full, messagingpb.ViewMode_FULL, ReadingFull},
+		{memberStanding, messagingpb.ViewMode_FULL, ReadingFull},
+
+		{none, messagingpb.ViewMode_FULL_OR_REDACTED, ReadingDenied},
+		{preview, messagingpb.ViewMode_FULL_OR_REDACTED, ReadingRedacted},
+		{full, messagingpb.ViewMode_FULL_OR_REDACTED, ReadingFull},
+		{memberStanding, messagingpb.ViewMode_FULL_OR_REDACTED, ReadingFull},
+
+		{none, messagingpb.ViewMode_REDACTED, ReadingDenied},
+		{preview, messagingpb.ViewMode_REDACTED, ReadingRedacted},
+		{full, messagingpb.ViewMode_REDACTED, ReadingRedacted},
+		{memberStanding, messagingpb.ViewMode_REDACTED, ReadingRedacted},
+
+		{none, messagingpb.ViewMode(99), ReadingDenied},
+		{preview, messagingpb.ViewMode(99), ReadingDenied},
+		{full, messagingpb.ViewMode(99), ReadingDenied},
+		{memberStanding, messagingpb.ViewMode(99), ReadingDenied},
+	} {
+		require.Equal(t, tc.want, tc.standing.Reading(tc.mode), "%+v under %v", tc.standing, tc.mode)
+	}
 }

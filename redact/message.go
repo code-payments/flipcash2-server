@@ -28,9 +28,11 @@ import (
 //     removed.
 //   - content: each item is its placeholder. An item Content refuses fails
 //     the whole message, so nothing unknown is passed through.
-//   - reactions: not carried. Reactions are an overlay the reaction RPCs
-//     serve, and those are a reader's in full: a viewer who reads a chat
-//     redacted may not call them, so a message does not carry them either.
+//   - reactions: not carried, as no message read carries them. Reactions are
+//     an overlay the reaction RPCs and the event stream serve, to a redacted
+//     reader as to a full one (see messaging.Server's overlayStanding): who
+//     reacted, with what, on which message is the conversation's movement,
+//     not its words.
 //
 // The message is expected to have had its media resolved already, so the
 // placeholder keeps each rendition's dimensions and blurhash (see Content on

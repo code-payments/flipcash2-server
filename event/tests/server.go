@@ -5,6 +5,7 @@ import (
 	"io"
 	"maps"
 	"math/rand/v2"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,11 +23,14 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
+	ocp_balancepb "github.com/code-payments/ocp-protobuf-api/generated/go/balance/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
 	badgememory "github.com/code-payments/flipcash2-server/badge/memory"
+	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/chat"
 	chat_memory "github.com/code-payments/flipcash2-server/chat/memory"
 	"github.com/code-payments/flipcash2-server/cluster"
@@ -49,6 +53,8 @@ func RunServerTests(t *testing.T, accounts account.Store, teardown func()) {
 		testChatEventPublishing,
 		testMembershipFollowsStreams,
 		testMembershipReconciles,
+		testChatPreview,
+		testChatPreviewExpires,
 		testServerShutdown,
 	} {
 		tf(t, accounts)
@@ -800,6 +806,7 @@ func newTestEvent() *eventpb.Event {
 type testEnv struct {
 	clusterStore cluster.Store
 	chats        chat.Store
+	accounts     *staffAccounts
 	client1      *clientTestEnv
 	client2      *clientTestEnv
 	server1      *serverTestEnv
@@ -892,6 +899,13 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool, opt
 	// A shared chat store, so both servers resolve the same group memberships.
 	env.chats = chat_memory.NewInMemory()
 
+	// The access a chat stream's viewer is admitted by, over the shared chat
+	// store, with a staff flag the tests can set and no admission window, so a
+	// standing re-check sees a revocation at once.
+	env.accounts = newStaffAccounts(accounts)
+	balances := balance.NewClient(log, env.accounts, &emptyOcpBalance{})
+	access := chat.NewAccess(env.chats, chat.NewRuleEvaluator(env.accounts, balances, env.chats), chat.WithListenerAdmissionTTL(0))
+
 	newServerEnv := func(name string, conn *grpc.ClientConn) *serverTestEnv {
 		membership := cluster.NewMembership(log, env.clusterStore, &cluster.Member{
 			InstanceID: name,
@@ -917,6 +931,7 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool, opt
 				accounts,
 				badges,
 				env.chats,
+				access,
 				subscriptions,
 				userEventBus,
 				chatEventBus,
@@ -1114,4 +1129,363 @@ func assertEquivalentTestEvents(t *testing.T, obj1, obj2 *eventpb.Event) {
 	cloned1.GetTest().Hops = nil
 	cloned2.GetTest().Hops = nil
 	require.NoError(t, protoutil.ProtoEqualError(cloned1, cloned2))
+}
+
+// testChatPreview pins a preview of a group: it opens for a non-member who
+// may read the group under the mode asked — a qualifying non-member in full,
+// any other registered user redacted under a mode that allows it — and for no
+// one else: a member is DENIED whatever the mode, having nothing to preview.
+// It carries that group's updates and nothing else, across the fleet,
+// honoring exclusions, with every message under the standing fixed at open.
+// A group that does not exist is NOT_FOUND; a DM is DENIED to everyone, its
+// members included.
+func testChatPreview(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, true)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	member, memberKeys := registerUser(t, accounts)
+	staff, staffKeys := registerUser(t, accounts)
+	testEnv.accounts.setStaff(staff, true)
+	other, otherKeys := registerUser(t, accounts)
+
+	// A staff-only group with member as its one member: staff may read it in
+	// full without joining, other only redacted.
+	group := putStaffGroupChat(t, testEnv.chats, member)
+	dm := putDmChat(t, testEnv.chats, member, other)
+
+	// Refused at open: a member under any mode, a non-member with no full
+	// reading under FULL, a group that does not exist under any mode, and a
+	// DM under any mode by anyone.
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		expectChatStreamError(t, testEnv.client1.openChatPreview(t, memberKeys, group, mode), eventpb.StreamEventsResponse_StreamError_DENIED)
+		expectChatStreamError(t, testEnv.client1.openChatPreview(t, memberKeys, dm, mode), eventpb.StreamEventsResponse_StreamError_DENIED)
+		expectChatStreamError(t, testEnv.client1.openChatPreview(t, staffKeys, dm, mode), eventpb.StreamEventsResponse_StreamError_DENIED)
+	}
+	expectChatStreamError(t, testEnv.client1.openChatPreview(t, otherKeys, group, messagingpb.ViewMode_FULL), eventpb.StreamEventsResponse_StreamError_DENIED)
+	expectChatStreamError(t, testEnv.client1.openChatPreview(t, staffKeys, chat.MustGenerateGroupChatID(), messagingpb.ViewMode_FULL_OR_REDACTED), eventpb.StreamEventsResponse_StreamError_NOT_FOUND)
+
+	// Open: the qualifying non-member in full, from a device on each server;
+	// other redacted, from each server too.
+	staffFull1 := testEnv.client1.openChatPreview(t, staffKeys, group, messagingpb.ViewMode_FULL)
+	staffFull2 := testEnv.client2.openChatPreview(t, staffKeys, group, messagingpb.ViewMode_FULL_OR_REDACTED)
+	otherRedacted1 := testEnv.client1.openChatPreview(t, otherKeys, group, messagingpb.ViewMode_FULL_OR_REDACTED)
+	otherRedacted2 := testEnv.client2.openChatPreview(t, otherKeys, group, messagingpb.ViewMode_REDACTED)
+
+	time.Sleep(500 * time.Millisecond)
+
+	publish := func(sender *serverTestEnv, e *eventpb.Event, exclude ...*commonpb.UserId) *eventpb.Event {
+		sender.chatEventBus.OnEvent(group, &eventpb.ChatEvent{ChatId: group, Event: e, ExcludeUserIds: exclude})
+		return e
+	}
+	receiveFull := func(streamer *cancellableStream, expected *eventpb.Event) {
+		got := receiveNextEvents(t, streamer)
+		require.Len(t, got, 1)
+		require.NoError(t, protoutil.ProtoEqualError(expected, got[0]))
+	}
+	receiveRedacted := func(streamer *cancellableStream, sent *eventpb.Event) {
+		got := receiveNextEvents(t, streamer)
+		require.Len(t, got, 1)
+		assertRedactedMessageSent(t, group, sent, got[0])
+	}
+	// receiveAll asserts a sent message arrives on every stream in full or
+	// redacted as each opened: the full readers as published, the redacted
+	// ones as a placeholder of the same message.
+	receiveAll := func(sent *eventpb.Event, full, redacted []*cancellableStream) {
+		for _, streamer := range full {
+			receiveFull(streamer, sent)
+		}
+		for _, streamer := range redacted {
+			receiveRedacted(streamer, sent)
+		}
+	}
+	fullStreams := []*cancellableStream{staffFull1, staffFull2}
+	redactedStreams := []*cancellableStream{otherRedacted1, otherRedacted2}
+	allStreams := append(append([]*cancellableStream{}, fullStreams...), redactedStreams...)
+
+	// A message sent, published from either server, reaches every stream.
+	for _, sender := range []*serverTestEnv{testEnv.server1, testEnv.server2} {
+		receiveAll(publish(sender, newMessageSentEvent(group, member, 1, "the words")), fullStreams, redactedStreams)
+	}
+
+	// Nothing but the group's updates: a user event and another chat's
+	// update, both addressed to staff, and the DM's update addressed to
+	// other, never appear on a preview — their next event is the group's.
+	testEnv.server1.sendTestUserEvent(staff)
+	testEnv.server1.userEventBus.OnEvent(staff, newMessageSentEvent(chat.MustGenerateGroupChatID(), staff, 1, "elsewhere"))
+	testEnv.server1.userEventBus.OnEvent(other, newMessageSentEvent(dm, member, 1, "in the dm"))
+	receiveAll(publish(testEnv.server1, newMessageSentEvent(group, member, 2, "more words")), fullStreams, redactedStreams)
+
+	// An exclusion applies to a preview as to any other stream: excluding
+	// staff suppresses both of their previews, on both delivery paths, while
+	// the others still receive.
+	excluded := publish(testEnv.server2, newMessageSentEvent(group, member, 3, "not for staff"), staff)
+	receiveAll(excluded, nil, redactedStreams)
+	receiveAll(publish(testEnv.server2, newMessageSentEvent(group, member, 4, "for everyone")), fullStreams, redactedStreams)
+
+	// A roster overlay is delivered whatever the mode, as it is: a member's
+	// departure reaches every preview unredacted.
+	left := rosterLeftEvent(group, member, 1)
+	publish(testEnv.server1, left)
+	for _, streamer := range allStreams {
+		receiveFull(streamer, left)
+	}
+
+	// The standing is the open's: staff who lose their flag mid-window keep
+	// their full previews until the window closes, and are refused a new
+	// one; other, who joins mid-window, keeps their redacted previews too,
+	// and is refused a new one as a member.
+	testEnv.accounts.setStaff(staff, false)
+	changed, _, err := testEnv.chats.AddGroupMembers(ctx, group, []*commonpb.UserId{other})
+	require.NoError(t, err)
+	require.True(t, changed)
+	receiveAll(publish(testEnv.server2, newMessageSentEvent(group, other, 5, "after the changes")), fullStreams, redactedStreams)
+	expectChatStreamError(t, testEnv.client1.openChatPreview(t, staffKeys, group, messagingpb.ViewMode_FULL), eventpb.StreamEventsResponse_StreamError_DENIED)
+	expectChatStreamError(t, testEnv.client1.openChatPreview(t, otherKeys, group, messagingpb.ViewMode_REDACTED), eventpb.StreamEventsResponse_StreamError_DENIED)
+}
+
+// testChatPreviewExpires pins the window: a preview ends with STREAM_EXPIRED
+// once the server's lifetime elapses, whether or not anything was delivered,
+// and a client answering every ping does not extend it. A preview opened
+// after another's window closed gets a window of its own.
+func testChatPreviewExpires(t *testing.T, accounts account.Store) {
+	const lifetime = 2 * time.Second
+	testEnv, cleanup := setupTest(t, accounts, false, event.WithChatPreviewLifetime(lifetime))
+	defer cleanup()
+
+	member, _ := registerUser(t, accounts)
+	staff, staffKeys := registerUser(t, accounts)
+	testEnv.accounts.setStaff(staff, true)
+	group := putStaffGroupChat(t, testEnv.chats, member)
+
+	// Two previews of the same window, one read as soon as it opens and one
+	// left to accumulate; both close together.
+	first := testEnv.client1.openChatPreview(t, staffKeys, group, messagingpb.ViewMode_FULL)
+	second := testEnv.client1.openChatPreview(t, staffKeys, group, messagingpb.ViewMode_FULL)
+	openedAt := time.Now()
+
+	time.Sleep(lifetime / 4)
+	sent := newMessageSentEvent(group, member, 1, "hello")
+	testEnv.server1.chatEventBus.OnEvent(group, &eventpb.ChatEvent{ChatId: group, Event: sent})
+	got := receiveNextEvents(t, first)
+	require.Len(t, got, 1)
+	require.NoError(t, protoutil.ProtoEqualError(sent, got[0]))
+	expectChatStreamError(t, first, eventpb.StreamEventsResponse_StreamError_STREAM_EXPIRED)
+	require.GreaterOrEqual(t, time.Since(openedAt), lifetime)
+
+	got = receiveNextEvents(t, second)
+	require.Len(t, got, 1)
+	require.NoError(t, protoutil.ProtoEqualError(sent, got[0]))
+	expectChatStreamError(t, second, eventpb.StreamEventsResponse_StreamError_STREAM_EXPIRED)
+	elapsed := time.Since(openedAt)
+	require.GreaterOrEqual(t, elapsed, lifetime)
+	require.Less(t, elapsed, 2*lifetime)
+
+	// A new preview opens with its own window, and is delivered to.
+	again := testEnv.client1.openChatPreview(t, staffKeys, group, messagingpb.ViewMode_FULL)
+	time.Sleep(250 * time.Millisecond)
+	sent = newMessageSentEvent(group, member, 2, "again")
+	testEnv.server1.chatEventBus.OnEvent(group, &eventpb.ChatEvent{ChatId: group, Event: sent})
+	got = receiveNextEvents(t, again)
+	require.Len(t, got, 1)
+	require.NoError(t, protoutil.ProtoEqualError(sent, got[0]))
+	expectChatStreamError(t, again, eventpb.StreamEventsResponse_StreamError_STREAM_EXPIRED)
+}
+
+// registerUser binds a fresh registered user and returns their identity.
+func registerUser(t *testing.T, accounts account.Store) (*commonpb.UserId, model.KeyPair) {
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(context.Background(), userID, keyPair.Proto())
+	require.NoError(t, err)
+	require.NoError(t, accounts.SetRegistrationFlag(context.Background(), userID, true))
+	return userID, keyPair
+}
+
+// putStaffGroupChat creates a staff-only group with the given members joined
+// and returns its ID. Staff is the one listener rule a test can satisfy
+// without a balance: it opens the group to a staff non-member in full, and to
+// every other registered user redacted.
+func putStaffGroupChat(t *testing.T, chats chat.Store, members ...*commonpb.UserId) *commonpb.ChatId {
+	c := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      members,
+		Title:        "Staff group",
+		IsStaffOnly:  true,
+		LastActivity: time.Now(),
+	}
+	require.NoError(t, chats.PutChat(context.Background(), c))
+	return c.ID
+}
+
+// putDmChat creates a contact DM between the two users and returns its ID.
+func putDmChat(t *testing.T, chats chat.Store, a, b *commonpb.UserId) *commonpb.ChatId {
+	c := &chat.Chat{
+		ID:           chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, b),
+		Type:         chatpb.ChatType_CONTACT_DM,
+		Members:      []*commonpb.UserId{a, b},
+		LastActivity: time.Now(),
+	}
+	require.NoError(t, chats.PutChat(context.Background(), c))
+	return c.ID
+}
+
+// newMessageSentEvent builds a chat update carrying one sent text message,
+// valid on its way out of the stream.
+func newMessageSentEvent(chatID *commonpb.ChatId, sender *commonpb.UserId, seq uint64, text string) *eventpb.Event {
+	e := &eventpb.Event{
+		Id: model.MustGenerateEventID(),
+		Ts: timestamppb.Now(),
+		Type: &eventpb.Event_ChatUpdate{ChatUpdate: &eventpb.ChatUpdate{
+			Chat: chatID,
+			Events: &messagingpb.EventBatch{Events: []*messagingpb.Event{{
+				Sequence: seq,
+				Count:    1,
+				Ts:       timestamppb.Now(),
+				Mutations: []*messagingpb.Mutation{{Type: &messagingpb.Mutation_MessageSent{MessageSent: &messagingpb.Message{
+					MessageId:     &messagingpb.MessageId{Value: seq},
+					SenderId:      sender,
+					Content:       []*messagingpb.Content{{Type: &messagingpb.Content_Text{Text: &messagingpb.TextContent{Text: text}}}},
+					Ts:            timestamppb.Now(),
+					EventSequence: seq,
+				}}}},
+			}}},
+		}},
+	}
+	if err := e.Validate(); err != nil {
+		panic(err)
+	}
+	return e
+}
+
+// rosterLeftEvent builds a chat update carrying a member's departure at the
+// given roster version.
+func rosterLeftEvent(chatID *commonpb.ChatId, subject *commonpb.UserId, version uint64) *eventpb.Event {
+	e := &eventpb.Event{
+		Id: model.MustGenerateEventID(),
+		Ts: timestamppb.Now(),
+		Type: &eventpb.Event_ChatUpdate{ChatUpdate: &eventpb.ChatUpdate{
+			Chat: chatID,
+			RosterUpdates: &chatpb.RosterUpdateBatch{RosterUpdates: []*chatpb.RosterUpdate{{
+				Kind:          &chatpb.RosterUpdate_MemberLeft_{MemberLeft: &chatpb.RosterUpdate_MemberLeft{UserId: subject}},
+				RosterSummary: &chatpb.RosterSummary{MemberCount: 1, Version: version},
+			}}},
+		}},
+	}
+	if err := e.Validate(); err != nil {
+		panic(err)
+	}
+	return e
+}
+
+// assertRedactedMessageSent asserts that got is the redaction of a message
+// sent event built by newMessageSentEvent: the same event and message, its
+// content a placeholder with Message.redacted set.
+func assertRedactedMessageSent(t *testing.T, chatID *commonpb.ChatId, sent, got *eventpb.Event) {
+	require.NoError(t, protoutil.ProtoEqualError(sent.Id, got.Id))
+	require.NoError(t, protoutil.ProtoEqualError(chatID, got.GetChatUpdate().GetChat()))
+
+	sentEvents := sent.GetChatUpdate().GetEvents().GetEvents()
+	gotEvents := got.GetChatUpdate().GetEvents().GetEvents()
+	require.Len(t, gotEvents, len(sentEvents))
+	for i, sentEvent := range sentEvents {
+		require.Equal(t, sentEvent.GetSequence(), gotEvents[i].GetSequence())
+		require.Len(t, gotEvents[i].GetMutations(), 1)
+		sentMsg := sentEvent.GetMutations()[0].GetMessageSent()
+		gotMsg := gotEvents[i].GetMutations()[0].GetMessageSent()
+		require.NotNil(t, gotMsg)
+		require.True(t, gotMsg.GetRedacted())
+		require.NoError(t, protoutil.ProtoEqualError(sentMsg.GetMessageId(), gotMsg.GetMessageId()))
+		require.NoError(t, protoutil.ProtoEqualError(sentMsg.GetSenderId(), gotMsg.GetSenderId()))
+		require.Len(t, gotMsg.GetContent(), 1)
+		require.NotEmpty(t, gotMsg.GetContent()[0].GetText().GetText())
+		require.NotEqual(t, sentMsg.GetContent()[0].GetText().GetText(), gotMsg.GetContent()[0].GetText().GetText())
+	}
+}
+
+// openChatPreview opens a preview of chatID under mode and
+// returns it, leaving the outcome — events, or an error at open — for the
+// caller to read.
+func (c *clientTestEnv) openChatPreview(t *testing.T, keyPair model.KeyPair, chatID *commonpb.ChatId, mode messagingpb.ViewMode) *cancellableStream {
+	cancellableCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	req := &eventpb.StreamEventsRequest{
+		Type: &eventpb.StreamEventsRequest_Params_{
+			Params: &eventpb.StreamEventsRequest_Params{
+				Ts: timestamppb.Now(),
+				Target: &eventpb.StreamEventsRequest_Params_ChatPreview{
+					ChatPreview: &eventpb.StreamEventsRequest_ChatPreviewParams{ChatId: chatID, ViewMode: mode},
+				},
+			},
+		},
+	}
+	require.NoError(t, keyPair.Auth(req.GetParams(), &req.GetParams().Auth))
+
+	streamer, err := c.client.StreamEvents(cancellableCtx)
+	require.NoError(t, err)
+	require.NoError(t, streamer.Send(req))
+
+	return &cancellableStream{stream: streamer, cancel: cancel}
+}
+
+// expectChatStreamError pumps the stream, answering pings, until it yields a
+// stream error, and asserts its code. An event batch before it is a failure.
+func expectChatStreamError(t *testing.T, streamer *cancellableStream, code eventpb.StreamEventsResponse_StreamError_Code) {
+	for {
+		resp, err := streamer.stream.Recv()
+		require.NoError(t, err)
+
+		switch typed := resp.Type.(type) {
+		case *eventpb.StreamEventsResponse_Error:
+			require.Equal(t, code, typed.Error.Code)
+			return
+		case *eventpb.StreamEventsResponse_Ping:
+			err = streamer.stream.Send(&eventpb.StreamEventsRequest{
+				Type: &eventpb.StreamEventsRequest_Pong{Pong: &eventpb.ClientPong{Timestamp: timestamppb.Now()}},
+			})
+			if err != io.EOF {
+				require.NoError(t, err)
+			}
+		case *eventpb.StreamEventsResponse_Events:
+			require.Failf(t, "unexpected events", "expected stream error %s, got %d events", code, len(typed.Events.Events))
+		default:
+			require.Fail(t, "events, ping or error wasn't set")
+		}
+	}
+}
+
+// staffAccounts is an account.Store whose staff flag a test can set: the
+// in-memory store answers IsStaff false for everyone, and has no setter.
+type staffAccounts struct {
+	account.Store
+
+	mu    sync.Mutex
+	staff map[string]bool
+}
+
+func newStaffAccounts(db account.Store) *staffAccounts {
+	return &staffAccounts{Store: db, staff: make(map[string]bool)}
+}
+
+func (a *staffAccounts) setStaff(userID *commonpb.UserId, isStaff bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.staff[string(userID.Value)] = isStaff
+}
+
+func (a *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.staff[string(userID.Value)], nil
+}
+
+// emptyOcpBalance is an OCP balance service with no accounts: the groups the
+// suite creates carry a staff rule alone, so no balance is ever asked for.
+type emptyOcpBalance struct{}
+
+func (emptyOcpBalance) GetBalances(context.Context, *ocp_balancepb.GetBalancesRequest, ...grpc.CallOption) (*ocp_balancepb.GetBalancesResponse, error) {
+	return &ocp_balancepb.GetBalancesResponse{}, nil
 }

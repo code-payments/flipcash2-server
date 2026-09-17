@@ -27,8 +27,8 @@ import (
 // would pass the shared suite and silently double the read.
 func TestMessaging_DynamoDBStore_PointerLayout(t *testing.T) {
 	ctx := context.Background()
-	require.NoError(t, CreateTables(ctx, testEnv.Client, messagesTable, pointersTable, reactionsTable))
-	s := NewInDynamoDB(testEnv.Client, messagesTable, pointersTable, reactionsTable).(*store)
+	require.NoError(t, CreateTables(ctx, testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable))
+	s := NewInDynamoDB(testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable).(*store)
 	defer s.reset()
 
 	userA := model.MustGenerateUserID()

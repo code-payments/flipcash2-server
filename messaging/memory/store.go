@@ -14,6 +14,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/messaging"
 )
@@ -43,14 +44,22 @@ type chatState struct {
 // across an emoji being removed and re-added; an empty aggregate is treated as
 // inactive (absent from summaries, not counted toward the per-message type cap).
 //
-// sample is the bounded subset of reactors retained for the surfaced sample,
-// capped at messaging.MaxStoredSampleReactors (a new reactor evicts the
-// least-recent entry once full) and never backfilled on removal — it mirrors the
-// DynamoDB store's sample map so both back ends behave identically.
+// Each reactor records the version that added them, the ordering key for every
+// reactor list (see messaging.ReactorLess). sample is the bounded subset of
+// reactors retained for the surfaced sample, capped at
+// messaging.MaxStoredSampleReactors (a new reactor evicts the lowest-version
+// entry once full) and never backfilled on removal — it mirrors the DynamoDB
+// store's sample map so both back ends behave identically.
 type reactionAgg struct {
 	version  uint64
-	reactors map[string]time.Time // string(userID.Value) -> reacted timestamp
-	sample   map[string]time.Time // bounded subset of reactors, string(userID.Value) -> ts
+	reactors map[string]reactorEntry // string(userID.Value) -> entry
+	sample   map[string]reactorEntry // bounded subset of reactors, string(userID.Value) -> entry
+}
+
+// reactorEntry is one user's reaction: the version that added it and when.
+type reactorEntry struct {
+	version uint64
+	ts      time.Time
 }
 
 func newChatState() *chatState {
@@ -527,8 +536,8 @@ func (m *memory) AddReaction(
 
 	// Idempotent: the user already reacted with this emoji.
 	if agg != nil {
-		if _, ok := agg.reactors[userKey]; ok {
-			return buildReaction(emoji, agg), false, false, nil
+		if existing, ok := agg.reactors[userKey]; ok {
+			return selfReaction(buildReaction(emoji, agg), existing.version), false, false, nil
 		}
 	}
 
@@ -541,21 +550,30 @@ func (m *memory) AddReaction(
 	}
 
 	if agg == nil {
-		agg = &reactionAgg{reactors: make(map[string]time.Time), sample: make(map[string]time.Time)}
+		agg = &reactionAgg{reactors: make(map[string]reactorEntry), sample: make(map[string]reactorEntry)}
 		byEmoji[emoji] = agg
 	}
 	agg.version++
-	agg.reactors[userKey] = ts
+	entry := reactorEntry{version: agg.version, ts: ts}
+	agg.reactors[userKey] = entry
 	// Maintain the recent sample: insert this reactor and, if that pushes the stored
-	// set over its cap, evict the least-recent entry. This keeps the sample the
+	// set over its cap, evict the lowest-version entry. This keeps the sample the
 	// most-recent MaxStoredSampleReactors (reads surface the most-recent
 	// MaxSampleReactors of it); it is not backfilled on removal.
-	agg.sample[userKey] = ts
+	agg.sample[userKey] = entry
 	if len(agg.sample) > messaging.MaxStoredSampleReactors {
 		evictLeastRecentSample(agg.sample)
 	}
 
-	return buildReaction(emoji, agg), true, false, nil
+	return selfReaction(buildReaction(emoji, agg), entry.version), true, false, nil
+}
+
+// selfReaction marks an AddReaction result as the reactor's own view: reacted,
+// at the version that added their reaction.
+func selfReaction(r *messaging.Reaction, addedAt uint64) *messaging.Reaction {
+	r.ReactedBySelf = true
+	r.ReactedBySelfVersion = addedAt
+	return r
 }
 
 func (m *memory) RemoveReaction(
@@ -701,8 +719,14 @@ func (m *memory) GetSelfReactions(
 	_ context.Context,
 	chatID *commonpb.ChatId,
 	userID *commonpb.UserId,
-	refs []messaging.ReactionRef,
-) ([]messaging.ReactionRef, error) {
+	messageIDs []*messagingpb.MessageId,
+) ([]messaging.SelfReaction, error) {
+	// Groups only, as the Store contract says; this store could answer a DM
+	// from its reactor map, but the backends must agree on what is an error.
+	if !chat.IsGroupChatID(chatID) {
+		return nil, messaging.ErrSelfReactionsGroupOnly
+	}
+
 	m.Lock()
 	defer m.Unlock()
 
@@ -712,14 +736,21 @@ func (m *memory) GetSelfReactions(
 	}
 
 	userKey := string(userID.Value)
-	var present []messaging.ReactionRef
-	for _, ref := range refs {
-		agg := cs.reactions[ref.MessageID.Value][ref.Emoji]
-		if agg == nil {
+	seen := make(map[uint64]struct{}, len(messageIDs))
+	var present []messaging.SelfReaction
+	for _, id := range messageIDs {
+		if _, dup := seen[id.Value]; dup {
 			continue
 		}
-		if _, ok := agg.reactors[userKey]; ok {
-			present = append(present, ref)
+		seen[id.Value] = struct{}{}
+		for emoji, agg := range cs.reactions[id.Value] {
+			if entry, ok := agg.reactors[userKey]; ok {
+				present = append(present, messaging.SelfReaction{
+					MessageID: &messagingpb.MessageId{Value: id.Value},
+					Emoji:     emoji,
+					Version:   entry.version,
+				})
+			}
 		}
 	}
 	return present, nil
@@ -730,9 +761,8 @@ func (m *memory) GetReactors(
 	chatID *commonpb.ChatId,
 	messageID *messagingpb.MessageId,
 	emoji string,
-	_ bool, // always consistent; the flag only matters for eventually consistent backends
 	opts ...database.QueryOption,
-) ([]*messaging.Reactor, bool, error) {
+) ([]*messaging.Reactor, uint64, bool, error) {
 	q := database.ApplyQueryOptions(opts...)
 
 	m.Lock()
@@ -740,21 +770,23 @@ func (m *memory) GetReactors(
 
 	cs := m.chats[string(chatID.Value)]
 	if cs == nil {
-		return nil, false, nil
+		return nil, 0, false, nil
 	}
 	agg := cs.reactions[messageID.Value][emoji]
-	if agg == nil || len(agg.reactors) == 0 {
-		return nil, false, nil
+	if agg == nil {
+		return nil, 0, false, nil
+	}
+	if len(agg.reactors) == 0 {
+		return nil, agg.version, false, nil
 	}
 
 	reactors := reactorsOf(agg)
 
-	// Resume strictly after the cursor reactor, in most-recent-first order.
-	if ts, userID, ok := messaging.ReactorFromPageToken(q.PagingToken); ok {
-		cursor := &messaging.Reactor{UserID: userID, ReactedTs: ts}
+	// Resume strictly below the cursor version, in most-recent-first order.
+	if cursor, ok := messaging.ReactorFromPageToken(q.PagingToken); ok {
 		filtered := reactors[:0]
 		for _, r := range reactors {
-			if reactorLess(cursor, r) {
+			if r.Version < cursor {
 				filtered = append(filtered, r)
 			}
 		}
@@ -769,7 +801,7 @@ func (m *memory) GetReactors(
 	if hasMore {
 		reactors = reactors[:limit]
 	}
-	return reactors, hasMore, nil
+	return reactors, agg.version, hasMore, nil
 }
 
 // buildReaction projects an in-memory aggregate onto a messaging.Reaction. The
@@ -778,10 +810,11 @@ func (m *memory) GetReactors(
 // for the server to overlay.
 func buildReaction(emoji string, agg *reactionAgg) *messaging.Reaction {
 	sample := make([]*messaging.Reactor, 0, len(agg.sample))
-	for userKey, ts := range agg.sample {
+	for userKey, entry := range agg.sample {
 		sample = append(sample, &messaging.Reactor{
 			UserID:    &commonpb.UserId{Value: []byte(userKey)},
-			ReactedTs: ts,
+			ReactedTs: entry.ts,
+			Version:   entry.version,
 		})
 	}
 	return &messaging.Reaction{
@@ -793,17 +826,17 @@ func buildReaction(emoji string, agg *reactionAgg) *messaging.Reaction {
 }
 
 // evictLeastRecentSample removes the single least-recent entry from a sample map
-// (earliest ts; ties broken by larger user key), restoring it to
-// MaxStoredSampleReactors after an over-cap insert. The tie-break matches
-// messaging.SampleFromReactors, whose user-ID order on the raw-byte keys is the
-// same as the lexicographic order used here.
-func evictLeastRecentSample(sample map[string]time.Time) {
+// (lowest version; ties, impossible among real reactors, broken by larger user
+// key), restoring it to MaxStoredSampleReactors after an over-cap insert. The
+// tie-break matches messaging.ReactorLess, whose user-ID order on the raw-byte
+// keys is the same as the lexicographic order used here.
+func evictLeastRecentSample(sample map[string]reactorEntry) {
 	var evictKey string
-	var evictTs time.Time
+	var lowest uint64
 	first := true
-	for k, t := range sample {
-		if first || t.Before(evictTs) || (t.Equal(evictTs) && k > evictKey) {
-			evictKey, evictTs, first = k, t, false
+	for k, e := range sample {
+		if first || e.version < lowest || (e.version == lowest && k > evictKey) {
+			evictKey, lowest, first = k, e.version, false
 		}
 	}
 	if !first {
@@ -828,27 +861,19 @@ func summarize(byEmoji map[string]*reactionAgg) []*messaging.Reaction {
 	return out
 }
 
-// reactorsOf returns an aggregate's reactors most-recent-first (ties broken by
-// user ID), the canonical order for samples and GetReactors paging.
+// reactorsOf returns an aggregate's reactors most-recent-first (see
+// messaging.ReactorLess), the canonical order for samples and GetReactors paging.
 func reactorsOf(agg *reactionAgg) []*messaging.Reactor {
 	out := make([]*messaging.Reactor, 0, len(agg.reactors))
-	for userKey, ts := range agg.reactors {
+	for userKey, entry := range agg.reactors {
 		out = append(out, &messaging.Reactor{
 			UserID:    &commonpb.UserId{Value: []byte(userKey)},
-			ReactedTs: ts,
+			ReactedTs: entry.ts,
+			Version:   entry.version,
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return reactorLess(out[i], out[j]) })
+	sort.Slice(out, func(i, j int) bool { return messaging.ReactorLess(out[i], out[j]) })
 	return out
-}
-
-// reactorLess orders reactors most-recent-first, breaking ties by ascending user
-// ID so the ordering is total and stable for pagination.
-func reactorLess(a, b *messaging.Reactor) bool {
-	if !a.ReactedTs.Equal(b.ReactedTs) {
-		return a.ReactedTs.After(b.ReactedTs)
-	}
-	return bytes.Compare(a.UserID.Value, b.UserID.Value) < 0
 }
 
 func countActiveReactions(byEmoji map[string]*reactionAgg) int {

@@ -1556,12 +1556,18 @@ func testServer_Reactions_Reactors(t *testing.T, badges badge.Store, blocklists 
 	_, err = e.addReaction(e.keysA, msgID, emoji)
 	require.NoError(t, err)
 
-	// Full list: both reactors, no further pages.
+	// Full list: both reactors, newest first, each stamped with the version that
+	// added them, and the page current to the aggregate's version (two adds).
 	full, err := e.getReactors(e.keysA, msgID, emoji, &commonpb.QueryOptions{})
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetReactorsResponse_OK, full.Result)
 	require.False(t, full.HasMore)
 	require.Len(t, full.Reactors, 2)
+	require.Equal(t, uint64(2), full.Version)
+	require.Equal(t, e.userA.Value, full.Reactors[0].UserId.Value)
+	require.Equal(t, uint64(2), full.Reactors[0].Version)
+	require.Equal(t, e.userB.Value, full.Reactors[1].UserId.Value)
+	require.Equal(t, uint64(1), full.Reactors[1].Version)
 
 	// Page one row at a time, resuming via the server-issued token (set only while
 	// more remain, cleared on the final page).
@@ -1586,12 +1592,22 @@ func testServer_Reactions_Reactors(t *testing.T, badges badge.Store, blocklists 
 	require.True(t, covered[string(e.userA.Value)])
 	require.True(t, covered[string(e.userB.Value)])
 
-	// An unknown (but valid) emoji on a real message is an empty OK.
+	// An unknown (but valid) emoji on a real message is an empty OK at version 0:
+	// nothing has ever happened to it.
 	none, err := e.getReactors(e.keysB, msgID, "🚀", &commonpb.QueryOptions{})
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetReactorsResponse_OK, none.Result)
 	require.Empty(t, none.Reactors)
 	require.False(t, none.HasMore)
+	require.Zero(t, none.Version)
+
+	// Sampled reactors carry their versions too.
+	summary, err := e.getReactionSummary(e.keysA, msgID)
+	require.NoError(t, err)
+	require.Len(t, summary.Summary.Reactions, 1)
+	require.Len(t, summary.Summary.Reactions[0].SampleReactors, 2)
+	require.Equal(t, uint64(2), summary.Summary.Reactions[0].SampleReactors[0].Version)
+	require.Equal(t, uint64(1), summary.Summary.Reactions[0].SampleReactors[1].Version)
 }
 
 // testServer_Reactions_Summaries covers GetReactionSummaries across both request

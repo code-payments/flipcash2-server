@@ -59,6 +59,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_Group_Picture,
 		testServer_GetChat_Group_MembershipLifecycle,
 		testServer_GetChat_Group_NonMember,
+		testServer_GetChat_ViewMode,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
 		testServer_GetDmChatFeed_Paging,
@@ -550,7 +551,11 @@ func (e *serverEnv) putGroupWithPicture(title string, pictureBlobID *blobpb.Blob
 }
 
 func (e *serverEnv) getChat(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.GetChatResponse {
-	req := &chatpb.GetChatRequest{ChatId: chatID}
+	return e.getChatWithMode(keys, chatID, messagingpb.ViewMode_FULL)
+}
+
+func (e *serverEnv) getChatWithMode(keys model.KeyPair, chatID *commonpb.ChatId, mode messagingpb.ViewMode) *chatpb.GetChatResponse {
+	req := &chatpb.GetChatRequest{ChatId: chatID, ViewMode: mode}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	resp, err := e.client.GetChat(e.ctx, req)
 	require.NoError(e.t, err)
@@ -1211,6 +1216,161 @@ func testServer_GetChat_Group_NonMember(t *testing.T, s chat.Store) {
 	resp = e.getChat(strangerKeys, dm)
 	require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result)
 	require.Nil(t, resp.Metadata)
+}
+
+// testServer_GetChat_ViewMode pins how the view mode a client asks for decides
+// a group's messaging state (see chat.Server.GetChat): a non-member who fails
+// the rules gets the last message redacted under FULL_OR_REDACTED where FULL
+// withholds it, and REDACTED gives everyone who may read the group a
+// placeholder — a member included — without evaluating the rules.
+func testServer_GetChat_ViewMode(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	const requirement = 100
+	founder := model.MustGenerateUserID()
+	group := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{founder},
+		Title:                  "Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: requirement},
+		LastActivity:           at(1),
+		LastMessageID:          &messagingpb.MessageId{Value: 7},
+	}
+	require.NoError(t, s.PutChat(e.ctx, group))
+	key := string(group.ID.Value)
+	const secret = "meet at the old bank at six"
+	e.messaging.lastMessages[key] = textMessage(7, founder, secret)
+	e.messaging.latestEventSeqs[key] = 9
+	e.messaging.pointers[key] = []*messagingpb.Pointer{
+		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 3}, Ts: timestamppb.New(at(3))},
+	}
+
+	// requireRedacted asserts a last message is the redacted copy of the
+	// stored one: same identity and envelope, placeholder text, and the flag
+	// set — and returns the placeholder for comparison across reads.
+	requireRedacted := func(md *chatpb.Metadata) string {
+		t.Helper()
+		require.NotNil(t, md.LastMessage)
+		require.True(t, md.LastMessage.Redacted)
+		require.Equal(t, uint64(7), md.LastMessage.MessageId.Value)
+		require.Equal(t, founder.Value, md.LastMessage.SenderId.Value)
+		require.Equal(t, uint64(7), md.LastMessage.EventSequence)
+		require.True(t, md.LastMessage.Ts.AsTime().Equal(at(7)))
+		placeholder := md.LastMessage.Content[0].GetText().GetText()
+		require.NotEmpty(t, placeholder)
+		require.NotEqual(t, secret, placeholder)
+		require.Equal(t, uint64(9), md.LatestEventSequence)
+		return placeholder
+	}
+
+	// With no owner account the env user fails the rules. Under FULL they get
+	// the record alone, as before; under FULL_OR_REDACTED and REDACTED the
+	// messaging state comes redacted. They are still not on the roster, and
+	// the pointer stored for them is still not read.
+	resp := e.getChat(e.keys, group.ID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Nil(t, resp.Metadata.LastMessage)
+	require.Zero(t, resp.Metadata.LatestEventSequence)
+
+	resp = e.getChatWithMode(e.keys, group.ID, messagingpb.ViewMode_FULL_OR_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Equal(t, "Whales", resp.Metadata.Title)
+	require.Len(t, resp.Metadata.GetRules().GetListener(), 1)
+	require.Empty(t, resp.Metadata.Members)
+	placeholder := requireRedacted(resp.Metadata)
+
+	resp = e.getChatWithMode(e.keys, group.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Empty(t, resp.Metadata.Members)
+	require.Equal(t, placeholder, requireRedacted(resp.Metadata))
+	require.Zero(t, e.messaging.pointerLookups[key])
+
+	// The stored message is untouched by the redaction.
+	require.Equal(t, secret, e.messaging.lastMessages[key].Content[0].GetText().GetText())
+	require.False(t, e.messaging.lastMessages[key].Redacted)
+
+	// Funded to the requirement they read in full under the modes that allow
+	// it, and redacted under REDACTED, which does not ask the rules: drained
+	// again, REDACTED still answers the moment the admission window closes —
+	// here, with no window at all, on the very next read.
+	_, err := e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+	resp = e.getChatWithMode(e.keys, group.ID, messagingpb.ViewMode_FULL_OR_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.NotNil(t, resp.Metadata.LastMessage)
+	require.False(t, resp.Metadata.LastMessage.Redacted)
+	require.Equal(t, secret, resp.Metadata.LastMessage.Content[0].GetText().GetText())
+	resp = e.getChatWithMode(e.keys, group.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Equal(t, placeholder, requireRedacted(resp.Metadata))
+
+	// A member asking for REDACTED is still a member — hydrated, with their
+	// pointer — and gets the placeholder they asked for.
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, group.ID).Result)
+	resp = e.getChatWithMode(e.keys, group.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Len(t, resp.Metadata.Members, 1)
+	require.Equal(t, e.userID.Value, resp.Metadata.Members[0].UserId.Value)
+	require.Len(t, resp.Metadata.Members[0].Pointers, 1)
+	require.Equal(t, placeholder, requireRedacted(resp.Metadata))
+	resp = e.getChat(e.keys, group.ID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.False(t, resp.Metadata.LastMessage.Redacted)
+	require.Equal(t, secret, resp.Metadata.LastMessage.Content[0].GetText().GetText())
+
+	// A group with no listener rules shows a non-member its record alone under
+	// every mode: only a rule can admit one, to a placeholder as to the rest.
+	// Its member gets a placeholder on request like any other.
+	strangerID, strangerKeys := e.addUser()
+	_, err = e.accounts.Bind(e.ctx, strangerID, strangerKeys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(strangerKeys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+	open := &chat.Chat{
+		ID:            chat.MustGenerateGroupChatID(),
+		Type:          chatpb.ChatType_GROUP,
+		Members:       []*commonpb.UserId{e.userID},
+		Title:         "Legacy",
+		LastActivity:  at(1),
+		LastMessageID: &messagingpb.MessageId{Value: 2},
+	}
+	require.NoError(t, s.PutChat(e.ctx, open))
+	e.messaging.lastMessages[string(open.ID.Value)] = textMessage(2, e.userID, "members only")
+	e.messaging.latestEventSeqs[string(open.ID.Value)] = 2
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		resp = e.getChatWithMode(strangerKeys, open.ID, mode)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result, mode)
+		require.Equal(t, "Legacy", resp.Metadata.Title)
+		require.Nil(t, resp.Metadata.LastMessage, mode)
+		require.Zero(t, resp.Metadata.LatestEventSequence, mode)
+	}
+	resp = e.getChatWithMode(e.keys, open.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.NotNil(t, resp.Metadata.LastMessage)
+	require.True(t, resp.Metadata.LastMessage.Redacted)
+	require.NotEqual(t, "members only", resp.Metadata.LastMessage.Content[0].GetText().GetText())
+
+	// A DM is unchanged: a non-member is denied outright under every mode, and
+	// a member may ask for a placeholder.
+	dm := generateDmChatID()
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
+		ID:            dm,
+		Type:          chatpb.ChatType_CONTACT_DM,
+		Members:       []*commonpb.UserId{e.userID, model.MustGenerateUserID()},
+		LastActivity:  at(1),
+		LastMessageID: &messagingpb.MessageId{Value: 1},
+	}))
+	e.messaging.lastMessages[string(dm.Value)] = textMessage(1, e.userID, "just us")
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		resp = e.getChatWithMode(strangerKeys, dm, mode)
+		require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result, mode)
+		require.Nil(t, resp.Metadata)
+	}
+	resp = e.getChatWithMode(e.keys, dm, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.True(t, resp.Metadata.LastMessage.Redacted)
+	require.NotEqual(t, "just us", resp.Metadata.LastMessage.Content[0].GetText().GetText())
 }
 
 func testServer_GetDmChatFeed_TypeScoped(t *testing.T, s chat.Store) {

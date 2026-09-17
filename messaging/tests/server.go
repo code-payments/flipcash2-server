@@ -81,6 +81,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		// Cross-cutting
 		testServer_NonMember_Denied,
 		testServer_NonMember_Group_Reads,
+		testServer_ViewMode,
 		testServer_StaffOnlyGroup_Rules,
 		testServer_BalanceGatedGroup_Rules,
 		testServer_Broadcast_IncludesActor,
@@ -301,7 +302,11 @@ func (e *serverEnv) getMessage(keys model.KeyPair, msgID *messagingpb.MessageId)
 }
 
 func (e *serverEnv) getMessageInChat(keys model.KeyPair, chatID *commonpb.ChatId, msgID *messagingpb.MessageId) (*messagingpb.GetMessageResponse, error) {
-	req := &messagingpb.GetMessageRequest{ChatId: chatID, MessageId: msgID}
+	return e.getMessageInChatWithMode(keys, chatID, msgID, messagingpb.ViewMode_FULL)
+}
+
+func (e *serverEnv) getMessageInChatWithMode(keys model.KeyPair, chatID *commonpb.ChatId, msgID *messagingpb.MessageId, mode messagingpb.ViewMode) (*messagingpb.GetMessageResponse, error) {
+	req := &messagingpb.GetMessageRequest{ChatId: chatID, MessageId: msgID, ViewMode: mode}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.GetMessage(e.ctx, req)
 }
@@ -311,18 +316,28 @@ func (e *serverEnv) getMessagesByOptions(keys model.KeyPair, opts *commonpb.Quer
 }
 
 func (e *serverEnv) getMessagesByOptionsInChat(keys model.KeyPair, chatID *commonpb.ChatId, opts *commonpb.QueryOptions) (*messagingpb.GetMessagesResponse, error) {
+	return e.getMessagesByOptionsInChatWithMode(keys, chatID, opts, messagingpb.ViewMode_FULL)
+}
+
+func (e *serverEnv) getMessagesByOptionsInChatWithMode(keys model.KeyPair, chatID *commonpb.ChatId, opts *commonpb.QueryOptions, mode messagingpb.ViewMode) (*messagingpb.GetMessagesResponse, error) {
 	req := &messagingpb.GetMessagesRequest{
-		ChatId: chatID,
-		Query:  &messagingpb.GetMessagesRequest_Options{Options: opts},
+		ChatId:   chatID,
+		Query:    &messagingpb.GetMessagesRequest_Options{Options: opts},
+		ViewMode: mode,
 	}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.GetMessages(e.ctx, req)
 }
 
 func (e *serverEnv) getMessagesByIDs(keys model.KeyPair, vals ...uint64) (*messagingpb.GetMessagesResponse, error) {
+	return e.getMessagesByIDsInChatWithMode(keys, e.chatID, messagingpb.ViewMode_FULL, vals...)
+}
+
+func (e *serverEnv) getMessagesByIDsInChatWithMode(keys model.KeyPair, chatID *commonpb.ChatId, mode messagingpb.ViewMode, vals ...uint64) (*messagingpb.GetMessagesResponse, error) {
 	req := &messagingpb.GetMessagesRequest{
-		ChatId: e.chatID,
-		Query:  &messagingpb.GetMessagesRequest_MessageIds{MessageIds: &messagingpb.MessageIdBatch{MessageIds: ids(vals...)}},
+		ChatId:   chatID,
+		Query:    &messagingpb.GetMessagesRequest_MessageIds{MessageIds: &messagingpb.MessageIdBatch{MessageIds: ids(vals...)}},
+		ViewMode: mode,
 	}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.GetMessages(e.ctx, req)
@@ -335,7 +350,11 @@ func (e *serverEnv) getDelta(keys model.KeyPair, afterSequence uint64) ([]*messa
 }
 
 func (e *serverEnv) getDeltaInChat(keys model.KeyPair, chatID *commonpb.ChatId, afterSequence uint64) ([]*messagingpb.GetDeltaResponse, error) {
-	req := &messagingpb.GetDeltaRequest{ChatId: chatID, AfterSequence: afterSequence}
+	return e.getDeltaInChatWithMode(keys, chatID, afterSequence, messagingpb.ViewMode_FULL)
+}
+
+func (e *serverEnv) getDeltaInChatWithMode(keys model.KeyPair, chatID *commonpb.ChatId, afterSequence uint64, mode messagingpb.ViewMode) ([]*messagingpb.GetDeltaResponse, error) {
+	req := &messagingpb.GetDeltaRequest{ChatId: chatID, AfterSequence: afterSequence, ViewMode: mode}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	stream, err := e.client.GetDelta(e.ctx, req)
 	if err != nil {
@@ -2045,6 +2064,262 @@ func testServer_NonMember_Group_Reads(t *testing.T, badges badge.Store, blocklis
 	_, err = e.getMessageInChat(blindKeys, groupID, msgID)
 	require.Equal(t, codes.Internal, status.Code(err))
 	e.ocpBalance.setErr(nil)
+}
+
+// testServer_ViewMode pins how the view mode a client asks for decides what a
+// message read returns (see messagingpb.ViewMode and messaging.Server.present):
+// a non-member who fails a gated group's rules is DENIED under FULL, as before,
+// and reads the group redacted under FULL_OR_REDACTED and REDACTED — every
+// message path, one placeholder per message, stable across paths and viewers —
+// while REDACTED gives a placeholder to anyone who may read the chat at all,
+// a member included. The reaction reads carry no mode and stay a full
+// reader's.
+func testServer_ViewMode(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	every := []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED}
+	redacting := every[1:]
+
+	// A gated group with one funded member, who sends a text, a media message
+	// and a reply.
+	const requirement = 100
+	_, err := e.accounts.Bind(e.ctx, e.userA, e.keysA.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keysA.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:                     groupID,
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{e.userA},
+		Title:                  "Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: requirement},
+		LastActivity:           at(1),
+	}))
+	const secret = "meet at the old bank at six, bring the cash"
+	textSent, err := e.sendContentToChat(e.keysA, groupID, textContent(secret), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, textSent.Result)
+	textID := textSent.Message.MessageId
+	blobID := e.putReadyBlob(e.userA)
+	mediaSent, err := e.sendContentToChat(e.keysA, groupID, mediaContent(blobID), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, mediaSent.Result)
+	mediaID := mediaSent.Message.MessageId
+	replySent, err := e.sendContentToChat(e.keysA, groupID, replyContent(textID.Value, "see above"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, replySent.Result)
+	replyID := replySent.Message.MessageId
+
+	// requireRedacted asserts a message is the redacted copy of what was
+	// sent: same identity, sender and sequence, placeholder content, the flag
+	// set, and returns the placeholder text for comparison across reads.
+	requireRedacted := func(sent, got *messagingpb.Message) string {
+		t.Helper()
+		require.True(t, got.Redacted)
+		require.Equal(t, sent.MessageId.Value, got.MessageId.Value)
+		require.Equal(t, sent.SenderId.Value, got.SenderId.Value)
+		require.Equal(t, sent.EventSequence, got.EventSequence)
+		require.Equal(t, sent.UnreadSeq, got.UnreadSeq)
+		require.True(t, proto.Equal(sent.Ts, got.Ts))
+		require.Len(t, got.Content, 1)
+		switch c := got.Content[0].Type.(type) {
+		case *messagingpb.Content_Text:
+			require.NotEmpty(t, c.Text.Text)
+			require.NotEqual(t, secret, c.Text.Text)
+			return c.Text.Text
+		case *messagingpb.Content_Reply:
+			require.Equal(t, textID.Value, c.Reply.RepliedMessageId.Value)
+			require.Len(t, c.Reply.Content, 1)
+			body := c.Reply.Content[0].GetText().GetText()
+			require.NotEmpty(t, body)
+			require.NotEqual(t, "see above", body)
+			return body
+		case *messagingpb.Content_Media:
+			// The media is resolved before it is redacted: its metadata is
+			// there for the client to render from, its download URL is not.
+			require.Len(t, c.Media.Items, 1)
+			require.NotEmpty(t, c.Media.Items[0].Renditions)
+			for _, r := range c.Media.Items[0].Renditions {
+				require.NotNil(t, r.Blob)
+				require.NotEmpty(t, r.Blob.MimeType)
+				require.Nil(t, r.Blob.DownloadUrl)
+			}
+			return ""
+		default:
+			t.Fatalf("unexpected content %T", c)
+			return ""
+		}
+	}
+	requireFull := func(got *messagingpb.Message) {
+		t.Helper()
+		require.False(t, got.Redacted)
+		switch c := got.Content[0].Type.(type) {
+		case *messagingpb.Content_Text:
+			require.Equal(t, secret, c.Text.Text)
+		case *messagingpb.Content_Reply:
+			require.Equal(t, "see above", c.Reply.Content[0].GetText().GetText())
+		case *messagingpb.Content_Media:
+			require.NotEmpty(t, c.Media.Items[0].Renditions[0].GetBlob().GetDownloadUrl().GetUrl())
+		}
+	}
+
+	// A non-member with no owner account fails the rules: DENIED under FULL,
+	// the group redacted under the other two — on every message path, and the
+	// same placeholder on each.
+	stranger, strangerKeys := e.addUser()
+	getResp, err := e.getMessageInChat(strangerKeys, groupID, textID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result)
+
+	var placeholder string
+	for _, mode := range redacting {
+		getResp, err := e.getMessageInChatWithMode(strangerKeys, groupID, textID, mode)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result, mode)
+		got := requireRedacted(textSent.Message, getResp.Message)
+		if placeholder == "" {
+			placeholder = got
+		}
+		require.Equal(t, placeholder, got, mode)
+
+		listResp, err := e.getMessagesByOptionsInChatWithMode(strangerKeys, groupID, &commonpb.QueryOptions{}, mode)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_OK, listResp.Result, mode)
+		require.Len(t, listResp.Messages.GetMessages(), 3)
+		for _, sent := range []*messagingpb.Message{textSent.Message, mediaSent.Message, replySent.Message} {
+			var got *messagingpb.Message
+			for _, m := range listResp.Messages.GetMessages() {
+				if m.MessageId.Value == sent.MessageId.Value {
+					got = m
+				}
+			}
+			require.NotNil(t, got, mode)
+			if text := requireRedacted(sent, got); sent == textSent.Message {
+				require.Equal(t, placeholder, text, mode)
+			}
+		}
+
+		batchResp, err := e.getMessagesByIDsInChatWithMode(strangerKeys, groupID, mode, textID.Value, mediaID.Value, replyID.Value)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_OK, batchResp.Result, mode)
+		require.Len(t, batchResp.Messages.GetMessages(), 3)
+		for _, m := range batchResp.Messages.GetMessages() {
+			require.True(t, m.Redacted, mode)
+		}
+
+		deltaResps, err := e.getDeltaInChatWithMode(strangerKeys, groupID, 0, mode)
+		require.NoError(t, err)
+		require.NotEmpty(t, deltaResps)
+		require.Equal(t, messagingpb.GetDeltaResponse_OK, deltaResps[0].Result, mode)
+		var delivered int
+		for _, resp := range deltaResps {
+			for _, m := range resp.Messages.GetMessages() {
+				delivered++
+				require.True(t, m.Redacted, mode)
+				if m.MessageId.Value == textID.Value {
+					require.Equal(t, placeholder, m.Content[0].GetText().GetText(), mode)
+				}
+			}
+		}
+		require.Equal(t, 3, delivered, mode)
+	}
+
+	// The reaction reads take no mode and stay DENIED; so do the writes.
+	sumResp, err := e.getReactionSummaryInChat(strangerKeys, groupID, textID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactionSummaryResponse_DENIED, sumResp.Result)
+	sendResp, err := e.sendContentToChat(strangerKeys, groupID, textContent("intruder"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
+	addResp, err := e.addReactionInChat(strangerKeys, groupID, textID, "👍")
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_DENIED, addResp.Result)
+
+	// Funded, the same non-member reads in full under the modes that allow it,
+	// and still gets the placeholder — the same one — under REDACTED.
+	_, err = e.accounts.Bind(e.ctx, stranger, strangerKeys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(strangerKeys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+	for _, mode := range every[:2] {
+		getResp, err := e.getMessageInChatWithMode(strangerKeys, groupID, textID, mode)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result, mode)
+		requireFull(getResp.Message)
+	}
+	getResp, err = e.getMessageInChatWithMode(strangerKeys, groupID, textID, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+	require.Equal(t, placeholder, requireRedacted(textSent.Message, getResp.Message))
+
+	// So does a member: the placeholder is the message's, not the viewer's.
+	getResp, err = e.getMessageInChatWithMode(e.keysA, groupID, textID, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+	require.Equal(t, placeholder, requireRedacted(textSent.Message, getResp.Message))
+	listResp, err := e.getMessagesByOptionsInChatWithMode(e.keysA, groupID, &commonpb.QueryOptions{}, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_OK, listResp.Result)
+	for _, m := range listResp.Messages.GetMessages() {
+		require.True(t, m.Redacted)
+	}
+	getResp, err = e.getMessageInChat(e.keysA, groupID, textID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+	requireFull(getResp.Message)
+
+	// A group with no listener rules admits no non-member in any form: only a
+	// rule can admit one, to a placeholder as to the rest. Its member may ask
+	// for one.
+	openID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           openID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA},
+		Title:        "Legacy",
+		LastActivity: at(1),
+	}))
+	openSent, err := e.sendContentToChat(e.keysA, openID, textContent("members only"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, openSent.Result)
+	for _, mode := range every {
+		getResp, err := e.getMessageInChatWithMode(strangerKeys, openID, openSent.Message.MessageId, mode)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result, mode)
+		listResp, err := e.getMessagesByOptionsInChatWithMode(strangerKeys, openID, &commonpb.QueryOptions{}, mode)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_DENIED, listResp.Result, mode)
+		deltaResps, err := e.getDeltaInChatWithMode(strangerKeys, openID, 0, mode)
+		require.NoError(t, err)
+		require.Len(t, deltaResps, 1)
+		require.Equal(t, messagingpb.GetDeltaResponse_DENIED, deltaResps[0].Result, mode)
+	}
+	getResp, err = e.getMessageInChatWithMode(e.keysA, openID, openSent.Message.MessageId, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+	require.True(t, getResp.Message.Redacted)
+	require.NotEqual(t, "members only", getResp.Message.Content[0].GetText().GetText())
+
+	// A DM is its members' alone under every mode, and a member may ask for a
+	// placeholder there too.
+	dmSent, err := e.send(e.keysA, "just us", generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, dmSent.Result)
+	for _, mode := range every {
+		getResp, err := e.getMessageInChatWithMode(strangerKeys, e.chatID, dmSent.Message.MessageId, mode)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result, mode)
+	}
+	getResp, err = e.getMessageInChatWithMode(e.keysB, e.chatID, dmSent.Message.MessageId, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+	require.True(t, getResp.Message.Redacted)
+	require.NotEqual(t, "just us", getResp.Message.Content[0].GetText().GetText())
+
+	// A mode this server does not know is refused at the door, not guessed at.
+	req := &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: textID, ViewMode: messagingpb.ViewMode(99)}
+	require.NoError(t, e.keysA.Auth(req, &req.Auth))
+	_, err = e.client.GetMessage(e.ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
 // testServer_StaffOnlyGroup_Rules pins that a staff-only group's listener rule

@@ -8,17 +8,27 @@ import (
 	"google.golang.org/grpc/status"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+
+	"github.com/code-payments/flipcash2-server/chat"
 )
 
-// The three gates every Messaging RPC passes through before touching a chat,
-// each a thin projection of the chat domain's Access (see chat.Access for the
+// The gates every Messaging RPC passes through before touching a chat, each a
+// thin projection of the chat domain's Access (see chat.Access for the
 // definitions and the reasoning) onto this server's logging and error
 // conventions. Which RPC sits behind which gate:
 //
-//   - canListen: every read — GetMessage, GetMessages, GetDelta, the reaction
-//     summaries and reactor lists. A member always passes; a non-member passes
-//     for a group whose listener rules they satisfy, so a qualifying user can
-//     preview a group before joining.
+//   - reading: every read that returns messages — GetMessage, GetMessages,
+//     GetDelta. It answers not just whether the caller may read but how the
+//     read is answered, full or redacted (see chat.Standing.Reading), from the
+//     caller's standing and the ViewMode they asked for. A member always
+//     reads in full; a non-member reads a group in full if they satisfy its
+//     listener rules, so a qualifying user can preview a group before joining,
+//     and redacted otherwise if the group carries a listener rule at all, so
+//     any registered user can see a gated group's shape (see present).
+//   - canListen: every other read — the reaction summaries and reactor lists,
+//     which carry no ViewMode and are a full reader's alone (see
+//     redact.Message on reactions).
 //   - isMember: every write that is not a send but is still a member's alone.
 //     A pointer advance leaves a per-user item in the chat's partition, and a
 //     reaction is something other members see, so neither is open to a
@@ -38,6 +48,15 @@ import (
 // satisfies a listener rule keeps reading, and is denied only on the send
 // paths, where the rules are evaluated. A non-member's read does evaluate the
 // rules, since nothing else can admit them; Access bounds what that costs.
+
+func (s *Server) reading(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (chat.Reading, error) {
+	standing, err := s.access.Standing(ctx, chatID, userID, mode)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure determining chat standing")
+		return chat.ReadingDenied, status.Error(codes.Internal, "")
+	}
+	return standing.Reading(mode), nil
+}
 
 func (s *Server) canListen(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
 	ok, err := s.access.CanListen(ctx, chatID, userID)

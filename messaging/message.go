@@ -10,11 +10,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/redact"
 )
 
 func (s *Server) GetMessage(ctx context.Context, req *messagingpb.GetMessageRequest) (*messagingpb.GetMessageResponse, error) {
@@ -25,9 +28,11 @@ func (s *Server) GetMessage(ctx context.Context, req *messagingpb.GetMessageRequ
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
+	reading, err := s.reading(ctx, log, req.ChatId, userID, req.GetViewMode())
+	if err != nil {
 		return nil, err
-	} else if !allowed {
+	}
+	if reading == chat.ReadingDenied {
 		return &messagingpb.GetMessageResponse{Result: messagingpb.GetMessageResponse_DENIED}, nil
 	}
 
@@ -40,14 +45,14 @@ func (s *Server) GetMessage(ctx context.Context, req *messagingpb.GetMessageRequ
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	proto := msg.ToProto()
-	if err := hydrateMedia(ctx, s.media, []*messagingpb.Message{proto}); err != nil {
-		log.With(zap.Error(err)).Warn("Failure resolving media metadata")
+	protos, err := s.present(ctx, log, req.ChatId, reading, []*Message{msg})
+	if err != nil {
+		return nil, err
 	}
 
 	return &messagingpb.GetMessageResponse{
 		Result:  messagingpb.GetMessageResponse_OK,
-		Message: proto,
+		Message: protos[0],
 	}, nil
 }
 
@@ -59,9 +64,11 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if allowed, err := s.canListen(ctx, log, req.ChatId, userID); err != nil {
+	reading, err := s.reading(ctx, log, req.ChatId, userID, req.GetViewMode())
+	if err != nil {
 		return nil, err
-	} else if !allowed {
+	}
+	if reading == chat.ReadingDenied {
 		return &messagingpb.GetMessagesResponse{Result: messagingpb.GetMessagesResponse_DENIED}, nil
 	}
 
@@ -84,6 +91,31 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 	if len(msgs) == 0 {
 		return &messagingpb.GetMessagesResponse{Result: messagingpb.GetMessagesResponse_NOT_FOUND}, nil
 	}
+	protos, err := s.present(ctx, log, req.ChatId, reading, msgs)
+	if err != nil {
+		return nil, err
+	}
+	return &messagingpb.GetMessagesResponse{
+		Result:   messagingpb.GetMessagesResponse_OK,
+		Messages: &messagingpb.MessageBatch{Messages: protos},
+	}, nil
+}
+
+// present projects stored messages into what a read returns for the given
+// reading: the protos with their media resolved (see hydrateMedia) and, for a
+// redacted reading, every message replaced by its placeholder (see
+// redact.Message). This is the one place a message read leaves the server, so
+// every read path — GetMessage, GetMessages, GetDelta — answers a redacted
+// viewer the same way, and a page is wholly full or wholly redacted.
+//
+// Media is resolved before redaction, not skipped for it: the placeholder
+// keeps each rendition's intrinsic metadata — dimensions, blurhash — and drops
+// only the download URL, and the metadata is what resolution supplies. A
+// resolution failure is logged and the messages returned with their stored
+// renditions, as before; a redaction failure fails the read with Internal,
+// since a message that cannot be redacted must not be returned to a viewer
+// who may only see it redacted.
+func (s *Server) present(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, reading chat.Reading, msgs []*Message) ([]*messagingpb.Message, error) {
 	protos := make([]*messagingpb.Message, len(msgs))
 	for i, m := range msgs {
 		protos[i] = m.ToProto()
@@ -91,10 +123,18 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 	if err := hydrateMedia(ctx, s.media, protos); err != nil {
 		log.With(zap.Error(err)).Warn("Failure resolving media metadata")
 	}
-	return &messagingpb.GetMessagesResponse{
-		Result:   messagingpb.GetMessagesResponse_OK,
-		Messages: &messagingpb.MessageBatch{Messages: protos},
-	}, nil
+	if reading != chat.ReadingRedacted {
+		return protos, nil
+	}
+	for i, p := range protos {
+		redacted, err := redact.Message(chatID, p)
+		if err != nil {
+			log.With(zap.Error(err), zap.Uint64("message_id", p.GetMessageId().GetValue())).Warn("Failure redacting message")
+			return nil, status.Error(codes.Internal, "")
+		}
+		protos[i] = redacted
+	}
+	return protos, nil
 }
 
 func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRequest) (*messagingpb.SendMessageResponse, error) {

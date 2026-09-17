@@ -11,6 +11,7 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 
 	"github.com/code-payments/flipcash2-server/blob"
@@ -174,7 +175,7 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberStanding, []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, memberStanding, ReadingFull, []*Chat{c})
 	if err != nil {
 		// The group exists; only the read back failed. It will surface on the
 		// creator's next feed read.
@@ -214,13 +215,13 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 // creation, and the creator may even have left, in which case they see it as
 // the non-member they are. Nothing is published; a retry is not news.
 func (s *Server) replayStartChat(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, c *Chat) (*chatpb.StartChatResponse, error) {
-	standing, err := s.access.StandingWithRules(ctx, c.ID, c.Rules(), userID)
+	standing, err := s.access.StandingWithRules(ctx, c.ID, c.Rules(), userID, messagingpb.ViewMode_FULL)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure determining chat standing")
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, standing, []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, standing, standing.Reading(messagingpb.ViewMode_FULL), []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
 		return nil, status.Error(codes.Internal, "")

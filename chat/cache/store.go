@@ -2,7 +2,6 @@ package cache
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/ReneKroon/ttlcache"
@@ -21,24 +20,15 @@ import (
 // member, and the DM's member pair, are safe to cache. Group membership is
 // mutable — and can be mutated by other processes, which this cache can never
 // observe — so group membership checks and member lists always defer to the
-// backing store. The rest of the store is passed straight through.
-//
-// The value also implements chat.UserStateStore when the backing store does,
-// as every persistent store does (see chat.UserStateStore): each of its
-// methods is passed straight through, uncached — a user's state is theirs to
-// change at any time, and the reads are already one strongly consistent query
-// — so a single value can be injected wherever either interface is wanted. A
-// backing store that does not implement it answers every call with
-// ErrUserStateUnsupported.
+// backing store. The rest of the store is passed straight through, viewer
+// state included: a user's state is theirs to change at any time, and its
+// reads are already one strongly consistent query, so nothing of it is held.
 type Cache struct {
 	db             chat.Store
 	memberCache    *ttlcache.Cache
 	dmMembersCache *ttlcache.Cache
 	rulesCache     *ttlcache.Cache
 }
-
-// The cache is a chat.UserStateStore too (see Cache), whichever store backs it.
-var _ chat.UserStateStore = (*Cache)(nil)
 
 func NewInCache(db chat.Store) chat.Store {
 	return &Cache{
@@ -173,65 +163,28 @@ func (c *Cache) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId,
 	return c.db.AdvanceLastMessage(ctx, chatID, messageID, ts)
 }
 
-// ErrUserStateUnsupported is returned by every chat.UserStateStore method when
-// the backing store does not implement that interface.
-var ErrUserStateUnsupported = errors.New("backing chat store does not implement chat.UserStateStore")
-
-// userState returns the backing store as a chat.UserStateStore, or
-// ErrUserStateUnsupported when it is not one.
-func (c *Cache) userState() (chat.UserStateStore, error) {
-	if us, ok := c.db.(chat.UserStateStore); ok {
-		return us, nil
-	}
-	return nil, ErrUserStateUnsupported
-}
-
 func (c *Cache) SetMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mute chat.Mute) (chat.ViewerState, bool, error) {
-	us, err := c.userState()
-	if err != nil {
-		return chat.ViewerState{}, false, err
-	}
-	return us.SetMute(ctx, chatID, userID, mute)
+	return c.db.SetMute(ctx, chatID, userID, mute)
 }
 
 func (c *Cache) ClearMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, bool, error) {
-	us, err := c.userState()
-	if err != nil {
-		return chat.ViewerState{}, false, err
-	}
-	return us.ClearMute(ctx, chatID, userID)
+	return c.db.ClearMute(ctx, chatID, userID)
 }
 
 func (c *Cache) GetViewerStates(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.ViewerState, error) {
-	us, err := c.userState()
-	if err != nil {
-		return nil, err
-	}
-	return us.GetViewerStates(ctx, userID, chatIDs)
+	return c.db.GetViewerStates(ctx, userID, chatIDs)
 }
 
 func (c *Cache) GetMutedUsers(ctx context.Context, chatID *commonpb.ChatId, now time.Time, limit int) ([]*commonpb.UserId, error) {
-	us, err := c.userState()
-	if err != nil {
-		return nil, err
-	}
-	return us.GetMutedUsers(ctx, chatID, now, limit)
+	return c.db.GetMutedUsers(ctx, chatID, now, limit)
 }
 
 func (c *Cache) GetMutedUsersInOrder(ctx context.Context, chatID *commonpb.ChatId, now time.Time, after *commonpb.UserId, limit int) (chat.MutedUsersPage, error) {
-	us, err := c.userState()
-	if err != nil {
-		return chat.MutedUsersPage{}, err
-	}
-	return us.GetMutedUsersInOrder(ctx, chatID, now, after, limit)
+	return c.db.GetMutedUsersInOrder(ctx, chatID, now, after, limit)
 }
 
 func (c *Cache) GetMutedCount(ctx context.Context, chatID *commonpb.ChatId) (uint64, error) {
-	us, err := c.userState()
-	if err != nil {
-		return 0, err
-	}
-	return us.GetMutedCount(ctx, chatID)
+	return c.db.GetMutedCount(ctx, chatID)
 }
 
 // memberCacheKey keys the membership cache by (chat, user). Only DM memberships

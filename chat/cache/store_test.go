@@ -336,17 +336,14 @@ func generateDmChatID() *commonpb.ChatId {
 	return &commonpb.ChatId{Value: b}
 }
 
-// TestCache_UserState_PassesThrough: the cached value is a chat.UserStateStore
-// over the backing store's, uncached — a mute set through it is read back
-// through it — and refuses every call when the backing store is not one.
+// TestCache_UserState_PassesThrough: viewer state goes through the cache to
+// the backing store uncached — a mute set through it is read back through it.
 func TestCache_UserState_PassesThrough(t *testing.T) {
 	ctx := context.Background()
 	user := model.MustGenerateUserID()
 	chatID := generateDmChatID()
 
-	c := cache.NewInCache(memory.NewInMemory())
-	us, ok := c.(chat.UserStateStore)
-	require.True(t, ok, "cache must implement chat.UserStateStore over a store that does")
+	us := cache.NewInCache(memory.NewInMemory())
 
 	state, changed, err := us.SetMute(ctx, chatID, user, chat.Mute{Forever: true})
 	require.NoError(t, err)
@@ -374,20 +371,4 @@ func TestCache_UserState_PassesThrough(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, changed)
 	require.Equal(t, chat.ViewerState{Version: 2}, state)
-
-	// A backing store without user state: every call is refused, none panics.
-	bare, ok := cache.NewInCache(&countingStore{}).(chat.UserStateStore)
-	require.True(t, ok)
-	_, _, err = bare.SetMute(ctx, chatID, user, chat.Mute{Forever: true})
-	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
-	_, _, err = bare.ClearMute(ctx, chatID, user)
-	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
-	_, err = bare.GetViewerStates(ctx, user, []*commonpb.ChatId{chatID})
-	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
-	_, err = bare.GetMutedUsers(ctx, chatID, time.Now(), 0)
-	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
-	_, err = bare.GetMutedUsersInOrder(ctx, chatID, time.Now(), nil, 0)
-	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
-	_, err = bare.GetMutedCount(ctx, chatID)
-	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
 }

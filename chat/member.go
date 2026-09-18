@@ -219,7 +219,7 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 // one; a departed member has no mute to clear in the common case, and that
 // no-op costs one read and publishes nothing.
 func (s *Server) clearMuteOnLeave(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) {
-	state, changed, err := s.userState.ClearMute(ctx, chatID, userID)
+	state, changed, err := s.chats.ClearMute(ctx, chatID, userID)
 	if err != nil {
 		log.With(zap.Error(err), zap.String("chat_id", model.ChatIDString(chatID))).Warn("Failure clearing mute on leave")
 		return

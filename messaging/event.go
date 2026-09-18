@@ -59,7 +59,6 @@ func publishChatUpdate(
 	chats chat.Store,
 	profiles profile.Store,
 	blocklists blocklist.Store,
-	userState chat.UserStateStore,
 	ocpData ocp_data.Provider,
 
 	pusher push.Pusher,
@@ -174,7 +173,7 @@ func publishChatUpdate(
 			if message.SenderId == nil {
 				continue
 			}
-			sendMessagePush(ctx, log, badges, profiles, blocklists, userState, ocpData, pusher, chatID, chatType, chatTitle, members, message)
+			sendMessagePush(ctx, log, badges, chats, profiles, blocklists, ocpData, pusher, chatID, chatType, chatTitle, members, message)
 		}
 	}()
 }
@@ -204,9 +203,9 @@ func sendMessagePush(
 	log *zap.Logger,
 
 	badges badge.Store,
+	chats chat.Store,
 	profiles profile.Store,
 	blocklists blocklist.Store,
-	userState chat.UserStateStore,
 	ocpData ocp_data.Provider,
 
 	pusher push.Pusher,
@@ -272,7 +271,7 @@ func sendMessagePush(
 	// still catch, while a suppressed push would lose the message delivery
 	// the flag exists to preserve.
 	recipients := push.ChatRecipients{Unmuted: membersForPush}
-	mutedUsers, err := userState.GetMutedUsers(ctx, chatID, time.Now(), 0)
+	mutedUsers, err := chats.GetMutedUsers(ctx, chatID, time.Now(), 0)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure reading muted users for message push; sending all as unmuted")
 	} else if len(mutedUsers) > 0 {

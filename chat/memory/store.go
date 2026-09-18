@@ -37,17 +37,16 @@ type memory struct {
 	memberVersions map[string]map[string]uint64
 
 	// viewerStates holds each user's state per chat, keyed by user ID then
-	// chat ID, mirroring the persistent layout (see chat.UserStateStore).
+	// chat ID, mirroring the persistent layout (see chat.Store).
 	viewerStates map[string]map[string]*chat.ViewerState
 
 	// mutedCounts is each chat's count of records with a mute recorded, keyed
 	// by chat ID, moved as the persistent stores move theirs (see
-	// chat.UserStateStore.GetMutedCount). Absent reads as zero.
+	// chat.Store.GetMutedCount). Absent reads as zero.
 	mutedCounts map[string]uint64
 }
 
-// NewInMemory returns an in-memory chat.Store, for tests. The value also
-// implements chat.UserStateStore.
+// NewInMemory returns an in-memory chat.Store, for tests.
 func NewInMemory() chat.Store {
 	return &memory{
 		chats:          make(map[string]*chat.Chat),

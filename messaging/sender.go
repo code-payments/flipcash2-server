@@ -44,7 +44,6 @@ type Sender struct {
 	messages   Store
 	profiles   profile.Store
 	blocklists blocklist.Store
-	userState  chat.UserStateStore
 
 	// media resolves blob metadata so a broadcast new-message event carries the
 	// same resolved media a read would. Hydration is best-effort and a no-op for
@@ -66,7 +65,6 @@ func NewSender(
 	messages Store,
 	profiles profile.Store,
 	blocklists blocklist.Store,
-	userState chat.UserStateStore,
 	media Media,
 	ocpData ocp_data.Provider,
 	pusher push.Pusher,
@@ -80,7 +78,6 @@ func NewSender(
 		messages:     messages,
 		profiles:     profiles,
 		blocklists:   blocklists,
-		userState:    userState,
 		media:        media,
 		ocpData:      ocpData,
 		pusher:       pusher,
@@ -222,7 +219,7 @@ func (s *Sender) Send(
 	}
 	// Reuse the members AdvanceLastMessage already loaded (empty for a group
 	// chat or if it failed, in which case publishChatUpdate loads them itself).
-	publishChatUpdate(ctx, log, s.badges, s.chats, s.profiles, s.blocklists, s.userState, s.ocpData, s.pusher, s.userEventBus, s.chatEventBus, chatID, update, nil, members)
+	publishChatUpdate(ctx, log, s.badges, s.chats, s.profiles, s.blocklists, s.ocpData, s.pusher, s.userEventBus, s.chatEventBus, chatID, update, nil, members)
 
 	return msgProto, nil
 }

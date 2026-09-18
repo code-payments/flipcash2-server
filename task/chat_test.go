@@ -51,7 +51,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	chatBus := event.NewBus[*commonpb.ChatId, *eventpb.ChatEvent]()
 
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, chats.(chat.UserStateStore), media, ocpData, push.NewNoOpPusher(), bus, chatBus)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
 	integration := intent.NewIntegration(accounts, chats, profiles, nil)
 
@@ -180,7 +180,7 @@ func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMe
 
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
 	blocklists := blocklistmemory.NewInMemory()
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, chats.(chat.UserStateStore), media, ocpData, push.NewNoOpPusher(), bus, chatBus)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
 	integration := intent.NewIntegration(accounts, chats, profiles, nil)
 

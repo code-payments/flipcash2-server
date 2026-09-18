@@ -69,7 +69,7 @@ func (s *Server) MuteChat(ctx context.Context, req *chatpb.MuteChatRequest) (*ch
 		return &chatpb.MuteChatResponse{Result: chatpb.MuteChatResponse_DENIED}, nil
 	}
 
-	state, changed, err := s.userState.SetMute(ctx, req.ChatId, userID, mute)
+	state, changed, err := s.chats.SetMute(ctx, req.ChatId, userID, mute)
 	if err != nil {
 		if errors.Is(err, ErrMuteUntilOutOfRange) {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -112,7 +112,7 @@ func (s *Server) UnmuteChat(ctx context.Context, req *chatpb.UnmuteChatRequest) 
 		return &chatpb.UnmuteChatResponse{Result: chatpb.UnmuteChatResponse_DENIED}, nil
 	}
 
-	state, changed, err := s.userState.ClearMute(ctx, req.ChatId, userID)
+	state, changed, err := s.chats.ClearMute(ctx, req.ChatId, userID)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure clearing mute")
 		return nil, status.Error(codes.Internal, "")

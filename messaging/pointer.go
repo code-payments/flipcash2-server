@@ -49,7 +49,7 @@ func (s *Server) AdvancePointer(ctx context.Context, req *messagingpb.AdvancePoi
 	// hydration (GetChat) instead. DMs keep real-time pointers, where the fan-out
 	// is one peer.
 	if advanced && !chat.IsGroupChatID(req.ChatId) {
-		publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.blocklists, s.sender.userState, s.sender.ocpData, s.sender.pusher, s.sender.userEventBus, s.sender.chatEventBus, req.ChatId, &eventpb.ChatUpdate{
+		publishChatUpdate(ctx, log, s.sender.badges, s.sender.chats, s.sender.profiles, s.sender.blocklists, s.sender.ocpData, s.sender.pusher, s.sender.userEventBus, s.sender.chatEventBus, req.ChatId, &eventpb.ChatUpdate{
 			PointerUpdates: &messagingpb.PointerBatch{Pointers: []*messagingpb.Pointer{pointer}},
 		}, nil, nil)
 	}

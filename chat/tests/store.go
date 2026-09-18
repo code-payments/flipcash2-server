@@ -1319,18 +1319,10 @@ func userIDValues(ids []*commonpb.UserId) [][]byte {
 	return out
 }
 
-// userStateStore returns s as a chat.UserStateStore: every chat store
-// implementation also persists viewer state, so the one suite covers both.
-func userStateStore(t *testing.T, s chat.Store) chat.UserStateStore {
-	us, ok := s.(chat.UserStateStore)
-	require.True(t, ok, "chat.Store implementation must also implement chat.UserStateStore")
-	return us
-}
-
 // requireMutedUsers checks both chat-scoped reads: the set read, and the
 // ordered walk — as one page, and paged one user at a time — which must agree
 // with it and come back in ascending user-ID order.
-func requireMutedUsers(t *testing.T, us chat.UserStateStore, chatID *commonpb.ChatId, now time.Time, want ...*commonpb.UserId) {
+func requireMutedUsers(t *testing.T, us chat.Store, chatID *commonpb.ChatId, now time.Time, want ...*commonpb.UserId) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -1361,14 +1353,14 @@ func requireMutedUsers(t *testing.T, us chat.UserStateStore, chatID *commonpb.Ch
 	assert.Equal(t, userIDValues(wantOrdered), userIDValues(walked))
 }
 
-func requireMutedCount(t *testing.T, us chat.UserStateStore, chatID *commonpb.ChatId, want uint64) {
+func requireMutedCount(t *testing.T, us chat.Store, chatID *commonpb.ChatId, want uint64) {
 	t.Helper()
 	got, err := us.GetMutedCount(context.Background(), chatID)
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 }
 
-func requireViewerState(t *testing.T, us chat.UserStateStore, chatID *commonpb.ChatId, userID *commonpb.UserId, want chat.ViewerState) {
+func requireViewerState(t *testing.T, us chat.Store, chatID *commonpb.ChatId, userID *commonpb.UserId, want chat.ViewerState) {
 	t.Helper()
 	states, err := us.GetViewerStates(context.Background(), userID, []*commonpb.ChatId{chatID})
 	require.NoError(t, err)
@@ -1379,7 +1371,7 @@ func requireViewerState(t *testing.T, us chat.UserStateStore, chatID *commonpb.C
 
 func testStore_UserState_Empty(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	user := model.MustGenerateUserID()
 	dm := generateDmChatID()
 	group := chat.MustGenerateGroupChatID()
@@ -1407,7 +1399,7 @@ func testStore_UserState_Empty(t *testing.T, s chat.Store) {
 
 func testStore_UserState_SetMute_Until(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	user := model.MustGenerateUserID()
 	dm := generateDmChatID()
 
@@ -1433,7 +1425,7 @@ func testStore_UserState_SetMute_Until(t *testing.T, s chat.Store) {
 
 func testStore_UserState_SetMute_Forever(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	user := model.MustGenerateUserID()
 	group := chat.MustGenerateGroupChatID()
 
@@ -1451,7 +1443,7 @@ func testStore_UserState_SetMute_Forever(t *testing.T, s chat.Store) {
 
 func testStore_UserState_SetMute_Idempotent(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	user := model.MustGenerateUserID()
 	dm := generateDmChatID()
 
@@ -1480,7 +1472,7 @@ func testStore_UserState_SetMute_Idempotent(t *testing.T, s chat.Store) {
 
 func testStore_UserState_SetMute_Replace(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	user := model.MustGenerateUserID()
 	dm := generateDmChatID()
 
@@ -1503,7 +1495,7 @@ func testStore_UserState_SetMute_Replace(t *testing.T, s chat.Store) {
 
 func testStore_UserState_ClearMute(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	user := model.MustGenerateUserID()
 	group := chat.MustGenerateGroupChatID()
 
@@ -1539,7 +1531,7 @@ func testStore_UserState_ClearMute(t *testing.T, s chat.Store) {
 
 func testStore_UserState_OutOfRange(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	user := model.MustGenerateUserID()
 	dm := generateDmChatID()
 
@@ -1570,7 +1562,7 @@ func testStore_UserState_OutOfRange(t *testing.T, s chat.Store) {
 
 func testStore_UserState_GetViewerStates_Batch(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	user := model.MustGenerateUserID()
 	other := model.MustGenerateUserID()
 	dm1 := generateDmChatID()
@@ -1622,7 +1614,7 @@ func testStore_UserState_GetViewerStates_Batch(t *testing.T, s chat.Store) {
 // the store bounds to the request, and must still be left out.
 func testStore_UserState_GetViewerStates_Bounded(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	user := model.MustGenerateUserID()
 
 	chats := []*commonpb.ChatId{generateDmChatID(), generateDmChatID(), generateDmChatID()}
@@ -1642,7 +1634,7 @@ func testStore_UserState_GetViewerStates_Bounded(t *testing.T, s chat.Store) {
 
 func testStore_UserState_GetMutedUsers(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	group := chat.MustGenerateGroupChatID()
 	otherChat := generateDmChatID()
 
@@ -1686,7 +1678,7 @@ func testStore_UserState_GetMutedUsers(t *testing.T, s chat.Store) {
 // user, so the final page carries a cursor that yields an empty, final page.
 func testStore_UserState_GetMutedUsersInOrder_Cursor(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	group := chat.MustGenerateGroupChatID()
 
 	users := []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()}
@@ -1731,7 +1723,7 @@ func testStore_UserState_GetMutedUsersInOrder_Cursor(t *testing.T, s chat.Store)
 
 func testStore_UserState_MutedCount(t *testing.T, s chat.Store) {
 	ctx := context.Background()
-	us := userStateStore(t, s)
+	us := s
 	group := chat.MustGenerateGroupChatID()
 	other := generateDmChatID()
 	a := model.MustGenerateUserID()

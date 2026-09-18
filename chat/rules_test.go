@@ -66,12 +66,16 @@ func (f *fakeAccounts) bind(userID *commonpb.UserId) *commonpb.PublicKey {
 // fakeOcpBalance is the OCP balance service behind a real balance.Client,
 // answering from a per-owner, per-mint ledger in USDF quarks and honouring the
 // request's mint filter the way OCP does: the owner's total covers only the
-// requested mints. It records how often it was asked.
+// requested mints. It values the total in each requested currency it has a
+// rate for, and silently not in one it lacks, as OCP answers a code it cannot
+// price. It records how often it was asked.
 type fakeOcpBalance struct {
 	// ledger is owner base58 -> mint base58 -> quarks.
 	ledger map[string]map[string]uint64
-	asked  int
-	err    error
+	// rates values a USDF unit in each fiat currency the fake can price.
+	rates map[string]float64
+	asked int
+	err   error
 }
 
 func (f *fakeOcpBalance) set(owner, mint *commonpb.PublicKey, quarks uint64) {
@@ -103,6 +107,16 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 			if len(requested) == 0 || requested[mint] {
 				ownerBalance.CoreMintValue += quarks
 			}
+		}
+		for _, code := range req.CurrencyCodes {
+			rate, ok := f.rates[code]
+			if !ok {
+				continue
+			}
+			if ownerBalance.FiatValuesByCurrency == nil {
+				ownerBalance.FiatValuesByCurrency = make(map[string]float64)
+			}
+			ownerBalance.FiatValuesByCurrency[code] = float64(ownerBalance.CoreMintValue) / float64(ocp_common.CoreMintQuarksPerUnit) * rate
 		}
 		resp.BalancesByOwner[base58.Encode(owner.Value)] = ownerBalance
 	}
@@ -182,6 +196,31 @@ func TestRulesFromProto_MinimumTransferValue(t *testing.T) {
 	require.Equal(t, 0.01, minimumTransferValue("usd"))
 	require.Equal(t, 1.0, minimumTransferValue("jpy"))
 	require.Equal(t, 0.001, minimumTransferValue("kwd"))
+
+	// The floor follows the currency: a yen for JPY, a fils for KWD. The
+	// currency itself is stored as asked; whether OCP can value a balance in
+	// it is not validation's question.
+	in := func(currency string, amount float64) *chatpb.Rules {
+		return &chatpb.Rules{Listener: []*chatpb.ListenerRules{{Kind: &chatpb.ListenerRules_MinimumBalance{MinimumBalance: &chatpb.MinimumBalanceRequirement{
+			Amount: &commonpb.FiatPaymentAmount{Currency: currency, NativeAmount: amount},
+		}}}}}
+	}
+	for _, tc := range []struct {
+		currency string
+		amount   float64
+	}{{"jpy", 1}, {"jpy", 1.5}, {"kwd", 0.001}, {"eur", 0.01}, {"xyz", 0.01}} {
+		_, minimum, err := RulesFromProto(in(tc.currency, tc.amount))
+		require.NoError(t, err, "%s %v", tc.currency, tc.amount)
+		require.Equal(t, tc.currency, minimum.Currency)
+		require.Equal(t, tc.amount, minimum.NativeAmount)
+	}
+	for _, tc := range []struct {
+		currency string
+		amount   float64
+	}{{"jpy", 0.5}, {"jpy", 0.99}, {"kwd", 0.0009}, {"eur", 0.009}, {"", 1}} {
+		_, _, err := RulesFromProto(in(tc.currency, tc.amount))
+		require.ErrorIs(t, err, ErrInvalidRules, "%s %v", tc.currency, tc.amount)
+	}
 }
 
 func TestChat_Rules(t *testing.T) {
@@ -450,12 +489,53 @@ func TestRuleEvaluator_MinimumBalance(t *testing.T) {
 	require.False(t, ok)
 	ocpBalance.err = nil
 
-	// Only USD can be answered: any other currency is an error, never a pass,
-	// and the balance is not even read.
-	eur := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumListenerBalance: &MinimumBalance{Currency: "eur", NativeAmount: 1}})
-	asked = ocpBalance.asked
+	// Any other currency is answered by OCP's valuation of the same holdings in
+	// it. Back at 100 USDF, holder is 90 EUR at the fake's rate: a requirement
+	// of 90 is met, and one of 90.01 is not.
+	ocpBalance.set(accounts.keys[string(holder.Value)], other, 0)
+	ocpBalance.set(accounts.keys[string(underfunded.Value)], usdf, ocp_common.ToCoreMintQuarks(requirement)-1)
+	ocpBalance.rates = map[string]float64{"eur": 0.9, "jpy": 150}
+	eur := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumListenerBalance: &MinimumBalance{Currency: "eur", NativeAmount: 90}})
 	ok, err = e.CanListen(ctx, eur.ID, holder)
-	require.Error(t, err)
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, err = e.CanListen(ctx, eur.ID, underfunded)
+	require.NoError(t, err)
+	require.True(t, ok, "a quark short of 100 USDF is still 90 EUR to the nearest cent")
+	ok, err = e.CanListen(ctx, eur.ID, unbound)
+	require.NoError(t, err)
 	require.False(t, ok)
-	require.Equal(t, asked, ocpBalance.asked)
+
+	dearer := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumListenerBalance: &MinimumBalance{Currency: "eur", NativeAmount: 90.01}})
+	ok, err = e.CanListen(ctx, dearer.ID, holder)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// The valuation is a quoted rate applied to quarks, so half a minor unit
+	// of slack is allowed under the requirement — and no more. At 150 JPY per
+	// USDF, 99.997 USDF is 14999.55 JPY: within half a yen of 15000, admitted;
+	// 99.996 USDF is 14999.4 JPY, refused.
+	jpy := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumListenerBalance: &MinimumBalance{Currency: "jpy", NativeAmount: 15000}})
+	ocpBalance.set(accounts.keys[string(underfunded.Value)], usdf, ocp_common.ToCoreMintQuarks(requirement)-3_000)
+	ok, err = e.CanListen(ctx, jpy.ID, underfunded)
+	require.NoError(t, err)
+	require.True(t, ok)
+	ocpBalance.set(accounts.keys[string(underfunded.Value)], usdf, ocp_common.ToCoreMintQuarks(requirement)-4_000)
+	ok, err = e.CanListen(ctx, jpy.ID, underfunded)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// A currency OCP cannot value is an error, never a pass — and never a zero
+	// balance.
+	unpriced := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumListenerBalance: &MinimumBalance{Currency: "xyz", NativeAmount: 1}})
+	ok, err = e.CanListen(ctx, unpriced.ID, holder)
+	require.ErrorIs(t, err, balance.ErrUnsupportedCurrency)
+	require.False(t, ok)
+
+	// A USD requirement never asks OCP for a valuation, so it is unaffected by
+	// what OCP can price.
+	ocpBalance.rates = nil
+	ok, err = e.CanListen(ctx, gated.ID, holder)
+	require.NoError(t, err)
+	require.True(t, ok)
 }

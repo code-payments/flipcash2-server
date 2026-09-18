@@ -64,7 +64,7 @@ type DmFeedCursor struct {
 	ChatID       *commonpb.ChatId
 }
 
-// Store persists chats and their membership.
+// Store persists chats, their membership, and each user's own state on a chat.
 //
 // DM membership is fixed at creation time (the two participants) and is never
 // mutated afterward. Group chat membership is mutable via AddGroupMembers and
@@ -73,7 +73,22 @@ type DmFeedCursor struct {
 //
 // A chat ID's length discriminates its family (see DmChatIDSize and
 // GroupChatIDSize): implementations dispatch on it, and each method rejects or
-// misses IDs of the wrong family for its semantics.
+// misses IDs of the wrong family for its semantics — except the viewer-state
+// methods, which accept both and do not care which.
+//
+// Viewer state (see ViewerState) is one record per (user, chat), written only
+// by that user's own actions and read back only to them — plus the chat-scoped
+// reads GetMutedUsers, GetMutedUsersInOrder and GetMutedCount, which serve the
+// push fan-out. Records are sparse: nothing is written when a chat is created
+// or joined, a record appears on the user's first write, and nothing removes
+// it — a cleared mute leaves the record and its version behind. The record
+// knows nothing of membership: a departure clears a mute only because the
+// leave handler calls ClearMute (see Server.LeaveChat), and whether the user
+// may act on the chat is likewise the caller's gate. Every write is
+// conditional — a single update, or one transaction where a store keeps an
+// aggregate alongside the record — and moves Version by exactly one on a real
+// change and not at all on a no-op, so a retried or duplicated request is
+// harmless.
 type Store interface {
 	// PutChat persists a new chat and its membership. It returns ErrChatExists
 	// if a chat with the same ID already exists, ErrNoMembers if the member set
@@ -248,24 +263,7 @@ type Store interface {
 	// ErrChatNotFound). A group chat's membership lives in its own records, so
 	// members is empty and the caller reads GetMembers itself.
 	AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (advanced bool, members []*commonpb.UserId, err error)
-}
 
-// UserStateStore persists ViewerState: one record per (user, chat), written
-// only by that user's own actions and read back only to them — plus one
-// chat-scoped read, GetMutedUsers, that serves the push fan-out.
-//
-// Records are sparse: nothing is written when a chat is created or joined, a
-// record appears on the user's first write, and nothing removes it — a
-// cleared mute leaves the record and its version behind. The store knows
-// nothing of membership: a departure clears a mute only because the leave
-// handler calls ClearMute (see Server.LeaveChat), and whether the user may
-// act on the chat is likewise the caller's gate. Every write is conditional
-// — a single update, or one transaction where a store keeps an aggregate
-// alongside the record — and moves Version by exactly one on a real change
-// and not at all on a no-op, so a retried or duplicated request is harmless.
-//
-// Chat IDs of both families are accepted; the record does not care which.
-type UserStateStore interface {
 	// SetMute records mute as userID's mute on chatID, replacing any mute
 	// already set, and returns the state after the write. changed reports
 	// whether anything moved: recording the mute already recorded (after

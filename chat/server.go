@@ -155,7 +155,6 @@ type Server struct {
 	accounts  account.Store
 	blocklist BlocklistReader
 	chats     Store
-	userState UserStateStore
 	media     Media
 	messaging MessagingReader
 	moderator moderation.Client
@@ -188,7 +187,6 @@ func NewServer(
 	accounts account.Store,
 	blocklist BlocklistReader,
 	chats Store,
-	userState UserStateStore,
 	media Media,
 	messaging MessagingReader,
 	moderator moderation.Client,
@@ -209,7 +207,6 @@ func NewServer(
 		accounts:  accounts,
 		blocklist: blocklist,
 		chats:     chats,
-		userState: userState,
 		media:     media,
 		messaging: messaging,
 		moderator: moderator,
@@ -510,7 +507,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		return err
 	})
 	g.Go(func() (err error) {
-		viewerStates, err = s.userState.GetViewerStates(gctx, viewerID, chatIDs)
+		viewerStates, err = s.chats.GetViewerStates(gctx, viewerID, chatIDs)
 		return err
 	})
 	if len(pictureBlobIDs) > 0 {

@@ -526,7 +526,7 @@ type ViewerState struct {
 }
 
 // MutedUsersPage is one page of a chat's muted users in user-ID order (see
-// UserStateStore.GetMutedUsersInOrder): the users, and the cursor to resume
+// Store.GetMutedUsersInOrder): the users, and the cursor to resume
 // after, nil once the walk is complete.
 type MutedUsersPage struct {
 	Users []*commonpb.UserId

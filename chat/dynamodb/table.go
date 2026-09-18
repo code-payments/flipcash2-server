@@ -26,52 +26,6 @@ import (
 func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
-			TableName:   aws.String(userStateTable),
-			BillingMode: types.BillingModePayPerRequest,
-			AttributeDefinitions: []types.AttributeDefinition{
-				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
-				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
-				{AttributeName: aws.String(attrChat), AttributeType: types.ScalarAttributeTypeB},
-				{AttributeName: aws.String(attrMutedUntil), AttributeType: types.ScalarAttributeTypeN},
-			},
-			KeySchema: []types.KeySchemaElement{
-				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
-				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
-			},
-			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
-				{
-					// Sparse index of a chat's recorded mutes ordered by when they
-					// end: muted_until exists only while a mute is recorded, so a
-					// range on it above "now" is exactly the active mutes, and an
-					// item whose mute was cleared leaves the index (see
-					// gsiByMuted). The user is in the projected pk, so the index
-					// carries nothing beyond its keys.
-					IndexName: aws.String(gsiByMuted),
-					KeySchema: []types.KeySchemaElement{
-						{AttributeName: aws.String(attrChat), KeyType: types.KeyTypeHash},
-						{AttributeName: aws.String(attrMutedUntil), KeyType: types.KeyTypeRange},
-					},
-					Projection: &types.Projection{ProjectionType: types.ProjectionTypeKeysOnly},
-				},
-				{
-					// Inverted index: (chat, user), in the same user order as a
-					// group's membership partition, so a chat-scoped walk of what
-					// its users have set pages in lockstep with a roster walk.
-					// Every record is in it, whatever state it holds, and the full
-					// record is projected, so any state added later is readable
-					// per chat without a new index (see gsiUserStateByUser). Both
-					// indexes are keyed by the chat attribute, which only records
-					// carry: the #meta item must omit it, or it leaks in.
-					IndexName: aws.String(gsiUserStateByUser),
-					KeySchema: []types.KeySchemaElement{
-						{AttributeName: aws.String(attrChat), KeyType: types.KeyTypeHash},
-						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeRange},
-					},
-					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
-				},
-			},
-		},
-		{
 			TableName:   aws.String(chatsTable),
 			BillingMode: types.BillingModePayPerRequest,
 			AttributeDefinitions: []types.AttributeDefinition{
@@ -152,6 +106,52 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 					KeySchema: []types.KeySchemaElement{
 						{AttributeName: aws.String(attrFeed), KeyType: types.KeyTypeHash},
 						{AttributeName: aws.String(attrLastActivity), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+			},
+		},
+		{
+			TableName:   aws.String(userStateTable),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrChat), AttributeType: types.ScalarAttributeTypeB},
+				{AttributeName: aws.String(attrMutedUntil), AttributeType: types.ScalarAttributeTypeN},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+			},
+			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
+				{
+					// Sparse index of a chat's recorded mutes ordered by when they
+					// end: muted_until exists only while a mute is recorded, so a
+					// range on it above "now" is exactly the active mutes, and an
+					// item whose mute was cleared leaves the index (see
+					// gsiByMuted). The user is in the projected pk, so the index
+					// carries nothing beyond its keys.
+					IndexName: aws.String(gsiByMuted),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrChat), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrMutedUntil), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeKeysOnly},
+				},
+				{
+					// Inverted index: (chat, user), in the same user order as a
+					// group's membership partition, so a chat-scoped walk of what
+					// its users have set pages in lockstep with a roster walk.
+					// Every record is in it, whatever state it holds, and the full
+					// record is projected, so any state added later is readable
+					// per chat without a new index (see gsiUserStateByUser). Both
+					// indexes are keyed by the chat attribute, which only records
+					// carry: the #meta item must omit it, or it leaks in.
+					IndexName: aws.String(gsiUserStateByUser),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrChat), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeRange},
 					},
 					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
 				},

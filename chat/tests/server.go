@@ -155,9 +155,7 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 	media := newFakeMedia()
 	moderator := &fakeModerator{}
 	access := chat.NewAccess(s, chat.NewRuleEvaluator(accounts, balances, s))
-	userState, ok := s.(chat.UserStateStore)
-	require.True(t, ok, "chat.Store implementation must also implement chat.UserStateStore")
-	server := chat.NewServer(log, authz, accounts, blocklist, s, userState, media, messaging, moderator, profiles, access, userBus, chatBus, false)
+	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, access, userBus, chatBus, false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))

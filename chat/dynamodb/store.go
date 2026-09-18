@@ -63,7 +63,7 @@ import (
 //	          those attributes or it leaks into the indexes.
 //
 //	chat_user_state  pk = "user#<id>", sk = "chat#<id>" (one item per (user,
-//	          chat) the user has ever set state on; see chat.UserStateStore).
+//	          chat) the user has ever set state on; see chat.Store).
 //	          What a chat holds about one user, independent of membership:
 //	          today a mute (muted_until) and the state's version. Keyed by
 //	          user so that the user's own read — their state across a page of
@@ -242,8 +242,7 @@ type store struct {
 }
 
 // NewInDynamoDB returns a chat.Store backed by the given DynamoDB tables. Use
-// CreateTables to provision them. The value also implements
-// chat.UserStateStore, over userStateTable.
+// CreateTables to provision them.
 func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable string) chat.Store {
 	return &store{
 		client:            client,

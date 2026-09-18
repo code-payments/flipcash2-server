@@ -103,7 +103,6 @@ type serverEnv struct {
 	observer     *event.TestEventObserver[*commonpb.UserId, *eventpb.Event]
 	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
 	pusher       *capturingPusher
-	userState    chat.UserStateStore
 
 	chatID *commonpb.ChatId
 	userA  *commonpb.UserId
@@ -226,10 +225,7 @@ func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, 
 	env.ocpBalance = &fakeOcpBalance{byOwner: make(map[string]uint64)}
 	balances := balance.NewClient(log, env.accounts, env.ocpBalance)
 
-	userState, ok := chats.(chat.UserStateStore)
-	require.True(t, ok, "chat.Store implementation must also implement chat.UserStateStore")
-	env.userState = userState
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, userState, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus)
 	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats))
 	server := messaging.NewServer(log, authz, chats, media, messages, access, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
@@ -2937,7 +2933,7 @@ func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.St
 		Members:      []*commonpb.UserId{e.userA, e.userB},
 		LastActivity: at(1),
 	}))
-	_, _, err := e.userState.SetMute(e.ctx, dmID, e.userB, chat.Mute{Forever: true})
+	_, _, err := chats.SetMute(e.ctx, dmID, e.userB, chat.Mute{Forever: true})
 	require.NoError(t, err)
 
 	resp, err := e.sendContentToChat(e.keysA, dmID, textContent("quiet dm"), generateClientID())
@@ -2962,7 +2958,7 @@ func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.St
 		Title:        "Mixed",
 		LastActivity: at(1),
 	}))
-	_, _, err = e.userState.SetMute(e.ctx, groupID, userC, chat.Mute{Until: time.Now().Add(time.Hour)})
+	_, _, err = chats.SetMute(e.ctx, groupID, userC, chat.Mute{Until: time.Now().Add(time.Hour)})
 	require.NoError(t, err)
 
 	resp, err = e.sendContentToChat(e.keysA, groupID, textContent("group hello"), generateClientID())
@@ -3000,7 +2996,7 @@ func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.St
 		LastActivity: at(1),
 	}))
 	require.NoError(t, profiles.LinkPhoneNumber(e.ctx, e.userA, "+15551234567", &commonpb.Hash{Value: make([]byte, 32)}))
-	_, _, err = e.userState.SetMute(e.ctx, lapsedID, e.userB, chat.Mute{Until: at(1)})
+	_, _, err = chats.SetMute(e.ctx, lapsedID, e.userB, chat.Mute{Until: at(1)})
 	require.NoError(t, err)
 
 	resp, err = e.sendContentToChat(e.keysA, lapsedID, textContent("lapsed"), generateClientID())

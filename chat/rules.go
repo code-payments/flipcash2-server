@@ -65,16 +65,19 @@ var ErrInvalidRules = errors.New("invalid chat rules")
 // It accepts what a group can store today, and nothing more, so that a rule
 // is never accepted and then silently dropped: listener rules only, since no
 // group carries a speaker rule yet; each kind at most once, since the record
-// holds one of each; and a minimum balance in USD only, since that is the only
-// balance the evaluator can answer (see satisfiesMinimumBalance), of at least
-// the currency's minimum transfer value — one unit at its last decimal place,
-// a penny for USD, the smallest amount OCP lets anyone hold or move in that
-// currency (see minimumTransferValue). A requirement below it asks for a
-// balance no one can distinguish from nothing, so the rule would admit
-// everyone, or no one, on rounding alone. The requirement's mints are taken as given: the
-// proto bounds how many, and validation bounds their shape. Anything else is
-// ErrInvalidRules — a rule the server cannot enforce is refused up front rather
-// than stored and failed on every evaluation.
+// holds one of each; and a minimum balance of at least the currency's minimum
+// transfer value — one unit at its last decimal place, a penny for USD, a yen
+// for JPY, the smallest amount OCP lets anyone hold or move in that currency
+// (see minimumTransferValue). A requirement below it asks for a balance no one
+// can distinguish from nothing, so the rule would admit everyone, or no one,
+// on rounding alone. The currency is any ISO 4217 code: the proto bounds its
+// shape, and whether OCP can value a balance in it is OCP's to say, which it
+// does the first time the rule is evaluated — for a new group, against its
+// creator, before anything is written (see Server.StartChat). The requirement's
+// mints are taken as given: the proto bounds how many, and validation bounds
+// their shape. Anything else is ErrInvalidRules — a rule the server cannot
+// enforce is refused up front rather than stored and failed on every
+// evaluation.
 //
 // It also requires what every group must carry today: a minimum listener
 // balance. A set without one — nil, empty, or staff-only — is ErrInvalidRules,
@@ -96,8 +99,8 @@ func RulesFromProto(rules *chatpb.Rules) (isStaffOnly bool, minimumListenerBalan
 			}
 			req := k.MinimumBalance
 			currency := currency_lib.Code(req.GetAmount().GetCurrency())
-			if currency != currency_lib.USD {
-				return false, nil, fmt.Errorf("%w: unsupported minimum balance currency %q", ErrInvalidRules, req.GetAmount().GetCurrency())
+			if currency == "" {
+				return false, nil, fmt.Errorf("%w: minimum balance currency is required", ErrInvalidRules)
 			}
 			amount := req.GetAmount().GetNativeAmount()
 			if minimum := minimumTransferValue(currency); math.IsNaN(amount) || math.IsInf(amount, 0) || amount < minimum {
@@ -108,7 +111,7 @@ func RulesFromProto(rules *chatpb.Rules) (isStaffOnly bool, minimumListenerBalan
 				mints[i] = &commonpb.PublicKey{Value: append([]byte(nil), mint.GetValue()...)}
 			}
 			minimumListenerBalance = &MinimumBalance{
-				Currency:     string(currency_lib.USD),
+				Currency:     string(currency),
 				NativeAmount: amount,
 				Mints:        mints,
 			}
@@ -262,28 +265,44 @@ func (e *RuleEvaluator) satisfies(ctx context.Context, kind any, userID *commonp
 // satisfiesMinimumBalance reports whether userID holds at least the required
 // amount, in the required mints, right now.
 //
-// Only a USD requirement can be answered: the balance client values holdings in
-// USDF, a USD stablecoin, so the requirement compares directly against what it
-// returns with no exchange rate in between. A requirement in any other currency
-// is, like an unknown rule kind, an error and never a pass. The comparison is
-// made in quarks, the requirement rounded to the nearest quark, so a balance
-// that is exactly the requirement satisfies it whatever the float arithmetic
-// on the way in.
+// A USD requirement is answered in quarks: the balance client's core mint
+// total is USDF, a USD stablecoin, so the requirement compares directly
+// against it with no exchange rate in between, the requirement rounded to the
+// nearest quark, so a balance that is exactly the requirement satisfies it
+// whatever the float arithmetic on the way in. The path asks OCP for no
+// valuation, so a USD group is unaffected by what OCP can price.
+//
+// Any other currency is answered by OCP's valuation of the same holdings in
+// that currency (see balance.Client.GetTotalFiatValue). The value is a quoted
+// rate applied to a quark total, so it can land a fraction of a minor unit
+// under a requirement it meets through rounding alone; half of the currency's
+// smallest transferable unit of slack is allowed, as intent validation allows
+// on a rate-derived tip. A currency OCP cannot value is, like an unknown rule
+// kind, an error and never a pass.
 //
 // A user with no owner account holds nothing, and fails as a zero balance would;
 // a balance that cannot be read is an error, so the gate is never left
 // unenforced.
 func (e *RuleEvaluator) satisfiesMinimumBalance(ctx context.Context, req *chatpb.MinimumBalanceRequirement, userID *commonpb.UserId) (bool, error) {
-	if currency_lib.Code(req.GetAmount().GetCurrency()) != currency_lib.USD {
-		return false, fmt.Errorf("unsupported minimum balance currency %q", req.GetAmount().GetCurrency())
-	}
-	required := uint64(math.Round(req.GetAmount().GetNativeAmount() * float64(ocp_common.CoreMintQuarksPerUnit)))
+	currency := currency_lib.Code(req.GetAmount().GetCurrency())
+	if currency == currency_lib.USD {
+		required := uint64(math.Round(req.GetAmount().GetNativeAmount() * float64(ocp_common.CoreMintQuarksPerUnit)))
 
-	held, err := e.balances.GetTotalUsdfBalance(ctx, userID, req.GetMints()...)
+		held, err := e.balances.GetTotalUsdfBalance(ctx, userID, req.GetMints()...)
+		if errors.Is(err, balance.ErrNotFound) {
+			held = 0
+		} else if err != nil {
+			return false, err
+		}
+		return held >= required, nil
+	}
+
+	held, err := e.balances.GetTotalFiatValue(ctx, userID, currency, req.GetMints()...)
 	if errors.Is(err, balance.ErrNotFound) {
 		held = 0
 	} else if err != nil {
 		return false, err
 	}
-	return held >= required, nil
+	tolerance := 0.5 * minimumTransferValue(currency)
+	return held >= req.GetAmount().GetNativeAmount()-tolerance, nil
 }

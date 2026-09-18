@@ -14,6 +14,7 @@ import (
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 
+	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/blob"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/moderation"
@@ -23,10 +24,10 @@ import (
 //
 // The request is checked in the order a client can act on: the rules it asks
 // for must be ones a group can carry — which today means they must include a
-// minimum listener balance (see RulesFromProto) — and ones the caller
-// satisfies (RULES_NOT_SATISFIED); the title must pass moderation
-// (TITLE_MODERATED); and the picture, if any, must be a READY image the caller
-// owns (PICTURE_BLOB_NOT_ACCEPTED). Only then is anything written. Rule checks
+// minimum listener balance, in a currency OCP can value (see RulesFromProto)
+// — and ones the caller satisfies (RULES_NOT_SATISFIED); the title must pass
+// moderation (TITLE_MODERATED); and the picture, if any, must be a READY image
+// the caller owns (PICTURE_BLOB_NOT_ACCEPTED). Only then is anything written. Rule checks
 // come first because they are local reads, moderation next because it is a
 // call out, and the picture last because attaching it grants read access —
 // against a chat ID minted for the purpose — and that grant, though harmless
@@ -106,7 +107,16 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 	// reach, and one whose creator cannot post in it is a room they opened and
 	// cannot use. The rules are evaluated from the request rather than a
 	// stored record, since there is no record yet.
+	//
+	// This is also where the requirement's currency is first put to OCP. One
+	// OCP cannot value is a rule the server cannot enforce, refused as
+	// INVALID_RULES like any other (see RulesFromProto) rather than failed:
+	// the currency is the client's choice, and no group is written that no one
+	// could ever be admitted to.
 	satisfied, err := s.rules.CanSpeakWithRules(ctx, params.Rules, userID)
+	if errors.Is(err, balance.ErrUnsupportedCurrency) {
+		return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_INVALID_RULES}, nil
+	}
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure evaluating chat rules")
 		return nil, status.Error(codes.Internal, "")

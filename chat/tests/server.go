@@ -80,6 +80,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_JoinChat_DeniedForDm,
 		testServer_JoinChat_StaffRule,
 		testServer_JoinChat_MinimumBalanceRule,
+		testServer_JoinChat_FiatMinimumBalanceRule,
 		testServer_JoinChat_MemberSkipsRules,
 		testServer_JoinChat_UnevaluableRuleFails,
 		testServer_LeaveChat_OK,
@@ -96,6 +97,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_StartChat_InvalidRules,
 		testServer_StartChat_RulesNotSatisfied,
 		testServer_StartChat_WithRules,
+		testServer_StartChat_FiatMinimumBalance,
 		testServer_MuteChat_Lifecycle,
 		testServer_MuteChat_Group,
 		testServer_MuteChat_Gates,
@@ -220,6 +222,19 @@ func (a *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (boo
 type fakeOcpBalance struct {
 	mu      sync.Mutex
 	byOwner map[string]uint64
+	// rates values a USDF unit in each fiat currency the fake can price; a
+	// requested currency without one is left unvalued, as OCP answers a code
+	// it cannot price.
+	rates map[string]float64
+}
+
+func (f *fakeOcpBalance) setRate(currency string, rate float64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rates == nil {
+		f.rates = make(map[string]float64)
+	}
+	f.rates[currency] = rate
 }
 
 func (f *fakeOcpBalance) setBalance(owner *commonpb.PublicKey, quarks uint64) {
@@ -238,7 +253,18 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 		if !ok {
 			continue // An owner OCP has no accounts for is left out.
 		}
-		resp.BalancesByOwner[key] = &ocp_balancepb.OwnerBalance{Owner: owner, CoreMintValue: quarks}
+		ownerBalance := &ocp_balancepb.OwnerBalance{Owner: owner, CoreMintValue: quarks}
+		for _, code := range req.CurrencyCodes {
+			rate, ok := f.rates[code]
+			if !ok {
+				continue
+			}
+			if ownerBalance.FiatValuesByCurrency == nil {
+				ownerBalance.FiatValuesByCurrency = make(map[string]float64)
+			}
+			ownerBalance.FiatValuesByCurrency[code] = float64(quarks) / float64(ocp_common.CoreMintQuarksPerUnit) * rate
+		}
+		resp.BalancesByOwner[key] = ownerBalance
 	}
 	return resp, nil
 }
@@ -1882,6 +1908,49 @@ func testServer_JoinChat_MinimumBalanceRule(t *testing.T, s chat.Store) {
 	e.waitForRosterUpdates(e.userID, group.ID, 1)
 }
 
+// testServer_JoinChat_FiatMinimumBalanceRule is
+// testServer_JoinChat_MinimumBalanceRule for a requirement in a currency other
+// than USD, answered by OCP's valuation of the user's holdings in it.
+func testServer_JoinChat_FiatMinimumBalanceRule(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// 150 JPY per USDF, so the requirement is 100 USDF.
+	const requirement = 15_000
+	e.ocpBalance.setRate("jpy", 150)
+	group := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:                  "Yen Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "jpy", NativeAmount: requirement},
+		LastActivity:           at(1),
+	}
+	require.NoError(t, s.PutChat(e.ctx, group))
+
+	// With no owner account at all the user holds nothing, and is refused —
+	// not failed.
+	resp := e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_RULES_NOT_SATISFIED, resp.Result)
+
+	// More than half a yen short is short: the valuation is a quoted rate
+	// applied to quarks, so that much slack is allowed and no more.
+	_, err := e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(100)-4_000)
+	resp = e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_RULES_NOT_SATISFIED, resp.Result)
+	e.requireNoRosterUpdates(e.userID, group.ID)
+
+	// Within it, the user is admitted; the metadata they get back shows the
+	// rule as stored.
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(100)-3_000)
+	resp = e.mustJoinChat(e.keys, group.ID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, resp.Result)
+	require.Equal(t, "jpy", resp.Chat.GetRules().GetListener()[0].GetMinimumBalance().GetAmount().GetCurrency())
+	require.Equal(t, float64(requirement), resp.Chat.GetRules().GetListener()[0].GetMinimumBalance().GetAmount().GetNativeAmount())
+	e.waitForRosterUpdates(e.userID, group.ID, 1)
+}
+
 // testServer_JoinChat_MemberSkipsRules pins that a current member re-joining
 // is answered on membership alone: a member who no longer satisfies the
 // group's rules keeps their membership, and a retried join says so.
@@ -1906,8 +1975,9 @@ func testServer_JoinChat_MemberSkipsRules(t *testing.T, s chat.Store) {
 }
 
 // testServer_JoinChat_UnevaluableRuleFails pins that a rule the server cannot
-// evaluate fails the join rather than admitting the user: a restriction the
-// server cannot answer admits no one.
+// evaluate — here a minimum balance in a currency OCP cannot value — fails the
+// join rather than admitting the user: a restriction the server cannot answer
+// admits no one.
 func testServer_JoinChat_UnevaluableRuleFails(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
@@ -1915,12 +1985,13 @@ func testServer_JoinChat_UnevaluableRuleFails(t *testing.T, s chat.Store) {
 		ID:                     chat.MustGenerateGroupChatID(),
 		Type:                   chatpb.ChatType_GROUP,
 		Members:                []*commonpb.UserId{model.MustGenerateUserID()},
-		Title:                  "Euros",
-		MinimumListenerBalance: &chat.MinimumBalance{Currency: "eur", NativeAmount: 1},
+		Title:                  "Unpriced",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "xyz", NativeAmount: 1},
 		LastActivity:           at(1),
 	}
 	require.NoError(t, s.PutChat(e.ctx, group))
 
+	e.fundEnvUser(1)
 	_, err := e.joinChat(e.keys, group.ID)
 	require.Equal(t, codes.Internal, status.Code(err))
 	isMember, err := s.IsMember(e.ctx, group.ID, e.userID)
@@ -2486,6 +2557,7 @@ func testServer_StartChat_InvalidRules(t *testing.T, s chat.Store) {
 	// rules' shape alone.
 	e.accounts.setStaff(e.userID, true)
 	e.fundEnvUser(startChatMinimumBalance)
+	e.ocpBalance.setRate("jpy", 150)
 
 	staff := &chatpb.ListenerRules{Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}}}
 	minimumBalance := minimumBalanceRule("usd", startChatMinimumBalance)
@@ -2503,15 +2575,18 @@ func testServer_StartChat_InvalidRules(t *testing.T, s chat.Store) {
 		// The record holds one requirement of each kind.
 		"duplicate staff":           {Listener: []*chatpb.ListenerRules{staff, staff, minimumBalance}},
 		"duplicate minimum balance": {Listener: []*chatpb.ListenerRules{minimumBalance, minimumBalanceRule("usd", 1)}},
-		// Only a USD requirement can be evaluated, and only one of at least the
-		// currency's minimum transfer value — a penny — requires anything.
-		// (A negative amount never reaches the server: the proto validator
-		// refuses it as an invalid request.)
-		"non-usd minimum balance":      {Listener: []*chatpb.ListenerRules{minimumBalanceRule("eur", 1)}},
+		// Only a requirement of at least the currency's minimum transfer value
+		// — a penny, a yen — requires anything. (A negative amount never
+		// reaches the server: the proto validator refuses it as an invalid
+		// request.)
 		"zero minimum balance":         {Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 0)}},
 		"sub-penny minimum balance":    {Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 0.009)}},
 		"half-penny minimum balance":   {Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 0.005)}},
+		"sub-yen minimum balance":      {Listener: []*chatpb.ListenerRules{minimumBalanceRule("jpy", 0.5)}},
 		"not-a-number minimum balance": {Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", math.NaN())}},
+		// A currency OCP cannot value is a rule the server cannot enforce,
+		// found out against the creator before anything is written.
+		"unpriced minimum balance": {Listener: []*chatpb.ListenerRules{minimumBalanceRule("xyz", 1)}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			resp := e.mustStartGroupChat(e.keys, &chatpb.StartChatRequest_GroupChatParameters{Title: "Ruled", Rules: rules})
@@ -2595,6 +2670,58 @@ func testServer_StartChat_WithRules(t *testing.T, s chat.Store) {
 	isMember, err := s.IsMember(e.ctx, resp.Chat.ChatId, stranger)
 	require.NoError(t, err)
 	require.False(t, isMember)
+}
+
+// testServer_StartChat_FiatMinimumBalance pins that a group can carry its
+// minimum listener balance in any currency OCP can value: the creator is
+// gated on OCP's valuation of their holdings in it, the requirement is stored
+// and shown back as asked, and it gates joins the same way.
+func testServer_StartChat_FiatMinimumBalance(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// 0.9 EUR per USDF, so 90 EUR is 100 USDF.
+	const requirement = 90
+	e.ocpBalance.setRate("eur", 0.9)
+	params := &chatpb.StartChatRequest_GroupChatParameters{
+		Title: "Euro Whales",
+		Rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{minimumBalanceRule("eur", requirement)}},
+	}
+
+	// A creator more than half a cent short is refused.
+	_, err := e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(100)-10_000)
+	resp := e.mustStartGroupChat(e.keys, params)
+	require.Equal(t, chatpb.StartChatResponse_RULES_NOT_SATISFIED, resp.Result)
+	require.Nil(t, resp.Chat)
+
+	// Holding the requirement, the creator gets the group, with the rule
+	// stored and shown back in the currency asked for.
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(100))
+	resp = e.mustStartGroupChat(e.keys, params)
+	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(params.Rules, resp.Chat.GetRules()))
+
+	stored, err := s.GetChatByID(e.ctx, resp.Chat.ChatId)
+	require.NoError(t, err)
+	require.NotNil(t, stored.MinimumListenerBalance)
+	require.Equal(t, "eur", stored.MinimumListenerBalance.Currency)
+	require.Equal(t, float64(requirement), stored.MinimumListenerBalance.NativeAmount)
+	require.NoError(t, protoutil.ProtoEqualError(params.Rules, stored.Rules()))
+
+	// The rule gates joins on the same valuation.
+	stranger, strangerKeys := e.addUser()
+	_, err = e.accounts.Bind(e.ctx, stranger, strangerKeys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(strangerKeys.Proto(), ocp_common.ToCoreMintQuarks(100)-10_000)
+	joinResp := e.mustJoinChat(strangerKeys, resp.Chat.ChatId)
+	require.Equal(t, chatpb.JoinChatResponse_RULES_NOT_SATISFIED, joinResp.Result)
+	e.ocpBalance.setBalance(strangerKeys.Proto(), ocp_common.ToCoreMintQuarks(100))
+	joinResp = e.mustJoinChat(strangerKeys, resp.Chat.ChatId)
+	require.Equal(t, chatpb.JoinChatResponse_OK, joinResp.Result)
+	isMember, err := s.IsMember(e.ctx, resp.Chat.ChatId, stranger)
+	require.NoError(t, err)
+	require.True(t, isMember)
 }
 
 func (e *serverEnv) muteChat(keys model.KeyPair, chatID *commonpb.ChatId, mute *chatpb.MuteState) (*chatpb.MuteChatResponse, error) {

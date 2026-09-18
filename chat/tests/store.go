@@ -43,6 +43,9 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_GroupChat_Membership,
 		testStore_GroupChat_MembersPage,
 		testStore_GroupChat_MembersPage_MuteOrder,
+		testStore_GroupChat_Roster,
+		testStore_GroupChat_RosterPage,
+		testStore_GroupChat_MemberRecords,
 		testStore_GroupChat_RosterSummary,
 		testStore_GroupChat_ConcurrentTransitions,
 		testStore_GroupChat_MembershipsForUser,
@@ -1102,6 +1105,229 @@ func testStore_GroupChat_MembersPage_MuteOrder(t *testing.T, s chat.Store) {
 		after = roster.Next
 	}
 	assert.Equal(t, len(users), seen)
+}
+
+// testStore_GroupChat_Roster pins the whole-roster read against the records
+// it enumerates: every joined member with the join time and version stamp of
+// the transition that placed them — creation's members at version zero, a
+// joiner at the version their join moved the summary to, a rejoiner at the
+// rejoin's — alongside a summary whose count is their number.
+func testStore_GroupChat_Roster(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+	userC := model.MustGenerateUserID()
+	before := time.Now().UTC()
+	c := putGroupChat(t, s, "Enumerated", at(5), userA, userB)
+
+	summary, members, err := s.GetGroupRoster(ctx, c.ID)
+	require.NoError(t, err)
+	require.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 0}, summary)
+	byUser := rosterByUser(members)
+	require.Len(t, byUser, 2)
+	for _, u := range []*commonpb.UserId{userA, userB} {
+		m, ok := byUser[string(u.Value)]
+		require.True(t, ok)
+		require.Zero(t, m.Version)
+		require.False(t, m.JoinedAt.Before(before), "a creation member's join time is the creation's")
+	}
+
+	// A join is stamped with the version it produced and a join time after
+	// the founders'.
+	settle()
+	_, roster := addGroupMembers(t, s, c.ID, userC)
+	summary, members, err = s.GetGroupRoster(ctx, c.ID)
+	require.NoError(t, err)
+	require.Equal(t, roster, summary)
+	require.Equal(t, chat.RosterSummary{MemberCount: 3, Version: 1}, summary)
+	byUser = rosterByUser(members)
+	require.Len(t, byUser, 3)
+	require.EqualValues(t, 1, byUser[string(userC.Value)].Version)
+	require.True(t, byUser[string(userC.Value)].JoinedAt.After(byUser[string(userA.Value)].JoinedAt))
+
+	// A departed member is not on the roster; the count says so.
+	removeGroupMember(t, s, c.ID, userA)
+	summary, members, err = s.GetGroupRoster(ctx, c.ID)
+	require.NoError(t, err)
+	require.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 2}, summary)
+	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{userB, userC}), userIDValues(rosterUserIDs(members)))
+
+	// A rejoin is a fresh record: the rejoin's version and a new join time.
+	settle()
+	addGroupMembers(t, s, c.ID, userA)
+	summary, members, err = s.GetGroupRoster(ctx, c.ID)
+	require.NoError(t, err)
+	require.Equal(t, chat.RosterSummary{MemberCount: 3, Version: 3}, summary)
+	byUser = rosterByUser(members)
+	require.EqualValues(t, 3, byUser[string(userA.Value)].Version)
+	require.True(t, byUser[string(userA.Value)].JoinedAt.After(byUser[string(userC.Value)].JoinedAt))
+
+	// An unknown group is not found, as opposed to empty; a DM has no roster
+	// records to read.
+	_, _, err = s.GetGroupRoster(ctx, chat.MustGenerateGroupChatID())
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+	dm := putDmChat(t, s, userA, userB, at(1))
+	_, _, err = s.GetGroupRoster(ctx, dm.ID)
+	require.Error(t, err)
+}
+
+// testStore_GroupChat_RosterPage pins the paged read's order and cursor:
+// most recently joined first, resuming strictly after a position — one that
+// names a departed member included — with departed members absent and a
+// rejoiner back at the head.
+func testStore_GroupChat_RosterPage(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// Five members joined one after another, so join order is known: the
+	// founder first, then each joiner.
+	users := make([]*commonpb.UserId, 5)
+	for i := range users {
+		users[i] = model.MustGenerateUserID()
+	}
+	c := putGroupChat(t, s, "Ordered", at(10), users[0])
+	for _, u := range users[1:] {
+		settle()
+		addGroupMembers(t, s, c.ID, u)
+	}
+	newestFirst := []*commonpb.UserId{users[4], users[3], users[2], users[1], users[0]}
+
+	// Unbounded: the whole roster, newest first, each at the version of the
+	// join that placed them.
+	page, err := s.GetGroupRosterPage(ctx, c.ID, nil, 0)
+	require.NoError(t, err)
+	require.Equal(t, userIDValues(newestFirst), userIDValues(rosterUserIDs(page)))
+	for i, m := range page {
+		require.EqualValues(t, 4-i, m.Version)
+	}
+
+	// Paged by two: each page resumes after the last member of the one before.
+	page, err = s.GetGroupRosterPage(ctx, c.ID, nil, 2)
+	require.NoError(t, err)
+	require.Equal(t, userIDValues(newestFirst[:2]), userIDValues(rosterUserIDs(page)))
+	after := page[1].Position()
+	page, err = s.GetGroupRosterPage(ctx, c.ID, &after, 2)
+	require.NoError(t, err)
+	require.Equal(t, userIDValues(newestFirst[2:4]), userIDValues(rosterUserIDs(page)))
+	after = page[1].Position()
+	page, err = s.GetGroupRosterPage(ctx, c.ID, &after, 2)
+	require.NoError(t, err)
+	require.Equal(t, userIDValues(newestFirst[4:]), userIDValues(rosterUserIDs(page)))
+	after = page[0].Position()
+	page, err = s.GetGroupRosterPage(ctx, c.ID, &after, 2)
+	require.NoError(t, err)
+	require.Empty(t, page)
+
+	// A departed member leaves the order; a cursor naming their old position
+	// still resumes from where they were.
+	departed := newestFirst[1]
+	departedPosition := page1Position(t, s, c.ID, departed)
+	removeGroupMember(t, s, c.ID, departed)
+	page, err = s.GetGroupRosterPage(ctx, c.ID, nil, 0)
+	require.NoError(t, err)
+	require.Equal(t, userIDValues([]*commonpb.UserId{newestFirst[0], newestFirst[2], newestFirst[3], newestFirst[4]}), userIDValues(rosterUserIDs(page)))
+	page, err = s.GetGroupRosterPage(ctx, c.ID, &departedPosition, 0)
+	require.NoError(t, err)
+	require.Equal(t, userIDValues(newestFirst[2:]), userIDValues(rosterUserIDs(page)))
+
+	// A rejoin is the newest join: the member is back at the head, at the
+	// rejoin's version.
+	settle()
+	addGroupMembers(t, s, c.ID, departed)
+	page, err = s.GetGroupRosterPage(ctx, c.ID, nil, 1)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	require.Equal(t, departed.Value, page[0].UserID.Value)
+	require.EqualValues(t, 6, page[0].Version)
+
+	// A group that does not exist is an empty page; a DM has no roster to page.
+	page, err = s.GetGroupRosterPage(ctx, chat.MustGenerateGroupChatID(), nil, 0)
+	require.NoError(t, err)
+	require.Empty(t, page)
+	dm := putDmChat(t, s, users[0], users[1], at(1))
+	_, err = s.GetGroupRosterPage(ctx, dm.ID, nil, 0)
+	require.Error(t, err)
+}
+
+// testStore_GroupChat_MemberRecords pins the batch read of a user's own
+// records: one per group they are joined to, with the join's stamp; a group
+// they left, never joined, or that does not exist is absent; a repeated ID
+// collapses; a DM ID is refused.
+func testStore_GroupChat_MemberRecords(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	user := model.MustGenerateUserID()
+	other := model.MustGenerateUserID()
+	founded := putGroupChat(t, s, "Founded", at(1), user, other)
+	joined := putGroupChat(t, s, "Joined", at(2), other)
+	settle()
+	addGroupMembers(t, s, joined.ID, user)
+	left := putGroupChat(t, s, "Left", at(3), user, other)
+	removeGroupMember(t, s, left.ID, user)
+	never := putGroupChat(t, s, "Never", at(4), other)
+
+	records, err := s.GetGroupMemberRecords(ctx, user, []*commonpb.ChatId{
+		founded.ID, joined.ID, left.ID, never.ID, chat.MustGenerateGroupChatID(), founded.ID,
+	})
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+
+	r, ok := records[string(founded.ID.Value)]
+	require.True(t, ok)
+	require.Equal(t, user.Value, r.UserID.Value)
+	require.Zero(t, r.Version)
+	require.False(t, r.JoinedAt.IsZero())
+
+	r, ok = records[string(joined.ID.Value)]
+	require.True(t, ok)
+	require.Equal(t, user.Value, r.UserID.Value)
+	require.EqualValues(t, 1, r.Version)
+	require.True(t, r.JoinedAt.After(records[string(founded.ID.Value)].JoinedAt))
+
+	// The other member's records are their own: the same groups, read for
+	// them, are the ones they are joined to.
+	records, err = s.GetGroupMemberRecords(ctx, other, []*commonpb.ChatId{founded.ID, joined.ID, left.ID, never.ID})
+	require.NoError(t, err)
+	require.Len(t, records, 4)
+
+	records, err = s.GetGroupMemberRecords(ctx, user, nil)
+	require.NoError(t, err)
+	require.Empty(t, records)
+
+	dm := putDmChat(t, s, user, other, at(1))
+	_, err = s.GetGroupMemberRecords(ctx, user, []*commonpb.ChatId{founded.ID, dm.ID})
+	require.Error(t, err)
+}
+
+// settle spaces two membership transitions apart in wall-clock time, so their
+// join times order the way the transitions did on any clock resolution.
+func settle() { time.Sleep(2 * time.Millisecond) }
+
+// page1Position is a current member's roster position, read off the whole
+// roster.
+func page1Position(t *testing.T, s chat.Store, chatID *commonpb.ChatId, userID *commonpb.UserId) chat.RosterPosition {
+	t.Helper()
+	_, members, err := s.GetGroupRoster(context.Background(), chatID)
+	require.NoError(t, err)
+	m, ok := rosterByUser(members)[string(userID.Value)]
+	require.True(t, ok)
+	return m.Position()
+}
+
+func rosterByUser(members []chat.GroupMember) map[string]chat.GroupMember {
+	out := make(map[string]chat.GroupMember, len(members))
+	for _, m := range members {
+		out[string(m.UserID.Value)] = m
+	}
+	return out
+}
+
+func rosterUserIDs(members []chat.GroupMember) []*commonpb.UserId {
+	out := make([]*commonpb.UserId, len(members))
+	for i, m := range members {
+		out[i] = m.UserID
+	}
+	return out
 }
 
 // testStore_GroupChat_CreationCap covers the boundary of the initial member set:

@@ -432,6 +432,33 @@ func (m *memory) joinedGroupMembersLocked(chatID *commonpb.ChatId) []*commonpb.U
 	return members
 }
 
+func (m *memory) GetGroupMembersPage(_ context.Context, chatID *commonpb.ChatId, after *commonpb.UserId, limit int) (chat.MembersPage, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.MembersPage{}, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	// The persistent stores' partitions sort by user-ID bytes, which the
+	// contract promises and the mute walk shares.
+	users := make([]*commonpb.UserId, 0)
+	for _, user := range m.joinedGroupMembersLocked(chatID) {
+		if after != nil && bytes.Compare(user.Value, after.Value) <= 0 {
+			continue
+		}
+		users = append(users, user)
+	}
+	sort.Slice(users, func(i, j int) bool { return bytes.Compare(users[i].Value, users[j].Value) < 0 })
+
+	page := chat.MembersPage{Users: users}
+	if limit > 0 && len(users) >= limit {
+		page.Users = users[:limit]
+		page.Next = users[limit-1]
+	}
+	return page, nil
+}
+
 func (m *memory) AdvanceLastMessage(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, []*commonpb.UserId, error) {
 	m.Lock()
 	defer m.Unlock()
@@ -555,13 +582,16 @@ func (m *memory) GetMutedUsers(_ context.Context, chatID *commonpb.ChatId, now t
 	return users, nil
 }
 
-func (m *memory) GetMutedUsersInOrder(_ context.Context, chatID *commonpb.ChatId, now time.Time, after *commonpb.UserId, limit int) (chat.MutedUsersPage, error) {
+func (m *memory) GetMutedUsersPage(_ context.Context, chatID *commonpb.ChatId, now time.Time, lo, hi *commonpb.UserId) ([]*commonpb.UserId, error) {
 	m.Lock()
 	defer m.Unlock()
 
 	users := make([]*commonpb.UserId, 0)
 	for user, byChat := range m.viewerStates {
-		if after != nil && bytes.Compare([]byte(user), after.Value) <= 0 {
+		if lo != nil && bytes.Compare([]byte(user), lo.Value) < 0 {
+			continue
+		}
+		if hi != nil && bytes.Compare([]byte(user), hi.Value) > 0 {
 			continue
 		}
 		state := byChat[string(chatID.Value)]
@@ -571,13 +601,7 @@ func (m *memory) GetMutedUsersInOrder(_ context.Context, chatID *commonpb.ChatId
 		users = append(users, &commonpb.UserId{Value: []byte(user)})
 	}
 	sort.Slice(users, func(i, j int) bool { return bytes.Compare(users[i].Value, users[j].Value) < 0 })
-
-	page := chat.MutedUsersPage{Users: users}
-	if limit > 0 && len(users) >= limit {
-		page.Users = users[:limit]
-		page.Next = users[limit-1]
-	}
-	return page, nil
+	return users, nil
 }
 
 func (m *memory) GetMutedCount(_ context.Context, chatID *commonpb.ChatId) (uint64, error) {

@@ -56,6 +56,52 @@ type Sender struct {
 
 	userEventBus *event.Bus[*commonpb.UserId, *eventpb.Event]
 	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent]
+
+	// pushPageSize, pushMutedWholeSetCap and pushPageSlots shape the push
+	// fan-out (see push.go); the defaults are production's, and the options
+	// exist so tests can drive a multi-page walk over a handful of members.
+	pushPageSize         int
+	pushMutedWholeSetCap uint64
+
+	// pushPageSlots bounds how many group pages this Sender has in send at
+	// once across every fan-out it runs, one token per page in flight (see
+	// defaultPushPageConcurrency). It is what makes a walk's pages send in
+	// parallel, and what stops a burst of sends into large groups from
+	// running unboundedly many page sends at once.
+	pushPageSlots chan struct{}
+}
+
+// SenderOption configures a Sender beyond its dependencies.
+type SenderOption func(*Sender)
+
+// WithPushPageSize sets how many members a push fan-out walks per page (see
+// defaultPushPageSize). Values below one are ignored.
+func WithPushPageSize(n int) SenderOption {
+	return func(s *Sender) {
+		if n > 0 {
+			s.pushPageSize = n
+		}
+	}
+}
+
+// WithPushMutedWholeSetCap sets the recorded-mute count at or below which a
+// fan-out reads a chat's muted set whole rather than per page (see
+// defaultPushMutedWholeSetCap). Zero forces the per-page read for every
+// group.
+func WithPushMutedWholeSetCap(n uint64) SenderOption {
+	return func(s *Sender) { s.pushMutedWholeSetCap = n }
+}
+
+// WithPushPageConcurrency sets how many group pages the Sender sends at once
+// across every fan-out it runs (see defaultPushPageConcurrency). One
+// serializes pages, as a walk did before pages were sent concurrently.
+// Values below one are ignored.
+func WithPushPageConcurrency(n int) SenderOption {
+	return func(s *Sender) {
+		if n > 0 {
+			s.pushPageSlots = make(chan struct{}, n)
+		}
+	}
 }
 
 func NewSender(
@@ -70,8 +116,9 @@ func NewSender(
 	pusher push.Pusher,
 	userEventBus *event.Bus[*commonpb.UserId, *eventpb.Event],
 	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent],
+	opts ...SenderOption,
 ) *Sender {
-	return &Sender{
+	s := &Sender{
 		log:          log,
 		badges:       badges,
 		chats:        chats,
@@ -83,7 +130,15 @@ func NewSender(
 		pusher:       pusher,
 		userEventBus: userEventBus,
 		chatEventBus: chatEventBus,
+
+		pushPageSize:         defaultPushPageSize,
+		pushMutedWholeSetCap: defaultPushMutedWholeSetCap,
+		pushPageSlots:        make(chan struct{}, defaultPushPageConcurrency),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Send persists content as a message in the chat and performs every side effect
@@ -219,7 +274,7 @@ func (s *Sender) Send(
 	}
 	// Reuse the members AdvanceLastMessage already loaded (empty for a group
 	// chat or if it failed, in which case publishChatUpdate loads them itself).
-	publishChatUpdate(ctx, log, s.badges, s.chats, s.profiles, s.blocklists, s.ocpData, s.pusher, s.userEventBus, s.chatEventBus, chatID, update, nil, members)
+	s.publishChatUpdate(ctx, log, chatID, update, nil, members)
 
 	return msgProto, nil
 }

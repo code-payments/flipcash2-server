@@ -78,7 +78,7 @@ type DmFeedCursor struct {
 //
 // Viewer state (see ViewerState) is one record per (user, chat), written only
 // by that user's own actions and read back only to them — plus the chat-scoped
-// reads GetMutedUsers, GetMutedUsersInOrder and GetMutedCount, which serve the
+// reads GetMutedUsers, GetMutedUsersPage and GetMutedCount, which serve the
 // push fan-out. Records are sparse: nothing is written when a chat is created
 // or joined, a record appears on the user's first write, and nothing removes
 // it — a cleared mute leaves the record and its version behind. The record
@@ -170,6 +170,25 @@ type Store interface {
 	// a DM this is the canonical inline member list; for a group chat it is the
 	// currently joined members.
 	GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*commonpb.UserId, error)
+
+	// GetGroupMembersPage is GetMembers as a walk over a group's roster: the
+	// currently joined members in ascending user-ID (byte) order, strictly
+	// after the after cursor (nil starts at the beginning), at most limit of
+	// them (limit <= 0 means unbounded). The order is the one
+	// GetMutedUsersPage returns a chat's mutes in, so a fan-out can read the
+	// mutes between a roster page's first and last user and never hold either
+	// whole; that is what bounds a push to a large group by its page size
+	// rather than its membership. A page's cursor is the last user it
+	// carries whenever the limit was reached, whether or not any member
+	// follows, so the walk may end on an empty, final page.
+	//
+	// It reads the membership records alone, never the canonical record: a
+	// group that does not exist is an empty page, not ErrChatNotFound, and a
+	// caller that needs the distinction reads GetChatByID first — which the
+	// walkers do anyway, for the metadata a push carries. Like GetMembers, it
+	// may lag a transition by a moment. It returns an error if chatID is not a
+	// group chat ID.
+	GetGroupMembersPage(ctx context.Context, chatID *commonpb.ChatId, after *commonpb.UserId, limit int) (MembersPage, error)
 
 	// GetGroupRosterSummary returns a group chat's RosterSummary, maintained
 	// alongside its membership records rather than computed by enumerating
@@ -297,21 +316,23 @@ type Store interface {
 	// state reads GetViewerStates instead.
 	GetMutedUsers(ctx context.Context, chatID *commonpb.ChatId, now time.Time, limit int) ([]*commonpb.UserId, error)
 
-	// GetMutedUsersInOrder is GetMutedUsers as a walk: the users whose mute
-	// on chatID is active at now, in ascending user-ID order, strictly after
-	// the after cursor (nil starts at the beginning), at most limit of them
-	// (limit <= 0 means unbounded). The order is the one Store.GetMembers
-	// enumerates a group's roster in, so a caller can advance both as
-	// cursors over one order and never hold either whole; that is the read
-	// for a chat most have muted. It reads every record the chat's users
-	// hold, muted or not, and consistency is as for GetMutedUsers.
-	GetMutedUsersInOrder(ctx context.Context, chatID *commonpb.ChatId, now time.Time, after *commonpb.UserId, limit int) (MutedUsersPage, error)
+	// GetMutedUsersPage is GetMutedUsers bounded to a key range: the users
+	// whose mute on chatID is active at now and whose ID lies in [lo, hi]
+	// (byte order, inclusive; a nil bound is open on that side), in ascending
+	// user-ID order. The order is the one GetGroupMembersPage walks a group's
+	// roster in, so a fan-out that holds one page of the roster asks for the
+	// mutes between that page's first and last user and never holds either
+	// whole; that is the read for a chat most have muted. It reads every
+	// record the chat's users hold in the range, muted or not — including
+	// records of users who have since left, which a caller intersects with
+	// the roster — and consistency is as for GetMutedUsers.
+	GetMutedUsersPage(ctx context.Context, chatID *commonpb.ChatId, now time.Time, lo, hi *commonpb.UserId) ([]*commonpb.UserId, error)
 
 	// GetMutedCount returns how many users have a mute recorded on chatID:
 	// moved with every mute first recorded or cleared, never by a replaced
 	// mute or a timed one lapsing, so it bounds the active mutes from above.
 	// It is what a fan-out compares against the roster size to choose
-	// between GetMutedUsers and GetMutedUsersInOrder, and is read for that
+	// between GetMutedUsers and GetMutedUsersPage, and is read for that
 	// alone: like them, it may lag a write by a moment, which a choice of
 	// shape tolerates. A chat nobody has muted reads as zero.
 	GetMutedCount(ctx context.Context, chatID *commonpb.ChatId) (uint64, error)

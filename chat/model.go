@@ -525,10 +525,11 @@ type ViewerState struct {
 	Version uint64
 }
 
-// MutedUsersPage is one page of a chat's muted users in user-ID order (see
-// Store.GetMutedUsersInOrder): the users, and the cursor to resume
-// after, nil once the walk is complete.
-type MutedUsersPage struct {
+// MembersPage is one page of a group's joined members in user-ID order (see
+// Store.GetGroupMembersPage): the users, and the cursor to resume after, nil
+// once the walk is complete. Its first and last user bound the key range a
+// caller hands Store.GetMutedUsersPage for the same page.
+type MembersPage struct {
 	Users []*commonpb.UserId
 	Next  *commonpb.UserId
 }

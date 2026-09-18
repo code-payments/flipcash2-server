@@ -359,9 +359,9 @@ func TestCache_UserState_PassesThrough(t *testing.T) {
 	require.Len(t, muted, 1)
 	require.Equal(t, user.Value, muted[0].Value)
 
-	page, err := us.GetMutedUsersInOrder(ctx, chatID, time.Now(), nil, 0)
+	page, err := us.GetMutedUsersPage(ctx, chatID, time.Now(), nil, nil)
 	require.NoError(t, err)
-	require.Len(t, page.Users, 1)
+	require.Len(t, page, 1)
 
 	count, err := us.GetMutedCount(ctx, chatID)
 	require.NoError(t, err)

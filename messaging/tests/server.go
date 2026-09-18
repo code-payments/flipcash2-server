@@ -89,6 +89,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_SendMessage_GroupChatPush,
 		testServer_SendMessage_SuppressedForBlockedSender,
 		testServer_SendMessage_MutedRecipientsFlagged,
+		testServer_SendMessage_GroupPushPaged,
+		testServer_SendMessage_GroupPushPagesConcurrent,
 	} {
 		tf(t, badges, blocklists, chats, messages, profiles)
 		teardown()
@@ -183,7 +185,10 @@ func (a *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (boo
 	return a.staff[string(userID.Value)], nil
 }
 
-func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) *serverEnv {
+// newServerEnv builds a messaging server over the given stores. senderOpts
+// configure its Sender beyond the defaults, e.g. a small push page size so a
+// handful of members walks several pages.
+func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store, senderOpts ...messaging.SenderOption) *serverEnv {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
@@ -225,7 +230,7 @@ func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, 
 	env.ocpBalance = &fakeOcpBalance{byOwner: make(map[string]uint64)}
 	balances := balance.NewClient(log, env.accounts, env.ocpBalance)
 
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus, senderOpts...)
 	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats))
 	server := messaging.NewServer(log, authz, chats, media, messages, access, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
@@ -257,19 +262,42 @@ type capturedPush struct {
 type capturingPusher struct {
 	mu     sync.Mutex
 	pushes []capturedPush
+
+	// hold, when set, is what every send waits on before returning (closed
+	// to release them all), so a test can observe how many sends the caller
+	// has in flight at once: inFlight is the current number, maxInFlight the
+	// most seen.
+	hold        chan struct{}
+	inFlight    int
+	maxInFlight int
 }
 
-func (p *capturingPusher) SendPushes(_ context.Context, title, body string, customPayload *pushpb.Payload, users ...*commonpb.UserId) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.pushes = append(p.pushes, capturedPush{title: title, body: body, payload: customPayload, users: users})
-	return nil
+func (p *capturingPusher) SendPushes(ctx context.Context, title, body string, customPayload *pushpb.Payload, users ...*commonpb.UserId) error {
+	return p.record(ctx, capturedPush{title: title, body: body, payload: customPayload, users: users})
 }
 
-func (p *capturingPusher) SendPushesWithBadges(_ context.Context, title, body string, customPayload *pushpb.Payload, resolve push.BadgeResolver, users ...*commonpb.UserId) error {
+func (p *capturingPusher) SendPushesWithBadges(ctx context.Context, title, body string, customPayload *pushpb.Payload, resolve push.BadgeResolver, users ...*commonpb.UserId) error {
+	return p.record(ctx, capturedPush{title: title, body: body, payload: customPayload, users: users, badged: resolve != nil})
+}
+
+func (p *capturingPusher) record(ctx context.Context, push capturedPush) error {
+	p.mu.Lock()
+	p.inFlight++
+	p.maxInFlight = max(p.maxInFlight, p.inFlight)
+	hold := p.hold
+	p.mu.Unlock()
+
+	if hold != nil {
+		select {
+		case <-hold:
+		case <-ctx.Done():
+		}
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.pushes = append(p.pushes, capturedPush{title: title, body: body, payload: customPayload, users: users, badged: resolve != nil})
+	p.inFlight--
+	p.pushes = append(p.pushes, push)
 	return nil
 }
 
@@ -277,6 +305,12 @@ func (p *capturingPusher) snapshot() []capturedPush {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]capturedPush(nil), p.pushes...)
+}
+
+func (p *capturingPusher) inFlightCounts() (current, most int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.inFlight, p.maxInFlight
 }
 
 // ============================================================================
@@ -2898,6 +2932,169 @@ func testServer_SendMessage_SuppressedForBlockedSender(t *testing.T, badges badg
 	require.Equal(t, "unblocked hello", pushes[0].body)
 	require.Len(t, pushes[0].users, 1)
 	require.Equal(t, e.userB.Value, pushes[0].users[0].Value)
+}
+
+// testServer_SendMessage_GroupPushPaged walks a group's roster in pages of
+// two and checks the pipeline holds across page boundaries: the sender, a
+// member who blocked the sender, a departed member with a mute still
+// recorded and a muted non-member are all left out; the one muted member
+// lands in a flagged, unbadged batch; every other member gets the badged
+// push; and no page ever carries more than its size. The same scenario runs
+// under both mute shapes — the whole set read once, and the per-page key
+// range — which must agree, and with pages sent one at a time as well as
+// concurrently (the default).
+func testServer_SendMessage_GroupPushPaged(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	for _, tc := range []struct {
+		name string
+		opts []messaging.SenderOption
+	}{
+		{name: "muted set read whole", opts: []messaging.SenderOption{messaging.WithPushPageSize(2)}},
+		{name: "muted set read per page", opts: []messaging.SenderOption{messaging.WithPushPageSize(2), messaging.WithPushMutedWholeSetCap(0)}},
+		{name: "pages sent one at a time", opts: []messaging.SenderOption{messaging.WithPushPageSize(2), messaging.WithPushPageConcurrency(1)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newServerEnv(t, badges, blocklists, chats, messages, profiles, tc.opts...)
+			require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
+
+			// Seven members: the sender and six others, so a page of two walks
+			// four pages whatever order the IDs sort in.
+			var others []*commonpb.UserId
+			for range 6 {
+				user, _ := e.addUser()
+				others = append(others, user)
+			}
+			blocker, mutedMember, departed := others[0], others[1], others[2]
+			plain := others[3:]
+
+			groupID := chat.MustGenerateGroupChatID()
+			require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+				ID:           groupID,
+				Type:         chatpb.ChatType_GROUP,
+				Members:      append([]*commonpb.UserId{e.userA}, others...),
+				Title:        "Paged",
+				LastActivity: at(1),
+			}))
+
+			added, err := blocklists.Block(e.ctx, blocker, e.userA, time.Now())
+			require.NoError(t, err)
+			require.True(t, added)
+			_, _, err = chats.SetMute(e.ctx, groupID, mutedMember, chat.Mute{Forever: true})
+			require.NoError(t, err)
+			// A mute recorded by someone who then left the group (the store
+			// alone, so nothing clears it) and one by a user who was never a
+			// member both sit in the chat's mute range and must not become
+			// recipients.
+			_, _, err = chats.SetMute(e.ctx, groupID, departed, chat.Mute{Forever: true})
+			require.NoError(t, err)
+			changed, _, err := chats.RemoveGroupMember(e.ctx, groupID, departed)
+			require.NoError(t, err)
+			require.True(t, changed)
+			_, _, err = chats.SetMute(e.ctx, groupID, model.MustGenerateUserID(), chat.Mute{Forever: true})
+			require.NoError(t, err)
+
+			resp, err := e.sendContentToChat(e.keysA, groupID, textContent("paged hello"), generateClientID())
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+
+			// The walk is asynchronous and its page count depends on where the
+			// excluded users fall, so wait for the audience rather than a
+			// number of pushes.
+			audience := func() (unmuted, muted [][]byte) {
+				for _, p := range e.pusher.snapshot() {
+					for _, u := range p.users {
+						if p.payload.ChatMetadata.Muted {
+							muted = append(muted, u.Value)
+						} else {
+							unmuted = append(unmuted, u.Value)
+						}
+					}
+				}
+				return unmuted, muted
+			}
+			require.Eventually(t, func() bool {
+				unmuted, muted := audience()
+				return len(unmuted) == len(plain) && len(muted) == 1
+			}, 5*time.Second, 10*time.Millisecond)
+			unmuted, muted := audience()
+			wantUnmuted := make([][]byte, len(plain))
+			for i, u := range plain {
+				wantUnmuted[i] = u.Value
+			}
+			require.ElementsMatch(t, wantUnmuted, unmuted)
+			require.Equal(t, [][]byte{mutedMember.Value}, muted)
+
+			// Every push is one page's half: at most the page size, rendered
+			// identically, badged only for the unmuted.
+			for _, p := range e.pusher.snapshot() {
+				require.LessOrEqual(t, len(p.users), 2)
+				require.Equal(t, "Paged", p.title)
+				require.Equal(t, "Sender Name: paged hello", p.body)
+				require.Equal(t, !p.payload.ChatMetadata.Muted, p.badged)
+				require.True(t, proto.Equal(resp.Message, p.payload.ChatMetadata.Message))
+			}
+		})
+	}
+}
+
+// testServer_SendMessage_GroupPushPagesConcurrent holds every send open at
+// the pusher and checks a walk keeps exactly its concurrency in pages in
+// flight: with pages of one member and two slots, two sends are in flight
+// and the third waits, and once released every page still lands.
+func testServer_SendMessage_GroupPushPagesConcurrent(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles, messaging.WithPushPageSize(1), messaging.WithPushPageConcurrency(2))
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
+
+	var others []*commonpb.UserId
+	for range 5 {
+		user, _ := e.addUser()
+		others = append(others, user)
+	}
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      append([]*commonpb.UserId{e.userA}, others...),
+		Title:        "Concurrent",
+		LastActivity: at(1),
+	}))
+
+	hold := make(chan struct{})
+	e.pusher.hold = hold
+
+	resp, err := e.sendContentToChat(e.keysA, groupID, textContent("concurrent hello"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+
+	require.Eventually(t, func() bool {
+		current, _ := e.pusher.inFlightCounts()
+		return current == 2
+	}, 5*time.Second, 10*time.Millisecond)
+	// The third page has been read but is waiting on a slot: nothing joins
+	// the two already in flight while they are held.
+	require.Never(t, func() bool {
+		current, _ := e.pusher.inFlightCounts()
+		return current > 2
+	}, 200*time.Millisecond, 10*time.Millisecond)
+
+	close(hold)
+
+	require.Eventually(t, func() bool {
+		return len(e.pusher.snapshot()) == len(others)
+	}, 5*time.Second, 10*time.Millisecond)
+	_, most := e.pusher.inFlightCounts()
+	require.Equal(t, 2, most)
+
+	var recipients [][]byte
+	for _, p := range e.pusher.snapshot() {
+		require.Len(t, p.users, 1)
+		require.Equal(t, "Concurrent", p.title)
+		recipients = append(recipients, p.users[0].Value)
+	}
+	want := make([][]byte, len(others))
+	for i, u := range others {
+		want[i] = u.Value
+	}
+	require.ElementsMatch(t, want, recipients)
 }
 
 // testServer_SendMessage_MutedRecipientsFlagged sends into a DM and a group

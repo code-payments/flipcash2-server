@@ -700,21 +700,57 @@ func (s *store) GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*com
 	return c.Members, nil
 }
 
-// getGroupMembers enumerates a group's joined members from its base-table
-// partition rather than the sparse gsiByJoinedAt. The partition holds the
-// membership rows plus the #meta item, which the key condition's sort-key
-// prefix excludes, and the tombstones, which a filter drops; tombstones
-// expire (see tombstoneTTL), so the partition is dense up to the group's
-// recent churn and the filter scans little. Reading the table leaves a
-// strongly consistent read available if a caller ever needs one; the index
-// stays for paging a large group's members in join order, which this
-// whole-roster read does not need. Members come back in sort-key order —
-// arbitrary, but stable.
+// getGroupMembers enumerates a group's joined members whole: the page walk
+// (see GetGroupMembersPage) drained in one call. A memberless group and a
+// nonexistent chat both walk empty; the contract distinguishes them, so the
+// canonical item (whose absence is ErrChatNotFound) is consulted only on that
+// ambiguous path.
 func (s *store) getGroupMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*commonpb.UserId, error) {
-	members := make([]*commonpb.UserId, 0)
+	page, err := s.GetGroupMembersPage(ctx, chatID, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(page.Users) == 0 {
+		if _, err := s.GetChatByID(ctx, chatID); err != nil {
+			return nil, err
+		}
+	}
+	return page.Users, nil
+}
+
+// GetGroupMembersPage walks a group's base-table partition rather than the
+// sparse gsiByJoinedAt. The partition holds the membership rows plus the
+// #meta item, which the key condition's sort-key prefix excludes, and the
+// tombstones, which a filter drops; tombstones expire (see tombstoneTTL), so
+// the partition is dense up to the group's recent churn and the filter scans
+// little. The sort key is "user#<hex>", so the partition's order is ascending
+// user-ID bytes — the order the contract promises, and the one
+// gsiUserStateByUser ranges a chat's mutes in. Reading the table leaves a
+// strongly consistent read available if a caller ever needs one; the index
+// stays for paging a large roster in join order, which no walk here needs.
+//
+// The cursor is resumed as an exclusive start key built from the user alone:
+// a Query's start key need not name an existing item, so a cursor that has
+// since left the group (or never was in it) resumes just as well. The filter
+// runs after DynamoDB applies the limit, so a page is assembled from as many
+// queries as it takes to collect limit joined rows, and each is asked for
+// only what the page still lacks.
+func (s *store) GetGroupMembersPage(ctx context.Context, chatID *commonpb.ChatId, after *commonpb.UserId, limit int) (chat.MembersPage, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.MembersPage{}, fmt.Errorf("not a group chat id")
+	}
+
 	var startKey map[string]types.AttributeValue
+	if after != nil {
+		startKey = map[string]types.AttributeValue{
+			attrPK: avS(chatPK(chatID)),
+			attrSK: avS(userPK(after)),
+		}
+	}
+
+	page := chat.MembersPage{Users: make([]*commonpb.UserId, 0)}
 	for {
-		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+		input := &dynamodb.QueryInput{
 			TableName:                aws.String(s.groupMembersTable),
 			KeyConditionExpression:   aws.String("#pk = :pk AND begins_with(#sk, :user)"),
 			FilterExpression:         aws.String("#state = :joined"),
@@ -725,32 +761,33 @@ func (s *store) getGroupMembers(ctx context.Context, chatID *commonpb.ChatId) ([
 				":joined": avN(memberStateJoined),
 			},
 			ExclusiveStartKey: startKey,
-		})
+		}
+		if limit > 0 {
+			input.Limit = aws.Int32(int32(limit - len(page.Users)))
+		}
+		out, err := s.client.Query(ctx, input)
 		if err != nil {
-			return nil, err
+			return chat.MembersPage{}, err
 		}
 		for _, item := range out.Items {
 			userID, err := userIDFromSK(item)
 			if err != nil {
-				return nil, err
+				return chat.MembersPage{}, err
 			}
-			members = append(members, userID)
+			page.Users = append(page.Users, userID)
+			if limit > 0 && len(page.Users) == limit {
+				// Whether any member follows is unknown without reading on,
+				// so the cursor is handed out regardless and the next page may
+				// come back empty and final.
+				page.Next = userID
+				return page, nil
+			}
 		}
 		if len(out.LastEvaluatedKey) == 0 {
-			break
+			return page, nil
 		}
 		startKey = out.LastEvaluatedKey
 	}
-
-	// A memberless group and a nonexistent chat both query empty; the contract
-	// distinguishes them, so consult the canonical item (whose absence is
-	// ErrChatNotFound) only on that ambiguous path.
-	if len(members) == 0 {
-		if _, err := s.GetChatByID(ctx, chatID); err != nil {
-			return nil, err
-		}
-	}
-	return members, nil
 }
 
 // GetGroupMembershipsForUser lists the user's membership records via the
@@ -1831,11 +1868,14 @@ func (s *store) GetMutedCount(ctx context.Context, chatID *commonpb.ChatId) (uin
 	return uint64(max(count, 0)), nil
 }
 
-// GetMutedUsersInOrder walks gsiUserStateByUser from after, in the index's
+// GetMutedUsersPage ranges gsiUserStateByUser over [lo, hi] in the index's
 // user order, filtering to the records whose mute is active at now. The
-// filter runs after the read, so a page is billed for every record it
-// passes over, muted or not — the shape the contract describes.
-func (s *store) GetMutedUsersInOrder(ctx context.Context, chatID *commonpb.ChatId, now time.Time, after *commonpb.UserId, limit int) (chat.MutedUsersPage, error) {
+// index's range key is the record's pk ("user#<hex>"), whose hex encoding
+// preserves the ID's byte order, so the bound is a key condition: records
+// outside it are never scanned, and never billed. The filter runs after the
+// read, so the range is billed for every record in it, muted or not — the
+// shape the contract describes.
+func (s *store) GetMutedUsersPage(ctx context.Context, chatID *commonpb.ChatId, now time.Time, lo, hi *commonpb.UserId) ([]*commonpb.UserId, error) {
 	nowSecs := max(now.Unix(), 0)
 
 	condition := "#chat = :chat"
@@ -1844,13 +1884,23 @@ func (s *store) GetMutedUsersInOrder(ctx context.Context, chatID *commonpb.ChatI
 		":chat": avB(chatID.Value),
 		":now":  avN(uint64(nowSecs)),
 	}
-	if after != nil {
-		condition += " AND #pk > :after"
+	switch {
+	case lo != nil && hi != nil:
+		condition += " AND #pk BETWEEN :lo AND :hi"
 		names["#pk"] = attrPK
-		values[":after"] = avS(userPK(after))
+		values[":lo"] = avS(userPK(lo))
+		values[":hi"] = avS(userPK(hi))
+	case lo != nil:
+		condition += " AND #pk >= :lo"
+		names["#pk"] = attrPK
+		values[":lo"] = avS(userPK(lo))
+	case hi != nil:
+		condition += " AND #pk <= :hi"
+		names["#pk"] = attrPK
+		values[":hi"] = avS(userPK(hi))
 	}
 
-	page := chat.MutedUsersPage{Users: make([]*commonpb.UserId, 0)}
+	users := make([]*commonpb.UserId, 0)
 	var startKey map[string]types.AttributeValue
 	for {
 		res, err := s.client.Query(ctx, &dynamodb.QueryInput{
@@ -1863,24 +1913,17 @@ func (s *store) GetMutedUsersInOrder(ctx context.Context, chatID *commonpb.ChatI
 			ExclusiveStartKey:         startKey,
 		})
 		if err != nil {
-			return chat.MutedUsersPage{}, err
+			return nil, err
 		}
 		for _, item := range res.Items {
 			userID, err := userIDFromPK(item)
 			if err != nil {
-				return chat.MutedUsersPage{}, err
+				return nil, err
 			}
-			page.Users = append(page.Users, userID)
-			if limit > 0 && len(page.Users) == limit {
-				// The walk resumes after the last user returned. Whether any
-				// record follows is unknown without reading on, so the cursor is
-				// handed out and the next page may come back empty and final.
-				page.Next = userID
-				return page, nil
-			}
+			users = append(users, userID)
 		}
 		if len(res.LastEvaluatedKey) == 0 {
-			return page, nil
+			return users, nil
 		}
 		startKey = res.LastEvaluatedKey
 	}

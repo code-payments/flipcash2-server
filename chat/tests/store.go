@@ -41,6 +41,8 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_GroupChat_Creator,
 		testStore_GroupChat_Picture,
 		testStore_GroupChat_Membership,
+		testStore_GroupChat_MembersPage,
+		testStore_GroupChat_MembersPage_MuteOrder,
 		testStore_GroupChat_RosterSummary,
 		testStore_GroupChat_ConcurrentTransitions,
 		testStore_GroupChat_MembershipsForUser,
@@ -67,7 +69,7 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_UserState_GetViewerStates_Batch,
 		testStore_UserState_GetViewerStates_Bounded,
 		testStore_UserState_GetMutedUsers,
-		testStore_UserState_GetMutedUsersInOrder_Cursor,
+		testStore_UserState_GetMutedUsersPage_Bounds,
 		testStore_UserState_MutedCount,
 	} {
 		tf(t, s)
@@ -989,6 +991,119 @@ func testStore_PutChat_NoMembers(t *testing.T, s chat.Store) {
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 }
 
+// testStore_GroupChat_MembersPage walks a group's roster in pages: ascending
+// user-ID order, departed members skipped, a cursor that resumes mid-way, and
+// a limit that lands exactly on the last member, so the final page carries a
+// cursor that yields an empty, final page. The union of the pages is what
+// GetMembers returns whole.
+func testStore_GroupChat_MembersPage(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	users := make([]*commonpb.UserId, 5)
+	for i := range users {
+		users[i] = model.MustGenerateUserID()
+	}
+	slices.SortFunc(users, func(a, b *commonpb.UserId) int { return bytes.Compare(a.Value, b.Value) })
+	c := putGroupChat(t, s, "Walked", at(10), users...)
+
+	// A departed member sits between the others in key order and must be
+	// stepped over, not counted against the limit.
+	changed, _, err := s.RemoveGroupMember(ctx, c.ID, users[2])
+	require.NoError(t, err)
+	require.True(t, changed)
+	joined := []*commonpb.UserId{users[0], users[1], users[3], users[4]}
+
+	// Unbounded: the whole roster, in order.
+	page, err := s.GetGroupMembersPage(ctx, c.ID, nil, 0)
+	require.NoError(t, err)
+	assert.Equal(t, userIDValues(joined), userIDValues(page.Users))
+	assert.Nil(t, page.Next)
+
+	whole, err := s.GetMembers(ctx, c.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, userIDValues(joined), userIDValues(whole))
+
+	// Paged by three: the first page is the first three joined members, its
+	// cursor the third; the second page is the rest.
+	page, err = s.GetGroupMembersPage(ctx, c.ID, nil, 3)
+	require.NoError(t, err)
+	assert.Equal(t, userIDValues(joined[:3]), userIDValues(page.Users))
+	require.NotNil(t, page.Next)
+	assert.Equal(t, joined[2].Value, page.Next.Value)
+
+	page, err = s.GetGroupMembersPage(ctx, c.ID, page.Next, 3)
+	require.NoError(t, err)
+	assert.Equal(t, userIDValues(joined[3:]), userIDValues(page.Users))
+	assert.Nil(t, page.Next)
+
+	// A cursor that is itself a departed member resumes just as well.
+	page, err = s.GetGroupMembersPage(ctx, c.ID, users[2], 0)
+	require.NoError(t, err)
+	assert.Equal(t, userIDValues(joined[2:]), userIDValues(page.Users))
+
+	// A limit that lands exactly on the last member still hands out a cursor;
+	// resuming from it is an empty, final page.
+	page, err = s.GetGroupMembersPage(ctx, c.ID, joined[1], 2)
+	require.NoError(t, err)
+	assert.Equal(t, userIDValues(joined[2:]), userIDValues(page.Users))
+	require.NotNil(t, page.Next)
+	assert.Equal(t, joined[3].Value, page.Next.Value)
+
+	page, err = s.GetGroupMembersPage(ctx, c.ID, page.Next, 2)
+	require.NoError(t, err)
+	assert.Empty(t, page.Users)
+	assert.Nil(t, page.Next)
+
+	// A group that does not exist is an empty walk, not an error: the read
+	// never consults the canonical record.
+	page, err = s.GetGroupMembersPage(ctx, chat.MustGenerateGroupChatID(), nil, 0)
+	require.NoError(t, err)
+	assert.Empty(t, page.Users)
+	assert.Nil(t, page.Next)
+
+	// A DM has no roster to walk.
+	dm := putDmChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(1))
+	_, err = s.GetGroupMembersPage(ctx, dm.ID, nil, 0)
+	require.Error(t, err)
+}
+
+// testStore_GroupChat_MembersPage_MuteOrder pins that the roster walk and the
+// mute read agree on order: every user is muted, the roster is walked in
+// pages of two, and the mutes between each page's first and last user are
+// exactly that page, so a fan-out's per-page mute read covers its page and
+// nothing else.
+func testStore_GroupChat_MembersPage_MuteOrder(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	users := make([]*commonpb.UserId, 5)
+	for i := range users {
+		users[i] = model.MustGenerateUserID()
+	}
+	c := putGroupChat(t, s, "In Step", at(10), users...)
+	for _, user := range users {
+		_, _, err := s.SetMute(ctx, c.ID, user, chat.Mute{Forever: true})
+		require.NoError(t, err)
+	}
+
+	var after *commonpb.UserId
+	var seen int
+	for {
+		roster, err := s.GetGroupMembersPage(ctx, c.ID, after, 2)
+		require.NoError(t, err)
+		if len(roster.Users) > 0 {
+			muted, err := s.GetMutedUsersPage(ctx, c.ID, at(0), roster.Users[0], roster.Users[len(roster.Users)-1])
+			require.NoError(t, err)
+			assert.Equal(t, userIDValues(roster.Users), userIDValues(muted))
+		}
+		seen += len(roster.Users)
+		if roster.Next == nil {
+			break
+		}
+		after = roster.Next
+	}
+	assert.Equal(t, len(users), seen)
+}
+
 // testStore_GroupChat_CreationCap covers the boundary of the initial member set:
 // a group at the cap is created whole, and one over it is rejected outright
 // rather than partially written.
@@ -1311,6 +1426,13 @@ func chatIDValues(chats []*chat.Chat) [][]byte {
 	return out
 }
 
+// justPast returns a key that sorts immediately after user and before any
+// other user ID: the ID with one more byte, which no real ID shares as a
+// prefix.
+func justPast(user *commonpb.UserId) *commonpb.UserId {
+	return &commonpb.UserId{Value: append(append([]byte(nil), user.Value...), 0)}
+}
+
 func userIDValues(ids []*commonpb.UserId) [][]byte {
 	out := make([][]byte, len(ids))
 	for i, id := range ids {
@@ -1333,22 +1455,17 @@ func requireMutedUsers(t *testing.T, us chat.Store, chatID *commonpb.ChatId, now
 	wantOrdered := slices.Clone(want)
 	slices.SortFunc(wantOrdered, func(a, b *commonpb.UserId) int { return bytes.Compare(a.Value, b.Value) })
 
-	page, err := us.GetMutedUsersInOrder(ctx, chatID, now, nil, 0)
+	ordered, err := us.GetMutedUsersPage(ctx, chatID, now, nil, nil)
 	require.NoError(t, err)
-	assert.Equal(t, userIDValues(wantOrdered), userIDValues(page.Users))
-	assert.Nil(t, page.Next)
+	assert.Equal(t, userIDValues(wantOrdered), userIDValues(ordered))
 
+	// Read one user at a time as a closed range, and stitched together the
+	// pages are the whole ordered set.
 	var walked []*commonpb.UserId
-	var after *commonpb.UserId
-	for {
-		page, err := us.GetMutedUsersInOrder(ctx, chatID, now, after, 1)
+	for _, user := range wantOrdered {
+		page, err := us.GetMutedUsersPage(ctx, chatID, now, user, user)
 		require.NoError(t, err)
-		require.LessOrEqual(t, len(page.Users), 1)
-		walked = append(walked, page.Users...)
-		if page.Next == nil {
-			break
-		}
-		after = page.Next
+		walked = append(walked, page...)
 	}
 	assert.Equal(t, userIDValues(wantOrdered), userIDValues(walked))
 }
@@ -1673,10 +1790,10 @@ func testStore_UserState_GetMutedUsers(t *testing.T, s chat.Store) {
 	assert.ElementsMatch(t, userIDValues([]*commonpb.UserId{timed, forever}), userIDValues(got))
 }
 
-// testStore_UserState_GetMutedUsersInOrder_Cursor pages a chat's muted users
-// with a cursor that starts mid-way and a limit that lands exactly on the last
-// user, so the final page carries a cursor that yields an empty, final page.
-func testStore_UserState_GetMutedUsersInOrder_Cursor(t *testing.T, s chat.Store) {
+// testStore_UserState_GetMutedUsersPage_Bounds reads a chat's muted users over
+// key ranges: closed on both sides, open on either, bounds that are not
+// themselves muted users, and a range that holds an unmuted record.
+func testStore_UserState_GetMutedUsersPage_Bounds(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 	us := s
 	group := chat.MustGenerateGroupChatID()
@@ -1687,38 +1804,40 @@ func testStore_UserState_GetMutedUsersInOrder_Cursor(t *testing.T, s chat.Store)
 		_, _, err := us.SetMute(ctx, group, user, chat.Mute{Forever: true})
 		require.NoError(t, err)
 	}
-	// An unmuted record between them is stepped over, not counted against the
-	// limit.
+	// A record with a cleared mute inside the range is read past, not
+	// returned.
 	between := model.MustGenerateUserID()
 	_, _, err := us.SetMute(ctx, group, between, chat.Mute{Forever: true})
 	require.NoError(t, err)
 	_, _, err = us.ClearMute(ctx, group, between)
 	require.NoError(t, err)
 
-	// Resume strictly after the second user: the third and fourth remain.
-	page, err := us.GetMutedUsersInOrder(ctx, group, at(0), users[1], 0)
+	// Both bounds are inclusive.
+	got, err := us.GetMutedUsersPage(ctx, group, at(0), users[1], users[2])
 	require.NoError(t, err)
-	assert.Equal(t, userIDValues(users[2:]), userIDValues(page.Users))
-	assert.Nil(t, page.Next)
+	assert.Equal(t, userIDValues(users[1:3]), userIDValues(got))
 
-	// A limit that lands exactly on the last user still hands out a cursor;
-	// resuming from it is an empty, final page.
-	page, err = us.GetMutedUsersInOrder(ctx, group, at(0), users[1], 2)
+	// Open on the low side, then on the high side.
+	got, err = us.GetMutedUsersPage(ctx, group, at(0), nil, users[1])
 	require.NoError(t, err)
-	assert.Equal(t, userIDValues(users[2:]), userIDValues(page.Users))
-	require.NotNil(t, page.Next)
-	assert.Equal(t, users[3].Value, page.Next.Value)
+	assert.Equal(t, userIDValues(users[:2]), userIDValues(got))
 
-	page, err = us.GetMutedUsersInOrder(ctx, group, at(0), page.Next, 2)
+	got, err = us.GetMutedUsersPage(ctx, group, at(0), users[2], nil)
 	require.NoError(t, err)
-	assert.Empty(t, page.Users)
-	assert.Nil(t, page.Next)
+	assert.Equal(t, userIDValues(users[2:]), userIDValues(got))
 
-	// A cursor past every user is likewise empty and final.
-	page, err = us.GetMutedUsersInOrder(ctx, group, at(0), users[3], 0)
+	// Bounds need not be muted users, or users at all: the roster page that
+	// supplies them may well hold no muter at either end.
+	lo := justPast(users[0])
+	got, err = us.GetMutedUsersPage(ctx, group, at(0), lo, users[3])
 	require.NoError(t, err)
-	assert.Empty(t, page.Users)
-	assert.Nil(t, page.Next)
+	assert.Equal(t, userIDValues(users[1:]), userIDValues(got))
+
+	// A range past every user is empty.
+	past := justPast(users[3])
+	got, err = us.GetMutedUsersPage(ctx, group, at(0), past, nil)
+	require.NoError(t, err)
+	assert.Empty(t, got)
 }
 
 func testStore_UserState_MutedCount(t *testing.T, s chat.Store) {

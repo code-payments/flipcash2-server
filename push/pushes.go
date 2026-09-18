@@ -139,16 +139,34 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 	return pusher.SendPushes(ctx, title, body, customPayload, users...)
 }
 
-// SendContactDmPush notifies recipients of a new message in a contact DM. The
-// title is a contact substitution on the sender's phone number, which the
-// recipient's client resolves against their address book.
-func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderContact *commonpb.PhoneNumber, recipients ChatRecipients) error {
+// ChatMessagePush is a chat message's notification, rendered once and sent to
+// any number of recipient pages (see Send). Rendering is the part of a push
+// that is the same for every recipient — the title, the body, the payload,
+// and for cash content a currency-name lookup — so a fan-out that walks a
+// large group's roster in pages builds it once per message rather than once
+// per page. A nil *ChatMessagePush from a builder means the message's content
+// earns no push (an unsupported content type, or a sender missing what the
+// title needs), which is not an error.
+type ChatMessagePush struct {
+	title, body string
+
+	// payload is the notification as the unmuted half of an audience receives
+	// it; mutedPayload is the same payload flagged for the muted half (see
+	// ChatRecipients). The muted copy is cloned at build time so no send
+	// mutates what another may still be reading.
+	payload, mutedPayload *pushpb.Payload
+}
+
+// BuildContactDmPush renders a new message in a contact DM. The title is a
+// contact substitution on the sender's phone number, which the recipient's
+// client resolves against their address book.
+func BuildContactDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderContact *commonpb.PhoneNumber) (*ChatMessagePush, error) {
 	body, ok, err := renderDmMessagePushBody(ctx, ocpData, message)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	title := "{0}"
@@ -175,20 +193,20 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 		},
 	}
 
-	return sendChatMessagePush(ctx, pusher, badges, title, body, customPayload, recipients)
+	return newChatMessagePush(title, body, customPayload), nil
 }
 
-// SendTipDmPush notifies recipients of a new message in a tip DM. The sender
-// is typically not in the recipient's contacts, so the title carries the
-// sender's display name directly rather than a contact substitution — and
-// never the sender's phone number, which is private in a tip DM.
-func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName string, recipients ChatRecipients) error {
+// BuildTipDmPush renders a new message in a tip DM. The sender is typically
+// not in the recipient's contacts, so the title carries the sender's display
+// name directly rather than a contact substitution — and never the sender's
+// phone number, which is private in a tip DM.
+func BuildTipDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName string) (*ChatMessagePush, error) {
 	body, ok, err := renderDmMessagePushBody(ctx, ocpData, message)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	customPayload := &pushpb.Payload{
@@ -206,21 +224,21 @@ func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpDa
 		},
 	}
 
-	return sendChatMessagePush(ctx, pusher, badges, senderDisplayName, body, customPayload, recipients)
+	return newChatMessagePush(senderDisplayName, body, customPayload), nil
 }
 
-// SendGroupChatPush notifies recipients of a new message in a group chat. The
-// notification is titled by the group ("Untitled Group" when it has none), with
-// the sender identified by display name in the body ("Alice: hello"). Like a
-// tip DM, a group push never carries the sender's phone number, which is
-// private outside contact DMs.
-func SendGroupChatPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName, chatTitle string, recipients ChatRecipients) error {
+// BuildGroupChatPush renders a new message in a group chat. The notification
+// is titled by the group ("Untitled Group" when it has none), with the sender
+// identified by display name in the body ("Alice: hello"). Like a tip DM, a
+// group push never carries the sender's phone number, which is private
+// outside contact DMs.
+func BuildGroupChatPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName, chatTitle string) (*ChatMessagePush, error) {
 	body, ok, err := renderGroupChatMessagePushBody(ctx, ocpData, message, senderDisplayName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	title := chatTitle
@@ -243,7 +261,28 @@ func SendGroupChatPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 		},
 	}
 
-	return sendChatMessagePush(ctx, pusher, badges, title, body, customPayload, recipients)
+	return newChatMessagePush(title, body, customPayload), nil
+}
+
+// newChatMessagePush pairs the rendered payload with its muted copy. The flag
+// is the only difference. A nil payload — which the pusher accepts as empty —
+// is copied as an empty one rather than cloned, since proto.Clone of a nil
+// interface is nil and asserts to nothing.
+func newChatMessagePush(title, body string, customPayload *pushpb.Payload) *ChatMessagePush {
+	mutedPayload := &pushpb.Payload{}
+	if customPayload != nil {
+		mutedPayload = proto.Clone(customPayload).(*pushpb.Payload)
+	}
+	if mutedPayload.ChatMetadata == nil {
+		mutedPayload.ChatMetadata = &pushpb.ChatMetadata{}
+	}
+	mutedPayload.ChatMetadata.Muted = true
+	return &ChatMessagePush{
+		title:        title,
+		body:         body,
+		payload:      customPayload,
+		mutedPayload: mutedPayload,
+	}
 }
 
 // renderGroupChatMessagePushBody renders the push body for a group chat
@@ -358,14 +397,16 @@ type ChatRecipients struct {
 	Muted   []*commonpb.UserId
 }
 
-// sendChatMessagePush sends the rendered chat message push to both halves of
-// its audience: the unmuted half with each recipient's badge bumped and the
-// new total carried on the notification, so a recipient's icon updates with
-// the same push that announces the message rather than a second, badge-only
-// push per recipient; the muted half flagged, unbadged, as a copy of the same
-// payload. Either half may be empty and costs nothing then. The two sends are
-// independent, and a failure in one is reported alongside the other's.
-func sendChatMessagePush(ctx context.Context, pusher Pusher, badges badge.Store, title, body string, customPayload *pushpb.Payload, recipients ChatRecipients) error {
+// Send delivers the push to both halves of one page of its audience: the
+// unmuted half with each recipient's badge bumped and the new total carried
+// on the notification, so a recipient's icon updates with the same push that
+// announces the message rather than a second, badge-only push per recipient;
+// the muted half flagged, unbadged, as a copy of the same payload. Either
+// half may be empty and costs nothing then. The two sends are independent,
+// and a failure in one is reported alongside the other's. Send may be called
+// once per page of a large audience; each call is its own token lookup,
+// badge batch and FCM send, so what a call holds is bounded by its page.
+func (p *ChatMessagePush) Send(ctx context.Context, pusher Pusher, badges badge.Store, recipients ChatRecipients) error {
 	var errs []error
 	if len(recipients.Unmuted) > 0 {
 		// Each recipient now has one more unread message. The pusher asks for
@@ -378,22 +419,10 @@ func sendChatMessagePush(ctx context.Context, pusher Pusher, badges badge.Store,
 			counts, err := badges.IncrementBatch(ctx, users, 1)
 			return BadgeCounts(counts), err
 		}
-		errs = append(errs, pusher.SendPushesWithBadges(ctx, title, body, customPayload, incrementBadges, recipients.Unmuted...))
+		errs = append(errs, pusher.SendPushesWithBadges(ctx, p.title, p.body, p.payload, incrementBadges, recipients.Unmuted...))
 	}
 	if len(recipients.Muted) > 0 {
-		// The flag is the only difference, on a copy: the unmuted send may
-		// still be reading the original. A nil payload — which the pusher
-		// accepts as empty — is copied as an empty one rather than cloned,
-		// since proto.Clone of a nil interface is nil and asserts to nothing.
-		mutedPayload := &pushpb.Payload{}
-		if customPayload != nil {
-			mutedPayload = proto.Clone(customPayload).(*pushpb.Payload)
-		}
-		if mutedPayload.ChatMetadata == nil {
-			mutedPayload.ChatMetadata = &pushpb.ChatMetadata{}
-		}
-		mutedPayload.ChatMetadata.Muted = true
-		errs = append(errs, pusher.SendPushes(ctx, title, body, mutedPayload, recipients.Muted...))
+		errs = append(errs, pusher.SendPushes(ctx, p.title, p.body, p.mutedPayload, recipients.Muted...))
 	}
 	return errors.Join(errs...)
 }

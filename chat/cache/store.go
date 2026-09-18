@@ -94,6 +94,12 @@ func (c *Cache) GetMembers(ctx context.Context, chatID *commonpb.ChatId) ([]*com
 	return copyUserIDs(members), nil
 }
 
+// GetGroupMembersPage passes through: a group's roster is mutable and never
+// cached here, as for GetMembers.
+func (c *Cache) GetGroupMembersPage(ctx context.Context, chatID *commonpb.ChatId, after *commonpb.UserId, limit int) (chat.MembersPage, error) {
+	return c.db.GetGroupMembersPage(ctx, chatID, after, limit)
+}
+
 func (c *Cache) GetGroupRosterSummary(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, error) {
 	return c.db.GetGroupRosterSummary(ctx, chatID)
 }
@@ -179,8 +185,8 @@ func (c *Cache) GetMutedUsers(ctx context.Context, chatID *commonpb.ChatId, now 
 	return c.db.GetMutedUsers(ctx, chatID, now, limit)
 }
 
-func (c *Cache) GetMutedUsersInOrder(ctx context.Context, chatID *commonpb.ChatId, now time.Time, after *commonpb.UserId, limit int) (chat.MutedUsersPage, error) {
-	return c.db.GetMutedUsersInOrder(ctx, chatID, now, after, limit)
+func (c *Cache) GetMutedUsersPage(ctx context.Context, chatID *commonpb.ChatId, now time.Time, lo, hi *commonpb.UserId) ([]*commonpb.UserId, error) {
+	return c.db.GetMutedUsersPage(ctx, chatID, now, lo, hi)
 }
 
 func (c *Cache) GetMutedCount(ctx context.Context, chatID *commonpb.ChatId) (uint64, error) {

@@ -534,6 +534,55 @@ type MembersPage struct {
 	Next  *commonpb.UserId
 }
 
+// GroupMember is one joined member of a group as its membership record holds
+// them: who, when they most recently joined, and the roster version that
+// placed them there — the version the group's RosterSummary moved to on their
+// join, or zero for a member written at the group's creation, which no
+// transition has touched (see GroupMembership for the same stamp read the
+// other way round). A member who left and rejoined carries the rejoin's time
+// and version. It is what a roster read hands a client per member, and what
+// Member.joined_at and Member.version are projected from.
+type GroupMember struct {
+	UserID   *commonpb.UserId
+	JoinedAt time.Time
+	Version  uint64
+}
+
+// Position is the member's place in roster order (see RosterPosition).
+func (m GroupMember) Position() RosterPosition {
+	return RosterPosition{JoinedAt: m.JoinedAt, UserID: m.UserID}
+}
+
+// RosterPosition is a place in a group's roster order: most recently joined
+// first, ties broken by user ID descending, so the order is total and a page
+// can resume strictly after the last member it carried. Store.GetGroupRosterPage
+// walks in this order; a caller that reads a roster whole sorts it with
+// SortRoster. Ties in join time are nanosecond coincidences within one group,
+// so the tie-break exists for totality rather than for anything a client sees.
+//
+// A DM's participants have no join time (see Member.joined_at): a DM's
+// position is the zero time and the user ID alone, so a DM's roster is in
+// user-ID order under the same rule.
+type RosterPosition struct {
+	JoinedAt time.Time
+	UserID   *commonpb.UserId
+}
+
+// Compare orders positions in roster order: negative when p comes before o
+// (joined later, or the same instant with the greater user ID), positive when
+// after, zero when they name the same member.
+func (p RosterPosition) Compare(o RosterPosition) int {
+	if c := o.JoinedAt.Compare(p.JoinedAt); c != 0 {
+		return c
+	}
+	return bytes.Compare(o.UserID.Value, p.UserID.Value)
+}
+
+// SortRoster sorts members into roster order (see RosterPosition).
+func SortRoster(members []GroupMember) {
+	slices.SortFunc(members, func(a, b GroupMember) int { return a.Position().Compare(b.Position()) })
+}
+
 // ActiveMute returns the recorded mute when it is in force at now, else nil.
 func (v ViewerState) ActiveMute(now time.Time) *Mute {
 	if v.Mute == nil || !v.Mute.Active(now) {

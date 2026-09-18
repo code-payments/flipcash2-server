@@ -100,6 +100,20 @@ func (c *Cache) GetGroupMembersPage(ctx context.Context, chatID *commonpb.ChatId
 	return c.db.GetGroupMembersPage(ctx, chatID, after, limit)
 }
 
+// GetGroupRoster, GetGroupRosterPage and GetGroupMemberRecords pass through
+// likewise: each is a read of the mutable membership records.
+func (c *Cache) GetGroupRoster(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, []chat.GroupMember, error) {
+	return c.db.GetGroupRoster(ctx, chatID)
+}
+
+func (c *Cache) GetGroupRosterPage(ctx context.Context, chatID *commonpb.ChatId, after *chat.RosterPosition, limit int) ([]chat.GroupMember, error) {
+	return c.db.GetGroupRosterPage(ctx, chatID, after, limit)
+}
+
+func (c *Cache) GetGroupMemberRecords(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.GroupMember, error) {
+	return c.db.GetGroupMemberRecords(ctx, userID, chatIDs)
+}
+
 func (c *Cache) GetGroupRosterSummary(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, error) {
 	return c.db.GetGroupRosterSummary(ctx, chatID)
 }

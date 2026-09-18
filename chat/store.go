@@ -190,6 +190,45 @@ type Store interface {
 	// group chat ID.
 	GetGroupMembersPage(ctx context.Context, chatID *commonpb.ChatId, after *commonpb.UserId, limit int) (MembersPage, error)
 
+	// GetGroupRoster returns a group's RosterSummary and every joined member
+	// (see GroupMember), in no particular order, from one strongly consistent
+	// read: the members are exactly the roster at the summary's version, and
+	// the summary's count is their number — an implementation whose read is
+	// not a snapshot verifies that against the rows and re-reads, a bounded
+	// number of times, when a transition landed mid-read, so the promise holds
+	// short of a roster churning faster than it can be read. It is the read
+	// behind a small group's roster page, which promises a client exactly
+	// that (see Server.GetRoster); it costs the whole roster, so a caller
+	// sizes the group first (GetGroupRosterSummary) and pages a large one with
+	// GetGroupRosterPage instead. It returns ErrChatNotFound if the chat does
+	// not exist, and an error if chatID is not a group chat ID.
+	GetGroupRoster(ctx context.Context, chatID *commonpb.ChatId) (RosterSummary, []GroupMember, error)
+
+	// GetGroupRosterPage is one page of a group's joined members in roster
+	// order (see RosterPosition): most recently joined first, strictly after
+	// the after position (nil starts at the newest member), at most limit of
+	// them (limit <= 0 means unbounded). A position need not name a current
+	// member: a cursor whose member has since left resumes just as well. The
+	// read may lag a transition by a moment — it is served from an index of
+	// the joined members in join order rather than the records themselves, so
+	// a member who just joined may be missing and one who just left may still
+	// appear — which is what a large group's page tolerates (see
+	// Server.GetRoster). It reads the membership records alone, never the
+	// canonical record, so a group that does not exist is an empty page. It
+	// returns an error if chatID is not a group chat ID.
+	GetGroupRosterPage(ctx context.Context, chatID *commonpb.ChatId, after *RosterPosition, limit int) ([]GroupMember, error)
+
+	// GetGroupMemberRecords returns userID's joined membership record (see
+	// GroupMember) on each of chatIDs they are currently a member of, keyed by
+	// string(chatID.Value); a chat they are not joined to — never, or no
+	// longer — or that does not exist is absent rather than reported, and
+	// duplicate IDs collapse. The read is strongly consistent, as IsMember is
+	// and for the same reason: it is asked about a chat the user just joined
+	// or created, to announce the record the join wrote (see
+	// RosterUpdate.MemberJoined). It returns an error if any ID is not a group
+	// chat ID, and an empty map (no error) when chatIDs is empty.
+	GetGroupMemberRecords(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]GroupMember, error)
+
 	// GetGroupRosterSummary returns a group chat's RosterSummary, maintained
 	// alongside its membership records rather than computed by enumerating
 	// them — so a group's size and version are known without paying for its

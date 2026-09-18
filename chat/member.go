@@ -12,6 +12,7 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
+	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/model"
 )
@@ -125,10 +126,12 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	if changed {
 		// The joiner's own member entry, as hydrate built it, is what the rest of
 		// the chat learns about them — less their pointers, which are never
-		// surfaced to other members (see hydrate).
-		member := &chatpb.Member{
-			UserId:      userID,
-			UserProfile: md.Members[0].UserProfile,
+		// surfaced to other members (see hydrate), plus the join time and
+		// version of the record this call wrote (see announcedMember), which
+		// hydrate does not read.
+		member, err := s.announcedMember(ctx, log, req.ChatId, userID, md.Members[0].UserProfile, roster)
+		if err != nil {
+			return nil, err
 		}
 		toMembers := &chatpb.RosterUpdate{
 			Kind:          &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{Member: member}},
@@ -205,6 +208,35 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 	s.clearMuteOnLeave(ctx, log, req.ChatId, userID)
 
 	return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_OK}, nil
+}
+
+// announcedMember is the member entry a join announces (see
+// RosterUpdate.MemberJoined): the joiner's profile as hydrated, and the join
+// time and version stamp of the record the join just wrote, read back
+// strongly consistent as one point read — the one carrier of a member's
+// record besides the roster page, and the one the client merges pages
+// against. A record that is not joined after all — a departure from another
+// of the user's devices landing between the join and this read — is announced
+// at the roster version the join produced, with no join time; the departure's
+// own update follows and supersedes it. A failed read is an Internal error:
+// the join has landed, and a retry is the idempotent path, which announces
+// nothing — the same standing as a failed hydrate.
+func (s *Server) announcedMember(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId, profile *profilepb.UserProfile, roster RosterSummary) (*chatpb.Member, error) {
+	records, err := s.chats.GetGroupMemberRecords(ctx, userID, []*commonpb.ChatId{chatID})
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure reading membership record")
+		return nil, status.Error(codes.Internal, "")
+	}
+	member := &chatpb.Member{
+		UserId:      userID,
+		UserProfile: profile,
+		Version:     roster.Version,
+	}
+	if record, ok := records[string(chatID.Value)]; ok {
+		member.JoinedAt = timestamppb.New(record.JoinedAt)
+		member.Version = record.Version
+	}
+	return member, nil
 }
 
 // clearMuteOnLeave clears the caller's mute on a chat they have just left, as

@@ -60,6 +60,10 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_Group_MembershipLifecycle,
 		testServer_GetChat_Group_NonMember,
 		testServer_GetChat_ViewMode,
+		testServer_GetRoster_Group,
+		testServer_GetRoster_Paging,
+		testServer_GetRoster_Dm,
+		testServer_GetRoster_Gates,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
 		testServer_GetDmChatFeed_Paging,
@@ -594,6 +598,27 @@ func (e *serverEnv) getChatWithMode(keys model.KeyPair, chatID *commonpb.ChatId,
 	return resp
 }
 
+func (e *serverEnv) getRoster(keys model.KeyPair, chatID *commonpb.ChatId, opts *commonpb.QueryOptions) (*chatpb.GetRosterResponse, error) {
+	req := &chatpb.GetRosterRequest{ChatId: chatID, QueryOptions: opts}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.GetRoster(e.ctx, req)
+}
+
+func (e *serverEnv) mustGetRoster(keys model.KeyPair, chatID *commonpb.ChatId, opts *commonpb.QueryOptions) *chatpb.GetRosterResponse {
+	resp, err := e.getRoster(keys, chatID, opts)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// memberUserIDs projects a page onto its members' user IDs, in page order.
+func memberUserIDs(members []*chatpb.Member) [][]byte {
+	out := make([][]byte, len(members))
+	for i, m := range members {
+		out[i] = m.UserId.Value
+	}
+	return out
+}
+
 func (e *serverEnv) getDmFeed(opts *commonpb.QueryOptions) *chatpb.GetDmChatFeedResponse {
 	resp, err := e.getDmFeedOfType(chatpb.ChatType_CONTACT_DM, opts)
 	require.NoError(e.t, err)
@@ -755,6 +780,200 @@ func testServer_GetChat_HiddenWhenPeerBlocked(t *testing.T, s chat.Store) {
 	resp = e.getChat(e.keys, visible)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.False(t, resp.Metadata.IsHidden)
+}
+
+// testServer_GetRoster_Group pins a group's roster page: every joined
+// member, most recently joined first, each with a hydrated profile, their
+// join time and the version of the join that placed them; the summary
+// alongside; no pointers, and no phone numbers, whatever is registered.
+func testServer_GetRoster_Group(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	memberB := model.MustGenerateUserID()
+	chatID := e.putGroup("Weekend Trip", at(1), memberB)
+	e.profiles.displayNames[string(e.userID.Value)] = "Viewer"
+	e.profiles.displayNames[string(memberB.Value)] = "Member B"
+	e.profiles.phoneNumbers[string(memberB.Value)] = &commonpb.PhoneNumber{Value: "+15551234567"}
+	e.messaging.pointers[string(chatID.Value)] = []*messagingpb.Pointer{
+		{Type: messagingpb.Pointer_READ, UserId: memberB, Value: &messagingpb.MessageId{Value: 4}, Ts: timestamppb.New(at(4))},
+	}
+
+	// A later joiner heads the roster.
+	joiner := model.MustGenerateUserID()
+	e.profiles.displayNames[string(joiner.Value)] = "Joiner"
+	settle()
+	addGroupMembers(t, s, chatID, joiner)
+
+	resp := e.mustGetRoster(e.keys, chatID, nil)
+	require.Equal(t, chatpb.GetRosterResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 3, Version: 1}, resp.RosterSummary))
+	require.False(t, resp.HasMore)
+	require.Nil(t, resp.PagingToken)
+	require.Len(t, resp.Members, 3)
+
+	// Newest first: the joiner, then the two creation members. Only the joiner
+	// has a transition to be stamped with.
+	require.Equal(t, joiner.Value, resp.Members[0].UserId.Value)
+	require.Equal(t, "Joiner", resp.Members[0].UserProfile.DisplayName)
+	require.EqualValues(t, 1, resp.Members[0].Version)
+	require.ElementsMatch(t, [][]byte{e.userID.Value, memberB.Value}, memberUserIDs(resp.Members[1:]))
+	for _, m := range resp.Members[1:] {
+		require.Zero(t, m.Version)
+	}
+	for i, m := range resp.Members {
+		require.NotNil(t, m.JoinedAt, "member %d", i)
+		if i > 0 {
+			require.False(t, m.JoinedAt.AsTime().After(resp.Members[i-1].JoinedAt.AsTime()), "member %d joined after member %d", i, i-1)
+		}
+		require.Nil(t, m.UserProfile.PhoneNumber)
+		require.Empty(t, m.Pointers)
+	}
+	require.Zero(t, e.messaging.pointerLookups[string(chatID.Value)], "a group's pointers are not so much as read")
+
+	// A departed member is off the roster; the summary moves with them.
+	removeGroupMember(t, s, chatID, memberB)
+	resp = e.mustGetRoster(e.keys, chatID, nil)
+	require.Equal(t, chatpb.GetRosterResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 2}, resp.RosterSummary))
+	require.Equal(t, [][]byte{joiner.Value, e.userID.Value}, memberUserIDs(resp.Members))
+}
+
+// testServer_GetRoster_Paging pins the walk: pages of the requested size,
+// each carrying the summary and a token that resumes strictly after it, whose
+// concatenation is the whole roster in order; has_more exact, so the walk
+// ends on a full page; and a token refused outside the chat it was minted
+// for, or when malformed.
+func testServer_GetRoster_Paging(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	chatID := e.putGroup("Walked", at(1))
+	joiners := make([]*commonpb.UserId, 4)
+	for i := range joiners {
+		joiners[i] = model.MustGenerateUserID()
+		settle()
+		addGroupMembers(t, s, chatID, joiners[i])
+	}
+	want := [][]byte{joiners[3].Value, joiners[2].Value, joiners[1].Value, joiners[0].Value, e.userID.Value}
+
+	var got [][]byte
+	var token *commonpb.PagingToken
+	for page := 0; ; page++ {
+		resp := e.mustGetRoster(e.keys, chatID, &commonpb.QueryOptions{PageSize: 2, PagingToken: token})
+		require.Equal(t, chatpb.GetRosterResponse_OK, resp.Result)
+		require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 5, Version: 4}, resp.RosterSummary))
+		require.LessOrEqual(t, len(resp.Members), 2)
+		got = append(got, memberUserIDs(resp.Members)...)
+		if !resp.HasMore {
+			require.Nil(t, resp.PagingToken)
+			require.Equal(t, 2, page, "five members page by two in three pages")
+			break
+		}
+		require.NotNil(t, resp.PagingToken)
+		token = resp.PagingToken
+	}
+	require.Equal(t, want, got)
+
+	// A token is bound to its chat: replayed into another group the caller is
+	// in, it is refused rather than resumed.
+	first := e.mustGetRoster(e.keys, chatID, &commonpb.QueryOptions{PageSize: 2})
+	require.NotNil(t, first.PagingToken)
+	other := e.putGroup("Other", at(2))
+	_, err := e.getRoster(e.keys, other, &commonpb.QueryOptions{PagingToken: first.PagingToken})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	// As is a token the server did not mint.
+	_, err = e.getRoster(e.keys, chatID, &commonpb.QueryOptions{PagingToken: &commonpb.PagingToken{Value: []byte("garbage")}})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	// The default page holds the whole roster of a small group.
+	resp := e.mustGetRoster(e.keys, chatID, nil)
+	require.Equal(t, want, memberUserIDs(resp.Members))
+	require.False(t, resp.HasMore)
+}
+
+// testServer_GetRoster_Dm pins a DM's roster: its two participants, with
+// profiles, pointers and — for a contact DM — phone numbers hydrated as
+// GetChat hydrates them, at version zero with no join time, under the DM's
+// fixed summary.
+func testServer_GetRoster_Dm(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	peer := model.MustGenerateUserID()
+	chatID := e.putDMWithPeer(chatpb.ChatType_CONTACT_DM, peer, at(1))
+	e.profiles.displayNames[string(peer.Value)] = "Peer"
+	e.profiles.phoneNumbers[string(peer.Value)] = &commonpb.PhoneNumber{Value: "+15551234567"}
+	e.messaging.pointers[string(chatID.Value)] = []*messagingpb.Pointer{
+		{Type: messagingpb.Pointer_READ, UserId: peer, Value: &messagingpb.MessageId{Value: 3}, Ts: timestamppb.New(at(3))},
+		{Type: messagingpb.Pointer_SENT, UserId: e.userID, Value: &messagingpb.MessageId{Value: 4}, Ts: timestamppb.New(at(4))},
+	}
+
+	resp := e.mustGetRoster(e.keys, chatID, nil)
+	require.Equal(t, chatpb.GetRosterResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 0}, resp.RosterSummary))
+	require.False(t, resp.HasMore)
+	require.Len(t, resp.Members, 2)
+	members := byUserID(resp.Members)
+	for _, m := range resp.Members {
+		require.Nil(t, m.JoinedAt)
+		require.Zero(t, m.Version)
+	}
+	require.Equal(t, "Peer", members[string(peer.Value)].UserProfile.DisplayName)
+	require.Equal(t, "+15551234567", members[string(peer.Value)].UserProfile.PhoneNumber.Value)
+	require.Len(t, members[string(peer.Value)].Pointers, 1)
+	require.Equal(t, messagingpb.Pointer_READ, members[string(peer.Value)].Pointers[0].Type)
+	// SENT pointers are the sender's alone and never surfaced.
+	require.Empty(t, members[string(e.userID.Value)].Pointers)
+
+	// A DM pages too, under the same cursor, should a client ask for one at a
+	// time.
+	first := e.mustGetRoster(e.keys, chatID, &commonpb.QueryOptions{PageSize: 1})
+	require.Len(t, first.Members, 1)
+	require.True(t, first.HasMore)
+	second := e.mustGetRoster(e.keys, chatID, &commonpb.QueryOptions{PageSize: 1, PagingToken: first.PagingToken})
+	require.Len(t, second.Members, 1)
+	require.False(t, second.HasMore)
+	require.ElementsMatch(t, [][]byte{e.userID.Value, peer.Value}, append(memberUserIDs(first.Members), memberUserIDs(second.Members)...))
+}
+
+// testServer_GetRoster_Gates pins who may read a roster: a member; a
+// non-member a group's listener rules admit; and no one else — not a DM's
+// stranger, not a non-member of a group without rules, and not a non-member
+// who fails them, who may preview the group but not its roster.
+func testServer_GetRoster_Gates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	_, strangerKeys := e.addUser()
+
+	resp := e.mustGetRoster(e.keys, chat.MustGenerateGroupChatID(), nil)
+	require.Equal(t, chatpb.GetRosterResponse_NOT_FOUND, resp.Result)
+
+	dm := e.putDM(at(1))
+	resp = e.mustGetRoster(strangerKeys, dm, nil)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
+
+	closed := e.putGroup("Closed", at(1))
+	resp = e.mustGetRoster(strangerKeys, closed, nil)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
+
+	// A non-member who fails a group's rule is denied — they may preview the
+	// group, but a roster is not a shape. Once they satisfy it, the roster is
+	// theirs to read without joining.
+	const requirement = 100
+	founder := model.MustGenerateUserID()
+	gated := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{founder},
+		Title:                  "Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: requirement},
+		LastActivity:           at(1),
+	}
+	require.NoError(t, s.PutChat(e.ctx, gated))
+	resp = e.mustGetRoster(e.keys, gated.ID, nil)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
+	e.fundEnvUser(requirement)
+	resp = e.mustGetRoster(e.keys, gated.ID, nil)
+	require.Equal(t, chatpb.GetRosterResponse_OK, resp.Result)
+	require.Equal(t, [][]byte{founder.Value}, memberUserIDs(resp.Members))
 }
 
 func testServer_GetDmChatFeed_Empty(t *testing.T, s chat.Store) {
@@ -1016,6 +1235,11 @@ func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
 	self := resp.Metadata.Members[0]
 	require.Equal(t, e.userID.Value, self.UserId.Value)
 	require.Equal(t, "Viewer", self.UserProfile.DisplayName)
+
+	// The viewer's own entry carries neither join time nor version: those are
+	// the roster page's (see GetRoster), not the metadata's.
+	require.Nil(t, self.JoinedAt)
+	require.Zero(t, self.Version)
 
 	// The viewer's own pointer is surfaced; the other member's is not, and the
 	// viewer's phone number is not, registered or not.
@@ -1750,6 +1974,11 @@ func testServer_JoinChat_OK(t *testing.T, s chat.Store) {
 	require.Equal(t, e.userID.Value, md.Members[0].UserId.Value)
 	require.Equal(t, "Joiner", md.Members[0].UserProfile.DisplayName)
 
+	// The joiner's own entry in the metadata carries no record fields; the
+	// announcement does (below).
+	require.Nil(t, md.Members[0].JoinedAt)
+	require.Zero(t, md.Members[0].Version)
+
 	// The join has landed in the store...
 	isMember, err := s.IsMember(e.ctx, group.ID, e.userID)
 	require.NoError(t, err)
@@ -1771,6 +2000,13 @@ func testServer_JoinChat_OK(t *testing.T, s chat.Store) {
 	require.True(t, joined.Member.UserProfile.JoinTs.AsTime().Equal(at(5)))
 	require.Empty(t, joined.Member.Pointers)
 	require.Nil(t, joined.Metadata)
+	// The announced member is the record the join wrote: the version the
+	// roster moved to, and the join time as stored.
+	require.EqualValues(t, 1, joined.Member.Version)
+	require.NotNil(t, joined.Member.JoinedAt)
+	records, err := s.GetGroupMemberRecords(e.ctx, e.userID, []*commonpb.ChatId{group.ID})
+	require.NoError(t, err)
+	require.True(t, joined.Member.JoinedAt.AsTime().Equal(records[string(group.ID.Value)].JoinedAt))
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 3, Version: 1}, toMembers[0].GetRosterSummary()))
 
 	// The joiner's own topic carries the same member plus the full metadata,
@@ -1781,6 +2017,8 @@ func testServer_JoinChat_OK(t *testing.T, s chat.Store) {
 	require.NotNil(t, joinedSelf)
 	require.Equal(t, e.userID.Value, joinedSelf.Member.UserId.Value)
 	require.Equal(t, "Joiner", joinedSelf.Member.UserProfile.DisplayName)
+	require.EqualValues(t, 1, joinedSelf.Member.Version)
+	require.True(t, joinedSelf.Member.JoinedAt.AsTime().Equal(joined.Member.JoinedAt.AsTime()))
 	require.NotNil(t, joinedSelf.Metadata)
 	require.Equal(t, group.ID.Value, joinedSelf.Metadata.ChatId.Value)
 	require.Equal(t, "Open Group", joinedSelf.Metadata.Title)
@@ -2307,6 +2545,10 @@ func testServer_StartChat_OK(t *testing.T, s chat.Store) {
 	require.NotNil(t, joined)
 	require.Equal(t, e.userID.Value, joined.Member.UserId.Value)
 	require.Equal(t, "Founder", joined.Member.UserProfile.DisplayName)
+	require.Zero(t, joined.Member.Version)
+	require.NotNil(t, joined.Member.JoinedAt)
+	require.WithinDuration(t, time.Now(), joined.Member.JoinedAt.AsTime(), time.Minute)
+	require.Nil(t, md.Members[0].JoinedAt, "the creator's own metadata entry carries no record fields")
 	require.NotNil(t, joined.Metadata)
 	require.Equal(t, md.ChatId.Value, joined.Metadata.ChatId.Value)
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 0}, toCreator[0].GetRosterSummary()))

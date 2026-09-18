@@ -127,10 +127,9 @@ const (
 	// gsiByJoinedAt is the sparse (chat, joined_at) index on group_members.
 	// joined_at is present iff the member is currently joined (a left tombstone
 	// carries left_at instead), so only joined members appear in the index, in
-	// join order. Nothing queries it today — GetMembers reads the base
-	// partition (see getGroupMembers) — but it is maintained, and kept, for
-	// paging a large group's members newest-first without reading the whole
-	// roster.
+	// join order. It is what pages a large group's roster newest-first without
+	// reading the whole partition (see GetGroupRosterPage); the whole-roster
+	// reads (GetMembers, GetGroupRoster) walk the base partition instead.
 	gsiByJoinedAt = "by_joined_at"
 
 	// gsiByMuted is the sparse (chat, muted_until) index on chat_user_state:
@@ -726,8 +725,8 @@ func (s *store) getGroupMembers(ctx context.Context, chatID *commonpb.ChatId) ([
 // little. The sort key is "user#<hex>", so the partition's order is ascending
 // user-ID bytes — the order the contract promises, and the one
 // gsiUserStateByUser ranges a chat's mutes in. Reading the table leaves a
-// strongly consistent read available if a caller ever needs one; the index
-// stays for paging a large roster in join order, which no walk here needs.
+// strongly consistent read available if a caller ever needs one; paging in
+// join order is the index's job (see GetGroupRosterPage).
 //
 // The cursor is resumed as an exclusive start key built from the user alone:
 // a Query's start key need not name an existing item, so a cursor that has
@@ -788,6 +787,252 @@ func (s *store) GetGroupMembersPage(ctx context.Context, chatID *commonpb.ChatId
 		}
 		startKey = out.LastEvaluatedKey
 	}
+}
+
+// GetGroupRoster is one strongly consistent Query of the group's whole base
+// partition, with no sort-key condition: the #meta item comes back at the
+// head ("#" sorts before "user#") and the membership rows follow. Tombstones
+// are dropped here rather than by a filter, since a filter would need to
+// spare the #meta item too. A partition with no #meta item is a group that
+// does not exist; the membership rows cannot exist without it (see
+// readRosterSummaryForWrite).
+//
+// A Query is consistent per item, not as a set: each item reflects the writes
+// committed before that item was read, but a transition — one transaction
+// over a row and #meta — can commit between the head and the rows, so the
+// rows may run ahead of the summary they came with. Which way the skew runs
+// is fixed by the sort order (the summary is read first, so it is never the
+// newer side), and every transition leaves a mark the summary contradicts: a
+// join writes a row stamped with a version above the summary's, and a leave
+// tombstones a row the summary still counts. So a read whose joined rows
+// number member_count and all carry a version at or below the summary's saw
+// no transition, and is exactly the roster at that version; one that fails
+// the check is re-read, a bounded number of times, and the last read is
+// returned as it is if the roster is churning faster than that. No second
+// read of the summary is needed for this, and it costs nothing when the
+// roster is quiet.
+func (s *store) GetGroupRoster(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, []chat.GroupMember, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.RosterSummary{}, nil, fmt.Errorf("not a group chat id")
+	}
+
+	var (
+		summary chat.RosterSummary
+		members []chat.GroupMember
+	)
+	for attempt := 1; ; attempt++ {
+		var err error
+		summary, members, err = s.readGroupRoster(ctx, chatID)
+		if err != nil {
+			return chat.RosterSummary{}, nil, err
+		}
+		if rosterAgrees(summary, members) || attempt == maxRosterReadAttempts {
+			return summary, members, nil
+		}
+	}
+}
+
+// maxRosterReadAttempts bounds how many times GetGroupRoster re-reads a
+// roster whose rows disagree with the summary they came with (see
+// GetGroupRoster). One transition landing mid-read is a race lost once; a
+// roster that loses it this many times running is churning faster than a
+// snapshot is worth, and the client's version merge covers the rest.
+const maxRosterReadAttempts = 3
+
+// rosterAgrees reports whether members are the roster at exactly summary's
+// version: as many as it counts, none placed by a later transition.
+func rosterAgrees(summary chat.RosterSummary, members []chat.GroupMember) bool {
+	if uint64(len(members)) != summary.MemberCount {
+		return false
+	}
+	for _, m := range members {
+		if m.Version > summary.Version {
+			return false
+		}
+	}
+	return true
+}
+
+// readGroupRoster is one pass of GetGroupRoster's Query.
+func (s *store) readGroupRoster(ctx context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, []chat.GroupMember, error) {
+	var (
+		summary chat.RosterSummary
+		found   bool
+		members = make([]chat.GroupMember, 0)
+	)
+	var startKey map[string]types.AttributeValue
+	for {
+		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                 aws.String(s.groupMembersTable),
+			KeyConditionExpression:    aws.String("#pk = :pk"),
+			ExpressionAttributeNames:  map[string]string{"#pk": attrPK},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(chatPK(chatID))},
+			ExclusiveStartKey:         startKey,
+			ConsistentRead:            aws.Bool(true),
+		})
+		if err != nil {
+			return chat.RosterSummary{}, nil, err
+		}
+		for _, item := range out.Items {
+			if asS(item[attrSK]) == skMeta {
+				if summary, err = rosterSummaryFromItem(item); err != nil {
+					return chat.RosterSummary{}, nil, err
+				}
+				found = true
+				continue
+			}
+			state, err := parseN(item[attrState])
+			if err != nil {
+				return chat.RosterSummary{}, nil, err
+			}
+			if state != memberStateJoined {
+				continue
+			}
+			member, err := groupMemberFromItem(item)
+			if err != nil {
+				return chat.RosterSummary{}, nil, err
+			}
+			members = append(members, member)
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		startKey = out.LastEvaluatedKey
+	}
+	if !found {
+		return chat.RosterSummary{}, nil, chat.ErrChatNotFound
+	}
+	return summary, members, nil
+}
+
+// GetGroupRosterPage is a descending range on the sparse gsiByJoinedAt: the
+// index holds exactly the joined members, in join order, so the page is
+// billed by what it returns and no tombstone is read or filtered. The index
+// projects every attribute, so each member's version stamp comes with the
+// row. A page resumes from an exclusive start key built from the position
+// alone — the index key plus the base table key, all three of which a
+// position names — so a cursor need not name an item still in the index. Two
+// members joined in the same nanosecond are ordered within the index by the
+// base table key, which is not the descending user-ID order the contract
+// promises; a page boundary inside such a tie could skip or repeat one of
+// the pair, which the contract accepts (see chat.RosterPosition).
+func (s *store) GetGroupRosterPage(ctx context.Context, chatID *commonpb.ChatId, after *chat.RosterPosition, limit int) ([]chat.GroupMember, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, fmt.Errorf("not a group chat id")
+	}
+
+	var startKey map[string]types.AttributeValue
+	if after != nil {
+		startKey = map[string]types.AttributeValue{
+			attrPK:       avS(chatPK(chatID)),
+			attrSK:       avS(userPK(after.UserID)),
+			attrJoinedAt: avN(uint64(after.JoinedAt.UnixNano())),
+		}
+	}
+
+	members := make([]chat.GroupMember, 0)
+	for {
+		input := &dynamodb.QueryInput{
+			TableName:                 aws.String(s.groupMembersTable),
+			IndexName:                 aws.String(gsiByJoinedAt),
+			KeyConditionExpression:    aws.String("#pk = :pk"),
+			ExpressionAttributeNames:  map[string]string{"#pk": attrPK},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(chatPK(chatID))},
+			ExclusiveStartKey:         startKey,
+			ScanIndexForward:          aws.Bool(false),
+		}
+		if limit > 0 {
+			input.Limit = aws.Int32(int32(limit - len(members)))
+		}
+		out, err := s.client.Query(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			member, err := groupMemberFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			members = append(members, member)
+			if limit > 0 && len(members) == limit {
+				return members, nil
+			}
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			return members, nil
+		}
+		startKey = out.LastEvaluatedKey
+	}
+}
+
+// GetGroupMemberRecords is one strongly consistent keyed batch read of the
+// user's row in each given group's partition: the same item IsMember reads,
+// whole. A tombstone comes back like any item and is dropped here, as is an
+// absent row.
+func (s *store) GetGroupMemberRecords(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.GroupMember, error) {
+	seen := make(map[string]struct{}, len(chatIDs))
+	var keys []map[string]types.AttributeValue
+	for _, chatID := range chatIDs {
+		if !chat.IsGroupChatID(chatID) {
+			return nil, fmt.Errorf("not a group chat id")
+		}
+		if _, dup := seen[string(chatID.Value)]; dup {
+			continue
+		}
+		seen[string(chatID.Value)] = struct{}{}
+		keys = append(keys, map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(userPK(userID))})
+	}
+
+	out := make(map[string]chat.GroupMember, len(keys))
+	err := s.batchGet(ctx, s.groupMembersTable, keys, "", nil, true, func(item map[string]types.AttributeValue) error {
+		state, err := parseN(item[attrState])
+		if err != nil {
+			return err
+		}
+		if state != memberStateJoined {
+			return nil
+		}
+		chatID, err := chatIDFromPK(item)
+		if err != nil {
+			return err
+		}
+		member, err := groupMemberFromItem(item)
+		if err != nil {
+			return err
+		}
+		out[string(chatID.Value)] = member
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// groupMemberFromItem decodes a joined membership row: the user from the sort
+// key, the join time, and the version stamp of the transition that wrote it —
+// absent on a row written at the group's creation, which reads as zero (see
+// transitionMembership).
+func groupMemberFromItem(item map[string]types.AttributeValue) (chat.GroupMember, error) {
+	userID, err := userIDFromSK(item)
+	if err != nil {
+		return chat.GroupMember{}, err
+	}
+	joinedAt, err := parseN(item[attrJoinedAt])
+	if err != nil {
+		return chat.GroupMember{}, fmt.Errorf("member %s joined_at: %w", asS(item[attrSK]), err)
+	}
+	var version uint64
+	if _, ok := item[attrVersion]; ok {
+		if version, err = parseN(item[attrVersion]); err != nil {
+			return chat.GroupMember{}, err
+		}
+	}
+	return chat.GroupMember{
+		UserID:   userID,
+		JoinedAt: time.Unix(0, int64(joinedAt)).UTC(),
+		Version:  version,
+	}, nil
 }
 
 // GetGroupMembershipsForUser lists the user's membership records via the
@@ -967,7 +1212,7 @@ func (s *store) batchGetChats(ctx context.Context, chatIDs []*commonpb.ChatId) (
 	}
 
 	chats := make([]*chat.Chat, 0, len(keys))
-	err := s.batchGet(ctx, s.chatsTable, keys, "", nil, func(item map[string]types.AttributeValue) error {
+	err := s.batchGet(ctx, s.chatsTable, keys, "", nil, false, func(item map[string]types.AttributeValue) error {
 		chatID, err := chatIDFromPK(item)
 		if err != nil {
 			return err
@@ -988,20 +1233,22 @@ func (s *store) batchGetChats(ctx context.Context, chatIDs []*commonpb.ChatId) (
 // batchGet reads the given keys from table in BatchGetItem chunks, retrying
 // UnprocessedKeys until each chunk drains, and calls fn on every item found.
 // projection and names are an optional ProjectionExpression and its attribute
-// name aliases; an empty projection reads whole items. Items come back in no
-// particular order.
+// name aliases; an empty projection reads whole items. consistent asks for a
+// strongly consistent read, at twice the cost of the default. Items come back
+// in no particular order.
 func (s *store) batchGet(
 	ctx context.Context,
 	table string,
 	keys []map[string]types.AttributeValue,
 	projection string,
 	names map[string]string,
+	consistent bool,
 	fn func(item map[string]types.AttributeValue) error,
 ) error {
 	for start := 0; start < len(keys); start += maxBatchGetKeys {
 		end := min(start+maxBatchGetKeys, len(keys))
 
-		attrs := types.KeysAndAttributes{Keys: keys[start:end]}
+		attrs := types.KeysAndAttributes{Keys: keys[start:end], ConsistentRead: aws.Bool(consistent)}
 		if projection != "" {
 			attrs.ProjectionExpression = aws.String(projection)
 			attrs.ExpressionAttributeNames = names
@@ -1067,7 +1314,7 @@ func (s *store) GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb
 	}
 
 	out := make(map[string]chat.RosterSummary, len(keys))
-	err := s.batchGet(ctx, s.groupMembersTable, keys, "", nil, func(item map[string]types.AttributeValue) error {
+	err := s.batchGet(ctx, s.groupMembersTable, keys, "", nil, false, func(item map[string]types.AttributeValue) error {
 		chatID, err := chatIDFromPK(item)
 		if err != nil {
 			return err

@@ -176,6 +176,12 @@ type Server struct {
 	// tests lower it to exercise the refusal without thousands of groups.
 	maxGroupFeedChats int
 
+	// rosterWholeReadCap is the largest group whose roster GetRoster reads
+	// whole (see roster.go). It is the package constant of the same name in
+	// production; tests lower it to exercise the paged shape without
+	// thousands of members.
+	rosterWholeReadCap int
+
 	chatpb.UnimplementedChatServer
 }
 
@@ -220,7 +226,8 @@ func NewServer(
 
 		requireStaffForGroupManagement: requireStaffForGroupManagement,
 
-		maxGroupFeedChats: maxGroupFeedChats,
+		maxGroupFeedChats:  maxGroupFeedChats,
+		rosterWholeReadCap: rosterWholeReadCap,
 	}
 }
 
@@ -340,7 +347,11 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 // summary — read as a batch across the set — says how large the roster really
 // is. So the cost of a group in the set is fixed, whatever its size, and every
 // caller passes chats straight from the store with no membership read of its
-// own. The roster itself is a separate read.
+// own. The roster itself is a separate read (see GetRoster), and it is where
+// a member's join time and version are read: the viewer's own entry here
+// carries neither (see Member.joined_at), since nothing a client does with
+// its own entry needs them, and reading them would cost a membership read
+// per group on the page.
 //
 // Display names are populated for members of every chat: they are the public
 // identifier a member is known by within the chat. Phone numbers are populated
@@ -561,47 +572,55 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 				md.Picture.Renditions = renditions
 			}
 		}
-		assignPointers(md, pointers[key])
+		assignPointers(md.Members, pointers[key])
 		for _, m := range md.Members {
-			// Every chat member is a user the profile domain knows, so a miss here
-			// is a data integrity problem rather than something to paper over with
-			// an invented profile.
-			publicProfile, ok := publicProfilesByUserId[string(m.UserId.Value)]
-			if !ok {
-				return nil, fmt.Errorf("no public profile for chat member %s", base64.StdEncoding.EncodeToString(m.UserId.Value))
+			if err := assignProfile(m, md.Type, publicProfilesByUserId, phoneNumbersByUserId); err != nil {
+				return nil, err
 			}
-
-			// The batch returns one proto per user, but each member row is filled in
-			// per chat below, so every row needs its own copy. Sharing one would let
-			// a contact DM's phone number show up on that same user's row in a chat
-			// of another type. Today's callers pass a single chat or a single-type
-			// feed page, so the copy is what keeps that true of any future caller.
-			profile := proto.Clone(publicProfile).(*profilepb.UserProfile)
-			if md.Type == chatpb.ChatType_CONTACT_DM {
-				profile.PhoneNumber = phoneNumbersByUserId[string(m.UserId.Value)]
-			}
-			m.UserProfile = profile
 		}
 		metadata[i] = md
 	}
 	return metadata, nil
 }
 
+// assignProfile fills a member's profile from a batch of public profiles and,
+// for a contact DM's member, their phone number. Every chat member is a user
+// the profile domain knows, so a missing profile is a data integrity problem
+// rather than something to paper over with an invented one.
+//
+// The batch returns one proto per user, but each member row is filled in per
+// chat, so every row gets its own copy. Sharing one would let a contact DM's
+// phone number show up on that same user's row in a chat of another type.
+// Today's callers pass a single chat or a single-type feed page, so the copy
+// is what keeps that true of any future caller.
+func assignProfile(m *chatpb.Member, chatType chatpb.ChatType, publicProfiles map[string]*profilepb.UserProfile, phoneNumbers map[string]*commonpb.PhoneNumber) error {
+	publicProfile, ok := publicProfiles[string(m.UserId.Value)]
+	if !ok {
+		return fmt.Errorf("no public profile for chat member %s", base64.StdEncoding.EncodeToString(m.UserId.Value))
+	}
+	profile := proto.Clone(publicProfile).(*profilepb.UserProfile)
+	if chatType == chatpb.ChatType_CONTACT_DM {
+		profile.PhoneNumber = phoneNumbers[string(m.UserId.Value)]
+	}
+	m.UserProfile = profile
+	return nil
+}
+
 // assignPointers distributes a chat's pointers onto the matching member entries
 // by user ID. SENT pointers are never shared with the chat, so they are dropped
 // defensively; each member is left with its DELIVERED and/or READ pointers.
-func assignPointers(md *chatpb.Metadata, pointers []*messagingpb.Pointer) {
+func assignPointers(members []*chatpb.Member, pointers []*messagingpb.Pointer) {
 	if len(pointers) == 0 {
 		return
 	}
-	byUser := make(map[string][]*messagingpb.Pointer, len(md.Members))
+	byUser := make(map[string][]*messagingpb.Pointer, len(members))
 	for _, p := range pointers {
 		if p.Type == messagingpb.Pointer_SENT {
 			continue
 		}
 		byUser[string(p.UserId.Value)] = append(byUser[string(p.UserId.Value)], p)
 	}
-	for _, m := range md.Members {
+	for _, m := range members {
 		m.Pointers = byUser[string(m.UserId.Value)]
 	}
 }

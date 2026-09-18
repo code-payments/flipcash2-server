@@ -200,13 +200,15 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 	md.RosterSummary = RosterSummary{MemberCount: 1, Version: 0}.ToProto()
 
 	// The creator is the only member, so there is no members-side update: just
-	// the creator's own, carrying the metadata.
+	// the creator's own, carrying the metadata, and the creation's record —
+	// the creation's join time at version zero (see announcedMember).
+	member, err := s.announcedMember(ctx, log, chatID, userID, md.Members[0].UserProfile, RosterSummary{MemberCount: 1, Version: 0})
+	if err != nil {
+		return nil, err
+	}
 	s.publishRosterUpdate(chatID, userID, nil, &chatpb.RosterUpdate{
 		Kind: &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{
-			Member: &chatpb.Member{
-				UserId:      userID,
-				UserProfile: md.Members[0].UserProfile,
-			},
+			Member:   member,
 			Metadata: md,
 		}},
 		RosterSummary: md.RosterSummary,

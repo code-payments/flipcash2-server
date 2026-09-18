@@ -59,6 +59,7 @@ func publishChatUpdate(
 	chats chat.Store,
 	profiles profile.Store,
 	blocklists blocklist.Store,
+	userState chat.UserStateStore,
 	ocpData ocp_data.Provider,
 
 	pusher push.Pusher,
@@ -173,7 +174,7 @@ func publishChatUpdate(
 			if message.SenderId == nil {
 				continue
 			}
-			sendMessagePush(ctx, log, badges, profiles, blocklists, ocpData, pusher, chatID, chatType, chatTitle, members, message)
+			sendMessagePush(ctx, log, badges, profiles, blocklists, userState, ocpData, pusher, chatID, chatType, chatTitle, members, message)
 		}
 	}()
 }
@@ -205,6 +206,7 @@ func sendMessagePush(
 	badges badge.Store,
 	profiles profile.Store,
 	blocklists blocklist.Store,
+	userState chat.UserStateStore,
 	ocpData ocp_data.Provider,
 
 	pusher push.Pusher,
@@ -259,6 +261,35 @@ func sendMessagePush(
 		return
 	}
 
+	// A recipient who has the chat muted still gets the push — it is how the
+	// message reaches their device — but in a batch of its own, flagged so
+	// the client suppresses the notification and sent without moving their
+	// badge (see push.ChatRecipients). The chat's muted set is read whole: it is
+	// the recorded mutes alone, not the roster, and this fan-out holds the
+	// roster whole regardless. Unlike the blocklist read, this one fails
+	// open: a lookup failure sends everyone the plain push, because the
+	// worst outcome is one notification a client's own copy of its mute may
+	// still catch, while a suppressed push would lose the message delivery
+	// the flag exists to preserve.
+	recipients := push.ChatRecipients{Unmuted: membersForPush}
+	mutedUsers, err := userState.GetMutedUsers(ctx, chatID, time.Now(), 0)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure reading muted users for message push; sending all as unmuted")
+	} else if len(mutedUsers) > 0 {
+		muted := make(map[string]struct{}, len(mutedUsers))
+		for _, u := range mutedUsers {
+			muted[string(u.Value)] = struct{}{}
+		}
+		recipients = push.ChatRecipients{}
+		for _, candidate := range membersForPush {
+			if _, ok := muted[string(candidate.Value)]; ok {
+				recipients.Muted = append(recipients.Muted, candidate)
+			} else {
+				recipients.Unmuted = append(recipients.Unmuted, candidate)
+			}
+		}
+	}
+
 	senderProfile, err := profiles.GetProfile(ctx, message.SenderId, true)
 	if err == profile.ErrNotFound {
 		return
@@ -272,17 +303,17 @@ func sendMessagePush(
 		if senderProfile.PhoneNumber == nil {
 			return
 		}
-		err = push.SendContactDmPush(ctx, pusher, badges, ocpData, chatID, message, message.SenderId, senderProfile.PhoneNumber, membersForPush...)
+		err = push.SendContactDmPush(ctx, pusher, badges, ocpData, chatID, message, message.SenderId, senderProfile.PhoneNumber, recipients)
 	case chatpb.ChatType_TIP_DM:
 		if senderProfile.DisplayName == "" {
 			return
 		}
-		err = push.SendTipDmPush(ctx, pusher, badges, ocpData, chatID, message, message.SenderId, senderProfile.DisplayName, membersForPush...)
+		err = push.SendTipDmPush(ctx, pusher, badges, ocpData, chatID, message, message.SenderId, senderProfile.DisplayName, recipients)
 	case chatpb.ChatType_GROUP:
 		if senderProfile.DisplayName == "" {
 			return
 		}
-		err = push.SendGroupChatPush(ctx, pusher, badges, ocpData, chatID, message, message.SenderId, senderProfile.DisplayName, chatTitle, membersForPush...)
+		err = push.SendGroupChatPush(ctx, pusher, badges, ocpData, chatID, message, message.SenderId, senderProfile.DisplayName, chatTitle, recipients)
 	default:
 		return
 	}

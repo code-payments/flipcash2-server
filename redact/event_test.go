@@ -38,6 +38,12 @@ func chatUpdateFixture() *eventpb.ChatUpdate {
 			{Kind: &chatpb.MetadataUpdate_LastActivityChanged_{LastActivityChanged: &chatpb.MetadataUpdate_LastActivityChanged{
 				NewLastActivity: timestamppb.Now(),
 			}}},
+			{Kind: &chatpb.MetadataUpdate_ViewerStateChanged_{ViewerStateChanged: &chatpb.MetadataUpdate_ViewerStateChanged{
+				ViewerState: &chatpb.ViewerState{
+					Settings: &chatpb.ViewerState_Settings{Mute: &chatpb.MuteState{Duration: &chatpb.MuteState_Forever_{Forever: &chatpb.MuteState_Forever{}}}},
+					Version:  2,
+				},
+			}}},
 		},
 		Events: &messagingpb.EventBatch{Events: []*messagingpb.Event{{
 			Sequence: 3,
@@ -101,14 +107,15 @@ func TestChatUpdate(t *testing.T) {
 	}
 
 	// A metadata refresh keeps its record with the last message redacted; a
-	// last-activity change is as it was.
-	require.Len(t, out.MetadataUpdates, 2)
+	// last-activity change and a viewer-state change are as they were.
+	require.Len(t, out.MetadataUpdates, 3)
 	refreshed := out.MetadataUpdates[0].GetFullRefresh().GetMetadata()
 	assert.Equal(t, "Title", refreshed.Title)
 	expected, err := Message(chatID, in.MetadataUpdates[0].GetFullRefresh().GetMetadata().LastMessage)
 	require.NoError(t, err)
 	assert.True(t, proto.Equal(expected, refreshed.LastMessage))
 	assert.True(t, proto.Equal(in.MetadataUpdates[1], out.MetadataUpdates[1]))
+	assert.True(t, proto.Equal(in.MetadataUpdates[2], out.MetadataUpdates[2]))
 
 	// A join keeps its member and summary with its metadata's last message
 	// redacted; a departure is as it was.

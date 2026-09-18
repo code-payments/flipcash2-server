@@ -88,6 +88,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_SendMessage_PushPerChatType,
 		testServer_SendMessage_GroupChatPush,
 		testServer_SendMessage_SuppressedForBlockedSender,
+		testServer_SendMessage_MutedRecipientsFlagged,
 	} {
 		tf(t, badges, blocklists, chats, messages, profiles)
 		teardown()
@@ -102,6 +103,7 @@ type serverEnv struct {
 	observer     *event.TestEventObserver[*commonpb.UserId, *eventpb.Event]
 	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
 	pusher       *capturingPusher
+	userState    chat.UserStateStore
 
 	chatID *commonpb.ChatId
 	userA  *commonpb.UserId
@@ -224,7 +226,10 @@ func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, 
 	env.ocpBalance = &fakeOcpBalance{byOwner: make(map[string]uint64)}
 	balances := balance.NewClient(log, env.accounts, env.ocpBalance)
 
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus)
+	userState, ok := chats.(chat.UserStateStore)
+	require.True(t, ok, "chat.Store implementation must also implement chat.UserStateStore")
+	env.userState = userState
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, userState, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus)
 	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats))
 	server := messaging.NewServer(log, authz, chats, media, messages, access, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
@@ -246,6 +251,9 @@ type capturedPush struct {
 	body    string
 	payload *pushpb.Payload
 	users   []*commonpb.UserId
+	// badged reports whether the push asked for badge counts — the unmuted
+	// batch does, the muted batch must not.
+	badged bool
 }
 
 // capturingPusher records every push so tests can assert on exactly what
@@ -262,8 +270,11 @@ func (p *capturingPusher) SendPushes(_ context.Context, title, body string, cust
 	return nil
 }
 
-func (p *capturingPusher) SendPushesWithBadges(ctx context.Context, title, body string, customPayload *pushpb.Payload, _ push.BadgeResolver, users ...*commonpb.UserId) error {
-	return p.SendPushes(ctx, title, body, customPayload, users...)
+func (p *capturingPusher) SendPushesWithBadges(_ context.Context, title, body string, customPayload *pushpb.Payload, resolve push.BadgeResolver, users ...*commonpb.UserId) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pushes = append(p.pushes, capturedPush{title: title, body: body, payload: customPayload, users: users, badged: resolve != nil})
+	return nil
 }
 
 func (p *capturingPusher) snapshot() []capturedPush {
@@ -2891,4 +2902,113 @@ func testServer_SendMessage_SuppressedForBlockedSender(t *testing.T, badges badg
 	require.Equal(t, "unblocked hello", pushes[0].body)
 	require.Len(t, pushes[0].users, 1)
 	require.Equal(t, e.userB.Value, pushes[0].users[0].Value)
+}
+
+// testServer_SendMessage_MutedRecipientsFlagged sends into a DM and a group
+// where some recipients have the chat muted: every recipient still gets the
+// push, but muted ones get it in a batch of their own, flagged and without a
+// badge, while a mute that has lapsed counts for nothing.
+func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
+
+	waitForPushes := func(n int) []capturedPush {
+		require.Eventually(t, func() bool {
+			return len(e.pusher.snapshot()) >= n
+		}, 5*time.Second, 10*time.Millisecond)
+		pushes := e.pusher.snapshot()
+		require.Len(t, pushes, n)
+		return pushes
+	}
+	userValues := func(users []*commonpb.UserId) [][]byte {
+		out := make([][]byte, len(users))
+		for i, u := range users {
+			out[i] = u.Value
+		}
+		return out
+	}
+
+	// A DM whose recipient has it muted: one push, flagged, unbadged.
+	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.userA, e.userB)
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           dmID,
+		Type:         chatpb.ChatType_TIP_DM,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+	_, _, err := e.userState.SetMute(e.ctx, dmID, e.userB, chat.Mute{Forever: true})
+	require.NoError(t, err)
+
+	resp, err := e.sendContentToChat(e.keysA, dmID, textContent("quiet dm"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+
+	pushes := waitForPushes(1)
+	require.Equal(t, [][]byte{e.userB.Value}, userValues(pushes[0].users))
+	require.True(t, pushes[0].payload.ChatMetadata.Muted)
+	require.False(t, pushes[0].badged)
+	require.True(t, proto.Equal(resp.Message, pushes[0].payload.ChatMetadata.Message))
+
+	// A group with one muted member: two pushes, one per half, with the same
+	// message in each and only the muted half flagged.
+	userC, _ := e.addUser()
+	userD, _ := e.addUser()
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB, userC, userD},
+		Title:        "Mixed",
+		LastActivity: at(1),
+	}))
+	_, _, err = e.userState.SetMute(e.ctx, groupID, userC, chat.Mute{Until: time.Now().Add(time.Hour)})
+	require.NoError(t, err)
+
+	resp, err = e.sendContentToChat(e.keysA, groupID, textContent("group hello"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+
+	pushes = waitForPushes(3)
+	var unmuted, muted *capturedPush
+	for i := range pushes[1:] {
+		p := &pushes[1+i]
+		if p.payload.ChatMetadata.Muted {
+			muted = p
+		} else {
+			unmuted = p
+		}
+	}
+	require.NotNil(t, unmuted)
+	require.NotNil(t, muted)
+	require.ElementsMatch(t, [][]byte{e.userB.Value, userD.Value}, userValues(unmuted.users))
+	require.True(t, unmuted.badged)
+	require.Equal(t, [][]byte{userC.Value}, userValues(muted.users))
+	require.False(t, muted.badged)
+	require.Equal(t, unmuted.title, muted.title)
+	require.Equal(t, unmuted.body, muted.body)
+	require.True(t, proto.Equal(resp.Message, muted.payload.ChatMetadata.Message))
+	// The flag is set on a copy: the unmuted payload is untouched.
+	require.False(t, unmuted.payload.ChatMetadata.Muted)
+
+	// A lapsed mute is no mute: the recipient is in the plain batch.
+	lapsedID := chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, e.userA, e.userB)
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           lapsedID,
+		Type:         chatpb.ChatType_CONTACT_DM,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+	require.NoError(t, profiles.LinkPhoneNumber(e.ctx, e.userA, "+15551234567", &commonpb.Hash{Value: make([]byte, 32)}))
+	_, _, err = e.userState.SetMute(e.ctx, lapsedID, e.userB, chat.Mute{Until: at(1)})
+	require.NoError(t, err)
+
+	resp, err = e.sendContentToChat(e.keysA, lapsedID, textContent("lapsed"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+
+	pushes = waitForPushes(4)
+	require.Equal(t, [][]byte{e.userB.Value}, userValues(pushes[3].users))
+	require.False(t, pushes[3].payload.ChatMetadata.Muted)
+	require.True(t, pushes[3].badged)
 }

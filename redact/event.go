@@ -120,8 +120,10 @@ func event(chatID *commonpb.ChatId, e *messagingpb.Event) (*messagingpb.Event, e
 
 // metadataUpdate redacts one metadata update: a full refresh carries the
 // chat's metadata, whose last_message is a message (see metadata); a
-// last-activity change carries only a time. A kind this version does not know
-// is an error.
+// last-activity change carries only a time; a viewer-state change carries
+// the recipient's own state on the chat (a mute and its version), which is
+// theirs whatever they may read of the chat and holds no message, so it
+// passes as it is. A kind this version does not know is an error.
 func metadataUpdate(chatID *commonpb.ChatId, md *chatpb.MetadataUpdate) (*chatpb.MetadataUpdate, error) {
 	switch kind := md.GetKind().(type) {
 	case *chatpb.MetadataUpdate_FullRefresh_:
@@ -132,7 +134,7 @@ func metadataUpdate(chatID *commonpb.ChatId, md *chatpb.MetadataUpdate) (*chatpb
 		return &chatpb.MetadataUpdate{Kind: &chatpb.MetadataUpdate_FullRefresh_{
 			FullRefresh: &chatpb.MetadataUpdate_FullRefresh{Metadata: redacted},
 		}}, nil
-	case *chatpb.MetadataUpdate_LastActivityChanged_:
+	case *chatpb.MetadataUpdate_LastActivityChanged_, *chatpb.MetadataUpdate_ViewerStateChanged_:
 		return proto.Clone(md).(*chatpb.MetadataUpdate), nil
 	default:
 		return nil, fmt.Errorf("redact: unsupported metadata update %T", kind)

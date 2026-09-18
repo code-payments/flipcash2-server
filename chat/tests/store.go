@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"slices"
@@ -56,6 +57,18 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_GetDmFeedPage_SnapshotPinned,
 		testStore_GetDmFeedPage_Empty,
 		testStore_GetDmFeedPage_TypeScoped,
+		testStore_UserState_Empty,
+		testStore_UserState_SetMute_Until,
+		testStore_UserState_SetMute_Forever,
+		testStore_UserState_SetMute_Idempotent,
+		testStore_UserState_SetMute_Replace,
+		testStore_UserState_ClearMute,
+		testStore_UserState_OutOfRange,
+		testStore_UserState_GetViewerStates_Batch,
+		testStore_UserState_GetViewerStates_Bounded,
+		testStore_UserState_GetMutedUsers,
+		testStore_UserState_GetMutedUsersInOrder_Cursor,
+		testStore_UserState_MutedCount,
 	} {
 		tf(t, s)
 		teardown()
@@ -1304,4 +1317,470 @@ func userIDValues(ids []*commonpb.UserId) [][]byte {
 		out[i] = id.Value
 	}
 	return out
+}
+
+// userStateStore returns s as a chat.UserStateStore: every chat store
+// implementation also persists viewer state, so the one suite covers both.
+func userStateStore(t *testing.T, s chat.Store) chat.UserStateStore {
+	us, ok := s.(chat.UserStateStore)
+	require.True(t, ok, "chat.Store implementation must also implement chat.UserStateStore")
+	return us
+}
+
+// requireMutedUsers checks both chat-scoped reads: the set read, and the
+// ordered walk — as one page, and paged one user at a time — which must agree
+// with it and come back in ascending user-ID order.
+func requireMutedUsers(t *testing.T, us chat.UserStateStore, chatID *commonpb.ChatId, now time.Time, want ...*commonpb.UserId) {
+	t.Helper()
+	ctx := context.Background()
+
+	got, err := us.GetMutedUsers(ctx, chatID, now, 0)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, userIDValues(want), userIDValues(got))
+
+	wantOrdered := slices.Clone(want)
+	slices.SortFunc(wantOrdered, func(a, b *commonpb.UserId) int { return bytes.Compare(a.Value, b.Value) })
+
+	page, err := us.GetMutedUsersInOrder(ctx, chatID, now, nil, 0)
+	require.NoError(t, err)
+	assert.Equal(t, userIDValues(wantOrdered), userIDValues(page.Users))
+	assert.Nil(t, page.Next)
+
+	var walked []*commonpb.UserId
+	var after *commonpb.UserId
+	for {
+		page, err := us.GetMutedUsersInOrder(ctx, chatID, now, after, 1)
+		require.NoError(t, err)
+		require.LessOrEqual(t, len(page.Users), 1)
+		walked = append(walked, page.Users...)
+		if page.Next == nil {
+			break
+		}
+		after = page.Next
+	}
+	assert.Equal(t, userIDValues(wantOrdered), userIDValues(walked))
+}
+
+func requireMutedCount(t *testing.T, us chat.UserStateStore, chatID *commonpb.ChatId, want uint64) {
+	t.Helper()
+	got, err := us.GetMutedCount(context.Background(), chatID)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+}
+
+func requireViewerState(t *testing.T, us chat.UserStateStore, chatID *commonpb.ChatId, userID *commonpb.UserId, want chat.ViewerState) {
+	t.Helper()
+	states, err := us.GetViewerStates(context.Background(), userID, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	got, ok := states[string(chatID.Value)]
+	require.True(t, ok, "no viewer state recorded")
+	assert.Equal(t, want, got)
+}
+
+func testStore_UserState_Empty(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	user := model.MustGenerateUserID()
+	dm := generateDmChatID()
+	group := chat.MustGenerateGroupChatID()
+
+	states, err := us.GetViewerStates(ctx, user, []*commonpb.ChatId{dm, group})
+	require.NoError(t, err)
+	assert.Empty(t, states)
+
+	states, err = us.GetViewerStates(ctx, user, nil)
+	require.NoError(t, err)
+	assert.Empty(t, states)
+
+	requireMutedUsers(t, us, dm, at(0))
+
+	// Clearing what was never set is a no-op that leaves no record behind.
+	state, changed, err := us.ClearMute(ctx, dm, user)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Equal(t, chat.ViewerState{}, state)
+
+	states, err = us.GetViewerStates(ctx, user, []*commonpb.ChatId{dm})
+	require.NoError(t, err)
+	assert.Empty(t, states)
+}
+
+func testStore_UserState_SetMute_Until(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	user := model.MustGenerateUserID()
+	dm := generateDmChatID()
+
+	// Until is recorded at second precision.
+	state, changed, err := us.SetMute(ctx, dm, user, chat.Mute{Until: at(100).Add(750 * time.Millisecond)})
+	require.NoError(t, err)
+	assert.True(t, changed)
+	want := chat.ViewerState{Mute: &chat.Mute{Until: at(100)}, Version: 1}
+	assert.Equal(t, want, state)
+	requireViewerState(t, us, dm, user, want)
+
+	// Active strictly before Until, lapsed from Until on.
+	requireMutedUsers(t, us, dm, at(50), user)
+	requireMutedUsers(t, us, dm, at(99), user)
+	requireMutedUsers(t, us, dm, at(100))
+	requireMutedUsers(t, us, dm, at(150))
+
+	// A lapsed mute is still recorded, as stored: nothing sweeps it.
+	requireViewerState(t, us, dm, user, want)
+	assert.Nil(t, state.ActiveMute(at(100)))
+	assert.NotNil(t, state.ActiveMute(at(99)))
+}
+
+func testStore_UserState_SetMute_Forever(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	user := model.MustGenerateUserID()
+	group := chat.MustGenerateGroupChatID()
+
+	// Until is ignored when Forever is set.
+	state, changed, err := us.SetMute(ctx, group, user, chat.Mute{Forever: true, Until: at(100)})
+	require.NoError(t, err)
+	assert.True(t, changed)
+	want := chat.ViewerState{Mute: &chat.Mute{Forever: true}, Version: 1}
+	assert.Equal(t, want, state)
+	requireViewerState(t, us, group, user, want)
+
+	requireMutedUsers(t, us, group, at(0), user)
+	requireMutedUsers(t, us, group, time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC), user)
+}
+
+func testStore_UserState_SetMute_Idempotent(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	user := model.MustGenerateUserID()
+	dm := generateDmChatID()
+
+	_, changed, err := us.SetMute(ctx, dm, user, chat.Mute{Until: at(100)})
+	require.NoError(t, err)
+	assert.True(t, changed)
+
+	// The mute already recorded — at second precision — moves nothing.
+	for _, until := range []time.Time{at(100), at(100).Add(500 * time.Millisecond)} {
+		state, changed, err := us.SetMute(ctx, dm, user, chat.Mute{Until: until})
+		require.NoError(t, err)
+		assert.False(t, changed)
+		assert.Equal(t, chat.ViewerState{Mute: &chat.Mute{Until: at(100)}, Version: 1}, state)
+	}
+	requireViewerState(t, us, dm, user, chat.ViewerState{Mute: &chat.Mute{Until: at(100)}, Version: 1})
+
+	_, changed, err = us.SetMute(ctx, dm, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	assert.True(t, changed)
+
+	state, changed, err := us.SetMute(ctx, dm, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Equal(t, chat.ViewerState{Mute: &chat.Mute{Forever: true}, Version: 2}, state)
+}
+
+func testStore_UserState_SetMute_Replace(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	user := model.MustGenerateUserID()
+	dm := generateDmChatID()
+
+	// Every real change — a different end, indefinite, timed again — is one
+	// transition, and the version counts exactly those.
+	for i, mute := range []chat.Mute{
+		{Until: at(100)},
+		{Until: at(200)},
+		{Forever: true},
+		{Until: at(200)},
+	} {
+		state, changed, err := us.SetMute(ctx, dm, user, mute)
+		require.NoError(t, err)
+		assert.True(t, changed)
+		want := chat.ViewerState{Mute: &mute, Version: uint64(i + 1)}
+		assert.Equal(t, want, state)
+		requireViewerState(t, us, dm, user, want)
+	}
+}
+
+func testStore_UserState_ClearMute(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	user := model.MustGenerateUserID()
+	group := chat.MustGenerateGroupChatID()
+
+	_, _, err := us.SetMute(ctx, group, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+
+	state, changed, err := us.ClearMute(ctx, group, user)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, chat.ViewerState{Version: 2}, state)
+
+	// The record and its version outlive the mute.
+	requireViewerState(t, us, group, user, chat.ViewerState{Version: 2})
+	requireMutedUsers(t, us, group, at(0))
+
+	state, changed, err = us.ClearMute(ctx, group, user)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Equal(t, chat.ViewerState{Version: 2}, state)
+
+	// A new mute continues the version from where the clear left it.
+	state, changed, err = us.SetMute(ctx, group, user, chat.Mute{Until: at(100)})
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, chat.ViewerState{Mute: &chat.Mute{Until: at(100)}, Version: 3}, state)
+
+	// A lapsed mute clears like any other.
+	state, changed, err = us.ClearMute(ctx, group, user)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, chat.ViewerState{Version: 4}, state)
+}
+
+func testStore_UserState_OutOfRange(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	user := model.MustGenerateUserID()
+	dm := generateDmChatID()
+
+	for _, until := range []time.Time{
+		{},                               // the zero time predates the epoch
+		time.Unix(-1, 0),                 // before the epoch
+		chat.MaxMuteUntil,                // the boundary is exclusive
+		chat.MaxMuteUntil.Add(time.Hour), // beyond it
+	} {
+		_, _, err := us.SetMute(ctx, dm, user, chat.Mute{Until: until})
+		assert.ErrorIs(t, err, chat.ErrMuteUntilOutOfRange, "until %v", until)
+	}
+
+	// A rejected write leaves no record behind.
+	states, err := us.GetViewerStates(ctx, user, []*commonpb.ChatId{dm})
+	require.NoError(t, err)
+	assert.Empty(t, states)
+
+	// The extremes of the range are recordable, and distinct from indefinite.
+	for _, until := range []time.Time{time.Unix(0, 0).UTC(), chat.MaxMuteUntil.Add(-time.Second)} {
+		state, changed, err := us.SetMute(ctx, dm, user, chat.Mute{Until: until})
+		require.NoError(t, err)
+		assert.True(t, changed)
+		assert.Equal(t, &chat.Mute{Until: until}, state.Mute)
+	}
+	requireMutedUsers(t, us, dm, at(0), user)
+}
+
+func testStore_UserState_GetViewerStates_Batch(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	user := model.MustGenerateUserID()
+	other := model.MustGenerateUserID()
+	dm1 := generateDmChatID()
+	dm2 := generateDmChatID()
+	group1 := chat.MustGenerateGroupChatID()
+	group2 := chat.MustGenerateGroupChatID()
+
+	_, _, err := us.SetMute(ctx, dm1, user, chat.Mute{Until: at(100)})
+	require.NoError(t, err)
+	_, _, err = us.SetMute(ctx, group1, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	_, _, err = us.SetMute(ctx, dm2, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	_, _, err = us.ClearMute(ctx, dm2, user)
+	require.NoError(t, err)
+	_, _, err = us.SetMute(ctx, dm1, other, chat.Mute{Forever: true})
+	require.NoError(t, err)
+
+	// Both families in one read; a chat with no record is absent; duplicates
+	// collapse; another user's records never bleed in.
+	states, err := us.GetViewerStates(ctx, user, []*commonpb.ChatId{dm1, group1, dm2, group2, dm1})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]chat.ViewerState{
+		string(dm1.Value):    {Mute: &chat.Mute{Until: at(100)}, Version: 1},
+		string(group1.Value): {Mute: &chat.Mute{Forever: true}, Version: 1},
+		string(dm2.Value):    {Version: 2},
+	}, states)
+
+	states, err = us.GetViewerStates(ctx, other, []*commonpb.ChatId{dm1, group1, dm2})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]chat.ViewerState{
+		string(dm1.Value): {Mute: &chat.Mute{Forever: true}, Version: 1},
+	}, states)
+
+	// A single chat, present and absent.
+	states, err = us.GetViewerStates(ctx, user, []*commonpb.ChatId{group1})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]chat.ViewerState{
+		string(group1.Value): {Mute: &chat.Mute{Forever: true}, Version: 1},
+	}, states)
+
+	states, err = us.GetViewerStates(ctx, user, []*commonpb.ChatId{group2})
+	require.NoError(t, err)
+	assert.Empty(t, states)
+}
+
+// testStore_UserState_GetViewerStates_Bounded asks for the two extremes of
+// three chats in key order: the one between them lies inside any range read
+// the store bounds to the request, and must still be left out.
+func testStore_UserState_GetViewerStates_Bounded(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	user := model.MustGenerateUserID()
+
+	chats := []*commonpb.ChatId{generateDmChatID(), generateDmChatID(), generateDmChatID()}
+	slices.SortFunc(chats, func(a, b *commonpb.ChatId) int { return bytes.Compare(a.Value, b.Value) })
+	for _, chatID := range chats {
+		_, _, err := us.SetMute(ctx, chatID, user, chat.Mute{Forever: true})
+		require.NoError(t, err)
+	}
+
+	states, err := us.GetViewerStates(ctx, user, []*commonpb.ChatId{chats[0], chats[2]})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]chat.ViewerState{
+		string(chats[0].Value): {Mute: &chat.Mute{Forever: true}, Version: 1},
+		string(chats[2].Value): {Mute: &chat.Mute{Forever: true}, Version: 1},
+	}, states)
+}
+
+func testStore_UserState_GetMutedUsers(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	group := chat.MustGenerateGroupChatID()
+	otherChat := generateDmChatID()
+
+	timed := model.MustGenerateUserID()
+	forever := model.MustGenerateUserID()
+	lapsed := model.MustGenerateUserID()
+	cleared := model.MustGenerateUserID()
+	elsewhere := model.MustGenerateUserID()
+
+	_, _, err := us.SetMute(ctx, group, timed, chat.Mute{Until: at(200)})
+	require.NoError(t, err)
+	_, _, err = us.SetMute(ctx, group, forever, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	_, _, err = us.SetMute(ctx, group, lapsed, chat.Mute{Until: at(100)})
+	require.NoError(t, err)
+	_, _, err = us.SetMute(ctx, group, cleared, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	_, _, err = us.ClearMute(ctx, group, cleared)
+	require.NoError(t, err)
+	_, _, err = us.SetMute(ctx, otherChat, elsewhere, chat.Mute{Forever: true})
+	require.NoError(t, err)
+
+	requireMutedUsers(t, us, group, at(150), timed, forever)
+	requireMutedUsers(t, us, group, at(50), timed, forever, lapsed)
+	requireMutedUsers(t, us, group, at(250), forever)
+	requireMutedUsers(t, us, otherChat, at(150), elsewhere)
+
+	// A positive limit caps the result; a limit above the count is not a floor.
+	got, err := us.GetMutedUsers(ctx, group, at(150), 1)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Contains(t, userIDValues([]*commonpb.UserId{timed, forever}), got[0].Value)
+
+	got, err = us.GetMutedUsers(ctx, group, at(150), 5)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, userIDValues([]*commonpb.UserId{timed, forever}), userIDValues(got))
+}
+
+// testStore_UserState_GetMutedUsersInOrder_Cursor pages a chat's muted users
+// with a cursor that starts mid-way and a limit that lands exactly on the last
+// user, so the final page carries a cursor that yields an empty, final page.
+func testStore_UserState_GetMutedUsersInOrder_Cursor(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	group := chat.MustGenerateGroupChatID()
+
+	users := []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()}
+	slices.SortFunc(users, func(a, b *commonpb.UserId) int { return bytes.Compare(a.Value, b.Value) })
+	for _, user := range users {
+		_, _, err := us.SetMute(ctx, group, user, chat.Mute{Forever: true})
+		require.NoError(t, err)
+	}
+	// An unmuted record between them is stepped over, not counted against the
+	// limit.
+	between := model.MustGenerateUserID()
+	_, _, err := us.SetMute(ctx, group, between, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	_, _, err = us.ClearMute(ctx, group, between)
+	require.NoError(t, err)
+
+	// Resume strictly after the second user: the third and fourth remain.
+	page, err := us.GetMutedUsersInOrder(ctx, group, at(0), users[1], 0)
+	require.NoError(t, err)
+	assert.Equal(t, userIDValues(users[2:]), userIDValues(page.Users))
+	assert.Nil(t, page.Next)
+
+	// A limit that lands exactly on the last user still hands out a cursor;
+	// resuming from it is an empty, final page.
+	page, err = us.GetMutedUsersInOrder(ctx, group, at(0), users[1], 2)
+	require.NoError(t, err)
+	assert.Equal(t, userIDValues(users[2:]), userIDValues(page.Users))
+	require.NotNil(t, page.Next)
+	assert.Equal(t, users[3].Value, page.Next.Value)
+
+	page, err = us.GetMutedUsersInOrder(ctx, group, at(0), page.Next, 2)
+	require.NoError(t, err)
+	assert.Empty(t, page.Users)
+	assert.Nil(t, page.Next)
+
+	// A cursor past every user is likewise empty and final.
+	page, err = us.GetMutedUsersInOrder(ctx, group, at(0), users[3], 0)
+	require.NoError(t, err)
+	assert.Empty(t, page.Users)
+	assert.Nil(t, page.Next)
+}
+
+func testStore_UserState_MutedCount(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	us := userStateStore(t, s)
+	group := chat.MustGenerateGroupChatID()
+	other := generateDmChatID()
+	a := model.MustGenerateUserID()
+	b := model.MustGenerateUserID()
+
+	requireMutedCount(t, us, group, 0)
+
+	// A first mute counts; the same mute again, or a different one replacing
+	// it, does not.
+	_, _, err := us.SetMute(ctx, group, a, chat.Mute{Until: at(100)})
+	require.NoError(t, err)
+	requireMutedCount(t, us, group, 1)
+	_, _, err = us.SetMute(ctx, group, a, chat.Mute{Until: at(100)})
+	require.NoError(t, err)
+	requireMutedCount(t, us, group, 1)
+	_, _, err = us.SetMute(ctx, group, a, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	requireMutedCount(t, us, group, 1)
+
+	_, _, err = us.SetMute(ctx, group, b, chat.Mute{Until: at(100)})
+	require.NoError(t, err)
+	requireMutedCount(t, us, group, 2)
+
+	// A lapsed mute is still recorded, and still counted: the count bounds
+	// the active mutes from above.
+	requireMutedUsers(t, us, group, at(150), a)
+	requireMutedCount(t, us, group, 2)
+
+	// A clear counts down; clearing again, or clearing what was never set,
+	// does not.
+	_, _, err = us.ClearMute(ctx, group, b)
+	require.NoError(t, err)
+	requireMutedCount(t, us, group, 1)
+	_, _, err = us.ClearMute(ctx, group, b)
+	require.NoError(t, err)
+	requireMutedCount(t, us, group, 1)
+	_, _, err = us.ClearMute(ctx, group, model.MustGenerateUserID())
+	require.NoError(t, err)
+	requireMutedCount(t, us, group, 1)
+
+	// Muting again after a clear counts again.
+	_, _, err = us.SetMute(ctx, group, b, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	requireMutedCount(t, us, group, 2)
+
+	// Counts are per chat.
+	requireMutedCount(t, us, other, 0)
+	_, _, err = us.SetMute(ctx, other, a, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	requireMutedCount(t, us, other, 1)
+	requireMutedCount(t, us, group, 2)
 }

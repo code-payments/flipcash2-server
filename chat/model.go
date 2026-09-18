@@ -3,6 +3,7 @@ package chat
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -352,6 +353,20 @@ func (r RosterSummary) ToProto() *chatpb.RosterSummary {
 	}
 }
 
+// HasMember reports whether userID is among the record's inline Members. It is
+// a DM's membership check — a DM's members are fixed at creation and carried
+// on its canonical record, so a caller holding the record has the answer in
+// hand — and says nothing about a group, whose record carries no members
+// (see Store.GetChatByID): for a group it is always false.
+func (c *Chat) HasMember(userID *commonpb.UserId) bool {
+	for _, m := range c.Members {
+		if bytes.Equal(m.Value, userID.Value) {
+			return true
+		}
+	}
+	return false
+}
+
 // Clone returns a deep copy of the chat.
 func (c *Chat) Clone() *Chat {
 	members := make([]*commonpb.UserId, len(c.Members))
@@ -420,4 +435,137 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 		}
 	}
 	return md
+}
+
+// ErrMuteUntilOutOfRange indicates that a timed mute ends outside the range a
+// store can record (see Mute.Until).
+var ErrMuteUntilOutOfRange = errors.New("mute until is out of range")
+
+// MaxMuteUntil bounds a timed mute: Mute.Until must be strictly before it.
+// Stores encode an indefinite mute as this instant, so a timed mute reaching
+// it would read back as indefinite; rejecting the boundary keeps the two
+// distinguishable. No real mute ends in the year 9999, so nothing is lost.
+var MaxMuteUntil = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+
+// Mute is a mute a viewer set on a chat: until an instant, or until they lift
+// it themselves (Forever). While a mute is active the viewer still receives
+// the chat's pushes, flagged so the client suppresses the notification (see
+// push.v1.ChatMetadata.muted); it never affects message delivery.
+//
+// Until is meaningful only when Forever is false, and is recorded at second
+// precision: a store truncates it on write and returns the truncated value.
+// It must lie in [Unix epoch, MaxMuteUntil), else the write is rejected with
+// ErrMuteUntilOutOfRange. A timed mute past its Until has lapsed: it is still
+// recorded, and returned as stored, until replaced or cleared — nothing
+// sweeps it, and nothing is published when it lapses — so a reader decides
+// with Active, never from presence alone.
+type Mute struct {
+	Forever bool
+	Until   time.Time
+}
+
+// Active reports whether the mute is in force at now.
+func (m Mute) Active(now time.Time) bool {
+	return m.Forever || now.Before(m.Until)
+}
+
+// ToProto projects the mute onto a chatpb.MuteState.
+func (m Mute) ToProto() *chatpb.MuteState {
+	if m.Forever {
+		return &chatpb.MuteState{Duration: &chatpb.MuteState_Forever_{Forever: &chatpb.MuteState_Forever{}}}
+	}
+	return &chatpb.MuteState{Duration: &chatpb.MuteState_Until{Until: timestamppb.New(m.Until)}}
+}
+
+// MuteFromProto is the inverse of Mute.ToProto. A MuteState carrying neither
+// duration — which validation rejects before a request reaches here — reads
+// as a timed mute at the zero time, which no store records (see Mute).
+func MuteFromProto(m *chatpb.MuteState) Mute {
+	switch d := m.GetDuration().(type) {
+	case *chatpb.MuteState_Forever_:
+		return Mute{Forever: true}
+	case *chatpb.MuteState_Until:
+		return Mute{Until: d.Until.AsTime()}
+	default:
+		return Mute{}
+	}
+}
+
+// Normalize returns the mute as a store records it — Until truncated to the
+// second, in UTC, and zeroed when Forever — or ErrMuteUntilOutOfRange when
+// it cannot be recorded. Every store applies it on write, so equality of two
+// normalized mutes is what "the mute already recorded" means.
+func (m Mute) Normalize() (Mute, error) {
+	if m.Forever {
+		return Mute{Forever: true}, nil
+	}
+	until := m.Until.Truncate(time.Second)
+	if until.Unix() < 0 || !until.Before(MaxMuteUntil) {
+		return Mute{}, ErrMuteUntilOutOfRange
+	}
+	return Mute{Until: until.UTC()}, nil
+}
+
+// ViewerState is what a chat holds about one user, independent of whether
+// they are a member: state the user set for themselves (today, a mute) and a
+// version over all of it. It is private to that user and never shared with
+// other members. The record outlives membership — the version never resets
+// — but what it holds may not: a mute is cleared, best effort, when the user
+// leaves the chat (see Server.LeaveChat), so a user who returns to a group
+// starts unmuted unless that clear failed.
+//
+// Mute is the recorded mute, or nil when none is set; see Mute for what a
+// recorded mute may still mean. Version is state, not a delta: every real
+// change — a mute set, replaced or cleared — moves it by exactly one and an
+// idempotent no-op leaves it alone, so a client keeps the greater of two
+// versions and drops the rest, whatever order they arrived in. It is not the
+// roster version (see RosterSummary), which nothing here ever moves.
+type ViewerState struct {
+	Mute    *Mute
+	Version uint64
+}
+
+// MutedUsersPage is one page of a chat's muted users in user-ID order (see
+// UserStateStore.GetMutedUsersInOrder): the users, and the cursor to resume
+// after, nil once the walk is complete.
+type MutedUsersPage struct {
+	Users []*commonpb.UserId
+	Next  *commonpb.UserId
+}
+
+// ActiveMute returns the recorded mute when it is in force at now, else nil.
+func (v ViewerState) ActiveMute(now time.Time) *Mute {
+	if v.Mute == nil || !v.Mute.Active(now) {
+		return nil
+	}
+	return v.Mute
+}
+
+// ToProto projects the state onto a chatpb.ViewerState exactly as recorded:
+// the version, and under settings the mute if one is recorded, lapsed or
+// not. A version names one exact state, and every carrier of that version —
+// a response, a hydrated Metadata, a ViewerStateChanged — must agree on it,
+// which they could not if the projection depended on the clock it was made
+// at. Whether a timed mute is still in force is the reader's call against
+// its own clock (see Mute.Active); the server makes that call only where it
+// acts on it, in the push fan-out.
+func (v ViewerState) ToProto() *chatpb.ViewerState {
+	out := &chatpb.ViewerState{
+		Settings: &chatpb.ViewerState_Settings{},
+		Version:  v.Version,
+	}
+	if v.Mute != nil {
+		out.Settings.Mute = v.Mute.ToProto()
+	}
+	return out
+}
+
+// Clone returns a deep copy of the state.
+func (v ViewerState) Clone() ViewerState {
+	out := ViewerState{Version: v.Version}
+	if v.Mute != nil {
+		mute := *v.Mute
+		out.Mute = &mute
+	}
+	return out
 }

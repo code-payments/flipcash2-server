@@ -24,7 +24,7 @@ import (
 	"github.com/code-payments/flipcash2-server/chat"
 )
 
-// The chat store spans three tables:
+// The chat store spans four tables:
 //
 //	chats     pk = "chat#<id>" (one item per chat). Canonical metadata: type,
 //	          members (the DM participants; absent for groups), title, creator
@@ -61,6 +61,51 @@ import (
 //	          carry (user, joined_at) — that discipline is load-bearing: the
 //	          #meta item, and any new item type added to this table, must omit
 //	          those attributes or it leaks into the indexes.
+//
+//	chat_user_state  pk = "user#<id>", sk = "chat#<id>" (one item per (user,
+//	          chat) the user has ever set state on; see chat.UserStateStore).
+//	          What a chat holds about one user, independent of membership:
+//	          today a mute (muted_until) and the state's version. Keyed by
+//	          user so that the user's own read — their state across a page of
+//	          chats, the one they expect to reflect the mute they just set —
+//	          is a strongly consistent query on their partition, bounded to
+//	          the page's key range, rather than a key probe per chat.
+//
+//	          The chat-scoped read the push fan-out needs — who has this chat
+//	          muted right now — has two shapes, and the fan-out picks by size.
+//	          The sparse gsiByMuted on (chat, muted_until) — chat is the raw
+//	          chat ID as a binary attribute, the sk's bytes without the prefix
+//	          or hex, since an index key is never parsed and the smaller key
+//	          is copied into every index entry; muted_until is present only
+//	          while a mute is recorded — holds exactly the recorded mutes, and a
+//	          range on muted_until yields the active ones as one set, billed
+//	          by what it returns: the read for a chat few have muted. The
+//	          inverted gsiUserStateByUser on (chat, pk) orders a chat's records
+//	          by user, the same "user#<id>" order a group's membership
+//	          partition uses, so a chat most have muted is walked as two
+//	          cursors over one order, roster and records, never holding
+//	          either whole; it carries every record with the full item
+//	          projected, so any state added later is readable per chat
+//	          without a new index, and a mute is picked out by a filter. Both
+//	          are eventually consistent, which that read tolerates. An
+//	          indefinite mute is stored as muteForeverUntil so it sorts above
+//	          any "now".
+//
+//	          Which shape is cheaper is decided from a count of the chat's
+//	          recorded mutes, kept on one aggregates item per chat, pk =
+//	          "chat#<id>", sk = "#meta" (see skMeta), and moved in the same
+//	          transaction as the record whenever a mute is first recorded or
+//	          cleared — never when one is replaced, and never when a timed one
+//	          lapses, so it bounds the active mutes from above. The #meta item
+//	          carries neither chat nor muted_until, which is what keeps it out
+//	          of both indexes.
+//
+//	          Every write moves version by exactly one and fails its
+//	          condition — returning the current item — when it would be a
+//	          no-op, so the no-op path costs no second read and never creates
+//	          an item. Nothing deletes an item: a cleared mute drops
+//	          muted_until (and so its gsiByMuted entry) and keeps the record
+//	          and its version.
 const (
 	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
 	// all of a user's DM types. Superseded by gsiByTypeActivity; retained until
@@ -88,9 +133,21 @@ const (
 	// roster.
 	gsiByJoinedAt = "by_joined_at"
 
-	// chatKeyPrefix prefixes a chat ID in the chats table pk and the dm_inbox
-	// sk. The chat ID is recovered from the key, so it is not stored as its own
-	// attribute.
+	// gsiByMuted is the sparse (chat, muted_until) index on chat_user_state:
+	// the users with a mute recorded on a chat, in order of when it ends.
+	// KEYS_ONLY, since the user is in the projected pk and the query wants
+	// nothing else.
+	gsiByMuted = "by_muted"
+
+	// gsiUserStateByUser is the inverted (chat, user) index on
+	// chat_user_state: a chat's records in user order, full item projected.
+	gsiUserStateByUser = "by_user"
+
+	// chatKeyPrefix prefixes a chat ID in the chats table pk, the dm_inbox sk
+	// and the chat_user_state sk. The chat ID is recovered from the key, so it
+	// is not stored as its own attribute — except in chat_user_state, where a
+	// record also carries it raw, as the binary chat attribute that keys both
+	// of that table's indexes (see attrChat).
 	chatKeyPrefix = "chat#"
 
 	// skMeta is the sort key of a group's aggregates item in group_members.
@@ -115,6 +172,9 @@ const (
 	attrLastMessageID      = "last_message_id"
 	attrMemberCount        = "member_count" // #meta item: joined member count
 	attrVersion            = "version"
+	attrChat               = "chat"        // chat_user_state records: the raw chat ID bytes (B), keying gsiByMuted and gsiUserStateByUser
+	attrMutedUntil         = "muted_until" // chat_user_state: epoch seconds, present only while a mute is recorded — see muteForeverUntil
+	attrMutedCount         = "muted_count" // chat_user_state #meta item: records with a mute recorded
 
 	// Keys of the min_listener_balance map.
 	attrBalanceCurrency     = "currency"
@@ -178,16 +238,19 @@ type store struct {
 	chatsTable        string
 	dmInboxTable      string
 	groupMembersTable string
+	userStateTable    string
 }
 
 // NewInDynamoDB returns a chat.Store backed by the given DynamoDB tables. Use
-// CreateTables to provision them.
-func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable string) chat.Store {
+// CreateTables to provision them. The value also implements
+// chat.UserStateStore, over userStateTable.
+func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable string) chat.Store {
 	return &store{
 		client:            client,
 		chatsTable:        chatsTable,
 		dmInboxTable:      dmInboxTable,
 		groupMembersTable: groupMembersTable,
+		userStateTable:    userStateTable,
 	}
 }
 
@@ -1386,16 +1449,24 @@ func chatIDFromKey(key string) (*commonpb.ChatId, error) {
 }
 
 // userIDFromSK recovers a user ID from a group_members item's sk
-// ("user#<hex>"), the inverse of userPK.
+// ("user#<hex>"), the inverse of userPK; userIDFromPK does the same for a
+// chat_user_state item's pk.
 func userIDFromSK(item map[string]types.AttributeValue) (*commonpb.UserId, error) {
-	sk := asS(item[attrSK])
-	encoded, ok := strings.CutPrefix(sk, userKeyPrefix)
+	return userIDFromKey(asS(item[attrSK]))
+}
+
+func userIDFromPK(item map[string]types.AttributeValue) (*commonpb.UserId, error) {
+	return userIDFromKey(asS(item[attrPK]))
+}
+
+func userIDFromKey(key string) (*commonpb.UserId, error) {
+	encoded, ok := strings.CutPrefix(key, userKeyPrefix)
 	if !ok {
-		return nil, fmt.Errorf("unexpected sk %q", sk)
+		return nil, fmt.Errorf("unexpected user key %q", key)
 	}
 	id, err := hex.DecodeString(encoded)
 	if err != nil {
-		return nil, fmt.Errorf("decoding user id from sk %q: %w", sk, err)
+		return nil, fmt.Errorf("decoding user id from key %q: %w", key, err)
 	}
 	return &commonpb.UserId{Value: id}, nil
 }
@@ -1406,6 +1477,9 @@ func avB(v []byte) types.AttributeValue {
 }
 func avN(v uint64) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.FormatUint(v, 10)}
+}
+func avInt(v int64) types.AttributeValue {
+	return &types.AttributeValueMemberN{Value: strconv.FormatInt(v, 10)}
 }
 func avBool(v bool) types.AttributeValue { return &types.AttributeValueMemberBOOL{Value: v} }
 
@@ -1520,4 +1594,457 @@ func isConditionalCheckFailed(err error) bool {
 
 func protoChatType(v uint64) chatpb.ChatType {
 	return chatpb.ChatType(v)
+}
+
+// muteForeverUntil encodes an indefinite mute in muted_until: the epoch
+// seconds of chat.MaxMuteUntil, which a timed mute may not reach (see
+// chat.Mute), so the two never collide — and above any "now" the fan-out
+// will ever ask about, so the gsiByMuted range needs no second case. It is a
+// storage encoding only: nothing outside this store sees the value.
+var muteForeverUntil = uint64(chat.MaxMuteUntil.Unix())
+
+// A mute first recorded or cleared is a two-item transaction — the user's
+// record and the chat's #meta muted count — on the membership-transition
+// pattern (see maxMembershipAttempts): a lost condition retries at once from
+// the item the failure returned, and a TransactionConflict backs off. A mute
+// replaced is a single conditional update of the record alone, since the
+// count does not move.
+const maxUserStateAttempts = maxMembershipAttempts
+
+func (s *store) SetMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mute chat.Mute) (chat.ViewerState, bool, error) {
+	mute, err := mute.Normalize()
+	if err != nil {
+		return chat.ViewerState{}, false, err
+	}
+	until := muteForeverUntil
+	if !mute.Forever {
+		until = uint64(mute.Until.Unix())
+	}
+
+	// current is the record as the last failed write returned it, nil until
+	// one has: every failure hands the item back, so the loop never reads,
+	// and each attempt starts from the case the record is known to be in.
+	var current *chat.ViewerState
+	backoff := membershipBackoffBase
+	for attempt := 0; attempt < maxUserStateAttempts; attempt++ {
+		if current == nil || current.Mute != nil {
+			// Replace: a recorded mute that differs is one write of the record
+			// alone. It is also the probe when nothing is known yet — the
+			// failure returns the item, which decides between the other two
+			// cases without a read: the mute already recorded is the no-op,
+			// and none recorded is a first mute, counted below.
+			out, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+				TableName:                aws.String(s.userStateTable),
+				Key:                      userStateKey(chatID, userID),
+				UpdateExpression:         aws.String(fmt.Sprintf("SET %s = :until ADD #version :one", attrMutedUntil)),
+				ConditionExpression:      aws.String(fmt.Sprintf("attribute_exists(%s) AND %s <> :until", attrMutedUntil, attrMutedUntil)),
+				ExpressionAttributeNames: map[string]string{"#version": attrVersion},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":until": avN(until),
+					":one":   avN(1),
+				},
+				ReturnValues:                        types.ReturnValueAllNew,
+				ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+			})
+			if err == nil {
+				state, err := viewerStateFromItem(out.Attributes)
+				return state, true, err
+			}
+			var ccf *types.ConditionalCheckFailedException
+			if !errors.As(err, &ccf) {
+				return chat.ViewerState{}, false, err
+			}
+			state, err := viewerStateFromItem(ccf.Item)
+			if err != nil {
+				return chat.ViewerState{}, false, err
+			}
+			current = &state
+			if current.Mute != nil {
+				return *current, false, nil
+			}
+		}
+
+		// A first mute: record it and count it together. The record's version
+		// is compared so the state returned is exactly what was written; a
+		// record that appeared or moved meanwhile fails the condition and
+		// returns the item, and the next attempt starts from the case it is
+		// in — a mute now recorded goes back to the replace above, a record
+		// that moved and holds none comes straight back here at its new
+		// version — rather than probing again.
+		record := &types.Update{
+			TableName:                aws.String(s.userStateTable),
+			Key:                      userStateKey(chatID, userID),
+			UpdateExpression:         aws.String(fmt.Sprintf("SET %s = :chat, %s = :until ADD #version :one", attrChat, attrMutedUntil)),
+			ConditionExpression:      aws.String(fmt.Sprintf("attribute_not_exists(%s) AND (attribute_not_exists(#version) OR #version = :version)", attrMutedUntil)),
+			ExpressionAttributeNames: map[string]string{"#version": attrVersion},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":chat":    avB(chatID.Value),
+				":until":   avN(until),
+				":one":     avN(1),
+				":version": avN(current.Version),
+			},
+			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		}
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+			{Update: record},
+			{Update: s.mutedCountUpdate(chatID, 1)},
+		}})
+		if err == nil {
+			return chat.ViewerState{Mute: &mute, Version: current.Version + 1}, true, nil
+		}
+		reasons, ok := cancellationReasons(err)
+		if !ok || len(reasons) != 2 {
+			return chat.ViewerState{}, false, err
+		}
+		codes := []string{aws.ToString(reasons[0].Code), aws.ToString(reasons[1].Code)}
+		switch {
+		case codes[0] == conditionalCheckFailedCode:
+			// Lost the race to the user's own other write: go again at once
+			// from the item the failure returned.
+			state, err := viewerStateFromItem(reasons[0].Item)
+			if err != nil {
+				return chat.ViewerState{}, false, err
+			}
+			current = &state
+			continue
+		case isTransactionConflict(codes):
+			// The record was not evaluated, so what is known of it still
+			// holds; the same attempt goes again after a pause.
+			select {
+			case <-ctx.Done():
+				return chat.ViewerState{}, false, ctx.Err()
+			case <-time.After(backoff + rand.N(backoff)):
+			}
+			backoff = min(2*backoff, membershipBackoffMax)
+			continue
+		default:
+			return chat.ViewerState{}, false, err
+		}
+	}
+	return chat.ViewerState{}, false, fmt.Errorf("recording mute for user %x on chat %x: attempts exhausted", userID.Value, chatID.Value)
+}
+
+func (s *store) ClearMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, bool, error) {
+	backoff := membershipBackoffBase
+	for attempt := 0; attempt < maxUserStateAttempts; attempt++ {
+		// The record's version is compared so the state returned is exactly
+		// what was written, with no read after; the condition on muted_until
+		// is what makes no mute recorded the no-op, and keeps that no-op from
+		// upserting an item.
+		item, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName:      aws.String(s.userStateTable),
+			Key:            userStateKey(chatID, userID),
+			ConsistentRead: aws.Bool(true),
+		})
+		if err != nil {
+			return chat.ViewerState{}, false, err
+		}
+		current, err := viewerStateFromItem(item.Item)
+		if err != nil {
+			return chat.ViewerState{}, false, err
+		}
+		if current.Mute == nil {
+			return current, false, nil
+		}
+
+		record := &types.Update{
+			TableName:                aws.String(s.userStateTable),
+			Key:                      userStateKey(chatID, userID),
+			UpdateExpression:         aws.String(fmt.Sprintf("REMOVE %s ADD #version :one", attrMutedUntil)),
+			ConditionExpression:      aws.String(fmt.Sprintf("attribute_exists(%s) AND #version = :version", attrMutedUntil)),
+			ExpressionAttributeNames: map[string]string{"#version": attrVersion},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":one":     avN(1),
+				":version": avN(current.Version),
+			},
+		}
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+			{Update: record},
+			{Update: s.mutedCountUpdate(chatID, -1)},
+		}})
+		if err == nil {
+			return chat.ViewerState{Version: current.Version + 1}, true, nil
+		}
+		reasons, ok := cancellationReasons(err)
+		if !ok || len(reasons) != 2 {
+			return chat.ViewerState{}, false, err
+		}
+		codes := []string{aws.ToString(reasons[0].Code), aws.ToString(reasons[1].Code)}
+		switch {
+		case codes[0] == conditionalCheckFailedCode:
+			continue
+		case isTransactionConflict(codes):
+			select {
+			case <-ctx.Done():
+				return chat.ViewerState{}, false, ctx.Err()
+			case <-time.After(backoff + rand.N(backoff)):
+			}
+			backoff = min(2*backoff, membershipBackoffMax)
+			continue
+		default:
+			return chat.ViewerState{}, false, err
+		}
+	}
+	return chat.ViewerState{}, false, fmt.Errorf("clearing mute for user %x on chat %x: attempts exhausted", userID.Value, chatID.Value)
+}
+
+// mutedCountUpdate moves a chat's #meta muted count by delta, creating the
+// item on first use. The item carries neither chat nor muted_until, so it
+// stays out of both indexes (see gsiUserStateByUser).
+func (s *store) mutedCountUpdate(chatID *commonpb.ChatId, delta int64) *types.Update {
+	return &types.Update{
+		TableName: aws.String(s.userStateTable),
+		Key: map[string]types.AttributeValue{
+			attrPK: avS(chatPK(chatID)),
+			attrSK: avS(skMeta),
+		},
+		UpdateExpression:          aws.String(fmt.Sprintf("ADD %s :delta", attrMutedCount)),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":delta": avInt(delta)},
+	}
+}
+
+// GetMutedCount reads the chat's #meta muted count eventually consistent, at
+// half the cost of a strong read: it feeds a choice of read shape, where a
+// count one transition behind picks the same shape as the current one would
+// in every case but a tie, and either shape is correct.
+func (s *store) GetMutedCount(ctx context.Context, chatID *commonpb.ChatId) (uint64, error) {
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(s.userStateTable),
+		Key: map[string]types.AttributeValue{
+			attrPK: avS(chatPK(chatID)),
+			attrSK: avS(skMeta),
+		},
+		ProjectionExpression: aws.String(attrMutedCount),
+	})
+	if err != nil {
+		return 0, err
+	}
+	av, ok := out.Item[attrMutedCount]
+	if !ok {
+		return 0, nil
+	}
+	count, err := parseInt(av)
+	if err != nil {
+		return 0, fmt.Errorf("parsing %s: %w", attrMutedCount, err)
+	}
+	// The count is moved only alongside the record it counts, so it cannot
+	// go negative; clamp anyway rather than hand a caller a wrapped value.
+	return uint64(max(count, 0)), nil
+}
+
+// GetMutedUsersInOrder walks gsiUserStateByUser from after, in the index's
+// user order, filtering to the records whose mute is active at now. The
+// filter runs after the read, so a page is billed for every record it
+// passes over, muted or not — the shape the contract describes.
+func (s *store) GetMutedUsersInOrder(ctx context.Context, chatID *commonpb.ChatId, now time.Time, after *commonpb.UserId, limit int) (chat.MutedUsersPage, error) {
+	nowSecs := max(now.Unix(), 0)
+
+	condition := "#chat = :chat"
+	names := map[string]string{"#chat": attrChat, "#until": attrMutedUntil}
+	values := map[string]types.AttributeValue{
+		":chat": avB(chatID.Value),
+		":now":  avN(uint64(nowSecs)),
+	}
+	if after != nil {
+		condition += " AND #pk > :after"
+		names["#pk"] = attrPK
+		values[":after"] = avS(userPK(after))
+	}
+
+	page := chat.MutedUsersPage{Users: make([]*commonpb.UserId, 0)}
+	var startKey map[string]types.AttributeValue
+	for {
+		res, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                 aws.String(s.userStateTable),
+			IndexName:                 aws.String(gsiUserStateByUser),
+			KeyConditionExpression:    aws.String(condition),
+			FilterExpression:          aws.String("#until > :now"),
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
+			ExclusiveStartKey:         startKey,
+		})
+		if err != nil {
+			return chat.MutedUsersPage{}, err
+		}
+		for _, item := range res.Items {
+			userID, err := userIDFromPK(item)
+			if err != nil {
+				return chat.MutedUsersPage{}, err
+			}
+			page.Users = append(page.Users, userID)
+			if limit > 0 && len(page.Users) == limit {
+				// The walk resumes after the last user returned. Whether any
+				// record follows is unknown without reading on, so the cursor is
+				// handed out and the next page may come back empty and final.
+				page.Next = userID
+				return page, nil
+			}
+		}
+		if len(res.LastEvaluatedKey) == 0 {
+			return page, nil
+		}
+		startKey = res.LastEvaluatedKey
+	}
+}
+
+// GetViewerStates reads the user's partition, strongly consistent, bounded to
+// the sort-key range the requested chats span: every requested sk lies
+// between the least and the greatest of them, so the query cannot miss one,
+// and it skips whatever the user has set on chats outside that span. Rows
+// inside the span that were not asked for are dropped in memory. A single
+// chat is a point read instead, which is cheaper than a query of one.
+func (s *store) GetViewerStates(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.ViewerState, error) {
+	wanted := make(map[string]struct{}, len(chatIDs))
+	var lo, hi string
+	for _, chatID := range chatIDs {
+		sk := chatSK(chatID)
+		wanted[sk] = struct{}{}
+		if lo == "" || sk < lo {
+			lo = sk
+		}
+		if sk > hi {
+			hi = sk
+		}
+	}
+	out := make(map[string]chat.ViewerState, len(wanted))
+	if len(wanted) == 0 {
+		return out, nil
+	}
+
+	if len(wanted) == 1 {
+		res, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName:      aws.String(s.userStateTable),
+			Key:            userStateKey(chatIDs[0], userID),
+			ConsistentRead: aws.Bool(true),
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(res.Item) == 0 {
+			return out, nil
+		}
+		state, err := viewerStateFromItem(res.Item)
+		if err != nil {
+			return nil, err
+		}
+		out[string(chatIDs[0].Value)] = state
+		return out, nil
+	}
+
+	var startKey map[string]types.AttributeValue
+	for {
+		res, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                aws.String(s.userStateTable),
+			KeyConditionExpression:   aws.String("#pk = :pk AND #sk BETWEEN :lo AND :hi"),
+			ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#sk": attrSK},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk": avS(userPK(userID)),
+				":lo": avS(lo),
+				":hi": avS(hi),
+			},
+			ConsistentRead:    aws.Bool(true),
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range res.Items {
+			if _, ok := wanted[asS(item[attrSK])]; !ok {
+				continue
+			}
+			chatID, err := chatIDFromSK(item)
+			if err != nil {
+				return nil, err
+			}
+			state, err := viewerStateFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			out[string(chatID.Value)] = state
+		}
+		if len(res.LastEvaluatedKey) == 0 {
+			return out, nil
+		}
+		startKey = res.LastEvaluatedKey
+	}
+}
+
+// GetMutedUsers queries gsiByMuted with a key range above now, so it reads
+// only the active mutes and never touches a cleared or lapsed one. The index
+// is eventually consistent, as the contract allows.
+func (s *store) GetMutedUsers(ctx context.Context, chatID *commonpb.ChatId, now time.Time, limit int) ([]*commonpb.UserId, error) {
+	nowSecs := now.Unix()
+	if nowSecs < 0 {
+		nowSecs = 0
+	}
+
+	users := make([]*commonpb.UserId, 0)
+	var startKey map[string]types.AttributeValue
+	for {
+		input := &dynamodb.QueryInput{
+			TableName:                aws.String(s.userStateTable),
+			IndexName:                aws.String(gsiByMuted),
+			KeyConditionExpression:   aws.String("#chat = :chat AND #until > :now"),
+			ExpressionAttributeNames: map[string]string{"#chat": attrChat, "#until": attrMutedUntil},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":chat": avB(chatID.Value),
+				":now":  avN(uint64(nowSecs)),
+			},
+			ExclusiveStartKey: startKey,
+		}
+		if limit > 0 {
+			input.Limit = aws.Int32(int32(limit - len(users)))
+		}
+		res, err := s.client.Query(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range res.Items {
+			userID, err := userIDFromPK(item)
+			if err != nil {
+				return nil, err
+			}
+			users = append(users, userID)
+		}
+		if limit > 0 && len(users) >= limit {
+			return users[:limit], nil
+		}
+		if len(res.LastEvaluatedKey) == 0 {
+			return users, nil
+		}
+		startKey = res.LastEvaluatedKey
+	}
+}
+
+func userStateKey(chatID *commonpb.ChatId, userID *commonpb.UserId) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		attrPK: avS(userPK(userID)),
+		attrSK: avS(chatSK(chatID)),
+	}
+}
+
+// viewerStateFromItem decodes a chat_user_state item. A missing version reads
+// as zero and a missing muted_until as no mute; muted_until at or above
+// muteForeverUntil is the indefinite mute.
+func viewerStateFromItem(item map[string]types.AttributeValue) (chat.ViewerState, error) {
+	var state chat.ViewerState
+	if av, ok := item[attrVersion]; ok {
+		version, err := parseN(av)
+		if err != nil {
+			return chat.ViewerState{}, fmt.Errorf("parsing %s: %w", attrVersion, err)
+		}
+		state.Version = version
+	}
+	if av, ok := item[attrMutedUntil]; ok {
+		until, err := parseN(av)
+		if err != nil {
+			return chat.ViewerState{}, fmt.Errorf("parsing %s: %w", attrMutedUntil, err)
+		}
+		if until >= muteForeverUntil {
+			state.Mute = &chat.Mute{Forever: true}
+		} else {
+			state.Mute = &chat.Mute{Until: time.Unix(int64(until), 0).UTC()}
+		}
+	}
+	return state, nil
 }

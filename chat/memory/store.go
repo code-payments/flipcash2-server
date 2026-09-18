@@ -35,15 +35,27 @@ type memory struct {
 	// persistent stores do. A record written at creation is unstamped and reads
 	// as zero.
 	memberVersions map[string]map[string]uint64
+
+	// viewerStates holds each user's state per chat, keyed by user ID then
+	// chat ID, mirroring the persistent layout (see chat.UserStateStore).
+	viewerStates map[string]map[string]*chat.ViewerState
+
+	// mutedCounts is each chat's count of records with a mute recorded, keyed
+	// by chat ID, moved as the persistent stores move theirs (see
+	// chat.UserStateStore.GetMutedCount). Absent reads as zero.
+	mutedCounts map[string]uint64
 }
 
-// NewInMemory returns an in-memory chat.Store, for tests.
+// NewInMemory returns an in-memory chat.Store, for tests. The value also
+// implements chat.UserStateStore.
 func NewInMemory() chat.Store {
 	return &memory{
 		chats:          make(map[string]*chat.Chat),
 		groupMembers:   make(map[string]map[string]bool),
 		groupVersions:  make(map[string]uint64),
 		memberVersions: make(map[string]map[string]uint64),
+		viewerStates:   make(map[string]map[string]*chat.ViewerState),
+		mutedCounts:    make(map[string]uint64),
 	}
 }
 
@@ -55,6 +67,8 @@ func (m *memory) reset() {
 	m.groupMembers = make(map[string]map[string]bool)
 	m.groupVersions = make(map[string]uint64)
 	m.memberVersions = make(map[string]map[string]uint64)
+	m.viewerStates = make(map[string]map[string]*chat.ViewerState)
+	m.mutedCounts = make(map[string]uint64)
 }
 
 // stampMemberLocked records the group's current roster version on a member's
@@ -456,4 +470,120 @@ func afterCursorDesc(c *chat.Chat, cursor *chat.DmFeedCursor) bool {
 		return c.LastActivity.Before(cursor.LastActivity)
 	}
 	return bytes.Compare(c.ID.Value, cursor.ChatID.Value) < 0
+}
+
+func (m *memory) SetMute(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mute chat.Mute) (chat.ViewerState, bool, error) {
+	mute, err := mute.Normalize()
+	if err != nil {
+		return chat.ViewerState{}, false, err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	byChat := m.viewerStates[string(userID.Value)]
+	if byChat == nil {
+		byChat = make(map[string]*chat.ViewerState)
+		m.viewerStates[string(userID.Value)] = byChat
+	}
+	state := byChat[string(chatID.Value)]
+	if state == nil {
+		state = &chat.ViewerState{}
+		byChat[string(chatID.Value)] = state
+	}
+
+	// The mute already recorded: the no-op the contract promises.
+	if state.Mute != nil && *state.Mute == mute {
+		return state.Clone(), false, nil
+	}
+	// A first mute is counted; a replaced one is not.
+	if state.Mute == nil {
+		m.mutedCounts[string(chatID.Value)]++
+	}
+	state.Mute = &mute
+	state.Version++
+	return state.Clone(), true, nil
+}
+
+func (m *memory) ClearMute(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	// No record, or a record with no mute: nothing to clear, and nothing is
+	// created to say so.
+	state := m.viewerStates[string(userID.Value)][string(chatID.Value)]
+	if state == nil {
+		return chat.ViewerState{}, false, nil
+	}
+	if state.Mute == nil {
+		return state.Clone(), false, nil
+	}
+	m.mutedCounts[string(chatID.Value)]--
+	state.Mute = nil
+	state.Version++
+	return state.Clone(), true, nil
+}
+
+func (m *memory) GetViewerStates(_ context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.ViewerState, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	out := make(map[string]chat.ViewerState)
+	byChat := m.viewerStates[string(userID.Value)]
+	for _, chatID := range chatIDs {
+		if state, ok := byChat[string(chatID.Value)]; ok {
+			out[string(chatID.Value)] = state.Clone()
+		}
+	}
+	return out, nil
+}
+
+func (m *memory) GetMutedUsers(_ context.Context, chatID *commonpb.ChatId, now time.Time, limit int) ([]*commonpb.UserId, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	users := make([]*commonpb.UserId, 0)
+	for user, byChat := range m.viewerStates {
+		if limit > 0 && len(users) >= limit {
+			break
+		}
+		state := byChat[string(chatID.Value)]
+		if state == nil || state.ActiveMute(now) == nil {
+			continue
+		}
+		users = append(users, &commonpb.UserId{Value: []byte(user)})
+	}
+	return users, nil
+}
+
+func (m *memory) GetMutedUsersInOrder(_ context.Context, chatID *commonpb.ChatId, now time.Time, after *commonpb.UserId, limit int) (chat.MutedUsersPage, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	users := make([]*commonpb.UserId, 0)
+	for user, byChat := range m.viewerStates {
+		if after != nil && bytes.Compare([]byte(user), after.Value) <= 0 {
+			continue
+		}
+		state := byChat[string(chatID.Value)]
+		if state == nil || state.ActiveMute(now) == nil {
+			continue
+		}
+		users = append(users, &commonpb.UserId{Value: []byte(user)})
+	}
+	sort.Slice(users, func(i, j int) bool { return bytes.Compare(users[i].Value, users[j].Value) < 0 })
+
+	page := chat.MutedUsersPage{Users: users}
+	if limit > 0 && len(users) >= limit {
+		page.Users = users[:limit]
+		page.Next = users[limit-1]
+	}
+	return page, nil
+}
+
+func (m *memory) GetMutedCount(_ context.Context, chatID *commonpb.ChatId) (uint64, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	return m.mutedCounts[string(chatID.Value)], nil
 }

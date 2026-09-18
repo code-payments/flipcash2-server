@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/chat/cache"
+	"github.com/code-payments/flipcash2-server/chat/memory"
 	"github.com/code-payments/flipcash2-server/model"
 )
 
@@ -332,4 +334,60 @@ func generateDmChatID() *commonpb.ChatId {
 		panic(err)
 	}
 	return &commonpb.ChatId{Value: b}
+}
+
+// TestCache_UserState_PassesThrough: the cached value is a chat.UserStateStore
+// over the backing store's, uncached — a mute set through it is read back
+// through it — and refuses every call when the backing store is not one.
+func TestCache_UserState_PassesThrough(t *testing.T) {
+	ctx := context.Background()
+	user := model.MustGenerateUserID()
+	chatID := generateDmChatID()
+
+	c := cache.NewInCache(memory.NewInMemory())
+	us, ok := c.(chat.UserStateStore)
+	require.True(t, ok, "cache must implement chat.UserStateStore over a store that does")
+
+	state, changed, err := us.SetMute(ctx, chatID, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, chat.ViewerState{Mute: &chat.Mute{Forever: true}, Version: 1}, state)
+
+	states, err := us.GetViewerStates(ctx, user, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	require.Equal(t, map[string]chat.ViewerState{string(chatID.Value): state}, states)
+
+	muted, err := us.GetMutedUsers(ctx, chatID, time.Now(), 0)
+	require.NoError(t, err)
+	require.Len(t, muted, 1)
+	require.Equal(t, user.Value, muted[0].Value)
+
+	page, err := us.GetMutedUsersInOrder(ctx, chatID, time.Now(), nil, 0)
+	require.NoError(t, err)
+	require.Len(t, page.Users, 1)
+
+	count, err := us.GetMutedCount(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), count)
+
+	state, changed, err = us.ClearMute(ctx, chatID, user)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, chat.ViewerState{Version: 2}, state)
+
+	// A backing store without user state: every call is refused, none panics.
+	bare, ok := cache.NewInCache(&countingStore{}).(chat.UserStateStore)
+	require.True(t, ok)
+	_, _, err = bare.SetMute(ctx, chatID, user, chat.Mute{Forever: true})
+	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
+	_, _, err = bare.ClearMute(ctx, chatID, user)
+	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
+	_, err = bare.GetViewerStates(ctx, user, []*commonpb.ChatId{chatID})
+	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
+	_, err = bare.GetMutedUsers(ctx, chatID, time.Now(), 0)
+	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
+	_, err = bare.GetMutedUsersInOrder(ctx, chatID, time.Now(), nil, 0)
+	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
+	_, err = bare.GetMutedCount(ctx, chatID)
+	require.ErrorIs(t, err, cache.ErrUserStateUnsupported)
 }

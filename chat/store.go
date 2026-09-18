@@ -249,3 +249,72 @@ type Store interface {
 	// members is empty and the caller reads GetMembers itself.
 	AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (advanced bool, members []*commonpb.UserId, err error)
 }
+
+// UserStateStore persists ViewerState: one record per (user, chat), written
+// only by that user's own actions and read back only to them — plus one
+// chat-scoped read, GetMutedUsers, that serves the push fan-out.
+//
+// Records are sparse: nothing is written when a chat is created or joined, a
+// record appears on the user's first write, and nothing removes it — a
+// cleared mute leaves the record and its version behind. The store knows
+// nothing of membership: a departure clears a mute only because the leave
+// handler calls ClearMute (see Server.LeaveChat), and whether the user may
+// act on the chat is likewise the caller's gate. Every write is conditional
+// — a single update, or one transaction where a store keeps an aggregate
+// alongside the record — and moves Version by exactly one on a real change
+// and not at all on a no-op, so a retried or duplicated request is harmless.
+//
+// Chat IDs of both families are accepted; the record does not care which.
+type UserStateStore interface {
+	// SetMute records mute as userID's mute on chatID, replacing any mute
+	// already set, and returns the state after the write. changed reports
+	// whether anything moved: recording the mute already recorded (after
+	// Mute.Normalize) is a no-op that returns the current state at its
+	// current version. It returns ErrMuteUntilOutOfRange for a timed mute
+	// outside the recordable range (see Mute).
+	SetMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mute Mute) (state ViewerState, changed bool, err error)
+
+	// ClearMute removes userID's mute on chatID, lapsed or not, and returns
+	// the state after the write. Clearing when no mute is recorded is a no-op
+	// that returns the current state — the zero state when the user has no
+	// record, which the no-op does not create.
+	ClearMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (state ViewerState, changed bool, err error)
+
+	// GetViewerStates returns userID's state on each of chatIDs that they have
+	// a record on, keyed by string(chatID.Value); a chat with no record is
+	// absent rather than reported, and duplicate IDs collapse. The read is
+	// strongly consistent: it reflects every write that completed before it,
+	// so the user who just muted sees the mute. An empty chatIDs is an empty
+	// result, not an error.
+	GetViewerStates(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]ViewerState, error)
+
+	// GetMutedUsers returns the users whose mute on chatID is active at now
+	// (see Mute.Active), at most limit of them when limit is positive; which
+	// users are omitted when the limit truncates is unspecified, and the
+	// order is arbitrary. It reads only the recorded mutes, so it is the
+	// cheaper read for a chat few have muted; see GetMutedCount for choosing.
+	// The read may lag a write by a moment — it is the fan-out's read, where
+	// a mute that lands during a send is tolerated, and the flag it feeds is
+	// best-effort by contract — and a caller that needs a user's own current
+	// state reads GetViewerStates instead.
+	GetMutedUsers(ctx context.Context, chatID *commonpb.ChatId, now time.Time, limit int) ([]*commonpb.UserId, error)
+
+	// GetMutedUsersInOrder is GetMutedUsers as a walk: the users whose mute
+	// on chatID is active at now, in ascending user-ID order, strictly after
+	// the after cursor (nil starts at the beginning), at most limit of them
+	// (limit <= 0 means unbounded). The order is the one Store.GetMembers
+	// enumerates a group's roster in, so a caller can advance both as
+	// cursors over one order and never hold either whole; that is the read
+	// for a chat most have muted. It reads every record the chat's users
+	// hold, muted or not, and consistency is as for GetMutedUsers.
+	GetMutedUsersInOrder(ctx context.Context, chatID *commonpb.ChatId, now time.Time, after *commonpb.UserId, limit int) (MutedUsersPage, error)
+
+	// GetMutedCount returns how many users have a mute recorded on chatID:
+	// moved with every mute first recorded or cleared, never by a replaced
+	// mute or a timed one lapsing, so it bounds the active mutes from above.
+	// It is what a fan-out compares against the roster size to choose
+	// between GetMutedUsers and GetMutedUsersInOrder, and is read for that
+	// alone: like them, it may lag a write by a moment, which a choice of
+	// shape tolerates. A chat nobody has muted reads as zero.
+	GetMutedCount(ctx context.Context, chatID *commonpb.ChatId) (uint64, error)
+}

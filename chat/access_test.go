@@ -316,6 +316,63 @@ func TestAccess_CanListenWithRules(t *testing.T) {
 	require.True(t, ok)
 }
 
+// TestAccess_WithChat pins what a caller holding the canonical record saves:
+// a DM's standing and membership are answered off the record's inline
+// members with no store read at all, while a group's membership is still the
+// store's, and its rules come off the record as for StandingWithRules.
+func TestAccess_WithChat(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	a := NewAccess(f.chats, f.rules)
+
+	peer := model.MustGenerateUserID()
+	third := model.MustGenerateUserID()
+	dm := &Chat{ID: MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, f.funded, peer), Type: chatpb.ChatType_CONTACT_DM, Members: []*commonpb.UserId{f.funded, peer}}
+
+	// The record alone decides a DM, whatever the membership store says: the
+	// store is never asked. Neither the fixture's store nor its rules see a
+	// read.
+	reads, membershipReads := f.chats.reads, f.chats.membershipReads
+	for _, u := range []*commonpb.UserId{f.funded, peer} {
+		ok, err := a.IsMemberWithChat(ctx, dm, u)
+		require.NoError(t, err)
+		require.True(t, ok)
+		standing, err := a.StandingWithChat(ctx, dm, u, messagingpb.ViewMode_FULL)
+		require.NoError(t, err)
+		require.Equal(t, memberStanding, standing)
+	}
+	ok, err := a.IsMemberWithChat(ctx, dm, third)
+	require.NoError(t, err)
+	require.False(t, ok)
+	standing, err := a.StandingWithChat(ctx, dm, third, messagingpb.ViewMode_FULL_OR_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, Standing{}, standing)
+	require.Equal(t, reads, f.chats.reads)
+	require.Equal(t, membershipReads, f.chats.membershipReads)
+
+	// A group's record carries no members, so its membership is the store's
+	// — one read per question — and a member is a member whatever the rules
+	// say of them.
+	f.chats.join(f.gated.ID, f.unfunded)
+	membershipReads = f.chats.membershipReads
+	ok, err = a.IsMemberWithChat(ctx, f.gated, f.unfunded)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, membershipReads+1, f.chats.membershipReads)
+	standing, err = a.StandingWithChat(ctx, f.gated, f.unfunded, messagingpb.ViewMode_FULL)
+	require.NoError(t, err)
+	require.Equal(t, memberStanding, standing)
+	require.Equal(t, membershipReads+2, f.chats.membershipReads)
+
+	// A group non-member is judged by the rules off the record, not the
+	// store's copy of them.
+	reads = f.chats.reads
+	standing, err = a.StandingWithChat(ctx, f.gated, f.funded, messagingpb.ViewMode_FULL)
+	require.NoError(t, err)
+	require.Equal(t, Standing{CanListen: true, CanPreview: true}, standing)
+	require.Equal(t, reads, f.chats.reads)
+}
+
 func TestAccess_Errors(t *testing.T) {
 	ctx := context.Background()
 	f := newAccessFixture(t)

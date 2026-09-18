@@ -645,13 +645,13 @@ func (s *Server) attachSession(ctx context.Context, session *streamSession, chat
 	if err != nil {
 		session.rollback(chatKey, version)
 		if !errors.Is(err, cluster.ErrSubscriptionsDraining) {
-			s.log.With(zap.Error(err), zap.String("chat_id", hex.EncodeToString(chatID.GetValue()))).Warn("Failure registering stream subscription for joined chat")
+			s.log.With(zap.Error(err), zap.String("chat_id", model.ChatIDString(chatID))).Warn("Failure registering stream subscription for joined chat")
 		}
 		return false, err
 	}
 	if !session.setHandle(chatKey, handle) {
 		if err := handle.Close(ctx); err != nil {
-			s.log.With(zap.Error(err), zap.String("chat_id", hex.EncodeToString(chatID.GetValue()))).Warn("Failed to close orphaned stream subscription")
+			s.log.With(zap.Error(err), zap.String("chat_id", model.ChatIDString(chatID))).Warn("Failed to close orphaned stream subscription")
 		}
 	}
 	return true, nil

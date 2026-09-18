@@ -3,7 +3,6 @@ package event
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"errors"
 	"time"
 
@@ -19,6 +18,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/cluster"
+	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/redact"
 )
 
@@ -124,7 +124,7 @@ func (s *Server) chatStanding(ctx context.Context, chatID *commonpb.ChatId, user
 	if err != nil {
 		return chat.Standing{}, err
 	}
-	return s.access.StandingWithRules(ctx, c.ID, c.Rules(), userID, mode)
+	return s.access.StandingWithChat(ctx, c, userID, mode)
 }
 
 // streamChatPreview serves a preview of one group chat (see chatPreview): it
@@ -135,7 +135,7 @@ func (s *Server) streamChatPreview(ctx context.Context, log *zap.Logger, stream 
 	chatID, mode := params.GetChatId(), params.GetViewMode()
 
 	log = log.With(
-		zap.String("chat_id", hex.EncodeToString(chatID.GetValue())),
+		zap.String("chat_id", model.ChatIDString(chatID)),
 		zap.String("view_mode", mode.String()),
 	)
 

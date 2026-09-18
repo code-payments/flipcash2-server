@@ -199,7 +199,34 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 		s.publishRosterUpdate(req.ChatId, userID, update, update)
 	}
 
+	// A departure clears the caller's mute (see clearMuteOnLeave). It runs
+	// whether or not the roster moved: a repeated leave is the retry that
+	// repairs a clear the first one failed.
+	s.clearMuteOnLeave(ctx, log, req.ChatId, userID)
+
 	return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_OK}, nil
+}
+
+// clearMuteOnLeave clears the caller's mute on a chat they have just left, as
+// the proto promises: a mute is a member's setting on a chat they are in, and
+// a user who returns later starts unmuted. It is best effort, after the
+// departure has landed: the roster is the record of the leave, and a mute
+// left behind costs the returning member one unmute (they see it on the
+// chat's viewer_state, since a departed member's state is still theirs to
+// read), while failing the RPC would tell them they had not left. A failure
+// is logged and the response is unchanged. A clear that moves the state is
+// published to the caller's other devices exactly as UnmuteChat publishes
+// one; a departed member has no mute to clear in the common case, and that
+// no-op costs one read and publishes nothing.
+func (s *Server) clearMuteOnLeave(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) {
+	state, changed, err := s.userState.ClearMute(ctx, chatID, userID)
+	if err != nil {
+		log.With(zap.Error(err), zap.String("chat_id", model.ChatIDString(chatID))).Warn("Failure clearing mute on leave")
+		return
+	}
+	if changed {
+		s.publishViewerStateChanged(userID, chatID, state)
+	}
 }
 
 // requireStaffForGroupManagementRPC reports whether userID passes the staff

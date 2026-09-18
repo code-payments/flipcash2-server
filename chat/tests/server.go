@@ -96,6 +96,12 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_StartChat_InvalidRules,
 		testServer_StartChat_RulesNotSatisfied,
 		testServer_StartChat_WithRules,
+		testServer_MuteChat_Lifecycle,
+		testServer_MuteChat_Group,
+		testServer_MuteChat_Gates,
+		testServer_LeaveChat_ClearsMute,
+		testServer_GetChat_ViewerState_LapsedMuteReturned,
+		testServer_GetDmChatFeed_ViewerState,
 	} {
 		tf(t, s)
 		teardown()
@@ -149,7 +155,9 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 	media := newFakeMedia()
 	moderator := &fakeModerator{}
 	access := chat.NewAccess(s, chat.NewRuleEvaluator(accounts, balances, s))
-	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, access, userBus, chatBus, false)
+	userState, ok := s.(chat.UserStateStore)
+	require.True(t, ok, "chat.Store implementation must also implement chat.UserStateStore")
+	server := chat.NewServer(log, authz, accounts, blocklist, s, userState, media, messaging, moderator, profiles, access, userBus, chatBus, false)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
@@ -2589,4 +2597,353 @@ func testServer_StartChat_WithRules(t *testing.T, s chat.Store) {
 	isMember, err := s.IsMember(e.ctx, resp.Chat.ChatId, stranger)
 	require.NoError(t, err)
 	require.False(t, isMember)
+}
+
+func (e *serverEnv) muteChat(keys model.KeyPair, chatID *commonpb.ChatId, mute *chatpb.MuteState) (*chatpb.MuteChatResponse, error) {
+	req := &chatpb.MuteChatRequest{ChatId: chatID, Mute: mute}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.MuteChat(e.ctx, req)
+}
+
+func (e *serverEnv) mustMuteChat(keys model.KeyPair, chatID *commonpb.ChatId, mute *chatpb.MuteState) *chatpb.MuteChatResponse {
+	resp, err := e.muteChat(keys, chatID, mute)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) unmuteChat(keys model.KeyPair, chatID *commonpb.ChatId) (*chatpb.UnmuteChatResponse, error) {
+	req := &chatpb.UnmuteChatRequest{ChatId: chatID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.UnmuteChat(e.ctx, req)
+}
+
+func (e *serverEnv) mustUnmuteChat(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.UnmuteChatResponse {
+	resp, err := e.unmuteChat(keys, chatID)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func muteUntil(until time.Time) *chatpb.MuteState {
+	return &chatpb.MuteState{Duration: &chatpb.MuteState_Until{Until: timestamppb.New(until)}}
+}
+
+func muteForever() *chatpb.MuteState {
+	return &chatpb.MuteState{Duration: &chatpb.MuteState_Forever_{Forever: &chatpb.MuteState_Forever{}}}
+}
+
+// viewerStateUpdatesOnUserTopic returns every ViewerStateChanged for chatID
+// published on userID's topic, in publish order.
+func (e *serverEnv) viewerStateUpdatesOnUserTopic(userID *commonpb.UserId, chatID *commonpb.ChatId) []*chatpb.ViewerState {
+	var states []*chatpb.ViewerState
+	for _, ev := range e.userObserver.GetEvents(func(k *commonpb.UserId) bool { return bytes.Equal(k.Value, userID.Value) }) {
+		update := ev.Event.GetChatUpdate()
+		if !bytes.Equal(update.GetChat().GetValue(), chatID.Value) {
+			continue
+		}
+		for _, md := range update.GetMetadataUpdates() {
+			if changed := md.GetViewerStateChanged(); changed != nil {
+				states = append(states, changed.GetViewerState())
+			}
+		}
+	}
+	return states
+}
+
+// waitForViewerStateUpdates waits for at least n ViewerStateChanged for chatID
+// on userID's topic, then asserts, after giving the bus a moment more, that no
+// more than n arrived and that the chat's own topic carried none: the state is
+// the user's alone.
+func (e *serverEnv) waitForViewerStateUpdates(userID *commonpb.UserId, chatID *commonpb.ChatId, n int) []*chatpb.ViewerState {
+	e.userObserver.WaitFor(e.t, func([]*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
+		return len(e.viewerStateUpdatesOnUserTopic(userID, chatID)) >= n
+	})
+	time.Sleep(100 * time.Millisecond)
+	states := e.viewerStateUpdatesOnUserTopic(userID, chatID)
+	require.Len(e.t, states, n)
+	for _, ev := range e.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, chatID.Value) }) {
+		for _, md := range ev.Event.Event.GetChatUpdate().GetMetadataUpdates() {
+			require.Nil(e.t, md.GetViewerStateChanged(), "viewer state must never be published on the chat topic")
+		}
+	}
+	return states
+}
+
+func testServer_MuteChat_Lifecycle(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	peer, _ := e.addUser()
+	chatID := e.putDMWithPeer(chatpb.ChatType_CONTACT_DM, peer, at(1))
+
+	// A chat the viewer has never touched carries no viewer state at all.
+	resp := e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Nil(t, resp.Metadata.ViewerState)
+
+	// A timed mute, recorded at second precision, is a first transition. The
+	// end is chosen on a whole second so the sub-second variant below lands
+	// on the same recorded value.
+	until := time.Now().Add(time.Hour).Truncate(time.Second)
+	muted := e.mustMuteChat(e.keys, chatID, muteUntil(until))
+	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
+	want := &chatpb.ViewerState{
+		Settings: &chatpb.ViewerState_Settings{Mute: muteUntil(until)},
+		Version:  1,
+	}
+	require.NoError(t, protoutil.ProtoEqualError(want, muted.ViewerState))
+
+	// The same state is what a read hydrates onto the chat...
+	resp = e.getChat(e.keys, chatID)
+	require.NoError(t, protoutil.ProtoEqualError(want, resp.Metadata.ViewerState))
+
+	// ...and what the caller's other devices are told, once.
+	states := e.waitForViewerStateUpdates(e.userID, chatID, 1)
+	require.NoError(t, protoutil.ProtoEqualError(want, states[0]))
+
+	// The mute already recorded is a no-op: same state, same version, and
+	// nothing published.
+	muted = e.mustMuteChat(e.keys, chatID, muteUntil(until.Add(500*time.Millisecond)))
+	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
+	require.NoError(t, protoutil.ProtoEqualError(want, muted.ViewerState))
+	e.waitForViewerStateUpdates(e.userID, chatID, 1)
+
+	// Indefinite where timed was is a real change.
+	muted = e.mustMuteChat(e.keys, chatID, muteForever())
+	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
+	want = &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{Mute: muteForever()}, Version: 2}
+	require.NoError(t, protoutil.ProtoEqualError(want, muted.ViewerState))
+	states = e.waitForViewerStateUpdates(e.userID, chatID, 2)
+	require.NoError(t, protoutil.ProtoEqualError(want, states[1]))
+
+	// A clear keeps the record and its version, with no mute under settings.
+	unmuted := e.mustUnmuteChat(e.keys, chatID)
+	require.Equal(t, chatpb.UnmuteChatResponse_OK, unmuted.Result)
+	want = &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{}, Version: 3}
+	require.NoError(t, protoutil.ProtoEqualError(want, unmuted.ViewerState))
+	resp = e.getChat(e.keys, chatID)
+	require.NoError(t, protoutil.ProtoEqualError(want, resp.Metadata.ViewerState))
+	states = e.waitForViewerStateUpdates(e.userID, chatID, 3)
+	require.NoError(t, protoutil.ProtoEqualError(want, states[2]))
+
+	// Clearing again is the no-op.
+	unmuted = e.mustUnmuteChat(e.keys, chatID)
+	require.Equal(t, chatpb.UnmuteChatResponse_OK, unmuted.Result)
+	require.NoError(t, protoutil.ProtoEqualError(want, unmuted.ViewerState))
+	e.waitForViewerStateUpdates(e.userID, chatID, 3)
+
+	// The peer is told none of it.
+	require.Empty(t, e.viewerStateUpdatesOnUserTopic(peer, chatID))
+}
+
+// testServer_MuteChat_Group is the lifecycle on a group: a member's mute is
+// recorded, hydrated onto GetChat and the group feed for them alone — another
+// member reads the same group with no viewer state, and is told nothing —
+// and cleared like a DM's.
+func testServer_MuteChat_Group(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	otherID, otherKeys := e.addUser()
+	muted := e.putGroup("Muted", at(2), otherID)
+	quiet := e.putGroup("Quiet", at(1), otherID)
+
+	resp := e.getChat(e.keys, muted)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Nil(t, resp.Metadata.ViewerState)
+
+	until := time.Now().Add(time.Hour).Truncate(time.Second)
+	mutedResp := e.mustMuteChat(e.keys, muted, muteUntil(until))
+	require.Equal(t, chatpb.MuteChatResponse_OK, mutedResp.Result)
+	want := &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{Mute: muteUntil(until)}, Version: 1}
+	require.NoError(t, protoutil.ProtoEqualError(want, mutedResp.ViewerState))
+
+	// Hydrated onto the record for the viewer who set it...
+	resp = e.getChat(e.keys, muted)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(want, resp.Metadata.ViewerState))
+
+	// ...and onto the group feed, on that group alone.
+	feed := e.mustGetGroupFeed(&commonpb.QueryOptions{})
+	require.Len(t, feed.Chats, 2)
+	byID := make(map[string]*chatpb.Metadata, len(feed.Chats))
+	for _, md := range feed.Chats {
+		byID[string(md.ChatId.Value)] = md
+	}
+	require.NoError(t, protoutil.ProtoEqualError(want, byID[string(muted.Value)].ViewerState))
+	require.Nil(t, byID[string(quiet.Value)].ViewerState)
+
+	// The other member reads the same group with no state on it, and hears
+	// nothing on their topic; the chat topic carries nothing either.
+	resp = e.getChat(otherKeys, muted)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Nil(t, resp.Metadata.ViewerState)
+	states := e.waitForViewerStateUpdates(e.userID, muted, 1)
+	require.NoError(t, protoutil.ProtoEqualError(want, states[0]))
+	require.Empty(t, e.viewerStateUpdatesOnUserTopic(otherID, muted))
+
+	// Replace, then clear, as on a DM.
+	mutedResp = e.mustMuteChat(e.keys, muted, muteForever())
+	require.Equal(t, chatpb.MuteChatResponse_OK, mutedResp.Result)
+	want = &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{Mute: muteForever()}, Version: 2}
+	require.NoError(t, protoutil.ProtoEqualError(want, mutedResp.ViewerState))
+
+	unmuted := e.mustUnmuteChat(e.keys, muted)
+	require.Equal(t, chatpb.UnmuteChatResponse_OK, unmuted.Result)
+	want = &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{}, Version: 3}
+	require.NoError(t, protoutil.ProtoEqualError(want, unmuted.ViewerState))
+	resp = e.getChat(e.keys, muted)
+	require.NoError(t, protoutil.ProtoEqualError(want, resp.Metadata.ViewerState))
+	states = e.waitForViewerStateUpdates(e.userID, muted, 3)
+	require.NoError(t, protoutil.ProtoEqualError(want, states[2]))
+	require.Empty(t, e.viewerStateUpdatesOnUserTopic(otherID, muted))
+}
+
+func testServer_MuteChat_Gates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	future := muteUntil(time.Now().Add(time.Hour))
+
+	// A chat that does not exist.
+	resp, err := e.muteChat(e.keys, generateDmChatID(), future)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.MuteChatResponse_NOT_FOUND, resp.Result)
+	unmuteResp, err := e.unmuteChat(e.keys, generateDmChatID())
+	require.NoError(t, err)
+	require.Equal(t, chatpb.UnmuteChatResponse_NOT_FOUND, unmuteResp.Result)
+
+	// A DM between two other users.
+	a := model.MustGenerateUserID()
+	b := model.MustGenerateUserID()
+	othersDM := generateDmChatID()
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{ID: othersDM, Type: chatpb.ChatType_CONTACT_DM, Members: []*commonpb.UserId{a, b}, LastActivity: at(1)}))
+	resp, err = e.muteChat(e.keys, othersDM, future)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.MuteChatResponse_DENIED, resp.Result)
+	unmuteResp, err = e.unmuteChat(e.keys, othersDM)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.UnmuteChatResponse_DENIED, unmuteResp.Result)
+
+	// A group the caller is not a member of — even one they could read.
+	group := e.putGroup("Open", at(1))
+	strangerID, strangerKeys := e.addUser()
+	resp, err = e.muteChat(strangerKeys, group, future)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.MuteChatResponse_DENIED, resp.Result)
+	unmuteResp, err = e.unmuteChat(strangerKeys, group)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.UnmuteChatResponse_DENIED, unmuteResp.Result)
+
+	// A member of it may.
+	e.mustJoinChat(strangerKeys, group)
+	resp, err = e.muteChat(strangerKeys, group, future)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.MuteChatResponse_OK, resp.Result)
+	e.waitForViewerStateUpdates(strangerID, group, 1)
+
+	// A timed mute must end in the future; one at the boundary of the
+	// recordable range is rejected too. Neither leaves a record behind.
+	dm := e.putDM(at(1))
+	for _, mute := range []*chatpb.MuteState{
+		muteUntil(time.Now().Add(-time.Second)),
+		muteUntil(time.Time{}),
+		muteUntil(chat.MaxMuteUntil),
+		{},
+		nil,
+	} {
+		_, err := e.muteChat(e.keys, dm, mute)
+		require.Error(t, err)
+		require.Equal(t, codes.InvalidArgument, status.Code(err), "mute %v", mute)
+	}
+	got := e.getChat(e.keys, dm)
+	require.Nil(t, got.Metadata.ViewerState)
+}
+
+func testServer_LeaveChat_ClearsMute(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	other := model.MustGenerateUserID()
+	chatID := e.putGroup("Group", at(1), other)
+
+	muted := e.mustMuteChat(e.keys, chatID, muteForever())
+	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
+	e.waitForViewerStateUpdates(e.userID, chatID, 1)
+
+	// Leaving clears the mute: the record and its version stay, the mute is
+	// gone, and the caller's other devices are told — a second transition on
+	// the user topic, none on the chat topic, alongside the roster update.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	cleared := &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{}, Version: 2}
+	states := e.waitForViewerStateUpdates(e.userID, chatID, 2)
+	require.NoError(t, protoutil.ProtoEqualError(cleared, states[1]))
+
+	// A departed member reads the group's record with their own state on it.
+	resp := e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Empty(t, resp.Metadata.Members)
+	require.NoError(t, protoutil.ProtoEqualError(cleared, resp.Metadata.ViewerState))
+
+	// A departed member cannot mute or unmute.
+	denied, err := e.muteChat(e.keys, chatID, muteForever())
+	require.NoError(t, err)
+	require.Equal(t, chatpb.MuteChatResponse_DENIED, denied.Result)
+	deniedUnmute, err := e.unmuteChat(e.keys, chatID)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.UnmuteChatResponse_DENIED, deniedUnmute.Result)
+
+	// Leaving again — a roster no-op — finds nothing to clear and publishes
+	// nothing.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	e.waitForViewerStateUpdates(e.userID, chatID, 2)
+
+	// Rejoining starts unmuted, at the version the clear left.
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, chatID).Result)
+	resp = e.getChat(e.keys, chatID)
+	require.NoError(t, protoutil.ProtoEqualError(cleared, resp.Metadata.ViewerState))
+
+	// A leave with no mute recorded at all touches nothing.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	e.waitForViewerStateUpdates(e.userID, chatID, 2)
+}
+
+// testServer_GetChat_ViewerState_LapsedMuteReturned lets a short mute lapse and
+// reads the chat again: the record comes back exactly as written, the past
+// end included, because a version names one state and the clock is the
+// reader's to apply.
+func testServer_GetChat_ViewerState_LapsedMuteReturned(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	chatID := e.putDM(at(1))
+
+	until := time.Now().Add(time.Second).Truncate(time.Second)
+	muted := e.mustMuteChat(e.keys, chatID, muteUntil(until))
+	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
+	want := &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{Mute: muteUntil(until)}, Version: 1}
+	require.NoError(t, protoutil.ProtoEqualError(want, muted.ViewerState))
+
+	time.Sleep(1500 * time.Millisecond)
+
+	resp := e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(want, resp.Metadata.ViewerState))
+
+	// Lapsed is still recorded: clearing it is a real transition.
+	unmuted := e.mustUnmuteChat(e.keys, chatID)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{}, Version: 2}, unmuted.ViewerState))
+}
+
+func testServer_GetDmChatFeed_ViewerState(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	mutedDM := e.putDM(at(1))
+	quietDM := e.putDM(at(2))
+	require.Equal(t, chatpb.MuteChatResponse_OK, e.mustMuteChat(e.keys, mutedDM, muteForever()).Result)
+
+	resp := e.getDmFeed(&commonpb.QueryOptions{})
+	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, resp.Result)
+	require.Len(t, resp.Chats, 2)
+	byID := make(map[string]*chatpb.Metadata, len(resp.Chats))
+	for _, md := range resp.Chats {
+		byID[string(md.ChatId.Value)] = md
+	}
+	want := &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{Mute: muteForever()}, Version: 1}
+	require.NoError(t, protoutil.ProtoEqualError(want, byID[string(mutedDM.Value)].ViewerState))
+	require.Nil(t, byID[string(quietDM.Value)].ViewerState)
 }

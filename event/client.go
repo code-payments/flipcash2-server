@@ -2,7 +2,6 @@ package event
 
 import (
 	"context"
-	"encoding/hex"
 	stderrors "errors"
 	"sync"
 	"time"
@@ -128,7 +127,7 @@ func (f *eventForwarder) ForwardChatEvents(ctx context.Context, events ...*event
 func (f *eventForwarder) fanOutChatEvent(ctx context.Context, event *eventpb.ChatEvent) {
 	log := f.log.With(
 		zap.String("event_id", model.EventIDString(event.Event.Id)),
-		zap.String("chat_id", hex.EncodeToString(event.ChatId.GetValue())),
+		zap.String("chat_id", model.ChatIDString(event.ChatId)),
 	)
 
 	// One resolution covers the whole chat, no matter how many members it

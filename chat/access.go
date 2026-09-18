@@ -235,7 +235,7 @@ func (a *Access) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId
 // blurred never pays a valuation for it. The standing is zero, not an error,
 // for a chat that does not exist.
 func (a *Access) Standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (Standing, error) {
-	return a.standing(ctx, chatID, userID, mode, func(ctx context.Context) (*chatpb.Rules, error) {
+	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(ctx context.Context) (*chatpb.Rules, error) {
 		return a.chats.GetGroupRules(ctx, chatID)
 	})
 }
@@ -247,18 +247,58 @@ func (a *Access) Standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 // everything else. A nil rules is a chat with none, which admits no
 // non-member in any form (see Access). On error the standing is zero.
 func (a *Access) StandingWithRules(ctx context.Context, chatID *commonpb.ChatId, rules *chatpb.Rules, userID *commonpb.UserId, mode messagingpb.ViewMode) (Standing, error) {
-	return a.standing(ctx, chatID, userID, mode, func(context.Context) (*chatpb.Rules, error) {
+	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(context.Context) (*chatpb.Rules, error) {
 		return rules, nil
 	})
 }
 
-// standing is the shared shape of Standing and StandingWithRules: membership,
-// then for a non-member of a group only, the remembered or freshly evaluated
-// listener rules. loadRules supplies the group's rules — from the store, or
-// off a record the caller holds — and is called only when they decide the
-// answer; ErrChatNotFound from it is a plain refusal.
-func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode, loadRules func(context.Context) (*chatpb.Rules, error)) (Standing, error) {
-	isMember, err := a.chats.IsMember(ctx, chatID, userID)
+// StandingWithChat is Standing for a caller already holding the chat's
+// canonical record, which decides all it can before the store is asked
+// again: a DM's membership is read off the record's inline members (see
+// Chat.HasMember), so a DM costs no membership read at all, and a group's
+// rules come off the record as for StandingWithRules. A group's membership
+// is not on its record and is read from the store, strongly consistent, as
+// every gate reads it. The chat is taken as existing, as a caller holding
+// its record has established.
+func (a *Access) StandingWithChat(ctx context.Context, c *Chat, userID *commonpb.UserId, mode messagingpb.ViewMode) (Standing, error) {
+	return a.standing(ctx, c.ID, userID, mode, a.recordMembership(c, userID), func(context.Context) (*chatpb.Rules, error) {
+		return c.Rules(), nil
+	})
+}
+
+// IsMemberWithChat is IsMember for a caller already holding the chat's
+// canonical record: a DM is answered off the record, a group from the store
+// (see StandingWithChat).
+func (a *Access) IsMemberWithChat(ctx context.Context, c *Chat, userID *commonpb.UserId) (bool, error) {
+	return a.recordMembership(c, userID)(ctx)
+}
+
+// storedMembership is the membership read every standing makes unless the
+// caller can answer it itself: the store's, strongly consistent.
+func (a *Access) storedMembership(chatID *commonpb.ChatId, userID *commonpb.UserId) func(context.Context) (bool, error) {
+	return func(ctx context.Context) (bool, error) {
+		return a.chats.IsMember(ctx, chatID, userID)
+	}
+}
+
+// recordMembership is the membership read for a caller holding the chat's
+// canonical record: a DM's off the record's inline members, a group's from
+// the store, since a group's record carries none.
+func (a *Access) recordMembership(c *Chat, userID *commonpb.UserId) func(context.Context) (bool, error) {
+	if IsGroupChatID(c.ID) {
+		return a.storedMembership(c.ID, userID)
+	}
+	return func(context.Context) (bool, error) { return c.HasMember(userID), nil }
+}
+
+// standing is the shared shape of Standing, StandingWithRules and
+// StandingWithChat: membership, then for a non-member of a group only, the
+// remembered or freshly evaluated listener rules. membership answers the
+// membership question — from the store, or off a record the caller holds — and
+// loadRules supplies the group's rules likewise, called only when they decide
+// the answer; ErrChatNotFound from it is a plain refusal.
+func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode, membership func(context.Context) (bool, error), loadRules func(context.Context) (*chatpb.Rules, error)) (Standing, error) {
+	isMember, err := membership(ctx)
 	if err != nil {
 		return Standing{}, err
 	}

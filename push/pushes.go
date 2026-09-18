@@ -3,10 +3,12 @@ package push
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
+	"google.golang.org/protobuf/proto"
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -140,7 +142,7 @@ func SendContactJoinedFlipcashPush(ctx context.Context, pusher Pusher, joinedPho
 // SendContactDmPush notifies recipients of a new message in a contact DM. The
 // title is a contact substitution on the sender's phone number, which the
 // recipient's client resolves against their address book.
-func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderContact *commonpb.PhoneNumber, recipients ...*commonpb.UserId) error {
+func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderContact *commonpb.PhoneNumber, recipients ChatRecipients) error {
 	body, ok, err := renderDmMessagePushBody(ctx, ocpData, message)
 	if err != nil {
 		return err
@@ -173,14 +175,14 @@ func SendContactDmPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 		},
 	}
 
-	return sendChatMessagePush(ctx, pusher, badges, title, body, customPayload, recipients...)
+	return sendChatMessagePush(ctx, pusher, badges, title, body, customPayload, recipients)
 }
 
 // SendTipDmPush notifies recipients of a new message in a tip DM. The sender
 // is typically not in the recipient's contacts, so the title carries the
 // sender's display name directly rather than a contact substitution — and
 // never the sender's phone number, which is private in a tip DM.
-func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName string, recipients ...*commonpb.UserId) error {
+func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName string, recipients ChatRecipients) error {
 	body, ok, err := renderDmMessagePushBody(ctx, ocpData, message)
 	if err != nil {
 		return err
@@ -204,7 +206,7 @@ func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpDa
 		},
 	}
 
-	return sendChatMessagePush(ctx, pusher, badges, senderDisplayName, body, customPayload, recipients...)
+	return sendChatMessagePush(ctx, pusher, badges, senderDisplayName, body, customPayload, recipients)
 }
 
 // SendGroupChatPush notifies recipients of a new message in a group chat. The
@@ -212,7 +214,7 @@ func SendTipDmPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpDa
 // the sender identified by display name in the body ("Alice: hello"). Like a
 // tip DM, a group push never carries the sender's phone number, which is
 // private outside contact DMs.
-func SendGroupChatPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName, chatTitle string, recipients ...*commonpb.UserId) error {
+func SendGroupChatPush(ctx context.Context, pusher Pusher, badges badge.Store, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName, chatTitle string, recipients ChatRecipients) error {
 	body, ok, err := renderGroupChatMessagePushBody(ctx, ocpData, message, senderDisplayName)
 	if err != nil {
 		return err
@@ -241,7 +243,7 @@ func SendGroupChatPush(ctx context.Context, pusher Pusher, badges badge.Store, o
 		},
 	}
 
-	return sendChatMessagePush(ctx, pusher, badges, title, body, customPayload, recipients...)
+	return sendChatMessagePush(ctx, pusher, badges, title, body, customPayload, recipients)
 }
 
 // renderGroupChatMessagePushBody renders the push body for a group chat
@@ -344,22 +346,56 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 	return body, true, nil
 }
 
-// sendChatMessagePush bumps each recipient's badge count and sends the rendered
-// chat message push carrying the new total, so a recipient's icon updates with
-// the same notification that announces the message rather than a second,
-// badge-only push per recipient.
-func sendChatMessagePush(ctx context.Context, pusher Pusher, badges badge.Store, title, body string, customPayload *pushpb.Payload, recipients ...*commonpb.UserId) error {
-	// Each recipient now has one more unread message. The pusher asks for counts
-	// only for recipients with an iOS device, so the stored count is bumped only
-	// where a badge can be displayed. The batch is best-effort per recipient: a
-	// failed bump leaves that recipient's badge off this push but must not block
-	// the others, and a missed bump self-heals on the next message.
-	incrementBadges := func(ctx context.Context, users []*commonpb.UserId) (BadgeCounts, error) {
-		counts, err := badges.IncrementBatch(ctx, users, 1)
-		return BadgeCounts(counts), err
-	}
+// ChatRecipients is a chat push's audience, split by whether each recipient has
+// the chat muted. Both halves receive the push — it is how the message reaches
+// a device — but the muted half receives it flagged (ChatMetadata.muted) so the
+// client suppresses the notification, and without a badge bump, since a muted
+// chat must not move the app icon's count. Which half a recipient lands in is
+// the sender's best-effort call at send time; the client's own copy of its
+// mute is the last word.
+type ChatRecipients struct {
+	Unmuted []*commonpb.UserId
+	Muted   []*commonpb.UserId
+}
 
-	return pusher.SendPushesWithBadges(ctx, title, body, customPayload, incrementBadges, recipients...)
+// sendChatMessagePush sends the rendered chat message push to both halves of
+// its audience: the unmuted half with each recipient's badge bumped and the
+// new total carried on the notification, so a recipient's icon updates with
+// the same push that announces the message rather than a second, badge-only
+// push per recipient; the muted half flagged, unbadged, as a copy of the same
+// payload. Either half may be empty and costs nothing then. The two sends are
+// independent, and a failure in one is reported alongside the other's.
+func sendChatMessagePush(ctx context.Context, pusher Pusher, badges badge.Store, title, body string, customPayload *pushpb.Payload, recipients ChatRecipients) error {
+	var errs []error
+	if len(recipients.Unmuted) > 0 {
+		// Each recipient now has one more unread message. The pusher asks for
+		// counts only for recipients with an iOS device, so the stored count is
+		// bumped only where a badge can be displayed. The batch is best-effort
+		// per recipient: a failed bump leaves that recipient's badge off this
+		// push but must not block the others, and a missed bump self-heals on
+		// the next message.
+		incrementBadges := func(ctx context.Context, users []*commonpb.UserId) (BadgeCounts, error) {
+			counts, err := badges.IncrementBatch(ctx, users, 1)
+			return BadgeCounts(counts), err
+		}
+		errs = append(errs, pusher.SendPushesWithBadges(ctx, title, body, customPayload, incrementBadges, recipients.Unmuted...))
+	}
+	if len(recipients.Muted) > 0 {
+		// The flag is the only difference, on a copy: the unmuted send may
+		// still be reading the original. A nil payload — which the pusher
+		// accepts as empty — is copied as an empty one rather than cloned,
+		// since proto.Clone of a nil interface is nil and asserts to nothing.
+		mutedPayload := &pushpb.Payload{}
+		if customPayload != nil {
+			mutedPayload = proto.Clone(customPayload).(*pushpb.Payload)
+		}
+		if mutedPayload.ChatMetadata == nil {
+			mutedPayload.ChatMetadata = &pushpb.ChatMetadata{}
+		}
+		mutedPayload.ChatMetadata.Muted = true
+		errs = append(errs, pusher.SendPushes(ctx, title, body, mutedPayload, recipients.Muted...))
+	}
+	return errors.Join(errs...)
 }
 
 func SendFlipcashCurrencyGainPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string, gainRegion ocp_currency.Code, gainAmount float64) error {

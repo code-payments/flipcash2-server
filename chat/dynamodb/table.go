@@ -10,17 +10,67 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// CreateTables provisions the chats, dm_inbox, and group_members tables with
-// on-demand billing. The chats table is keyed by pk only; dm_inbox is keyed by
-// (pk, sk) with a GSI ordering each user's DMs by last_activity; group_members
-// is keyed by (pk, sk) = (chat, user) — plus one "#meta" aggregates item per
-// group — with an inverted GSI for listing a user's group chats, a sparse GSI
-// of a group's joined members by join time (maintained for paging, not read
-// today; see gsiByJoinedAt), and TTL on expires_at sweeping departed members'
-// tombstones (see tombstoneTTL). It is idempotent and blocks until all tables
+// CreateTables provisions the chats, dm_inbox, group_members and
+// chat_user_state tables with on-demand billing. The chats table is keyed by
+// pk only; dm_inbox is keyed by (pk, sk) with a GSI ordering each user's DMs
+// by last_activity; group_members is keyed by (pk, sk) = (chat, user) — plus
+// one "#meta" aggregates item per group — with an inverted GSI for listing a
+// user's group chats, a sparse GSI of a group's joined members by join time
+// (maintained for paging, not read today; see gsiByJoinedAt), and TTL on
+// expires_at sweeping departed members' tombstones (see tombstoneTTL);
+// chat_user_state is keyed by (pk, sk) = (user, chat) — plus one "#meta"
+// aggregates item per chat — with a sparse GSI of a chat's recorded mutes by
+// when they end (see gsiByMuted) and an inverted GSI of a chat's records by
+// user (see gsiUserStateByUser). It is idempotent and blocks until all tables
 // are ACTIVE.
-func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable string) error {
+func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
+		{
+			TableName:   aws.String(userStateTable),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrChat), AttributeType: types.ScalarAttributeTypeB},
+				{AttributeName: aws.String(attrMutedUntil), AttributeType: types.ScalarAttributeTypeN},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+			},
+			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
+				{
+					// Sparse index of a chat's recorded mutes ordered by when they
+					// end: muted_until exists only while a mute is recorded, so a
+					// range on it above "now" is exactly the active mutes, and an
+					// item whose mute was cleared leaves the index (see
+					// gsiByMuted). The user is in the projected pk, so the index
+					// carries nothing beyond its keys.
+					IndexName: aws.String(gsiByMuted),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrChat), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrMutedUntil), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeKeysOnly},
+				},
+				{
+					// Inverted index: (chat, user), in the same user order as a
+					// group's membership partition, so a chat-scoped walk of what
+					// its users have set pages in lockstep with a roster walk.
+					// Every record is in it, whatever state it holds, and the full
+					// record is projected, so any state added later is readable
+					// per chat without a new index (see gsiUserStateByUser). Both
+					// indexes are keyed by the chat attribute, which only records
+					// carry: the #meta item must omit it, or it leaks in.
+					IndexName: aws.String(gsiUserStateByUser),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrChat), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+			},
+		},
 		{
 			TableName:   aws.String(chatsTable),
 			BillingMode: types.BillingModePayPerRequest,
@@ -164,6 +214,9 @@ func (s *store) reset() {
 		panic(err)
 	}
 	if err := clearTable(ctx, s.client, s.groupMembersTable, []string{attrPK, attrSK}); err != nil {
+		panic(err)
+	}
+	if err := clearTable(ctx, s.client, s.userStateTable, []string{attrPK, attrSK}); err != nil {
 		panic(err)
 	}
 }

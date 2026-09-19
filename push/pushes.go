@@ -386,12 +386,14 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 }
 
 // ChatRecipients is a chat push's audience, split by whether each recipient has
-// the chat muted. Both halves receive the push — it is how the message reaches
-// a device — but the muted half receives it flagged (ChatMetadata.muted) so the
-// client suppresses the notification, and without a badge bump, since a muted
-// chat must not move the app icon's count. Which half a recipient lands in is
-// the sender's best-effort call at send time; the client's own copy of its
-// mute is the last word.
+// the chat muted. The unmuted half receives the alert with a badge bump. The
+// muted half receives the same payload flagged (ChatMetadata.muted) and
+// without a badge bump, since a muted chat must not move the app icon's
+// count — and only on Android, where the client can deliver the message
+// quietly; the FCMPusher drops a muted recipient's iOS devices, which could
+// not suppress the alert, so an iOS user hears nothing from a chat they
+// muted. Which half a recipient lands in is the sender's best-effort call at
+// send time; the client's own copy of its mute is the last word.
 type ChatRecipients struct {
 	Unmuted []*commonpb.UserId
 	Muted   []*commonpb.UserId
@@ -401,8 +403,8 @@ type ChatRecipients struct {
 // unmuted half with each recipient's badge bumped and the new total carried
 // on the notification, so a recipient's icon updates with the same push that
 // announces the message rather than a second, badge-only push per recipient;
-// the muted half flagged, unbadged, as a copy of the same payload. Either
-// half may be empty and costs nothing then. The two sends are independent,
+// the muted half flagged, unbadged, as a copy of the same payload, to Android
+// devices only. Either half may be empty and costs nothing then. The two sends are independent,
 // and a failure in one is reported alongside the other's. Send may be called
 // once per page of a large audience; each call is its own token lookup,
 // badge batch and FCM send, so what a call holds is bounded by its page.

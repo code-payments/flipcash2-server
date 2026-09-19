@@ -77,9 +77,11 @@ func RunPusherTests(t *testing.T, s push.TokenStore, teardown func()) {
 		testFCMPusher_SendBasicPushes,
 		testFCMPusher_SendPushesWithSubstitutions,
 		testFCMPusher_SendPushesWithChatMetadata,
+		testFCMPusher_SendPushes_ChatTargetUrl,
 		testFCMPusher_SendPushesWithBadges,
 		testFCMPusher_SendPushesWithBadges_ResolverFailure,
 		testFCMPusher_SendPushesWithBadges_NoIOSUsers,
+		testFCMPusher_SendPushes_MutedSkipsIOS,
 		testFCMPusher_SendPushes_Batched,
 		testFCMPusher_SendPushes_BatchFailureIsolated,
 	} {
@@ -317,6 +319,63 @@ func testFCMPusher_SendPushesWithChatMetadata(t *testing.T, store push.TokenStor
 	}
 }
 
+// testFCMPusher_SendPushes_ChatTargetUrl verifies the target URL a chat
+// navigation carries renders the chat ID in its family's form: a group's
+// 16-byte ID as a UUID string, a DM's 32-byte digest as URL-safe base64.
+func testFCMPusher_SendPushes_ChatTargetUrl(t *testing.T, store push.TokenStore) {
+	ctx := context.Background()
+
+	user := &commonpb.UserId{Value: []byte("user_chat_url")}
+	installId := &commonpb.AppInstallId{Value: "install_chat_url"}
+	require.NoError(t, store.AddToken(ctx, user, installId, pushpb.TokenType_FCM_ANDROID, "token_chat_url"))
+
+	groupID := make([]byte, 16)
+	for i := range groupID {
+		groupID[i] = byte(i)
+	}
+	dmID := make([]byte, 32)
+	for i := range dmID {
+		dmID[i] = byte(0xff - i)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		chatID  []byte
+		wantUrl string
+	}{
+		{
+			name:    "group chat id is a uuid",
+			chatID:  groupID,
+			wantUrl: "https://app.flipcash.com/chat/00010203-0405-0607-0809-0a0b0c0d0e0f",
+		},
+		{
+			name:    "dm chat id is url-safe base64",
+			chatID:  dmID,
+			wantUrl: "https://app.flipcash.com/chat/" + base64.URLEncoding.EncodeToString(dmID),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fcmClient := &testFCMClient{}
+			pusher := push.NewFCMPusher(zap.NewNop(), store, fcmClient)
+
+			payload := &pushpb.Payload{
+				Category: pushpb.Payload_CHAT,
+				Navigation: &pushpb.Navigation{
+					Type: &pushpb.Navigation_ChatId{
+						ChatId: &commonpb.ChatId{Value: tc.chatID},
+					},
+				},
+			}
+			require.NoError(t, pusher.SendPushes(ctx, "title", "body", payload, user))
+
+			require.Len(t, fcmClient.sentMessages, 1)
+			sentMessage := fcmClient.sentMessages[0]
+			require.Equal(t, tc.wantUrl, sentMessage.Android.Data["target_url"])
+			require.Equal(t, tc.wantUrl, sentMessage.APNS.Payload.Aps.CustomData["target_url"])
+		})
+	}
+}
+
 // testFCMPusher_SendPushesWithBadges verifies that a per-user badge rides on
 // the notification itself, and that badges are resolved only for users who own
 // an iOS device: each iOS device gets its own user's count, an Android-only
@@ -432,6 +491,71 @@ func testFCMPusher_SendPushesWithBadges_NoIOSUsers(t *testing.T, store push.Toke
 	// The alert still goes out.
 	require.Equal(t, []string{"android_token"}, fcmClient.tokens())
 	require.Equal(t, "title", fcmClient.sentMessages[0].Android.Data["push_notification_title"])
+}
+
+// testFCMPusher_SendPushes_MutedSkipsIOS verifies a push flagged as muted is
+// delivered to Android devices only: a muted recipient's iOS devices get
+// nothing, an iOS-only recipient gets nothing at all, and the same payload
+// unflagged still reaches every device.
+func testFCMPusher_SendPushes_MutedSkipsIOS(t *testing.T, store push.TokenStore) {
+	ctx := context.Background()
+
+	alice := &commonpb.UserId{Value: []byte("alice")}
+	bob := &commonpb.UserId{Value: []byte("bob")}
+	carol := &commonpb.UserId{Value: []byte("carol")}
+
+	// Alice has both an iOS and an Android device, Bob is iOS only, Carol is
+	// Android only.
+	require.NoError(t, store.AddToken(ctx, alice, &commonpb.AppInstallId{Value: "ios"}, pushpb.TokenType_FCM_APNS, "alice_apns"))
+	require.NoError(t, store.AddToken(ctx, alice, &commonpb.AppInstallId{Value: "android"}, pushpb.TokenType_FCM_ANDROID, "alice_android"))
+	require.NoError(t, store.AddToken(ctx, bob, &commonpb.AppInstallId{Value: "ios"}, pushpb.TokenType_FCM_APNS, "bob_apns"))
+	require.NoError(t, store.AddToken(ctx, carol, &commonpb.AppInstallId{Value: "android"}, pushpb.TokenType_FCM_ANDROID, "carol_android"))
+
+	chatMetadata := func(muted bool) *pushpb.ChatMetadata {
+		return &pushpb.ChatMetadata{
+			SendingUserId: &commonpb.UserId{Value: []byte("sender")},
+			Type:          chatpb.ChatType_GROUP,
+			Muted:         muted,
+		}
+	}
+
+	for _, tc := range []struct {
+		name       string
+		payload    *pushpb.Payload
+		wantTokens []string
+	}{
+		{
+			name:       "muted",
+			payload:    &pushpb.Payload{Category: pushpb.Payload_CHAT, ChatMetadata: chatMetadata(true)},
+			wantTokens: []string{"alice_android", "carol_android"},
+		},
+		{
+			name:       "unmuted",
+			payload:    &pushpb.Payload{Category: pushpb.Payload_CHAT, ChatMetadata: chatMetadata(false)},
+			wantTokens: []string{"alice_apns", "alice_android", "bob_apns", "carol_android"},
+		},
+		{
+			name:       "no chat metadata",
+			payload:    &pushpb.Payload{},
+			wantTokens: []string{"alice_apns", "alice_android", "bob_apns", "carol_android"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fcmClient := &testFCMClient{}
+			pusher := push.NewFCMPusher(zap.NewNop(), store, fcmClient)
+
+			require.NoError(t, pusher.SendPushes(ctx, "title", "body", tc.payload, alice, bob, carol))
+			require.ElementsMatch(t, tc.wantTokens, fcmClient.tokens())
+		})
+	}
+
+	// An iOS-only audience with the chat muted sends nothing, and that is not
+	// an error.
+	fcmClient := &testFCMClient{}
+	pusher := push.NewFCMPusher(zap.NewNop(), store, fcmClient)
+	require.NoError(t, pusher.SendPushes(ctx, "title", "body", &pushpb.Payload{Category: pushpb.Payload_CHAT, ChatMetadata: chatMetadata(true)}, bob))
+	require.Empty(t, fcmClient.sentMessages)
+	require.Empty(t, fcmClient.batchSizes)
 }
 
 // addManyTokens registers count iOS tokens for user, named "<prefix>_<i>".

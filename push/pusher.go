@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"firebase.google.com/go/v4/messaging"
+	"github.com/google/uuid"
 	"github.com/mr-tron/base58"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
@@ -108,6 +109,15 @@ func (p *FCMPusher) SendPushesWithBadges(ctx context.Context, title, body string
 		return err
 	}
 
+	// A push flagged as muted (see ChatRecipients) is never delivered to an
+	// iOS device: the iOS client has no way to suppress an alert once APNs has
+	// it, so the flag would still surface a notification for a chat the user
+	// asked to hear nothing from. Android delivers it as data the client keeps
+	// quiet, so only APNs tokens are dropped.
+	if customPayload.GetChatMetadata().GetMuted() {
+		pushTokens = withoutTokenType(pushTokens, pushpb.TokenType_FCM_APNS)
+	}
+
 	if len(pushTokens) == 0 {
 		p.log.Debug("Dropping push, no tokens for users", zap.Int("num_users", len(users)))
 		return nil
@@ -152,7 +162,7 @@ func (p *FCMPusher) SendPushesWithBadges(ctx context.Context, title, body string
 		case *pushpb.Navigation_CurrencyInfo:
 			targetUrl = fmt.Sprintf("https://app.flipcash.com/token/%s", base58.Encode(typed.CurrencyInfo.Value))
 		case *pushpb.Navigation_ChatId:
-			targetUrl = fmt.Sprintf("https://app.flipcash.com/chat/%s", base64.URLEncoding.EncodeToString(typed.ChatId.Value))
+			targetUrl = fmt.Sprintf("https://app.flipcash.com/chat/%s", chatIDPathSegment(typed.ChatId))
 		case *pushpb.Navigation_ChatContactPhoneNumber:
 			targetUrl = fmt.Sprintf("https://app.flipcash.com/chat/%s", strings.Replace(typed.ChatContactPhoneNumber.Value, "+", "%2B", 1))
 		}
@@ -282,6 +292,29 @@ func usersWithTokenType(users []*commonpb.UserId, pushTokens []Token, tokenType 
 		}
 	}
 	return matched
+}
+
+// chatIDPathSegment renders a chat ID for the target URL's path. A group chat's
+// 16-byte ID is UUID-shaped (see chat.MustDeriveGroupChatID) and is rendered
+// as a UUID string, which is how the app addresses a group; a DM's 32-byte
+// digest keeps the legacy URL-safe base64 form.
+func chatIDPathSegment(chatID *commonpb.ChatId) string {
+	if id, err := uuid.FromBytes(chatID.GetValue()); err == nil {
+		return id.String()
+	}
+	return base64.URLEncoding.EncodeToString(chatID.GetValue())
+}
+
+// withoutTokenType returns pushTokens, in their given order, less every token
+// of the given type.
+func withoutTokenType(pushTokens []Token, tokenType pushpb.TokenType) []Token {
+	kept := make([]Token, 0, len(pushTokens))
+	for _, token := range pushTokens {
+		if token.Type != tokenType {
+			kept = append(kept, token)
+		}
+	}
+	return kept
 }
 
 // processResponse logs per-message failures and returns the tokens FCM

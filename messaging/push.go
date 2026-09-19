@@ -352,10 +352,10 @@ func (p *messagePush) sendPageStep(ctx context.Context, members []*commonpb.User
 		return
 	}
 
-	// A recipient who has the chat muted still gets the push — it is how the
-	// message reaches their device — but in a batch of its own, flagged so
-	// the client suppresses the notification and sent without moving their
-	// badge (see push.ChatRecipients).
+	// A recipient who has the chat muted gets the push in a batch of its own,
+	// flagged and sent without moving their badge, and only to their Android
+	// devices — the pusher drops a muted push's iOS tokens, so an iOS user
+	// hears nothing from a muted chat (see push.ChatRecipients).
 	split, err := p.splitMuted(ctx, recipients)
 	if err != nil {
 		p.log.With(zap.Error(err)).Warn("Failure reading muted users for message push; sending page as unmuted")

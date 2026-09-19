@@ -3098,9 +3098,10 @@ func testServer_SendMessage_GroupPushPagesConcurrent(t *testing.T, badges badge.
 }
 
 // testServer_SendMessage_MutedRecipientsFlagged sends into a DM and a group
-// where some recipients have the chat muted: every recipient still gets the
-// push, but muted ones get it in a batch of their own, flagged and without a
-// badge, while a mute that has lapsed counts for nothing.
+// where some recipients have the chat muted: muted ones get the push in a
+// batch of their own, flagged and without a badge (which the FCM pusher then
+// delivers to Android devices only), while a mute that has lapsed counts for
+// nothing.
 func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 

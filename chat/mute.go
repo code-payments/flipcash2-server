@@ -58,7 +58,7 @@ func (s *Server) MuteChat(ctx context.Context, req *chatpb.MuteChatRequest) (*ch
 		return nil, status.Error(codes.InvalidArgument, "mute must end in the future")
 	}
 
-	allowed, err := s.mutingAllowed(ctx, log, req.ChatId, userID)
+	c, allowed, err := s.mutingAllowed(ctx, log, req.ChatId, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -78,12 +78,14 @@ func (s *Server) MuteChat(ctx context.Context, req *chatpb.MuteChatRequest) (*ch
 		return nil, status.Error(codes.Internal, "")
 	}
 
+	// The gate established membership, so the permissions are a member's.
+	permissions := c.PermissionsFor(userID, true)
 	if changed {
-		s.publishViewerStateChanged(userID, req.ChatId, state)
+		s.publishViewerStateChanged(userID, req.ChatId, state, permissions)
 	}
 	return &chatpb.MuteChatResponse{
 		Result:      chatpb.MuteChatResponse_OK,
-		ViewerState: state.ToProto(),
+		ViewerState: state.ToProto(permissions),
 	}, nil
 }
 
@@ -101,7 +103,7 @@ func (s *Server) UnmuteChat(ctx context.Context, req *chatpb.UnmuteChatRequest) 
 		zap.String("chat_id", model.ChatIDString(req.ChatId)),
 	)
 
-	allowed, err := s.mutingAllowed(ctx, log, req.ChatId, userID)
+	c, allowed, err := s.mutingAllowed(ctx, log, req.ChatId, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -118,12 +120,13 @@ func (s *Server) UnmuteChat(ctx context.Context, req *chatpb.UnmuteChatRequest) 
 		return nil, status.Error(codes.Internal, "")
 	}
 
+	permissions := c.PermissionsFor(userID, true)
 	if changed {
-		s.publishViewerStateChanged(userID, req.ChatId, state)
+		s.publishViewerStateChanged(userID, req.ChatId, state, permissions)
 	}
 	return &chatpb.UnmuteChatResponse{
 		Result:      chatpb.UnmuteChatResponse_OK,
-		ViewerState: state.ToProto(),
+		ViewerState: state.ToProto(permissions),
 	}, nil
 }
 
@@ -135,38 +138,40 @@ func (s *Server) UnmuteChat(ctx context.Context, req *chatpb.UnmuteChatRequest) 
 // so a DM is gated on that one read; a group's is read from the store,
 // strongly consistent, as every gate reads it (see Access.IsMemberWithChat)
 // — the first thing a user does after joining may be to mute. The rules are
-// never evaluated: membership alone is the gate. A gRPC error is returned
-// only for a failed read.
-func (s *Server) mutingAllowed(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (chatpb.MuteChatResponse_Result, error) {
+// never evaluated: membership alone is the gate. The record is returned with
+// an OK, since the caller projects the member's permissions off it. A gRPC
+// error is returned only for a failed read.
+func (s *Server) mutingAllowed(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (*Chat, chatpb.MuteChatResponse_Result, error) {
 	c, err := s.chats.GetChatByID(ctx, chatID)
 	if err != nil {
 		if errors.Is(err, ErrChatNotFound) {
-			return chatpb.MuteChatResponse_NOT_FOUND, nil
+			return nil, chatpb.MuteChatResponse_NOT_FOUND, nil
 		}
 		log.With(zap.Error(err)).Warn("Failure getting chat")
-		return 0, status.Error(codes.Internal, "")
+		return nil, 0, status.Error(codes.Internal, "")
 	}
 
 	isMember, err := s.access.IsMemberWithChat(ctx, c, userID)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure checking chat membership")
-		return 0, status.Error(codes.Internal, "")
+		return nil, 0, status.Error(codes.Internal, "")
 	}
 	if !isMember {
-		return chatpb.MuteChatResponse_DENIED, nil
+		return nil, chatpb.MuteChatResponse_DENIED, nil
 	}
-	return chatpb.MuteChatResponse_OK, nil
+	return c, chatpb.MuteChatResponse_OK, nil
 }
 
-// publishViewerStateChanged sends the user's new state on chatID to their own
-// devices as a MetadataUpdate.ViewerStateChanged on their user topic. Only the
-// user topic: the state is theirs alone and never reaches other members, so
-// the chat topic stays silent. It is best-effort and non-blocking, like every
-// publish here, and never fails the RPC whose change it announces; a device
-// that misses it converges from the next Metadata it reads, which carries the
-// same state at its version — exactly the same, lapsed mute included, since
-// the projection never depends on when it was made (see ViewerState.ToProto).
-func (s *Server) publishViewerStateChanged(userID *commonpb.UserId, chatID *commonpb.ChatId, state ViewerState) {
+// publishViewerStateChanged sends the user's new state on chatID, with their
+// permissions as the caller computed them, to their own devices as a
+// MetadataUpdate.ViewerStateChanged on their user topic. Only the user topic:
+// the state is theirs alone and never reaches other members, so the chat
+// topic stays silent. It is best-effort and non-blocking, like every publish
+// here, and never fails the RPC whose change it announces; a device that
+// misses it converges from the next Metadata it reads, which carries the same
+// state at its version — exactly the same, lapsed mute included, since the
+// projection never depends on when it was made (see ViewerState.ToProto).
+func (s *Server) publishViewerStateChanged(userID *commonpb.UserId, chatID *commonpb.ChatId, state ViewerState, permissions Permissions) {
 	s.userEventBus.OnEvent(userID, &eventpb.Event{
 		Id: model.MustGenerateEventID(),
 		Ts: timestamppb.Now(),
@@ -175,7 +180,7 @@ func (s *Server) publishViewerStateChanged(userID *commonpb.UserId, chatID *comm
 			MetadataUpdates: []*chatpb.MetadataUpdate{{
 				Kind: &chatpb.MetadataUpdate_ViewerStateChanged_{
 					ViewerStateChanged: &chatpb.MetadataUpdate_ViewerStateChanged{
-						ViewerState: state.ToProto(),
+						ViewerState: state.ToProto(permissions),
 					},
 				},
 			}},

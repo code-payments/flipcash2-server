@@ -9,6 +9,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
@@ -40,9 +41,16 @@ func chatUpdateFixture() *eventpb.ChatUpdate {
 			}}},
 			{Kind: &chatpb.MetadataUpdate_ViewerStateChanged_{ViewerStateChanged: &chatpb.MetadataUpdate_ViewerStateChanged{
 				ViewerState: &chatpb.ViewerState{
-					Settings: &chatpb.ViewerState_Settings{Mute: &chatpb.MuteState{Duration: &chatpb.MuteState_Forever_{Forever: &chatpb.MuteState_Forever{}}}},
-					Version:  2,
+					Settings:    &chatpb.ViewerState_Settings{Mute: &chatpb.MuteState{Duration: &chatpb.MuteState_Forever_{Forever: &chatpb.MuteState_Forever{}}}},
+					Permissions: &chatpb.ViewerState_Permissions{CanEdit: true},
+					Version:     2,
 				},
+			}}},
+			{Kind: &chatpb.MetadataUpdate_TitleChanged_{TitleChanged: &chatpb.MetadataUpdate_TitleChanged{
+				NewTitle: "New Title",
+			}}},
+			{Kind: &chatpb.MetadataUpdate_PictureChanged_{PictureChanged: &chatpb.MetadataUpdate_PictureChanged{
+				NewPicture: &blobpb.Media{Renditions: []*blobpb.Rendition{{Role: blobpb.Rendition_ORIGINAL, BlobId: &blobpb.BlobId{Value: bytes.Repeat([]byte{7}, 16)}}}},
 			}}},
 		},
 		Events: &messagingpb.EventBatch{Events: []*messagingpb.Event{{
@@ -107,15 +115,18 @@ func TestChatUpdate(t *testing.T) {
 	}
 
 	// A metadata refresh keeps its record with the last message redacted; a
-	// last-activity change and a viewer-state change are as they were.
-	require.Len(t, out.MetadataUpdates, 3)
+	// last-activity change, a viewer-state change, a title change and a
+	// picture change are as they were.
+	require.Len(t, out.MetadataUpdates, 5)
 	refreshed := out.MetadataUpdates[0].GetFullRefresh().GetMetadata()
 	assert.Equal(t, "Title", refreshed.Title)
 	expected, err := Message(chatID, in.MetadataUpdates[0].GetFullRefresh().GetMetadata().LastMessage)
 	require.NoError(t, err)
 	assert.True(t, proto.Equal(expected, refreshed.LastMessage))
-	assert.True(t, proto.Equal(in.MetadataUpdates[1], out.MetadataUpdates[1]))
-	assert.True(t, proto.Equal(in.MetadataUpdates[2], out.MetadataUpdates[2]))
+	for i := 1; i < 5; i++ {
+		assert.True(t, proto.Equal(in.MetadataUpdates[i], out.MetadataUpdates[i]), "metadata update %d", i)
+		assert.NotSame(t, in.MetadataUpdates[i], out.MetadataUpdates[i])
+	}
 
 	// A join keeps its member and summary with its metadata's last message
 	// redacted; a departure is as it was.

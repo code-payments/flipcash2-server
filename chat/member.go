@@ -244,12 +244,13 @@ func (s *Server) announcedMember(ctx context.Context, log *zap.Logger, chatID *c
 // a user who returns later starts unmuted. It is best effort, after the
 // departure has landed: the roster is the record of the leave, and a mute
 // left behind costs the returning member one unmute (they see it on the
-// chat's viewer_state, since a departed member's state is still theirs to
-// read), while failing the RPC would tell them they had not left. A failure
+// chat's viewer_state once they rejoin; a non-member is shown no state),
+// while failing the RPC would tell them they had not left. A failure
 // is logged and the response is unchanged. A clear that moves the state is
 // published to the caller's other devices exactly as UnmuteChat publishes
 // one; a departed member has no mute to clear in the common case, and that
-// no-op costs one read and publishes nothing.
+// no-op costs one read and publishes nothing. The state is published with no
+// permissions: the caller has just left, and a non-member may do nothing.
 func (s *Server) clearMuteOnLeave(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) {
 	state, changed, err := s.chats.ClearMute(ctx, chatID, userID)
 	if err != nil {
@@ -257,7 +258,7 @@ func (s *Server) clearMuteOnLeave(ctx context.Context, log *zap.Logger, chatID *
 		return
 	}
 	if changed {
-		s.publishViewerStateChanged(userID, chatID, state)
+		s.publishViewerStateChanged(userID, chatID, state, Permissions{})
 	}
 }
 

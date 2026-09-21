@@ -367,6 +367,38 @@ func (c *Chat) HasMember(userID *commonpb.UserId) bool {
 	return false
 }
 
+// IsCreator reports whether userID created the chat (see CreatorID). It is
+// false for a DM, and for a group whose creator was never recorded.
+func (c *Chat) IsCreator(userID *commonpb.UserId) bool {
+	return c.CreatorID != nil && bytes.Equal(c.CreatorID.Value, userID.Value)
+}
+
+// PermissionsFor returns what userID may do in the chat (see Permissions),
+// given whether they are a member — which the caller has established, since
+// a group's membership is not on its record. A non-member may do nothing. A
+// member may edit the chat if and only if they created it: a DM has no
+// creator, so a DM is never editable, and a group's creator who has left it
+// edits nothing until they rejoin.
+func (c *Chat) PermissionsFor(userID *commonpb.UserId, isMember bool) Permissions {
+	return Permissions{CanEdit: isMember && c.IsCreator(userID)}
+}
+
+// GroupEdit is a change to a group's editable record fields (see
+// Store.EditGroup): the title, and the blob holding its picture's ORIGINAL. A
+// nil field is left as it is, so an edit names only what it changes and two
+// edits of different fields never overwrite each other. Neither field can be
+// cleared through an edit — a picture is removed with Store.SetGroupPicture —
+// and an edit that names nothing is invalid.
+type GroupEdit struct {
+	Title         *string
+	PictureBlobID *blobpb.BlobId
+}
+
+// IsEmpty reports whether the edit names nothing.
+func (e GroupEdit) IsEmpty() bool {
+	return e.Title == nil && e.PictureBlobID == nil
+}
+
 // Clone returns a deep copy of the chat.
 func (c *Chat) Clone() *Chat {
 	members := make([]*commonpb.UserId, len(c.Members))
@@ -509,7 +541,8 @@ func (m Mute) Normalize() (Mute, error) {
 // ViewerState is what a chat holds about one user, independent of whether
 // they are a member: state the user set for themselves (today, a mute) and a
 // version over all of it. It is private to that user and never shared with
-// other members. The record outlives membership — the version never resets
+// other members, and shown to the user only while they are a member (see
+// Server.hydrate). The record outlives membership — the version never resets
 // — but what it holds may not: a mute is cleared, best effort, when the user
 // leaves the chat (see Server.LeaveChat), so a user who returns to a group
 // starts unmuted unless that clear failed.
@@ -520,9 +553,35 @@ func (m Mute) Normalize() (Mute, error) {
 // idempotent no-op leaves it alone, so a client keeps the greater of two
 // versions and drops the rest, whatever order they arrived in. It is not the
 // roster version (see RosterSummary), which nothing here ever moves.
+//
+// What a client is shown alongside the record is the chat's Permissions for
+// the user (see ToProto), computed from the chat's record and the user's
+// membership at the time of the read rather than stored, and not covered by
+// Version: a membership transition changes what the user may do (see
+// Chat.PermissionsFor) without moving the record, so the same version may
+// carry different permissions before and after one. That is accepted for
+// now — a transition of the user's own is what changes them, and it reaches
+// the user's devices as a RosterUpdate carrying fresh metadata — rather than
+// moving the version on every transition of a user who may hold no record.
 type ViewerState struct {
 	Mute    *Mute
 	Version uint64
+}
+
+// Permissions is what a user may do in a chat beyond what membership alone
+// allows every member: today, whether they may edit its record (see
+// Server.EditChat). It is computed from the chat's record and the user's
+// membership (see Chat.PermissionsFor), never stored, and shown to the user
+// alone on their ViewerState — a client shows an affordance if and only if
+// its flag is set, so the flags are the server's word on what an RPC will
+// admit, and every gate must agree with them.
+type Permissions struct {
+	CanEdit bool
+}
+
+// ToProto projects the permissions onto a chatpb.ViewerState_Permissions.
+func (p Permissions) ToProto() *chatpb.ViewerState_Permissions {
+	return &chatpb.ViewerState_Permissions{CanEdit: p.CanEdit}
 }
 
 // MembersPage is one page of a group's joined members in user-ID order (see
@@ -592,17 +651,21 @@ func (v ViewerState) ActiveMute(now time.Time) *Mute {
 }
 
 // ToProto projects the state onto a chatpb.ViewerState exactly as recorded:
-// the version, and under settings the mute if one is recorded, lapsed or
-// not. A version names one exact state, and every carrier of that version —
-// a response, a hydrated Metadata, a ViewerStateChanged — must agree on it,
-// which they could not if the projection depended on the clock it was made
-// at. Whether a timed mute is still in force is the reader's call against
-// its own clock (see Mute.Active); the server makes that call only where it
-// acts on it, in the push fan-out.
-func (v ViewerState) ToProto() *chatpb.ViewerState {
+// the version, under settings the mute if one is recorded, lapsed or not,
+// and the user's permissions in the chat as the caller computed them (see
+// Permissions). A version names one exact state, and every carrier of that
+// version — a response, a hydrated Metadata, a ViewerStateChanged — must
+// agree on it, which they could not if the projection depended on the clock
+// it was made at. Whether a timed mute is still in force is the reader's call
+// against its own clock (see Mute.Active); the server makes that call only
+// where it acts on it, in the push fan-out. The permissions are always
+// carried, empty for a user who may do nothing, so a carrier never leaves a
+// client to guess whether they were withheld or are none.
+func (v ViewerState) ToProto(permissions Permissions) *chatpb.ViewerState {
 	out := &chatpb.ViewerState{
-		Settings: &chatpb.ViewerState_Settings{},
-		Version:  v.Version,
+		Settings:    &chatpb.ViewerState_Settings{},
+		Permissions: permissions.ToProto(),
+		Version:     v.Version,
 	}
 	if v.Mute != nil {
 		out.Settings.Mute = v.Mute.ToProto()

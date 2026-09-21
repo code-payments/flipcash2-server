@@ -369,15 +369,15 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 // member who is not the viewer) is on the viewer's blocklist. Every DM peer
 // across the set is resolved against the viewer's blocklist in one batched read.
 //
-// viewer_state is per-viewer too, and read for every chat in the set whatever
-// the viewer's standing: it is what the chat holds about the viewer themselves
-// (see ViewerState), whose record outlives their membership and which a
-// non-member previewing a group is as entitled to as a member — so it is
-// never withheld by the standing that withholds messaging state, and a mute
-// a departure failed to clear is visible to the user it belongs to. It is
-// one read across the set, and a chat the viewer has no record on gets no
-// viewer_state at all. What it carries is the record exactly, a lapsed mute
-// included (see ViewerState.ToProto).
+// viewer_state is per-viewer too, and a member's alone: it is what the chat
+// holds about the viewer (see ViewerState) plus what they may do in it, and
+// a non-member may do nothing and has no standing to see what the record
+// still holds — a mute a departure failed to clear stays on the record, out
+// of sight, until they rejoin. So it is read only for a member, one read
+// across the set, and every member gets one: the record exactly, a lapsed
+// mute included, or the zero record when they have written none, with their
+// permissions computed off the record (see Chat.PermissionsFor and
+// ViewerState.ToProto). A non-member gets none.
 //
 // A group's picture is stored as the blob holding its ORIGINAL; every picture
 // across the set is expanded to its full rendition set, each with a short-lived
@@ -517,10 +517,12 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		blockedPeers, err = s.blocklist.GetBlocked(gctx, viewerID, peerIDs)
 		return err
 	})
-	g.Go(func() (err error) {
-		viewerStates, err = s.chats.GetViewerStates(gctx, viewerID, chatIDs)
-		return err
-	})
+	if standing.IsMember {
+		g.Go(func() (err error) {
+			viewerStates, err = s.chats.GetViewerStates(gctx, viewerID, chatIDs)
+			return err
+		})
+	}
 	if len(pictureBlobIDs) > 0 {
 		g.Go(func() (err error) {
 			pictureRenditions, err = s.media.ResolveRenditions(gctx, pictureBlobIDs)
@@ -535,8 +537,8 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 	for i, c := range chats {
 		key := string(c.ID.Value)
 		md := c.ToProto()
-		if vs, ok := viewerStates[key]; ok {
-			md.ViewerState = vs.ToProto()
+		if standing.IsMember {
+			md.ViewerState = viewerStates[key].ToProto(c.PermissionsFor(viewerID, true))
 		}
 		if IsGroupChatID(c.ID) {
 			// ToProto projects the canonical record, which carries neither a

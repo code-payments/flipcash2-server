@@ -207,6 +207,30 @@ func (m *memory) SetGroupPicture(_ context.Context, chatID *commonpb.ChatId, blo
 	return nil
 }
 
+func (m *memory) EditGroup(_ context.Context, chatID *commonpb.ChatId, edit chat.GroupEdit) error {
+	if !chat.IsGroupChatID(chatID) {
+		return fmt.Errorf("not a group chat id")
+	}
+	if edit.IsEmpty() {
+		return fmt.Errorf("edit names nothing")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	c, ok := m.chats[string(chatID.Value)]
+	if !ok {
+		return chat.ErrChatNotFound
+	}
+	if edit.Title != nil {
+		c.Title = *edit.Title
+	}
+	if edit.PictureBlobID != nil {
+		c.PictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), edit.PictureBlobID.Value...)}
+	}
+	return nil
+}
+
 func (m *memory) GetChatByID(_ context.Context, chatID *commonpb.ChatId) (*chat.Chat, error) {
 	m.Lock()
 	defer m.Unlock()

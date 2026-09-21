@@ -136,6 +136,15 @@ type Store interface {
 	// a group chat ID.
 	SetGroupPicture(ctx context.Context, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error
 
+	// EditGroup applies edit to a group chat's canonical record (see
+	// GroupEdit): each field the edit names is set, and every other field is
+	// left as it is, in one write. Like SetGroupPicture it touches only the
+	// canonical record and validates nothing — the title is moderated and the
+	// picture attached before this is called (see Server.EditChat). It returns
+	// ErrChatNotFound if the chat does not exist, and an error if chatID is
+	// not a group chat ID or the edit names nothing.
+	EditGroup(ctx context.Context, chatID *commonpb.ChatId, edit GroupEdit) error
+
 	// GetChatByID returns the canonical record for the chat with the given ID,
 	// or ErrChatNotFound. It reads only that record: Members carries a DM's
 	// inline participants and is always empty for a group chat, whose mutable

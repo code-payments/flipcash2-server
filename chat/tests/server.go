@@ -108,6 +108,16 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_LeaveChat_ClearsMute,
 		testServer_GetChat_ViewerState_LapsedMuteReturned,
 		testServer_GetDmChatFeed_ViewerState,
+		testServer_EditChat_Title,
+		testServer_EditChat_Picture,
+		testServer_EditChat_Both,
+		testServer_EditChat_NoOp,
+		testServer_EditChat_Denied,
+		testServer_EditChat_NotFound,
+		testServer_EditChat_TitleModerated,
+		testServer_EditChat_PictureNotAccepted,
+		testServer_EditChat_ModerationFailureIsInternal,
+		testServer_ViewerState_Permissions,
 	} {
 		tf(t, s)
 		teardown()
@@ -2998,6 +3008,20 @@ func muteForever() *chatpb.MuteState {
 	return &chatpb.MuteState{Duration: &chatpb.MuteState_Forever_{Forever: &chatpb.MuteState_Forever{}}}
 }
 
+// viewerState is the ViewerState every carrier projects: the mute under
+// settings (nil for none), the permissions, and the version.
+func viewerState(version uint64, mute *chatpb.MuteState, canEdit bool) *chatpb.ViewerState {
+	return &chatpb.ViewerState{
+		Settings:    &chatpb.ViewerState_Settings{Mute: mute},
+		Permissions: &chatpb.ViewerState_Permissions{CanEdit: canEdit},
+		Version:     version,
+	}
+}
+
+// memberViewerState is what a member who has never written a record, and
+// may not edit the chat, is shown: the zero record with no permissions.
+var memberViewerState = viewerState(0, nil, false)
+
 // viewerStateUpdatesOnUserTopic returns every ViewerStateChanged for chatID
 // published on userID's topic, in publish order.
 func (e *serverEnv) viewerStateUpdatesOnUserTopic(userID *commonpb.UserId, chatID *commonpb.ChatId) []*chatpb.ViewerState {
@@ -3041,10 +3065,11 @@ func testServer_MuteChat_Lifecycle(t *testing.T, s chat.Store) {
 	peer, _ := e.addUser()
 	chatID := e.putDMWithPeer(chatpb.ChatType_CONTACT_DM, peer, at(1))
 
-	// A chat the viewer has never touched carries no viewer state at all.
+	// A chat the viewer has never touched carries the zero state for a member:
+	// no mute, no permissions on a DM, version zero.
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-	require.Nil(t, resp.Metadata.ViewerState)
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, resp.Metadata.ViewerState))
 
 	// A timed mute, recorded at second precision, is a first transition. The
 	// end is chosen on a whole second so the sub-second variant below lands
@@ -3052,10 +3077,7 @@ func testServer_MuteChat_Lifecycle(t *testing.T, s chat.Store) {
 	until := time.Now().Add(time.Hour).Truncate(time.Second)
 	muted := e.mustMuteChat(e.keys, chatID, muteUntil(until))
 	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
-	want := &chatpb.ViewerState{
-		Settings: &chatpb.ViewerState_Settings{Mute: muteUntil(until)},
-		Version:  1,
-	}
+	want := viewerState(1, muteUntil(until), false)
 	require.NoError(t, protoutil.ProtoEqualError(want, muted.ViewerState))
 
 	// The same state is what a read hydrates onto the chat...
@@ -3076,7 +3098,7 @@ func testServer_MuteChat_Lifecycle(t *testing.T, s chat.Store) {
 	// Indefinite where timed was is a real change.
 	muted = e.mustMuteChat(e.keys, chatID, muteForever())
 	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
-	want = &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{Mute: muteForever()}, Version: 2}
+	want = viewerState(2, muteForever(), false)
 	require.NoError(t, protoutil.ProtoEqualError(want, muted.ViewerState))
 	states = e.waitForViewerStateUpdates(e.userID, chatID, 2)
 	require.NoError(t, protoutil.ProtoEqualError(want, states[1]))
@@ -3084,7 +3106,7 @@ func testServer_MuteChat_Lifecycle(t *testing.T, s chat.Store) {
 	// A clear keeps the record and its version, with no mute under settings.
 	unmuted := e.mustUnmuteChat(e.keys, chatID)
 	require.Equal(t, chatpb.UnmuteChatResponse_OK, unmuted.Result)
-	want = &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{}, Version: 3}
+	want = viewerState(3, nil, false)
 	require.NoError(t, protoutil.ProtoEqualError(want, unmuted.ViewerState))
 	resp = e.getChat(e.keys, chatID)
 	require.NoError(t, protoutil.ProtoEqualError(want, resp.Metadata.ViewerState))
@@ -3114,12 +3136,12 @@ func testServer_MuteChat_Group(t *testing.T, s chat.Store) {
 
 	resp := e.getChat(e.keys, muted)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-	require.Nil(t, resp.Metadata.ViewerState)
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, resp.Metadata.ViewerState))
 
 	until := time.Now().Add(time.Hour).Truncate(time.Second)
 	mutedResp := e.mustMuteChat(e.keys, muted, muteUntil(until))
 	require.Equal(t, chatpb.MuteChatResponse_OK, mutedResp.Result)
-	want := &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{Mute: muteUntil(until)}, Version: 1}
+	want := viewerState(1, muteUntil(until), false)
 	require.NoError(t, protoutil.ProtoEqualError(want, mutedResp.ViewerState))
 
 	// Hydrated onto the record for the viewer who set it...
@@ -3135,13 +3157,13 @@ func testServer_MuteChat_Group(t *testing.T, s chat.Store) {
 		byID[string(md.ChatId.Value)] = md
 	}
 	require.NoError(t, protoutil.ProtoEqualError(want, byID[string(muted.Value)].ViewerState))
-	require.Nil(t, byID[string(quiet.Value)].ViewerState)
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, byID[string(quiet.Value)].ViewerState))
 
-	// The other member reads the same group with no state on it, and hears
-	// nothing on their topic; the chat topic carries nothing either.
+	// The other member reads the same group with the zero state on it, and
+	// hears nothing on their topic; the chat topic carries nothing either.
 	resp = e.getChat(otherKeys, muted)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-	require.Nil(t, resp.Metadata.ViewerState)
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, resp.Metadata.ViewerState))
 	states := e.waitForViewerStateUpdates(e.userID, muted, 1)
 	require.NoError(t, protoutil.ProtoEqualError(want, states[0]))
 	require.Empty(t, e.viewerStateUpdatesOnUserTopic(otherID, muted))
@@ -3149,12 +3171,12 @@ func testServer_MuteChat_Group(t *testing.T, s chat.Store) {
 	// Replace, then clear, as on a DM.
 	mutedResp = e.mustMuteChat(e.keys, muted, muteForever())
 	require.Equal(t, chatpb.MuteChatResponse_OK, mutedResp.Result)
-	want = &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{Mute: muteForever()}, Version: 2}
+	want = viewerState(2, muteForever(), false)
 	require.NoError(t, protoutil.ProtoEqualError(want, mutedResp.ViewerState))
 
 	unmuted := e.mustUnmuteChat(e.keys, muted)
 	require.Equal(t, chatpb.UnmuteChatResponse_OK, unmuted.Result)
-	want = &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{}, Version: 3}
+	want = viewerState(3, nil, false)
 	require.NoError(t, protoutil.ProtoEqualError(want, unmuted.ViewerState))
 	resp = e.getChat(e.keys, muted)
 	require.NoError(t, protoutil.ProtoEqualError(want, resp.Metadata.ViewerState))
@@ -3220,7 +3242,7 @@ func testServer_MuteChat_Gates(t *testing.T, s chat.Store) {
 		require.Equal(t, codes.InvalidArgument, status.Code(err), "mute %v", mute)
 	}
 	got := e.getChat(e.keys, dm)
-	require.Nil(t, got.Metadata.ViewerState)
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, got.Metadata.ViewerState))
 }
 
 func testServer_LeaveChat_ClearsMute(t *testing.T, s chat.Store) {
@@ -3237,15 +3259,16 @@ func testServer_LeaveChat_ClearsMute(t *testing.T, s chat.Store) {
 	// gone, and the caller's other devices are told — a second transition on
 	// the user topic, none on the chat topic, alongside the roster update.
 	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
-	cleared := &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{}, Version: 2}
+	cleared := viewerState(2, nil, false)
 	states := e.waitForViewerStateUpdates(e.userID, chatID, 2)
 	require.NoError(t, protoutil.ProtoEqualError(cleared, states[1]))
 
-	// A departed member reads the group's record with their own state on it.
+	// A departed member reads the group's record with no state on it: the
+	// record persists, but a non-member is shown none of it.
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.Empty(t, resp.Metadata.Members)
-	require.NoError(t, protoutil.ProtoEqualError(cleared, resp.Metadata.ViewerState))
+	require.Nil(t, resp.Metadata.ViewerState)
 
 	// A departed member cannot mute or unmute.
 	denied, err := e.muteChat(e.keys, chatID, muteForever())
@@ -3282,7 +3305,7 @@ func testServer_GetChat_ViewerState_LapsedMuteReturned(t *testing.T, s chat.Stor
 	until := time.Now().Add(time.Second).Truncate(time.Second)
 	muted := e.mustMuteChat(e.keys, chatID, muteUntil(until))
 	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
-	want := &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{Mute: muteUntil(until)}, Version: 1}
+	want := viewerState(1, muteUntil(until), false)
 	require.NoError(t, protoutil.ProtoEqualError(want, muted.ViewerState))
 
 	time.Sleep(1500 * time.Millisecond)
@@ -3293,7 +3316,7 @@ func testServer_GetChat_ViewerState_LapsedMuteReturned(t *testing.T, s chat.Stor
 
 	// Lapsed is still recorded: clearing it is a real transition.
 	unmuted := e.mustUnmuteChat(e.keys, chatID)
-	require.NoError(t, protoutil.ProtoEqualError(&chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{}, Version: 2}, unmuted.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(viewerState(2, nil, false), unmuted.ViewerState))
 }
 
 func testServer_GetDmChatFeed_ViewerState(t *testing.T, s chat.Store) {
@@ -3310,7 +3333,429 @@ func testServer_GetDmChatFeed_ViewerState(t *testing.T, s chat.Store) {
 	for _, md := range resp.Chats {
 		byID[string(md.ChatId.Value)] = md
 	}
-	want := &chatpb.ViewerState{Settings: &chatpb.ViewerState_Settings{Mute: muteForever()}, Version: 1}
+	want := viewerState(1, muteForever(), false)
 	require.NoError(t, protoutil.ProtoEqualError(want, byID[string(mutedDM.Value)].ViewerState))
-	require.Nil(t, byID[string(quietDM.Value)].ViewerState)
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, byID[string(quietDM.Value)].ViewerState))
+}
+
+// putOwnedGroup persists a group the env user created and is a member of,
+// alongside the given others, with the given title and picture (nil for
+// none).
+func (e *serverEnv) putOwnedGroup(title string, pictureBlobID *blobpb.BlobId, others ...*commonpb.UserId) *commonpb.ChatId {
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
+		ID:            chatID,
+		Type:          chatpb.ChatType_GROUP,
+		Members:       append([]*commonpb.UserId{e.userID}, others...),
+		Title:         title,
+		CreatorID:     e.userID,
+		PictureBlobID: pictureBlobID,
+		LastActivity:  at(1),
+	}))
+	return chatID
+}
+
+func (e *serverEnv) editChat(keys model.KeyPair, chatID *commonpb.ChatId, title *string, picture *blobpb.BlobId) (*chatpb.EditChatResponse, error) {
+	req := &chatpb.EditChatRequest{ChatId: chatID}
+	if title != nil {
+		req.Title = &chatpb.EditChatRequest_Title{Value: *title}
+	}
+	if picture != nil {
+		req.Picture = &chatpb.EditChatRequest_Picture{BlobId: picture}
+	}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.EditChat(e.ctx, req)
+}
+
+func (e *serverEnv) mustEditChat(keys model.KeyPair, chatID *commonpb.ChatId, title *string, picture *blobpb.BlobId) *chatpb.EditChatResponse {
+	resp, err := e.editChat(keys, chatID, title, picture)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// metadataUpdatesOnChatTopic returns every MetadataUpdate published on
+// chatID's topic, grouped by the event that carried them, in publish order,
+// paired with the users each event excluded.
+func (e *serverEnv) metadataUpdatesOnChatTopic(chatID *commonpb.ChatId) (updates [][]*chatpb.MetadataUpdate, excludes [][]*commonpb.UserId) {
+	for _, ev := range e.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, chatID.Value) }) {
+		mds := ev.Event.Event.GetChatUpdate().GetMetadataUpdates()
+		if len(mds) == 0 {
+			continue
+		}
+		require.Equal(e.t, chatID.Value, ev.Event.Event.GetChatUpdate().GetChat().GetValue())
+		updates = append(updates, mds)
+		excludes = append(excludes, ev.Event.ExcludeUserIds)
+	}
+	return updates, excludes
+}
+
+// waitForMetadataUpdates waits for at least n events carrying metadata
+// updates on chatID's topic, then asserts, after giving the bus a moment
+// more, that exactly n arrived, each excluding no one, and returns them.
+func (e *serverEnv) waitForMetadataUpdates(chatID *commonpb.ChatId, n int) [][]*chatpb.MetadataUpdate {
+	e.chatObserver.WaitFor(e.t, func([]*event.KeyAndEvent[*commonpb.ChatId, *eventpb.ChatEvent]) bool {
+		updates, _ := e.metadataUpdatesOnChatTopic(chatID)
+		return len(updates) >= n
+	})
+	time.Sleep(100 * time.Millisecond)
+	updates, excludes := e.metadataUpdatesOnChatTopic(chatID)
+	require.Len(e.t, updates, n)
+	for _, ex := range excludes {
+		require.Empty(e.t, ex, "an edit reaches every member, the editor included")
+	}
+	return updates
+}
+
+func testServer_EditChat_Title(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	other, otherKeys := e.addUser()
+	chatID := e.putOwnedGroup("Before", nil, other)
+
+	title := "After"
+	resp := e.mustEditChat(e.keys, chatID, &title, nil)
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.Equal(t, moderationpb.FlaggedCategory_NONE, resp.FlaggedCategory)
+
+	// The response is the record after the edit, as the editor sees it: the
+	// new title, themselves as the hydrated member, and their permissions.
+	md := resp.Chat
+	require.NotNil(t, md)
+	require.Equal(t, chatID.Value, md.ChatId.Value)
+	require.Equal(t, "After", md.Title)
+	require.Nil(t, md.Picture)
+	require.Len(t, md.Members, 1)
+	require.Equal(t, e.userID.Value, md.Members[0].UserId.Value)
+	require.NoError(t, protoutil.ProtoEqualError(viewerState(0, nil, true), md.ViewerState))
+
+	// The title went through the moderator and landed in the store, where
+	// every other member reads it.
+	require.Equal(t, "After", e.moderator.classifiedTitle)
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, "After", stored.Title)
+	require.Equal(t, "After", e.getChat(otherKeys, chatID).Metadata.Title)
+
+	// One event on the chat topic, excluding no one, carrying the title change
+	// alone. Nothing on any user topic.
+	updates := e.waitForMetadataUpdates(chatID, 1)
+	require.Len(t, updates[0], 1)
+	require.Equal(t, "After", updates[0][0].GetTitleChanged().GetNewTitle())
+	require.Empty(t, e.viewerStateUpdatesOnUserTopic(e.userID, chatID))
+	require.Empty(t, e.rosterUpdatesOnUserTopic(e.userID, chatID))
+	require.Empty(t, e.rosterUpdatesOnUserTopic(other, chatID))
+}
+
+func testServer_EditChat_Picture(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	original := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	e.media.setRenditions(original)
+	chatID := e.putOwnedGroup("Group", original, model.MustGenerateUserID())
+
+	replacement := &blobpb.BlobId{Value: []byte("group-picture-02")}
+	renditions := e.media.setAttachable(replacement)
+
+	resp := e.mustEditChat(e.keys, chatID, nil, replacement)
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+
+	// The picture was attached against the group and comes back hydrated with
+	// the full rendition set; the title was left alone.
+	require.Equal(t, replacement.Value, e.media.chatPictures[string(chatID.Value)].GetValue())
+	md := resp.Chat
+	require.Equal(t, "Group", md.Title)
+	require.NotNil(t, md.Picture)
+	require.Len(t, md.Picture.Renditions, len(renditions))
+	require.Equal(t, replacement.Value, md.Picture.Renditions[0].GetBlobId().GetValue())
+	require.NotNil(t, md.Picture.Renditions[0].Blob)
+
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, replacement.Value, stored.PictureBlobID.GetValue())
+	require.Equal(t, "Group", stored.Title)
+
+	// The announcement carries the same hydrated picture, and no title.
+	updates := e.waitForMetadataUpdates(chatID, 1)
+	require.Len(t, updates[0], 1)
+	require.NoError(t, protoutil.ProtoEqualError(md.Picture, updates[0][0].GetPictureChanged().GetNewPicture()))
+
+	// No title was moderated.
+	require.Empty(t, e.moderator.classifiedTitle)
+}
+
+func testServer_EditChat_Both(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	chatID := e.putOwnedGroup("Before", nil)
+	picture := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	e.media.setAttachable(picture)
+
+	title := "After"
+	resp := e.mustEditChat(e.keys, chatID, &title, picture)
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.Equal(t, "After", resp.Chat.Title)
+	require.Equal(t, picture.Value, resp.Chat.GetPicture().GetRenditions()[0].GetBlobId().GetValue())
+
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, "After", stored.Title)
+	require.Equal(t, picture.Value, stored.PictureBlobID.GetValue())
+
+	// One event, one update per field, title first.
+	updates := e.waitForMetadataUpdates(chatID, 1)
+	require.Len(t, updates[0], 2)
+	require.Equal(t, "After", updates[0][0].GetTitleChanged().GetNewTitle())
+	require.NoError(t, protoutil.ProtoEqualError(resp.Chat.Picture, updates[0][1].GetPictureChanged().GetNewPicture()))
+}
+
+func testServer_EditChat_NoOp(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	picture := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	e.media.setRenditions(picture)
+	chatID := e.putOwnedGroup("Same", picture)
+
+	requireUntouched := func() {
+		t.Helper()
+		time.Sleep(100 * time.Millisecond)
+		updates, _ := e.metadataUpdatesOnChatTopic(chatID)
+		require.Empty(t, updates)
+		require.Empty(t, e.moderator.classifiedTitle)
+		require.Empty(t, e.media.chatPictures)
+	}
+
+	// Every field set to what the record holds: OK with the record, nothing
+	// moderated, nothing attached, nothing written or published.
+	title := "Same"
+	resp := e.mustEditChat(e.keys, chatID, &title, picture)
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.Equal(t, "Same", resp.Chat.Title)
+	require.Equal(t, picture.Value, resp.Chat.GetPicture().GetRenditions()[0].GetBlobId().GetValue())
+	require.NoError(t, protoutil.ProtoEqualError(viewerState(0, nil, true), resp.Chat.ViewerState))
+	requireUntouched()
+
+	// A request that sets nothing is the same no-op.
+	resp = e.mustEditChat(e.keys, chatID, nil, nil)
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.Equal(t, "Same", resp.Chat.Title)
+	requireUntouched()
+}
+
+func testServer_EditChat_Denied(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	memberID, memberKeys := e.addUser()
+	_, strangerKeys := e.addUser()
+	owned := e.putOwnedGroup("Owned", nil, memberID)
+
+	title := "Hijacked"
+	requireDenied := func(keys model.KeyPair, chatID *commonpb.ChatId) {
+		t.Helper()
+		resp := e.mustEditChat(keys, chatID, &title, nil)
+		require.Equal(t, chatpb.EditChatResponse_DENIED, resp.Result)
+		require.Nil(t, resp.Chat)
+	}
+
+	// A member who did not create the group, and a non-member.
+	requireDenied(memberKeys, owned)
+	requireDenied(strangerKeys, owned)
+
+	// A DM, the caller's own or anyone's: never editable.
+	requireDenied(e.keys, e.putDM(at(1)))
+	requireDenied(e.keys, putDmChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(1)).ID)
+
+	// A group with no recorded creator has no one who may edit it — not even
+	// a member who was there at creation.
+	requireDenied(e.keys, e.putGroup("Legacy", at(1)))
+
+	// The creator who left edits nothing until they rejoin.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, owned).Result)
+	requireDenied(e.keys, owned)
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, owned).Result)
+	require.Equal(t, chatpb.EditChatResponse_OK, e.mustEditChat(e.keys, owned, &title, nil).Result)
+
+	// Nothing but the last edit reached the store or the moderator.
+	stored, err := s.GetChatByID(e.ctx, owned)
+	require.NoError(t, err)
+	require.Equal(t, "Hijacked", stored.Title)
+	e.waitForMetadataUpdates(owned, 1)
+}
+
+func testServer_EditChat_NotFound(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	title := "Title"
+	resp := e.mustEditChat(e.keys, chat.MustGenerateGroupChatID(), &title, nil)
+	require.Equal(t, chatpb.EditChatResponse_NOT_FOUND, resp.Result)
+	require.Nil(t, resp.Chat)
+	require.Empty(t, e.moderator.classifiedTitle)
+}
+
+func testServer_EditChat_TitleModerated(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	chatID := e.putOwnedGroup("Before", nil)
+	picture := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	e.media.setAttachable(picture)
+
+	// A flagged title refuses the whole edit: the picture sent alongside it is
+	// not attached, and nothing is written or published.
+	e.moderator.titleFlagged = true
+	e.moderator.titleCategories = []string{"gibberish", "solicitation"}
+	title := "DM for signals"
+	resp := e.mustEditChat(e.keys, chatID, &title, picture)
+	require.Equal(t, chatpb.EditChatResponse_TITLE_MODERATED, resp.Result)
+	require.Equal(t, moderationpb.FlaggedCategory_SPAM, resp.FlaggedCategory)
+	require.Nil(t, resp.Chat)
+	require.Empty(t, e.media.chatPictures)
+
+	// The text classifier alone refuses too.
+	e.moderator.titleFlagged = false
+	e.moderator.titleCategories = nil
+	e.moderator.textFlagged = true
+	e.moderator.textCategories = []string{"hate"}
+	resp = e.mustEditChat(e.keys, chatID, &title, nil)
+	require.Equal(t, chatpb.EditChatResponse_TITLE_MODERATED, resp.Result)
+	require.Equal(t, moderationpb.FlaggedCategory_NSFW, resp.FlaggedCategory)
+
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, "Before", stored.Title)
+	require.Nil(t, stored.PictureBlobID)
+	time.Sleep(100 * time.Millisecond)
+	updates, _ := e.metadataUpdatesOnChatTopic(chatID)
+	require.Empty(t, updates)
+}
+
+func testServer_EditChat_PictureNotAccepted(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	chatID := e.putOwnedGroup("Before", nil)
+
+	// A blob the media domain will not attach refuses the whole edit: the
+	// title sent alongside it — already moderated — is not written.
+	title := "After"
+	resp := e.mustEditChat(e.keys, chatID, &title, &blobpb.BlobId{Value: []byte("not-attachable01")})
+	require.Equal(t, chatpb.EditChatResponse_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
+	require.Nil(t, resp.Chat)
+	require.Equal(t, "After", e.moderator.classifiedTitle)
+
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, "Before", stored.Title)
+	require.Nil(t, stored.PictureBlobID)
+
+	// A blob domain that cannot attach at all is the server's fault.
+	picture := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	e.media.setAttachable(picture)
+	e.media.attachErr = errors.New("blob store down")
+	_, err = e.editChat(e.keys, chatID, nil, picture)
+	require.Equal(t, codes.Internal, status.Code(err))
+
+	time.Sleep(100 * time.Millisecond)
+	updates, _ := e.metadataUpdatesOnChatTopic(chatID)
+	require.Empty(t, updates)
+}
+
+func testServer_EditChat_ModerationFailureIsInternal(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	chatID := e.putOwnedGroup("Before", nil)
+	title := "After"
+
+	e.moderator.titleErr = errors.New("classifier down")
+	_, err := e.editChat(e.keys, chatID, &title, nil)
+	require.Equal(t, codes.Internal, status.Code(err))
+
+	e.moderator.titleErr = nil
+	e.moderator.textErr = errors.New("classifier down")
+	_, err = e.editChat(e.keys, chatID, &title, nil)
+	require.Equal(t, codes.Internal, status.Code(err))
+
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, "Before", stored.Title)
+}
+
+// testServer_ViewerState_Permissions pins who is shown what they may do: a
+// member always gets a viewer_state, carrying can_edit for the group's
+// creator alone, on every carrier of the metadata; a non-member gets none,
+// whatever record they hold.
+func testServer_ViewerState_Permissions(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	memberID, memberKeys := e.addUser()
+	strangerID, strangerKeys := e.addUser()
+	owned := e.putOwnedGroup("Owned", nil, memberID)
+	plain := e.putGroup("Plain", at(2), memberID)
+	dm := e.putDMWithPeer(chatpb.ChatType_CONTACT_DM, memberID, at(3))
+
+	canEdit := viewerState(0, nil, true)
+
+	// GetChat: the creator may edit their group and nothing else; another
+	// member and a DM participant may do nothing; a stranger gets no state.
+	require.NoError(t, protoutil.ProtoEqualError(canEdit, e.getChat(e.keys, owned).Metadata.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, e.getChat(e.keys, plain).Metadata.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, e.getChat(e.keys, dm).Metadata.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, e.getChat(memberKeys, owned).Metadata.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, e.getChat(memberKeys, dm).Metadata.ViewerState))
+	require.Nil(t, e.getChat(strangerKeys, owned).Metadata.ViewerState)
+
+	// The feeds carry the same.
+	feed := e.mustGetGroupFeed(&commonpb.QueryOptions{})
+	require.Len(t, feed.Chats, 2)
+	for _, md := range feed.Chats {
+		want := memberViewerState
+		if bytes.Equal(md.ChatId.Value, owned.Value) {
+			want = canEdit
+		}
+		require.NoError(t, protoutil.ProtoEqualError(want, md.ViewerState))
+	}
+	dmFeed := e.getDmFeed(&commonpb.QueryOptions{})
+	require.Len(t, dmFeed.Chats, 1)
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, dmFeed.Chats[0].ViewerState))
+
+	// A mute carries the permissions with it, on the response and the update.
+	muted := e.mustMuteChat(e.keys, owned, muteForever())
+	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
+	want := viewerState(1, muteForever(), true)
+	require.NoError(t, protoutil.ProtoEqualError(want, muted.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(want, e.getChat(e.keys, owned).Metadata.ViewerState))
+	states := e.waitForViewerStateUpdates(e.userID, owned, 1)
+	require.NoError(t, protoutil.ProtoEqualError(want, states[0]))
+
+	// The permissions follow membership: a creator who leaves may do nothing
+	// — the clear on leave says so — and, as a non-member, is shown no state
+	// at all; rejoining restores them at the version the record is at, on the
+	// join's own metadata.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, owned).Result)
+	cleared := viewerState(2, nil, false)
+	states = e.waitForViewerStateUpdates(e.userID, owned, 2)
+	require.NoError(t, protoutil.ProtoEqualError(cleared, states[1]))
+	require.Nil(t, e.getChat(e.keys, owned).Metadata.ViewerState)
+
+	rejoined := e.mustJoinChat(e.keys, owned)
+	require.Equal(t, chatpb.JoinChatResponse_OK, rejoined.Result)
+	restored := viewerState(2, nil, true)
+	require.NoError(t, protoutil.ProtoEqualError(restored, rejoined.Chat.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(restored, e.getChat(e.keys, owned).Metadata.ViewerState))
+	e.waitForRosterUpdates(e.userID, owned, 2)
+	toSelf := e.rosterUpdatesOnUserTopic(e.userID, owned)
+	require.NoError(t, protoutil.ProtoEqualError(restored, toSelf[1].GetMemberJoined().GetMetadata().GetViewerState()))
+
+	// A stranger who joins a group they did not create may do nothing in it.
+	joined := e.mustJoinChat(strangerKeys, plain)
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, joined.Chat.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, e.getChat(strangerKeys, plain).Metadata.ViewerState))
+	require.Empty(t, e.viewerStateUpdatesOnUserTopic(strangerID, plain))
+
+	// A group created through StartChat is its creator's to edit from the
+	// response on.
+	e.fundEnvUser(startChatMinimumBalance)
+	created := e.mustStartGroupChat(e.keys, groupParams("Created"))
+	require.Equal(t, chatpb.StartChatResponse_OK, created.Result)
+	require.NoError(t, protoutil.ProtoEqualError(canEdit, created.Chat.ViewerState))
+	title := "Created, Edited"
+	require.Equal(t, chatpb.EditChatResponse_OK, e.mustEditChat(e.keys, created.Chat.ChatId, &title, nil).Result)
 }

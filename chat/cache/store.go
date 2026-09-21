@@ -55,6 +55,10 @@ func (c *Cache) SetGroupPicture(ctx context.Context, chatID *commonpb.ChatId, bl
 	return c.db.SetGroupPicture(ctx, chatID, blobID)
 }
 
+func (c *Cache) EditGroup(ctx context.Context, chatID *commonpb.ChatId, edit chat.GroupEdit) error {
+	return c.db.EditGroup(ctx, chatID, edit)
+}
+
 func (c *Cache) GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*chat.Chat, error) {
 	return c.db.GetChatByID(ctx, chatID)
 }

@@ -619,6 +619,44 @@ func (s *store) SetGroupPicture(ctx context.Context, chatID *commonpb.ChatId, bl
 	return nil
 }
 
+// EditGroup is one update of the canonical item that SETs exactly the
+// attributes the edit names, so two edits of different fields never clobber
+// each other, conditioned on the item existing as SetGroupPicture is.
+func (s *store) EditGroup(ctx context.Context, chatID *commonpb.ChatId, edit chat.GroupEdit) error {
+	if !chat.IsGroupChatID(chatID) {
+		return fmt.Errorf("not a group chat id")
+	}
+	if edit.IsEmpty() {
+		return fmt.Errorf("edit names nothing")
+	}
+
+	var sets []string
+	values := make(map[string]types.AttributeValue)
+	if edit.Title != nil {
+		sets = append(sets, fmt.Sprintf("%s = :title", attrTitle))
+		values[":title"] = avS(*edit.Title)
+	}
+	if edit.PictureBlobID != nil {
+		sets = append(sets, fmt.Sprintf("%s = :picture", attrPictureBlobID))
+		values[":picture"] = avB(edit.PictureBlobID.Value)
+	}
+
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(s.chatsTable),
+		Key:                       map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
+		UpdateExpression:          aws.String("SET " + strings.Join(sets, ", ")),
+		ConditionExpression:       aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
+		ExpressionAttributeValues: values,
+	})
+	if err != nil {
+		if isConditionalCheckFailed(err) {
+			return chat.ErrChatNotFound
+		}
+		return err
+	}
+	return nil
+}
+
 // GetChatByID is a single point read of the canonical chats item. A group's
 // membership lives in group_members and is deliberately not joined in here:
 // enumerating it is a paged query, and no metadata read should pay for it

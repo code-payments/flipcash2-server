@@ -171,6 +171,12 @@ type Server struct {
 	// requireStaffForGroupManagementRPC).
 	requireStaffForGroupManagement bool
 
+	// disableGetRoster turns the GetRoster RPC off when set: every call is
+	// refused with UNAVAILABLE before anything is read (see roster.go). It is
+	// an operator's switch on the one read that walks a whole roster, so the
+	// read can be withdrawn without a deploy if it proves too costly.
+	disableGetRoster bool
+
 	// maxGroupFeedChats is the most group chats a user's feed may hold (see
 	// feed.go). It is the package constant of the same name in production;
 	// tests lower it to exercise the refusal without thousands of groups.
@@ -204,6 +210,7 @@ func NewServer(
 	chatEventBus ChatEventPublisher,
 
 	requireStaffForGroupManagement bool,
+	disableGetRoster bool,
 ) *Server {
 	return &Server{
 		log: log,
@@ -225,6 +232,7 @@ func NewServer(
 		chatEventBus: chatEventBus,
 
 		requireStaffForGroupManagement: requireStaffForGroupManagement,
+		disableGetRoster:               disableGetRoster,
 
 		maxGroupFeedChats:  maxGroupFeedChats,
 		rosterWholeReadCap: rosterWholeReadCap,

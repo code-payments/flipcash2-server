@@ -64,6 +64,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetRoster_Paging,
 		testServer_GetRoster_Dm,
 		testServer_GetRoster_Gates,
+		testServer_GetRoster_Disabled,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
 		testServer_GetDmChatFeed_Paging,
@@ -145,7 +146,17 @@ type serverEnv struct {
 	keys   model.KeyPair
 }
 
+// serverConfig is the configuration a test env's server is built with; the
+// zero value is what every test gets unless it asks otherwise.
+type serverConfig struct {
+	disableGetRoster bool
+}
+
 func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
+	return newServerEnvWithConfig(t, s, serverConfig{})
+}
+
+func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serverEnv {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
@@ -171,7 +182,7 @@ func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
 	media := newFakeMedia()
 	moderator := &fakeModerator{}
 	access := chat.NewAccess(s, chat.NewRuleEvaluator(accounts, balances, s))
-	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, access, userBus, chatBus, false)
+	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, access, userBus, chatBus, false, cfg.disableGetRoster)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
@@ -984,6 +995,27 @@ func testServer_GetRoster_Gates(t *testing.T, s chat.Store) {
 	resp = e.mustGetRoster(e.keys, gated.ID, nil)
 	require.Equal(t, chatpb.GetRosterResponse_OK, resp.Result)
 	require.Equal(t, [][]byte{founder.Value}, memberUserIDs(resp.Members))
+}
+
+// testServer_GetRoster_Disabled pins the operator's switch: with GetRoster
+// disabled, a member of a group they could otherwise read is refused with
+// UNAVAILABLE, as is a DM's participant and a caller naming a chat that does
+// not exist — the switch is checked before any read, so it answers the same
+// whatever the chat. A request that fails authorization is still refused on
+// that ground first: the switch is behind the authorizer, not in front of it.
+func testServer_GetRoster_Disabled(t *testing.T, s chat.Store) {
+	e := newServerEnvWithConfig(t, s, serverConfig{disableGetRoster: true})
+
+	group := e.putGroup("Group", at(1))
+	dm := e.putDM(at(1))
+
+	for _, chatID := range []*commonpb.ChatId{group, dm, chat.MustGenerateGroupChatID()} {
+		_, err := e.getRoster(e.keys, chatID, nil)
+		require.Equal(t, codes.Unavailable, status.Code(err))
+	}
+
+	_, err := e.client.GetRoster(e.ctx, &chatpb.GetRosterRequest{ChatId: group})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
 func testServer_GetDmChatFeed_Empty(t *testing.T, s chat.Store) {

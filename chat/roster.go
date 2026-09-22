@@ -57,6 +57,12 @@ import (
 // listener rules admit, evaluated through the shared Access with the usual
 // admission cache. A viewer who may only preview the chat is denied — a
 // roster is not a shape.
+//
+// The whole RPC can be switched off by configuration (see
+// Server.disableGetRoster): every call is then refused with UNAVAILABLE once
+// the caller is authorized and before any read, so a client that handles the
+// code as a transient condition falls back to the roster it holds from
+// Metadata and the RosterUpdates it has seen.
 
 const (
 	// maxGetRosterPageSize bounds a single GetRoster page and is its
@@ -84,6 +90,10 @@ func (s *Server) GetRoster(ctx context.Context, req *chatpb.GetRosterRequest) (*
 	}
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
+
+	if s.disableGetRoster {
+		return nil, status.Error(codes.Unavailable, "roster reads are disabled")
+	}
 
 	limit := maxGetRosterPageSize
 	if pageSize := req.GetQueryOptions().GetPageSize(); pageSize > 0 && int(pageSize) < limit {

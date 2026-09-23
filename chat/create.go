@@ -275,7 +275,7 @@ func (s *Server) moderateTitle(ctx context.Context, log *zap.Logger, title strin
 		if result == nil || !result.Flagged {
 			continue
 		}
-		log.With(zap.Strings("categories", result.FlaggedCategories)).Info("Chat title is flagged")
+		log.With(zap.String("title", title), zap.Strings("categories", result.FlaggedCategories)).Info("Chat title is flagged")
 		return true, moderation.HighestFlaggedCategory(result), nil
 	}
 	return false, moderationpb.FlaggedCategory_NONE, nil

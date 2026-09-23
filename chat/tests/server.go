@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
@@ -60,6 +61,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_Group_MembershipLifecycle,
 		testServer_GetChat_Group_NonMember,
 		testServer_GetChat_ViewMode,
+		testServer_GetChat_Unauthenticated,
 		testServer_GetRoster_Group,
 		testServer_GetRoster_Paging,
 		testServer_GetRoster_Dm,
@@ -615,6 +617,13 @@ func (e *serverEnv) getChatWithMode(keys model.KeyPair, chatID *commonpb.ChatId,
 	req := &chatpb.GetChatRequest{ChatId: chatID, ViewMode: mode}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	resp, err := e.client.GetChat(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// getPublicChat asks for a chat with no auth at all (see chat.Server.GetChat).
+func (e *serverEnv) getPublicChat(chatID *commonpb.ChatId, mode messagingpb.ViewMode) *chatpb.GetChatResponse {
+	resp, err := e.client.GetChat(e.ctx, &chatpb.GetChatRequest{ChatId: chatID, ViewMode: mode})
 	require.NoError(e.t, err)
 	return resp
 }
@@ -1669,6 +1678,96 @@ func testServer_GetChat_ViewMode(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.True(t, resp.Metadata.LastMessage.Redacted)
 	require.NotEqual(t, "just us", resp.Metadata.LastMessage.Content[0].GetText().GetText())
+}
+
+// testServer_GetChat_Unauthenticated: a request with no auth gets a group's
+// public view under REDACTED — what a registered non-member previewing it
+// gets, with no per-viewer fields — and DENIED under any other mode or for a
+// DM, whether or not the DM exists.
+func testServer_GetChat_Unauthenticated(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	founder := model.MustGenerateUserID()
+	group := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{founder},
+		Title:                  "Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: 100},
+		LastActivity:           at(1),
+		LastMessageID:          &messagingpb.MessageId{Value: 7},
+	}
+	require.NoError(t, s.PutChat(e.ctx, group))
+	key := string(group.ID.Value)
+	const secret = "meet at the old bank at six"
+	e.messaging.lastMessages[key] = textMessage(7, founder, secret)
+	e.messaging.latestEventSeqs[key] = 9
+
+	// The public view matches a registered non-member's REDACTED read, bar
+	// the per-viewer fields, which it never carries.
+	public := e.getPublicChat(group.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, public.Result)
+	md := public.Metadata
+	require.Equal(t, "Whales", md.Title)
+	require.Len(t, md.GetRules().GetListener(), 1)
+	require.Empty(t, md.Members)
+	require.Nil(t, md.ViewerState)
+	require.False(t, md.IsHidden)
+	require.NotNil(t, md.LastMessage)
+	require.True(t, md.LastMessage.Redacted)
+	require.NotEqual(t, secret, md.LastMessage.Content[0].GetText().GetText())
+	require.Equal(t, uint64(9), md.LatestEventSequence)
+	require.Zero(t, e.messaging.pointerLookups[key])
+
+	registered := e.getChatWithMode(e.keys, group.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, registered.Result)
+	require.True(t, proto.Equal(registered.Metadata, md))
+
+	// Any other mode is refused.
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED} {
+		resp := e.getPublicChat(group.ID, mode)
+		require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result, mode)
+		require.Nil(t, resp.Metadata)
+	}
+
+	// A group with no listener rules is its record alone.
+	open := &chat.Chat{
+		ID:            chat.MustGenerateGroupChatID(),
+		Type:          chatpb.ChatType_GROUP,
+		Members:       []*commonpb.UserId{founder},
+		Title:         "Legacy",
+		LastActivity:  at(1),
+		LastMessageID: &messagingpb.MessageId{Value: 2},
+	}
+	require.NoError(t, s.PutChat(e.ctx, open))
+	e.messaging.lastMessages[string(open.ID.Value)] = textMessage(2, founder, "members only")
+	e.messaging.latestEventSeqs[string(open.ID.Value)] = 2
+	resp := e.getPublicChat(open.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Equal(t, "Legacy", resp.Metadata.Title)
+	require.Nil(t, resp.Metadata.LastMessage)
+	require.Zero(t, resp.Metadata.LatestEventSequence)
+
+	// A missing group is NOT_FOUND.
+	resp = e.getPublicChat(chat.MustGenerateGroupChatID(), messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_NOT_FOUND, resp.Result)
+
+	// A DM is DENIED under every mode, existing or not.
+	dm := generateDmChatID()
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
+		ID:            dm,
+		Type:          chatpb.ChatType_CONTACT_DM,
+		Members:       []*commonpb.UserId{e.userID, model.MustGenerateUserID()},
+		LastActivity:  at(1),
+		LastMessageID: &messagingpb.MessageId{Value: 1},
+	}))
+	for _, id := range []*commonpb.ChatId{dm, generateDmChatID()} {
+		for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+			resp = e.getPublicChat(id, mode)
+			require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result, mode)
+			require.Nil(t, resp.Metadata)
+		}
+	}
 }
 
 func testServer_GetDmChatFeed_TypeScoped(t *testing.T, s chat.Store) {

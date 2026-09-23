@@ -266,6 +266,20 @@ func (a *Access) StandingWithChat(ctx context.Context, c *Chat, userID *commonpb
 	})
 }
 
+// PublicStanding is the standing of a viewer who is no one — an
+// unauthenticated read of a chat's public view (see chat.Server.GetChat) —
+// towards the chat whose canonical record the caller holds. They are on no
+// roster and satisfy no rule, so they stand exactly where a registered
+// non-member reading under REDACTED does: a group that carries a listener
+// rule may be previewed, and nothing else admits them in any form. Nothing
+// is read: the rules come off the record.
+func (a *Access) PublicStanding(c *Chat) Standing {
+	if !IsGroupChatID(c.ID) || len(c.Rules().GetListener()) == 0 {
+		return Standing{}
+	}
+	return Standing{CanPreview: true}
+}
+
 // IsMemberWithChat is IsMember for a caller already holding the chat's
 // canonical record: a DM is answered off the record, a group from the store
 // (see StandingWithChat).

@@ -301,6 +301,167 @@ func TestCache_GettersSeedWatermark(t *testing.T) {
 	})
 }
 
+// countingPointers is a real in-memory messaging.Store that counts
+// AdvancePointer calls, so a test can assert which advances were answered from
+// the pointer bound cache versus the backing store.
+type countingPointers struct {
+	messaging.Store
+
+	mu           sync.Mutex
+	advanceCalls int
+}
+
+func newCountingPointers() *countingPointers {
+	return &countingPointers{Store: memory.NewInMemory()}
+}
+
+func (s *countingPointers) AdvancePointer(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	userID *commonpb.UserId,
+	pointerType messagingpb.Pointer_Type,
+	newValue *messagingpb.MessageId,
+) (*messagingpb.Pointer, bool, error) {
+	s.mu.Lock()
+	s.advanceCalls++
+	s.mu.Unlock()
+	return s.Store.AdvancePointer(ctx, chatID, userID, pointerType, newValue)
+}
+
+func (s *countingPointers) advanceCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.advanceCalls
+}
+
+// newPointerChat creates a chat in the backing store to hold pointers: the
+// in-memory store keeps no pointers for a chat with no messages.
+func newPointerChat(t *testing.T, ctx context.Context, backing messaging.Store) *commonpb.ChatId {
+	t.Helper()
+	chatID := generateChatID()
+	putMessage(t, ctx, backing, chatID)
+	return chatID
+}
+
+// advance advances a pointer through s and returns whether it moved.
+func advance(t *testing.T, ctx context.Context, s messaging.Store, chatID *commonpb.ChatId, userID *commonpb.UserId, pointerType messagingpb.Pointer_Type, value uint64) bool {
+	t.Helper()
+	pointer, advanced, err := s.AdvancePointer(ctx, chatID, userID, pointerType, &messagingpb.MessageId{Value: value})
+	require.NoError(t, err)
+	if advanced {
+		require.EqualValues(t, value, pointer.Value.Value)
+	} else {
+		require.Nil(t, pointer)
+	}
+	return advanced
+}
+
+func TestCache_AdvancePointer_NoOpServedFromBoundAfterAdvance(t *testing.T) {
+	ctx := context.Background()
+	backing := newCountingPointers()
+	c := cache.NewInCache(backing)
+	chatID, userID := newPointerChat(t, ctx, backing), generateUserID()
+
+	require.True(t, advance(t, ctx, c, chatID, userID, messagingpb.Pointer_READ, 3))
+	require.Equal(t, 1, backing.advanceCallCount())
+
+	// The same value and anything below it are no-ops answered from the bound.
+	require.False(t, advance(t, ctx, c, chatID, userID, messagingpb.Pointer_READ, 3))
+	require.False(t, advance(t, ctx, c, chatID, userID, messagingpb.Pointer_READ, 1))
+	require.Equal(t, 1, backing.advanceCallCount())
+
+	// A forward advance reaches the store and raises the bound.
+	require.True(t, advance(t, ctx, c, chatID, userID, messagingpb.Pointer_READ, 5))
+	require.False(t, advance(t, ctx, c, chatID, userID, messagingpb.Pointer_READ, 4))
+	require.Equal(t, 2, backing.advanceCallCount())
+}
+
+// TestCache_AdvancePointer_StoreNoOpRaisesBound covers a pointer advanced
+// elsewhere (another server instance): the first stale advance reaches the
+// store and fails there, and raises the bound so the next one does not.
+func TestCache_AdvancePointer_StoreNoOpRaisesBound(t *testing.T) {
+	ctx := context.Background()
+	backing := newCountingPointers()
+	c := cache.NewInCache(backing)
+	chatID, userID := newPointerChat(t, ctx, backing), generateUserID()
+
+	require.True(t, advance(t, ctx, backing, chatID, userID, messagingpb.Pointer_READ, 5))
+
+	require.False(t, advance(t, ctx, c, chatID, userID, messagingpb.Pointer_READ, 3))
+	require.Equal(t, 2, backing.advanceCallCount())
+
+	require.False(t, advance(t, ctx, c, chatID, userID, messagingpb.Pointer_READ, 3))
+	require.Equal(t, 2, backing.advanceCallCount())
+
+	// The bound is 3, not the stored 5: the store's no-op confirms only that
+	// the pointer is at or past the value asked for. A value between the two
+	// reaches the store, which rejects it.
+	require.False(t, advance(t, ctx, c, chatID, userID, messagingpb.Pointer_READ, 4))
+	require.Equal(t, 3, backing.advanceCallCount())
+}
+
+func TestCache_AdvancePointer_KeyedByChatMemberAndType(t *testing.T) {
+	ctx := context.Background()
+	backing := newCountingPointers()
+	c := cache.NewInCache(backing)
+	chatA, chatB := newPointerChat(t, ctx, backing), newPointerChat(t, ctx, backing)
+	userA, userB := generateUserID(), generateUserID()
+
+	require.True(t, advance(t, ctx, c, chatA, userA, messagingpb.Pointer_READ, 5))
+
+	// A bound covers only its own (chat, member, type): each of these is a real
+	// advance that reaches the store.
+	require.True(t, advance(t, ctx, c, chatA, userA, messagingpb.Pointer_DELIVERED, 3))
+	require.True(t, advance(t, ctx, c, chatA, userB, messagingpb.Pointer_READ, 3))
+	require.True(t, advance(t, ctx, c, chatB, userA, messagingpb.Pointer_READ, 3))
+	require.Equal(t, 4, backing.advanceCallCount())
+}
+
+func TestCache_AdvancePointer_GettersSeedBound(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("GetPointers", func(t *testing.T) {
+		backing := newCountingPointers()
+		c := cache.NewInCache(backing)
+		chatID, userID := newPointerChat(t, ctx, backing), generateUserID()
+
+		// Seed through the backing store directly, so the getter under test is
+		// the only thing that can set the bound.
+		require.True(t, advance(t, ctx, backing, chatID, userID, messagingpb.Pointer_READ, 4))
+		require.True(t, advance(t, ctx, backing, chatID, userID, messagingpb.Pointer_DELIVERED, 6))
+
+		_, err := c.GetPointers(ctx, chatID)
+		require.NoError(t, err)
+
+		require.False(t, advance(t, ctx, c, chatID, userID, messagingpb.Pointer_READ, 4))
+		require.False(t, advance(t, ctx, c, chatID, userID, messagingpb.Pointer_DELIVERED, 6))
+		require.Equal(t, 2, backing.advanceCallCount())
+	})
+
+	t.Run("GetPointersForChats", func(t *testing.T) {
+		backing := newCountingPointers()
+		c := cache.NewInCache(backing)
+		chatA, chatB := newPointerChat(t, ctx, backing), newPointerChat(t, ctx, backing)
+		userID := generateUserID()
+
+		require.True(t, advance(t, ctx, backing, chatA, userID, messagingpb.Pointer_READ, 2))
+		require.True(t, advance(t, ctx, backing, chatB, userID, messagingpb.Pointer_READ, 7))
+
+		_, err := c.GetPointersForChats(ctx, []messaging.PointerRef{
+			{ChatID: chatA, Members: []*commonpb.UserId{userID}},
+			{ChatID: chatB, Members: []*commonpb.UserId{userID}},
+		})
+		require.NoError(t, err)
+
+		// Each chat's bound was seeded from its own pointer.
+		require.False(t, advance(t, ctx, c, chatA, userID, messagingpb.Pointer_READ, 2))
+		require.False(t, advance(t, ctx, c, chatB, userID, messagingpb.Pointer_READ, 7))
+		require.Equal(t, 2, backing.advanceCallCount())
+		require.True(t, advance(t, ctx, c, chatA, userID, messagingpb.Pointer_READ, 3))
+		require.Equal(t, 3, backing.advanceCallCount())
+	})
+}
+
 func putMessage(t *testing.T, ctx context.Context, s messaging.Store, chatID *commonpb.ChatId) *messaging.Message {
 	t.Helper()
 	msg, _, err := s.PutMessage(ctx, chatID, nil, []*messagingpb.Content{textContent("hi")}, time.Unix(0, 0), generateClientID(), true)
@@ -326,4 +487,12 @@ func generateChatID() *commonpb.ChatId {
 		panic(err)
 	}
 	return &commonpb.ChatId{Value: b}
+}
+
+func generateUserID() *commonpb.UserId {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return &commonpb.UserId{Value: b}
 }

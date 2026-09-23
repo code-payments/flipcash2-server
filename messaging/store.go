@@ -234,10 +234,12 @@ type Store interface {
 
 	// AdvancePointer moves a member's pointer of the given type forward to
 	// newValue. Pointers are monotonic: a request to move a pointer to a value
-	// at or before its current value is a no-op. It always returns the pointer's
-	// current state (carrying its last-advanced ts), whether or not this call
-	// moved it; the bool reports whether it advanced. The pointer is nil only
-	// alongside a non-nil error.
+	// at or before its current value is a no-op. The bool reports whether this
+	// call moved the pointer; when it did, the returned pointer is the new state
+	// (newValue, carrying this advance's ts). On a no-op the pointer is nil: the
+	// stored state is not read back, so an implementation (see messaging/cache)
+	// may answer a no-op without reaching storage at all. Callers act on a
+	// pointer only when it advanced.
 	//
 	// It does not verify that newValue references an existing message. Callers
 	// with a caller-supplied newValue must check existence first (see

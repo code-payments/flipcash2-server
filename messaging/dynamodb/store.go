@@ -1143,24 +1143,14 @@ func (s *store) AdvancePointer(
 			":v":  avN(newValue.Value),
 			":ts": avN(uint64(now.UnixNano())),
 		},
-		// On a no-op (the pointer is already at/past newValue) return the existing
-		// item so the caller still gets the current pointer state without a second
-		// read.
-		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 	})
 	if err != nil {
 		var ccf *types.ConditionalCheckFailedException
 		if errors.As(err, &ccf) {
-			// Not advanced (already at or past newValue); reconstruct from the
-			// item that failed the condition. It must carry the pair — the
-			// condition can only fail on a stored value — so its absence is an
-			// integrity error rather than a nil pointer, which the Store contract
-			// returns only alongside an error.
-			p := pointerFromAttrs(ccf.Item, userID, pointerType, valAttr, tsAttr)
-			if p == nil {
-				return nil, false, fmt.Errorf("pointer %s for user %x rejected as a no-op but has no stored value", pointerType, userID.Value)
-			}
-			return p, false, nil
+			// Not advanced: the pointer is already at or past newValue. The
+			// Store contract returns no pointer for a no-op, so the old item is
+			// not asked for.
+			return nil, false, nil
 		}
 		return nil, false, err
 	}

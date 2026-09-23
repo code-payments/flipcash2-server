@@ -811,21 +811,25 @@ func testStore_Pointers_Shape(t *testing.T, s messaging.Store, chatID *commonpb.
 	require.NotNil(t, pointer.Ts)
 	advancedTs := pointer.Ts.AsTime()
 
-	// Moving backward is a no-op, but the current pointer (still at 3) is
-	// returned — with the timestamp of the advance that put it there, not the
-	// no-op's.
+	// Moving backward is a no-op, which returns no pointer.
 	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 2})
 	require.NoError(t, err)
 	require.False(t, advanced)
-	require.EqualValues(t, 3, pointer.Value.Value)
-	require.True(t, pointer.Ts.AsTime().Equal(advancedTs))
+	require.Nil(t, pointer)
 
 	// Moving to the same value is a no-op.
 	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 3})
 	require.NoError(t, err)
 	require.False(t, advanced)
-	require.EqualValues(t, 3, pointer.Value.Value)
-	require.True(t, pointer.Ts.AsTime().Equal(advancedTs))
+	require.Nil(t, pointer)
+
+	// Neither no-op touched the stored pointer: it is still at 3, with the
+	// timestamp of the advance that put it there.
+	pointers, err = s.GetPointers(ctx, chatID)
+	require.NoError(t, err)
+	require.Len(t, pointers, 1)
+	require.EqualValues(t, 3, pointers[0].Value.Value)
+	require.True(t, pointers[0].Ts.AsTime().Equal(advancedTs))
 
 	// Forward advances.
 	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 5})
@@ -898,11 +902,11 @@ func testStore_AdvancePointer_NoExistenceCheck_Shape(t *testing.T, s messaging.S
 	require.EqualValues(t, 2, pointer.Value.Value)
 	require.NotNil(t, pointer.Ts)
 
-	// Backward is a no-op, but the current pointer (still at 2) is returned.
+	// Backward is a no-op, which returns no pointer.
 	pointer, advanced, err = s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
 	require.False(t, advanced)
-	require.EqualValues(t, 2, pointer.Value.Value)
+	require.Nil(t, pointer)
 
 	pointers, err := s.GetPointers(ctx, chatID)
 	require.NoError(t, err)

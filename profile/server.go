@@ -161,7 +161,7 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 				continue
 			}
 
-			log.Info("Display name is flagged", zap.Strings("categories", result.FlaggedCategories))
+			log.Info("Display name is flagged", zap.String("display_name", req.DisplayName), zap.Strings("categories", result.FlaggedCategories))
 			return &profilepb.SetDisplayNameResponse{
 				Result:          profilepb.SetDisplayNameResponse_FAILED_MODERATED,
 				FlaggedCategory: moderation.HighestFlaggedCategory(result),
@@ -296,7 +296,7 @@ func (s *Server) SetUsername(ctx context.Context, req *profilepb.SetUsernameRequ
 				continue
 			}
 
-			log.Info("Username is flagged", zap.Strings("categories", result.FlaggedCategories))
+			log.Info("Username is flagged", zap.String("username", req.Username.Value), zap.Strings("categories", result.FlaggedCategories))
 			return &profilepb.SetUsernameResponse{
 				Result:          profilepb.SetUsernameResponse_FAILED_MODERATED,
 				FlaggedCategory: moderation.HighestFlaggedCategory(result),

@@ -274,7 +274,14 @@ func NewServer(
 // on media in a message they previewed, is denied; that is accepted, since a
 // non-member's read access is short-lived by nature and the URLs hydrated here
 // and on the messages are what a previewing client renders from.
+//
+// Auth is optional. A request without it asks for the chat's public view (see
+// getPublicChat).
 func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chatpb.GetChatResponse, error) {
+	if req.Auth == nil {
+		return s.getPublicChat(ctx, req)
+	}
+
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
 		return nil, err
@@ -309,6 +316,43 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 	}
 
 	metadata, err := s.hydrate(ctx, userID, standing, standing.Reading(req.GetViewMode()), []*Chat{c})
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	return &chatpb.GetChatResponse{
+		Result:   chatpb.GetChatResponse_OK,
+		Metadata: metadata[0],
+	}, nil
+}
+
+// getPublicChat is GetChat for an unauthenticated caller: the chat's public
+// view, which is what a registered non-member previewing the group gets under
+// REDACTED (see Access.PublicStanding) — the record, and the redacted
+// messaging state when the group carries a listener rule — with none of the
+// per-viewer fields, since there is no viewer: no hydrated member, no
+// is_hidden, no viewer_state. It is REDACTED or nothing: any other mode is
+// DENIED, as is a DM, before anything is read, so an anonymous caller cannot
+// learn whether a DM exists.
+func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) (*chatpb.GetChatResponse, error) {
+	if req.GetViewMode() != messagingpb.ViewMode_REDACTED || !IsGroupChatID(req.ChatId) {
+		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
+	}
+
+	log := s.log.With(zap.String("chat_id", base64.StdEncoding.EncodeToString(req.ChatId.Value)))
+
+	c, err := s.chats.GetChatByID(ctx, req.ChatId)
+	switch {
+	case errors.Is(err, ErrChatNotFound):
+		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_NOT_FOUND}, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure getting chat")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	standing := s.access.PublicStanding(c)
+	metadata, err := s.hydrate(ctx, nil, standing, standing.Reading(req.GetViewMode()), []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
 		return nil, status.Error(codes.Internal, "")
@@ -377,6 +421,10 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 // member who is not the viewer) is on the viewer's blocklist. Every DM peer
 // across the set is resolved against the viewer's blocklist in one batched read.
 //
+// The viewer is nil for an unauthenticated read (see getPublicChat): its
+// standing is never a member's and it is never shown a DM, so no per-viewer
+// state is read on its behalf.
+//
 // viewer_state is per-viewer too, and a member's alone: it is what the chat
 // holds about the viewer (see ViewerState) plus what they may do in it, and
 // a non-member may do nothing and has no standing to see what the record
@@ -444,7 +492,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		}
 		if IsDmChatType(c.Type) {
 			for _, m := range c.Members {
-				if !bytes.Equal(m.Value, viewerID.Value) {
+				if !bytes.Equal(m.Value, viewerID.GetValue()) {
 					dmPeerByChat[string(c.ID.Value)] = m
 					uniquePeerIDs[string(m.Value)] = m
 					break
@@ -521,10 +569,12 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		publicProfilesByUserId, err = s.profiles.GetPublicProfiles(gctx, userIDs)
 		return err
 	})
-	g.Go(func() (err error) {
-		blockedPeers, err = s.blocklist.GetBlocked(gctx, viewerID, peerIDs)
-		return err
-	})
+	if len(peerIDs) > 0 {
+		g.Go(func() (err error) {
+			blockedPeers, err = s.blocklist.GetBlocked(gctx, viewerID, peerIDs)
+			return err
+		})
+	}
 	if standing.IsMember {
 		g.Go(func() (err error) {
 			viewerStates, err = s.chats.GetViewerStates(gctx, viewerID, chatIDs)

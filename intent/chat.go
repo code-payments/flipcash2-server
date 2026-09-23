@@ -242,12 +242,17 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 // Whether the payment is a tip or a send decides which rules apply — that is
 // the payment's action, or the default for its location where the action is
 // unset (see GetDmPaymentVerb). A tip is what initializes the DM, so it may
-// target a chat that doesn't exist yet, and it must meet the per-currency
-// minimum. When it is the tip that initializes the chat, it must also meet the
-// recipient's minimum DM chat initialization fee, where they have set one. A
-// send has no minimum, but the chat must already be initialized — a send is
-// made from within the chat, and the client can only be inside a chat that
-// exists, so a send into one that doesn't is denied.
+// target a chat that doesn't exist yet. Only the tip that initializes the chat
+// is held to a floor: the recipient's minimum DM chat initialization fee where
+// they have set one, the per-currency preset minimum otherwise. The fee is
+// what the recipient asks of anyone reaching them for the first time, and it
+// can be no lower than its own currency's preset minimum
+// (profile.ValidateMinDmChatInitFee), so it stands in for the preset rather
+// than stacking on it. Once the chat exists the gate has been paid, and every
+// later payment into it, tip or send, may be any amount. A send has no
+// minimum, but the chat must already be initialized — a send is made from
+// within the chat, and the client can only be inside a chat that exists, so a
+// send into one that doesn't is denied.
 func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
 	chatMetadata := appMetadata.GetChat()
 	tipDmPayment := chatMetadata.GetTipDmPayment()
@@ -256,12 +261,6 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 	}
 
 	isTip := GetDmPaymentVerb(intentRecord.AppMetadata) == messagingpb.CashContent_TIPPED
-
-	if isTip {
-		if err := validateMinimumTipAmount(intentRecord.SendPublicPaymentMetadata); err != nil {
-			return err
-		}
-	}
 
 	senderUserID, recipientUserID, err := i.resolveDirectDmPaymentParties(ctx, intentRecord, "tip dm")
 	if err != nil {
@@ -281,8 +280,8 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 	_, err = i.chats.GetChatByID(ctx, expectedChatID)
 	switch {
 	case err == nil:
-		// An initialized chat has already had its fee paid: sends are any
-		// amount, and tips are held to the preset minimum checked above.
+		// An initialized chat has already had its gate paid: tips and sends
+		// alike are any amount.
 		return nil
 	case errors.Is(err, chat.ErrChatNotFound):
 	default:
@@ -294,22 +293,31 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 	}
 
 	// This tip is what initializes the chat, so it must clear whatever the
-	// recipient asks of anyone reaching them for the first time.
+	// recipient asks of anyone reaching them for the first time: their fee
+	// where they have set one, the preset minimum otherwise.
+	var fee *commonpb.FiatPaymentAmount
 	recipientProfile, err := i.profiles.GetProfile(ctx, recipientUserID, false)
-	if errors.Is(err, profile.ErrNotFound) {
-		// A user the profile store doesn't know has set nothing, so only the
-		// preset minimum applies.
-		return nil
-	} else if err != nil {
+	switch {
+	case err == nil:
+		fee = recipientProfile.MinDmChatInitFee
+	case errors.Is(err, profile.ErrNotFound):
+		// A user the profile store doesn't know has set nothing.
+	default:
 		return err
 	}
 
-	return i.validateMinDmChatInitFee(ctx, intentRecord.SendPublicPaymentMetadata, recipientProfile.MinDmChatInitFee)
+	if fee == nil {
+		return validateMinimumTipAmount(intentRecord.SendPublicPaymentMetadata)
+	}
+	return i.validateMinDmChatInitFee(ctx, intentRecord.SendPublicPaymentMetadata, fee)
 }
 
 // validateMinDmChatInitFee enforces the recipient's minimum DM chat
-// initialization fee, if they have set one, on the payment initializing the
-// chat. A payment in the fee's currency is compared as is. Any other payment
+// initialization fee on the payment initializing the chat. The fee is the
+// only floor on that payment — the preset minimum of the payment's currency is
+// not applied beside it — so a tip that clears the fee is accepted even where
+// it would fall under its own currency's preset. A payment in the fee's
+// currency is compared as is. Any other payment
 // is compared by converting its USD market value into the fee's currency at
 // the latest live exchange rate, so a tipper may pay in whatever currency they
 // hold. A fee in a currency with no live rate cannot be compared against, so
@@ -357,8 +365,10 @@ func (i *Integration) validateMinDmChatInitFee(ctx context.Context, paymentMetad
 }
 
 // validateMinimumTipAmount enforces the minimum tip amount for the payment's
-// exchange currency. Clients surface the minimum as the first tip preset, but
-// the amount is ultimately client-chosen, so the floor is enforced here too.
+// exchange currency on the tip that initializes a chat with a recipient who
+// has set no minimum DM chat initialization fee. Clients surface the minimum
+// as the first tip preset, but the amount is ultimately client-chosen, so the
+// floor is enforced here too.
 // Currencies without a preset fall back to a USD floor applied to the payment's
 // USD market value, so no currency is left without a minimum.
 func validateMinimumTipAmount(paymentMetadata *ocp_intent.SendPublicPaymentMetadata) error {

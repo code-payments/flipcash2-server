@@ -210,9 +210,10 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "tip to yourself")
 	})
 
-	// Tips below the per-currency minimum are denied. The minimum itself, and
-	// anything above it, is allowed, as is anything within half of the
-	// currency's smallest transferable unit below the minimum.
+	// Tips that initialize the chat and fall below the per-currency minimum are
+	// denied. The minimum itself, and anything above it, is allowed, as is
+	// anything within half of the currency's smallest transferable unit below
+	// the minimum. The chat is uninitialized throughout this case.
 	t.Run("minimum_amount", func(t *testing.T) {
 		for _, tc := range []struct {
 			currency       string
@@ -259,8 +260,9 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 	})
 
 	// A send from within the chat is only allowed once the tip DM has been
-	// initialized (by a tip card tip), and has no minimum amount. The env is
-	// fresh here, so a separate pair keeps the uninitialized case isolated.
+	// initialized (by a tip card tip), and has no minimum amount. Once it is,
+	// neither does a tip. The env is fresh here, so a separate pair keeps the
+	// uninitialized case isolated.
 	t.Run("send_from_chat", func(t *testing.T) {
 		sendRecord := func(amount float64) *ocp_intent.Record {
 			record := dmPaymentIntentRecord(t, tipDmChatMetadataFrom(tipChatID, intentpb.ChatMetadata_TipDmPayment_CHAT), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
@@ -285,12 +287,13 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		require.NoError(t, e.integration.AllowCreation(e.ctx, sendRecord(5.0), nil, nil))
 		require.NoError(t, e.integration.AllowCreation(e.ctx, sendRecord(0.01), nil, nil))
 
-		// The tip minimum still applies to tip card tips.
+		// The tip minimum no longer applies to tip card tips either: the gate
+		// was paid when the chat was initialized.
 		tipRecord := validRecord()
 		tipRecord.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.USD
 		tipRecord.SendPublicPaymentMetadata.NativeAmount = 0.01
 		tipRecord.SendPublicPaymentMetadata.UsdMarketValue = 0.01
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tipRecord, nil, nil), "below the minimum")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, tipRecord, nil, nil))
 	})
 
 	// An explicit action overrides the default for the location, and the rules
@@ -326,13 +329,15 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 			Members: []*commonpb.UserId{senderUserID, recipientUserID},
 		}))
 
-		// Initialized: the send carries no minimum, the tip still does.
+		// Initialized: neither the send nor the tip carries a minimum.
 		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_TIPCARD, intentpb.ChatMetadata_TipDmPayment_SEND, 0.01), nil, nil))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_TIP, 0.5), nil, nil), "below the minimum")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_TIP, 0.5), nil, nil))
 	})
 
 	// A recipient's minimum DM chat initialization fee applies only to the tip
-	// that initializes the chat. A fresh env keeps the chat uninitialized here.
+	// that initializes the chat, and where set it replaces the preset minimum
+	// as that tip's floor rather than stacking on it. A fresh env keeps the
+	// chat uninitialized here.
 	t.Run("min_dm_chat_init_fee", func(t *testing.T) {
 		e := newIntegrationEnv(t)
 		senderUserID, senderKeys := e.bindUser(t)
@@ -373,7 +378,7 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 			{"usd", 1.0, false, "chat initialization fee"}, // clears the preset minimum, not the fee
 			{"jpy", 1_500, true, ""},                       // cross-currency: converted at the live rate
 			{"jpy", 1_499, false, "chat initialization fee"},
-			{"jpy", 50, false, "below the minimum"}, // preset minimum is checked first
+			{"jpy", 50, false, "chat initialization fee"}, // the fee is the only floor, so it names the denial
 			{"eur", 9.0, true, ""},
 			{"eur", 8.9, false, "chat initialization fee"},
 		} {
@@ -395,6 +400,14 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 6.67), nil, nil))
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("usd", 6.66), nil, nil), "chat initialization fee")
 
+		// The fee replaces the preset minimum of the tipper's currency: a fee at
+		// JPY's preset minimum is cleared by EUR 0.70 (JPY 116.67 at the live
+		// rate) even though EUR's own preset minimum is 1.00, while EUR 0.59
+		// (JPY 98.33) is short of the fee, not the preset.
+		setFee("jpy", 100)
+		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("eur", 0.7), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("eur", 0.59), nil, nil), "chat initialization fee")
+
 		// A fee in a currency with no live rate cannot be compared against a
 		// payment in another currency, and is denied rather than waved through.
 		setFee("kwd", 1)
@@ -405,15 +418,15 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		// whatever the amount.
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, "usd", 100), nil, nil), "not been initialized")
 
-		// Once the chat exists the fee no longer applies: tips are held to the
-		// preset minimum only, and sends to nothing.
+		// Once the chat exists nothing applies: tips and sends alike are any
+		// amount, below the fee and below the preset minimum.
 		require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
 			ID:      tipChatID,
 			Type:    chatpb.ChatType_TIP_DM,
 			Members: []*commonpb.UserId{senderUserID, recipientUserID},
 		}))
 		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 1.0), nil, nil))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("usd", 0.5), nil, nil), "below the minimum")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 0.5), nil, nil))
 		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, "usd", 0.01), nil, nil))
 	})
 }

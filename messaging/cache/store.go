@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"time"
 
@@ -26,18 +27,41 @@ import (
 // MessageExists), so a true cache answer is always correct even across multiple
 // server instances. A miss (id above the cached bound, or no entry yet) falls
 // through to the backing store, and a confirmed existing id then raises the bound.
+//
+// It likewise caches a lower bound on each stored pointer, per (chat, member,
+// type), to answer no-op advances without a write. Pointers are monotonic, so a
+// value the backing store has confirmed at or below the stored pointer stays so;
+// an advance to newValue at or below that bound would fail the store's
+// condition, and is answered as not advanced without reaching it. That saves the
+// write a failed conditional update still bills, for the repeats clients send
+// (an advance re-sent on reconnect, a READ to the sender's own message, which
+// the send already advanced). Across server instances the bound only ever lags
+// the stored value, so a cached no-op is always correct; a miss falls through.
+//
 // The rest of the store is passed straight through.
 type Cache struct {
 	db messaging.Store
 
 	mu      sync.Mutex // guards the read-modify-write of the largest-ID cache
 	largest *ttlcache.Cache
+
+	pointerMu sync.Mutex // guards the read-modify-write of the pointer bound cache
+	pointers  *ttlcache.Cache
 }
 
+// pointerBoundTTL bounds how long an idle pointer bound is held. The pointer
+// cache has an entry per member per chat, unlike the per-chat message
+// watermark, so it is aged out rather than kept for the process lifetime; an
+// expired bound only costs the next no-op its write.
+const pointerBoundTTL = time.Hour
+
 func NewInCache(db messaging.Store) messaging.Store {
+	pointers := ttlcache.NewCache()
+	pointers.SetTTL(pointerBoundTTL)
 	return &Cache{
-		db:      db,
-		largest: ttlcache.NewCache(),
+		db:       db,
+		largest:  ttlcache.NewCache(),
+		pointers: pointers,
 	}
 }
 
@@ -206,11 +230,27 @@ func (c *Cache) GetLatestEventSequencesForChats(ctx context.Context, chatIDs []*
 }
 
 func (c *Cache) GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*messagingpb.Pointer, error) {
-	return c.db.GetPointers(ctx, chatID)
+	pointers, err := c.db.GetPointers(ctx, chatID)
+	if err == nil {
+		// Each stored pointer is a confirmed value for its member and type.
+		for _, p := range pointers {
+			c.observePointer(chatID, p.UserId, p.Type, p.Value.Value)
+		}
+	}
+	return pointers, err
 }
 
 func (c *Cache) GetPointersForChats(ctx context.Context, refs []messaging.PointerRef) (map[string][]*messagingpb.Pointer, error) {
-	return c.db.GetPointersForChats(ctx, refs)
+	byChat, err := c.db.GetPointersForChats(ctx, refs)
+	if err == nil {
+		for chatKey, pointers := range byChat {
+			chatID := &commonpb.ChatId{Value: []byte(chatKey)}
+			for _, p := range pointers {
+				c.observePointer(chatID, p.UserId, p.Type, p.Value.Value)
+			}
+		}
+	}
+	return byChat, err
 }
 
 func (c *Cache) AdvancePointer(
@@ -220,7 +260,40 @@ func (c *Cache) AdvancePointer(
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
 ) (*messagingpb.Pointer, bool, error) {
-	return c.db.AdvancePointer(ctx, chatID, userID, pointerType, newValue)
+	// Fast path: the stored pointer is known to be at or past newValue, so the
+	// store would reject the advance as a no-op.
+	if bound, ok := c.pointerBound(chatID, userID, pointerType); ok && newValue.Value <= bound {
+		return nil, false, nil
+	}
+
+	pointer, advanced, err := c.db.AdvancePointer(ctx, chatID, userID, pointerType, newValue)
+	if err == nil {
+		// Advanced or not, the stored pointer is now at or past newValue.
+		c.observePointer(chatID, userID, pointerType, newValue.Value)
+	}
+	return pointer, advanced, err
+}
+
+// pointerBound returns the cached lower bound on the member's stored pointer of
+// the given type, and whether one exists.
+func (c *Cache) pointerBound(chatID *commonpb.ChatId, userID *commonpb.UserId, pointerType messagingpb.Pointer_Type) (uint64, bool) {
+	if v, ok := c.pointers.Get(pointerCacheKey(chatID, userID, pointerType)); ok {
+		return v.(uint64), true
+	}
+	return 0, false
+}
+
+// observePointer raises the cached bound on the member's pointer of the given
+// type to value if value is greater (or seeds it when absent). The caller must
+// pass a value the backing store has confirmed the stored pointer is at or past.
+func (c *Cache) observePointer(chatID *commonpb.ChatId, userID *commonpb.UserId, pointerType messagingpb.Pointer_Type, value uint64) {
+	c.pointerMu.Lock()
+	defer c.pointerMu.Unlock()
+
+	if cur, ok := c.pointerBound(chatID, userID, pointerType); ok && value <= cur {
+		return
+	}
+	c.pointers.Set(pointerCacheKey(chatID, userID, pointerType), value)
 }
 
 func (c *Cache) AddReaction(
@@ -291,4 +364,11 @@ func (c *Cache) GetReactors(
 // so the raw bytes are an unambiguous key.
 func largestKey(chatID *commonpb.ChatId) string {
 	return string(chatID.Value)
+}
+
+// pointerCacheKey keys the pointer bound cache by (chat, member, type). User IDs
+// are fixed width and the type trails them, so the raw bytes are an unambiguous
+// key whichever length of chat ID leads it.
+func pointerCacheKey(chatID *commonpb.ChatId, userID *commonpb.UserId, pointerType messagingpb.Pointer_Type) string {
+	return string(chatID.Value) + string(userID.Value) + strconv.Itoa(int(pointerType))
 }

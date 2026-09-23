@@ -492,7 +492,7 @@ func (m *memory) AdvancePointer(
 
 	key := pointerKey(pointerType, userID)
 	if cur, ok := cs.pointers[key]; ok && newValue.Value <= cur.Value.Value {
-		return cur, false, nil
+		return nil, false, nil
 	}
 	pointer := &messagingpb.Pointer{
 		Type:   pointerType,

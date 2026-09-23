@@ -133,6 +133,7 @@ func (s *Server) RemoveReaction(ctx context.Context, req *messagingpb.RemoveReac
 						Action:    messagingpb.ReactionUpdate_REMOVED,
 						Count:     reaction.Count,
 						Version:   reaction.Version,
+						ReactedTs: timestamppb.Now(),
 					},
 				},
 			},

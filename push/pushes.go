@@ -189,11 +189,11 @@ func BuildContactDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *
 		ChatMetadata: &pushpb.ChatMetadata{
 			SendingUserId: senderID,
 			Type:          chatpb.ChatType_CONTACT_DM,
-			Message:       message,
+			MessageRef:    &pushpb.ChatMetadata_Message{Message: message},
 		},
 	}
 
-	return newChatMessagePush(title, body, customPayload), nil
+	return newChatMessagePush(title, body, customPayload)
 }
 
 // BuildTipDmPush renders a new message in a tip DM. The sender is typically
@@ -220,11 +220,11 @@ func BuildTipDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *comm
 		ChatMetadata: &pushpb.ChatMetadata{
 			SendingUserId: senderID,
 			Type:          chatpb.ChatType_TIP_DM,
-			Message:       message,
+			MessageRef:    &pushpb.ChatMetadata_Message{Message: message},
 		},
 	}
 
-	return newChatMessagePush(senderDisplayName, body, customPayload), nil
+	return newChatMessagePush(senderDisplayName, body, customPayload)
 }
 
 // BuildGroupChatPush renders a new message in a group chat. The notification
@@ -257,18 +257,41 @@ func BuildGroupChatPush(ctx context.Context, ocpData ocp_data.Provider, chatId *
 		ChatMetadata: &pushpb.ChatMetadata{
 			SendingUserId: senderID,
 			Type:          chatpb.ChatType_GROUP,
-			Message:       message,
+			MessageRef:    &pushpb.ChatMetadata_Message{Message: message},
 		},
 	}
 
-	return newChatMessagePush(title, body, customPayload), nil
+	return newChatMessagePush(title, body, customPayload)
 }
+
+// maxChatPushBytes is the most a chat push may measure (see payloadSize) and
+// still carry the full message. FCM and APNs each refuse a payload over 4096
+// bytes. The rest is headroom for what the measurement does not see: the
+// muted copy's flag, and whatever a provider adds around what it is given.
+const maxChatPushBytes = 3500
 
 // newChatMessagePush pairs the rendered payload with its muted copy. The flag
 // is the only difference. A nil payload — which the pusher accepts as empty —
 // is copied as an empty one rather than cloned, since proto.Clone of a nil
 // interface is nil and asserts to nothing.
-func newChatMessagePush(title, body string, customPayload *pushpb.Payload) *ChatMessagePush {
+//
+// A payload carrying the full message that measures over maxChatPushBytes
+// carries only the message's ID instead, for the client to fetch the message
+// by (see pushpb.ChatMetadata); the title, body and sender are unchanged. The
+// decision is made once per message, here: every recipient gets the same
+// title, body and payload but for the badge, which the measurement allows for,
+// and the muted copy is cloned after it, so both halves agree.
+func newChatMessagePush(title, body string, customPayload *pushpb.Payload) (*ChatMessagePush, error) {
+	if message := customPayload.GetChatMetadata().GetMessage(); message != nil {
+		size, err := payloadSize(title, body, customPayload)
+		if err != nil {
+			return nil, err
+		}
+		if size > maxChatPushBytes {
+			customPayload.ChatMetadata.MessageRef = &pushpb.ChatMetadata_MessageId{MessageId: message.MessageId}
+		}
+	}
+
 	mutedPayload := &pushpb.Payload{}
 	if customPayload != nil {
 		mutedPayload = proto.Clone(customPayload).(*pushpb.Payload)
@@ -282,7 +305,7 @@ func newChatMessagePush(title, body string, customPayload *pushpb.Payload) *Chat
 		body:         body,
 		payload:      customPayload,
 		mutedPayload: mutedPayload,
-	}
+	}, nil
 }
 
 // renderGroupChatMessagePushBody renders the push body for a group chat
@@ -331,12 +354,32 @@ func renderGroupChatMessagePushBody(ctx context.Context, ocpData ocp_data.Provid
 		return "", false, nil
 	}
 
-	if len(body) > 1024 {
-		body = fmt.Sprintf("%s...", body[:1024])
-	}
-
-	return body, true, nil
+	return truncatePushBody(body), true, nil
 }
+
+// maxPushBodyChars is the most characters of rendered text a chat push body
+// carries. A notification shows a few lines at most, and the body is repeated
+// in the payload (on iOS twice), so a longer one only spends the provider's
+// payload budget on text nobody sees.
+const maxPushBodyChars = 100
+
+// truncatePushBody cuts body to its first maxPushBodyChars characters, marking
+// the cut with "...". Characters are counted as runes and the cut falls on a
+// rune boundary, so a multi-byte character is never split into invalid UTF-8.
+func truncatePushBody(body string) string {
+	var n int
+	for i := range body {
+		if n == maxPushBodyChars {
+			return body[:i] + "..."
+		}
+		n++
+	}
+	return body
+}
+
+// encryptedDmMessagePushBody is the push body for an encrypted DM message,
+// whose content the server cannot render.
+const encryptedDmMessagePushBody = "Sent you a message"
 
 // renderDmMessagePushBody renders the push body for a DM message. ok is false
 // for content types that don't produce a push.
@@ -354,6 +397,12 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 			return "", false, nil
 		}
 		body = textContent.Text.Text
+	case *messagingpb.Content_Encrypted:
+		// The server cannot read encrypted content, so the body is generic. A
+		// payload within maxChatPushBytes carries the message, so a client able
+		// to decrypt it before display can replace the body with the plaintext;
+		// a larger one carries only the message ID, for the client to fetch.
+		body = encryptedDmMessagePushBody
 	case *messagingpb.Content_Cash:
 		currencyName, err := resolveCurrencyName(ctx, ocpData, content.Cash.Amount.Mint)
 		if err != nil {
@@ -378,11 +427,7 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 		return "", false, nil
 	}
 
-	if len(body) > 1024 {
-		body = fmt.Sprintf("%s...", body[:1024])
-	}
-
-	return body, true, nil
+	return truncatePushBody(body), true, nil
 }
 
 // ChatRecipients is a chat push's audience, split by whether each recipient has

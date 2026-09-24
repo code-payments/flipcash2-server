@@ -44,6 +44,11 @@ import (
 //     and deleted content as never redacted. Its structure is still
 //     settling; a variant that carries member-authored text is a new
 //     decision here, not a pass-through.
+//   - Encrypted: kept as is. The server cannot read the ciphertext, so it
+//     has no shape to build a placeholder from, and nothing it could hide:
+//     only the DM's two members hold the key. Encrypted content is DM-only
+//     and a DM's only readers are its members, so the one viewer who reaches
+//     this is a member reading REDACTED, who could decrypt it anyway.
 //
 // A nil content, or one of a kind this function does not know, is
 // ErrUnsupportedContent: nothing unknown is passed through, and the caller
@@ -98,6 +103,10 @@ func content(seed []byte, c *messagingpb.Content) (*messagingpb.Content, error) 
 	case *messagingpb.Content_System:
 		return &messagingpb.Content{Type: &messagingpb.Content_System{
 			System: proto.Clone(t.System).(*messagingpb.SystemContent),
+		}}, nil
+	case *messagingpb.Content_Encrypted:
+		return &messagingpb.Content{Type: &messagingpb.Content_Encrypted{
+			Encrypted: proto.Clone(t.Encrypted).(*messagingpb.EncryptedContent),
 		}}, nil
 	default:
 		return nil, ErrUnsupportedContent

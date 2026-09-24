@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"fmt"
@@ -1616,6 +1617,18 @@ func replyMediaContent(repliedMessageID uint64, blobID *blobpb.BlobId) []*messag
 				Content:          mediaContent(blobID),
 			},
 		},
+	}}
+}
+
+// encryptedContent builds an end-to-end encrypted message. The server never
+// reads the ciphertext, so any bytes of a valid length stand in for one.
+func encryptedContent(ciphertext byte) []*messagingpb.Content {
+	return []*messagingpb.Content{{
+		Type: &messagingpb.Content_Encrypted{Encrypted: &messagingpb.EncryptedContent{
+			Scheme:     messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305,
+			Nonce:      bytes.Repeat([]byte{ciphertext}, 24),
+			Ciphertext: bytes.Repeat([]byte{ciphertext}, 48),
+		}},
 	}}
 }
 

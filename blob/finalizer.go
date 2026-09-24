@@ -10,6 +10,7 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 
+	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/moderation"
 )
 
@@ -435,6 +436,7 @@ func (f *Finalizer) reject(ctx context.Context, record *Blob, rejection *Rejecti
 	}
 	fields := []zap.Field{
 		zap.String("blob_id", IDString(record.ID)),
+		zap.String("owner_id", model.UserIDString(record.Owner)),
 		zap.String("reason", rejection.Reason.ToProto().String()),
 	}
 	f.log.Info("Blob rejected", append(fields, logFields...)...)

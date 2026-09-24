@@ -55,6 +55,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_Hydrates,
 		testServer_GetChat_HydrationFailureCancelsSiblings,
 		testServer_GetChat_TipDm_HidesPhoneNumbers,
+		testServer_GetChat_Dm_NoCreator,
 		testServer_GetChat_HiddenWhenPeerBlocked,
 		testServer_GetChat_Group_Hydrates,
 		testServer_GetChat_Group_Picture,
@@ -1246,6 +1247,27 @@ func testServer_GetChat_TipDm_HidesPhoneNumbers(t *testing.T, s chat.Store) {
 	require.Nil(t, profile.PhoneNumber)
 	require.Equal(t, "Peer Name", profile.DisplayName)
 	require.NotNil(t, profile.GetProfilePicture())
+}
+
+func testServer_GetChat_Dm_NoCreator(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// A DM has no creator, whatever its type and whichever read serves it.
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_TIP_DM} {
+		chatID := e.putDMOfType(chatType, at(1))
+
+		resp := e.getChat(e.keys, chatID)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+		require.Equal(t, chatType, resp.Metadata.Type)
+		require.Nil(t, resp.Metadata.Creator)
+
+		feed, err := e.getDmFeedOfType(chatType, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Equal(t, chatpb.GetDmChatFeedResponse_OK, feed.Result)
+		require.Len(t, feed.Chats, 1)
+		require.Equal(t, chatID.Value, feed.Chats[0].ChatId.Value)
+		require.Nil(t, feed.Chats[0].Creator)
+	}
 }
 
 func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
@@ -2641,11 +2663,12 @@ func testServer_StartChat_OK(t *testing.T, s chat.Store) {
 
 	// The response carries the new group as its creator sees it: a fresh
 	// server-minted ID, the title, the rules asked for, no picture, the creator
-	// as its only member, and a roster of one at version zero.
+	// as its creator and only member, and a roster of one at version zero.
 	md := resp.Chat
 	require.NotNil(t, md)
 	require.True(t, chat.IsGroupChatID(md.ChatId))
 	require.Equal(t, chatpb.ChatType_GROUP, md.Type)
+	require.Equal(t, e.userID.Value, md.GetCreator().GetValue())
 	require.Equal(t, "Sunday Hikers", md.Title)
 	require.NoError(t, protoutil.ProtoEqualError(groupParams("Sunday Hikers").Rules, md.Rules))
 	require.Nil(t, md.Picture)

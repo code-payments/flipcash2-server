@@ -97,6 +97,16 @@ func deletedFixture() *messagingpb.Content {
 	}}
 }
 
+func encryptedFixture() *messagingpb.Content {
+	return &messagingpb.Content{Type: &messagingpb.Content_Encrypted{
+		Encrypted: &messagingpb.EncryptedContent{
+			Scheme:     messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305,
+			Nonce:      bytes.Repeat([]byte{6}, 24),
+			Ciphertext: bytes.Repeat([]byte{9}, 64),
+		},
+	}}
+}
+
 // mustContent redacts c and fails the test on error.
 func mustContent(t *testing.T, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, c *messagingpb.Content) *messagingpb.Content {
 	t.Helper()
@@ -175,6 +185,15 @@ func TestContent_System(t *testing.T) {
 	assert.NotSame(t, in.GetSystem(), out.GetSystem())
 }
 
+// TestContent_Encrypted: the server cannot read a ciphertext, so it passes
+// through unchanged; only a DM's members, who hold the key, ever read it.
+func TestContent_Encrypted(t *testing.T) {
+	in := encryptedFixture()
+	out := mustContent(t, chatID, messageID, in)
+	assert.True(t, proto.Equal(in, out))
+	assert.NotSame(t, in.GetEncrypted(), out.GetEncrypted())
+}
+
 func TestContent_Deleted(t *testing.T) {
 	in := deletedFixture()
 	out := mustContent(t, chatID, messageID, in)
@@ -223,7 +242,7 @@ func TestContent_LeavesInputAlone(t *testing.T) {
 		before := proto.Clone(in)
 		out := mustContent(t, chatID, messageID, in)
 		assert.True(t, proto.Equal(before, in), "%v", in)
-		if in.GetDeleted() == nil && in.GetCash() == nil && in.GetSystem() == nil {
+		if in.GetDeleted() == nil && in.GetCash() == nil && in.GetSystem() == nil && in.GetEncrypted() == nil {
 			assert.False(t, proto.Equal(in, out), "%v", in)
 		}
 	}
@@ -238,5 +257,6 @@ func fixturesForAllKinds() []*messagingpb.Content {
 		cashFixture(),
 		systemFixture(),
 		deletedFixture(),
+		encryptedFixture(),
 	}
 }

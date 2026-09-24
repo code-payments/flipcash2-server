@@ -156,6 +156,13 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
 	}
 
+	// Encrypted content is between a DM's two members (see
+	// messagingpb.EncryptedContent). Checked after the speaker gate so a
+	// non-member is DENIED like any other send.
+	if isEncrypted(req.Content) && chat.IsGroupChatID(req.ChatId) {
+		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED}, nil
+	}
+
 	// The replied-to message must exist in this chat and be repliable. Checked
 	// after membership so non-members can't probe which message IDs exist.
 	if repliedMessageID != nil {
@@ -213,6 +220,11 @@ func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRe
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
 	}
 
+	// The same DM-only rule as a send.
+	if isEncrypted(req.Content) && chat.IsGroupChatID(req.ChatId) {
+		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_ENCRYPTION_NOT_ALLOWED}, nil
+	}
+
 	// The target must exist in this chat. Checked after membership so non-members
 	// can't probe which message IDs exist.
 	msg, err := s.messages.GetMessage(ctx, req.ChatId, req.MessageId)
@@ -233,6 +245,16 @@ func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRe
 	// Only user-authored conversational content is editable; a cash payment, a
 	// system message, or an already-deleted tombstone is not (see IsEditable).
 	if !msg.IsEditable() {
+		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_CANNOT_EDIT}, nil
+	}
+
+	// An encrypted message stays encrypted: an edit may replace it only with
+	// other encrypted content, never downgrade it to plaintext. Plaintext may be
+	// upgraded. The rule is judged on the read above, which is strongly
+	// consistent, and the write is conditioned on the caller's expected
+	// event_sequence, so an upgrade that lands after the read makes this edit a
+	// CONFLICT rather than slipping a downgrade past the check.
+	if isEncrypted(msg.Content) && !isEncrypted(req.Content) {
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_CANNOT_EDIT}, nil
 	}
 
@@ -394,11 +416,18 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 // clientAllowedContent reports whether content is a message body a client may
 // author via SendMessage or EditMessage, and extracts the replied-to message ID
 // when it is a reply. The permitted set is a whitelist — currently a text or media
-// message, or a reply whose own body is text or media — so it excludes
-// server-injected content (e.g. cash payment messages) and any content type added
-// later until it is explicitly allowed. repliedMessageID is non-nil only for a
-// valid reply, signaling the caller to verify the replied-to message exists and is
-// repliable.
+// message, a reply whose own body is text or media, or encrypted content — so it
+// excludes server-injected content (e.g. cash payment messages) and any content
+// type added later until it is explicitly allowed. repliedMessageID is non-nil
+// only for a valid reply, signaling the caller to verify the replied-to message
+// exists and is repliable. Encrypted content is allowed in a DM only, which
+// depends on the chat and so is the caller's to enforce (see isEncrypted), as
+// is the rule that an edit never downgrades an encrypted message to plaintext,
+// which depends on the message being edited.
+//
+// Encrypted content is opaque: whatever it wraps — the proto allows text or a
+// text reply — is the recipient's to check, not the server's, so a reply inside
+// it names a replied-to message the server never sees or verifies.
 func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *messagingpb.MessageId, ok bool) {
 	if len(content) != 1 {
 		return nil, false
@@ -416,9 +445,18 @@ func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *mes
 			return nil, false
 		}
 		return c.Reply.RepliedMessageId, true
+	case *messagingpb.Content_Encrypted:
+		return nil, true
 	default:
 		return nil, false
 	}
+}
+
+// isEncrypted reports whether content is end-to-end encrypted, which is allowed
+// in a DM only (see messagingpb.EncryptedContent). Encrypted content is only
+// ever top-level, never a reply's body (see clientAllowedContent).
+func isEncrypted(content []*messagingpb.Content) bool {
+	return len(content) == 1 && content[0].GetEncrypted() != nil
 }
 
 // validReplyBody reports whether a reply's body is content a client may author:

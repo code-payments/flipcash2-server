@@ -57,6 +57,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_SendMessage_DisallowedContent,
 		testServer_SendMedia,
 		testServer_ResolvesMediaOnRead,
+		testServer_EncryptedContent,
+		testServer_EncryptedContent_NotInGroups,
 		testServer_SendMessage_Broadcast,
 		testServer_EditMessage,
 		testServer_DeleteMessage,
@@ -1000,6 +1002,171 @@ func testServer_SendMessage_DisallowedContent(t *testing.T, badges badge.Store, 
 	extraResp, err := e.sendContent(e.keysA, extraRendition, generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_DENIED, extraResp.Result)
+}
+
+// testServer_EncryptedContent: a DM carries encrypted content like any other
+// user-authored message — sent, read, replied to, reacted to, edited, deleted —
+// with the ciphertext passed through untouched, a redacted read included, and a
+// generic push body in place of a preview the server cannot render (and only
+// the message's ID in a push it would not fit in). An edit may upgrade
+// plaintext to encrypted but never downgrade encrypted to plaintext.
+func testServer_EncryptedContent(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
+
+	// The push path recovers the chat type from the canonical DM derivation, so
+	// the DM lives at its derived ID.
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.userA, e.userB)
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_TIP_DM,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+
+	sent, err := e.sendContentToChat(e.keysA, chatID, encryptedContent(1), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	require.True(t, proto.Equal(encryptedContent(1)[0], sent.Message.Content[0]))
+	msgID := sent.Message.MessageId
+	e.waitForNewMessage(e.userB, msgID.Value)
+
+	// Both members read the ciphertext back as sent, in any mode: a redacted
+	// read has no placeholder to give and passes it through.
+	for _, keys := range []model.KeyPair{e.keysA, e.keysB} {
+		for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_REDACTED} {
+			got, err := e.getMessageInChatWithMode(keys, chatID, msgID, mode)
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.GetMessageResponse_OK, got.Result)
+			require.True(t, proto.Equal(encryptedContent(1)[0], got.Message.Content[0]), mode)
+			require.Equal(t, mode == messagingpb.ViewMode_REDACTED, got.Message.Redacted)
+		}
+	}
+
+	// The push cannot preview the content, so its body is generic; the payload
+	// still carries the whole message for a client that can decrypt it.
+	require.Eventually(t, func() bool {
+		return len(e.pusher.snapshot()) >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+	encryptedPush := e.pusher.snapshot()[0]
+	require.Equal(t, "Sender Name", encryptedPush.title)
+	require.Equal(t, "Sent you a message", encryptedPush.body)
+	require.True(t, proto.Equal(sent.Message, encryptedPush.payload.ChatMetadata.GetMessage()))
+
+	// An encrypted message may be replied to and reacted to.
+	reply, err := e.sendContentToChat(e.keysB, chatID, replyContent(msgID.Value, "plain reply"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, reply.Result)
+	react, err := e.addReactionInChat(e.keysB, chatID, msgID, "👍")
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, react.Result)
+
+	// Encrypted content is never a reply's body: a reply is encrypted whole.
+	nested := []*messagingpb.Content{{Type: &messagingpb.Content_Reply{Reply: &messagingpb.ReplyContent{
+		RepliedMessageId: msgID,
+		Content:          encryptedContent(2),
+	}}}}
+	nestedResp, err := e.sendContentToChat(e.keysB, chatID, nested, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, nestedResp.Result)
+
+	// The sender may edit an encrypted message, and a plaintext one into an
+	// encrypted one.
+	edited, err := e.editMessageInChat(e.keysA, chatID, msgID, encryptedContent(3), sent.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_OK, edited.Result)
+	require.True(t, proto.Equal(encryptedContent(3)[0], edited.Message.Content[0]))
+
+	// An encrypted message is never downgraded: an edit to plaintext, bare or
+	// as a reply, is CANNOT_EDIT and the message keeps its ciphertext.
+	for _, downgrade := range [][]*messagingpb.Content{
+		textContent("plaintext"),
+		replyContent(reply.Message.MessageId.Value, "plaintext reply"),
+	} {
+		resp, err := e.editMessageInChat(e.keysA, chatID, msgID, downgrade, edited.Message.EventSequence)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.EditMessageResponse_CANNOT_EDIT, resp.Result)
+	}
+	unchanged, err := e.getMessageInChatWithMode(e.keysA, chatID, msgID, messagingpb.ViewMode_FULL)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(encryptedContent(3)[0], unchanged.Message.Content[0]))
+	require.Equal(t, edited.Message.EventSequence, unchanged.Message.EventSequence)
+
+	plain, err := e.sendContentToChat(e.keysA, chatID, textContent("plaintext"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, plain.Result)
+	upgraded, err := e.editMessageInChat(e.keysA, chatID, plain.Message.MessageId, encryptedContent(4), plain.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_OK, upgraded.Result)
+	require.True(t, proto.Equal(encryptedContent(4)[0], upgraded.Message.Content[0]))
+
+	// A message too large to carry in a push is pushed by its ID alone, for
+	// the recipient to fetch; the sender and generic body are still there.
+	large := encryptedContent(5)
+	large[0].GetEncrypted().Ciphertext = bytes.Repeat([]byte{5}, 4096)
+	largeSent, err := e.sendContentToChat(e.keysA, chatID, large, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, largeSent.Result)
+	var largePush capturedPush
+	require.Eventually(t, func() bool {
+		for _, p := range e.pusher.snapshot() {
+			if proto.Equal(largeSent.Message.MessageId, p.payload.GetChatMetadata().GetMessageId()) {
+				largePush = p
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond)
+	require.Nil(t, largePush.payload.ChatMetadata.GetMessage())
+	require.True(t, proto.Equal(e.userA, largePush.payload.ChatMetadata.SendingUserId))
+	require.Equal(t, "Sent you a message", largePush.body)
+
+	// And delete it.
+	deleted, err := e.deleteMessageInChat(e.keysA, chatID, msgID, edited.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, deleted.Result)
+	require.NotNil(t, deleted.Message.Content[0].GetDeleted())
+}
+
+// testServer_EncryptedContent_NotInGroups: encrypted content is a DM's alone.
+// A group member's send or edit carrying it is ENCRYPTION_NOT_ALLOWED and
+// nothing is written; a non-member is DENIED before the chat type matters.
+func testServer_EncryptedContent_NotInGroups(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+
+	resp, err := e.sendContentToChat(e.keysA, groupID, encryptedContent(1), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED, resp.Result)
+	require.Nil(t, resp.Message)
+
+	_, strangerKeys := e.addUser()
+	strangerResp, err := e.sendContentToChat(strangerKeys, groupID, encryptedContent(1), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, strangerResp.Result)
+
+	sent, err := e.sendContentToChat(e.keysA, groupID, textContent("plaintext"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+
+	edit, err := e.editMessageInChat(e.keysA, groupID, sent.Message.MessageId, encryptedContent(2), sent.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_ENCRYPTION_NOT_ALLOWED, edit.Result)
+
+	// Only the plaintext message was written, and it is unchanged.
+	got, err := e.getMessagesByOptionsInChat(e.keysA, groupID, nil)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_OK, got.Result)
+	require.Len(t, got.Messages.Messages, 1)
+	require.Equal(t, "plaintext", got.Messages.Messages[0].Content[0].GetText().GetText())
+	require.Equal(t, sent.Message.EventSequence, got.Messages.Messages[0].EventSequence)
 }
 
 func testServer_SendMessage_Broadcast(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
@@ -2686,7 +2853,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	// render the notification from it without a round trip to the server.
 	require.Equal(t, chatpb.ChatType_TIP_DM, tipPush.payload.ChatMetadata.Type)
 	require.Equal(t, e.userA.Value, tipPush.payload.ChatMetadata.SendingUserId.Value)
-	require.True(t, proto.Equal(tipMessage, tipPush.payload.ChatMetadata.Message))
+	require.True(t, proto.Equal(tipMessage, tipPush.payload.ChatMetadata.GetMessage()))
 	// Nothing in the push may carry the sender's phone number.
 	require.NotContains(t, tipPush.title, senderPhone)
 	require.NotContains(t, tipPush.body, senderPhone)
@@ -2704,7 +2871,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	require.Equal(t, e.userB.Value, contactPush.users[0].Value)
 	require.Equal(t, chatpb.ChatType_CONTACT_DM, contactPush.payload.ChatMetadata.Type)
 	require.Equal(t, e.userA.Value, contactPush.payload.ChatMetadata.SendingUserId.Value)
-	require.True(t, proto.Equal(contactMessage, contactPush.payload.ChatMetadata.Message))
+	require.True(t, proto.Equal(contactMessage, contactPush.payload.ChatMetadata.GetMessage()))
 }
 
 // testServer_Reactions_GroupSelfReaction pins self_reactor in a group, where
@@ -2850,7 +3017,7 @@ func testServer_SendMessage_GroupChatPush(t *testing.T, badges badge.Store, bloc
 	require.Empty(t, groupPush.payload.TitleSubstitutions)
 	require.Equal(t, chatpb.ChatType_GROUP, groupPush.payload.ChatMetadata.Type)
 	require.Equal(t, e.userA.Value, groupPush.payload.ChatMetadata.SendingUserId.Value)
-	require.True(t, proto.Equal(resp.Message, groupPush.payload.ChatMetadata.Message))
+	require.True(t, proto.Equal(resp.Message, groupPush.payload.ChatMetadata.GetMessage()))
 	require.NotContains(t, groupPush.payload.String(), strings.TrimPrefix(senderPhone, "+"))
 	recipients := make([][]byte, len(groupPush.users))
 	for i, u := range groupPush.users {
@@ -3030,7 +3197,7 @@ func testServer_SendMessage_GroupPushPaged(t *testing.T, badges badge.Store, blo
 				require.Equal(t, "Paged", p.title)
 				require.Equal(t, "Sender Name: paged hello", p.body)
 				require.Equal(t, !p.payload.ChatMetadata.Muted, p.badged)
-				require.True(t, proto.Equal(resp.Message, p.payload.ChatMetadata.Message))
+				require.True(t, proto.Equal(resp.Message, p.payload.ChatMetadata.GetMessage()))
 			}
 		})
 	}
@@ -3142,7 +3309,7 @@ func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.St
 	require.Equal(t, [][]byte{e.userB.Value}, userValues(pushes[0].users))
 	require.True(t, pushes[0].payload.ChatMetadata.Muted)
 	require.False(t, pushes[0].badged)
-	require.True(t, proto.Equal(resp.Message, pushes[0].payload.ChatMetadata.Message))
+	require.True(t, proto.Equal(resp.Message, pushes[0].payload.ChatMetadata.GetMessage()))
 
 	// A group with one muted member: two pushes, one per half, with the same
 	// message in each and only the muted half flagged.
@@ -3181,7 +3348,7 @@ func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.St
 	require.False(t, muted.badged)
 	require.Equal(t, unmuted.title, muted.title)
 	require.Equal(t, unmuted.body, muted.body)
-	require.True(t, proto.Equal(resp.Message, muted.payload.ChatMetadata.Message))
+	require.True(t, proto.Equal(resp.Message, muted.payload.ChatMetadata.GetMessage()))
 	// The flag is set on a copy: the unmuted payload is untouched.
 	require.False(t, unmuted.payload.ChatMetadata.Muted)
 

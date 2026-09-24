@@ -104,6 +104,7 @@ func (m *Message) IsReplyable() bool {
 		*messagingpb.Content_Cash,
 		*messagingpb.Content_Media,
 		*messagingpb.Content_Reply,
+		*messagingpb.Content_Encrypted,
 		*messagingpb.Content_Deleted:
 		return true
 	default:
@@ -125,6 +126,7 @@ func (m *Message) IsReactable() bool {
 		*messagingpb.Content_Cash,
 		*messagingpb.Content_Media,
 		*messagingpb.Content_Reply,
+		*messagingpb.Content_Encrypted,
 		*messagingpb.Content_Deleted:
 		return true
 	default:
@@ -150,7 +152,8 @@ func (m *Message) IsDeletable() bool {
 	switch m.Content[0].Type.(type) {
 	case *messagingpb.Content_Text,
 		*messagingpb.Content_Media,
-		*messagingpb.Content_Reply:
+		*messagingpb.Content_Reply,
+		*messagingpb.Content_Encrypted:
 		return true
 	default:
 		return false
@@ -182,7 +185,8 @@ func (m *Message) IsEditable() bool {
 	switch m.Content[0].Type.(type) {
 	case *messagingpb.Content_Text,
 		*messagingpb.Content_Media,
-		*messagingpb.Content_Reply:
+		*messagingpb.Content_Reply,
+		*messagingpb.Content_Encrypted:
 		return true
 	default:
 		return false

@@ -302,7 +302,7 @@ func (s *store) PutMessage(
 		// could spuriously return ErrMessageNotFound (or stale content) for a message
 		// that provably exists.
 		if markerSeq != nil {
-			msg, err := s.getMessage(ctx, chatID, &messagingpb.MessageId{Value: *markerSeq}, true)
+			msg, err := s.getMessage(ctx, chatID, &messagingpb.MessageId{Value: *markerSeq})
 			return msg, false, err
 		}
 
@@ -475,7 +475,7 @@ func (s *store) EditMessage(
 			// Re-read strongly-consistent: an eventually-consistent read right after
 			// the commit can still return the pre-edit content/event_seq, which would
 			// surface stale state to the caller and to the broadcast.
-			return s.getMessage(ctx, chatID, messageID, true) // canonical edited state
+			return s.getMessage(ctx, chatID, messageID) // canonical edited state
 		}
 
 		var tce *types.TransactionCanceledException
@@ -591,7 +591,7 @@ func (s *store) DeleteMessage(
 			// the commit can still return the pre-delete (non-tombstone) state, which
 			// would surface stale content to the caller and make NewMessageDeletedEvent
 			// dereference a Deleted that isn't there.
-			return s.getMessage(ctx, chatID, messageID, true) // canonical tombstone
+			return s.getMessage(ctx, chatID, messageID) // canonical tombstone
 		}
 
 		var tce *types.TransactionCanceledException
@@ -835,21 +835,22 @@ func (s *store) getMessagesByIDs(ctx context.Context, chatID *commonpb.ChatId, i
 }
 
 func (s *store) GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {
-	return s.getMessage(ctx, chatID, messageID, false)
+	return s.getMessage(ctx, chatID, messageID)
 }
 
-// getMessage reads a single message by ID, or ErrMessageNotFound. consistent
-// forces a strongly-consistent read; callers reading a message back immediately
-// after mutating it (e.g. the delete tombstone) must set it, since an
-// eventually-consistent read can still return the pre-mutation state.
-func (s *store) getMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, consistent bool) (*messaging.Message, error) {
+// getMessage reads a single message by ID, or ErrMessageNotFound. The read is
+// strongly consistent (see messaging.Store.GetMessage), which also lets callers
+// read a message back immediately after mutating it (e.g. the delete
+// tombstone): an eventually-consistent read could still return the
+// pre-mutation state.
+func (s *store) getMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, error) {
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(s.messagesTable),
 		Key: map[string]types.AttributeValue{
 			attrPK: avS(chatPK(chatID)),
 			attrSK: avS(msgSK(messageID.Value)),
 		},
-		ConsistentRead: aws.Bool(consistent),
+		ConsistentRead: aws.Bool(true),
 	})
 	if err != nil {
 		return nil, err

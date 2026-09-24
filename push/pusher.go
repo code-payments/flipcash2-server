@@ -3,8 +3,10 @@ package push
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -145,13 +147,50 @@ func (p *FCMPusher) SendPushesWithBadges(ctx context.Context, title, body string
 		return err
 	}
 
-	marshalledCustomPayload, err := proto.Marshal(customPayload)
+	customDataAndroid, err := customPushData(title, body, customPayload)
 	if err != nil {
 		return err
 	}
+	customDataApns := apnsCustomData(customDataAndroid)
+
+	// The alert, category, thread, and custom data are identical for every
+	// device. Only the badge varies, so each message gets its own Aps while the
+	// read-only pieces are shared.
+	android := &messaging.AndroidConfig{
+		Priority: "high",
+		Data:     customDataAndroid,
+	}
+	messages := make([]*messaging.Message, len(pushTokens))
+	for i, pushToken := range pushTokens {
+		var badge *int
+		if count, ok := badges[string(pushToken.UserID.Value)]; ok {
+			b := int(count)
+			badge = &b
+		}
+		messages[i] = &messaging.Message{
+			Token:   pushToken.Token,
+			Android: android,
+			APNS: &messaging.APNSConfig{
+				Payload: &messaging.APNSPayload{Aps: newAps(title, body, customPayload, customDataApns, badge)},
+			},
+		}
+	}
+
+	return errors.Join(p.sendInBatches(ctx, messages, pushTokens), badgeErr)
+}
+
+// customPushData is the data every device of a push receives: the rendered
+// title and body, the encoded payload, and a deep link when the payload
+// navigates somewhere. Android delivers it as the message's data; APNs
+// carries a copy in the aps dictionary beside the alert (see apnsCustomData).
+func customPushData(title, body string, customPayload *pushpb.Payload) (map[string]string, error) {
+	marshalledCustomPayload, err := proto.Marshal(customPayload)
+	if err != nil {
+		return nil, err
+	}
 	encodedCustomPayload := base64.StdEncoding.EncodeToString(marshalledCustomPayload)
 
-	customDataAndroid := map[string]string{
+	data := map[string]string{
 		"push_notification_title": title,
 		"push_notification_body":  body,
 		"flipcash_payload":        encodedCustomPayload,
@@ -167,50 +206,66 @@ func (p *FCMPusher) SendPushesWithBadges(ctx context.Context, title, body string
 			targetUrl = fmt.Sprintf("https://app.flipcash.com/chat/%s", strings.Replace(typed.ChatContactPhoneNumber.Value, "+", "%2B", 1))
 		}
 		if len(targetUrl) > 0 {
-			customDataAndroid["target_url"] = targetUrl
+			data["target_url"] = targetUrl
 		}
 	}
-	customDataApns := make(map[string]any)
-	for k, v := range customDataAndroid {
-		customDataApns[k] = v
-	}
+	return data, nil
+}
 
-	categoryString := customPayload.Category.String()
+// apnsCustomData is customPushData in the form the APNs payload carries it.
+func apnsCustomData(data map[string]string) map[string]any {
+	custom := make(map[string]any, len(data))
+	for k, v := range data {
+		custom[k] = v
+	}
+	return custom
+}
+
+// newAps builds one device's aps dictionary: the alert, category, thread and
+// custom data every device shares, and badge, which is nil for a device that
+// displays none.
+func newAps(title, body string, customPayload *pushpb.Payload, customData map[string]any, badge *int) *messaging.Aps {
 	hasSubstitutions := len(customPayload.TitleSubstitutions) > 0 || len(customPayload.BodySubstitutions) > 0
-
-	// The alert, category, thread, and custom data are identical for every
-	// device. Only the badge varies, so each message gets its own Aps while the
-	// read-only pieces are shared.
-	android := &messaging.AndroidConfig{
-		Priority: "high",
-		Data:     customDataAndroid,
+	return &messaging.Aps{
+		Alert: &messaging.ApsAlert{
+			Title: title,
+			Body:  body,
+		},
+		Category:       customPayload.Category.String(),
+		ThreadID:       customPayload.GroupKey,
+		MutableContent: hasSubstitutions || customPayload.ChatMetadata != nil,
+		CustomData:     customData,
+		Badge:          badge,
 	}
-	messages := make([]*messaging.Message, len(pushTokens))
-	for i, pushToken := range pushTokens {
-		aps := &messaging.Aps{
-			Alert: &messaging.ApsAlert{
-				Title: title,
-				Body:  body,
-			},
-			Category:       categoryString,
-			ThreadID:       customPayload.GroupKey,
-			MutableContent: hasSubstitutions || customPayload.ChatMetadata != nil,
-			CustomData:     customDataApns,
-		}
-		if count, ok := badges[string(pushToken.UserID.Value)]; ok {
-			badge := int(count)
-			aps.Badge = &badge
-		}
-		messages[i] = &messaging.Message{
-			Token:   pushToken.Token,
-			Android: android,
-			APNS: &messaging.APNSConfig{
-				Payload: &messaging.APNSPayload{Aps: aps},
-			},
-		}
+}
+
+// measuredBadge is the badge a payload is measured with (see payloadSize).
+// The badge is the one part of a push that varies by device, so it is
+// measured at a width no real count reaches.
+const measuredBadge = math.MaxInt32
+
+// payloadSize reports how many bytes a push occupies against the providers'
+// payload limits, on whichever platform it is larger. FCM counts an Android
+// message's data keys and values. APNs counts the payload's JSON, which
+// carries the same data beside the alert, so the title and body count twice
+// on iOS and it is usually the larger. It encodes the push exactly as
+// SendPushesWithBadges does, badge aside (see measuredBadge).
+func payloadSize(title, body string, customPayload *pushpb.Payload) (int, error) {
+	data, err := customPushData(title, body, customPayload)
+	if err != nil {
+		return 0, err
+	}
+	var android int
+	for k, v := range data {
+		android += len(k) + len(v)
 	}
 
-	return errors.Join(p.sendInBatches(ctx, messages, pushTokens), badgeErr)
+	badge := measuredBadge
+	apns, err := json.Marshal(&messaging.APNSPayload{Aps: newAps(title, body, customPayload, apnsCustomData(data), &badge)})
+	if err != nil {
+		return 0, err
+	}
+	return max(android, len(apns)), nil
 }
 
 // sendInBatches sends messages to FCM in batches of at most maxBatchSize,

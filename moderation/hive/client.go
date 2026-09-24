@@ -50,19 +50,44 @@ const (
 
 	profanityFilterType = "profanity"
 
+	// minorSexualEscalationScore is the minimum sexual score that, together
+	// with a minor-presence hit, flags the text as child exploitation. It sits
+	// below textFlagThreshold on purpose: mildly sexual text that mentions a
+	// minor is flagged even though neither signal would flag on its own.
+	minorSexualEscalationScore = 1.0
+
+	minorExplicitlyMentionedCategory = "minor_explicitly_mentioned"
+	minorImplicitlyMentionedCategory = "minor_implicitly_mentioned"
+	sexualCategory                   = "sexual"
+
 	childExploitationCategory = "child_exploitation"
 	profanityCategory         = "profanity"
 	piiCategory               = "pii"
 )
 
+// textContextClasses are Hive text classes that describe the text rather than
+// judge it, and so never flag on their own. Their scores are still recorded.
+//
+// The minor-presence classes are binary (0 or 3) and fire on any likely
+// reference to someone under 18: "little boy", "teens", a school, or a name
+// like "BadBoys". A mention of a minor is not a violation; it only escalates
+// sexual text (see applyMinorSexualEscalation). Child exploitation itself is
+// covered by Hive's child_exploitation class and the IWF text filters.
+var textContextClasses = map[string]struct{}{
+	minorExplicitlyMentionedCategory: {},
+	minorImplicitlyMentionedCategory: {},
+}
+
 type client struct {
 	apiKey     string
+	apiUrl     string
 	httpClient *http.Client
 }
 
 func NewClient(apiKey string) moderation.Client {
 	return &client{
 		apiKey:     apiKey,
+		apiUrl:     apiUrl,
 		httpClient: http.DefaultClient,
 	}
 }
@@ -80,7 +105,7 @@ func (c *client) classifyText(ctx context.Context, text string) (*moderation.Res
 	form := url.Values{}
 	form.Set("text_data", text)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiUrl, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiUrl, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
@@ -90,11 +115,15 @@ func (c *client) classifyText(ctx context.Context, text string) (*moderation.Res
 
 	result, hiveResp, err := c.doClassify(req, textFlagThreshold, func(_ string) bool {
 		return true
+	}, func(category string) bool {
+		_, ok := textContextClasses[category]
+		return !ok
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	applyMinorSexualEscalation(result)
 	applyIWFTextFilters(hiveResp, result)
 	applyProfanityTextFilters(hiveResp, result)
 	applyPIIEntities(hiveResp, result)
@@ -143,7 +172,7 @@ func (c *client) classifyImage(ctx context.Context, data []byte) (*moderation.Re
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiUrl, &buf)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiUrl, &buf)
 	if err != nil {
 		return nil, err
 	}
@@ -154,11 +183,16 @@ func (c *client) classifyImage(ctx context.Context, data []byte) (*moderation.Re
 	result, _, err := c.doClassify(req, imageFlagThreshold, func(category string) bool {
 		_, ok := imageFlaggedCategories[strings.ToLower(category)]
 		return ok
+	}, func(_ string) bool {
+		return true
 	})
 	return result, err
 }
 
-func (c *client) doClassify(req *http.Request, flagThreshold float64, categoryInclusionFunc func(category string) bool) (*moderation.Result, *response, error) {
+// doClassify sends req and converts Hive's response into a Result. Only
+// categories passing categoryInclusionFunc are recorded, and only recorded
+// categories passing categoryFlaggableFunc can flag.
+func (c *client) doClassify(req *http.Request, flagThreshold float64, categoryInclusionFunc, categoryFlaggableFunc func(category string) bool) (*moderation.Result, *response, error) {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, nil, err
@@ -187,7 +221,7 @@ func (c *client) doClassify(req *http.Request, flagThreshold float64, categoryIn
 		return nil, nil, fmt.Errorf("hive returned error code: %d", hiveResp.Status[0].Response.Code)
 	}
 
-	result, err := hiveResp.toResult(flagThreshold, categoryInclusionFunc)
+	result, err := hiveResp.toResult(flagThreshold, categoryInclusionFunc, categoryFlaggableFunc)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -255,7 +289,7 @@ type classResult struct {
 	Score float64 `json:"score"`
 }
 
-func (r *response) toResult(flagThreshold float64, categoryInclusionFunc func(category string) bool) (*moderation.Result, error) {
+func (r *response) toResult(flagThreshold float64, categoryInclusionFunc, categoryFlaggableFunc func(category string) bool) (*moderation.Result, error) {
 	result := &moderation.Result{
 		CategoryScores: make(map[string]float64),
 	}
@@ -276,7 +310,7 @@ func (r *response) toResult(flagThreshold float64, categoryInclusionFunc func(ca
 
 			result.CategoryScores[class.Class] = class.Score
 
-			if class.Score > flagThreshold {
+			if class.Score > flagThreshold && categoryFlaggableFunc(class.Class) {
 				result.Flagged = true
 				result.FlaggedCategories = append(result.FlaggedCategories, class.Class)
 			}
@@ -284,6 +318,27 @@ func (r *response) toResult(flagThreshold float64, categoryInclusionFunc func(ca
 	}
 
 	return result, nil
+}
+
+// applyMinorSexualEscalation flags the result as child exploitation when Hive
+// detected a minor and the text is at least mildly sexual. The minor-presence
+// classes never flag alone (see textContextClasses); this is what they exist
+// for.
+func applyMinorSexualEscalation(result *moderation.Result) {
+	if result.CategoryScores[minorExplicitlyMentionedCategory] <= 0 &&
+		result.CategoryScores[minorImplicitlyMentionedCategory] <= 0 {
+		return
+	}
+
+	if result.CategoryScores[sexualCategory] < minorSexualEscalationScore {
+		return
+	}
+
+	result.Flagged = true
+	result.CategoryScores[childExploitationCategory] = filterDetectedScore
+	if !slices.Contains(result.FlaggedCategories, childExploitationCategory) {
+		result.FlaggedCategories = append(result.FlaggedCategories, childExploitationCategory)
+	}
 }
 
 // applyIWFTextFilters folds Hive's IWF text_filters matches into the result.

@@ -10,6 +10,7 @@ import (
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 
+	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/moderation"
 )
 
@@ -140,7 +141,7 @@ func (f *Finalizer) Finalize(ctx context.Context, record *Blob) (blobpb.BlobStat
 				return f.reject(ctx, record, &RejectionMetadata{
 					Reason:          RejectionReasonModeration,
 					FlaggedCategory: moderation.HighestFlaggedCategory(result),
-				})
+				}, zap.Strings("flagged_features", result.FlaggedCategories))
 			}
 		}
 
@@ -421,7 +422,9 @@ func (f *Finalizer) fetchUploaded(ctx context.Context, record *Blob) ([]byte, er
 	return data, nil
 }
 
-func (f *Finalizer) reject(ctx context.Context, record *Blob, rejection *RejectionMetadata) (blobpb.BlobStatus, error) {
+// reject terminally rejects a blob. logFields are extra context for the
+// rejection's log line (e.g. the individual moderation features that flagged).
+func (f *Finalizer) reject(ctx context.Context, record *Blob, rejection *RejectionMetadata, logFields ...zap.Field) (blobpb.BlobStatus, error) {
 	advanced, err := f.blobs.Reject(ctx, record.ID, rejection)
 	if err != nil {
 		return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
@@ -431,6 +434,12 @@ func (f *Finalizer) reject(ctx context.Context, record *Blob, rejection *Rejecti
 		// was actually committed rather than asserting REJECTED over it.
 		return f.currentStatus(ctx, record.ID)
 	}
+	fields := []zap.Field{
+		zap.String("blob_id", IDString(record.ID)),
+		zap.String("owner_id", model.UserIDString(record.Owner)),
+		zap.String("reason", rejection.Reason.ToProto().String()),
+	}
+	f.log.Info("Blob rejected", append(fields, logFields...)...)
 	// Drop the rejected bytes from the upload store; they are never promoted.
 	f.cleanupUpload(ctx, record)
 	return blobpb.BlobStatus_BLOB_STATUS_REJECTED, nil

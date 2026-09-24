@@ -438,9 +438,9 @@ func (c *Chat) Clone() *Chat {
 
 // ToProto projects the stored chat onto a chatpb.Metadata. Only the fields
 // owned by the chat domain are populated: chat_id, type, title, last_activity,
-// roster_summary, rules, a Member entry per member with just user_id set, and —
-// for a group with a picture — a picture carrying only its ORIGINAL rendition's
-// blob id. The caller is responsible for hydrating member profiles, pointers,
+// roster_summary, rules, creator (a group's, when recorded), a Member entry per
+// member with just user_id set, and — for a group with a picture — a picture
+// carrying only its ORIGINAL rendition's blob id. The caller is responsible for hydrating member profiles, pointers,
 // the last message, and the picture's resolved rendition set.
 func (c *Chat) ToProto() *chatpb.Metadata {
 	members := make([]*chatpb.Member, len(c.Members))
@@ -457,6 +457,9 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 		Title:         c.Title,
 		Rules:         c.Rules(),
 		LastActivity:  timestamppb.New(c.LastActivity),
+	}
+	if c.CreatorID != nil {
+		md.Creator = &commonpb.UserId{Value: append([]byte(nil), c.CreatorID.Value...)}
 	}
 	if c.PictureBlobID != nil {
 		md.Picture = &blobpb.Media{

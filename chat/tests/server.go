@@ -56,6 +56,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_HydrationFailureCancelsSiblings,
 		testServer_GetChat_TipDm_HidesPhoneNumbers,
 		testServer_GetChat_Dm_NoCreator,
+		testServer_GetChat_Dm_UseE2ee,
 		testServer_GetChat_HiddenWhenPeerBlocked,
 		testServer_GetChat_Group_Hydrates,
 		testServer_GetChat_Group_Picture,
@@ -1268,6 +1269,63 @@ func testServer_GetChat_Dm_NoCreator(t *testing.T, s chat.Store) {
 		require.Equal(t, chatID.Value, feed.Chats[0].ChatId.Value)
 		require.Nil(t, feed.Chats[0].Creator)
 	}
+}
+
+func testServer_GetChat_Dm_UseE2ee(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// use_e2ee is set exactly when both members of a DM are staff, whatever the
+	// DM's type and whichever read serves it, and never on a group.
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_TIP_DM} {
+		peer := model.MustGenerateUserID()
+		chatID := e.putDMWithPeer(chatType, peer, at(1))
+
+		assertUseE2ee := func(want bool) {
+			t.Helper()
+			resp := e.getChat(e.keys, chatID)
+			require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+			require.Equal(t, want, resp.Metadata.UseE2Ee)
+
+			feed, err := e.getDmFeedOfType(chatType, &commonpb.QueryOptions{})
+			require.NoError(t, err)
+			require.Equal(t, chatpb.GetDmChatFeedResponse_OK, feed.Result)
+			require.Len(t, feed.Chats, 1)
+			require.Equal(t, chatID.Value, feed.Chats[0].ChatId.Value)
+			require.Equal(t, want, feed.Chats[0].UseE2Ee)
+		}
+
+		// Neither member is staff.
+		assertUseE2ee(false)
+
+		// Only the viewer is staff.
+		e.accounts.setStaff(e.userID, true)
+		assertUseE2ee(false)
+
+		// Only the peer is staff.
+		e.accounts.setStaff(e.userID, false)
+		e.accounts.setStaff(peer, true)
+		assertUseE2ee(false)
+
+		// Both are staff: the flag is decided per read, so it appears with no
+		// write to the chat.
+		e.accounts.setStaff(e.userID, true)
+		assertUseE2ee(true)
+
+		// And is withdrawn the same way.
+		e.accounts.setStaff(peer, false)
+		assertUseE2ee(false)
+
+		e.accounts.setStaff(e.userID, false)
+	}
+
+	// A group of staff members never carries it.
+	other := model.MustGenerateUserID()
+	e.accounts.setStaff(e.userID, true)
+	e.accounts.setStaff(other, true)
+	groupID := e.putGroup("Staff", at(2), other)
+	resp := e.getChat(e.keys, groupID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.False(t, resp.Metadata.UseE2Ee)
 }
 
 func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {

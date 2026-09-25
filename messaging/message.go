@@ -425,9 +425,12 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 // is the rule that an edit never downgrades an encrypted message to plaintext,
 // which depends on the message being edited.
 //
-// Encrypted content is opaque: whatever it wraps — the proto allows text or a
-// text reply — is the recipient's to check, not the server's, so a reply inside
-// it names a replied-to message the server never sees or verifies.
+// Encrypted content is opaque: whatever it wraps — the proto allows text, media,
+// or a reply whose body is either — is the recipient's to check, not the
+// server's, so a reply inside it names a replied-to message the server never
+// sees or verifies, and media inside it names blobs the server never shares
+// into the chat (an encrypted blob is granted to its DM when it becomes READY,
+// see blob.Finalizer) and never hydrates.
 func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *messagingpb.MessageId, ok bool) {
 	if len(content) != 1 {
 		return nil, false

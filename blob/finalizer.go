@@ -32,42 +32,142 @@ type Finalizer struct {
 	// moderator classifies uploaded image bytes during finalization. It is
 	// optional; when nil, moderation is skipped.
 	moderator moderation.Client
+
+	// access holds the blob ACL grants. Finalization writes exactly one kind of
+	// grant: an end-to-end encrypted blob's grant to the DM it was encrypted
+	// for, made in the step that turns the blob READY (see finalizeEncrypted).
+	// Every other surface's grants are made by the domain that attaches the
+	// blob, after READY (see Integration).
+	access AccessStore
 }
 
 // NewFinalizer returns a Finalizer over the given blob metadata store, object
-// storage, and (optional) moderation client.
+// storage, (optional) moderation client, and ACL store.
 func NewFinalizer(
 	log *zap.Logger,
 	blobs Store,
 	storage ObjectStorage,
 	moderator moderation.Client,
+	access AccessStore,
 ) *Finalizer {
 	return &Finalizer{
 		log:       log,
 		blobs:     blobs,
 		storage:   storage,
 		moderator: moderator,
+		access:    access,
 	}
 }
 
-// Finalize drives a blob through its processing pipeline, resuming from whatever
-// state it is already in: confirm the upload landed, validate + derive metadata +
-// moderate, copy into the origin store, and clean up. Each step checkpoints its
-// completed state, so a replay (a worker retry, or a concurrent worker) skips the
-// steps already done — notably re-moderation and the copy. It is idempotent and
-// safe to run concurrently for the same blob (the store's forward-only
-// transitions resolve races), and returns the blob's resulting public status. A
-// returned error means the pipeline stopped before a terminal state and the
-// attempt should be retried.
+// Finalize drives a blob through its content kind's processing pipeline,
+// resuming from whatever state it is already in, and returns the blob's
+// resulting public status. Each pipeline checkpoints every completed step, so a
+// replay (a worker retry, or a concurrent worker) skips the steps already done.
+// It is idempotent and safe to run concurrently for the same blob (the store's
+// forward-only transitions resolve races). A returned error means the pipeline
+// stopped before a terminal state and the attempt should be retried.
+//
+// The pipeline is the kind's: an image is validated, moderated, promoted and
+// given renditions (finalizeImage); an end-to-end encrypted blob, whose bytes
+// the server cannot read, is size-checked and promoted (finalizeEncrypted).
 func (f *Finalizer) Finalize(ctx context.Context, record *Blob) (blobpb.BlobStatus, error) {
-	state := record.State
-	if state.Terminal() {
-		return state.ToBlobStatus(), nil
+	if record.State.Terminal() {
+		return record.State.ToBlobStatus(), nil
 	}
 
-	if record.ContentKind() != ContentKindImage {
+	switch record.ContentKind() {
+	case ContentKindImage:
+		return f.finalizeImage(ctx, record)
+	case ContentKindEncrypted:
+		return f.finalizeEncrypted(ctx, record)
+	default:
 		return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, errors.New("unsupported content kind for finalization")
 	}
+}
+
+// finalizeEncrypted is the end-to-end encrypted kind's pipeline: confirm the
+// upload landed and is exactly the declared size, copy it into the origin store,
+// grant the DM read access, clean up. The bytes are ciphertext the server cannot
+// read, so there is nothing to inspect, moderate or derive renditions from, and
+// the size is the one contract it can hold the upload to — a mismatch is the
+// only rejection this kind can earn on its own (TOO_LARGE, like an image whose
+// bytes broke their declared size), as the proto promises.
+//
+// The grant to the surface the blob was encrypted for (Blob.EncryptedFor; for a
+// DM, blobpb.AccessContext.chat: "shared into the chat it was uploaded for once
+// it is READY") is made here, immediately before the READY transition, rather
+// than at reservation or by the message that later references the blob. The
+// principal is whatever reservation recorded, so this step knows nothing about
+// chats. Before it the surface's readers see nothing, exactly as for a blob
+// that does not exist, so READY is the one moment the blob becomes visible to
+// them, and a rejected blob is never granted at all. The grant is idempotent, so a finalize that lands the grant and then
+// loses the READY race, or is retried after it, re-grants harmlessly; and it
+// precedes the transition so that READY, once observed, implies the grant
+// exists — a recipient never resolves a READY blob only to be refused it. Two
+// checkpoints suffice: StatePromoted once the bytes are durably servable,
+// StateReady once the grant is made and the upload copy cleaned up.
+func (f *Finalizer) finalizeEncrypted(ctx context.Context, record *Blob) (blobpb.BlobStatus, error) {
+	state := record.State
+
+	// The declared size is checked against the stored bytes exactly as an
+	// image's is: the presigned upload already pins it, so this is the server
+	// confirming its own contract held, not a first line of defence. The copy
+	// follows in the same step, so the promoted bytes are always ones that
+	// passed the check.
+	if state < StatePromoted {
+		data, err := f.fetchUploaded(ctx, record)
+		if err != nil {
+			return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
+		}
+		if uint64(len(data)) != record.SizeBytes {
+			return f.reject(ctx, record, &RejectionMetadata{Reason: RejectionReasonTooLarge})
+		}
+		if err := f.storage.CopyToOrigin(ctx, record.StorageKey); err != nil {
+			return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
+		}
+		advanced, err := f.blobs.Advance(ctx, record.ID, StatePromoted, nil)
+		if err != nil {
+			return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
+		}
+		if !advanced {
+			// Another finalizer moved the blob on; defer to it and report the
+			// committed state rather than acting on our stale view.
+			return f.currentStatus(ctx, record.ID)
+		}
+		state = StatePromoted
+	}
+
+	// Grant the DM read access, clean up the now-redundant upload bytes, then
+	// checkpoint StateReady. The grant must succeed for the blob to go READY; the
+	// cleanup, as for an image, is best-effort and never holds the blob back.
+	if state < StateReady {
+		if err := f.access.Grant(ctx, &Grant{
+			BlobID:     record.ID,
+			Principal:  *record.EncryptedFor,
+			Permission: PermissionRead,
+		}); err != nil {
+			return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
+		}
+		f.cleanupUpload(ctx, record)
+		advanced, err := f.blobs.Advance(ctx, record.ID, StateReady, nil)
+		if err != nil {
+			return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
+		}
+		if !advanced {
+			return f.currentStatus(ctx, record.ID)
+		}
+		state = StateReady
+	}
+
+	return state.ToBlobStatus(), nil
+}
+
+// finalizeImage is the image kind's pipeline: confirm the upload landed,
+// validate + derive metadata + moderate, copy into the origin store, generate
+// renditions, and clean up. Each step checkpoints its completed state, so a
+// replay skips the steps already done — notably re-moderation and the copy.
+func (f *Finalizer) finalizeImage(ctx context.Context, record *Blob) (blobpb.BlobStatus, error) {
+	state := record.State
 
 	var data []byte // the uploaded bytes, fetched once and reused across steps
 

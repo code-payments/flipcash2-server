@@ -25,10 +25,11 @@ var (
 
 // ContentKind identifies which processing family a blob's bytes belong to:
 // which validation, moderation, and rendition pipeline they go through, and
-// which finalization queue they wait in. It is derived from the blob's pinned
-// MIME type, never stored on its own. Images are the only kind supported today;
-// video, audio, etc. each become their own kind — with their own queue and
-// worker tuning — as they are added.
+// which finalization queue they wait in. It is derived from the blob's record —
+// its pinned MIME type, or the fact that it is end-to-end encrypted — never
+// stored on its own. Images and encrypted blobs are the only kinds supported
+// today; video, audio, etc. each become their own kind — with their own queue
+// and worker tuning — as they are added.
 //
 // The values are persisted (in finalization queue partition keys), so they must
 // be stable forever.
@@ -39,11 +40,19 @@ const (
 
 	// ContentKindImage is a still image.
 	ContentKindImage
+
+	// ContentKindEncrypted is an end-to-end encrypted blob (see
+	// Blob.EncryptedFor). The server cannot read its bytes, so its pipeline is
+	// the shortest: confirm the size, promote, done — no inspection, moderation
+	// or renditions.
+	ContentKindEncrypted
 )
 
 // ContentKindForMimeType maps a declared MIME type to its processing family.
 // An unsupported type maps to ContentKindUnknown, which nothing may be queued
-// under.
+// under. An encrypted blob's MIME type is the opaque application/octet-stream,
+// which maps to unknown here: its kind comes from the record, not the type
+// (see Blob.ContentKind).
 func ContentKindForMimeType(mimeType string) ContentKind {
 	if SupportedImageMimeTypes[mimeType] {
 		return ContentKindImage
@@ -56,14 +65,21 @@ func (k ContentKind) String() string {
 	switch k {
 	case ContentKindImage:
 		return "image"
+	case ContentKindEncrypted:
+		return "encrypted"
 	default:
 		return "unknown"
 	}
 }
 
-// ContentKind is the blob's processing family, derived from its pinned MIME
-// type.
+// ContentKind is the blob's processing family. An end-to-end encrypted blob is
+// ContentKindEncrypted whatever its declared type says (the type is the opaque
+// application/octet-stream); any other blob's kind is derived from its pinned
+// MIME type.
 func (b *Blob) ContentKind() ContentKind {
+	if b.EncryptedFor != nil {
+		return ContentKindEncrypted
+	}
 	return ContentKindForMimeType(b.MimeType)
 }
 
@@ -115,7 +131,10 @@ type ImageMetadata struct {
 // The success path advances strictly forward — Pending → Uploaded → Inspected →
 // Promoted → GeneratingRenditions → Ready — with Rejected an alternative
 // terminal. The ordering of the constants is significant: a blob is only ever
-// advanced to a higher-ranked state.
+// advanced to a higher-ranked state. A kind with less to do skips states rather
+// than passing through them: an end-to-end encrypted blob has nothing to
+// inspect and no renditions to generate, so it goes Uploaded → Promoted → Ready
+// (see Finalizer.finalizeEncrypted).
 type State int
 
 const (
@@ -245,8 +264,31 @@ func (r *RejectionMetadata) ToProto() *blobpb.RejectionMetadata {
 // re-validates the stored bytes against them and REJECTs the blob on any
 // mismatch rather than overwriting them. Only the derived kind-specific
 // metadata is filled in at finalization.
+//
+// An end-to-end encrypted blob (EncryptedFor set) is the exception to "the
+// server derives the metadata": its bytes are opaque, so the record carries
+// only what the client declared (an application/octet-stream of SizeBytes)
+// and the surface it was encrypted for, and finalization checks nothing but
+// the size.
 type Blob struct {
 	ID *blobpb.BlobId
+
+	// EncryptedFor is set when the blob's bytes are end-to-end encrypted for one
+	// surface (blobpb.InitiateExternalUploadRequest.end_to_end_encrypted_for),
+	// naming that surface as the principal its read grant will be made to — a
+	// DM is PrincipalForChat(chat), the only surface today. It is pinned at
+	// reservation and immutable. The server cannot read such a blob, so it
+	// derives no metadata or renditions from it, never moderates it, grants the
+	// principal read access in the step that makes it READY (see
+	// Finalizer.finalizeEncrypted), and lets it be referenced only from
+	// encrypted content on that surface: every other attach surface refuses it
+	// (see validateAttachable). It is nil for an ordinary blob.
+	//
+	// It is a Principal rather than a chat id so that the pipeline, the stores
+	// and the read paths stay surface-agnostic: a new oneof arm in the proto is
+	// mapped to its principal, and given its own admission gate, in exactly one
+	// place (Server.initiateEncryptedUpload) and finalizes through the same code.
+	EncryptedFor *Principal
 
 	// Rendition is which rendition of its media this blob holds. An ORIGINAL has
 	// a nil ParentID; any other rendition type is a server-derived variant with
@@ -383,6 +425,12 @@ func (b *Blob) Clone() *Blob {
 	}
 	if b.Owner != nil {
 		cloned.Owner = &commonpb.UserId{Value: append([]byte(nil), b.Owner.Value...)}
+	}
+	if b.EncryptedFor != nil {
+		cloned.EncryptedFor = &Principal{
+			Type: b.EncryptedFor.Type,
+			ID:   append([]byte(nil), b.EncryptedFor.ID...),
+		}
 	}
 	if b.Image != nil {
 		image := *b.Image

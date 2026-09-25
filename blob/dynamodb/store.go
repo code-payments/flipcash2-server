@@ -45,6 +45,14 @@ const (
 	attrExpiresAt     = "expires_at"      // N, Unix seconds; TTL on non-READY blobs
 	attrCreatedAt     = "created_at"      // N, Unix nanos; stamped once at creation
 
+	// The surface an end-to-end encrypted blob was encrypted for, as the principal
+	// its READY grant is made to (blob.Blob.EncryptedFor). Both are present only on
+	// encrypted blobs. The type is the persisted blob.PrincipalType value, exactly
+	// as the ACL table stores it; the id is the principal's raw bytes, since it is
+	// never part of a key and so needs no string rendering.
+	attrEncryptedForType = "encrypted_for_type" // N
+	attrEncryptedForID   = "encrypted_for_id"   // B
+
 	attrRejectionReason = "rejection_reason" // N, present only on REJECTED blobs
 	attrFlaggedCategory = "flagged_category" // N, present only on REJECTED-by-moderation blobs
 
@@ -532,6 +540,10 @@ func toItem(b *blob.Blob) map[string]types.AttributeValue {
 	if b.ParentID != nil {
 		item[attrParentID] = avS(hex.EncodeToString(b.ParentID.Value))
 	}
+	if b.EncryptedFor != nil {
+		item[attrEncryptedForType] = avInt(int(b.EncryptedFor.Type))
+		item[attrEncryptedForID] = avB(b.EncryptedFor.ID)
+	}
 	if b.Image != nil {
 		item[attrImageWidth] = avInt(int(b.Image.Width))
 		item[attrImageHeight] = avInt(int(b.Image.Height))
@@ -580,6 +592,18 @@ func fromItem(item map[string]types.AttributeValue) (*blob.Blob, error) {
 			return nil, err
 		}
 		b.ParentID = &blobpb.BlobId{Value: parentBytes}
+	}
+
+	if _, ok := item[attrEncryptedForType]; ok {
+		principalType, err := intAttr(item, attrEncryptedForType)
+		if err != nil {
+			return nil, err
+		}
+		principalID, err := bytesAttr(item, attrEncryptedForID)
+		if err != nil {
+			return nil, err
+		}
+		b.EncryptedFor = &blob.Principal{Type: blob.PrincipalType(principalType), ID: principalID}
 	}
 
 	if _, ok := item[attrImageBlurhash]; ok {
@@ -776,6 +800,9 @@ func avUnixNanos(t time.Time) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.FormatInt(t.UnixNano(), 10)}
 }
 func avBool(v bool) types.AttributeValue { return &types.AttributeValueMemberBOOL{Value: v} }
+func avB(v []byte) types.AttributeValue {
+	return &types.AttributeValueMemberB{Value: append([]byte(nil), v...)}
+}
 
 func stringAttr(item map[string]types.AttributeValue, name string) string {
 	if av, ok := item[name].(*types.AttributeValueMemberS); ok {
@@ -789,6 +816,17 @@ func boolAttr(item map[string]types.AttributeValue, name string) bool {
 		return av.Value
 	}
 	return false
+}
+
+// bytesAttr reads a B attribute, copying the value so the item can be dropped.
+// A missing or non-binary attribute is an error: every caller reads it beside a
+// sibling attribute whose presence promises it.
+func bytesAttr(item map[string]types.AttributeValue, name string) ([]byte, error) {
+	v, ok := item[name].(*types.AttributeValueMemberB)
+	if !ok {
+		return nil, fmt.Errorf("missing or non-binary %s attribute", name)
+	}
+	return append([]byte(nil), v.Value...), nil
 }
 
 func hexAttr(item map[string]types.AttributeValue, name string) ([]byte, error) {

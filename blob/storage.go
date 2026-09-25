@@ -83,9 +83,10 @@ type ObjectStorage interface {
 // Only images are supported today, so a non-image mime type is rejected outright
 // rather than being silently forced into the image layout. Other kinds (videos,
 // files) may want a different prefix and layout — keyed off the kind, not merely
-// a resolvable extension — so adding one has to make a deliberate decision here.
-// The extension is derived from the (immutable) mime type, and the same key is
-// used in both the upload and origin stores.
+// a resolvable extension — so adding one has to make a deliberate decision here
+// (encrypted blobs did: see EncryptedStorageKey). The extension is derived from
+// the (immutable) mime type, and the same key is used in both the upload and
+// origin stores.
 func StorageKey(id *blobpb.BlobId, mimeType string) (string, error) {
 	// Gate on the image kind explicitly, not merely on a resolvable extension: if
 	// mimeTypeToExtension later grows video/file entries, this still rejects them
@@ -102,4 +103,29 @@ func StorageKey(id *blobpb.BlobId, mimeType string) (string, error) {
 		return "", fmt.Errorf("missing extension for image mime type %q", mimeType)
 	}
 	return fmt.Sprintf("images/%s/original%s", IDString(id), ext), nil
+}
+
+// EncryptedMimeType is the only MIME type an end-to-end encrypted blob may
+// declare: the bytes are ciphertext, opaque to the server and the CDN alike,
+// so they are typed as an octet stream. The plaintext's real type travels
+// inside the encrypted message that references the blob, never here.
+const EncryptedMimeType = "application/octet-stream"
+
+// EncryptedStorageKey derives the object key for an end-to-end encrypted
+// blob's bytes from its id:
+//
+//	encrypted/<uuid>/original.bin
+//
+// It is its own layout rather than a branch of StorageKey because the two are
+// different decisions: an image key is chosen by the bytes' type and leaves
+// room for derived renditions, while an encrypted blob has no readable type
+// and never has renditions. The prefix keeps ciphertext apart from every
+// plaintext kind in both the upload and origin stores, so a bucket-level rule
+// (lifecycle, access logging, a future scanner exclusion) can name it. The
+// same key is used in both stores.
+func EncryptedStorageKey(id *blobpb.BlobId) (string, error) {
+	if err := id.Validate(); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("encrypted/%s/original.bin", IDString(id)), nil
 }

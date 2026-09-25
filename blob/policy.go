@@ -34,15 +34,40 @@ var currentPolicyVersion = currentPolicy.Version
 // constraint entry per supported image MIME type, each pinned to the same byte,
 // dimension, and pixel ceilings the server enforces authoritatively when it
 // reserves the upload (InitiateExternalUpload) and inspects the stored bytes
-// (InspectImage). The policy is advisory — it lets a client validate and resize
-// before uploading — but it never advertises a limit the server does not itself
-// enforce. It is called once, to initialize currentPolicy.
+// (InspectImage), plus the constraints on end-to-end encrypted uploads. The
+// policy is advisory — it lets a client validate and resize before uploading —
+// but it never advertises a limit the server does not itself enforce, with one
+// deliberate exception: the encrypted block's image bounds, which the proto
+// itself declares advisory because the server cannot see the image. It is
+// called once, to initialize currentPolicy.
+//
+// The encrypted block is always present: every caller who may upload at all
+// may upload encrypted blobs, since what actually gates one is membership in
+// the DM it is for, decided per request at reservation.
 func buildUploadPolicy() *blobpb.UploadPolicy {
 	constraints := buildMimeTypeConstraints()
+	encrypted := buildEncryptedConstraints()
 	return &blobpb.UploadPolicy{
-		Version:             &blobpb.PolicyVersion{Value: policyVersion(constraints)},
+		Version:             &blobpb.PolicyVersion{Value: policyVersion(constraints, encrypted)},
 		Ttl:                 durationpb.New(uploadPolicyTTL),
 		MimeTypeConstraints: constraints,
+		Encrypted:           encrypted,
+	}
+}
+
+// buildEncryptedConstraints returns the constraints on end-to-end encrypted
+// uploads: the size ceiling the server enforces at reservation and
+// finalization, and the image bounds it advises a sender to downscale to
+// before encrypting (see MaxEncryptedBlobSizeBytes and
+// maxEncryptedImageDimension for why each is what it is).
+func buildEncryptedConstraints() *blobpb.EncryptedConstraints {
+	return &blobpb.EncryptedConstraints{
+		MaxSizeBytes: MaxEncryptedBlobSizeBytes,
+		Image: &blobpb.ImageConstraints{
+			MaxWidth:  maxEncryptedImageDimension,
+			MaxHeight: maxEncryptedImageDimension,
+			MaxPixels: maxEncryptedImagePixels,
+		},
 	}
 }
 
@@ -78,9 +103,10 @@ func buildMimeTypeConstraints() []*blobpb.MimeTypeConstraints {
 
 // policyVersion hashes a canonical rendering of the policy's limits into a short
 // hex token. The rendering covers every advertised value, so any change to the
-// TTL or a constraint yields a different token; the constraints arrive in a
-// stable order, so an unchanged policy always yields the same token.
-func policyVersion(constraints []*blobpb.MimeTypeConstraints) string {
+// TTL, a constraint, or the encrypted block yields a different token; the
+// constraints arrive in a stable order, so an unchanged policy always yields
+// the same token.
+func policyVersion(constraints []*blobpb.MimeTypeConstraints, encrypted *blobpb.EncryptedConstraints) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "ttl=%d;", uploadPolicyTTL)
 	for _, c := range constraints {
@@ -88,6 +114,9 @@ func policyVersion(constraints []*blobpb.MimeTypeConstraints) string {
 		fmt.Fprintf(h, "type=%s,size=%d,w=%d,h=%d,px=%d;",
 			c.MimeTypePattern, c.MaxSizeBytes, img.GetMaxWidth(), img.GetMaxHeight(), img.GetMaxPixels())
 	}
+	img := encrypted.GetImage()
+	fmt.Fprintf(h, "encrypted:size=%d,w=%d,h=%d,px=%d;",
+		encrypted.GetMaxSizeBytes(), img.GetMaxWidth(), img.GetMaxHeight(), img.GetMaxPixels())
 	// 16 bytes is ample to make an accidental collision between two distinct
 	// policies vanishingly unlikely, and stays well inside the proto's length cap.
 	return hex.EncodeToString(h.Sum(nil)[:16])

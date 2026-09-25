@@ -33,6 +33,10 @@ type Server struct {
 	access   AccessStore
 	resolver PrincipalResolver
 
+	// dms gates end-to-end encrypted uploads: one is reserved only for a DM the
+	// caller is a member of (see initiateEncryptedUpload).
+	dms DMMembership
+
 	blobpb.UnimplementedBlobStorageServer
 }
 
@@ -44,6 +48,7 @@ func NewServer(
 	storage ObjectStorage,
 	access AccessStore,
 	resolver PrincipalResolver,
+	dms DMMembership,
 ) *Server {
 	return &Server{
 		log:      log,
@@ -53,6 +58,7 @@ func NewServer(
 		storage:  storage,
 		access:   access,
 		resolver: resolver,
+		dms:      dms,
 	}
 }
 
@@ -104,6 +110,13 @@ func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.Initiat
 		return &blobpb.InitiateExternalUploadResponse{Result: blobpb.InitiateExternalUploadResponse_DENIED}, nil
 	}
 
+	// An end-to-end encrypted upload is its own contract — an opaque type, its
+	// own size ceiling, and a DM it is pinned to — so it is reserved on its own
+	// path. An ordinary upload has no surface named.
+	if chatID := req.GetChat(); chatID != nil {
+		return s.initiateEncryptedUpload(ctx, log, owner, chatID, req)
+	}
+
 	// The declared type and size become the immutable, pinned contract for the
 	// upload. Reject anything we would not accept up front rather than after the
 	// bytes land, surfacing the specific reason so the client can react instead of
@@ -136,13 +149,7 @@ func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.Initiat
 		return nil, status.Error(codes.Internal, "failed to initiate upload")
 	}
 
-	target, err := s.storage.PresignUpload(ctx, key, req.MimeType, req.SizeBytes)
-	if err != nil {
-		log.Warn("Failed to presign upload target", zap.Error(err))
-		return nil, status.Error(codes.Internal, "failed to initiate upload")
-	}
-
-	record := &Blob{
+	return s.reserve(ctx, log, &Blob{
 		ID:         id,
 		Rendition:  RenditionOriginal,
 		Owner:      owner,
@@ -150,7 +157,92 @@ func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.Initiat
 		StorageKey: key,
 		MimeType:   req.MimeType,
 		SizeBytes:  req.SizeBytes,
+	})
+}
+
+// initiateEncryptedUpload reserves an end-to-end encrypted blob for a DM
+// (blobpb.InitiateExternalUploadRequest.end_to_end_encrypted_for). The server
+// cannot read the bytes, so the contract it pins is the one it can hold the
+// upload to: the opaque type (UNSUPPORTED_TYPE otherwise), the encrypted size
+// ceiling (TOO_LARGE otherwise; both policy-driven, so they echo the policy
+// version), and a DM the caller is a member of (DENIED otherwise — a group, an
+// unknown chat, and a non-member are indistinguishable, so a caller learns
+// nothing about a chat they are not in). The cheap checks run first; the
+// membership read runs only for a request that is otherwise acceptable.
+//
+// Reservation pins the blob to the chat as the principal its grant will be made
+// to (Blob.EncryptedFor = PrincipalForChat) but grants nothing: the read grant
+// is made by finalization in the step that turns the blob READY (see
+// Finalizer.finalizeEncrypted), so the other member sees the blob exactly when
+// it becomes servable and never a blob that was rejected. Until then only the
+// owner can observe it, as with any pending upload.
+//
+// This is the one place that knows which proto arm maps to which principal
+// and what admits a caller to it, mirroring principalForAccessContext on the
+// read side. A new end_to_end_encrypted_for arm is handled by adding its
+// mapping and gate here; the pipeline, stores and read paths take any
+// principal.
+func (s *Server) initiateEncryptedUpload(ctx context.Context, log *zap.Logger, owner *commonpb.UserId, chatID *commonpb.ChatId, req *blobpb.InitiateExternalUploadRequest) (*blobpb.InitiateExternalUploadResponse, error) {
+	log = log.With(zap.String("encrypted_for_chat_id", model.ChatIDString(chatID)))
+
+	if req.MimeType != EncryptedMimeType {
+		log.Debug("Rejecting encrypted upload of non-opaque mime type")
+		return &blobpb.InitiateExternalUploadResponse{
+			Result:        blobpb.InitiateExternalUploadResponse_UNSUPPORTED_TYPE,
+			PolicyVersion: currentPolicyVersion,
+		}, nil
 	}
+
+	if req.SizeBytes > MaxEncryptedBlobSizeBytes {
+		log.Debug("Rejecting oversize encrypted upload")
+		return &blobpb.InitiateExternalUploadResponse{
+			Result:        blobpb.InitiateExternalUploadResponse_TOO_LARGE,
+			PolicyVersion: currentPolicyVersion,
+		}, nil
+	}
+
+	isDMMember, err := s.dms.IsDMMember(ctx, chatID, owner)
+	if err != nil {
+		log.Warn("Failed to check DM membership", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to initiate upload")
+	}
+	if !isDMMember {
+		return &blobpb.InitiateExternalUploadResponse{Result: blobpb.InitiateExternalUploadResponse_DENIED}, nil
+	}
+
+	id := MustGenerateID()
+	log = log.With(zap.String("blob_id", IDString(id)))
+
+	key, err := EncryptedStorageKey(id)
+	if err != nil {
+		log.Warn("Failed to derive storage key", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to initiate upload")
+	}
+
+	encryptedFor := PrincipalForChat(chatID)
+	return s.reserve(ctx, log, &Blob{
+		ID:           id,
+		Rendition:    RenditionOriginal,
+		Owner:        owner,
+		EncryptedFor: &encryptedFor,
+		State:        StatePending,
+		StorageKey:   key,
+		MimeType:     req.MimeType,
+		SizeBytes:    req.SizeBytes,
+	})
+}
+
+// reserve presigns the upload target for a freshly built PENDING record and
+// writes the record, returning the OK response that hands the client its blob
+// id and target. It is the tail every reservation shares once its contract —
+// type, size, storage key, and any surface it is pinned to — has been decided.
+func (s *Server) reserve(ctx context.Context, log *zap.Logger, record *Blob) (*blobpb.InitiateExternalUploadResponse, error) {
+	target, err := s.storage.PresignUpload(ctx, record.StorageKey, record.MimeType, record.SizeBytes)
+	if err != nil {
+		log.Warn("Failed to presign upload target", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to initiate upload")
+	}
+
 	if err := s.blobs.CreatePending(ctx, record); err != nil {
 		log.Warn("Failed to reserve blob", zap.Error(err))
 		return nil, status.Error(codes.Internal, "failed to initiate upload")
@@ -158,7 +250,7 @@ func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.Initiat
 
 	return &blobpb.InitiateExternalUploadResponse{
 		Result:       blobpb.InitiateExternalUploadResponse_OK,
-		BlobId:       id,
+		BlobId:       record.ID,
 		UploadTarget: target,
 	}, nil
 }
@@ -410,7 +502,15 @@ func buildMetadata(ctx context.Context, storage ObjectStorage, record *Blob) (*b
 		SizeBytes:   record.SizeBytes,
 		DownloadUrl: downloadURL,
 	}
-	if record.Image != nil {
+	switch {
+	case record.EncryptedFor != nil:
+		// The type and size describe the ciphertext; the plaintext's are inside
+		// the encrypted message that references the blob, so the kind marks the
+		// blob as one whose metadata a client reads from there instead.
+		metadata.Kind = &blobpb.BlobMetadata_Encrypted{
+			Encrypted: &blobpb.EncryptedBlobMetadata{},
+		}
+	case record.Image != nil:
 		metadata.Kind = &blobpb.BlobMetadata_Image{
 			Image: &blobpb.ImageMetadata{
 				Width:    record.Image.Width,

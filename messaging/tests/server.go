@@ -76,6 +76,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_Reactions,
 		testServer_Reactions_Reactors,
 		testServer_Reactions_Summaries,
+		testServer_Reactions_SummaryOrder,
 		testServer_Reactions_Errors,
 		testServer_Reactions_GroupSelfReaction,
 		// Typing
@@ -1916,6 +1917,78 @@ func testServer_Reactions_Summaries(t *testing.T, badges badge.Store, blocklists
 	found, n = reactionsOf(byIDs.Summaries, msg3.Value)
 	require.True(t, found)
 	require.Zero(t, n)
+}
+
+// testServer_Reactions_SummaryOrder pins the wire order of a summary's
+// aggregates (messaging.ReactionLess): most reacted first, ties by the emoji's
+// bytes, on both summary RPCs, and follows the order as counts move so a tie
+// that forms or breaks is re-ranked deterministically.
+func testServer_Reactions_SummaryOrder(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	const (
+		thumbsUp = "👍"  // F0 9F 91 8D
+		heart    = "❤️" // E2 9D A4 EF B8 8F: the lowest bytes of the three
+		joy      = "😂"  // F0 9F 98 82: the highest
+	)
+
+	m, err := e.send(e.keysA, "ordered", generateClientID())
+	require.NoError(t, err)
+	msgID := m.Message.MessageId
+
+	emojiOrder := func(reactions []*messagingpb.EmojiReaction) []string {
+		out := make([]string, len(reactions))
+		for i, r := range reactions {
+			out[i] = r.Emoji.Value
+		}
+		return out
+	}
+	// Both RPCs, for both viewers, must agree on the order.
+	expectOrder := func(want ...string) {
+		t.Helper()
+		for _, keys := range []model.KeyPair{e.keysA, e.keysB} {
+			single, err := e.getReactionSummary(keys, msgID)
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, single.Result)
+			require.Equal(t, want, emojiOrder(single.Summary.Reactions))
+
+			byIDs, err := e.getReactionSummariesByIDs(keys, msgID.Value)
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.GetReactionSummariesResponse_OK, byIDs.Result)
+			require.Len(t, byIDs.Summaries, 1)
+			require.Equal(t, want, emojiOrder(byIDs.Summaries[0].Reactions))
+
+			byOpts, err := e.getReactionSummariesByOptions(keys, &commonpb.QueryOptions{Order: commonpb.QueryOptions_ASC})
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.GetReactionSummariesResponse_OK, byOpts.Result)
+			require.Len(t, byOpts.Summaries, 1)
+			require.Equal(t, want, emojiOrder(byOpts.Summaries[0].Reactions))
+		}
+	}
+
+	// Added in an order that is neither the wire order nor its reverse: 😂 first
+	// (highest bytes), then 👍 by both members, then ❤️.
+	_, err = e.addReaction(e.keysB, msgID, joy)
+	require.NoError(t, err)
+	_, err = e.addReaction(e.keysA, msgID, thumbsUp)
+	require.NoError(t, err)
+	_, err = e.addReaction(e.keysB, msgID, thumbsUp)
+	require.NoError(t, err)
+	_, err = e.addReaction(e.keysA, msgID, heart)
+	require.NoError(t, err)
+
+	// 👍 leads on count; ❤️ and 😂 tie at one and fall back to emoji bytes.
+	expectOrder(thumbsUp, heart, joy)
+
+	// Breaking 👍's lead makes a three-way tie: pure emoji order, and 👍 drops
+	// to the middle rather than keeping its slot.
+	_, err = e.removeReaction(e.keysB, msgID, thumbsUp)
+	require.NoError(t, err)
+	expectOrder(heart, thumbsUp, joy)
+
+	// A new leader jumps to the front regardless of its bytes.
+	_, err = e.addReaction(e.keysA, msgID, joy)
+	require.NoError(t, err)
+	expectOrder(joy, heart, thumbsUp)
 }
 
 // testServer_Reactions_Errors covers the reaction-specific rejection matrix:

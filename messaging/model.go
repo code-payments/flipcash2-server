@@ -281,10 +281,18 @@ type ReactionSummary struct {
 	Reactions []*Reaction
 }
 
-// ToProto projects onto a messagingpb.ReactionSummary.
+// ToProto projects onto a messagingpb.ReactionSummary, with the aggregates in
+// wire order (see ReactionLess): most reacted first, ties by emoji. The stores
+// each return a deterministic order of their own (by emoji), but the order a
+// client sees is decided here, at the one projection every summary read goes
+// through, so it never depends on the backend. The model's slice is left as it
+// was.
 func (s *ReactionSummary) ToProto() *messagingpb.ReactionSummary {
-	reactions := make([]*messagingpb.EmojiReaction, len(s.Reactions))
-	for i, r := range s.Reactions {
+	ordered := make([]*Reaction, len(s.Reactions))
+	copy(ordered, s.Reactions)
+	sort.SliceStable(ordered, func(i, j int) bool { return ReactionLess(ordered[i], ordered[j]) })
+	reactions := make([]*messagingpb.EmojiReaction, len(ordered))
+	for i, r := range ordered {
 		reactions[i] = r.ToProto()
 	}
 	return &messagingpb.ReactionSummary{
@@ -402,4 +410,21 @@ func ReactorLess(a, b *Reactor) bool {
 		return a.Version > b.Version
 	}
 	return bytes.Compare(a.UserID.Value, b.UserID.Value) < 0
+}
+
+// ReactionLess is the wire order of a message's emoji aggregates: most reacted
+// first (descending Count), ties broken by the emoji itself (ascending byte
+// order of its UTF-8 encoding, which is code point order). Emoji are unique
+// within a message, so the tie-break makes the order total: two summaries of
+// the same state always list the same sequence, whatever store or read
+// produced them, and no clock or version takes part. Versions are deliberately
+// not a key — they are per emoji, so they say nothing about one emoji against
+// another. Counts move as users react, so a client that wants a row to hold
+// still between refreshes must keep its own order; this is the server's
+// contract for a fresh render.
+func ReactionLess(a, b *Reaction) bool {
+	if a.Count != b.Count {
+		return a.Count > b.Count
+	}
+	return a.Emoji < b.Emoji
 }

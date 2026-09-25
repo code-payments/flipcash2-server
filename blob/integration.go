@@ -231,7 +231,10 @@ func chatMedia(mimeType string) bool {
 // The remaining checks are shared by every attach point because they are what make a
 // blob safe to publish at all: only a READY original is servable and grantable, since
 // renditions inherit their original's grants and only a READY blob has passed
-// moderation.
+// moderation. An end-to-end encrypted blob never passed moderation — the server
+// cannot read it — so no attach point takes one: it is readable only through the
+// grant finalization made to the DM it was encrypted for when it went READY, and
+// only encrypted content in that chat, which the server never sees, references it.
 func validateAttachable(record *Blob, owner *commonpb.UserId, accepts mimeTypeFilter) error {
 	if record == nil {
 		return ErrBlobNotFound
@@ -252,6 +255,13 @@ func validateAttachable(record *Blob, owner *commonpb.UserId, accepts mimeTypeFi
 	}
 
 	if record.Rendition != RenditionOriginal || record.ParentID != nil {
+		return ErrBlobInvalid
+	}
+	// An encrypted blob is refused on its own account, not merely because its
+	// opaque type fails every surface's filter: the invariant that ciphertext
+	// is never published outside its DM must not hinge on which MIME types a
+	// surface happens to accept.
+	if record.EncryptedFor != nil {
 		return ErrBlobInvalid
 	}
 	// Reject content this surface cannot render or serve rather than attaching it.
@@ -292,6 +302,13 @@ func (i *Integration) ResolveRenditions(ctx context.Context, ids []*blobpb.BlobI
 		// Only a READY original is servable and carries a rendition manifest; a
 		// pending/rejected one is left for the client to treat as unavailable.
 		if original.State != StateReady {
+			continue
+		}
+		// An encrypted blob is referenced only from inside encrypted content the
+		// server never reads, so no plaintext media on a message can legitimately
+		// name one. Omitting it here keeps a message that does — which
+		// shareMessageMedia already refuses — from ever resolving to a URL.
+		if original.EncryptedFor != nil {
 			continue
 		}
 

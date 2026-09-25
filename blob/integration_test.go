@@ -121,6 +121,58 @@ func TestIntegration_ShareIntoChat(t *testing.T) {
 	})
 }
 
+// putReadyEncrypted stores a READY end-to-end encrypted blob pinned to a DM.
+func putReadyEncrypted(t *testing.T, store blob.Store, owner *commonpb.UserId) *blobpb.BlobId {
+	ctx := context.Background()
+	id := newBlobID(t)
+	encryptedFor := blob.PrincipalForChat(newChatID())
+	require.NoError(t, store.CreatePending(ctx, &blob.Blob{
+		ID:           id,
+		Rendition:    blob.RenditionOriginal,
+		Owner:        owner,
+		EncryptedFor: &encryptedFor,
+		State:        blob.StatePending,
+		StorageKey:   "encrypted/x/original.bin",
+		MimeType:     blob.EncryptedMimeType,
+		SizeBytes:    1,
+	}))
+	_, err := store.Advance(ctx, id, blob.StateReady, nil)
+	require.NoError(t, err)
+	return id
+}
+
+func TestIntegration_EncryptedBlobIsNeverAttachable(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewInMemory()
+	access := memory.NewInMemoryAccessStore()
+	integration := blob.NewIntegration(store, memory.NewInMemoryStorage(), access)
+
+	owner := model.MustGenerateUserID()
+	chatID := newChatID()
+	id := putReadyEncrypted(t, store, owner)
+
+	// The blob is READY and the owner's, yet no surface takes it: it is referenced
+	// only from encrypted content the server never reads, and is readable only
+	// through the grant its reservation made to its own DM.
+	require.ErrorIs(t, integration.ShareIntoChat(ctx, owner, chatID, []*blobpb.BlobId{id}), blob.ErrBlobNotShareable)
+	require.ErrorIs(t, integration.SetAsProfilePicture(ctx, owner, id), blob.ErrBlobInvalid)
+	require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, id), blob.ErrBlobInvalid)
+	for _, principal := range []blob.Principal{
+		blob.PrincipalForChat(chatID),
+		blob.PrincipalForChatProfile(chatID),
+		blob.PrincipalForUserProfile(owner),
+	} {
+		granted, err := access.HasGrant(ctx, id, principal, blob.PermissionRead)
+		require.NoError(t, err)
+		require.False(t, granted)
+	}
+
+	// And it never resolves as plaintext media.
+	resolved, err := integration.ResolveRenditions(ctx, []*blobpb.BlobId{id})
+	require.NoError(t, err)
+	require.Empty(t, resolved)
+}
+
 func TestIntegration_SetAsChatPicture(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewInMemory()

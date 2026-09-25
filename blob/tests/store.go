@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 
 	"github.com/code-payments/flipcash2-server/blob"
@@ -43,6 +45,25 @@ func pendingOriginal(t *testing.T) *blob.Blob {
 	}
 }
 
+// pendingEncrypted is a freshly reserved end-to-end encrypted blob for a DM: an
+// opaque octet stream pinned to the chat principal it was encrypted for.
+func pendingEncrypted(t *testing.T) *blob.Blob {
+	id := blob.MustGenerateID()
+	key, err := blob.EncryptedStorageKey(id)
+	require.NoError(t, err)
+	encryptedFor := blob.PrincipalForChat(&commonpb.ChatId{Value: bytes.Repeat([]byte{7}, 32)})
+	return &blob.Blob{
+		ID:           id,
+		Rendition:    blob.RenditionOriginal,
+		Owner:        model.MustGenerateUserID(),
+		EncryptedFor: &encryptedFor,
+		State:        blob.StatePending,
+		StorageKey:   key,
+		MimeType:     blob.EncryptedMimeType,
+		SizeBytes:    1234 + 40,
+	}
+}
+
 func testStoreCreateAndGet(t *testing.T, store blob.Store) {
 	ctx := context.Background()
 
@@ -64,6 +85,8 @@ func testStoreCreateAndGet(t *testing.T, store blob.Store) {
 	require.Equal(t, original.StorageKey, got.StorageKey)
 	require.Equal(t, original.Owner.Value, got.Owner.Value)
 	require.Nil(t, got.ParentID)
+	require.Nil(t, got.EncryptedFor)
+	require.Equal(t, blob.ContentKindImage, got.ContentKind())
 
 	// GetByIDs returns only the ids that exist.
 	second := pendingOriginal(t)
@@ -72,6 +95,25 @@ func testStoreCreateAndGet(t *testing.T, store blob.Store) {
 	found, err := store.GetByIDs(ctx, []*blobpb.BlobId{original.ID, blob.MustGenerateID(), second.ID})
 	require.NoError(t, err)
 	require.Len(t, found, 2)
+
+	// An encrypted blob round-trips the principal it was encrypted for — type
+	// and id — which is what makes its kind encrypted: its declared type alone
+	// maps to no kind.
+	encrypted := pendingEncrypted(t)
+	require.NoError(t, store.CreatePending(ctx, encrypted))
+	got, err = store.GetByID(ctx, encrypted.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.EncryptedFor)
+	require.Equal(t, blob.PrincipalTypeChat, got.EncryptedFor.Type)
+	require.Equal(t, encrypted.EncryptedFor.ID, got.EncryptedFor.ID)
+	require.Equal(t, blob.EncryptedMimeType, got.MimeType)
+	require.Equal(t, encrypted.StorageKey, got.StorageKey)
+	require.Equal(t, blob.ContentKindEncrypted, got.ContentKind())
+	require.Equal(t, blob.ContentKindUnknown, blob.ContentKindForMimeType(got.MimeType))
+	found, err = store.GetByIDs(ctx, []*blobpb.BlobId{encrypted.ID})
+	require.NoError(t, err)
+	require.Len(t, found, 1)
+	require.Equal(t, *encrypted.EncryptedFor, *found[0].EncryptedFor)
 }
 
 func testStoreAdvance(t *testing.T, store blob.Store) {
@@ -243,6 +285,16 @@ func testStoreFinalizationQueue(t *testing.T, store blob.Store) {
 	due, err = store.GetDueForFinalization(ctx, blob.ContentKindUnknown, now.Add(time.Hour), 10)
 	require.NoError(t, err)
 	require.Empty(t, due)
+	encrypted := pendingEncrypted(t)
+	require.NoError(t, store.CreatePending(ctx, encrypted))
+	require.NoError(t, store.MarkForFinalization(ctx, encrypted.ID, blob.ContentKindEncrypted, now))
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindEncrypted, now.Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	require.Equal(t, encrypted.ID.Value, due[0].ID.Value)
+	due, err = store.GetDueForFinalization(ctx, blob.ContentKindImage, now.Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Len(t, due, 2)
 
 	// The stats cover everything queued under the kind — due or not — and are
 	// likewise partitioned by kind. The oldest enqueue time is a real, recent

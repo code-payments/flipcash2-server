@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 
 	"github.com/code-payments/flipcash2-server/blob"
@@ -27,18 +29,20 @@ func RunWorkerTests(
 	t *testing.T,
 	blobs blob.Store,
 	storage blob.ObjectStorage,
+	access blob.AccessStore,
 	putObject putObjectFunc,
 	teardown func(),
 ) {
-	for _, tf := range []func(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, putObject putObjectFunc){
+	for _, tf := range []func(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, putObject putObjectFunc){
 		testWorkerFinalizesUploadedBlob,
 		testWorkerRejectsFlaggedBlob,
 		testWorkerRetriesUntilBytesArrive,
 		testWorkerExhaustedAttemptsRejectAsInternal,
 		testWorkerSkipsClaimedWork,
 		testWorkerProcessesBatchAcrossBlobs,
+		testWorkerFinalizesEncryptedBlob,
 	} {
-		tf(t, blobs, storage, putObject)
+		tf(t, blobs, storage, access, putObject)
 		teardown()
 	}
 }
@@ -52,11 +56,17 @@ type workerHarness struct {
 	putObject putObjectFunc
 }
 
-func newWorkerHarness(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, putObject putObjectFunc, moderator moderation.Client, opts ...blob.WorkerOption) *workerHarness {
+func newWorkerHarness(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, putObject putObjectFunc, moderator moderation.Client, opts ...blob.WorkerOption) *workerHarness {
+	return newWorkerHarnessForKind(t, blobs, storage, access, putObject, moderator, blob.ContentKindImage, opts...)
+}
+
+// newWorkerHarnessForKind is newWorkerHarness over the queue of the given
+// content kind, for the suites of kinds other than images.
+func newWorkerHarnessForKind(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, putObject putObjectFunc, moderator moderation.Client, kind blob.ContentKind, opts ...blob.WorkerOption) *workerHarness {
 	log := zaptest.NewLogger(t)
-	finalizer := blob.NewFinalizer(log, blobs, storage, moderator)
+	finalizer := blob.NewFinalizer(log, blobs, storage, moderator, access)
 	return &workerHarness{
-		worker:    blob.NewWorker(log, blobs, finalizer, blob.ContentKindImage, opts...),
+		worker:    blob.NewWorker(log, blobs, finalizer, kind, opts...),
 		blobs:     blobs,
 		storage:   storage,
 		putObject: putObject,
@@ -86,6 +96,29 @@ func (h *workerHarness) stageUpload(t *testing.T, data []byte, uploaded bool) *b
 	return record
 }
 
+// stageEncryptedUpload reserves a pending end-to-end encrypted blob for a DM,
+// declared at the given size, and stores data as the client's finished upload.
+func (h *workerHarness) stageEncryptedUpload(t *testing.T, data []byte, declaredSize uint64) *blob.Blob {
+	id := blob.MustGenerateID()
+	key, err := blob.EncryptedStorageKey(id)
+	require.NoError(t, err)
+
+	encryptedFor := blob.PrincipalForChat(&commonpb.ChatId{Value: bytes.Repeat([]byte{9}, 32)})
+	record := &blob.Blob{
+		ID:           id,
+		Rendition:    blob.RenditionOriginal,
+		Owner:        model.MustGenerateUserID(),
+		EncryptedFor: &encryptedFor,
+		State:        blob.StatePending,
+		StorageKey:   key,
+		MimeType:     blob.EncryptedMimeType,
+		SizeBytes:    declaredSize,
+	}
+	require.NoError(t, h.blobs.CreatePending(context.Background(), record))
+	h.putObject(key, data)
+	return record
+}
+
 // mark queues the record for finalization, due immediately.
 func (h *workerHarness) mark(t *testing.T, record *blob.Blob) {
 	require.NoError(t, h.blobs.MarkForFinalization(context.Background(), record.ID, record.ContentKind(), time.Now()))
@@ -105,8 +138,8 @@ func (h *workerHarness) process(t *testing.T, expected int) {
 	require.Equal(t, expected, processed)
 }
 
-func testWorkerFinalizesUploadedBlob(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, putObject putObjectFunc) {
-	h := newWorkerHarness(t, blobs, storage, putObject, nil)
+func testWorkerFinalizesUploadedBlob(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, putObject putObjectFunc) {
+	h := newWorkerHarness(t, blobs, storage, access, putObject, nil)
 	record := h.stageUpload(t, makePNG(t, 100, 80), true)
 	h.mark(t, record)
 
@@ -125,8 +158,8 @@ func testWorkerFinalizesUploadedBlob(t *testing.T, blobs blob.Store, storage blo
 	h.process(t, 0)
 }
 
-func testWorkerRejectsFlaggedBlob(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, putObject putObjectFunc) {
-	h := newWorkerHarness(t, blobs, storage, putObject, &fakeModerator{flagged: true, categories: []string{"general_nsfw"}})
+func testWorkerRejectsFlaggedBlob(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, putObject putObjectFunc) {
+	h := newWorkerHarness(t, blobs, storage, access, putObject, &fakeModerator{flagged: true, categories: []string{"general_nsfw"}})
 	record := h.stageUpload(t, makePNG(t, 50, 50), true)
 	h.mark(t, record)
 
@@ -141,10 +174,10 @@ func testWorkerRejectsFlaggedBlob(t *testing.T, blobs blob.Store, storage blob.O
 	h.process(t, 0)
 }
 
-func testWorkerRetriesUntilBytesArrive(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, putObject putObjectFunc) {
+func testWorkerRetriesUntilBytesArrive(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, putObject putObjectFunc) {
 	// A vanishing backoff keeps the retried task immediately due, so the test
 	// drives attempts with successive Process calls instead of sleeping.
-	h := newWorkerHarness(t, blobs, storage, putObject, nil, blob.WithWorkerBackoff(time.Nanosecond, time.Nanosecond))
+	h := newWorkerHarness(t, blobs, storage, access, putObject, nil, blob.WithWorkerBackoff(time.Nanosecond, time.Nanosecond))
 	data := makePNG(t, 40, 30)
 	record := h.stageUpload(t, data, false)
 	h.mark(t, record)
@@ -165,8 +198,8 @@ func testWorkerRetriesUntilBytesArrive(t *testing.T, blobs blob.Store, storage b
 	require.Equal(t, blob.StateReady, h.state(t, record).State)
 }
 
-func testWorkerExhaustedAttemptsRejectAsInternal(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, putObject putObjectFunc) {
-	h := newWorkerHarness(t, blobs, storage, putObject, nil,
+func testWorkerExhaustedAttemptsRejectAsInternal(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, putObject putObjectFunc) {
+	h := newWorkerHarness(t, blobs, storage, access, putObject, nil,
 		blob.WithWorkerBackoff(time.Nanosecond, time.Nanosecond),
 		blob.WithWorkerMaxAttempts(2),
 	)
@@ -189,8 +222,8 @@ func testWorkerExhaustedAttemptsRejectAsInternal(t *testing.T, blobs blob.Store,
 	h.process(t, 0)
 }
 
-func testWorkerSkipsClaimedWork(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, putObject putObjectFunc) {
-	h := newWorkerHarness(t, blobs, storage, putObject, nil)
+func testWorkerSkipsClaimedWork(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, putObject putObjectFunc) {
+	h := newWorkerHarness(t, blobs, storage, access, putObject, nil)
 	record := h.stageUpload(t, makePNG(t, 40, 30), true)
 	h.mark(t, record)
 
@@ -204,8 +237,8 @@ func testWorkerSkipsClaimedWork(t *testing.T, blobs blob.Store, storage blob.Obj
 	require.Equal(t, blob.StatePending, h.state(t, record).State)
 }
 
-func testWorkerProcessesBatchAcrossBlobs(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, putObject putObjectFunc) {
-	h := newWorkerHarness(t, blobs, storage, putObject, nil, blob.WithWorkerMaxConcurrency(2))
+func testWorkerProcessesBatchAcrossBlobs(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, putObject putObjectFunc) {
+	h := newWorkerHarness(t, blobs, storage, access, putObject, nil, blob.WithWorkerMaxConcurrency(2))
 	records := make([]*blob.Blob, 0, 5)
 	for range 5 {
 		record := h.stageUpload(t, makePNG(t, 60, 40), true)
@@ -217,4 +250,48 @@ func testWorkerProcessesBatchAcrossBlobs(t *testing.T, blobs blob.Store, storage
 	for _, record := range records {
 		require.Equal(t, blob.StateReady, h.state(t, record).State)
 	}
+}
+
+// testWorkerFinalizesEncryptedBlob drives an end-to-end encrypted blob through
+// its own queue: the bytes are promoted without inspection or moderation (the
+// moderator flags everything and is never asked), only their size is held to
+// the declaration, READY comes with the DM's read grant, and the image worker
+// never sees the work.
+func testWorkerFinalizesEncryptedBlob(t *testing.T, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, putObject putObjectFunc) {
+	flagging := &fakeModerator{flagged: true}
+	encrypted := newWorkerHarnessForKind(t, blobs, storage, access, putObject, flagging, blob.ContentKindEncrypted)
+	images := newWorkerHarness(t, blobs, storage, access, putObject, flagging)
+	ciphertext := []byte("nonce, ciphertext and tag — opaque to the server")
+
+	ready := encrypted.stageEncryptedUpload(t, ciphertext, uint64(len(ciphertext)))
+	encrypted.mark(t, ready)
+	oversize := encrypted.stageEncryptedUpload(t, ciphertext, uint64(len(ciphertext))+1)
+	encrypted.mark(t, oversize)
+
+	// Partitioned by kind: the image worker finds nothing due.
+	images.process(t, 0)
+
+	encrypted.process(t, 2)
+	got := encrypted.state(t, ready)
+	require.Equal(t, blob.StateReady, got.State)
+	require.Nil(t, got.Image)
+	require.Empty(t, got.Renditions)
+	require.Equal(t, *ready.EncryptedFor, *got.EncryptedFor)
+	url, err := storage.SignDownloadURL(context.Background(), got.StorageKey)
+	require.NoError(t, err)
+	require.NotEmpty(t, url.GetUrl())
+	granted, err := access.HasGrant(context.Background(), ready.ID, *ready.EncryptedFor, blob.PermissionRead)
+	require.NoError(t, err)
+	require.True(t, granted, "READY implies the DM is granted")
+
+	got = encrypted.state(t, oversize)
+	require.Equal(t, blob.StateRejected, got.State)
+	require.NotNil(t, got.Rejection)
+	require.Equal(t, blob.RejectionReasonTooLarge, got.Rejection.Reason)
+	granted, err = access.HasGrant(context.Background(), oversize.ID, *oversize.EncryptedFor, blob.PermissionRead)
+	require.NoError(t, err)
+	require.False(t, granted, "a rejected blob is never granted")
+
+	// Both left the queue.
+	encrypted.process(t, 0)
 }

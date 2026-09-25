@@ -9,6 +9,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ func RunServerTests(
 		testModeration,
 		testRenditionGeneration,
 		testGetBlobs,
+		testEncryptedUpload,
 	} {
 		// A fresh resolver per test func; the access store is reset by teardown.
 		resolver := newFakeResolver()
@@ -62,32 +64,38 @@ func RunServerTests(
 	}
 }
 
-// harness bundles the server with the worker that drives the finalization
-// pipeline the RPCs only queue work for, so a test can complete an upload and
-// then deterministically run the processing it kicked off.
+// harness bundles the server with the workers that drive the finalization
+// pipelines the RPCs only queue work for — one per content kind, as in
+// production — so a test can complete an upload and then deterministically run
+// the processing it kicked off.
 type harness struct {
-	server *blob.Server
-	worker *blob.Worker
+	server          *blob.Server
+	worker          *blob.Worker // drains the image queue
+	encryptedWorker *blob.Worker // drains the end-to-end encrypted queue
 }
 
-func newHarness(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver blob.PrincipalResolver, moderator moderation.Client) *harness {
+func newHarness(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, moderator moderation.Client) *harness {
 	log := zaptest.NewLogger(t)
 	authn := auth.NewKeyPairAuthenticator(log)
 	authz := account.NewAuthorizer(log, accounts, authn)
+	finalizer := blob.NewFinalizer(log, blobs, storage, moderator, access)
 	return &harness{
-		server: blob.NewServer(log, authz, accounts, blobs, storage, access, resolver),
-		worker: blob.NewWorker(log, blobs, blob.NewFinalizer(log, blobs, storage, moderator), blob.ContentKindImage),
+		server:          blob.NewServer(log, authz, accounts, blobs, storage, access, resolver, resolver),
+		worker:          blob.NewWorker(log, blobs, finalizer, blob.ContentKindImage),
+		encryptedWorker: blob.NewWorker(log, blobs, finalizer, blob.ContentKindEncrypted),
 	}
 }
 
-// drain runs worker ticks until the due queue is empty. Happy-path and
-// rejection finalizations complete on their first attempt, so this terminates
-// for every flow the suite exercises.
+// drain runs worker ticks, for every kind, until the due queues are empty.
+// Happy-path and rejection finalizations complete on their first attempt, so
+// this terminates for every flow the suite exercises.
 func (h *harness) drain(t *testing.T) {
 	for {
 		processed, err := h.worker.Process(context.Background())
 		require.NoError(t, err)
-		if processed == 0 {
+		processedEncrypted, err := h.encryptedWorker.Process(context.Background())
+		require.NoError(t, err)
+		if processed+processedEncrypted == 0 {
 			return
 		}
 	}
@@ -152,6 +160,17 @@ func testGetUploadPolicy(t *testing.T, accounts account.Store, blobs blob.Store,
 			require.Positive(t, img.MaxPixels)
 		}
 		require.Len(t, seen, len(blob.SupportedImageMimeTypes))
+
+		// The encrypted block is always advertised: the size ceiling the server
+		// enforces, and the advisory image bounds a sender downscales to.
+		encrypted := policy.Encrypted
+		require.NotNil(t, encrypted)
+		require.EqualValues(t, blob.MaxEncryptedBlobSizeBytes, encrypted.MaxSizeBytes)
+		require.GreaterOrEqual(t, encrypted.MaxSizeBytes, uint64(blob.MaxOriginalImageSizeBytes))
+		require.NotNil(t, encrypted.Image)
+		require.Positive(t, encrypted.Image.MaxWidth)
+		require.Positive(t, encrypted.Image.MaxHeight)
+		require.Positive(t, encrypted.Image.MaxPixels)
 	})
 
 	t.Run("version matches the one echoed on a policy-driven denial", func(t *testing.T) {
@@ -866,6 +885,178 @@ func testRenditionGeneration(t *testing.T, accounts account.Store, blobs blob.St
 	})
 }
 
+// testEncryptedUpload covers the end-to-end encrypted upload path: what
+// reservation refuses and pins, that the pipeline neither inspects nor
+// moderates the bytes and holds them only to their declared size, and that the
+// result is readable by the DM's members alone. The moderator is one that
+// flags everything, so an encrypted blob reaching READY proves it was never
+// consulted.
+func testEncryptedUpload(t *testing.T, accounts account.Store, blobs blob.Store, storage blob.ObjectStorage, access blob.AccessStore, resolver *fakeResolver, upload uploadFunc) {
+	h := newHarness(t, accounts, blobs, storage, access, resolver, &fakeModerator{flagged: true})
+	senderID, sender := registerUser(t, accounts)
+	recipientID, recipient := registerUser(t, accounts)
+	dmID := newChatID(t)
+	resolver.joinDM(dmID, senderID)
+	resolver.joinDM(dmID, recipientID)
+
+	// Any bytes stand in for the ciphertext: the server never looks inside.
+	ciphertext := []byte("24-byte-nonce-goes-here!then the ciphertext bytes, then a 16 byte tag")
+
+	t.Run("a non-opaque mime type is unsupported", func(t *testing.T) {
+		resp := initiateEncrypted(t, h, sender, dmID, "image/png", uint64(len(ciphertext)))
+		require.Equal(t, blobpb.InitiateExternalUploadResponse_UNSUPPORTED_TYPE, resp.Result)
+		require.NotNil(t, resp.PolicyVersion)
+		require.NotEmpty(t, resp.PolicyVersion.Value)
+	})
+
+	t.Run("oversize is too large against the encrypted ceiling", func(t *testing.T) {
+		// Just over the encrypted ceiling, then exactly at it.
+		resp := initiateEncrypted(t, h, sender, dmID, blob.EncryptedMimeType, blob.MaxEncryptedBlobSizeBytes+1)
+		require.Equal(t, blobpb.InitiateExternalUploadResponse_TOO_LARGE, resp.Result)
+		require.NotNil(t, resp.PolicyVersion)
+		resp = initiateEncrypted(t, h, sender, dmID, blob.EncryptedMimeType, blob.MaxEncryptedBlobSizeBytes)
+		require.Equal(t, blobpb.InitiateExternalUploadResponse_OK, resp.Result)
+	})
+
+	t.Run("a group chat is denied", func(t *testing.T) {
+		groupID := &commonpb.ChatId{Value: dmID.Value[:16]}
+		resolver.joinDM(groupID, senderID) // membership does not help: it is not a DM
+		resp := initiateEncrypted(t, h, sender, groupID, blob.EncryptedMimeType, uint64(len(ciphertext)))
+		require.Equal(t, blobpb.InitiateExternalUploadResponse_DENIED, resp.Result)
+		require.Nil(t, resp.PolicyVersion)
+	})
+
+	t.Run("a non-member is denied", func(t *testing.T) {
+		_, outsider := registerUser(t, accounts)
+		resp := initiateEncrypted(t, h, outsider, dmID, blob.EncryptedMimeType, uint64(len(ciphertext)))
+		require.Equal(t, blobpb.InitiateExternalUploadResponse_DENIED, resp.Result)
+		require.Nil(t, resp.PolicyVersion)
+	})
+
+	t.Run("a member reserves a blob pinned to the DM but not yet granted to it", func(t *testing.T) {
+		resp := initiateEncrypted(t, h, sender, dmID, blob.EncryptedMimeType, uint64(len(ciphertext)))
+		require.Equal(t, blobpb.InitiateExternalUploadResponse_OK, resp.Result)
+		require.NotNil(t, resp.BlobId)
+		require.NotNil(t, resp.UploadTarget)
+		require.Equal(t, blob.EncryptedMimeType, resp.UploadTarget.FormFields["Content-Type"])
+		require.True(t, strings.HasPrefix(resp.UploadTarget.FormFields["key"], "encrypted/"), resp.UploadTarget.FormFields["key"])
+
+		record, err := blobs.GetByID(context.Background(), resp.BlobId)
+		require.NoError(t, err)
+		require.Equal(t, blob.StatePending, record.State)
+		require.Equal(t, blob.RenditionOriginal, record.Rendition)
+		require.NotNil(t, record.EncryptedFor)
+		require.Equal(t, blob.PrincipalForChat(dmID), *record.EncryptedFor)
+		require.Equal(t, blob.ContentKindEncrypted, record.ContentKind())
+
+		// The grant is finalization's to make, so until READY the other member
+		// sees nothing through the chat — the blob is as good as nonexistent to
+		// them — while the owner can already watch it.
+		granted, err := access.HasGrant(context.Background(), resp.BlobId, blob.PrincipalForChat(dmID), blob.PermissionRead)
+		require.NoError(t, err)
+		require.False(t, granted)
+		require.Empty(t, getBlobs(t, h, recipient, []*blobpb.BlobId{resp.BlobId}, &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: dmID}}))
+		got := getBlobs(t, h, sender, []*blobpb.BlobId{resp.BlobId}, nil)
+		require.Len(t, got, 1)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_PENDING, got[0].Status)
+		require.Nil(t, got[0].Metadata)
+	})
+
+	t.Run("finalization checks only the size and never moderates", func(t *testing.T) {
+		resp := initiateEncrypted(t, h, sender, dmID, blob.EncryptedMimeType, uint64(len(ciphertext)))
+		require.Equal(t, blobpb.InitiateExternalUploadResponse_OK, resp.Result)
+		upload(resp.UploadTarget, ciphertext)
+
+		// The complete only queues the work; the encrypted worker drives it to
+		// READY — through a moderator that would have flagged it, had it been asked.
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_PROCESSING, completeResponse(t, h, sender, resp.BlobId).Status)
+		processed, err := h.worker.Process(context.Background())
+		require.NoError(t, err)
+		require.Zero(t, processed, "the image worker must not pick up encrypted work")
+		h.drain(t)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, completeResponse(t, h, sender, resp.BlobId).Status)
+
+		record, err := blobs.GetByID(context.Background(), resp.BlobId)
+		require.NoError(t, err)
+		require.Equal(t, blob.StateReady, record.State)
+		require.Nil(t, record.Image)
+		require.Empty(t, record.Renditions)
+
+		// READY came with the DM's read grant.
+		granted, err := access.HasGrant(context.Background(), resp.BlobId, blob.PrincipalForChat(dmID), blob.PermissionRead)
+		require.NoError(t, err)
+		require.True(t, granted)
+
+		// The metadata describes the ciphertext and is marked encrypted; the
+		// plaintext's description is the sender's to carry in the message.
+		for _, viewer := range []struct {
+			name    string
+			signer  model.KeyPair
+			context *blobpb.AccessContext
+		}{
+			{name: "owner", signer: sender},
+			{name: "other member", signer: recipient, context: &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: dmID}}},
+		} {
+			got := getBlobs(t, h, viewer.signer, []*blobpb.BlobId{resp.BlobId}, viewer.context)
+			require.Len(t, got, 1, viewer.name)
+			require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, got[0].Status, viewer.name)
+			metadata := got[0].Metadata
+			require.NotNil(t, metadata, viewer.name)
+			require.Equal(t, blob.EncryptedMimeType, metadata.MimeType, viewer.name)
+			require.EqualValues(t, len(ciphertext), metadata.SizeBytes, viewer.name)
+			require.NotEmpty(t, metadata.GetDownloadUrl().GetUrl(), viewer.name)
+			require.NotNil(t, metadata.GetEncrypted(), viewer.name)
+			require.Nil(t, metadata.GetImage(), viewer.name)
+		}
+
+		// Anyone outside the DM sees nothing, context or not.
+		_, outsider := registerUser(t, accounts)
+		require.Empty(t, getBlobs(t, h, outsider, []*blobpb.BlobId{resp.BlobId}, nil))
+		require.Empty(t, getBlobs(t, h, outsider, []*blobpb.BlobId{resp.BlobId}, &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: dmID}}))
+	})
+
+	t.Run("bytes that break the declared size are rejected as too large", func(t *testing.T) {
+		resp := initiateEncrypted(t, h, sender, dmID, blob.EncryptedMimeType, uint64(len(ciphertext))+1)
+		require.Equal(t, blobpb.InitiateExternalUploadResponse_OK, resp.Result)
+		upload(resp.UploadTarget, ciphertext)
+
+		requireRejected(t, h, sender, resp.BlobId, blobpb.RejectionReason_REJECTION_REASON_TOO_LARGE)
+
+		// A rejected blob is never granted, so the other member never learns of it.
+		granted, err := access.HasGrant(context.Background(), resp.BlobId, blob.PrincipalForChat(dmID), blob.PermissionRead)
+		require.NoError(t, err)
+		require.False(t, granted)
+		require.Empty(t, getBlobs(t, h, recipient, []*blobpb.BlobId{resp.BlobId}, &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: dmID}}))
+	})
+}
+
+// initiateEncrypted runs InitiateExternalUpload for an end-to-end encrypted
+// blob pinned to chatID and returns the full response, whatever its result.
+func initiateEncrypted(t *testing.T, h *harness, signer model.KeyPair, chatID *commonpb.ChatId, mimeType string, sizeBytes uint64) *blobpb.InitiateExternalUploadResponse {
+	req := &blobpb.InitiateExternalUploadRequest{
+		MimeType:             mimeType,
+		SizeBytes:            sizeBytes,
+		EndToEndEncryptedFor: &blobpb.InitiateExternalUploadRequest_Chat{Chat: chatID},
+	}
+	require.NoError(t, signer.Auth(req, &req.Auth))
+
+	resp, err := h.server.InitiateExternalUpload(context.Background(), req)
+	require.NoError(t, err)
+	return resp
+}
+
+// getBlobs runs GetBlobs as signer under the given (possibly nil) access
+// context and returns the resolved blobs, empty when nothing resolved.
+func getBlobs(t *testing.T, h *harness, signer model.KeyPair, ids []*blobpb.BlobId, accessContext *blobpb.AccessContext) []*blobpb.Blob {
+	req := &blobpb.GetBlobsRequest{BlobIds: &blobpb.BlobIdBatch{BlobIds: ids}, Context: accessContext}
+	require.NoError(t, signer.Auth(req, &req.Auth))
+
+	resp, err := h.server.GetBlobs(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, blobpb.GetBlobsResponse_OK, resp.Result)
+	return resp.GetBlobs().GetBlobs()
+}
+
 // initiate runs InitiateExternalUpload and returns the reserved id and target.
 func initiate(t *testing.T, h *harness, signer model.KeyPair, mimeType string, sizeBytes uint64) (*blobpb.BlobId, *blobpb.UploadTarget) {
 	req := &blobpb.InitiateExternalUploadRequest{MimeType: mimeType, SizeBytes: sizeBytes}
@@ -969,17 +1160,35 @@ func makePNGWithExif(t *testing.T, width, height int) []byte {
 }
 
 // fakeResolver is a controllable blob.PrincipalResolver for the server suite: a
-// (principal, user) pair resolves as covered only after allow records it.
+// (principal, user) pair resolves as covered only after allow records it. It
+// doubles as the suite's blob.DMMembership: joinDM records a user as a member
+// of a DM, which both admits their encrypted uploads for it and — as the
+// production ChatResolver would — covers them for the chat's grants.
 type fakeResolver struct {
-	covered map[string]bool
+	covered   map[string]bool
+	dmMembers map[string]bool
 }
 
 func newFakeResolver() *fakeResolver {
-	return &fakeResolver{covered: make(map[string]bool)}
+	return &fakeResolver{covered: make(map[string]bool), dmMembers: make(map[string]bool)}
 }
 
 func (r *fakeResolver) allow(principal blob.Principal, user *commonpb.UserId) {
 	r.covered[resolverKey(principal, user)] = true
+}
+
+func (r *fakeResolver) joinDM(chatID *commonpb.ChatId, user *commonpb.UserId) {
+	r.dmMembers[resolverKey(blob.PrincipalForChat(chatID), user)] = true
+	r.allow(blob.PrincipalForChat(chatID), user)
+}
+
+func (r *fakeResolver) IsDMMember(_ context.Context, chatID *commonpb.ChatId, user *commonpb.UserId) (bool, error) {
+	// The production adapter refuses a group ID before reading membership; the
+	// fake mirrors that so the suite exercises the same shape.
+	if len(chatID.GetValue()) != 32 {
+		return false, nil
+	}
+	return r.dmMembers[resolverKey(blob.PrincipalForChat(chatID), user)], nil
 }
 
 func (r *fakeResolver) Covers(ctx context.Context, principal blob.Principal, user *commonpb.UserId) (bool, error) {

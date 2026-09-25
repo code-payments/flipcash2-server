@@ -110,7 +110,6 @@ Score each category from 0.0 (no match) to 1.0 (clear match):
 - financial_claim: Promises returns, giveaways, guarantees, or free money (Free USDC, Guaranteed 10x, Crypto Giveaway, etc.)
 - solicitation: Advertises a service, recruits, or directs the reader elsewhere (DM for signals, Buy followers, Join my channel, etc.)
 - contact_info: Contains a URL, domain, social handle, phone number, email address, or wallet address
-- gibberish: Random characters or filler with no plausible meaning as a name (asdfgh, xxxxxxxx, etc.)
 - sexual: Sexually explicit or graphic
 - hate: Slurs, hate symbols, hate groups, or coded hate references (1488, 88, etc.)
 - violence: Threats, glorification of violence, or terrorism references
@@ -124,6 +123,7 @@ Rules:
 - Score based on the whole name, including obfuscation. Read leetspeak, homoglyphs, inserted spacing, and zero-width characters as the letters they imitate, so that an evaded slur or an obscured URL is scored the same as a plain one.
 - Score %.1f or higher only when the interpretation is clear. Short or ambiguous strings score low.
 - Emoji, stylization, and unusual capitalization are not themselves violations.
+- Random characters, filler, or a name with no plausible meaning (asdfgh, xxxxxxxx, etc.) is not a violation. Score it only for what it spells, never for being meaningless.
 
 Respond with only a JSON object mapping each category to its score. No other text. Evaluate the entire text as a display name.`, displayNameFlagThreshold)
 

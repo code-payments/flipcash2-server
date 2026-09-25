@@ -913,7 +913,6 @@ var displayNameCategories = []string{
 	"contact_info",
 	"drugs",
 	"financial_claim",
-	"gibberish",
 	"hate",
 	"profanity",
 	"self_harm",
@@ -1140,8 +1139,9 @@ func TestClassifyDisplayName_SafeNameNotFlagged(t *testing.T) {
 }
 
 // groupTitleCategories are the categories the group title prompt scores — the
-// same set as the display name prompt, since a title is abused the same ways a
-// name is. It is the authoritative list: TestClassifyGroupTitle reports any
+// display name prompt's set plus gibberish, since a title is abused the same
+// ways a name is but, unlike a name, has no reason to be meaningless. It is the
+// authoritative list: TestClassifyGroupTitle reports any
 // category it has no fixtures for, and TestClassifyGroupTitle_AllCategoriesPresent
 // asserts the model returns a score for each.
 var groupTitleCategories = []string{

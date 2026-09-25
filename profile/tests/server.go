@@ -975,6 +975,33 @@ func testUsernameModeration(t *testing.T, accounts account.Store, profiles profi
 		require.Equal(t, "clean_handle", username())
 	})
 
+	t.Run("Handle the text classifier flags only as gibberish is claimed", func(t *testing.T) {
+		reset()
+		// A meaningless handle is the user's to choose. The text classifier's
+		// gibberish verdict is the one category set aside for a handle.
+		moderator.textFlagged = true
+		moderator.textCategories = []string{moderation.CategoryGibberish}
+
+		resp, err := setUsername("xq7zk_wv")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetUsernameResponse_OK, resp.Result)
+		require.Equal(t, "xq7zk_wv", username())
+	})
+
+	t.Run("Handle the text classifier flags as gibberish and more is rejected", func(t *testing.T) {
+		reset()
+		// Setting gibberish aside excuses nothing else the text classifier found.
+		moderator.textFlagged = true
+		moderator.textCategories = []string{moderation.CategoryGibberish, "general_nsfw"}
+
+		resp, err := setUsername("xq7zk_bad")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetUsernameResponse_FAILED_MODERATED, resp.Result)
+		require.Equal(t, moderationpb.FlaggedCategory_NSFW, resp.FlaggedCategory)
+
+		require.Equal(t, "xq7zk_wv", username())
+	})
+
 	t.Run("Handle the text classifier cannot identify a language for is still allowed", func(t *testing.T) {
 		reset()
 		// A handle is short and has no whitespace, so the text classifier routinely
@@ -1298,6 +1325,33 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 		require.Equal(t, moderationpb.FlaggedCategory_SPAM, resp.FlaggedCategory)
 
 		require.Equal(t, "clean name", displayName())
+	})
+
+	t.Run("Name the text classifier flags only as gibberish is persisted", func(t *testing.T) {
+		reset()
+		// A meaningless name is the user's to choose. The text classifier's
+		// gibberish verdict is the one category set aside for a name.
+		moderator.textFlagged = true
+		moderator.textCategories = []string{moderation.CategoryGibberish}
+
+		resp, err := setDisplayName("xq7zk wv")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, resp.Result)
+		require.Equal(t, "xq7zk wv", displayName())
+	})
+
+	t.Run("Name the text classifier flags as gibberish and more is rejected", func(t *testing.T) {
+		reset()
+		// Setting gibberish aside excuses nothing else the text classifier found.
+		moderator.textFlagged = true
+		moderator.textCategories = []string{moderation.CategoryGibberish, "general_nsfw"}
+
+		resp, err := setDisplayName("xq7zk bad")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetDisplayNameResponse_FAILED_MODERATED, resp.Result)
+		require.Equal(t, moderationpb.FlaggedCategory_NSFW, resp.FlaggedCategory)
+
+		require.Equal(t, "xq7zk wv", displayName())
 	})
 
 	t.Run("Name the text classifier cannot identify a language for is still allowed", func(t *testing.T) {

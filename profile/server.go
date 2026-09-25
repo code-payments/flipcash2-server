@@ -144,6 +144,11 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 		// ErrUnsupportedLanguage is not fatal here. A one- or two-word name often
 		// gives the text classifier too little to identify a language from, and the
 		// display-name classifier below still covers the name.
+		//
+		// A meaningless name is the user's to choose, so the text classifier's
+		// gibberish verdict is set aside; the display-name classifier does not score
+		// it at all. Anything else the text classifier flagged still stands.
+		textResult = textResult.Ignoring(moderation.CategoryGibberish)
 
 		displayNameResult, err := s.moderator.ClassifyDisplayName(ctx, req.DisplayName)
 		if err != nil {
@@ -279,6 +284,11 @@ func (s *Server) SetUsername(ctx context.Context, req *profilepb.SetUsernameRequ
 		// ErrUnsupportedLanguage is not fatal here. A handle is at most 15 characters
 		// with no whitespace, so the text classifier frequently has too little to
 		// identify a language from, and the username classifier below still covers it.
+		//
+		// A meaningless handle is the user's to choose, so the text classifier's
+		// gibberish verdict is set aside; the username classifier does not score it
+		// at all. Anything else the text classifier flagged still stands.
+		textResult = textResult.Ignoring(moderation.CategoryGibberish)
 
 		usernameResult, err := s.moderator.ClassifyUsername(ctx, username)
 		if err != nil {

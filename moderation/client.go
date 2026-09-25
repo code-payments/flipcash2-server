@@ -3,11 +3,18 @@ package moderation
 import (
 	"context"
 	"errors"
+	"slices"
 )
 
 // ErrUnsupportedLanguage is returned when the moderation service does not
 // support the language of the provided text.
 var ErrUnsupportedLanguage = errors.New("unsupported language")
+
+// CategoryGibberish is the category the generic text classifier and the group
+// title classifier score text under when it has no plausible meaning. It is
+// named here because a caller moderating a name ignores it (see
+// Result.Ignoring); no other category is singled out that way.
+const CategoryGibberish = "gibberish"
 
 type Result struct {
 	// Is the piece of data flaggged as unsafe?
@@ -18,6 +25,37 @@ type Result struct {
 
 	// Various category scores applied to the piece of data
 	CategoryScores map[string]float64
+}
+
+// Ignoring returns r's verdict with the named categories no longer counted
+// toward it: they are dropped from FlaggedCategories and Flagged is recomputed
+// from what remains, while CategoryScores is kept whole so an ignored category
+// still reads for logging. A result that flagged none of them is returned as
+// is, verdict included, and a nil r yields nil, so a classifier that declined
+// (ErrUnsupportedLanguage) needs no special case. r itself is never modified.
+//
+// It exists for a caller that runs the generic text classifier on input one of
+// its categories does not apply to and cannot ask the classifier to leave that
+// category out: a display name or username is a user's to make meaningless, so
+// the gibberish class that is right for prose, and for a group title, is wrong
+// for them.
+func (r *Result) Ignoring(categories ...string) *Result {
+	if r == nil {
+		return nil
+	}
+
+	remaining := slices.DeleteFunc(slices.Clone(r.FlaggedCategories), func(category string) bool {
+		return slices.Contains(categories, category)
+	})
+	if len(remaining) == len(r.FlaggedCategories) {
+		return r
+	}
+
+	return &Result{
+		Flagged:           len(remaining) > 0,
+		FlaggedCategories: remaining,
+		CategoryScores:    r.CategoryScores,
+	}
 }
 
 type Client interface {
@@ -68,8 +106,13 @@ type Client interface {
 	//
 	// It deliberately does not score impersonation: users are free to call
 	// themselves whatever they like, including the name of a real person or
-	// brand. It is also distinct from ClassifyText, which is tuned for prose
-	// and has little to work with in a one- or two-word name.
+	// brand. Nor does it score gibberish, and neither does ClassifyUsername: a
+	// random-looking name or handle is a user's to choose, and a meaningless
+	// one harms no one, so both are judged only on what they spell. ClassifyText
+	// still scores gibberish when run on the same name, and a caller moderating
+	// a name sets that one verdict aside with Result.Ignoring. It is also
+	// distinct from ClassifyText, which is tuned for prose and has little to
+	// work with in a one- or two-word name.
 	ClassifyDisplayName(ctx context.Context, name string) (*Result, error)
 
 	// ClassifyGroupTitle checks whether a user-chosen group chat title abuses
@@ -78,7 +121,9 @@ type Client interface {
 	// categories (solicitation, contact_info, hate, etc.), but is tuned for what
 	// a title is: a label for a shared room, seen by everyone in the group and
 	// everyone considering joining it, that names a topic, a community, or an
-	// occasion rather than a person.
+	// occasion rather than a person. It is the one name-like classifier that
+	// also scores gibberish, because a title with no plausible meaning is a
+	// room nobody can find rather than a name somebody chose.
 	//
 	// Like ClassifyDisplayName it does not score impersonation: a group may be
 	// titled after any brand, person, or topic. It is also distinct from

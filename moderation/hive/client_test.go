@@ -76,6 +76,16 @@ func TestClassifyText(t *testing.T) {
 			expectedCategories: []string{"bullying"},
 		},
 		{
+			// Recorded and flagged under the name a caller moderating a name sets
+			// aside with Result.Ignoring, so that exclusion matches what Hive emits.
+			name: "gibberish is flagged under its own name",
+			scores: map[string]float64{
+				moderation.CategoryGibberish: 2,
+			},
+			expectedFlagged:    true,
+			expectedCategories: []string{moderation.CategoryGibberish},
+		},
+		{
 			name:               "profanity filter hit is flagged",
 			scores:             map[string]float64{},
 			textFilters:        []textFilter{{Type: profanityFilterType, Value: "damn"}},

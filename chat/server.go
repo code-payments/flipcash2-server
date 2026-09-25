@@ -421,6 +421,13 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 // member who is not the viewer) is on the viewer's blocklist. Every DM peer
 // across the set is resolved against the viewer's blocklist in one batched read.
 //
+// use_e2ee is a DM's alone and, while E2EE is rolling out, a staff DM's alone:
+// it is set exactly when every member of the DM is a staff user (see useE2ee),
+// which is decided per read from the account store's staff flag — never
+// stored on the chat — so a DM starts carrying it the moment its second
+// member becomes staff, and a group never carries it. Every DM member across
+// the set is resolved once, concurrently with the other reads.
+//
 // The viewer is nil for an unauthenticated read (see getPublicChat): its
 // standing is never a member's and it is never shown a DM, so no per-viewer
 // state is read on its behalf.
@@ -454,6 +461,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 	dmPeerByChat := make(map[string]*commonpb.UserId)
 	uniquePeerIDs := make(map[string]*commonpb.UserId)
 	uniquePictureBlobIDs := make(map[string]*blobpb.BlobId)
+	uniqueDmMemberIDs := make(map[string]*commonpb.UserId)
 	hydratedMembers := make([][]*commonpb.UserId, len(chats))
 	for i, c := range chats {
 		// The members to hydrate: a DM's participants, or the viewer alone in a
@@ -492,6 +500,9 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		}
 		if IsDmChatType(c.Type) {
 			for _, m := range c.Members {
+				uniqueDmMemberIDs[string(m.Value)] = m
+			}
+			for _, m := range c.Members {
 				if !bytes.Equal(m.Value, viewerID.GetValue()) {
 					dmPeerByChat[string(c.ID.Value)] = m
 					uniquePeerIDs[string(m.Value)] = m
@@ -516,6 +527,10 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 	for _, id := range uniquePictureBlobIDs {
 		pictureBlobIDs = append(pictureBlobIDs, id)
 	}
+	dmMemberIDs := make([]*commonpb.UserId, 0, len(uniqueDmMemberIDs))
+	for _, u := range uniqueDmMemberIDs {
+		dmMemberIDs = append(dmMemberIDs, u)
+	}
 
 	// The reads are independent of one another, so they run concurrently: the
 	// page waits for the slowest rather than the sum. Each goroutine writes only
@@ -531,6 +546,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		blockedPeers           map[string]bool
 		pictureRenditions      map[string][]*blobpb.Rendition
 		viewerStates           map[string]ViewerState
+		staffByUserId          map[string]bool
 	)
 	chatIDs := make([]*commonpb.ChatId, len(chats))
 	for i, c := range chats {
@@ -587,6 +603,12 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 			return err
 		})
 	}
+	if len(dmMemberIDs) > 0 {
+		g.Go(func() (err error) {
+			staffByUserId, err = s.staffFlags(gctx, dmMemberIDs)
+			return err
+		})
+	}
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
@@ -624,6 +646,9 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		md.LatestEventSequence = latestEventSeqs[key]
 		if peer, ok := dmPeerByChat[key]; ok {
 			md.IsHidden = blockedPeers[string(peer.Value)]
+		}
+		if IsDmChatType(c.Type) {
+			md.UseE2Ee = useE2ee(c, staffByUserId)
 		}
 		if c.PictureBlobID != nil {
 			// ToProto seeds the picture with its stored ORIGINAL; swap in the full
@@ -683,4 +708,49 @@ func assignPointers(members []*chatpb.Member, pointers []*messagingpb.Pointer) {
 	for _, m := range members {
 		m.Pointers = byUser[string(m.UserId.Value)]
 	}
+}
+
+// useE2ee reports whether a DM's messages are to be end-to-end encrypted (see
+// chat.v1.Metadata.use_e2ee): today, exactly when every member of the DM is a
+// staff user, so the transitional rollout reaches staff DMs and no one else.
+// staffByUserId is the staff flag per member, as staffFlags returns it; a
+// member it does not name is not staff.
+func useE2ee(c *Chat, staffByUserId map[string]bool) bool {
+	if !IsDmChatType(c.Type) || len(c.Members) == 0 {
+		return false
+	}
+	for _, m := range c.Members {
+		if !staffByUserId[string(m.Value)] {
+			return false
+		}
+	}
+	return true
+}
+
+// staffFlagConcurrency bounds how many staff-flag reads staffFlags has in
+// flight at once for one set.
+const staffFlagConcurrency = 8
+
+// staffFlags resolves the account store's staff flag for each user, keyed by
+// user ID. The store answers one user at a time (behind a cache in
+// production), so the reads run concurrently under staffFlagConcurrency and
+// the first failure fails the set.
+func (s *Server) staffFlags(ctx context.Context, userIDs []*commonpb.UserId) (map[string]bool, error) {
+	flags := make([]bool, len(userIDs))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(staffFlagConcurrency)
+	for i, userID := range userIDs {
+		g.Go(func() (err error) {
+			flags[i], err = s.accounts.IsStaff(gctx, userID)
+			return err
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(userIDs))
+	for i, userID := range userIDs {
+		out[string(userID.Value)] = flags[i]
+	}
+	return out, nil
 }

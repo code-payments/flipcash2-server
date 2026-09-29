@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/mr-tron/base58"
@@ -49,6 +50,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 		testDisplayNameModeration,
 		testDefaultUsername,
 		testUsernameModeration,
+		testFirstUsernameHandler,
 	} {
 		tf(t, accounts, profiles)
 		teardown()
@@ -1548,6 +1550,136 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 
 		require.Equal(t, "네네네", displayName())
 	})
+}
+
+// testFirstUsernameHandler covers what the FirstUsernameHandler is told: a user's
+// first handle, whether claimed or assigned by default, and never a later one.
+func testFirstUsernameHandler(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+	media, _, _ := newMedia()
+
+	handler := &recordingFirstUsernameHandler{}
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient(), profile.WithFirstUsernameHandler(handler))
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+	client := profilepb.NewProfileClient(cc)
+
+	type user struct {
+		id      *commonpb.UserId
+		keyPair model.KeyPair
+	}
+	newUser := func() user {
+		t.Helper()
+		u := user{id: model.MustGenerateUserID(), keyPair: model.MustGenerateKeyPair()}
+		_, err := accounts.Bind(ctx, u.id, u.keyPair.Proto())
+		require.NoError(t, err)
+		require.NoError(t, accounts.SetRegistrationFlag(ctx, u.id, true))
+		return u
+	}
+	setUsername := func(u user, username string) profilepb.SetUsernameResponse_Result {
+		t.Helper()
+		req := &profilepb.SetUsernameRequest{Username: &commonpb.Username{Value: username}}
+		require.NoError(t, u.keyPair.Auth(req, &req.Auth))
+		resp, err := client.SetUsername(ctx, req)
+		require.NoError(t, err)
+		return resp.Result
+	}
+	setDisplayName := func(u user, name string) *profilepb.SetDisplayNameResponse {
+		t.Helper()
+		req := &profilepb.SetDisplayNameRequest{DisplayName: name}
+		require.NoError(t, u.keyPair.Auth(req, &req.Auth))
+		resp, err := client.SetDisplayName(ctx, req)
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, resp.Result)
+		return resp
+	}
+	// told is whom the handler has been told of so far, as (user ID, handle).
+	told := func() [][2]string {
+		var out [][2]string
+		for _, c := range handler.snapshot() {
+			out = append(out, [2]string{string(c.userID.Value), c.username})
+		}
+		return out
+	}
+
+	t.Run("A claimed first handle is told, later ones are not", func(t *testing.T) {
+		handler.reset()
+		u := newUser()
+
+		// A refused claim holds nothing and tells nothing.
+		require.Equal(t, profilepb.SetUsernameResponse_RESERVED_WORD, setUsername(u, "flipcash"))
+		require.Empty(t, told())
+
+		require.Equal(t, profilepb.SetUsernameResponse_OK, setUsername(u, "first_claim"))
+		require.Equal(t, [][2]string{{string(u.id.Value), "first_claim"}}, told())
+
+		// Re-claiming the handle held, or moving to another, is not a first.
+		require.Equal(t, profilepb.SetUsernameResponse_OK, setUsername(u, "first_claim"))
+		require.Equal(t, profilepb.SetUsernameResponse_OK, setUsername(u, "second_claim"))
+		require.Len(t, told(), 1)
+
+		// Nor is a display name set while holding one.
+		setDisplayName(u, "Holder")
+		require.Len(t, told(), 1)
+	})
+
+	t.Run("A default first handle is told, a later claim is not", func(t *testing.T) {
+		handler.reset()
+		u := newUser()
+
+		resp := setDisplayName(u, "Welcomed")
+		require.NotEmpty(t, resp.GetUsername().GetValue())
+		require.Equal(t, [][2]string{{string(u.id.Value), resp.Username.Value}}, told())
+
+		setDisplayName(u, "Welcomed Again")
+		require.Equal(t, profilepb.SetUsernameResponse_OK, setUsername(u, "chosen_handle"))
+		require.Len(t, told(), 1)
+	})
+
+	t.Run("A display name earning no handle tells nothing, the claim after it does", func(t *testing.T) {
+		handler.reset()
+		u := newUser()
+
+		resp := setDisplayName(u, "Zoë")
+		require.Nil(t, resp.Username)
+		require.Empty(t, told())
+
+		require.Equal(t, profilepb.SetUsernameResponse_OK, setUsername(u, "zoe_claims"))
+		require.Equal(t, [][2]string{{string(u.id.Value), "zoe_claims"}}, told())
+	})
+}
+
+type firstUsername struct {
+	userID   *commonpb.UserId
+	username string
+}
+
+// recordingFirstUsernameHandler records every first handle it is told of.
+type recordingFirstUsernameHandler struct {
+	mu    sync.Mutex
+	calls []firstUsername
+}
+
+func (h *recordingFirstUsernameHandler) OnFirstUsername(_ context.Context, userID *commonpb.UserId, username string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls = append(h.calls, firstUsername{userID: userID, username: username})
+}
+
+func (h *recordingFirstUsernameHandler) snapshot() []firstUsername {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]firstUsername(nil), h.calls...)
+}
+
+func (h *recordingFirstUsernameHandler) reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls = nil
 }
 
 // fakeModerator is a configurable moderation.Client for the display-name and

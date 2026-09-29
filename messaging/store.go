@@ -23,6 +23,27 @@ var ErrMessageNotFound = errors.New("message not found")
 // state alongside this error so the caller can surface it.
 var ErrEventSequenceConflict = errors.New("message event sequence conflict")
 
+// ErrPartialReplay is returned by Store.PutMessages when some of the batch's
+// client message IDs name messages that already exist and others do not. A
+// batch lands whole or not at all, so a replay of it finds every marker; a mix
+// means the IDs were spent by other sends (a single, or a differently shaped
+// batch), and the store neither persists the rest — that would break the
+// batch's atomicity — nor guesses which existing messages to hand back. It
+// catches a mix only: a batch whose every ID was spent, by one earlier batch
+// or by several sends, is a replay (see Store.PutMessages).
+var ErrPartialReplay = errors.New("batch client message ids partly reused")
+
+// ErrEmptyBatch, ErrBatchTooLarge, ErrMissingClientMessageID and
+// ErrDuplicateClientMessageID are Store.PutMessages' shape errors (see ValidateMessageInputs). Every store
+// answers them before touching storage, so a batch a backend could not commit
+// fails identically in a unit test against the memory store.
+var (
+	ErrEmptyBatch               = errors.New("batch holds no messages")
+	ErrBatchTooLarge            = errors.New("batch exceeds MaxMessagesPerPut")
+	ErrMissingClientMessageID   = errors.New("batch message has no client message id")
+	ErrDuplicateClientMessageID = errors.New("batch repeats a client message id")
+)
+
 // ErrSelfReactionsGroupOnly is returned by Store.GetSelfReactions for a DM: a
 // store keeps no per-viewer reaction rows for a DM (see there), so the read has
 // nothing to answer from and refuses rather than report the viewer reacted to
@@ -35,6 +56,53 @@ var ErrSelfReactionsGroupOnly = errors.New("self reactions are read for groups o
 type MessageRef struct {
 	ChatID    *commonpb.ChatId
 	MessageID *messagingpb.MessageId
+}
+
+// MessageInput is one message of a send, as Store.PutMessages takes it: what
+// PutMessage takes per message, minus the chat, which a batch shares.
+type MessageInput struct {
+	SenderID           *commonpb.UserId // nil for a system message
+	Content            []*messagingpb.Content
+	Timestamp          time.Time
+	ClientMessageID    *messagingpb.ClientMessageId
+	CountsTowardUnread bool
+}
+
+// MaxMessagesPerPut bounds a Store.PutMessages batch. It is set by the
+// DynamoDB store, where a send is one transaction of 2n + 2 items (the chat's
+// counter row, a message row and an idempotency marker per message, and one
+// event-log row covering the whole batch) and a transaction holds at most 100
+// items: floor(98 / 2). Every store enforces it (see ValidateMessageInputs) so
+// the bound is one contract rather than a production-only surprise.
+const MaxMessagesPerPut = 49
+
+// ValidateMessageInputs checks the shape of a PutMessages batch: at least one
+// message (ErrEmptyBatch), at most MaxMessagesPerPut (ErrBatchTooLarge), every
+// message carrying a non-empty client message ID (ErrMissingClientMessageID —
+// it is the idempotency marker's key, so a nil one cannot be keyed and an empty
+// one would be a marker every such send shares), and no client message ID used
+// twice (ErrDuplicateClientMessageID — two messages cannot share an idempotency
+// marker, and a DynamoDB transaction refuses two writes to one item anyway).
+// Stores call it before any read or write.
+func ValidateMessageInputs(inputs []MessageInput) error {
+	if len(inputs) == 0 {
+		return ErrEmptyBatch
+	}
+	if len(inputs) > MaxMessagesPerPut {
+		return ErrBatchTooLarge
+	}
+	seen := make(map[string]struct{}, len(inputs))
+	for _, in := range inputs {
+		key := string(in.ClientMessageID.GetValue())
+		if key == "" {
+			return ErrMissingClientMessageID
+		}
+		if _, dup := seen[key]; dup {
+			return ErrDuplicateClientMessageID
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
 }
 
 // PointerRef requests a chat's stored pointers (StoredPointerTypes) for the
@@ -89,6 +157,8 @@ type Store interface {
 	// value forward (for messages that shouldn't bump anyone's unread count).
 	//
 	// senderID may be nil to denote a system message.
+	//
+	// It is PutMessages with a batch of one.
 	PutMessage(
 		ctx context.Context,
 		chatID *commonpb.ChatId,
@@ -98,6 +168,36 @@ type Store interface {
 		clientMessageID *messagingpb.ClientMessageId,
 		countsTowardUnread bool,
 	) (msg *Message, created bool, err error)
+
+	// PutMessages persists a batch of messages in one chat atomically: either
+	// every message lands or none does, and no other send, edit or delete is
+	// interleaved with them. The messages take consecutive gapless IDs and
+	// consecutive event sequences in batch order, and unread_seq accumulates
+	// through the batch as it would over the same sends made one at a time.
+	// The result is in batch order, one persisted message per input.
+	//
+	// Idempotency is the batch's, on its client message IDs: a retry whose
+	// every ID already names a message returns those messages (in batch order)
+	// with created false, exactly as PutMessage answers a retried send. The
+	// replay is judged per ID, not per original batch: the IDs may have been
+	// spent by several earlier sends, so a replay's messages need not be
+	// consecutive, nor in ID order when the retry lists its IDs in another
+	// order. Only a fresh write promises consecutive IDs. A batch is judged
+	// whole, so a retry that finds only some of its IDs spent is
+	// ErrPartialReplay (see there) and persists nothing. The batch's shape
+	// is checked first (ValidateMessageInputs): an empty batch, one over
+	// MaxMessagesPerPut, one with a message missing its client message ID, or
+	// one repeating a client message ID is refused with nothing read or
+	// written.
+	//
+	// It is the write behind a send whose messages must be seen together or
+	// not at all — a client would otherwise observe, and a crash between two
+	// single sends could leave, the first without the second.
+	PutMessages(
+		ctx context.Context,
+		chatID *commonpb.ChatId,
+		inputs []MessageInput,
+	) (msgs []*Message, created bool, err error)
 
 	// EditMessage replaces a message's content with the given content and stamps
 	// editedTs as its last-edited time, advances the chat's event-log head, and

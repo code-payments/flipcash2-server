@@ -30,16 +30,34 @@ import (
 // The messaging store spans five tables:
 //
 //	messages           pk = "chat#<id>", sk in { "#counter", "msg#<padded seq>",
-//	                   "evt#<padded event_seq>", "cmid#<client id>" }. All of a
-//	                   chat's messages, its event log, its sequence counter, and its
-//	                   idempotency markers share one partition so a send is one
-//	                   single-partition transaction. The #counter row holds last_seq
-//	                   (message-ID head) and last_event_seq (event-log head). Each
+//	                   "evt#<padded event_seq>" }, plus one idempotency marker
+//	                   per sent message under its own partition,
+//	                   pk = "cmid#<chat id>#<client id>", sk = "#marker". All of
+//	                   a chat's messages, its event log and its sequence counter
+//	                   share one partition, and a send is one transaction over
+//	                   that partition and its messages' markers — of one message
+//	                   or a batch (PutMessages: the counter moves once by the
+//	                   whole batch, every message's row and marker ride the same
+//	                   transaction beside one event-log row for the batch, and
+//	                   that is what bounds messaging.MaxMessagesPerPut). The
+//	                   markers are kept out of the chat's partition because
+//	                   every send writes one per
+//	                   message and a partition's write throughput is the chat's
+//	                   ceiling: each marker is its own partition key, so they
+//	                   spread across the table rather than landing on any one
+//	                   partition (a chat-keyed marker partition would only move
+//	                   the hot spot). The marker's sk carries nothing — the pk
+//	                   names it — and no chat-partition query can reach it. The
+//	                   #counter row holds last_seq (message-ID head) and
+//	                   last_event_seq (event-log head). Each
 //	                   msg# row is a message's current materialized state (read by ID
 //	                   for history) and carries its current event_seq — the client's
-//	                   optimistic-concurrency token. Each evt#<event_seq> row is an
+//	                   optimistic-concurrency token. Each evt# row is an
 //	                   append-only event-log entry — a thin descriptor (message_id,
-//	                   type, ts), not a copy of the message — read as a
+//	                   type, ts), not a copy of the message; a batch's sends share
+//	                   one row covering their run of event_seqs, keyed by its last
+//	                   and carrying its first (first_event_seq, see runItem) —
+//	                   read as a
 //	                   strongly-consistent, gapless, event-ordered range and joined to
 //	                   the messages' current state for delta catch-up (see
 //	                   GetEventDelta). Unlike a GSI this range can be read consistently
@@ -135,9 +153,10 @@ const (
 	msgPrefix   = "msg#"
 	evtPrefix   = "evt#"
 	cmidPrefix  = "cmid#"
+	skMarker    = "#marker"
 	seqPadWidth = 20
 
-	// cmidTTL is how long a cmid# idempotency marker is retained before DynamoDB
+	// cmidTTL is how long a cmid idempotency marker is retained before DynamoDB
 	// TTL reaps it. Markers only guard against retried sends, which happen within
 	// seconds, so a month of retention is ample; a (wildly implausible) retry past
 	// this window would persist a duplicate message rather than dedup.
@@ -154,11 +173,12 @@ const (
 	attrContent       = "content"
 	attrTS            = "ts"
 	attrUnreadSeq     = "unread_seq"
-	attrEventSeq      = "event_seq"      // msg# row: the message's current event-log sequence (== seq while every event is a new message); the client's optimistic-concurrency token
-	attrLastEditedTs  = "last_edited_ts" // msg# row: when the message's content was last edited (absent until edited); a delete leaves it untouched
-	attrMessageID     = "message_id"     // evt# row: the message this event concerns (msg# rows encode it in the sk instead)
-	attrEventType     = "event_type"     // evt# row: the messaging.EventType recorded (create/edit/delete)
-	attrExpiresAt     = "expires_at"     // DynamoDB TTL attribute (epoch seconds)
+	attrEventSeq      = "event_seq"       // msg# row: the message's current event-log sequence (== seq while every event is a new message); the client's optimistic-concurrency token
+	attrLastEditedTs  = "last_edited_ts"  // msg# row: when the message's content was last edited (absent until edited); a delete leaves it untouched
+	attrMessageID     = "message_id"      // evt# row: the message this event concerns (msg# rows encode it in the sk instead); a run's first message
+	attrEventType     = "event_type"      // evt# row: the messaging.EventType recorded (create/edit/delete)
+	attrFirstEventSeq = "first_event_seq" // evt# row: the first event_seq of the run of sends the row covers, the sk being its last (absent = the sk, a run of one; see runItem)
+	attrExpiresAt     = "expires_at"      // DynamoDB TTL attribute (epoch seconds)
 
 	// message_pointers table, group items. The member is carried by the sk
 	// alone (see pointerSK / userIDFromPointerSK), as the chat is by the pk.
@@ -284,114 +304,177 @@ func (s *store) PutMessage(
 	clientMessageID *messagingpb.ClientMessageId,
 	countsTowardUnread bool,
 ) (*messaging.Message, bool, error) {
-	contentBlobs, err := marshalContent(content)
+	msgs, created, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{{
+		SenderID:           senderID,
+		Content:            content,
+		Timestamp:          ts,
+		ClientMessageID:    clientMessageID,
+		CountsTowardUnread: countsTowardUnread,
+	}})
 	if err != nil {
 		return nil, false, err
 	}
+	return msgs[0], created, nil
+}
 
-	for attempt := 0; attempt < maxPutMessageAttempts; attempt++ {
-		// The idempotency marker and the sequence counter live in the same
-		// partition (pk = chat#<id>), so one consistent batch read fetches both.
-		markerSeq, lastSeq, lastUnread, lastEventSeq, err := s.readSendState(ctx, chatID, clientMessageID)
+func (s *store) PutMessages(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	inputs []messaging.MessageInput,
+) ([]*messaging.Message, bool, error) {
+	if err := messaging.ValidateMessageInputs(inputs); err != nil {
+		return nil, false, err
+	}
+	contentBlobs := make([][]types.AttributeValue, len(inputs))
+	clientMessageIDs := make([]*messagingpb.ClientMessageId, len(inputs))
+	for i, in := range inputs {
+		blobs, err := marshalContent(in.Content)
 		if err != nil {
 			return nil, false, err
 		}
-		// Fast idempotent path: a prior send with this client message ID wins. The
-		// marker was just read strongly-consistent, so the message it points at is
-		// committed; read it back strongly-consistent too, else a lagging replica
-		// could spuriously return ErrMessageNotFound (or stale content) for a message
-		// that provably exists.
-		if markerSeq != nil {
-			msg, err := s.getMessage(ctx, chatID, &messagingpb.MessageId{Value: *markerSeq})
-			return msg, false, err
+		contentBlobs[i] = blobs
+		clientMessageIDs[i] = in.ClientMessageID
+	}
+
+	for attempt := 0; attempt < maxPutMessageAttempts; attempt++ {
+		// The idempotency markers (each its own partition) and the chat's
+		// sequence counter are all exact keys, so one consistent batch read
+		// fetches them together.
+		markers, lastSeq, lastUnread, lastEventSeq, err := s.readSendState(ctx, chatID, clientMessageIDs)
+		if err != nil {
+			return nil, false, err
+		}
+		switch {
+		case len(markers) == len(inputs):
+			// Fast idempotent path: a prior send with these client message IDs
+			// wins. The markers were just read strongly-consistent, so the
+			// messages they point at are committed; read them back
+			// strongly-consistent too, else a lagging replica could spuriously
+			// miss (or return stale content for) a message that provably exists.
+			msgs, err := s.replayMessages(ctx, chatID, inputs, markers)
+			return msgs, false, err
+		case len(markers) > 0:
+			// A batch commits whole, but a batch read is not a snapshot of it:
+			// each item is serializable against the transaction on its own, so a
+			// batch get issued while an identical batch commits can see some of
+			// its markers and not the rest. Settle it with a transactional read,
+			// which sees a committed batch whole or not at all: a partial answer
+			// there is not a race but the IDs spent by other sends (see
+			// messaging.ErrPartialReplay).
+			markers, err = s.readMarkersIsolated(ctx, chatID, clientMessageIDs)
+			if err != nil {
+				if reasons, ok := cancellationReasons(err); ok && isRetryable(reasons) {
+					continue // a write to these markers is in flight; read again
+				}
+				return nil, false, err
+			}
+			switch {
+			case len(markers) == len(inputs):
+				msgs, err := s.replayMessages(ctx, chatID, inputs, markers)
+				return msgs, false, err
+			case len(markers) > 0:
+				return nil, false, messaging.ErrPartialReplay
+			}
+			// Every marker is gone (TTL reaped them since the batch read):
+			// re-read the counter and send fresh.
+			continue
 		}
 
-		nextSeq := lastSeq + 1
-		nextUnread := lastUnread
-		if countsTowardUnread {
-			nextUnread++
-		}
-		// event_seq is assigned from the event-log head. While every event is a new
-		// message it advances in lockstep with the message ID (nextEventSeq ==
-		// nextSeq); edits and deletes will advance it without minting a seq.
-		nextEventSeq := lastEventSeq + 1
-
-		msg := &messaging.Message{
-			ChatID:        &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
-			ID:            &messagingpb.MessageId{Value: nextSeq},
-			SenderID:      senderID,
-			Content:       content,
-			Timestamp:     ts,
-			UnreadSeq:     nextUnread,
-			EventSequence: nextEventSeq,
-		}
-
-		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-			TransactItems: []types.TransactWriteItem{
-				// [0] advance both heads under an optimistic lock on both, so the
-				// whole transaction rolls back together — no leaked sequence numbers.
-				// Locking on last_event_seq (not just last_seq) is what lets edits and
-				// deletes — which advance only the event-log head — serialize against
-				// sends. While every event is a new message the two heads stay equal.
-				{Update: &types.Update{
-					TableName: aws.String(s.messagesTable),
-					Key: map[string]types.AttributeValue{
-						attrPK: avS(chatPK(chatID)),
-						attrSK: avS(skCounter),
-					},
-					UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :nextSeq, %s = :nextUnread, %s = :nextEventSeq", attrLastSeq, attrLastUnreadSeq, attrLastEventSeq)),
-					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s) OR (%s = :expectedSeq AND %s = :expectedEventSeq)", attrPK, attrLastSeq, attrLastEventSeq)),
-					ExpressionAttributeValues: map[string]types.AttributeValue{
-						":nextSeq":          avN(nextSeq),
-						":nextUnread":       avN(nextUnread),
-						":nextEventSeq":     avN(nextEventSeq),
-						":expectedSeq":      avN(lastSeq),
-						":expectedEventSeq": avN(lastEventSeq),
-					},
-				}},
-				// [1] the message's current materialized state, read by ID for
-				// history and carrying its current event_seq.
-				{Put: &types.Put{
+		// Each message takes the next seq and event seq in batch order, and the
+		// unread seq carries through the batch as it would over the same sends
+		// made one at a time. event_seq is assigned from the event-log head:
+		// while every event is a new message it advances in lockstep with the
+		// message ID; edits and deletes advance it without minting a seq.
+		nextSeq, nextUnread, nextEventSeq := lastSeq, lastUnread, lastEventSeq
+		msgs := make([]*messaging.Message, len(inputs))
+		// [0] advances both heads under an optimistic lock on both, so the whole
+		// transaction rolls back together — no leaked sequence numbers. Locking
+		// on last_event_seq (not just last_seq) is what lets edits and deletes —
+		// which advance only the event-log head — serialize against sends. The
+		// heads move once, by the whole batch. Then per message i:
+		// [1+2i] the message's current materialized state, read by ID for
+		//        history and carrying its current event_seq;
+		// [2+2i] the idempotency marker. It is transient — only the message,
+		//        counter, and event-log entry are permanent — so it carries a
+		//        TTL for auto-reaping;
+		// and last, [1+2n] the append-only event-log entry for the whole
+		//        batch: one run row covering its n sends (see runItem), read as
+		//        a gapless event-ordered range for delta catch-up. Minted under
+		//        the same counter lock, so its event_seqs are unique.
+		// The batch is bounded (messaging.MaxMessagesPerPut) so the transaction
+		// never exceeds DynamoDB's 100 items.
+		items := make([]types.TransactWriteItem, 0, 2+2*len(inputs))
+		items = append(items, types.TransactWriteItem{}) // [0], filled once the heads are known
+		for i, in := range inputs {
+			nextSeq++
+			nextEventSeq++
+			if in.CountsTowardUnread {
+				nextUnread++
+			}
+			msg := &messaging.Message{
+				ChatID:        &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
+				ID:            &messagingpb.MessageId{Value: nextSeq},
+				SenderID:      in.SenderID,
+				Content:       in.Content,
+				Timestamp:     in.Timestamp,
+				UnreadSeq:     nextUnread,
+				EventSequence: nextEventSeq,
+			}
+			msgs[i] = msg
+			items = append(items,
+				types.TransactWriteItem{Put: &types.Put{
 					TableName:           aws.String(s.messagesTable),
-					Item:                s.messageItem(msg, contentBlobs),
+					Item:                s.messageItem(msg, contentBlobs[i]),
 					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 				}},
-				// [2] the idempotency marker. It is transient — only the message,
-				// counter, and event-log entry are permanent — so it carries a TTL
-				// for auto-reaping.
-				{Put: &types.Put{
+				types.TransactWriteItem{Put: &types.Put{
 					TableName: aws.String(s.messagesTable),
 					Item: map[string]types.AttributeValue{
-						attrPK:        avS(chatPK(chatID)),
-						attrSK:        avS(cmidSK(clientMessageID)),
+						attrPK:        avS(cmidPK(chatID, in.ClientMessageID)),
+						attrSK:        avS(skMarker),
 						attrSeq:       avN(nextSeq),
-						attrExpiresAt: avN(uint64(ts.Add(cmidTTL).Unix())),
+						attrExpiresAt: avN(uint64(in.Timestamp.Add(cmidTTL).Unix())),
 					},
 					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 				}},
-				// [3] the append-only event-log entry for this send: a thin descriptor
-				// keyed by its event_seq, read as a gapless event-ordered range for
-				// delta catch-up. Minted under the same counter lock, so its event_seq
-				// is unique.
-				{Put: &types.Put{
-					TableName:           aws.String(s.messagesTable),
-					Item:                s.eventItem(chatID, msg.EventSequence, msg.ID.Value, messaging.EventTypeMessageSent, msg.Timestamp),
-					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
-				}},
+			)
+		}
+		items = append(items, types.TransactWriteItem{Put: &types.Put{
+			TableName:           aws.String(s.messagesTable),
+			Item:                s.runItem(chatID, msgs[0], len(msgs)),
+			ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+		}})
+		items[0] = types.TransactWriteItem{Update: &types.Update{
+			TableName: aws.String(s.messagesTable),
+			Key: map[string]types.AttributeValue{
+				attrPK: avS(chatPK(chatID)),
+				attrSK: avS(skCounter),
 			},
-		})
+			UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :nextSeq, %s = :nextUnread, %s = :nextEventSeq", attrLastSeq, attrLastUnreadSeq, attrLastEventSeq)),
+			ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s) OR (%s = :expectedSeq AND %s = :expectedEventSeq)", attrPK, attrLastSeq, attrLastEventSeq)),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":nextSeq":          avN(nextSeq),
+				":nextUnread":       avN(nextUnread),
+				":nextEventSeq":     avN(nextEventSeq),
+				":expectedSeq":      avN(lastSeq),
+				":expectedEventSeq": avN(lastEventSeq),
+			},
+		}}
+
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 		if err == nil {
-			return msg, true, nil
+			return msgs, true, nil
 		}
 
 		reasons, ok := cancellationReasons(err)
 		if !ok {
 			return nil, false, err
 		}
-		// reasons index matches TransactItems order: [0]=counter, [1]=message,
-		// [2]=idempotency marker, [3]=event-log entry.
-		if len(reasons) == 4 && reasons[2] == codeConditionalCheckFailed {
-			// A concurrent identical send already persisted; re-read and return it.
+		// reasons index matches TransactItems order (see above). A failed marker
+		// means a concurrent send already spent that client message ID: re-read,
+		// and the next attempt answers as a replay, a partial reuse, or — for a
+		// marker DynamoDB's TTL reaped meanwhile — a fresh send.
+		if len(reasons) == len(items) && markerConditionFailed(reasons, len(inputs)) {
 			continue
 		}
 		if isRetryable(reasons) {
@@ -399,7 +482,43 @@ func (s *store) PutMessage(
 		}
 		return nil, false, err
 	}
-	return nil, false, fmt.Errorf("put message exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
+	return nil, false, fmt.Errorf("put messages exhausted retries for chat %s", hex.EncodeToString(chatID.Value))
+}
+
+// markerConditionFailed reports whether any of a send transaction's idempotency
+// marker puts (index 2+2i for message i, see PutMessages) failed its condition.
+func markerConditionFailed(reasons []string, n int) bool {
+	for i := 0; i < n; i++ {
+		if reasons[2+2*i] == codeConditionalCheckFailed {
+			return true
+		}
+	}
+	return false
+}
+
+// replayMessages answers a replayed PutMessages: the messages the batch's
+// markers (keyed by cmid pk) point at, in batch order. Every marker was read
+// strongly consistent and each is written in its message's transaction, so a
+// marker whose message is missing is corruption, not a race.
+func (s *store) replayMessages(ctx context.Context, chatID *commonpb.ChatId, inputs []messaging.MessageInput, markers map[string]uint64) ([]*messaging.Message, error) {
+	ids := make(map[uint64]struct{}, len(markers))
+	for _, seq := range markers {
+		ids[seq] = struct{}{}
+	}
+	byID, err := s.getMessagesByIDs(ctx, chatID, ids)
+	if err != nil {
+		return nil, err
+	}
+	msgs := make([]*messaging.Message, len(inputs))
+	for i, in := range inputs {
+		seq := markers[cmidPK(chatID, in.ClientMessageID)]
+		msg, ok := byID[seq]
+		if !ok {
+			return nil, fmt.Errorf("idempotency marker for chat %s names missing message %d", hex.EncodeToString(chatID.Value), seq)
+		}
+		msgs[i] = msg
+	}
+	return msgs, nil
 }
 
 func (s *store) EditMessage(
@@ -725,19 +844,27 @@ func (s *store) GetEventDelta(ctx context.Context, chatID *commonpb.ChatId, afte
 		return nil, afterEventSeq, nil
 	}
 
-	// 1. Read the thin event descriptors in (after, head], ascending. BETWEEN bounds
-	//    the scan to the evt# prefix and stops at head. The sort key encodes event_seq
-	//    zero-padded, so lexicographic order is numeric order. The range is in the
-	//    chat's own partition, so — unlike the eventually-consistent GSI this replaced
-	//    — it is read strongly-consistent and gapless: no transient holes for the
-	//    cursor to skip, no out-of-order propagation between events.
+	// 1. Read the thin event rows covering (after, head], ascending. BETWEEN bounds
+	//    the scan to the evt# prefix. The sort key encodes event_seq zero-padded, so
+	//    lexicographic order is numeric order. The range is in the chat's own
+	//    partition, so — unlike the eventually-consistent GSI this replaced — it is
+	//    read strongly-consistent and gapless: no transient holes for the cursor to
+	//    skip, no out-of-order propagation between events.
+	//
+	//    A row may be a run of sends keyed by its last event_seq (see runItem), so
+	//    starting at after+1 also finds the run the cursor sits inside. The upper
+	//    bound reaches a run's length past head so a run straddling head is read and
+	//    clipped rather than missed: GetDelta's head comes from the counter and so
+	//    always ends a run, but the contract takes any head. The Limit counts rows,
+	//    each at least one event, so it always yields at least limit events or
+	//    reaches the end.
 	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String(s.messagesTable),
 		KeyConditionExpression: aws.String(fmt.Sprintf("%s = :pk AND %s BETWEEN :from AND :to", attrPK, attrSK)),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":pk":   avS(chatPK(chatID)),
 			":from": avS(evtSK(afterEventSeq + 1)),
-			":to":   avS(evtSK(headEventSeq)),
+			":to":   avS(evtSK(headEventSeq + messaging.MaxMessagesPerPut - 1)),
 		},
 		ScanIndexForward: aws.Bool(true), // ascending by event_seq
 		Limit:            aws.Int32(int32(limit)),
@@ -750,23 +877,59 @@ func (s *store) GetEventDelta(ctx context.Context, chatID *commonpb.ChatId, afte
 		return nil, afterEventSeq, nil
 	}
 
+	// Expand each row into its events, clipped to (after, head] and cut at limit
+	// events. The log is gapless by construction, so the events must run
+	// after+1, after+2, ... with no hole; a hole is corruption (or a run whose
+	// bounds were misread) and fails the read rather than silently skipping a
+	// message.
 	type descriptor struct{ eventSeq, messageID uint64 }
-	descriptors := make([]descriptor, 0, len(out.Items))
-	ids := make(map[uint64]struct{}, len(out.Items))
+	descriptors := make([]descriptor, 0, limit)
+	ids := make(map[uint64]struct{}, limit)
+	expected := afterEventSeq + 1
+expand:
 	for _, item := range out.Items {
-		eventSeq, err := eventSeqFromEvtSK(asS(item[attrSK]))
+		last, err := eventSeqFromEvtSK(asS(item[attrSK]))
 		if err != nil {
 			return nil, 0, err
 		}
-		messageID, err := parseN(item[attrMessageID])
+		firstMessageID, err := parseN(item[attrMessageID])
 		if err != nil {
 			return nil, 0, err
 		}
-		descriptors = append(descriptors, descriptor{eventSeq, messageID})
-		ids[messageID] = struct{}{}
+		first := last
+		if av, ok := item[attrFirstEventSeq]; ok {
+			if first, err = parseN(av); err != nil {
+				return nil, 0, err
+			}
+		}
+		if first == 0 || first > last {
+			return nil, 0, fmt.Errorf("event log row %d in chat %s has invalid first event %d", last, hex.EncodeToString(chatID.Value), first)
+		}
+		// Only the first event read may sit inside its row (the cursor's run);
+		// every later row must start exactly where the last one ended.
+		if len(descriptors) > 0 && first < expected {
+			return nil, 0, fmt.Errorf("event log overlap in chat %s: row %d starts at %d, expected %d", hex.EncodeToString(chatID.Value), last, first, expected)
+		}
+		for k := max(first, expected); k <= last; k++ {
+			if k > headEventSeq || len(descriptors) == limit {
+				break expand
+			}
+			if k != expected {
+				return nil, 0, fmt.Errorf("event log gap in chat %s: expected event %d, found %d", hex.EncodeToString(chatID.Value), expected, k)
+			}
+			messageID := firstMessageID + (k - first)
+			descriptors = append(descriptors, descriptor{k, messageID})
+			ids[messageID] = struct{}{}
+			expected++
+		}
+	}
+	if len(descriptors) == 0 {
+		return nil, afterEventSeq, nil
 	}
 	// The cursor advances over every event scanned, survivor or not, so a wholly
-	// superseded page still makes progress rather than re-reading.
+	// superseded page still makes progress rather than re-reading. It may land
+	// inside a run; the next page's range read finds that run again and resumes
+	// past the cursor.
 	nextCursor := descriptors[len(descriptors)-1].eventSeq
 
 	// 2. Join each referenced message to its current materialized state.
@@ -1158,29 +1321,27 @@ func (s *store) AdvancePointer(
 	return newPointer(pointerType, userID, newValue.Value, now), true, nil
 }
 
-// readSendState fetches, in a single consistent batch read, the two partition
-// items PutMessage needs before assigning a sequence number: the idempotency
-// marker for clientMessageID and the chat's sequence counter. Both share the
-// chat's partition (pk = chat#<id>), so one BatchGetItem covers them.
-//
-// markerSeq is non-nil when a prior send with this client message ID already
-// persisted, carrying that message's sequence number; the caller then returns
-// the existing message rather than assigning a new one. lastSeq, lastUnread, and
-// lastEventSeq are zero when the counter does not yet exist (the chat's first
-// send); on an existing counter lastEventSeq is always present (guaranteed by the
-// maintain phase plus the one-time backfill).
-func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clientMessageID *messagingpb.ClientMessageId) (markerSeq *uint64, lastSeq, lastUnread, lastEventSeq uint64, err error) {
-	cmidSKVal := cmidSK(clientMessageID)
+// readSendState reads, strongly consistent and in one batch, a chat's counter
+// row and the idempotency markers of the given client message IDs. markers
+// holds the seq each existing marker points at, keyed by its cmid pk; an ID
+// with no marker is absent. lastSeq, lastUnread, and lastEventSeq are zero
+// when the counter does not yet exist (the chat's first send); on an existing
+// counter lastEventSeq is always present (guaranteed by the maintain phase plus
+// the one-time backfill). The batch is at most 1 + messaging.MaxMessagesPerPut
+// keys, under maxBatchGetKeys. A batch read is serializable per item, not as a
+// set, so a partial set of markers may be a concurrent send caught mid-commit
+// (see readMarkersIsolated).
+func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clientMessageIDs []*messagingpb.ClientMessageId) (markers map[string]uint64, lastSeq, lastUnread, lastEventSeq uint64, err error) {
+	keys := make([]map[string]types.AttributeValue, 0, 1+len(clientMessageIDs))
+	keys = append(keys, map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skCounter)})
+	for _, id := range clientMessageIDs {
+		keys = append(keys, markerKey(chatID, id))
+	}
 	req := map[string]types.KeysAndAttributes{
-		s.messagesTable: {
-			Keys: []map[string]types.AttributeValue{
-				{attrPK: avS(chatPK(chatID)), attrSK: avS(cmidSKVal)},
-				{attrPK: avS(chatPK(chatID)), attrSK: avS(skCounter)},
-			},
-			ConsistentRead: aws.Bool(true),
-		},
+		s.messagesTable: {Keys: keys, ConsistentRead: aws.Bool(true)},
 	}
 
+	markers = make(map[string]uint64, len(clientMessageIDs))
 	// Drain UnprocessedKeys; values accumulate across iterations, so an item
 	// resolved early is retained while a throttled one is retried.
 	for len(req[s.messagesTable].Keys) > 0 {
@@ -1190,12 +1351,6 @@ func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clie
 		}
 		for _, item := range resp.Responses[s.messagesTable] {
 			switch asS(item[attrSK]) {
-			case cmidSKVal:
-				seq, perr := parseN(item[attrSeq])
-				if perr != nil {
-					return nil, 0, 0, 0, perr
-				}
-				markerSeq = &seq
 			case skCounter:
 				ls, perr := parseN(item[attrLastSeq])
 				if perr != nil {
@@ -1210,6 +1365,12 @@ func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clie
 					return nil, 0, 0, 0, perr
 				}
 				lastSeq, lastUnread, lastEventSeq = ls, lu, les
+			case skMarker:
+				seq, perr := parseN(item[attrSeq])
+				if perr != nil {
+					return nil, 0, 0, 0, perr
+				}
+				markers[asS(item[attrPK])] = seq
 			}
 		}
 		if unprocessed, ok := resp.UnprocessedKeys[s.messagesTable]; ok && len(unprocessed.Keys) > 0 {
@@ -1218,7 +1379,42 @@ func (s *store) readSendState(ctx context.Context, chatID *commonpb.ChatId, clie
 			break
 		}
 	}
-	return markerSeq, lastSeq, lastUnread, lastEventSeq, nil
+	return markers, lastSeq, lastUnread, lastEventSeq, nil
+}
+
+// readMarkersIsolated reads the idempotency markers of the given client message
+// IDs in one TransactGetItems, keyed by cmid pk as readSendState keys them.
+// Unlike a batch read it is serializable against a send's transaction as a
+// whole, so it never returns part of one batch's markers; a write to them in
+// flight cancels it with a TransactionConflict instead. It is the arbiter for a
+// partial readSendState, so it runs only then. The read is at most
+// messaging.MaxMessagesPerPut items, under TransactGetItems' 100.
+func (s *store) readMarkersIsolated(ctx context.Context, chatID *commonpb.ChatId, clientMessageIDs []*messagingpb.ClientMessageId) (map[string]uint64, error) {
+	items := make([]types.TransactGetItem, len(clientMessageIDs))
+	for i, id := range clientMessageIDs {
+		items[i] = types.TransactGetItem{Get: &types.Get{
+			TableName: aws.String(s.messagesTable),
+			Key:       markerKey(chatID, id),
+		}}
+	}
+	out, err := s.client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{TransactItems: items})
+	if err != nil {
+		return nil, err
+	}
+	markers := make(map[string]uint64, len(clientMessageIDs))
+	// Responses are in request order, one per item; a missing marker is an
+	// empty item.
+	for i, r := range out.Responses {
+		if len(r.Item) == 0 {
+			continue
+		}
+		seq, err := parseN(r.Item[attrSeq])
+		if err != nil {
+			return nil, err
+		}
+		markers[cmidPK(chatID, clientMessageIDs[i])] = seq
+	}
+	return markers, nil
 }
 
 func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.AttributeValue) map[string]types.AttributeValue {
@@ -1259,6 +1455,34 @@ func (s *store) eventItem(chatID *commonpb.ChatId, eventSeq, messageID uint64, e
 		attrEventType: avN(uint64(eventType)),
 		attrTS:        avN(uint64(ts.UnixNano())),
 	}
+}
+
+// runItem builds the event-log row for a send of n messages, first being the
+// batch's first message: one row covering the run of event_seqs
+// [first.EventSequence, first.EventSequence+n-1], whose k-th event is the send of
+// message first.ID+k. A send takes consecutive message IDs and consecutive
+// event_seqs under one counter lock, so the two advance in lockstep through a
+// batch and the run is exactly described by its bounds. Only sends form runs;
+// an edit or delete names an arbitrary earlier message and is always a row of
+// its own.
+//
+// The row is keyed by the run's LAST event_seq, not its first, so the catch-up
+// range read (sk >= evt#<cursor+1>, see GetEventDelta) finds the run holding a
+// cursor that lands inside it — a client checkpoints whatever event it last saw
+// on the live stream, which can be any message of a batch. The row carries the
+// run's other bound, first_event_seq, beside message_id, the message sent at
+// that event, so a reader has both ends in the key's own units and the two
+// attributes describe the same event; it is written only for a run of more than
+// one, so a single send is exactly the row eventItem writes and every row
+// written before runs existed already reads as a run of one. ts is the first
+// send's; the log does not read it, and every message's own row carries its
+// exact timestamp.
+func (s *store) runItem(chatID *commonpb.ChatId, first *messaging.Message, n int) map[string]types.AttributeValue {
+	item := s.eventItem(chatID, first.EventSequence+uint64(n)-1, first.ID.Value, messaging.EventTypeMessageSent, first.Timestamp)
+	if n > 1 {
+		item[attrFirstEventSeq] = avN(first.EventSequence)
+	}
+	return item
 }
 
 func messageFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue) (*messaging.Message, error) {
@@ -1501,8 +1725,17 @@ func seqFromMsgSK(sk string) (uint64, error) {
 	return strconv.ParseUint(padded, 10, 64)
 }
 
-func cmidSK(clientMessageID *messagingpb.ClientMessageId) string {
-	return cmidPrefix + hex.EncodeToString(clientMessageID.Value)
+// cmidPK keys a message's idempotency marker: a partition of its own per (chat,
+// client message ID), so markers spread across the table rather than loading
+// the chat's partition (see the messages table above). Both IDs are hex, so the
+// '#' between them is unambiguous.
+func cmidPK(chatID *commonpb.ChatId, clientMessageID *messagingpb.ClientMessageId) string {
+	return cmidPrefix + hex.EncodeToString(chatID.Value) + "#" + hex.EncodeToString(clientMessageID.Value)
+}
+
+// markerKey is the primary key of a message's idempotency marker.
+func markerKey(chatID *commonpb.ChatId, clientMessageID *messagingpb.ClientMessageId) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{attrPK: avS(cmidPK(chatID, clientMessageID)), attrSK: avS(skMarker)}
 }
 
 // pointerSK keys a group member's pointers item within the chat's partition.

@@ -106,6 +106,26 @@ func (c *Cache) PutMessage(
 	return msg, created, err
 }
 
+func (c *Cache) PutMessages(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	inputs []messaging.MessageInput,
+) ([]*messaging.Message, bool, error) {
+	msgs, created, err := c.db.PutMessages(ctx, chatID, inputs)
+	if err == nil {
+		// Every persisted message's ID is a confirmed existing ID for the chat,
+		// whether this was a fresh write or a replay; observing the highest
+		// covers the rest. A fresh batch's highest is its last message, but a
+		// replay answers in the order asked, so its IDs may come in any order.
+		var highest uint64
+		for _, msg := range msgs {
+			highest = max(highest, msg.ID.Value)
+		}
+		c.observe(chatID, highest)
+	}
+	return msgs, created, err
+}
+
 func (c *Cache) EditMessage(
 	ctx context.Context,
 	chatID *commonpb.ChatId,

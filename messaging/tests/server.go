@@ -61,6 +61,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_EncryptedContent_NotInGroups,
 		testServer_SendMessage_Broadcast,
 		testServer_SendBatch,
+		testServer_SendBatch_SideEffects,
+		testServer_SendBatch_Group,
 		testServer_SendMessage_TeamAccount,
 		testServer_EditMessage,
 		testServer_DeleteMessage,
@@ -1256,7 +1258,212 @@ func testServer_SendBatch(t *testing.T, badges badge.Store, blocklists blocklist
 	require.Error(t, err)
 }
 
-func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+// testServer_SendBatch_SideEffects pins everything a DM batch does beyond
+// persisting: unread accumulation across a system message, per-sender
+// pointers, the chat's last message, one push per sender-authored message,
+// catch-up that agrees with the live update (including from a cursor inside
+// the batch), and a retry, partial reuse or oversized batch that adds nothing.
+func testServer_SendBatch_SideEffects(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Alice"))
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userB, "Bob"))
+
+	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.userA, e.userB)
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           dmID,
+		Type:         chatpb.ChatType_TIP_DM,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+
+	outgoing := []messaging.OutgoingMessage{
+		{SenderID: e.userA, Content: textContent("one"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: e.userA, Content: textContent("two"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: nil, Content: textContent("system"), ClientMessageID: generateClientID(), CountsTowardUnread: false},
+		{SenderID: e.userB, Content: textContent("three"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	}
+	sent, err := e.sender.SendBatch(e.ctx, dmID, outgoing)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2, 3, 4}, protoMessageIDs(sent))
+	for i, msg := range sent {
+		require.Equal(t, uint64(i+1), msg.EventSequence)
+	}
+	// The system message carries the unread sequence forward.
+	unread := make([]uint64, len(sent))
+	for i, msg := range sent {
+		unread[i] = msg.UnreadSeq
+	}
+	require.Equal(t, []uint64{1, 2, 2, 3}, unread)
+	require.Nil(t, sent[2].SenderId)
+
+	// Each sender's READ pointer sits at the last message they sent; the
+	// system message advances no one's.
+	pointers, err := messages.GetPointers(e.ctx, dmID)
+	require.NoError(t, err)
+	require.True(t, hasPointer(pointers, messagingpb.Pointer_READ, e.userA, 2))
+	require.True(t, hasPointer(pointers, messagingpb.Pointer_READ, e.userB, 4))
+
+	// The chat's most recent message is the batch's last, on the record and on
+	// both members' feed rows.
+	record, err := chats.GetChatByID(e.ctx, dmID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), record.LastMessageID.GetValue())
+	for _, member := range []*commonpb.UserId{e.userA, e.userB} {
+		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_TIP_DM, time.Now().Add(time.Hour), nil, 0)
+		require.NoError(t, err)
+		require.Len(t, page, 1)
+		require.Equal(t, uint64(4), page[0].LastMessageID.GetValue())
+	}
+
+	// One update per member carries the whole batch.
+	for _, member := range []*commonpb.UserId{e.userA, e.userB} {
+		e.waitForChatUpdate(member, func(u *eventpb.ChatUpdate) bool {
+			events := u.GetEvents().GetEvents()
+			if len(events) != 4 {
+				return false
+			}
+			for i, ev := range events {
+				if ev.Sequence != uint64(i+1) || ev.Count != 1 || ev.Mutations[0].GetMessageSent().GetMessageId().GetValue() != uint64(i+1) {
+					return false
+				}
+			}
+			return len(u.MetadataUpdates) == 1 &&
+				len(u.GetPointerUpdates().GetPointers()) == 2 &&
+				hasPointer(u.GetPointerUpdates().GetPointers(), messagingpb.Pointer_READ, e.userA, 2) &&
+				hasPointer(u.GetPointerUpdates().GetPointers(), messagingpb.Pointer_READ, e.userB, 4)
+		})
+	}
+
+	// One push per sender-authored message, in batch order, each to the other
+	// member only: A's two reach B, B's one reaches A, the system message none.
+	type pushed struct {
+		messageID uint64
+		to        string
+	}
+	pushes := func() []pushed {
+		var out []pushed
+		for _, p := range e.pusher.snapshot() {
+			for _, u := range p.users {
+				out = append(out, pushed{p.payload.GetChatMetadata().GetMessage().GetMessageId().GetValue(), string(u.Value)})
+			}
+		}
+		return out
+	}
+	want := []pushed{{1, string(e.userB.Value)}, {2, string(e.userB.Value)}, {4, string(e.userA.Value)}}
+	require.Eventually(t, func() bool { return len(pushes()) >= len(want) }, time.Second, 20*time.Millisecond)
+	require.Equal(t, want, pushes())
+
+	// Catch-up agrees with the live update, from the start and from cursors
+	// inside the batch's single event-log run.
+	for after, wantIDs := range map[uint64][]uint64{0: {1, 2, 3, 4}, 1: {2, 3, 4}, 2: {3, 4}, 3: {4}} {
+		resps, err := e.getDeltaInChat(e.keysB, dmID, after)
+		require.NoError(t, err)
+		msgs, latest, checkpoint := collectDelta(resps)
+		require.Equal(t, wantIDs, protoMessageIDs(msgs), "after %d", after)
+		for _, m := range msgs {
+			require.True(t, proto.Equal(sent[m.MessageId.Value-1], m), "after %d: message %d", after, m.MessageId.Value)
+		}
+		require.Equal(t, uint64(4), latest)
+		require.Equal(t, uint64(4), checkpoint)
+	}
+
+	updatesBefore := len(e.chatUpdatesFor(e.userA)) + len(e.chatUpdatesFor(e.userB))
+	pushesBefore := len(e.pusher.snapshot())
+
+	// A retry returns the originals and runs no side effect again.
+	replayed, err := e.sender.SendBatch(e.ctx, dmID, outgoing)
+	require.NoError(t, err)
+	require.Len(t, replayed, len(sent))
+	for i := range sent {
+		require.True(t, proto.Equal(sent[i], replayed[i]), "message %d", i+1)
+	}
+
+	// A batch reusing some spent IDs is refused whole.
+	_, err = e.sender.SendBatch(e.ctx, dmID, []messaging.OutgoingMessage{
+		outgoing[0],
+		{SenderID: e.userA, Content: textContent("fresh"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	})
+	require.Equal(t, codes.Internal, status.Code(err))
+
+	// So is one over the store's cap.
+	tooMany := make([]messaging.OutgoingMessage, messaging.MaxMessagesPerPut+1)
+	for i := range tooMany {
+		tooMany[i] = messaging.OutgoingMessage{SenderID: e.userA, Content: textContent("x"), ClientMessageID: generateClientID(), CountsTowardUnread: true}
+	}
+	_, err = e.sender.SendBatch(e.ctx, dmID, tooMany)
+	require.Error(t, err)
+
+	// And one with an invalid message, before anything is written.
+	_, err = e.sender.SendBatch(e.ctx, dmID, []messaging.OutgoingMessage{
+		{SenderID: e.userA, Content: textContent("ok"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: e.userA, Content: nil, ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	})
+	require.Error(t, err)
+
+	stored, err := messages.GetMessages(e.ctx, dmID)
+	require.NoError(t, err)
+	require.Len(t, stored, 4)
+	require.Never(t, func() bool {
+		return len(e.chatUpdatesFor(e.userA))+len(e.chatUpdatesFor(e.userB)) != updatesBefore ||
+			len(e.pusher.snapshot()) != pushesBefore
+	}, 300*time.Millisecond, 20*time.Millisecond)
+}
+
+// testServer_SendBatch_Group pins a group batch: one publish on the chat
+// topic carrying every message and no pointers (a group never carries
+// real-time pointers), the sender's pointer still stored, and one push per
+// message to the other member.
+func testServer_SendBatch_Group(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Alice"))
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+
+	sent, err := e.sender.SendBatch(e.ctx, groupID, []messaging.OutgoingMessage{
+		{SenderID: e.userA, Content: textContent("one"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: e.userA, Content: textContent("two"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2}, protoMessageIDs(sent))
+
+	var groupEvents []*event.KeyAndEvent[*commonpb.ChatId, *eventpb.ChatEvent]
+	require.Eventually(t, func() bool {
+		groupEvents = e.chatObserver.GetEvents(func(id *commonpb.ChatId) bool { return bytes.Equal(id.Value, groupID.Value) })
+		return len(groupEvents) >= 1
+	}, time.Second, 20*time.Millisecond)
+	require.Len(t, groupEvents, 1)
+	update := groupEvents[0].Event.Event.GetChatUpdate()
+	require.Len(t, update.GetEvents().GetEvents(), 2)
+	require.Nil(t, update.PointerUpdates)
+	require.Len(t, update.MetadataUpdates, 1)
+
+	pointers, err := messages.GetPointers(e.ctx, groupID)
+	require.NoError(t, err)
+	require.True(t, hasPointer(pointers, messagingpb.Pointer_READ, e.userA, 2))
+
+	record, err := chats.GetChatByID(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), record.LastMessageID.GetValue())
+
+	require.Eventually(t, func() bool { return len(e.pusher.snapshot()) >= 2 }, time.Second, 20*time.Millisecond)
+	var pushedIDs []uint64
+	for _, p := range e.pusher.snapshot() {
+		require.Len(t, p.users, 1)
+		require.Equal(t, e.userB.Value, p.users[0].Value)
+		pushedIDs = append(pushedIDs, p.payload.GetChatMetadata().GetMessage().GetMessageId().GetValue())
+	}
+	require.Equal(t, []uint64{1, 2}, pushedIDs)
+}
+
+func testServer_SendMessage_TeamAccount(t *testing.T,badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	team := model.MustGenerateUserID()
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles, messaging.WithTeamAccount(team))
 

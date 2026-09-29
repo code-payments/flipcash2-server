@@ -34,6 +34,16 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_PutMessage_ConcurrentIdempotent,
 		testStore_PutMessage_UnreadSeq,
 		testStore_PutMessage_SystemMessage,
+		testStore_PutMessages_Batch,
+		testStore_PutMessages_Replay,
+		testStore_PutMessages_Shape,
+		testStore_PutMessages_MaxBatch,
+		testStore_PutMessages_ConcurrentDistinct,
+		testStore_PutMessages_ConcurrentIdempotent,
+		testStore_PutMessages_EventDelta,
+		testStore_PutMessages_EventDeltaDefaultPage,
+		testStore_PutMessages_EventLogPerChat,
+		testStore_EventLog_ConcurrentMixedWriters,
 		testStore_GetMessage_NotFound,
 		testStore_MessageExists,
 		testStore_GetLatestEventSequence,
@@ -181,6 +191,7 @@ func testStore_PutMessage_ConcurrentDistinct(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	require.Equal(t, want, messageIDs(all))
 	require.Equal(t, uint64(n), all[len(all)-1].UnreadSeq) // all counted toward unread
+	requireEventLog(t, s, chatID, n)
 }
 
 func testStore_PutMessage_ConcurrentIdempotent(t *testing.T, s messaging.Store) {
@@ -231,11 +242,12 @@ func testStore_PutMessage_ConcurrentIdempotent(t *testing.T, s messaging.Store) 
 	require.Equal(t, 1, createdCount)
 
 	// The sequence advanced exactly once, and the persisted message carries the
-	// ID that was returned to callers.
+	// ID that was returned to callers. The replays logged nothing.
 	all, err := s.GetMessages(ctx, chatID, database.WithAscending())
 	require.NoError(t, err)
 	require.Equal(t, []uint64{1}, messageIDs(all))
 	require.Equal(t, got[0], all[0].ID.Value)
+	requireEventLog(t, s, chatID, 1)
 }
 
 func testStore_PutMessage_UnreadSeq(t *testing.T, s messaging.Store) {
@@ -273,6 +285,718 @@ func testStore_PutMessage_SystemMessage(t *testing.T, s messaging.Store) {
 	got, err := s.GetMessage(ctx, chatID, msg.ID)
 	require.NoError(t, err)
 	require.Nil(t, got.SenderID)
+}
+
+func testStore_PutMessages_Batch(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// A single send first, then a delete of it, so the event-log head (2) is
+	// ahead of the message-ID head (1) when the batch lands: the batch must
+	// take its IDs and its event sequences from their own heads.
+	first, _, err := s.PutMessage(ctx, chatID, sender, textContent("first"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	_, err = s.DeleteMessage(ctx, chatID, first.ID, sender, at(2), first.EventSequence)
+	require.NoError(t, err)
+
+	inputs := []messaging.MessageInput{
+		{SenderID: sender, Content: textContent("a"), Timestamp: at(10), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: nil, Content: systemContent("b"), Timestamp: at(11), ClientMessageID: generateClientID(), CountsTowardUnread: false},
+		{SenderID: sender, Content: textContent("c"), Timestamp: at(12), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	}
+	msgs, created, err := s.PutMessages(ctx, chatID, inputs)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Len(t, msgs, 3)
+
+	// Consecutive IDs and event sequences in batch order, from the two heads;
+	// unread_seq accumulates through the batch exactly as three single sends
+	// would: 1 before it (the first single send), 2 after the first message,
+	// unchanged by the system message, 3 after the third.
+	require.Equal(t, []uint64{2, 3, 4}, messageIDs(msgs))
+	for i, msg := range msgs {
+		require.Equal(t, uint64(3+i), msg.EventSequence)
+		require.True(t, msg.Timestamp.Equal(inputs[i].Timestamp))
+		require.True(t, bytes.Equal(chatID.Value, msg.ChatID.Value))
+	}
+	require.Equal(t, uint64(2), msgs[0].UnreadSeq)
+	require.Equal(t, uint64(2), msgs[1].UnreadSeq)
+	require.Equal(t, uint64(3), msgs[2].UnreadSeq)
+	require.Equal(t, "a", messageText(msgs[0]))
+	require.Nil(t, msgs[1].SenderID)
+	require.Equal(t, "c", messageText(msgs[2]))
+
+	// Everything is persisted as returned, the heads have moved by the whole
+	// batch, and the event log carries one entry per message.
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending())
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2, 3, 4}, messageIDs(all))
+	for i, msg := range msgs {
+		got, err := s.GetMessage(ctx, chatID, msg.ID)
+		require.NoError(t, err)
+		require.Equal(t, msg.EventSequence, got.EventSequence)
+		require.Equal(t, msg.UnreadSeq, got.UnreadSeq)
+		if inputs[i].SenderID == nil {
+			require.Nil(t, got.SenderID)
+			require.Equal(t, "b", got.Content[0].GetSystem().FallbackText)
+		} else {
+			require.True(t, bytes.Equal(sender.Value, got.SenderID.Value))
+			require.Equal(t, messageText(msg), messageText(got))
+		}
+	}
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), head)
+	delta, cursor, err := s.GetEventDelta(ctx, chatID, 2, head, 0)
+	require.NoError(t, err)
+	require.Equal(t, head, cursor)
+	require.Equal(t, []uint64{2, 3, 4}, messageIDs(delta))
+
+	// A single send after the batch continues both sequences.
+	next, created, err := s.PutMessage(ctx, chatID, sender, textContent("after"), at(20), generateClientID(), true)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, uint64(5), next.ID.Value)
+	require.Equal(t, uint64(6), next.EventSequence)
+	require.Equal(t, uint64(4), next.UnreadSeq)
+}
+
+func testStore_PutMessages_Replay(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	inputs := []messaging.MessageInput{
+		{SenderID: sender, Content: textContent("a"), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: sender, Content: textContent("b"), Timestamp: at(2), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	}
+	msgs, created, err := s.PutMessages(ctx, chatID, inputs)
+	require.NoError(t, err)
+	require.True(t, created)
+	requireHead := func(want uint64) {
+		t.Helper()
+		head, err := s.GetLatestEventSequence(ctx, chatID)
+		require.NoError(t, err)
+		require.Equal(t, want, head)
+	}
+	requireHead(2)
+
+	// Replaying the batch returns the original messages in batch order —
+	// original content and timestamps, nothing new minted — and reports that
+	// nothing was created so callers skip one-time side effects.
+	retry := []messaging.MessageInput{
+		{SenderID: sender, Content: textContent("a2"), Timestamp: at(9), ClientMessageID: inputs[0].ClientMessageID, CountsTowardUnread: true},
+		{SenderID: sender, Content: textContent("b2"), Timestamp: at(9), ClientMessageID: inputs[1].ClientMessageID, CountsTowardUnread: true},
+	}
+	again, created, err := s.PutMessages(ctx, chatID, retry)
+	require.NoError(t, err)
+	require.False(t, created)
+	require.Equal(t, messageIDs(msgs), messageIDs(again))
+	require.Equal(t, "a", messageText(again[0]))
+	require.Equal(t, "b", messageText(again[1]))
+	require.True(t, again[0].Timestamp.Equal(at(1)))
+	requireHead(2) // a replay logs nothing
+
+	// The replay is order-preserving: the same IDs in the other order come
+	// back in the order asked.
+	reversed, created, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{retry[1], retry[0]})
+	require.NoError(t, err)
+	require.False(t, created)
+	require.Equal(t, []uint64{msgs[1].ID.Value, msgs[0].ID.Value}, messageIDs(reversed))
+	requireHead(2)
+
+	// A batch that reuses one spent ID beside a fresh one is neither a send nor
+	// a replay: refused whole, nothing persisted, the sequence untouched.
+	_, _, err = s.PutMessages(ctx, chatID, []messaging.MessageInput{
+		retry[0],
+		{SenderID: sender, Content: textContent("c"), Timestamp: at(3), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	})
+	require.ErrorIs(t, err, messaging.ErrPartialReplay)
+	requireHead(2)
+
+	// The same holds for an ID a single send spent.
+	singleID := generateClientID()
+	single, _, err := s.PutMessage(ctx, chatID, sender, textContent("single"), at(4), singleID, true)
+	require.NoError(t, err)
+	requireHead(3)
+	singleInput := messaging.MessageInput{SenderID: sender, Content: textContent("single"), Timestamp: at(4), ClientMessageID: singleID, CountsTowardUnread: true}
+	_, _, err = s.PutMessages(ctx, chatID, []messaging.MessageInput{
+		singleInput,
+		{SenderID: sender, Content: textContent("d"), Timestamp: at(5), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	})
+	require.ErrorIs(t, err, messaging.ErrPartialReplay)
+	requireHead(3)
+
+	// A batch of one is a single send, and a single retries it: the two paths
+	// share one idempotency marker.
+	one, _, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{singleInput})
+	require.NoError(t, err)
+	require.Equal(t, single.ID.Value, one[0].ID.Value)
+	sameAsSingle, created, err := s.PutMessage(ctx, chatID, sender, textContent("x"), at(6), inputs[0].ClientMessageID, true)
+	require.NoError(t, err)
+	require.False(t, created)
+	require.Equal(t, msgs[0].ID.Value, sameAsSingle.ID.Value)
+
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending())
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2, 3}, messageIDs(all))
+	requireEventLog(t, s, chatID, 3)
+}
+
+func testStore_PutMessages_Shape(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+	input := func() messaging.MessageInput {
+		return messaging.MessageInput{SenderID: sender, Content: textContent("m"), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true}
+	}
+
+	_, _, err := s.PutMessages(ctx, chatID, nil)
+	require.ErrorIs(t, err, messaging.ErrEmptyBatch)
+
+	tooMany := make([]messaging.MessageInput, messaging.MaxMessagesPerPut+1)
+	for i := range tooMany {
+		tooMany[i] = input()
+	}
+	_, _, err = s.PutMessages(ctx, chatID, tooMany)
+	require.ErrorIs(t, err, messaging.ErrBatchTooLarge)
+
+	dup := input()
+	_, _, err = s.PutMessages(ctx, chatID, []messaging.MessageInput{input(), dup, dup})
+	require.ErrorIs(t, err, messaging.ErrDuplicateClientMessageID)
+
+	// A message with no client message ID, nil or empty, has no idempotency
+	// marker to key and is refused, in a batch and as a single send alike.
+	missing := input()
+	missing.ClientMessageID = nil
+	_, _, err = s.PutMessages(ctx, chatID, []messaging.MessageInput{input(), missing})
+	require.ErrorIs(t, err, messaging.ErrMissingClientMessageID)
+	missing.ClientMessageID = &messagingpb.ClientMessageId{}
+	_, _, err = s.PutMessages(ctx, chatID, []messaging.MessageInput{missing})
+	require.ErrorIs(t, err, messaging.ErrMissingClientMessageID)
+	_, _, err = s.PutMessage(ctx, chatID, sender, textContent("m"), at(1), nil, true)
+	require.ErrorIs(t, err, messaging.ErrMissingClientMessageID)
+
+	// A refused batch persists nothing: the chat is still empty.
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending())
+	require.NoError(t, err)
+	require.Empty(t, all)
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Zero(t, head)
+}
+
+func testStore_PutMessages_MaxBatch(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// The largest batch allowed lands whole (for DynamoDB, a transaction of
+	// exactly the 100 items it permits).
+	inputs := make([]messaging.MessageInput, messaging.MaxMessagesPerPut)
+	for i := range inputs {
+		inputs[i] = messaging.MessageInput{SenderID: sender, Content: textContent(strconv.Itoa(i)), Timestamp: at(int64(i + 1)), ClientMessageID: generateClientID(), CountsTowardUnread: true}
+	}
+	msgs, created, err := s.PutMessages(ctx, chatID, inputs)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Len(t, msgs, messaging.MaxMessagesPerPut)
+
+	want := make([]uint64, messaging.MaxMessagesPerPut)
+	for i := range want {
+		want[i] = uint64(i + 1)
+	}
+	require.Equal(t, want, messageIDs(msgs))
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending(), database.WithLimit(messaging.MaxMessagesPerPut+1))
+	require.NoError(t, err)
+	require.Equal(t, want, messageIDs(all))
+	for i, msg := range all {
+		require.Equal(t, strconv.Itoa(i), messageText(msg))
+	}
+}
+
+func testStore_PutMessages_ConcurrentDistinct(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// Concurrent batches and singles with distinct client message IDs must each
+	// receive distinct, gapless IDs, and a batch's IDs must be contiguous in
+	// batch order: no other send lands inside a batch.
+	const batches = 10
+	const perBatch = 5
+	const singles = 10
+	var wg sync.WaitGroup
+	batchIDs := make([][]uint64, batches)
+	singleIDs := make([]uint64, singles)
+	errs := make([]error, batches+singles)
+	for b := 0; b < batches; b++ {
+		wg.Add(1)
+		go func(b int) {
+			defer wg.Done()
+			inputs := make([]messaging.MessageInput, perBatch)
+			for i := range inputs {
+				inputs[i] = messaging.MessageInput{SenderID: sender, Content: textContent("b"), Timestamp: at(int64(b*perBatch + i + 1)), ClientMessageID: generateClientID(), CountsTowardUnread: true}
+			}
+			msgs, _, err := s.PutMessages(ctx, chatID, inputs)
+			if err != nil {
+				errs[b] = err
+				return
+			}
+			batchIDs[b] = messageIDs(msgs)
+		}(b)
+	}
+	for i := 0; i < singles; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			msg, _, err := s.PutMessage(ctx, chatID, sender, textContent("s"), at(int64(100+i)), generateClientID(), true)
+			if err != nil {
+				errs[batches+i] = err
+				return
+			}
+			singleIDs[i] = msg.ID.Value
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+
+	var got []uint64
+	for _, ids := range batchIDs {
+		require.Len(t, ids, perBatch)
+		for i := 1; i < perBatch; i++ {
+			require.Equal(t, ids[0]+uint64(i), ids[i], "batch IDs must be contiguous in batch order")
+		}
+		got = append(got, ids...)
+	}
+	got = append(got, singleIDs...)
+
+	const n = batches*perBatch + singles
+	sort.Slice(got, func(a, b int) bool { return got[a] < got[b] })
+	want := make([]uint64, n)
+	for i := range want {
+		want[i] = uint64(i + 1)
+	}
+	require.Equal(t, want, got)
+
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending(), database.WithLimit(n+1))
+	require.NoError(t, err)
+	require.Equal(t, want, messageIDs(all))
+	require.Equal(t, uint64(n), all[len(all)-1].UnreadSeq)
+	requireEventLog(t, s, chatID, n)
+}
+
+func testStore_PutMessages_ConcurrentIdempotent(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// Concurrent identical batches must collapse to one: exactly one creates,
+	// the rest replay the same messages.
+	inputs := []messaging.MessageInput{
+		{SenderID: sender, Content: textContent("a"), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: sender, Content: textContent("b"), Timestamp: at(2), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: sender, Content: textContent("c"), Timestamp: at(3), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	}
+	const n = 25
+	var wg sync.WaitGroup
+	got := make([][]uint64, n)
+	createds := make([]bool, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			msgs, created, err := s.PutMessages(ctx, chatID, inputs)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			got[i] = messageIDs(msgs)
+			createds[i] = created
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+
+	var createdCount int
+	for i := 0; i < n; i++ {
+		require.Equal(t, []uint64{1, 2, 3}, got[i])
+		if createds[i] {
+			createdCount++
+		}
+	}
+	require.Equal(t, 1, createdCount)
+
+	// One batch landed and logged; the replays logged nothing.
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending())
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2, 3}, messageIDs(all))
+	requireEventLog(t, s, chatID, 3)
+}
+
+func testStore_PutMessages_EventDelta(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+	batch := func(n int, ts int64) []*messaging.Message {
+		inputs := make([]messaging.MessageInput, n)
+		for i := range inputs {
+			inputs[i] = messaging.MessageInput{SenderID: sender, Content: textContent("m"), Timestamp: at(ts + int64(i)), ClientMessageID: generateClientID(), CountsTowardUnread: true}
+		}
+		msgs, _, err := s.PutMessages(ctx, chatID, inputs)
+		require.NoError(t, err)
+		return msgs
+	}
+
+	// A batch of 5: IDs and event sequences 1..5, every event a send.
+	batch(5, 1)
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), head)
+
+	// The page limit counts events, not stored rows, so pages may end inside
+	// the batch and the next resumes right after.
+	page, next, err := s.GetEventDelta(ctx, chatID, 0, head, 2)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2}, messageIDs(page))
+	require.Equal(t, uint64(2), next)
+	page, next, err = s.GetEventDelta(ctx, chatID, 2, head, 2)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{3, 4}, messageIDs(page))
+	require.Equal(t, uint64(4), next)
+	page, next, err = s.GetEventDelta(ctx, chatID, 4, head, 2)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{5}, messageIDs(page))
+	require.Equal(t, uint64(5), next)
+
+	// A cursor inside the batch (a client that saw its third message on the
+	// live stream) catches up on the rest of it only.
+	page, next, err = s.GetEventDelta(ctx, chatID, 3, head, 100)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{4, 5}, messageIDs(page))
+	require.Equal(t, uint64(5), next)
+
+	// A head inside the batch bounds the read there.
+	page, next, err = s.GetEventDelta(ctx, chatID, 1, 3, 100)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{2, 3}, messageIDs(page))
+	require.Equal(t, uint64(3), next)
+
+	// Edit and delete messages in the middle of the batch: each leaves its
+	// place in the batch and surfaces once, at its new event.
+	edited, err := s.EditMessage(ctx, chatID, &messagingpb.MessageId{Value: 3}, textContent("edited"), at(50), 3)
+	require.NoError(t, err)
+	require.Equal(t, uint64(6), edited.EventSequence)
+	deleted, err := s.DeleteMessage(ctx, chatID, &messagingpb.MessageId{Value: 2}, sender, at(51), 2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), deleted.EventSequence)
+
+	// Then a single send (ID 6, event 8) and another batch (IDs 7..9, events
+	// 9..11), so the log interleaves batches, singles, edits and deletes, and
+	// event sequences have run ahead of message IDs.
+	single, _, err := s.PutMessage(ctx, chatID, sender, textContent("single"), at(60), generateClientID(), true)
+	require.NoError(t, err)
+	require.Equal(t, uint64(8), single.EventSequence)
+	second := batch(3, 70)
+	require.Equal(t, []uint64{7, 8, 9}, messageIDs(second))
+	for i, msg := range second {
+		require.Equal(t, uint64(9+i), msg.EventSequence)
+	}
+	head, err = s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(11), head)
+
+	// Read whole, each message appears once at its latest event, in event order.
+	want := []uint64{1, 4, 5, 3, 2, 6, 7, 8, 9}
+	all, next, err := s.GetEventDelta(ctx, chatID, 0, head, 100)
+	require.NoError(t, err)
+	require.Equal(t, want, messageIDs(all))
+	require.Equal(t, head, next)
+	got, err := s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: 8})
+	require.NoError(t, err)
+	require.Equal(t, got.EventSequence, all[7].EventSequence)
+
+	// Walked a page at a time at any page size, the log yields the same
+	// messages, and every page advances the cursor by exactly its limit (or to
+	// the head): no event is skipped or read twice.
+	for _, limit := range []int{1, 2, 3, 4} {
+		var walked []uint64
+		cursor := uint64(0)
+		for cursor < head {
+			page, next, err := s.GetEventDelta(ctx, chatID, cursor, head, limit)
+			require.NoError(t, err)
+			require.Equal(t, min(cursor+uint64(limit), head), next, "limit %d from %d", limit, cursor)
+			walked = append(walked, messageIDs(page)...)
+			cursor = next
+		}
+		require.Equal(t, want, walked, "limit %d", limit)
+	}
+
+	// From a cursor inside the second batch, only the rest of it.
+	page, next, err = s.GetEventDelta(ctx, chatID, 9, head, 100)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{8, 9}, messageIDs(page))
+	require.Equal(t, head, next)
+
+	// A reader holds head 11 while message 8 (in the second batch) is edited and
+	// message 6 (the single) deleted, at events 12 and 13. Their events inside
+	// the held range are now superseded by events past it, which the live stream
+	// delivers, so the held read drops them rather than hand back their newer
+	// state out of event order; the cursor still reaches the held head.
+	heldHead := head
+	_, err = s.EditMessage(ctx, chatID, &messagingpb.MessageId{Value: 8}, textContent("late edit"), at(80), 10)
+	require.NoError(t, err)
+	_, err = s.DeleteMessage(ctx, chatID, &messagingpb.MessageId{Value: 6}, sender, at(81), 8)
+	require.NoError(t, err)
+	page, next, err = s.GetEventDelta(ctx, chatID, 7, heldHead, 100)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{7, 9}, messageIDs(page))
+	require.Equal(t, heldHead, next)
+
+	// Past the held head, each surfaces once at its new event.
+	page, next, err = s.GetEventDelta(ctx, chatID, heldHead, 13, 100)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{8, 6}, messageIDs(page))
+	require.Equal(t, uint64(13), next)
+	requireEventLog(t, s, chatID, 13)
+}
+
+func testStore_PutMessages_EventDeltaDefaultPage(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// Three full batches: events 1..147, the third batch holding 99..147.
+	for b := 0; b < 3; b++ {
+		inputs := make([]messaging.MessageInput, messaging.MaxMessagesPerPut)
+		for i := range inputs {
+			inputs[i] = messaging.MessageInput{SenderID: sender, Content: textContent("m"), Timestamp: at(int64(b*100 + i)), ClientMessageID: generateClientID(), CountsTowardUnread: true}
+		}
+		_, _, err := s.PutMessages(ctx, chatID, inputs)
+		require.NoError(t, err)
+	}
+	const total = 3 * messaging.MaxMessagesPerPut
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(total), head)
+
+	// The default page (limit <= 0) is 100 events, so the first page ends
+	// inside the third batch and the second resumes right after.
+	page, next, err := s.GetEventDelta(ctx, chatID, 0, head, 0)
+	require.NoError(t, err)
+	require.Len(t, page, 100)
+	require.Equal(t, uint64(1), page[0].ID.Value)
+	require.Equal(t, uint64(100), page[99].ID.Value)
+	require.Equal(t, uint64(100), next)
+	page, next, err = s.GetEventDelta(ctx, chatID, next, head, 0)
+	require.NoError(t, err)
+	require.Len(t, page, total-100)
+	require.Equal(t, uint64(101), page[0].ID.Value)
+	require.Equal(t, uint64(total), page[len(page)-1].ID.Value)
+	require.Equal(t, head, next)
+}
+
+func testStore_PutMessages_EventLogPerChat(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatA := generateChatID()
+	chatB := generateChatID()
+	sender := model.MustGenerateUserID()
+	send := func(chatID *commonpb.ChatId, n int) {
+		inputs := make([]messaging.MessageInput, n)
+		for i := range inputs {
+			inputs[i] = messaging.MessageInput{SenderID: sender, Content: textContent("m"), Timestamp: at(int64(i + 1)), ClientMessageID: generateClientID(), CountsTowardUnread: true}
+		}
+		_, _, err := s.PutMessages(ctx, chatID, inputs)
+		require.NoError(t, err)
+	}
+
+	// Interleaved writes to two chats, concurrently, each keep their own log
+	// from 1, untouched by the other's.
+	var wg sync.WaitGroup
+	for _, c := range []struct {
+		chatID *commonpb.ChatId
+		sizes  []int
+	}{{chatA, []int{3, 1, 4}}, {chatB, []int{2, 5}}} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, n := range c.sizes {
+				send(c.chatID, n)
+			}
+		}()
+	}
+	wg.Wait()
+	requireEventLog(t, s, chatA, 8)
+	requireEventLog(t, s, chatB, 7)
+}
+
+func testStore_EventLog_ConcurrentMixedWriters(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// Seed 20 messages (IDs and events 1..20) for the editors and deleters.
+	const seeded = 20
+	seed := make([]messaging.MessageInput, seeded)
+	for i := range seed {
+		seed[i] = messaging.MessageInput{SenderID: sender, Content: textContent("seed"), Timestamp: at(int64(i + 1)), ClientMessageID: generateClientID(), CountsTowardUnread: true}
+	}
+	_, _, err := s.PutMessages(ctx, chatID, seed)
+	require.NoError(t, err)
+
+	// Every kind of log writer at once. Sends lock both heads; edits and
+	// deletes lock only the event-log head, so this is where a numbering race
+	// between the two would show. Each editor and deleter owns its message, so
+	// none of them expects a conflict: the only contention is on the heads.
+	const (
+		singleSenders = 5
+		singlesEach   = 3
+		batchers      = 4
+		batchSize     = 4
+		editors       = 5 // editor j edits message j+1
+		editsEach     = 3
+		deleters      = 5 // deleter j deletes message 11+j
+	)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+	fail := func(err error) {
+		mu.Lock()
+		errs = append(errs, err)
+		mu.Unlock()
+	}
+	batchIDs := make([][]uint64, batchers)
+	for j := 0; j < singleSenders; j++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < singlesEach; i++ {
+				if _, _, err := s.PutMessage(ctx, chatID, sender, textContent("single"), at(100), generateClientID(), true); err != nil {
+					fail(err)
+				}
+			}
+		}()
+	}
+	for j := 0; j < batchers; j++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			inputs := make([]messaging.MessageInput, batchSize)
+			for i := range inputs {
+				inputs[i] = messaging.MessageInput{SenderID: sender, Content: textContent("batch"), Timestamp: at(200), ClientMessageID: generateClientID(), CountsTowardUnread: true}
+			}
+			msgs, _, err := s.PutMessages(ctx, chatID, inputs)
+			if err != nil {
+				fail(err)
+				return
+			}
+			batchIDs[j] = messageIDs(msgs)
+		}()
+	}
+	for j := 0; j < editors; j++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id := &messagingpb.MessageId{Value: uint64(j + 1)}
+			expected := uint64(j + 1)
+			for i := 0; i < editsEach; i++ {
+				edited, err := s.EditMessage(ctx, chatID, id, textContent(fmt.Sprintf("edit %d", i)), at(300), expected)
+				if err != nil {
+					fail(err)
+					return
+				}
+				expected = edited.EventSequence
+			}
+		}()
+	}
+	for j := 0; j < deleters; j++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.DeleteMessage(ctx, chatID, &messagingpb.MessageId{Value: uint64(11 + j)}, sender, at(400), uint64(11+j)); err != nil {
+				fail(err)
+			}
+		}()
+	}
+	wg.Wait()
+	require.Empty(t, errs)
+
+	// Every write took exactly one event, and batches stayed contiguous.
+	const messages = seeded + singleSenders*singlesEach + batchers*batchSize
+	const events = messages + editors*editsEach + deleters
+	for _, ids := range batchIDs {
+		require.Len(t, ids, batchSize)
+		for i := 1; i < batchSize; i++ {
+			require.Equal(t, ids[0]+uint64(i), ids[i])
+		}
+	}
+	requireEventLog(t, s, chatID, events)
+
+	// The log's view of the edited and deleted messages is their final state.
+	for j := 0; j < editors; j++ {
+		got, err := s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: uint64(j + 1)})
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("edit %d", editsEach-1), messageText(got))
+	}
+	for j := 0; j < deleters; j++ {
+		got, err := s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: uint64(11 + j)})
+		require.NoError(t, err)
+		requireDeleted(t, got, sender, at(400))
+	}
+}
+
+// requireEventLog checks a chat's event log against its messages. The head is
+// wantHead. Walked one event per page from 0, the cursor advances by exactly
+// one each time, so every event from 1 to the head exists and the log is
+// gapless. Walked in pages of 7, which end inside batches, every message from
+// 1 to the highest ID appears exactly once, at its current event_sequence, in
+// ascending event order: no event is lost, repeated or misnumbered.
+func requireEventLog(t *testing.T, s messaging.Store, chatID *commonpb.ChatId, wantHead uint64) {
+	t.Helper()
+	ctx := context.Background()
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, wantHead, head)
+
+	for cursor := uint64(0); cursor < head; cursor++ {
+		_, next, err := s.GetEventDelta(ctx, chatID, cursor, head, 1)
+		require.NoError(t, err)
+		require.Equal(t, cursor+1, next, "event %d", cursor+1)
+	}
+
+	var walked []*messaging.Message
+	for cursor := uint64(0); cursor < head; {
+		page, next, err := s.GetEventDelta(ctx, chatID, cursor, head, 7)
+		require.NoError(t, err)
+		require.Equal(t, min(cursor+7, head), next)
+		walked = append(walked, page...)
+		cursor = next
+	}
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending(), database.WithLimit(len(walked)+1))
+	require.NoError(t, err)
+	current := make(map[uint64]uint64, len(all))
+	for _, msg := range all {
+		current[msg.ID.Value] = msg.EventSequence
+	}
+	require.Len(t, walked, len(all), "every message appears in the log exactly once")
+	seen := make(map[uint64]bool, len(walked))
+	for i, msg := range walked {
+		require.False(t, seen[msg.ID.Value], "message %d repeated", msg.ID.Value)
+		seen[msg.ID.Value] = true
+		require.Equal(t, current[msg.ID.Value], msg.EventSequence, "message %d", msg.ID.Value)
+		if i > 0 {
+			require.Greater(t, msg.EventSequence, walked[i-1].EventSequence)
+		}
+	}
+	for id := uint64(1); id <= uint64(len(all)); id++ {
+		require.True(t, seen[id], "message %d missing from the log", id)
+	}
 }
 
 func testStore_GetMessage_NotFound(t *testing.T, s messaging.Store) {
@@ -609,6 +1333,7 @@ func testStore_EditMessage(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), next.ID.Value)
 	require.Equal(t, uint64(6), next.EventSequence)
+	requireSendInEventLog(t, s, chatID, 5, next)
 }
 
 func testStore_DeleteMessage(t *testing.T, s messaging.Store) {
@@ -673,6 +1398,26 @@ func testStore_DeleteMessage(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), next.ID.Value)
 	require.Equal(t, uint64(5), next.EventSequence)
+	requireSendInEventLog(t, s, chatID, 4, next)
+}
+
+// requireSendInEventLog asserts a send's event-log entry sits at the send's own
+// event_sequence, not at its message ID: a client caught up to prevHead (the head
+// just before the send) must find exactly the send in its next delta, and the
+// cursor must reach the new head. Once edits or deletes have moved the event-log
+// head past the message-ID head the two differ, and an entry keyed by the ID
+// would land at or below prevHead, where the catch-up never looks.
+func requireSendInEventLog(t *testing.T, s messaging.Store, chatID *commonpb.ChatId, prevHead uint64, sent *messaging.Message) {
+	t.Helper()
+	ctx := context.Background()
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, sent.EventSequence, head)
+	delta, cursor, err := s.GetEventDelta(ctx, chatID, prevHead, head, 100)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{sent.ID.Value}, messageIDs(delta))
+	require.Equal(t, sent.EventSequence, delta[0].EventSequence)
+	require.Equal(t, head, cursor)
 }
 
 // requireDeleted asserts a message is a tombstone: its content is a single

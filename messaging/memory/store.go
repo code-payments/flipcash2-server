@@ -92,7 +92,7 @@ func (m *memory) reset() {
 }
 
 func (m *memory) PutMessage(
-	_ context.Context,
+	ctx context.Context,
 	chatID *commonpb.ChatId,
 	senderID *commonpb.UserId,
 	content []*messagingpb.Content,
@@ -100,6 +100,28 @@ func (m *memory) PutMessage(
 	clientMessageID *messagingpb.ClientMessageId,
 	countsTowardUnread bool,
 ) (*messaging.Message, bool, error) {
+	msgs, created, err := m.PutMessages(ctx, chatID, []messaging.MessageInput{{
+		SenderID:           senderID,
+		Content:            content,
+		Timestamp:          ts,
+		ClientMessageID:    clientMessageID,
+		CountsTowardUnread: countsTowardUnread,
+	}})
+	if err != nil {
+		return nil, false, err
+	}
+	return msgs[0], created, nil
+}
+
+func (m *memory) PutMessages(
+	_ context.Context,
+	chatID *commonpb.ChatId,
+	inputs []messaging.MessageInput,
+) ([]*messaging.Message, bool, error) {
+	if err := messaging.ValidateMessageInputs(inputs); err != nil {
+		return nil, false, err
+	}
+
 	m.Lock()
 	defer m.Unlock()
 
@@ -109,54 +131,82 @@ func (m *memory) PutMessage(
 		m.chats[string(chatID.Value)] = cs
 	}
 
-	// Idempotency: a retried send with the same client message ID returns the
-	// originally persisted message.
-	if seq, ok := cs.byClient[string(clientMessageID.Value)]; ok {
-		return cs.messages[seq].Clone(), false, nil
+	// Idempotency is the batch's: a retry finds every client message ID spent
+	// and returns the originally persisted messages; a mix of spent and fresh
+	// IDs is neither a send nor a replay.
+	replayed := 0
+	for _, in := range inputs {
+		if _, ok := cs.byClient[string(in.ClientMessageID.Value)]; ok {
+			replayed++
+		}
+	}
+	if replayed == len(inputs) {
+		msgs := make([]*messaging.Message, len(inputs))
+		for i, in := range inputs {
+			msgs[i] = cs.messages[cs.byClient[string(in.ClientMessageID.Value)]].Clone()
+		}
+		return msgs, false, nil
+	}
+	if replayed > 0 {
+		return nil, false, messaging.ErrPartialReplay
 	}
 
-	seq := cs.lastSeq + 1
-	unreadSeq := cs.lastUnread
-	if countsTowardUnread {
-		unreadSeq++
+	// The batch is built whole before any of it is applied, so a failure part
+	// way through leaves the chat untouched. Each message takes the next seq and
+	// event seq, and the unread seq carries through the batch exactly as it
+	// would over the same sends made one at a time. The event-log head is
+	// tracked independently of the seq: while every event is a new message the
+	// two advance in lockstep (eventSeq == seq); once a delete advances the head
+	// without minting an ID they diverge, and a later send takes the next head,
+	// which is then greater than its own ID.
+	seq, unreadSeq, eventSeq := cs.lastSeq, cs.lastUnread, cs.lastEventSeq
+	msgs := make([]*messaging.Message, len(inputs))
+	for i, in := range inputs {
+		seq++
+		eventSeq++
+		if in.CountsTowardUnread {
+			unreadSeq++
+		}
+		clonedContent := make([]*messagingpb.Content, len(in.Content))
+		for j, c := range in.Content {
+			clonedContent[j] = proto.Clone(c).(*messagingpb.Content)
+		}
+		var clonedSender *commonpb.UserId // nil for a system message
+		if in.SenderID != nil {
+			clonedSender = &commonpb.UserId{Value: append([]byte(nil), in.SenderID.Value...)}
+		}
+		msgs[i] = &messaging.Message{
+			ChatID:        &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
+			ID:            &messagingpb.MessageId{Value: seq},
+			SenderID:      clonedSender,
+			Content:       clonedContent,
+			Timestamp:     in.Timestamp,
+			UnreadSeq:     unreadSeq,
+			EventSequence: eventSeq,
+		}
 	}
-	// The event-log head is tracked independently. While every event is a new
-	// message it advances in lockstep with the message ID (so eventSeq == seq);
-	// once a delete advances the head without minting an ID the two diverge, and a
-	// later send takes the next head, which is then greater than its own ID.
-	eventSeq := cs.lastEventSeq + 1
 
-	clonedContent := make([]*messagingpb.Content, len(content))
-	for i, c := range content {
-		clonedContent[i] = proto.Clone(c).(*messagingpb.Content)
+	for i, msg := range msgs {
+		cs.messages[msg.ID.Value] = msg // sender and content already cloned from the input
+		// Append a thin descriptor of the send to the event log (the event-ordered
+		// read source; see GetEventDelta), keyed by the event seq the send took.
+		cs.events = append(cs.events, eventLogEntry{
+			eventSeq:  msg.EventSequence,
+			messageID: msg.ID.Value,
+			eventType: messaging.EventTypeMessageSent,
+			ts:        msg.Timestamp,
+		})
+		cs.byClient[string(inputs[i].ClientMessageID.Value)] = msg.ID.Value
 	}
-	msg := &messaging.Message{
-		ChatID:        &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
-		ID:            &messagingpb.MessageId{Value: seq},
-		SenderID:      senderID,
-		Content:       clonedContent,
-		Timestamp:     ts,
-		UnreadSeq:     unreadSeq,
-		EventSequence: eventSeq,
-	}
-
-	cs.messages[seq] = msg.Clone()
-	// Append a thin descriptor of the send to the event log (the event-ordered read
-	// source; see GetEventDelta). Every event is a new message here, so its event_seq
-	// is the message's seq; edits and deletes will append further events without
-	// minting a message ID.
-	cs.events = append(cs.events, eventLogEntry{
-		eventSeq:  seq,
-		messageID: seq,
-		eventType: messaging.EventTypeMessageSent,
-		ts:        ts,
-	})
-	cs.byClient[string(clientMessageID.Value)] = seq
 	cs.lastSeq = seq
 	cs.lastUnread = unreadSeq
 	cs.lastEventSeq = eventSeq
 
-	return msg.Clone(), true, nil
+	out := make([]*messaging.Message, len(msgs))
+	for i, msg := range msgs {
+		out[i] = msg.Clone()
+	}
+	return out, true, nil
 }
 
 func (m *memory) GetLatestEventSequence(_ context.Context, chatID *commonpb.ChatId) (uint64, error) {

@@ -68,6 +68,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_GetMessages_ByIDs,
 		testServer_GetDelta,
 		testServer_GetDelta_ResetRequired,
+		testServer_GetDelta_Batches,
 		// Pointers
 		testServer_AdvancePointer,
 		testServer_AdvancePointer_PointerTypes,
@@ -1562,6 +1563,72 @@ func testServer_GetDelta_ResetRequired(t *testing.T, badges badge.Store, blockli
 	require.Equal(t, uint64(seeded), msgs[len(msgs)-1].MessageId.Value)
 	require.Equal(t, uint64(seeded), latest)
 	require.Equal(t, uint64(seeded), checkpoint)
+}
+
+func testServer_GetDelta_Batches(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	putBatches := func(n int) {
+		for b := 0; b < n; b++ {
+			inputs := make([]messaging.MessageInput, messaging.MaxMessagesPerPut)
+			for i := range inputs {
+				inputs[i] = messaging.MessageInput{SenderID: e.userA, Content: textContent("m"), Timestamp: at(int64(b*100 + i + 1)), ClientMessageID: generateClientID(), CountsTowardUnread: true}
+			}
+			_, _, err := messages.PutMessages(e.ctx, e.chatID, inputs)
+			require.NoError(t, err)
+		}
+	}
+
+	// Three full batches, seeded straight through the store: events 1..147,
+	// the third batch holding 99..147.
+	putBatches(3)
+	const total = 3 * messaging.MaxMessagesPerPut
+
+	// Cold boot streams two pages. The first ends at event 100, inside the
+	// third batch, and its checkpoint is that mid-batch event; the second
+	// resumes right after it and converges on the head.
+	resps, err := e.getDelta(e.keysB, 0)
+	require.NoError(t, err)
+	require.Len(t, resps, 2)
+	require.Equal(t, uint64(100), resps[0].CheckpointSequence)
+	require.Len(t, resps[0].Messages.Messages, 100)
+	require.Equal(t, uint64(total), resps[1].CheckpointSequence)
+	msgs, latest, checkpoint := collectDelta(resps)
+	require.Len(t, msgs, total)
+	for i, m := range msgs {
+		require.Equal(t, uint64(i+1), m.MessageId.Value)
+		require.Equal(t, uint64(i+1), m.EventSequence)
+	}
+	require.Equal(t, uint64(total), latest)
+	require.Equal(t, uint64(total), checkpoint)
+
+	// A client whose cursor sits inside the second batch (it saw event 50 on
+	// the live stream) catches up on the rest of that batch onward only.
+	resps, err = e.getDelta(e.keysB, 50)
+	require.NoError(t, err)
+	msgs, latest, checkpoint = collectDelta(resps)
+	require.Len(t, msgs, total-50)
+	require.Equal(t, uint64(51), msgs[0].MessageId.Value)
+	require.Equal(t, uint64(total), latest)
+	require.Equal(t, uint64(total), checkpoint)
+
+	// The reset threshold counts events, not stored rows: grow the log to 1029
+	// events (21 batches) and a gap of 1001 resets while a gap of exactly 1000,
+	// from a cursor inside a batch, streams.
+	putBatches(18)
+	const grown = 21 * messaging.MaxMessagesPerPut
+	resps, err = e.getDelta(e.keysB, grown-1001)
+	require.NoError(t, err)
+	require.Len(t, resps, 1)
+	require.Equal(t, messagingpb.GetDeltaResponse_RESET_REQUIRED, resps[0].Result)
+	require.Equal(t, uint64(grown), resps[0].LatestSequence)
+	resps, err = e.getDelta(e.keysB, grown-1000)
+	require.NoError(t, err)
+	msgs, latest, checkpoint = collectDelta(resps)
+	require.Len(t, msgs, 1000)
+	require.Equal(t, uint64(grown-999), msgs[0].MessageId.Value)
+	require.Equal(t, uint64(grown), msgs[len(msgs)-1].MessageId.Value)
+	require.Equal(t, uint64(grown), latest)
+	require.Equal(t, uint64(grown), checkpoint)
 }
 
 // ============================================================================

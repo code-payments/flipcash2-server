@@ -49,6 +49,11 @@ type integrationEnv struct {
 	chats       chat.Store
 	profiles    profile.Store
 	integration ocp_integration.SubmitIntent
+
+	// team is the Flipcash team account the integration is built with, and
+	// teamKeys the key pair it is bound to.
+	team     *commonpb.UserId
+	teamKeys model.KeyPair
 }
 
 func newIntegrationEnv(t *testing.T) *integrationEnv {
@@ -74,12 +79,19 @@ func newIntegrationEnv(t *testing.T) *integrationEnv {
 	require.NoError(t, mintDataProvider.Start(ctx))
 	t.Cleanup(mintDataProvider.Stop)
 
+	team := model.MustGenerateUserID()
+	teamKeys := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, team, teamKeys.Proto())
+	require.NoError(t, err)
+
 	return &integrationEnv{
 		ctx:         ctx,
 		accounts:    accounts,
 		chats:       chats,
 		profiles:    profiles,
-		integration: intent.NewIntegration(accounts, chats, profiles, mintDataProvider),
+		integration: intent.NewIntegration(accounts, chats, profiles, mintDataProvider, team),
+		team:        team,
+		teamKeys:    teamKeys,
 	}
 }
 
@@ -428,6 +440,49 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 1.0), nil, nil))
 		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 0.5), nil, nil))
 		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, "usd", 0.01), nil, nil))
+	})
+}
+
+// No tip DM payment is allowed to or from the Flipcash team account, tip or
+// send, whether or not the DM exists (the team's welcome creates it).
+func TestIntegration_AllowCreation_TipDmPayment_TeamAccount(t *testing.T) {
+	e := newIntegrationEnv(t)
+	userID, userKeys := e.bindUser(t)
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, userID, e.team)
+
+	parties := []struct {
+		name     string
+		from, to model.KeyPair
+	}{
+		{"to_team", userKeys, e.teamKeys},
+		{"from_team", e.teamKeys, userKeys},
+	}
+	payment := func(from, to model.KeyPair, action intentpb.ChatMetadata_TipDmPayment_Action) *ocp_intent.Record {
+		metadata := tipDmChatMetadataWithAction(chatID, intentpb.ChatMetadata_TipDmPayment_CHAT, action)
+		return dmPaymentIntentRecord(t, metadata, base58.Encode(from.Public()), base58.Encode(to.Public()))
+	}
+	requireDenied := func(t *testing.T) {
+		for _, p := range parties {
+			for _, action := range []intentpb.ChatMetadata_TipDmPayment_Action{intentpb.ChatMetadata_TipDmPayment_TIP, intentpb.ChatMetadata_TipDmPayment_SEND} {
+				err := e.integration.AllowCreation(e.ctx, payment(p.from, p.to, action), nil, nil)
+				require.ErrorContains(t, err, "flipcash team", "%s %s", p.name, action)
+			}
+		}
+	}
+
+	t.Run("uninitialized", requireDenied)
+
+	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+		ID:      chatID,
+		Type:    chatpb.ChatType_TIP_DM,
+		Members: []*commonpb.UserId{userID, e.team},
+	}))
+	t.Run("initialized", requireDenied)
+
+	// Without a team account configured, the same user is anyone else.
+	t.Run("no_team_configured", func(t *testing.T) {
+		unconfigured := intent.NewIntegration(e.accounts, e.chats, e.profiles, nil, nil)
+		require.NoError(t, unconfigured.AllowCreation(e.ctx, payment(userKeys, e.teamKeys, intentpb.ChatMetadata_TipDmPayment_SEND), nil, nil))
 	})
 }
 

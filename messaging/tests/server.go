@@ -64,6 +64,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_SendBatch_SideEffects,
 		testServer_SendBatch_Group,
 		testServer_SendMessage_TeamAccount,
+		testServer_TeamAccount_Refused,
 		testServer_EditMessage,
 		testServer_DeleteMessage,
 		testServer_GetMessage_NotFound,
@@ -1463,7 +1464,7 @@ func testServer_SendBatch_Group(t *testing.T, badges badge.Store, blocklists blo
 	require.Equal(t, []uint64{1, 2}, pushedIDs)
 }
 
-func testServer_SendMessage_TeamAccount(t *testing.T,badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	team := model.MustGenerateUserID()
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles, messaging.WithTeamAccount(team))
 
@@ -1521,7 +1522,9 @@ func testServer_SendMessage_TeamAccount(t *testing.T,badges badge.Store, blockli
 	e.waitForNewMessage(e.userA, fromTeam.MessageId.Value)
 	require.Eventually(t, func() bool { return pushedTo(e.userA) }, time.Second, 20*time.Millisecond)
 
-	// A reply from the user advances their own pointer as usual.
+	// A message from the user, which only the Sender can put in the DM (a tip's
+	// payment message, say; the server refuses a user's own send, see
+	// testServer_TeamAccount_Refused), advances their own pointer as usual.
 	reply, err := e.sender.Send(e.ctx, dmID, e.userA, textContent("thanks"), generateClientID(), true)
 	require.NoError(t, err)
 
@@ -1540,6 +1543,61 @@ func testServer_SendMessage_TeamAccount(t *testing.T,badges badge.Store, blockli
 	require.Never(t, func() bool {
 		return len(e.chatUpdatesFor(team)) > 0 || pushedTo(team)
 	}, 500*time.Millisecond, 20*time.Millisecond)
+}
+
+func testServer_TeamAccount_Refused(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	team := model.MustGenerateUserID()
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles, messaging.WithTeamAccount(team))
+	teamKeys := model.MustGenerateKeyPair()
+	e.authz.Add(team, teamKeys)
+
+	// A DM of each type between userA and the team, each with a message from
+	// userA put there through the Sender (as a tip's payment message is), so
+	// an edit and a deletion have something of userA's to target.
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_TIP_DM} {
+		dmID := chat.MustDeriveDmChatID(chatType, e.userA, team)
+		require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+			ID:           dmID,
+			Type:         chatType,
+			Members:      []*commonpb.UserId{e.userA, team},
+			LastActivity: at(1),
+		}))
+		own, err := e.sender.Send(e.ctx, dmID, e.userA, textContent("tip"), generateClientID(), true)
+		require.NoError(t, err)
+
+		// Nobody speaks in it through the server: not the user, and not the
+		// team account either, which writes only through the Sender.
+		for _, keys := range []model.KeyPair{e.keysA, teamKeys} {
+			sent, err := e.sendContentToChat(keys, dmID, textContent("hello"), generateClientID())
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.SendMessageResponse_DENIED, sent.Result)
+
+			typing, err := e.notifyIsTypingInChat(keys, dmID, messagingpb.IsTypingNotification_STARTED_TYPING)
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typing.Result)
+		}
+
+		edited, err := e.editMessageInChat(e.keysA, dmID, own.MessageId, textContent("edited"), own.EventSequence)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.EditMessageResponse_DENIED, edited.Result)
+
+		deleted, err := e.deleteMessageInChat(e.keysA, dmID, own.MessageId, own.EventSequence)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.DeleteMessageResponse_DENIED, deleted.Result)
+
+		// Nothing the refusals were asked for landed.
+		read, err := e.getMessagesByOptionsInChat(e.keysA, dmID, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_OK, read.Result)
+		require.Len(t, read.Messages.Messages, 1)
+		require.Equal(t, own.MessageId.Value, read.Messages.Messages[0].MessageId.Value)
+		require.Equal(t, "tip", read.Messages.Messages[0].Content[0].GetText().GetText())
+	}
+
+	// A DM with anyone else is unaffected.
+	sent, err := e.send(e.keysA, "hello", generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
 }
 
 func testServer_GetMessage_NotFound(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

@@ -54,7 +54,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
-	integration := intent.NewIntegration(accounts, chats, profiles, nil)
+	integration := intent.NewIntegration(accounts, chats, profiles, nil, nil)
 
 	senderUserID := model.MustGenerateUserID()
 	senderKeys := model.MustGenerateKeyPair()
@@ -209,7 +209,7 @@ func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMe
 	chats := chatmemory.NewInMemory(chatOpts...)
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, senderOpts...)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
-	integration := intent.NewIntegration(accounts, chats, profiles, nil)
+	integration := intent.NewIntegration(accounts, chats, profiles, nil, nil)
 
 	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
 

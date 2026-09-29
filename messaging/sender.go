@@ -120,6 +120,11 @@ func WithPushPageConcurrency(n int) SenderOption {
 // read spent on an account with no devices. The user it talks to hears about
 // everything as usual. Nil, the default, names no one.
 //
+// Its DMs are the team's to write in alone: the Server refuses every send, edit,
+// deletion and typing notification in one (see Server.canSpeak), whoever
+// asks, the team account included, so the team only ever writes through the
+// Sender, and a user cannot message it.
+//
 // Its DMs are created with it excluded from the feed, which the parent
 // configures the chat store to do for every DM with it (see
 // chat.WithExcludedFromFeed), so no send in them moves its copy of the chat's
@@ -385,6 +390,23 @@ func (s *Sender) TeamAccount() *commonpb.UserId {
 // WithTeamAccount).
 func (s *Sender) isTeamAccount(userID *commonpb.UserId) bool {
 	return s.teamUserID != nil && bytes.Equal(userID.GetValue(), s.teamUserID.Value)
+}
+
+// inTeamDm reports whether chatID is a DM that userID shares with the team
+// account (see WithTeamAccount), or, when userID is the team account itself,
+// any DM. It is decided off the IDs alone, with no read: a DM's ID is derived
+// from its members, so it is a DM with the team exactly when it derives from
+// the team and userID under one of the DM types. It says nothing of whether
+// the chat exists or userID is in it.
+func (s *Sender) inTeamDm(chatID *commonpb.ChatId, userID *commonpb.UserId) bool {
+	if s.teamUserID == nil || chat.IsGroupChatID(chatID) {
+		return false
+	}
+	if s.isTeamAccount(userID) {
+		return true
+	}
+	members := []*commonpb.UserId{s.teamUserID, userID}
+	return chat.DeriveDmChatType(chatID, members) != chatpb.ChatType_UNKNOWN
 }
 
 // withoutTeamAccount returns userIDs less the team account (see

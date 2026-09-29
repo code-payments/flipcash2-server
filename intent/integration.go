@@ -5,6 +5,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
 	ocp_transactionpb "github.com/code-payments/ocp-protobuf-api/generated/go/transaction/v1"
 
@@ -25,13 +26,23 @@ type Integration struct {
 	profiles profile.Store
 
 	mintDataProvider *ocp_currency_util.MintDataProvider
+
+	// teamUserID is the Flipcash team account (see flipcashteam), nil when
+	// there is none. No tip DM payment is allowed to or from it (see
+	// validateTipDmAppMetadata).
+	teamUserID *commonpb.UserId
 }
 
+// NewIntegration constructs the intent integration. teamUserID is the Flipcash
+// team account, which the parent resolves once at startup with
+// flipcashteam.GetUserID and passes to chat and messaging too; nil names no
+// one.
 func NewIntegration(
 	accounts account.Store,
 	chats chat.Store,
 	profiles profile.Store,
 	mintDataProvider *ocp_currency_util.MintDataProvider,
+	teamUserID *commonpb.UserId,
 ) ocp_integration.SubmitIntent {
 	return &Integration{
 		accounts: accounts,
@@ -39,6 +50,8 @@ func NewIntegration(
 		profiles: profiles,
 
 		mintDataProvider: mintDataProvider,
+
+		teamUserID: teamUserID,
 	}
 }
 

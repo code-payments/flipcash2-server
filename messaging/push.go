@@ -118,10 +118,19 @@ func (s *Sender) pushSentMessages(ctx context.Context, log *zap.Logger, chatID *
 		}
 	} else {
 		chatType = chat.DeriveDmChatType(chatID, members)
+
+		// The team account is never pushed to (see WithTeamAccount). It is
+		// dropped only now: the type derivation above needs the pair whole.
+		members = s.withoutTeamAccount(members)
 	}
 
 	for _, message := range sent {
 		if message.SenderId == nil {
+			continue
+		}
+		// A DM message with no one to push to, a user's message to the team
+		// account, earns no push, so nothing is read to prepare one.
+		if !isGroup && !hasRecipient(members, message.SenderId) {
 			continue
 		}
 		p := &messagePush{
@@ -144,6 +153,16 @@ func (s *Sender) pushSentMessages(ctx context.Context, log *zap.Logger, chatID *
 			p.sendPage(ctx, members)
 		}
 	}
+}
+
+// hasRecipient reports whether members holds anyone other than the sender.
+func hasRecipient(members []*commonpb.UserId, senderID *commonpb.UserId) bool {
+	for _, m := range members {
+		if !bytes.Equal(m.Value, senderID.Value) {
+			return true
+		}
+	}
+	return false
 }
 
 // pushStep runs one step of a fan-out under its own deadline.

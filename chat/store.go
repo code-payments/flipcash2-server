@@ -102,6 +102,15 @@ type Store interface {
 	// is rejected with ErrTooManyMembers rather than written non-atomically; a
 	// caller wanting a larger group creates it at the cap and grows it with
 	// AddGroupMembers. RosterSummary is derived from Members and ignored.
+	//
+	// A store built WithExcludedFromFeed creates every DM with that user
+	// excluded from the feed: their copy of the chat records their membership
+	// (so IsMember answers for them as for anyone) and nothing else, with no
+	// activity to order a feed by, which AdvanceLastMessage never moves and
+	// GetDmFeedPage never returns. The exclusion is decided at creation and
+	// kept with the chat, internal to the store and not on the Chat it
+	// returns: a DM keeps it however the store is later configured, which is
+	// what makes an advance of it safe from any process.
 	PutChat(ctx context.Context, chat *Chat) error
 
 	// AddGroupMembers adds users as joined members of a group chat. It is
@@ -156,11 +165,12 @@ type Store interface {
 	GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*Chat, error)
 
 	// GetDmFeedPage returns one page of userID's DM feed for a single chat type,
-	// pinned to a snapshot: the DMs of chatType userID is a member of whose
-	// last_activity is at or before snapshot, ordered by (last_activity, chat_id)
-	// descending (most recent first), at most limit chats (limit <= 0 means
-	// unbounded). When cursor is nil the page starts at the most recent chat in
-	// the snapshot; otherwise it resumes strictly after cursor. An empty result
+	// pinned to a snapshot: the DMs of chatType userID is a member of (never
+	// one that excludes them from the feed, see PutChat) whose last_activity
+	// is at or before snapshot, ordered by (last_activity, chat_id) descending
+	// (most recent first), at most limit chats (limit <= 0 means unbounded).
+	// When cursor is nil the page starts at the most recent chat in the
+	// snapshot; otherwise it resumes strictly after cursor. An empty result
 	// (no error) is returned when no chats remain.
 	//
 	// Pinning to a fixed watermark makes a multi-page read internally consistent.
@@ -329,6 +339,11 @@ type Store interface {
 	// advanced and no-op paths; they are nil on error (including
 	// ErrChatNotFound). A group chat's membership lives in its own records, so
 	// members is empty and the caller reads GetMembers itself.
+	//
+	// A DM keeps a copy of its activity per member, which is what orders that
+	// member's DM feed (see GetDmFeedPage); an advance moves every such copy
+	// with the canonical record. A member the DM excludes from the feed (see
+	// PutChat) has no copy to move and is left out.
 	AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (advanced bool, members []*commonpb.UserId, err error)
 
 	// SetMute records mute as userID's mute on chatID, replacing any mute

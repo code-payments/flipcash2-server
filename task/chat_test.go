@@ -3,6 +3,7 @@ package task_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/mr-tron/base58"
@@ -160,18 +161,26 @@ func TestExecutor_SendTipDmPaymentMessage(t *testing.T) {
 		{"chat_tip", intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_TIP, messagingpb.CashContent_TIPPED},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testExecutor_SendTipDmPaymentMessage(t, tc.location, tc.action, tc.expectedVerb)
+			testExecutor_SendTipDmPaymentMessage(t, tc.location, tc.action, tc.expectedVerb, false)
 		})
 	}
+
+	// A tip to the team account creates the DM with the team excluded from the
+	// feed, by the store's configuration alone.
+	t.Run("to_team", func(t *testing.T) {
+		testExecutor_SendTipDmPaymentMessage(t, intentpb.ChatMetadata_TipDmPayment_TIPCARD, intentpb.ChatMetadata_TipDmPayment_DEFAULT, messagingpb.CashContent_TIPPED, true)
+	})
 }
 
-func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMetadata_TipDmPayment_Location, action intentpb.ChatMetadata_TipDmPayment_Action, expectedVerb messagingpb.CashContent_Verb) {
+// testExecutor_SendTipDmPaymentMessage pays a tip DM payment through the task.
+// toTeam makes the recipient the team account, which the chat store is built
+// to exclude from the feed as the parent builds it.
+func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMetadata_TipDmPayment_Location, action intentpb.ChatMetadata_TipDmPayment_Action, expectedVerb messagingpb.CashContent_Verb, toTeam bool) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
 	accounts := accountmemory.NewInMemory()
 	badges := badgememory.NewInMemory()
-	chats := chatmemory.NewInMemory()
 	messages := messagingmemory.NewInMemory()
 	profiles := profilememory.NewInMemory()
 	ocpData := ocp_data.NewTestDataProvider()
@@ -180,9 +189,6 @@ func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMe
 
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
 	blocklists := blocklistmemory.NewInMemory()
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus)
-	executor := task.NewExecutor(accounts, chats, sender, ocpData)
-	integration := intent.NewIntegration(accounts, chats, profiles, nil)
 
 	senderUserID := model.MustGenerateUserID()
 	senderKeys := model.MustGenerateKeyPair()
@@ -193,6 +199,17 @@ func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMe
 	recipientKeys := model.MustGenerateKeyPair()
 	_, err = accounts.Bind(ctx, recipientUserID, recipientKeys.Proto())
 	require.NoError(t, err)
+
+	var chatOpts []chat.StoreOption
+	var senderOpts []messaging.SenderOption
+	if toTeam {
+		chatOpts = append(chatOpts, chat.WithExcludedFromFeed(recipientUserID))
+		senderOpts = append(senderOpts, messaging.WithTeamAccount(recipientUserID))
+	}
+	chats := chatmemory.NewInMemory(chatOpts...)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, senderOpts...)
+	executor := task.NewExecutor(accounts, chats, sender, ocpData)
+	integration := intent.NewIntegration(accounts, chats, profiles, nil)
 
 	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
 
@@ -248,6 +265,19 @@ func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMe
 	created, err := chats.GetChatByID(ctx, chatID)
 	require.NoError(t, err)
 	assert.Equal(t, chatpb.ChatType_TIP_DM, created.Type)
+
+	// Only the team account is ever excluded from the feed, and it is a
+	// member all the same.
+	recipientFeed, err := chats.GetDmFeedPage(ctx, recipientUserID, chatpb.ChatType_TIP_DM, time.Now().Add(time.Hour), nil, 0)
+	require.NoError(t, err)
+	if toTeam {
+		require.Empty(t, recipientFeed)
+	} else {
+		require.Len(t, recipientFeed, 1)
+	}
+	isMember, err := chats.IsMember(ctx, chatID, recipientUserID)
+	require.NoError(t, err)
+	require.True(t, isMember)
 
 	msgs, err := messages.GetMessages(ctx, chatID)
 	require.NoError(t, err)

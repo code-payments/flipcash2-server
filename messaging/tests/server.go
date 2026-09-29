@@ -60,6 +60,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_EncryptedContent,
 		testServer_EncryptedContent_NotInGroups,
 		testServer_SendMessage_Broadcast,
+		testServer_SendBatch,
+		testServer_SendMessage_TeamAccount,
 		testServer_EditMessage,
 		testServer_DeleteMessage,
 		testServer_GetMessage_NotFound,
@@ -105,6 +107,7 @@ type serverEnv struct {
 	t            *testing.T
 	ctx          context.Context
 	client       messagingpb.MessagingClient
+	sender       *messaging.Sender
 	authz        *auth.StaticAuthorizer
 	observer     *event.TestEventObserver[*commonpb.UserId, *eventpb.Event]
 	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
@@ -241,6 +244,7 @@ func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, 
 		messagingpb.RegisterMessagingServer(s, server)
 	}))
 	env.client = messagingpb.NewMessagingClient(cc)
+	env.sender = sender
 	return env
 }
 
@@ -1202,6 +1206,133 @@ func testServer_SendMessage_Broadcast(t *testing.T, badges badge.Store, blocklis
 		return len(u.MetadataUpdates) > 0 &&
 			u.PointerUpdates != nil && hasPointer(u.PointerUpdates.Pointers, messagingpb.Pointer_READ, e.userA, id)
 	})
+}
+
+func testServer_SendBatch(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	outgoing := []messaging.OutgoingMessage{
+		{SenderID: e.userA, Content: textContent("first"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: e.userB, Content: textContent("second"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: e.userA, Content: textContent("third"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	}
+	sent, err := e.sender.SendBatch(e.ctx, e.chatID, outgoing)
+	require.NoError(t, err)
+	require.Len(t, sent, 3)
+	for i, text := range []string{"first", "second", "third"} {
+		require.Equal(t, uint64(i+1), sent[i].MessageId.Value)
+		require.Equal(t, outgoing[i].SenderID.Value, sent[i].SenderId.Value)
+		require.Equal(t, text, sent[i].Content[0].GetText().Text)
+	}
+
+	// One update carries the whole batch, one message_sent event per message in
+	// batch order, with each sender's READ pointer past the last message they
+	// sent in it.
+	e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
+		events := u.GetEvents().GetEvents()
+		if len(events) != 3 {
+			return false
+		}
+		for i, ev := range events {
+			if ev.Sequence != uint64(i+1) || ev.Mutations[0].GetMessageSent().GetMessageId().GetValue() != uint64(i+1) {
+				return false
+			}
+		}
+		return len(u.MetadataUpdates) > 0 &&
+			hasPointer(u.GetPointerUpdates().GetPointers(), messagingpb.Pointer_READ, e.userA, 3) &&
+			hasPointer(u.GetPointerUpdates().GetPointers(), messagingpb.Pointer_READ, e.userB, 2)
+	})
+
+	// A retry returns the original messages and persists nothing.
+	replayed, err := e.sender.SendBatch(e.ctx, e.chatID, outgoing)
+	require.NoError(t, err)
+	require.Equal(t, protoMessageIDs(sent), protoMessageIDs(replayed))
+	stored, err := messages.GetMessages(e.ctx, e.chatID)
+	require.NoError(t, err)
+	require.Len(t, stored, 3)
+
+	// An empty batch is refused.
+	_, err = e.sender.SendBatch(e.ctx, e.chatID, nil)
+	require.Error(t, err)
+}
+
+func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	team := model.MustGenerateUserID()
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles, messaging.WithTeamAccount(team))
+
+	// A display name is what a tip-DM push renders, so both have one: a push
+	// that is missing is missing because of the team account, not the name.
+	require.NoError(t, profiles.SetDisplayName(e.ctx, team, "Flipcash"))
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
+
+	// pushedTo reports whether any push so far was addressed to the user.
+	pushedTo := func(userID *commonpb.UserId) bool {
+		for _, p := range e.pusher.snapshot() {
+			for _, u := range p.users {
+				if bytes.Equal(u.Value, userID.Value) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// Whether the team's feed lists the DM is the chat store's to decide (see
+	// chat.WithExcludedFromFeed), and not what this test is about.
+	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.userA, team)
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           dmID,
+		Type:         chatpb.ChatType_TIP_DM,
+		Members:      []*commonpb.UserId{e.userA, team},
+		LastActivity: at(1),
+	}))
+
+	// feedEntry is the DM as the member's own DM feed lists it.
+	feedEntry := func(member *commonpb.UserId) *chat.Chat {
+		t.Helper()
+		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_TIP_DM, time.Now().Add(time.Hour), nil, 0)
+		require.NoError(t, err)
+		require.Len(t, page, 1)
+		return page[0]
+	}
+
+	// A send by the team account advances the chat and the user's feed, but
+	// not the team's read pointer.
+	fromTeam, err := e.sender.Send(e.ctx, dmID, team, textContent("welcome"), generateClientID(), true)
+	require.NoError(t, err)
+
+	pointers, err := messages.GetPointers(e.ctx, dmID)
+	require.NoError(t, err)
+	require.Empty(t, pointers)
+
+	record, err := chats.GetChatByID(e.ctx, dmID)
+	require.NoError(t, err)
+	require.Equal(t, fromTeam.MessageId.Value, record.LastMessageID.GetValue())
+	require.Equal(t, fromTeam.MessageId.Value, feedEntry(e.userA).LastMessageID.GetValue())
+
+	// The user hears about it on the stream and by push.
+	e.waitForNewMessage(e.userA, fromTeam.MessageId.Value)
+	require.Eventually(t, func() bool { return pushedTo(e.userA) }, time.Second, 20*time.Millisecond)
+
+	// A reply from the user advances their own pointer as usual.
+	reply, err := e.sender.Send(e.ctx, dmID, e.userA, textContent("thanks"), generateClientID(), true)
+	require.NoError(t, err)
+
+	pointers, err = messages.GetPointers(e.ctx, dmID)
+	require.NoError(t, err)
+	require.True(t, hasPointer(pointers, messagingpb.Pointer_READ, e.userA, reply.MessageId.Value))
+	for _, p := range pointers {
+		require.NotEqual(t, team.Value, p.UserId.Value)
+	}
+	require.Equal(t, reply.MessageId.Value, feedEntry(e.userA).LastMessageID.GetValue())
+
+	// Nothing in the DM is ever delivered to the team account: no event on its
+	// stream, and no push, for its own message or the user's reply. The window
+	// gives the asynchronous paths room to (not) fire.
+	e.waitForNewMessage(e.userA, reply.MessageId.Value)
+	require.Never(t, func() bool {
+		return len(e.chatUpdatesFor(team)) > 0 || pushedTo(team)
+	}, 500*time.Millisecond, 20*time.Millisecond)
 }
 
 func testServer_GetMessage_NotFound(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

@@ -38,7 +38,10 @@ import (
 //	          with true server-side pagination and no filtering. last_activity
 //	          and the participants are denormalized so the inbox renders from
 //	          one query. AdvanceLastActivity fans the new last_activity out to
-//	          each member's row (two for a DM), re-sorting the GSI.
+//	          each member's row (two for a DM), re-sorting the GSI. The row
+//	          of a member excluded from the feed (see chat.Store.PutChat)
+//	          carries neither feed nor last_activity, so it is in neither GSI:
+//	          it records membership alone, and no advance ever touches it.
 //
 //	group_members  pk = "chat#<id>", sk = "user#<id>" (one item per (group,
 //	          member), kept as a tombstone after departure). Group membership,
@@ -157,6 +160,7 @@ const (
 	attrType               = "type"
 	attrFeed               = "feed"
 	attrMembers            = "members"
+	attrExcludedFromFeed   = "excluded_from_feed" // DM chats item: binary set of the members the DM excludes from the feed (see chat.Store.PutChat), absent when none
 	attrTitle              = "title"
 	attrIsStaffOnly        = "is_staff_only"
 	attrMinListenerBalance = "min_listener_balance" // map: see minimumBalanceAttr
@@ -238,12 +242,15 @@ type store struct {
 	dmInboxTable      string
 	groupMembersTable string
 	userStateTable    string
+
+	opts chat.StoreOptions
 }
 
 // NewInDynamoDB returns a chat.Store backed by the given DynamoDB tables. Use
 // CreateTables to provision them.
-func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable string) chat.Store {
+func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable string, opts ...chat.StoreOption) chat.Store {
 	return &store{
+		opts:              chat.NewStoreOptions(opts...),
 		client:            client,
 		chatsTable:        chatsTable,
 		dmInboxTable:      dmInboxTable,
@@ -275,24 +282,34 @@ func (s *store) PutChat(ctx context.Context, c *chat.Chat) error {
 
 // putDmChat creates a DM chat: the canonical metadata item plus each
 // participant's dm_inbox row, in one transaction. The canonical item's
-// condition enforces uniqueness for the whole write.
+// condition enforces uniqueness for the whole write. The members the store's
+// options exclude from the feed, if the DM has any, are recorded on the
+// canonical item as a binary set, where every advance reads them, and each
+// gets a row that records membership alone (see dmInboxItem). A set cannot be
+// empty, so a DM excluding no one has no attribute at all.
 func (s *store) putDmChat(ctx context.Context, c *chat.Chat) error {
 	if len(c.Members) == 0 {
 		return chat.ErrNoMembers
 	}
 
+	excluded := s.opts.ExcludedFromFeed(c)
+	canonical := s.chatItem(c)
+	if len(excluded) > 0 {
+		canonical[attrExcludedFromFeed] = avBS(excluded)
+	}
 	transactItems := []types.TransactWriteItem{
 		{Put: &types.Put{
 			TableName:           aws.String(s.chatsTable),
-			Item:                s.chatItem(c),
+			Item:                canonical,
 			ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 		}},
 	}
 	for _, member := range c.Members {
+		isExcluded := slices.ContainsFunc(excluded, func(u *commonpb.UserId) bool { return bytes.Equal(u.Value, member.Value) })
 		transactItems = append(transactItems, types.TransactWriteItem{
 			Put: &types.Put{
 				TableName: aws.String(s.dmInboxTable),
-				Item:      s.dmInboxItem(c, member),
+				Item:      s.dmInboxItem(c, member, isExcluded),
 			},
 		})
 	}
@@ -1489,6 +1506,7 @@ func (s *store) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId,
 	// Members are returned to the caller regardless of whether the activity
 	// advances, so parse them before the no-op short-circuit.
 	members := membersFromItem(out.Item)
+	excluded := asBS(out.Item[attrExcludedFromFeed])
 	if ts.UnixNano() <= cur {
 		return false, members, nil // No-op: stored value is already at or after ts.
 	}
@@ -1514,6 +1532,11 @@ func (s *store) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId,
 		}},
 	}
 	for _, member := range members {
+		// An excluded member's row has no activity to move, and its condition
+		// could never hold: it would cancel every advance of the chat.
+		if slices.ContainsFunc(excluded, func(u []byte) bool { return bytes.Equal(u, member.Value) }) {
+			continue
+		}
 		transactItems = append(transactItems, types.TransactWriteItem{
 			Update: &types.Update{
 				TableName:        aws.String(s.dmInboxTable),
@@ -1602,15 +1625,24 @@ func (s *store) groupMetaItem(chatID *commonpb.ChatId, memberCount uint64) map[s
 	}
 }
 
-func (s *store) dmInboxItem(c *chat.Chat, member *commonpb.UserId) map[string]types.AttributeValue {
+// dmInboxItem is member's dm_inbox row for the DM c. The row of a member the
+// DM excludes from the feed (excluded) records membership alone: without feed
+// and last_activity, the keys of both GSIs, it stays out of them, so creating
+// it writes the base table only, where the sort key is a chat ID and a busy
+// member's rows spread across the partition rather than all landing at the
+// newest end of one index key.
+func (s *store) dmInboxItem(c *chat.Chat, member *commonpb.UserId, excluded bool) map[string]types.AttributeValue {
 	item := map[string]types.AttributeValue{
-		attrPK:           avS(userPK(member)),
-		attrSK:           avS(chatSK(c.ID)),
-		attrType:         avN(uint64(c.Type)),
-		attrFeed:         avS(feedPK(member, c.Type)),
-		attrMembers:      membersAttr(c.Members),
-		attrLastActivity: avN(uint64(c.LastActivity.UnixNano())),
+		attrPK:      avS(userPK(member)),
+		attrSK:      avS(chatSK(c.ID)),
+		attrType:    avN(uint64(c.Type)),
+		attrMembers: membersAttr(c.Members),
 	}
+	if excluded {
+		return item
+	}
+	item[attrFeed] = avS(feedPK(member, c.Type))
+	item[attrLastActivity] = avN(uint64(c.LastActivity.UnixNano()))
 	if c.LastMessageID != nil {
 		item[attrLastMessageID] = avN(c.LastMessageID.Value)
 	}
@@ -1796,6 +1828,16 @@ func avS(v string) types.AttributeValue { return &types.AttributeValueMemberS{Va
 func avB(v []byte) types.AttributeValue {
 	return &types.AttributeValueMemberB{Value: append([]byte(nil), v...)}
 }
+
+// avBS encodes user IDs as a binary set. userIDs must be non-empty and
+// distinct: DynamoDB rejects an empty set and one naming a value twice.
+func avBS(userIDs []*commonpb.UserId) types.AttributeValue {
+	values := make([][]byte, len(userIDs))
+	for i, userID := range userIDs {
+		values[i] = append([]byte(nil), userID.Value...)
+	}
+	return &types.AttributeValueMemberBS{Value: values}
+}
 func avN(v uint64) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.FormatUint(v, 10)}
 }
@@ -1829,6 +1871,13 @@ func asBool(av types.AttributeValue) bool {
 func asB(av types.AttributeValue) []byte {
 	if b, ok := av.(*types.AttributeValueMemberB); ok {
 		return b.Value
+	}
+	return nil
+}
+
+func asBS(av types.AttributeValue) [][]byte {
+	if bs, ok := av.(*types.AttributeValueMemberBS); ok {
+		return bs.Value
 	}
 	return nil
 }

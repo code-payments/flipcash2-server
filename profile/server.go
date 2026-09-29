@@ -218,7 +218,6 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 	}
 	if err != nil {
 		if errors.Is(err, ErrInvalidDisplayName) {
-			log.Info("Invalid display name")
 			return nil, status.Error(codes.InvalidArgument, "invalid display name")
 		}
 

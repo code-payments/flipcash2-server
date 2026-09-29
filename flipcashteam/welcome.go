@@ -100,7 +100,7 @@ func (w *Welcomer) OnFirstUsername(ctx context.Context, userID *commonpb.UserId,
 func welcomeV1Messages(username string) []*messagingpb.Content {
 	lines := []string{
 		"Welcome to Flipcash!",
-		fmt.Sprintf("To connect with people tell them your Flipcash username is %s", username),
+		fmt.Sprintf("Tell people your Flipcash username is %s to connect with you", username),
 		fmt.Sprintf("https://flipcash.com/%s", username),
 		"Flipcash is the only chat app where people have to send you cash before they can message you, so you can say goodbye to spam",
 		"Happy chatting!",

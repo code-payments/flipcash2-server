@@ -131,6 +131,13 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 		return &profilepb.SetDisplayNameResponse{Result: profilepb.SetDisplayNameResponse_DENIED}, nil
 	}
 
+	// A name of nothing but whitespace would show as blank, so it is refused
+	// before moderating: request validation only requires a character, and a
+	// classifier has nothing to judge in one of these.
+	if strings.TrimSpace(req.DisplayName) == "" {
+		return &profilepb.SetDisplayNameResponse{Result: profilepb.SetDisplayNameResponse_INVALID_DISPLAY_NAME}, nil
+	}
+
 	if s.moderator != nil {
 		// Moderate before persisting, so a flagged name is never briefly visible to
 		// anyone reading the profile. Both classifiers run: the general text
@@ -174,7 +181,34 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 		}
 	}
 
-	if err := s.profiles.SetDisplayName(ctx, userID, req.DisplayName); err != nil {
+	// The caller's handle is read up front. A handle is never released without
+	// another taking its place, so a user seen holding one here still holds one
+	// after the write: they skip the default username path, and the handle read is
+	// the one the response reports.
+	var username *commonpb.Username
+	userProfile, err := s.profiles.GetProfile(ctx, userID, false)
+	switch {
+	case err == nil:
+		username = userProfile.Username
+	case errors.Is(err, ErrNotFound):
+	default:
+		log.Warn("Failed to get profile", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to get profile")
+	}
+
+	// A display name that can be spelled as a handle also earns the user a default
+	// one, if they hold none. It needs no moderation of its
+	// own: it is the display name just moderated above, set off by a number, and
+	// it skips the balance gate on claiming a handle by design.
+	var defaultUsername DefaultUsernameResult
+	usernameBase, eligibleForDefaultUsername := DefaultUsernameBase(req.DisplayName)
+	eligibleForDefaultUsername = eligibleForDefaultUsername && username == nil
+	if eligibleForDefaultUsername {
+		defaultUsername, err = s.profiles.SetDisplayNameWithDefaultUsername(ctx, userID, req.DisplayName, usernameBase)
+	} else {
+		err = s.profiles.SetDisplayName(ctx, userID, req.DisplayName)
+	}
+	if err != nil {
 		if errors.Is(err, ErrInvalidDisplayName) {
 			log.Info("Invalid display name")
 			return nil, status.Error(codes.InvalidArgument, "invalid display name")
@@ -184,7 +218,37 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 		return nil, status.Error(codes.Internal, "failed to set display name")
 	}
 
-	return &profilepb.SetDisplayNameResponse{}, nil
+	switch {
+	case defaultUsername.Username != "":
+		log.Info("Assigned default username", zap.String("username", defaultUsername.Username))
+		username = &commonpb.Username{Value: defaultUsername.Username}
+	case defaultUsername.NoneAvailable:
+		// The user is left without a handle until a later display name finds one.
+		// This only happens once a name's low numbers are all held and its cuts for
+		// the random fallback are reserved words, or every number tried was lost to
+		// concurrent assignments, so it is worth knowing about when it does.
+		log.Warn("No default username available", zap.String("username_base", usernameBase))
+	case eligibleForDefaultUsername:
+		// Neither assigned nor none available: the store found the user already
+		// holding a handle, one a concurrent write gave them after the read above.
+		// Only then is the handle read again, so the response still reports it. A
+		// failed read fails the call even though the name is set; a retry is safe,
+		// since the name is the same and the handle is not assigned again.
+		userProfile, err := s.profiles.GetProfile(ctx, userID, false)
+		if err != nil {
+			log.Warn("Failed to get profile after setting display name", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to get profile")
+		}
+		username = userProfile.Username
+	}
+
+	// The response carries the caller's handle as it stands now, whether just
+	// assigned, held from before, or none, so a client never has to guess whether
+	// this call gave them one.
+	return &profilepb.SetDisplayNameResponse{
+		Result:   profilepb.SetDisplayNameResponse_OK,
+		Username: username,
+	}, nil
 }
 
 func (s *Server) SetUsername(ctx context.Context, req *profilepb.SetUsernameRequest) (*profilepb.SetUsernameResponse, error) {

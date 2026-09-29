@@ -2,11 +2,13 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/georgysavva/scany/v2/pgxscan"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -120,12 +122,111 @@ func dbGetPublicProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 	return userProfile, nil
 }
 
+const setDisplayNameQuery = `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, $2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "displayName" = $2 WHERE ` + usersTableName + `."id" = $1`
+
 func dbSetDisplayName(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, displayName string) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, $2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "displayName" = $2 WHERE ` + usersTableName + `."id" = $1`
-		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), displayName)
+		_, err := tx.Exec(ctx, setDisplayNameQuery, pg.Encode(userID.Value), displayName)
 		return err
 	})
+}
+
+// claimDefaultUsernameQuery gives a user a default handle, but only while they
+// are still eligible for one: they hold no handle. A user the
+// table does not know yet is inserted with the handle and nothing else. The
+// condition is evaluated against the row as last committed, so it is what
+// decides eligibility, not the unlocked read ahead of it.
+const claimDefaultUsernameQuery = `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, $2, NULL, NULL, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "username" = $2 WHERE ` + usersTableName + `."username" IS NULL`
+
+func dbSetDisplayNameWithDefaultUsername(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, displayName, usernameBase string) (profile.DefaultUsernameResult, error) {
+	var result profile.DefaultUsernameResult
+	err := pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
+		encodedID := pg.Encode(userID.Value)
+
+		// An unlocked read only spares the search for a user who already holds a
+		// handle, which is final: a handle is never released without another taking
+		// its place. One who looks eligible is decided by the claim's own
+		// condition, so a concurrent handle for the same user wins over this
+		// assignment.
+		var existing *string
+		query := `SELECT "username" FROM ` + usersTableName + ` WHERE "id" = $1`
+		if err := pgxscan.Get(ctx, tx, &existing, query, encodedID); err != nil && !pgxscan.NotFound(err) {
+			return err
+		}
+
+		if existing == nil {
+			held := func(ctx context.Context, usernames []string) (map[string]struct{}, error) {
+				return dbGetHeldUsernames(ctx, tx, usernames)
+			}
+
+			// Each claim runs in a savepoint so that losing the handle to another
+			// user rolls back the claim alone, not the transaction. Under read
+			// committed, the search that follows sees the winner's handle and moves
+			// past it.
+			claim := func(ctx context.Context, username string) (bool, error) {
+				savepoint, err := tx.Begin(ctx)
+				if err != nil {
+					return false, err
+				}
+				tag, err := savepoint.Exec(ctx, claimDefaultUsernameQuery, encodedID, username)
+				if err != nil {
+					// A savepoint that cannot be rolled back leaves the transaction
+					// aborted, so the search must not go on: the joined error never
+					// matches ErrUsernameTaken, which ends it.
+					if rollbackErr := savepoint.Rollback(ctx); rollbackErr != nil {
+						return false, errors.Join(err, rollbackErr)
+					}
+					if isUniqueViolation(err) {
+						return false, profile.ErrUsernameTaken
+					}
+					return false, err
+				}
+				if err := savepoint.Commit(ctx); err != nil {
+					return false, err
+				}
+				return tag.RowsAffected() > 0, nil
+			}
+
+			username, err := profile.AssignDefaultUsername(ctx, usernameBase, held, claim)
+			if errors.Is(err, profile.ErrNoDefaultUsername) {
+				result.NoneAvailable = true
+			} else if err != nil {
+				return err
+			}
+			result.Username = username
+		}
+
+		// The claim may have inserted the user's row, which the display name then
+		// updates.
+		_, err := tx.Exec(ctx, setDisplayNameQuery, encodedID, displayName)
+		return err
+	})
+	if err != nil {
+		return profile.DefaultUsernameResult{}, err
+	}
+	return result, nil
+}
+
+// dbGetHeldUsernames is a profile.HeldUsernamesFunc over the users table. Every
+// handle is matched exactly, so each one is a probe of the unique index on
+// "username".
+func dbGetHeldUsernames(ctx context.Context, tx pgx.Tx, usernames []string) (map[string]struct{}, error) {
+	var held []string
+	query := `SELECT "username" FROM ` + usersTableName + ` WHERE "username" = ANY($1::text[])`
+	if err := pgxscan.Select(ctx, tx, &held, query, usernames); err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]struct{}, len(held))
+	for _, username := range held {
+		result[username] = struct{}{}
+	}
+	return result, nil
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" // unique_violation
 }
 
 func dbSetUsername(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, username string) error {

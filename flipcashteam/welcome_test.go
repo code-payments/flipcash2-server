@@ -24,7 +24,7 @@ func TestSendWelcomeV1(t *testing.T) {
 
 	expected := []string{
 		"Welcome to Flipcash!",
-		"To connect with people tell them your Flipcash username is alice_1",
+		"Tell people your Flipcash username is alice_1 to connect with you",
 		"https://flipcash.com/alice_1",
 		"Flipcash is the only chat app where people have to send you cash before they can message you, so you can say goodbye to spam",
 		"Happy chatting!",

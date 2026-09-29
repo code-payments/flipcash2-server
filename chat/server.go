@@ -161,7 +161,8 @@ type Server struct {
 	profiles  ProfileReader
 
 	// teamUserID is the Flipcash team account (see flipcashteam), whose DMs are
-	// never end-to-end encrypted (see useE2ee). Nil when there is none.
+	// never end-to-end encrypted (see useE2ee) and are shown with a Never
+	// speaker rule (see teamDmRules). Nil when there is none.
 	teamUserID *commonpb.UserId
 
 	rules  *RuleEvaluator
@@ -657,6 +658,9 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		}
 		if IsDmChatType(c.Type) {
 			md.UseE2Ee = useE2ee(c, staffByUserId, s.teamUserID)
+			if hasTeamMember(c, s.teamUserID) {
+				md.Rules = teamDmRules()
+			}
 		}
 		if c.PictureBlobID != nil {
 			// ToProto seeds the picture with its stored ORIGINAL; swap in the full
@@ -715,6 +719,28 @@ func assignPointers(members []*chatpb.Member, pointers []*messagingpb.Pointer) {
 	}
 	for _, m := range members {
 		m.Pointers = byUser[string(m.UserId.Value)]
+	}
+}
+
+// hasTeamMember reports whether the Flipcash team account is one of the DM's
+// members. teamUserID is nil when there is no team account.
+func hasTeamMember(c *Chat, teamUserID *commonpb.UserId) bool {
+	return teamUserID != nil && c.HasMember(teamUserID)
+}
+
+// teamDmRules are the rules a DM with the Flipcash team account is shown with:
+// a Never speaker rule, since nobody sends in one. The messaging server
+// refuses every send there (see messaging.WithTeamAccount); this is how a
+// client learns it before trying, so it can leave the composer out. The rule
+// is not stored: a DM's record carries no rules (see Chat.Rules), and the
+// team is known only from the ID the server was built with, so it is decided
+// per read, like use_e2ee. The team itself writes through the messaging
+// Sender, which no rule gates.
+func teamDmRules() *chatpb.Rules {
+	return &chatpb.Rules{
+		Speaker: []*chatpb.SpeakerRules{{
+			Kind: &chatpb.SpeakerRules_Never{Never: &chatpb.Never{}},
+		}},
 	}
 }
 

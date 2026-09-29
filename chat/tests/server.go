@@ -58,6 +58,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_Dm_NoCreator,
 		testServer_GetChat_Dm_UseE2ee,
 		testServer_GetChat_Dm_UseE2ee_TeamAccount,
+		testServer_GetChat_Dm_TeamAccount_NeverSpeak,
 		testServer_GetChat_HiddenWhenPeerBlocked,
 		testServer_GetChat_Group_Hydrates,
 		testServer_GetChat_Group_Picture,
@@ -1296,6 +1297,42 @@ func testServer_GetChat_Dm_UseE2ee_TeamAccount(t *testing.T, s chat.Store) {
 	require.Len(t, feed.Chats, 1)
 	require.Equal(t, chatID.Value, feed.Chats[0].ChatId.Value)
 	require.False(t, feed.Chats[0].UseE2Ee)
+}
+
+func testServer_GetChat_Dm_TeamAccount_NeverSpeak(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// A DM with the Flipcash team account is shown with a Never speaker rule,
+	// whatever its type and whichever read serves it; any other DM carries no
+	// rules.
+	neverSpeak := &chatpb.Rules{
+		Speaker: []*chatpb.SpeakerRules{{
+			Kind: &chatpb.SpeakerRules_Never{Never: &chatpb.Never{}},
+		}},
+	}
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_TIP_DM} {
+		teamChatID := e.putDMWithPeer(chatType, e.teamUserID, at(2))
+		otherChatID := e.putDMWithPeer(chatType, model.MustGenerateUserID(), at(1))
+
+		resp := e.getChat(e.keys, teamChatID)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+		require.True(t, proto.Equal(neverSpeak, resp.Metadata.Rules), "%s", chatType)
+
+		resp = e.getChat(e.keys, otherChatID)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+		require.Nil(t, resp.Metadata.Rules, "%s", chatType)
+
+		feed, err := e.getDmFeedOfType(chatType, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Len(t, feed.Chats, 2)
+		for _, md := range feed.Chats {
+			if bytes.Equal(md.ChatId.Value, teamChatID.Value) {
+				require.True(t, proto.Equal(neverSpeak, md.Rules), "%s", chatType)
+			} else {
+				require.Nil(t, md.Rules, "%s", chatType)
+			}
+		}
+	}
 }
 
 func testServer_GetChat_Dm_UseE2ee(t *testing.T, s chat.Store) {

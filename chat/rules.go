@@ -33,6 +33,9 @@ import (
 // class — which no group carries yet. The rules are listed cheapest to evaluate
 // first, since an evaluator stops at the first one a user fails: a staff check
 // is a flag read, a balance check a valuation.
+//
+// A DM's record carries none, but a read of a DM with the Flipcash team
+// account is shown a Never speaker rule, added per read (see teamDmRules).
 func (c *Chat) Rules() *chatpb.Rules {
 	if c.Type != chatpb.ChatType_GROUP {
 		return nil
@@ -257,6 +260,12 @@ func (e *RuleEvaluator) satisfies(ctx context.Context, kind any, userID *commonp
 		return e.satisfiesMinimumBalance(ctx, k.MinimumBalance, userID)
 	case *chatpb.SpeakerRules_MinimumBalance:
 		return e.satisfiesMinimumBalance(ctx, k.MinimumBalance, userID)
+	case *chatpb.SpeakerRules_Never:
+		// No one satisfies it. Only a DM with the Flipcash team account is
+		// shown one, and never from its record (see teamDmRules), so nothing
+		// stored reaches here today; it is answered so that the rule a client
+		// is shown is one the evaluator can evaluate.
+		return false, nil
 	default:
 		return false, fmt.Errorf("unsupported chat rule %T", k)
 	}

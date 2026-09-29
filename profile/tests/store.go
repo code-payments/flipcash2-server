@@ -2,6 +2,8 @@ package tests
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +33,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testTipCardColor,
 		testMinDmChatInitFeeStore,
 		testUsername,
+		testDefaultUsernameStore,
 		testJoinTs,
 	} {
 		tf(t, s)
@@ -543,6 +546,122 @@ func testUsername(t *testing.T, s profile.Store) {
 	for _, publicProfile := range publicProfiles {
 		require.NoError(t, publicProfile.Validate())
 	}
+}
+
+func testDefaultUsernameStore(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	username := func(userID *commonpb.UserId) string {
+		t.Helper()
+		p, err := s.GetProfile(ctx, userID, false)
+		require.NoError(t, err)
+		return p.GetUsername().GetValue()
+	}
+
+	setName := func(userID *commonpb.UserId, displayName, base string) string {
+		t.Helper()
+		result, err := s.SetDisplayNameWithDefaultUsername(ctx, userID, displayName, base)
+		require.NoError(t, err)
+		require.False(t, result.NoneAvailable)
+		p, err := s.GetProfile(ctx, userID, false)
+		require.NoError(t, err)
+		require.Equal(t, displayName, p.DisplayName)
+		require.Equal(t, result.Username, p.GetUsername().GetValue())
+		return result.Username
+	}
+
+	// The bare handle is never assigned, whether or not anyone holds it, and each
+	// user after the first gets the next number.
+	user1 := model.MustGenerateUserID()
+	user2 := model.MustGenerateUserID()
+	user3 := model.MustGenerateUserID()
+	require.Equal(t, "jeff_yanta_2", setName(user1, "Jeff Yanta", "jeff_yanta"))
+	require.Equal(t, "jeff_yanta_3", setName(user2, "Jeff Yanta", "jeff_yanta"))
+	require.Equal(t, "jeff_yanta_4", setName(user3, "Jeff Yanta", "jeff_yanta"))
+	_, err := s.GetUserIdByUsername(ctx, "jeff_yanta")
+	require.ErrorIs(t, err, profile.ErrNotFound)
+
+	// Only a user without a handle earns one: a rename changes the display name
+	// and leaves the handle alone.
+	result, err := s.SetDisplayNameWithDefaultUsername(ctx, user1, "Someone Else", "someone_else")
+	require.NoError(t, err)
+	require.Equal(t, profile.DefaultUsernameResult{}, result)
+	require.Equal(t, "jeff_yanta_2", username(user1))
+
+	// A number freed by its holder changing handle is the next one handed out,
+	// ahead of any higher one.
+	require.NoError(t, s.SetUsername(ctx, user2, "renamed"))
+	user4 := model.MustGenerateUserID()
+	require.Equal(t, "jeff_yanta_3", setName(user4, "Jeff Yanta", "jeff_yanta"))
+	user5 := model.MustGenerateUserID()
+	require.Equal(t, "jeff_yanta_5", setName(user5, "Jeff Yanta", "jeff_yanta"))
+
+	// A user who already holds a handle keeps it.
+	claimed := model.MustGenerateUserID()
+	require.NoError(t, s.SetUsername(ctx, claimed, "claimed"))
+	result, err = s.SetDisplayNameWithDefaultUsername(ctx, claimed, "Jeff Yanta", "jeff_yanta")
+	require.NoError(t, err)
+	require.Equal(t, profile.DefaultUsernameResult{}, result)
+	require.Equal(t, "claimed", username(claimed))
+
+	// A user whose display name was set before, without a handle, still earns one.
+	named := model.MustGenerateUserID()
+	require.NoError(t, s.SetDisplayName(ctx, named, "Earlier Name"))
+	require.Equal(t, "jeff_yanta_6", setName(named, "Jeff Yanta", "jeff_yanta"))
+
+	// A long name is cut to fit.
+	long := model.MustGenerateUserID()
+	require.Equal(t, "christopher_j_2", setName(long, "Christopher Johnson", "christopher_johnson"))
+
+	// A name whose low numbers are all held, and whose cuts for four- and
+	// five-digit numbers are reserved words ("developers", "developer"), has no
+	// handle left to give. For numbers of three digits or more the cut is already
+	// "developers", so 2 through 99 are all it ever had. The display name is still
+	// set, and the result says the user was left without a handle.
+	for n := 2; n < 100; n++ {
+		require.NoError(t, s.SetUsername(ctx, model.MustGenerateUserID(), fmt.Sprintf("developers_x_%d", n)))
+	}
+	saturated := model.MustGenerateUserID()
+	result, err = s.SetDisplayNameWithDefaultUsername(ctx, saturated, "Developers X", "developers_x")
+	require.NoError(t, err)
+	require.Equal(t, profile.DefaultUsernameResult{NoneAvailable: true}, result)
+	p, err := s.GetProfile(ctx, saturated, false)
+	require.NoError(t, err)
+	require.Equal(t, "Developers X", p.DisplayName)
+	require.Nil(t, p.Username)
+
+	// Users taking the same name at once each get a distinct handle. A user who
+	// loses a race retries on one of the lowest few free numbers rather than the
+	// lowest, so the numbers need not be contiguous, but with so few racers nobody
+	// loses often enough to leave the low numbers for the random fallback.
+	const concurrent = 4
+	var wg sync.WaitGroup
+	results := make([]string, concurrent)
+	errs := make([]error, concurrent)
+	for i := range concurrent {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var result profile.DefaultUsernameResult
+			result, errs[i] = s.SetDisplayNameWithDefaultUsername(ctx, model.MustGenerateUserID(), "Race", "race")
+			results[i] = result.Username
+		}()
+	}
+	wg.Wait()
+
+	seen := make(map[string]struct{}, concurrent)
+	for i := range concurrent {
+		require.NoError(t, errs[i])
+
+		var n int
+		_, err := fmt.Sscanf(results[i], "race_%d", &n)
+		require.NoError(t, err, "username: %q", results[i])
+		require.GreaterOrEqual(t, n, 2)
+		require.LessOrEqual(t, n, 101) // the first batch of low numbers
+
+		seen[results[i]] = struct{}{}
+	}
+	require.Len(t, seen, concurrent)
 }
 
 func testGetPublicProfiles(t *testing.T, s profile.Store) {

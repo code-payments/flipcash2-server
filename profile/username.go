@@ -1,14 +1,22 @@
 package profile
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand/v2"
 	"regexp"
+	"strconv"
 	"strings"
 )
+
+// maxUsernameLength is the longest handle a user may hold.
+const maxUsernameLength = 15
 
 // usernamePattern is the set of handles a user may hold, mirroring what
 // profile.v1.Username enforces on the wire: X's character set, minus upper
 // case, so a handle has exactly one spelling.
-var usernamePattern = regexp.MustCompile(`^[a-z0-9_]{2,15}$`)
+var usernamePattern = regexp.MustCompile(fmt.Sprintf(`^[a-z0-9_]{2,%d}$`, maxUsernameLength))
 
 // NormalizeUsername puts a handle into the canonical form it is stored and
 // compared in, so a lookup finds its holder regardless of the casing it was
@@ -258,4 +266,358 @@ func IsUsernameReserved(username string) bool {
 	}
 
 	return false
+}
+
+// A user who sets a display name while holding no handle is given one derived
+// from it, so that everyone is addressable from the start without having to
+// claim a handle (which is balance-gated). Any display name counts, not only the
+// first: a user whose earlier name could not be spelled as a handle, or found no
+// number free, gets one from the next name that can, and a user who predates
+// default handles gets one on their next rename. The default handle is the display
+// name lowercased with spaces as underscores, always followed by a number from 2
+// up: the bare handle is the valuable one, and stays free for whoever claims it
+// through SetUsername. The number is the lowest one nobody holds at the time of
+// assignment, so a number freed when its holder changes handle is handed out
+// again before any higher one. Only contention bends that: an assignment that
+// loses its number to a concurrent one of the same name retries on a random one
+// of the lowest few free numbers, and failing those on a random number of four or
+// five digits (see AssignDefaultUsername). The lowest-number search stops at
+// maxLowDefaultUsernameNumber, so a name held that many times over is only ever
+// given random numbers above it.
+
+// ErrNoDefaultUsername is returned when an assignment claims no handle: every
+// candidate it is allowed to consider is held, unusable, or lost to another
+// holder while it tried.
+var ErrNoDefaultUsername = errors.New("no default username available")
+
+// defaultUsernameDisplayNamePattern is the set of display names a default handle
+// is derived from. Anything else (punctuation, emoji, letters outside ASCII) has
+// no faithful spelling as a handle, so such a user gets none.
+var defaultUsernameDisplayNamePattern = regexp.MustCompile(`^[A-Za-z0-9 ]+$`)
+
+// maxLowDefaultUsernameNumber is the highest number the lowest-number search
+// considers. Past it, finding the lowest free number would take lookups large
+// enough for Postgres to stop answering them from the index, so numbers above it
+// are only handed out at random.
+const maxLowDefaultUsernameNumber = 1_000
+
+// minDefaultUsernameNumber is the lowest number a default handle carries, leaving
+// the bare handle to whoever claims it.
+const minDefaultUsernameNumber = 2
+
+// firstDefaultUsernameBatchSize is how many numbers the lowest-number search's
+// first lookup covers. Almost every base resolves in it.
+const firstDefaultUsernameBatchSize = 100
+
+// defaultUsernameBatchSizes is how many numbers each successive lookup covers,
+// together exactly minDefaultUsernameNumber through maxLowDefaultUsernameNumber:
+// the first batch, then the rest in one more lookup.
+var defaultUsernameBatchSizes = []int{
+	firstDefaultUsernameBatchSize,
+	maxLowDefaultUsernameNumber - minDefaultUsernameNumber + 1 - firstDefaultUsernameBatchSize,
+}
+
+// maxLowestDefaultUsernameAttempts bounds how many times an assignment searches
+// the low numbers, its first attempt included, before falling back to a random
+// number. Each loss means another user committed the handle it wanted, so only
+// that many users taking the same name at the same moment exhausts it.
+const maxLowestDefaultUsernameAttempts = 5
+
+// defaultUsernameRetrySpread is how many of the lowest free numbers a retry picks
+// among. Assignments that just collided are likely to be retrying together, and
+// would each find the same lowest number again; spreading them over a few keeps
+// the next round from being the same race, at the cost of a number a little
+// above the lowest for whoever was contended.
+const defaultUsernameRetrySpread = 10
+
+// maxRandomDefaultUsernameAttempts bounds how many random numbers are tried once
+// the lowest free number cannot be had. With 98,999 numbers to draw from, a draw
+// collides with a held handle only for a name that has nearly used them up.
+const maxRandomDefaultUsernameAttempts = 5
+
+// minRandomDefaultUsernameNumber and maxRandomDefaultUsernameNumber bound the
+// numbers the random fallback draws: everything above what the lowest-number
+// search covers, so a draw never lands on a number it just found held, up to five
+// digits, which leaves the stem at least nine characters.
+const (
+	minRandomDefaultUsernameNumber = maxLowDefaultUsernameNumber + 1
+	maxRandomDefaultUsernameNumber = 99_999
+)
+
+// HeldUsernamesFunc reports which of the given canonical handles currently have a
+// holder. Handles nobody holds are absent from the returned set.
+type HeldUsernamesFunc func(ctx context.Context, usernames []string) (map[string]struct{}, error)
+
+// ClaimUsernameFunc gives the user being assigned a handle the given one. It
+// returns ErrUsernameTaken when another user holds it, which AssignDefaultUsername
+// answers by trying another number, and false when the user turned out to be no
+// longer eligible for one (a concurrent write gave them a handle first), in which
+// case nothing was claimed.
+type ClaimUsernameFunc func(ctx context.Context, username string) (bool, error)
+
+// AssignDefaultUsername claims a default handle for base and returns it, or ""
+// when claim reported the user is no longer eligible for one.
+//
+// Its first attempt claims the lowest free number. Each time a concurrent
+// assignment takes a number first it searches again, and claims one picked at
+// random from the lowest defaultUsernameRetrySpread free numbers rather than the
+// lowest, so racing assignments of the same name drift apart instead of meeting
+// again. If it loses maxLowestDefaultUsernameAttempts times, or every number the
+// search considers is held, it falls back to claiming random numbers from
+// minRandomDefaultUsernameNumber to maxRandomDefaultUsernameNumber — drawn only
+// from the digit counts whose cut of base leaves a usable stem, so that no draw is
+// wasted on a number that could never be a handle.
+//
+// ErrNoDefaultUsername is returned when no handle could be claimed: no number
+// considered yields a usable handle, or every one tried was lost to another
+// holder. Either way the caller leaves the user without a handle rather than
+// failing, since a contended name has all but run out of numbers anyway.
+func AssignDefaultUsername(ctx context.Context, base string, held HeldUsernamesFunc, claim ClaimUsernameFunc) (string, error) {
+	return assignDefaultUsername(ctx, base, held, claim, rand.IntN)
+}
+
+// assignDefaultUsername is AssignDefaultUsername with its source of randomness,
+// which returns a number in [0, n), passed in.
+func assignDefaultUsername(ctx context.Context, base string, held HeldUsernamesFunc, claim ClaimUsernameFunc, randomIntN func(n int) int) (string, error) {
+	// try claims username, reporting whether the attempt is over (claimed, or
+	// failed for a reason another number cannot fix).
+	var claimed string
+	try := func(username string) (bool, error) {
+		ok, err := claim(ctx, username)
+		if errors.Is(err, ErrUsernameTaken) {
+			return false, nil
+		} else if err != nil {
+			return true, err
+		}
+		if ok {
+			claimed = username
+		}
+		return true, nil
+	}
+
+	for attempt := range maxLowestDefaultUsernameAttempts {
+		free, err := findFreeDefaultUsernames(ctx, base, held, defaultUsernameRetrySpread)
+		if errors.Is(err, ErrNoDefaultUsername) {
+			break
+		} else if err != nil {
+			return "", err
+		}
+
+		// An uncontended assignment always gets the lowest number; only one that
+		// has already lost a race is spread.
+		username := free[0]
+		if attempt > 0 {
+			username = free[randomIntN(len(free))]
+		}
+
+		done, err := try(username)
+		if done {
+			return claimed, err
+		}
+	}
+
+	// Uniform over the usable ranges. A draw needs to be hard to collide with, not
+	// hard to predict: a handle is public anyway. When no range is usable there is
+	// nothing to draw, and the assignment ends here.
+	ranges := randomDefaultUsernameRanges(base)
+	var total int
+	for _, r := range ranges {
+		total += r.size()
+	}
+	for range maxRandomDefaultUsernameAttempts {
+		if total == 0 {
+			break
+		}
+
+		// A usable stem makes nearly every number in its range usable, but a stem
+		// of digits can still spell a reserved word together with the number
+		// ("5" and 4135 read as "sales"), which is skipped like a collision would
+		// not be: it contends with nobody.
+		username, ok := defaultUsernameCandidate(base, nthNumber(ranges, randomIntN(total)))
+		if !ok {
+			continue
+		}
+
+		done, err := try(username)
+		if done {
+			return claimed, err
+		}
+	}
+
+	return "", ErrNoDefaultUsername
+}
+
+// DefaultUsernameBase returns the stem default handles for displayName are built
+// from, or false when displayName is not eligible for one: it must contain only
+// ASCII letters, digits and spaces, and must not name a reserved word.
+//
+// Leading and trailing spaces are dropped, and each run of spaces in between
+// becomes a single underscore, so "Jeff  Yanta" cannot mint a handle that
+// differs from "Jeff Yanta"'s by an extra underscore.
+func DefaultUsernameBase(displayName string) (string, bool) {
+	if !defaultUsernameDisplayNamePattern.MatchString(displayName) {
+		return "", false
+	}
+
+	words := strings.Fields(strings.ToLower(displayName))
+	if len(words) == 0 {
+		return "", false
+	}
+
+	base := strings.Join(words, "_")
+	if IsUsernameReserved(base) {
+		return "", false
+	}
+	return base, true
+}
+
+// defaultUsernameCandidate returns the handle numbered n (n >= 2) for base, or
+// false when that number has no usable handle: its stem is unusable (see
+// defaultUsernameStem), or the handle as a whole spells a reserved word.
+func defaultUsernameCandidate(base string, n int) (string, bool) {
+	number := strconv.Itoa(n)
+
+	stem, ok := defaultUsernameStem(base, len(number))
+	if !ok {
+		return "", false
+	}
+	return defaultUsernameCandidateWithStem(stem, number)
+}
+
+// defaultUsernameCandidateWithStem is defaultUsernameCandidate for a number whose
+// usable stem is already known. The handle as a whole is still checked, since the
+// number can complete a reserved word the stem alone does not spell.
+func defaultUsernameCandidateWithStem(stem, number string) (string, bool) {
+	candidate := stem + "_" + number
+	if ValidateUsername(candidate) != nil || IsUsernameReserved(candidate) {
+		return "", false
+	}
+	return candidate, true
+}
+
+// defaultUsernameStem returns the part of base a handle keeps ahead of a number
+// with the given count of digits, or false when that leaves nothing usable.
+//
+// The stem is cut so the whole handle fits maxUsernameLength, which makes it a
+// function of the digit count alone: "christopher_johnson" gives
+// "christopher_j_2" but "christopher_10". An underscore left dangling by the cut
+// is dropped, so the number is always set off by exactly one. A cut can also
+// leave a stem that is reserved where the whole base was not ("developers_x" cut
+// to "developers"), which makes every number of that length unusable.
+func defaultUsernameStem(base string, digits int) (string, bool) {
+	stem := base
+	if maxStem := maxUsernameLength - 1 - digits; len(stem) > maxStem {
+		stem = stem[:max(maxStem, 0)]
+	}
+	stem = strings.TrimRight(stem, "_")
+	if stem == "" || IsUsernameReserved(stem) {
+		return "", false
+	}
+	return stem, true
+}
+
+// numberRange is the inclusive range of numbers [lo, hi].
+type numberRange struct {
+	lo, hi int
+}
+
+func (r numberRange) size() int {
+	return r.hi - r.lo + 1
+}
+
+// randomDefaultUsernameRanges returns the parts of the random fallback's range
+// whose numbers leave base a usable stem. The stem depends only on how many
+// digits a number has, so the range is split by digit count and each part kept
+// or dropped whole.
+func randomDefaultUsernameRanges(base string) []numberRange {
+	var ranges []numberRange
+	lo := minRandomDefaultUsernameNumber
+
+	// Each power of ten bounds the numbers with one digit more than the last.
+	for bound := 10; lo <= maxRandomDefaultUsernameNumber; bound *= 10 {
+		if lo >= bound {
+			continue
+		}
+		hi := min(bound-1, maxRandomDefaultUsernameNumber)
+
+		if _, ok := defaultUsernameStem(base, len(strconv.Itoa(lo))); ok {
+			ranges = append(ranges, numberRange{lo: lo, hi: hi})
+		}
+		lo = hi + 1
+	}
+	return ranges
+}
+
+// nthNumber returns the i'th number (from 0) across ranges taken in order.
+func nthNumber(ranges []numberRange, i int) int {
+	for _, r := range ranges {
+		if i < r.size() {
+			return r.lo + i
+		}
+		i -= r.size()
+	}
+	panic("index outside ranges")
+}
+
+// findFreeDefaultUsernames returns up to limit of the lowest-numbered default
+// handles for base that held reports nobody holds, in ascending order of their
+// number, or ErrNoDefaultUsername when there is none within the numbers it
+// considers. They all come from the first batch with any free, so a search that
+// finds the lowest costs no more lookups for the rest.
+//
+// The answer is only as fresh as held's view: another user can take a handle
+// before the caller writes it, which the unique constraint on the handle catches
+// and the caller answers by searching again.
+func findFreeDefaultUsernames(ctx context.Context, base string, held HeldUsernamesFunc, limit int) ([]string, error) {
+	// The stem depends only on a number's digit count, so it is worked out once
+	// per count the search meets rather than once per number.
+	type stemResult struct {
+		stem string
+		ok   bool
+	}
+	stems := make(map[int]stemResult, 4)
+
+	n := minDefaultUsernameNumber
+	for _, batchSize := range defaultUsernameBatchSizes {
+		candidates := make([]string, 0, batchSize)
+		for end := n + batchSize; n < end; n++ {
+			number := strconv.Itoa(n)
+
+			stem, known := stems[len(number)]
+			if !known {
+				stem.stem, stem.ok = defaultUsernameStem(base, len(number))
+				stems[len(number)] = stem
+			}
+			if !stem.ok {
+				continue
+			}
+
+			if candidate, ok := defaultUsernameCandidateWithStem(stem.stem, number); ok {
+				candidates = append(candidates, candidate)
+			}
+		}
+		if len(candidates) == 0 {
+			continue
+		}
+
+		taken, err := held(ctx, candidates)
+		if err != nil {
+			return nil, err
+		}
+
+		var free []string
+		for _, candidate := range candidates {
+			if _, ok := taken[candidate]; ok {
+				continue
+			}
+			free = append(free, candidate)
+			if len(free) == limit {
+				break
+			}
+		}
+		if len(free) > 0 {
+			return free, nil
+		}
+	}
+	return nil, ErrNoDefaultUsername
 }

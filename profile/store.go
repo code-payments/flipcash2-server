@@ -24,6 +24,20 @@ type PhoneForPayment struct {
 	JoinedAt    time.Time
 }
 
+// DefaultUsernameResult is what SetDisplayNameWithDefaultUsername did about the
+// user's handle.
+type DefaultUsernameResult struct {
+	// Username is the handle assigned, or "" when none was.
+	Username string
+
+	// NoneAvailable is set when the user was eligible for a handle — they held
+	// none — but no number yielded one both free and usable, or every one tried
+	// was lost to a concurrent assignment, so they were left without. It is the one
+	// outcome that leaves an eligible user with no handle. The display name is set
+	// regardless, and the user stays eligible, so a later display name tries again.
+	NoneAvailable bool
+}
+
 type Store interface {
 	// GetProfile returns the user profile for a user, or ErrNotFound when the store
 	// does not know the user.
@@ -33,6 +47,22 @@ type Store interface {
 	//
 	// ErrInvalidDisplayName is returned if there is an issue with the display name.
 	SetDisplayName(ctx context.Context, id *commonpb.UserId, displayName string) error
+
+	// SetDisplayNameWithDefaultUsername sets the display name exactly as
+	// SetDisplayName does and, when the user holds no handle, assigns them a
+	// default handle for usernameBase: the
+	// lowest-numbered one nobody holds, or under contention one of the next few or
+	// a random one (see AssignDefaultUsername). Both are written in one
+	// transaction, so a handle is never assigned without the display name that
+	// earned it, and no reader sees that display name before its handle.
+	//
+	// The result carries the handle assigned, if any. None is when the user
+	// already held a handle, or when no number yields a handle
+	// both free and usable (NoneAvailable), in which case the display name is
+	// still set. A handle taken concurrently by another user is retried against
+	// another number, and running out of retries is NoneAvailable too: contention
+	// never fails the display name.
+	SetDisplayNameWithDefaultUsername(ctx context.Context, id *commonpb.UserId, displayName, usernameBase string) (DefaultUsernameResult, error)
 
 	// SetUsername claims username as the user's handle, replacing any handle they
 	// already hold — which, having no holder any more, is immediately claimable by

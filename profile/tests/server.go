@@ -3,11 +3,15 @@ package tests
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest"
+	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -43,6 +47,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 		testSetUsername,
 		testSetUsernameBalanceGated,
 		testDisplayNameModeration,
+		testDefaultUsername,
 		testUsernameModeration,
 	} {
 		tf(t, accounts, profiles)
@@ -162,11 +167,17 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 		require.NoError(t, keyPair.Auth(setDisplayName, &setDisplayName.Auth))
 		setDisplayNameResp, err := client.SetDisplayName(ctx, setDisplayName)
 		require.NoError(t, err)
-		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetDisplayNameResponse{Result: profilepb.SetDisplayNameResponse_OK}, setDisplayNameResp))
 
+		// A display name that can be spelled as a handle earns a user without one a
+		// default handle, which the response reports.
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetDisplayNameResponse{
+			Result:   profilepb.SetDisplayNameResponse_OK,
+			Username: &commonpb.Username{Value: "my_name_2"},
+		}, setDisplayNameResp))
 		expected := &profilepb.UserProfile{
 			UserId:               userID,
 			DisplayName:          "my name",
+			Username:             &commonpb.Username{Value: "my_name_2"},
 			TipCardCustomization: profile.DefaultTipCardCustomization(),
 		}
 
@@ -1236,6 +1247,140 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 	})
 }
 
+func testDefaultUsername(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+
+	// Warnings are observed as well as written out, so a test can assert one was
+	// logged.
+	observed, warnings := observer.New(zap.WarnLevel)
+	log := zap.New(zapcore.NewTee(zaptest.NewLogger(t).Core(), observed))
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+	media, _, _ := newMedia()
+
+	moderator := &fakeModerator{}
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, nil, x.NewClient())
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+	client := profilepb.NewProfileClient(cc)
+
+	type user struct {
+		id      *commonpb.UserId
+		keyPair model.KeyPair
+	}
+	newUser := func() user {
+		t.Helper()
+		u := user{id: model.MustGenerateUserID(), keyPair: model.MustGenerateKeyPair()}
+		_, err := accounts.Bind(ctx, u.id, u.keyPair.Proto())
+		require.NoError(t, err)
+		require.NoError(t, accounts.SetRegistrationFlag(ctx, u.id, true))
+		return u
+	}
+
+	username := func(u user) string {
+		t.Helper()
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: u.id}})
+		require.NoError(t, err)
+		return resp.GetUserProfile().GetUsername().GetValue()
+	}
+
+	// setDisplayName also checks the response against the profile: an OK carries
+	// the handle the user now holds, unset when they hold none, and any other
+	// result carries none.
+	setDisplayName := func(u user, name string) profilepb.SetDisplayNameResponse_Result {
+		t.Helper()
+		req := &profilepb.SetDisplayNameRequest{DisplayName: name}
+		require.NoError(t, u.keyPair.Auth(req, &req.Auth))
+		resp, err := client.SetDisplayName(ctx, req)
+		require.NoError(t, err)
+
+		if held := username(u); resp.Result == profilepb.SetDisplayNameResponse_OK && held != "" {
+			require.Equal(t, held, resp.GetUsername().GetValue())
+		} else {
+			require.Nil(t, resp.Username)
+		}
+		return resp.Result
+	}
+
+	t.Run("Eligible display name is assigned the lowest free number", func(t *testing.T) {
+		first, second := newUser(), newUser()
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, setDisplayName(first, "Jeff Yanta"))
+		require.Equal(t, "jeff_yanta_2", username(first))
+
+		// Surrounding spaces are trimmed, so this is the same base.
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, setDisplayName(second, "  JEFF YANTA "))
+		require.Equal(t, "jeff_yanta_3", username(second))
+
+		// A rename afterwards leaves the handle alone.
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, setDisplayName(first, "Someone Else"))
+		require.Equal(t, "jeff_yanta_2", username(first))
+	})
+
+	t.Run("A handle held from before is reported on every rename", func(t *testing.T) {
+		u := newUser()
+		require.NoError(t, profiles.SetUsername(ctx, u.id, "claimed_handle"))
+
+		// Eligible or not, the name assigns nothing and the held handle comes back.
+		for _, name := range []string{"Jeff Yanta", "José"} {
+			req := &profilepb.SetDisplayNameRequest{DisplayName: name}
+			require.NoError(t, u.keyPair.Auth(req, &req.Auth))
+			resp, err := client.SetDisplayName(ctx, req)
+			require.NoError(t, err)
+			require.Equal(t, profilepb.SetDisplayNameResponse_OK, resp.Result)
+			require.Equal(t, "claimed_handle", resp.GetUsername().GetValue(), "display name: %q", name)
+		}
+	})
+
+	t.Run("Ineligible display names get no handle", func(t *testing.T) {
+		for _, name := range []string{"Jeff!", "José", "jeff_yanta", "Admin", "Flipcash Fan"} {
+			u := newUser()
+			require.Equal(t, profilepb.SetDisplayNameResponse_OK, setDisplayName(u, name))
+			require.Empty(t, username(u), "display name: %q", name)
+		}
+	})
+
+	t.Run("A user without a handle earns one from a later eligible name", func(t *testing.T) {
+		u := newUser()
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, setDisplayName(u, "Zoë Late"))
+		require.Empty(t, username(u))
+
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, setDisplayName(u, "Zoe Late"))
+		require.Equal(t, "zoe_late_2", username(u))
+	})
+
+	t.Run("A moderated display name assigns nothing", func(t *testing.T) {
+		u := newUser()
+
+		moderator.displayNameFlagged = true
+		moderator.displayNameCategories = []string{"general_nsfw"}
+		require.Equal(t, profilepb.SetDisplayNameResponse_FAILED_MODERATED, setDisplayName(u, "Bad Name"))
+		require.Empty(t, username(u))
+
+		// The rejected name assigned nothing, so the next one still earns a handle.
+		*moderator = fakeModerator{}
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, setDisplayName(u, "Good Name"))
+		require.Equal(t, "good_name_2", username(u))
+	})
+
+	t.Run("A name with no handle left sets the display name and warns", func(t *testing.T) {
+		// Every number "developers_x" can take is held: 2 through 99, since past
+		// that and for every random number its cut is a reserved word.
+		for n := 2; n < 100; n++ {
+			require.NoError(t, profiles.SetUsername(ctx, model.MustGenerateUserID(), fmt.Sprintf("developers_x_%d", n)))
+		}
+		_ = warnings.TakeAll()
+
+		u := newUser()
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, setDisplayName(u, "Developers X"))
+		require.Empty(t, username(u))
+
+		logged := warnings.FilterMessage("No default username available").TakeAll()
+		require.Len(t, logged, 1)
+		require.Equal(t, "developers_x", logged[0].ContextMap()["username_base"])
+	})
+}
+
 func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
@@ -1282,6 +1427,24 @@ func testDisplayNameModeration(t *testing.T, accounts account.Store, profiles pr
 		resp, err := setDisplayName("clean name")
 		require.NoError(t, err)
 		require.Equal(t, profilepb.SetDisplayNameResponse_OK, resp.Result)
+		require.Equal(t, "clean name", displayName())
+	})
+
+	t.Run("Whitespace-only name is invalid and never classified", func(t *testing.T) {
+		reset()
+		// A classification would fail the call, so an INVALID_DISPLAY_NAME shows
+		// none was attempted.
+		moderator.textErr = errors.New("classifier unavailable")
+		moderator.displayNameErr = errors.New("classifier unavailable")
+
+		for _, name := range []string{" ", "   ", "\t\n", "\u00a0", "\u3000"} {
+			resp, err := setDisplayName(name)
+			require.NoError(t, err)
+			require.Equal(t, profilepb.SetDisplayNameResponse_INVALID_DISPLAY_NAME, resp.Result, "display name: %q", name)
+			require.Nil(t, resp.Username)
+		}
+
+		// The prior name is left untouched.
 		require.Equal(t, "clean name", displayName())
 	})
 

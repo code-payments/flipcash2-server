@@ -64,6 +64,10 @@ func (s *store) SetDisplayName(ctx context.Context, id *commonpb.UserId, display
 	return dbSetDisplayName(ctx, s.pool, id, displayName)
 }
 
+func (s *store) SetDisplayNameWithDefaultUsername(ctx context.Context, id *commonpb.UserId, displayName, usernameBase string) (profile.DefaultUsernameResult, error) {
+	return dbSetDisplayNameWithDefaultUsername(ctx, s.pool, id, displayName, usernameBase)
+}
+
 func (s *store) SetUsername(ctx context.Context, id *commonpb.UserId, username string) error {
 	return dbSetUsername(ctx, s.pool, id, username)
 }

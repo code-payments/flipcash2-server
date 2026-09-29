@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"sync"
 	"time"
 
@@ -180,6 +181,64 @@ func (m *InMemoryStore) SetDisplayName(_ context.Context, id *commonpb.UserId, d
 	profile.DisplayName = displayName
 
 	return nil
+}
+
+func (m *InMemoryStore) SetDisplayNameWithDefaultUsername(ctx context.Context, id *commonpb.UserId, displayName, usernameBase string) (profile.DefaultUsernameResult, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	key := userIDCacheKey(id)
+
+	var result profile.DefaultUsernameResult
+	if _, hasUsername := m.usernameByUser[key]; !hasUsername {
+		// Nothing is written until the whole assignment has succeeded, so a failure
+		// leaves the display name unset too. The lock rules out a concurrent claim,
+		// so a claim only fails on a handle already held.
+		claim := func(ctx context.Context, username string) (bool, error) {
+			held, err := m.heldUsernames(ctx, []string{username})
+			if err != nil {
+				return false, err
+			}
+			if _, ok := held[username]; ok {
+				return false, profile.ErrUsernameTaken
+			}
+			return true, nil
+		}
+
+		username, err := profile.AssignDefaultUsername(ctx, usernameBase, m.heldUsernames, claim)
+		switch {
+		case err == nil:
+			result.Username = username
+		case errors.Is(err, profile.ErrNoDefaultUsername):
+			result.NoneAvailable = true
+		default:
+			return profile.DefaultUsernameResult{}, err
+		}
+	}
+
+	m.ensureProfile(key).DisplayName = displayName
+	if result.Username != "" {
+		m.usernameByUser[key] = result.Username
+	}
+
+	return result, nil
+}
+
+// heldUsernames is a profile.HeldUsernamesFunc over the store. Callers hold the
+// lock.
+func (m *InMemoryStore) heldUsernames(_ context.Context, usernames []string) (map[string]struct{}, error) {
+	wanted := make(map[string]struct{}, len(usernames))
+	for _, username := range usernames {
+		wanted[username] = struct{}{}
+	}
+
+	held := make(map[string]struct{})
+	for _, username := range m.usernameByUser {
+		if _, ok := wanted[username]; ok {
+			held[username] = struct{}{}
+		}
+	}
+	return held, nil
 }
 
 func (m *InMemoryStore) SetUsername(_ context.Context, id *commonpb.UserId, username string) error {

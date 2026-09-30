@@ -97,7 +97,7 @@ The codebase extends OCP by implementing integration interfaces:
 Each package represents a bounded context with clear responsibilities:
 
 **Core Services (gRPC Servers):**
-- `account/` - User registration, login, public key management, user flags (flags also carry tip presets to clients)
+- `account/` - User registration, login, public key management, user flags (flags also carry the `send/` presets to clients as `SendPresets`)
 - `activity/` - Activity feed for payments, deposits, withdrawals, gift cards
 - `chat/` - Group/DM chat metadata, membership, feeds (DynamoDB-backed). See "Chat, messaging and events" below.
 - `messaging/` - Message persistence, delivery/read pointers, reactions, typing notifications (DynamoDB-backed); `sender.go` is the transport-free engine for server-initiated messages (used by `task/` and `flipcashteam/`; `SendBatch` sends several atomically over `PutMessages`, one broadcast, a push per message; `Send` is a batch of one; `NewSender`'s required `teamUserID` (nil for none) makes the team account write-only: its sends don't advance its READ pointer, its DMs are created with it excluded from the feed (the chat store is built excluding the team) so no send moves its inbox row, and `publishChatUpdate` never delivers to it, neither events nor pushes, with a user's message to it skipping push preparation entirely; the push path drops it only after deriving the DM type from the full pair; and nobody messages it: a DM with it carries a `Never` speaker rule (see `chat.RuleEvaluator` under "Rules"), so `Server.canSpeak` refuses every send, edit, deletion and typing notification in one, whoever asks, the team included, and only the `Sender`, which no rule gates, writes there; DM payments to or from it are refused at intent validation, so no payment message lands either, and reactions, which gate on `isMember`, are unaffected)
@@ -131,7 +131,7 @@ Each package represents a bounded context with clear responsibilities:
 - `protoutil/` - gRPC stream helpers (bounded receive with timeout, keep-alive monitoring) and proto comparison
 - `redact/` - Shape-only placeholders for message content a viewer may see the shape of but not read (`Text`, `Content`, `Message`); pure functions of (chat ID, message seq, shape). See "Redacted reads" below.
 - `rpc/` - Shared RPC constants (user-agent)
-- `send/` - Fiat payment preset table per currency (`Minimum/Low/Medium/High`, sent to clients as `TipPresets` in the user flags); the minimum is the floor on the payment that opens a DM (when the recipient set no fee) and on DM-fee validation
+- `send/` - Fiat payment preset table per currency (`Minimum/Low/Medium/High`, sent to clients as `SendPresets` in the user flags); the minimum is the floor on the payment that opens a DM (when the recipient set no fee) and on DM-fee validation
 - `testutil/` - In-memory gRPC server helpers for tests (`RunGRPCServer` only; auth helpers live in each package's `tests/`)
 
 ### Repository Pattern

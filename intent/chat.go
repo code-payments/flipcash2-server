@@ -379,10 +379,10 @@ func (i *Integration) validateMinDmChatInitFee(ctx context.Context, paymentMetad
 	return nil
 }
 
-// validateDefaultMinimumToChat enforces the tip preset minimum for the
+// validateDefaultMinimumToChat enforces the send preset minimum for the
 // payment's exchange currency on the payment that initializes a chat with a
 // recipient who has set no minimum DM chat initialization fee. Clients surface
-// the minimum as the first tip preset, but the amount is ultimately
+// the minimum as the first send preset, but the amount is ultimately
 // client-chosen, so the floor is enforced here too.
 // Currencies without a preset fall back to a USD floor applied to the payment's
 // USD market value, so no currency is left without a minimum.

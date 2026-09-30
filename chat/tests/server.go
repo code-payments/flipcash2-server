@@ -526,11 +526,11 @@ func (f *fakeProfileReader) GetPublicProfiles(_ context.Context, userIDs []*comm
 		}
 
 		out[key] = &profilepb.UserProfile{
-			UserId:               userID,
-			DisplayName:          f.displayNames[key],
-			ProfilePicture:       f.profilePictures[key],
-			JoinTs:               timestamppb.New(joinedAt),
-			TipCardCustomization: profile.DefaultTipCardCustomization(),
+			UserId:                userID,
+			DisplayName:           f.displayNames[key],
+			ProfilePicture:        f.profilePictures[key],
+			JoinTs:                timestamppb.New(joinedAt),
+			FlipcardCustomization: profile.DefaultFlipcardCustomization(),
 		}
 	}
 	return out, nil

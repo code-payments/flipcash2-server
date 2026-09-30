@@ -467,10 +467,10 @@ func testMembershipFollowsStreams(t *testing.T, accounts account.Store) {
 			update.Kind = &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{Member: &chatpb.Member{
 				UserId: userA,
 				UserProfile: &profilepb.UserProfile{
-					UserId:               userA,
-					DisplayName:          "Alice",
-					JoinTs:               timestamppb.Now(),
-					TipCardCustomization: &profilepb.TipCardCustomization{Color: &commonpb.Color{Hex: "#19191A"}},
+					UserId:                userA,
+					DisplayName:           "Alice",
+					JoinTs:                timestamppb.Now(),
+					FlipcardCustomization: &profilepb.FlipcardCustomization{Color: &commonpb.Color{Hex: "#19191A"}},
 				},
 			}}}
 		} else {

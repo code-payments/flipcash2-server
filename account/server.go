@@ -101,14 +101,14 @@ var (
 		commonpb.Platform_APPLE: {Major: 1, Minor: 13, Patch: 0},
 	}
 
-	tipPresets []*accountpb.TipPresets
+	sendPresets []*accountpb.SendPresets
 )
 
 func init() {
 	entries := send.AllPresets()
-	tipPresets = make([]*accountpb.TipPresets, 0, len(entries))
+	sendPresets = make([]*accountpb.SendPresets, 0, len(entries))
 	for _, entry := range entries {
-		tipPresets = append(tipPresets, &accountpb.TipPresets{
+		sendPresets = append(sendPresets, &accountpb.SendPresets{
 			Region:  &commonpb.Region{Value: string(entry.Region)},
 			Minimum: entry.Presets.Minimum,
 			Low:     entry.Presets.Low,
@@ -292,7 +292,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			MinimumHolderValue:               MinHolderValue,
 			RequireCoinbaseEmailVerification: RequireCoinbaseEmailVerification,
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
-			TipPresets:                       tipPresets,
+			SendPresets:                      sendPresets,
 			UsernameMinBalance:               MinUsernameTotalBalance,
 			MessageEditWindow:                durationpb.New(DefaultMessageEditWindow),
 			MessageDeleteWindow:              durationpb.New(DefaultMessageDeleteWindow),
@@ -332,7 +332,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			MinimumHolderValue:               MinHolderValue,
 			RequireCoinbaseEmailVerification: RequireCoinbaseEmailVerification,
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
-			TipPresets:                       tipPresets,
+			SendPresets:                      sendPresets,
 			UsernameMinBalance:               MinUsernameTotalBalance,
 			MessageEditWindow:                durationpb.New(DefaultMessageEditWindow),
 			MessageDeleteWindow:              durationpb.New(DefaultMessageDeleteWindow),

@@ -86,7 +86,7 @@ type Store interface {
 	//
 	// Display name is empty, and username, profile picture and minimum DM chat
 	// initialization fee nil, for a user who has set none of them, while the join
-	// timestamp and Tip Card customization are always set — so a present entry
+	// timestamp and Flipcard customization are always set — so a present entry
 	// means "this user exists", not "this user filled in a profile".
 	//
 	// The returned picture carries only the blob holding its ORIGINAL rendition;
@@ -97,10 +97,10 @@ type Store interface {
 	// ORIGINAL rendition, replacing any picture already set.
 	SetProfilePicture(ctx context.Context, id *commonpb.UserId, blobID *blobpb.BlobId) error
 
-	// SetTipCardColor sets the colour of the user's Tip Card, provided they exist,
-	// replacing any colour already picked. colorHex is stored as given, so callers
-	// normalize it first.
-	SetTipCardColor(ctx context.Context, id *commonpb.UserId, colorHex string) error
+	// SetFlipcardColor sets the colour of the user's Flipcard, provided they
+	// exist, replacing any colour already picked. colorHex is stored as given, so
+	// callers normalize it first.
+	SetFlipcardColor(ctx context.Context, id *commonpb.UserId, colorHex string) error
 
 	// SetMinDmChatInitFee sets the minimum fee another user must pay to
 	// initialize a DM chat with the user, provided they exist, replacing any fee

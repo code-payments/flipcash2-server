@@ -75,7 +75,7 @@ func dbGetPublicProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 		DisplayName                  *string   `db:"displayName"`
 		Username                     *string   `db:"username"`
 		ProfilePictureBlobID         *string   `db:"profilePictureBlobId"`
-		TipCardColor                 *string   `db:"tipCardColor"`
+		FlipcardColor                *string   `db:"tipCardColor"`
 		MinDmChatInitFeeCurrency     *string   `db:"minDmChatInitFeeCurrency"`
 		MinDmChatInitFeeNativeAmount *float64  `db:"minDmChatInitFeeNativeAmount"`
 		CreatedAt                    time.Time `db:"createdAt"`
@@ -96,11 +96,11 @@ func dbGetPublicProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonp
 	}
 
 	userProfile := &profilepb.UserProfile{
-		UserId:               proto.Clone(userID).(*commonpb.UserId),
-		DisplayName:          *pointer.StringOrDefault(res.DisplayName, ""),
-		JoinTs:               timestamppb.New(res.CreatedAt),
-		TipCardCustomization: profile.TipCardCustomizationFromStored(res.TipCardColor),
-		MinDmChatInitFee:     profile.MinDmChatInitFeeFromStored(res.MinDmChatInitFeeCurrency, res.MinDmChatInitFeeNativeAmount),
+		UserId:                proto.Clone(userID).(*commonpb.UserId),
+		DisplayName:           *pointer.StringOrDefault(res.DisplayName, ""),
+		JoinTs:                timestamppb.New(res.CreatedAt),
+		FlipcardCustomization: profile.FlipcardCustomizationFromStored(res.FlipcardColor),
+		MinDmChatInitFee:      profile.MinDmChatInitFeeFromStored(res.MinDmChatInitFeeCurrency, res.MinDmChatInitFeeNativeAmount),
 	}
 
 	if res.Username != nil {
@@ -293,7 +293,7 @@ func dbGetPublicProfiles(ctx context.Context, pool *pgxpool.Pool, userIDs []*com
 		DisplayName                  *string   `db:"displayName"`
 		Username                     *string   `db:"username"`
 		ProfilePictureBlobID         *string   `db:"profilePictureBlobId"`
-		TipCardColor                 *string   `db:"tipCardColor"`
+		FlipcardColor                *string   `db:"tipCardColor"`
 		MinDmChatInitFeeCurrency     *string   `db:"minDmChatInitFeeCurrency"`
 		MinDmChatInitFeeNativeAmount *float64  `db:"minDmChatInitFeeNativeAmount"`
 		CreatedAt                    time.Time `db:"createdAt"`
@@ -314,11 +314,11 @@ func dbGetPublicProfiles(ctx context.Context, pool *pgxpool.Pool, userIDs []*com
 		}
 
 		userProfile := &profilepb.UserProfile{
-			UserId:               &commonpb.UserId{Value: rawID},
-			DisplayName:          *pointer.StringOrDefault(r.DisplayName, ""),
-			JoinTs:               timestamppb.New(r.CreatedAt),
-			TipCardCustomization: profile.TipCardCustomizationFromStored(r.TipCardColor),
-			MinDmChatInitFee:     profile.MinDmChatInitFeeFromStored(r.MinDmChatInitFeeCurrency, r.MinDmChatInitFeeNativeAmount),
+			UserId:                &commonpb.UserId{Value: rawID},
+			DisplayName:           *pointer.StringOrDefault(r.DisplayName, ""),
+			JoinTs:                timestamppb.New(r.CreatedAt),
+			FlipcardCustomization: profile.FlipcardCustomizationFromStored(r.FlipcardColor),
+			MinDmChatInitFee:      profile.MinDmChatInitFeeFromStored(r.MinDmChatInitFeeCurrency, r.MinDmChatInitFeeNativeAmount),
 		}
 
 		if r.Username != nil {
@@ -351,7 +351,7 @@ func dbSetProfilePicture(ctx context.Context, pool *pgxpool.Pool, userID *common
 	})
 }
 
-func dbSetTipCardColor(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, colorHex string) error {
+func dbSetFlipcardColor(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, colorHex string) error {
 	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
 		query := `INSERT INTO ` + usersTableName + ` (` + allUserFields + `) VALUES ($1, NULL, NULL, NULL, $2, NULL, NULL, NULL, NULL, FALSE, FALSE, FALSE, 'usd', 'en', NOW(), NOW()) ON CONFLICT ("id") DO UPDATE SET "tipCardColor" = $2 WHERE ` + usersTableName + `."id" = $1`
 		_, err := tx.Exec(ctx, query, pg.Encode(userID.Value), colorHex)

@@ -14,10 +14,10 @@ var ErrInvalidMinDmChatInitFee = errors.New("invalid min dm chat init fee")
 
 // ValidateMinDmChatInitFee reports whether fee is one a user may set as their
 // minimum DM chat initialization fee. The fee may be in any currency that has
-// tip presets, and must be finite and no smaller than that currency's preset
+// send presets, and must be finite and no smaller than that currency's preset
 // minimum, so the floor enforced on a payment that opens a DM is also the floor
-// on what a user may ask of whoever initializes a DM with them. Returns ErrInvalidMinDmChatInitFee
-// otherwise.
+// on what a user may ask of whoever initializes a DM with them. Returns
+// ErrInvalidMinDmChatInitFee otherwise.
 func ValidateMinDmChatInitFee(fee *commonpb.FiatPaymentAmount) error {
 	if fee == nil {
 		return ErrInvalidMinDmChatInitFee

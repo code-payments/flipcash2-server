@@ -80,8 +80,8 @@ func (s *store) SetProfilePicture(ctx context.Context, id *commonpb.UserId, blob
 	return dbSetProfilePicture(ctx, s.pool, id, blobID)
 }
 
-func (s *store) SetTipCardColor(ctx context.Context, id *commonpb.UserId, colorHex string) error {
-	return dbSetTipCardColor(ctx, s.pool, id, colorHex)
+func (s *store) SetFlipcardColor(ctx context.Context, id *commonpb.UserId, colorHex string) error {
+	return dbSetFlipcardColor(ctx, s.pool, id, colorHex)
 }
 
 func (s *store) SetMinDmChatInitFee(ctx context.Context, id *commonpb.UserId, fee *commonpb.FiatPaymentAmount) error {

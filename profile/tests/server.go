@@ -41,7 +41,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 	for _, tf := range []func(t *testing.T, accounts account.Store, profiles profile.Store){
 		testServer,
 		testProfilePicture,
-		testTipCardCustomization,
+		testFlipcardCustomization,
 		testMinDmChatInitFee,
 		testUsernameIsPublic,
 		testGetProfileByUsername,
@@ -101,7 +101,7 @@ func seedBlob(t *testing.T, blobs blob.Store, owner *commonpb.UserId, state blob
 // the store knows the user at all — Postgres shares the user row with account
 // binding, the in-memory store only learns of a user when a profile field is set
 // — so the assertion is on the fields, which are unset either way. The join
-// timestamp is exempt: every user the store knows has one, as is the Tip Card
+// timestamp is exempt: every user the store knows has one, as is the Flipcard
 // customization, which is asserted to be the default rather than absent.
 func requireProfileUnset(t *testing.T, resp *profilepb.GetProfileResponse) {
 	t.Helper()
@@ -114,7 +114,7 @@ func requireProfileUnset(t *testing.T, resp *profilepb.GetProfileResponse) {
 	require.Nil(t, resp.UserProfile.GetMinDmChatInitFee())
 
 	if resp.UserProfile != nil {
-		require.NoError(t, protoutil.ProtoEqualError(profile.DefaultTipCardCustomization(), resp.UserProfile.TipCardCustomization))
+		require.NoError(t, protoutil.ProtoEqualError(profile.DefaultFlipcardCustomization(), resp.UserProfile.FlipcardCustomization))
 	}
 }
 
@@ -177,10 +177,10 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 			Username: &commonpb.Username{Value: "my_name_2"},
 		}, setDisplayNameResp))
 		expected := &profilepb.UserProfile{
-			UserId:               userID,
-			DisplayName:          "my name",
-			Username:             &commonpb.Username{Value: "my_name_2"},
-			TipCardCustomization: profile.DefaultTipCardCustomization(),
+			UserId:                userID,
+			DisplayName:           "my name",
+			Username:              &commonpb.Username{Value: "my_name_2"},
+			FlipcardCustomization: profile.DefaultFlipcardCustomization(),
 		}
 
 		getResp, err = client.GetProfile(ctx, &profilepb.GetProfileRequest{
@@ -307,7 +307,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 	})
 }
 
-func testTipCardCustomization(t *testing.T, accounts account.Store, profiles profile.Store) {
+func testFlipcardCustomization(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
@@ -326,28 +326,28 @@ func testTipCardCustomization(t *testing.T, accounts account.Store, profiles pro
 	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
 	require.NoError(t, err)
 
-	updateTipCard := func(color *commonpb.Color) *profilepb.UpdateTipCardResponse {
+	updateFlipcard := func(color *commonpb.Color) *profilepb.UpdateFlipcardResponse {
 		t.Helper()
-		req := &profilepb.UpdateTipCardRequest{Color: color}
+		req := &profilepb.UpdateFlipcardRequest{Color: color}
 		require.NoError(t, keyPair.Auth(req, &req.Auth))
-		resp, err := client.UpdateTipCard(ctx, req)
+		resp, err := client.UpdateFlipcard(ctx, req)
 		require.NoError(t, err)
 		return resp
 	}
 
 	// Read without auth, since the customization is public: what this returns is
-	// what any other user sees on the Tip Card.
+	// what any other user sees on the Flipcard.
 	getColorHex := func() string {
 		t.Helper()
 		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
 		require.NoError(t, err)
 		require.Equal(t, profilepb.GetProfileResponse_OK, resp.Result)
-		return resp.UserProfile.TipCardCustomization.Color.Hex
+		return resp.UserProfile.FlipcardCustomization.Color.Hex
 	}
 
 	t.Run("Unregistered user is denied", func(t *testing.T) {
-		resp := updateTipCard(&commonpb.Color{Hex: "#19191A"})
-		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateTipCardResponse{Result: profilepb.UpdateTipCardResponse_DENIED}, resp))
+		resp := updateFlipcard(&commonpb.Color{Hex: "#19191A"})
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateFlipcardResponse{Result: profilepb.UpdateFlipcardResponse_DENIED}, resp))
 
 		getResp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
 		require.NoError(t, err)
@@ -357,24 +357,24 @@ func testTipCardCustomization(t *testing.T, accounts account.Store, profiles pro
 	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
 
 	t.Run("Color is set and replaced", func(t *testing.T) {
-		resp := updateTipCard(&commonpb.Color{Hex: "#19191A"})
-		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateTipCardResponse{Result: profilepb.UpdateTipCardResponse_OK}, resp))
+		resp := updateFlipcard(&commonpb.Color{Hex: "#19191A"})
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateFlipcardResponse{Result: profilepb.UpdateFlipcardResponse_OK}, resp))
 		require.Equal(t, "#19191A", getColorHex())
 
-		updateTipCard(&commonpb.Color{Hex: "#FFFFFF"})
+		updateFlipcard(&commonpb.Color{Hex: "#FFFFFF"})
 		require.Equal(t, "#FFFFFF", getColorHex())
 	})
 
 	t.Run("Color is normalized", func(t *testing.T) {
-		updateTipCard(&commonpb.Color{Hex: "#abcdef"})
+		updateFlipcard(&commonpb.Color{Hex: "#abcdef"})
 		require.Equal(t, "#ABCDEF", getColorHex())
 	})
 
 	t.Run("Unset fields are left alone", func(t *testing.T) {
-		updateTipCard(&commonpb.Color{Hex: "#19191A"})
+		updateFlipcard(&commonpb.Color{Hex: "#19191A"})
 
-		resp := updateTipCard(nil)
-		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateTipCardResponse{Result: profilepb.UpdateTipCardResponse_OK}, resp))
+		resp := updateFlipcard(nil)
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.UpdateFlipcardResponse{Result: profilepb.UpdateFlipcardResponse_OK}, resp))
 		require.Equal(t, "#19191A", getColorHex())
 	})
 }
@@ -437,7 +437,7 @@ func testMinDmChatInitFee(t *testing.T, accounts account.Store, profiles profile
 		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetMinDmChatInitFeeResponse{Result: profilepb.SetMinDmChatInitFeeResponse_OK}, resp))
 		require.NoError(t, protoutil.ProtoEqualError(fee, getFee()))
 
-		// Any currency with tip presets is accepted, and the replacement is whole
+		// Any currency with send presets is accepted, and the replacement is whole
 		// rather than per field.
 		fee = &commonpb.FiatPaymentAmount{Currency: "eur", NativeAmount: 100}
 		resp = setFee(fee)
@@ -459,7 +459,7 @@ func testMinDmChatInitFee(t *testing.T, accounts account.Store, profiles profile
 		for _, fee := range []*commonpb.FiatPaymentAmount{
 			{Currency: "usd", NativeAmount: usdMinimum.Minimum / 2}, // below the currency floor
 			{Currency: "usd", NativeAmount: 0},
-			{Currency: "xyz", NativeAmount: 1_000_000}, // no tip presets for it
+			{Currency: "xyz", NativeAmount: 1_000_000}, // no send presets for it
 		} {
 			resp := setFee(fee)
 			require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetMinDmChatInitFeeResponse{Result: profilepb.SetMinDmChatInitFeeResponse_INVALID_AMOUNT}, resp), "%v", fee)

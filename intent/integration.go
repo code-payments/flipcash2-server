@@ -35,8 +35,8 @@ type Integration struct {
 
 // NewIntegration constructs the intent integration. teamUserID is the Flipcash
 // team account, which the parent resolves once at startup with
-// flipcashteam.GetUserID and passes to chat and messaging too; nil names no
-// one.
+// flipcashteam.GetUserID and passes to the chat store, the chat RuleEvaluator,
+// the chat server and the Sender too; nil names no one.
 func NewIntegration(
 	accounts account.Store,
 	chats chat.Store,

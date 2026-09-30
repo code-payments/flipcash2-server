@@ -32,10 +32,12 @@ func AssignUsername(ctx context.Context, profiles profile.Store, userID *commonp
 // the handle.
 //
 // The parent resolves it here once, at startup, and builds everything that
-// treats the team specially with that one ID: the chat store
-// (chat.WithExcludedFromFeed), the chat server (its teamUserID) and the Sender
-// (messaging.WithTeamAccount), which SendMessages takes it from. None of them
-// calls this, since this package imports them. A process started before the
+// treats the team specially with that one ID, each taking it as a required
+// argument so none can be built without it: the chat store (its
+// excludedFromFeed, see chat.FeedExclusions), and the teamUserID of the chat
+// RuleEvaluator, the chat server, the Sender (which SendMessages takes it
+// from) and the intent integration. None of them calls this, since this package
+// imports them. A process started before the
 // team account was set up has none of them configured, and needs a restart
 // once it is.
 func GetUserID(ctx context.Context, profiles profile.Store) (*commonpb.UserId, error) {

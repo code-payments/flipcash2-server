@@ -897,14 +897,14 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool, opt
 	env.clusterStore = cluster_memory.NewInMemory()
 
 	// A shared chat store, so both servers resolve the same group memberships.
-	env.chats = chat_memory.NewInMemory()
+	env.chats = chat_memory.NewInMemory(nil)
 
 	// The access a chat stream's viewer is admitted by, over the shared chat
 	// store, with a staff flag the tests can set and no admission window, so a
 	// standing re-check sees a revocation at once.
 	env.accounts = newStaffAccounts(accounts)
 	balances := balance.NewClient(log, env.accounts, &emptyOcpBalance{})
-	access := chat.NewAccess(env.chats, chat.NewRuleEvaluator(env.accounts, balances, env.chats), chat.WithListenerAdmissionTTL(0))
+	access := chat.NewAccess(env.chats, chat.NewRuleEvaluator(env.accounts, balances, env.chats, nil), chat.WithListenerAdmissionTTL(0))
 
 	newServerEnv := func(name string, conn *grpc.ClientConn) *serverTestEnv {
 		membership := cluster.NewMembership(log, env.clusterStore, &cluster.Member{

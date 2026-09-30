@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"slices"
 	"sort"
 	"time"
 
@@ -154,6 +155,67 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatTyp
 		ChatID:       &commonpb.ChatId{Value: append([]byte(nil), token.Value[16:16+DmChatIDSize]...)},
 	}
 	return snapshot, chatType, cursor, true
+}
+
+// ---------------------------------------------------------------------------
+// DM feed exclusions
+// ---------------------------------------------------------------------------
+
+// FeedExclusions are the users a Store creates every DM with them excluding
+// from the feed (see Store.PutChat). Every Store implementation takes the
+// users as a required constructor argument and applies them through
+// FeedExclusions, so they mean the same thing in every backend.
+//
+// It is for an account in a DM with every user whose feed nobody reads, today
+// the Flipcash team account (see flipcashteam): a DM created with it in the
+// feed puts every one of its DMs under one feed key ordered by time, which
+// every creation and every message then writes at the same end of. Taking the
+// users at construction is what keeps any path that creates a DM from
+// forgetting to, and taking them as an argument rather than an option is what
+// keeps a parent from forgetting to configure it: a store with no one to
+// exclude says so with nil. The exclusion is recorded on each DM at creation,
+// so a DM created by a store that forgot is excluding no one for good.
+type FeedExclusions struct {
+	// userIDs are the users excluded, each named once.
+	userIDs []*commonpb.UserId
+}
+
+// NewFeedExclusions returns the exclusions of userIDs. Nil user IDs are
+// ignored, so a parent with no team account configured may pass one, and a
+// user named more than once is excluded once.
+func NewFeedExclusions(userIDs []*commonpb.UserId) FeedExclusions {
+	var e FeedExclusions
+	for _, userID := range userIDs {
+		if userID == nil || containsUser(e.userIDs, userID) {
+			continue
+		}
+		e.userIDs = append(e.userIDs, &commonpb.UserId{Value: bytes.Clone(userID.Value)})
+	}
+	return e
+}
+
+// For returns the members a DM being created is to exclude from the feed:
+// those of c's members e names, each once, in the order c lists them. It is
+// empty when there are none, and for every group, which keeps no per-member
+// feed copies to exclude anyone from.
+func (e FeedExclusions) For(c *Chat) []*commonpb.UserId {
+	if len(e.userIDs) == 0 || IsGroupChatID(c.ID) {
+		return nil
+	}
+	var excluded []*commonpb.UserId
+	for _, member := range c.Members {
+		if containsUser(e.userIDs, member) && !containsUser(excluded, member) {
+			excluded = append(excluded, member)
+		}
+	}
+	return excluded
+}
+
+// containsUser reports whether userIDs names userID.
+func containsUser(userIDs []*commonpb.UserId, userID *commonpb.UserId) bool {
+	return slices.ContainsFunc(userIDs, func(u *commonpb.UserId) bool {
+		return bytes.Equal(u.Value, userID.Value)
+	})
 }
 
 // ---------------------------------------------------------------------------

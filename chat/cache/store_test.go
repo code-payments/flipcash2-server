@@ -343,7 +343,7 @@ func TestCache_UserState_PassesThrough(t *testing.T) {
 	user := model.MustGenerateUserID()
 	chatID := generateDmChatID()
 
-	us := cache.NewInCache(memory.NewInMemory())
+	us := cache.NewInCache(memory.NewInMemory(nil))
 
 	state, changed, err := us.SetMute(ctx, chatID, user, chat.Mute{Forever: true})
 	require.NoError(t, err)

@@ -103,8 +103,8 @@ type Store interface {
 	// caller wanting a larger group creates it at the cap and grows it with
 	// AddGroupMembers. RosterSummary is derived from Members and ignored.
 	//
-	// A store built WithExcludedFromFeed creates every DM with that user
-	// excluded from the feed: their copy of the chat records their membership
+	// A store built with users excluded from the feed (see FeedExclusions)
+	// creates every DM with one of them excluding them from it: their copy of the chat records their membership
 	// (so IsMember answers for them as for anyone) and nothing else, with no
 	// activity to order a feed by, which AdvanceLastMessage never moves and
 	// GetDmFeedPage never returns. The exclusion is decided at creation and

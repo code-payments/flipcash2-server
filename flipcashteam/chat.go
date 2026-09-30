@@ -20,7 +20,7 @@ import (
 )
 
 // ErrNoTeamAccount is returned by SendMessages when the Sender it is given was
-// built with no team account (see messaging.WithTeamAccount).
+// built with no team account (see messaging.NewSender).
 var ErrNoTeamAccount = errors.New("no team account configured")
 
 // clientMessageIDNamespace is the UUID namespace SendMessages derives its client
@@ -37,9 +37,9 @@ var clientMessageIDNamespace = uuid.MustParse("0fea31a1-c7d6-4084-b481-fde267cf1
 // user sees all of them or none, in order, each counting toward their unread
 // and earning its own push. At most messaging.MaxMessagesPerPut messages go in
 // one call. The team account is the one sender was built with (see
-// messaging.WithTeamAccount), so the account these messages are sent as is
+// messaging.NewSender), so the account these messages are sent as is
 // the one the Sender treats as the team, and the one the parent configured
-// the chat store to exclude from the feed (see chat.WithExcludedFromFeed):
+// the chat store to exclude from the feed (see chat.FeedExclusions):
 // the parent resolves it once, at startup, with GetUserID. It fails with
 // ErrNoTeamAccount when sender has none, as it has when the process started
 // before the team account was set up; setting it up takes a restart.
@@ -110,7 +110,7 @@ func SendMessages(
 // not a failure.
 //
 // The chat store excludes the team account from the feed of every DM it
-// creates with it (see chat.WithExcludedFromFeed), this one and one a tip the
+// creates with it (see chat.FeedExclusions), this one and one a tip the
 // user sent the team first created alike, so nothing here asks for it.
 //
 // The chat is looked up before it is created, rather than created and

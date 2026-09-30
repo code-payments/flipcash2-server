@@ -59,7 +59,7 @@ func newChatEnvWithTeam(t *testing.T, setUp bool) *chatEnv {
 		teamUserID = nil
 	}
 
-	chats := chat_memory.NewInMemory(chat.WithExcludedFromFeed(teamUserID))
+	chats := chat_memory.NewInMemory([]*commonpb.UserId{teamUserID})
 	messages := messaging_memory.NewInMemory()
 	sender := messaging.NewSender(
 		zaptest.NewLogger(t),
@@ -73,7 +73,7 @@ func newChatEnvWithTeam(t *testing.T, setUp bool) *chatEnv {
 		push.NewNoOpPusher(),
 		event.NewBus[*commonpb.UserId, *eventpb.Event](),
 		event.NewBus[*commonpb.ChatId, *eventpb.ChatEvent](),
-		messaging.WithTeamAccount(teamUserID),
+		teamUserID,
 	)
 
 	return &chatEnv{

@@ -196,10 +196,16 @@ func (a *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (boo
 	return a.staff[string(userID.Value)], nil
 }
 
-// newServerEnv builds a messaging server over the given stores. senderOpts
-// configure its Sender beyond the defaults, e.g. a small push page size so a
-// handful of members walks several pages.
+// newServerEnv builds a messaging server over the given stores, with no team
+// account. senderOpts configure its Sender beyond the defaults, e.g. a small
+// push page size so a handful of members walks several pages.
 func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store, senderOpts ...messaging.SenderOption) *serverEnv {
+	return newServerEnvWithTeam(t, badges, blocklists, chats, messages, profiles, nil, senderOpts...)
+}
+
+// newServerEnvWithTeam is newServerEnv with teamUserID as the Sender's team
+// account.
+func newServerEnvWithTeam(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store, teamUserID *commonpb.UserId, senderOpts ...messaging.SenderOption) *serverEnv {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
@@ -241,8 +247,8 @@ func newServerEnv(t *testing.T, badges badge.Store, blocklists blocklist.Store, 
 	env.ocpBalance = &fakeOcpBalance{byOwner: make(map[string]uint64)}
 	balances := balance.NewClient(log, env.accounts, env.ocpBalance)
 
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus, senderOpts...)
-	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats))
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus, teamUserID, senderOpts...)
+	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats, teamUserID))
 	server := messaging.NewServer(log, authz, chats, media, messages, access, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
@@ -1513,7 +1519,7 @@ func testServer_SendBatch_Group(t *testing.T, badges badge.Store, blocklists blo
 
 func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	team := model.MustGenerateUserID()
-	e := newServerEnv(t, badges, blocklists, chats, messages, profiles, messaging.WithTeamAccount(team))
+	e := newServerEnvWithTeam(t, badges, blocklists, chats, messages, profiles, team)
 
 	// A display name is what a tip-DM push renders, so both have one: a push
 	// that is missing is missing because of the team account, not the name.
@@ -1533,7 +1539,7 @@ func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blockl
 	}
 
 	// Whether the team's feed lists the DM is the chat store's to decide (see
-	// chat.WithExcludedFromFeed), and not what this test is about.
+	// chat.FeedExclusions), and not what this test is about.
 	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.userA, team)
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 		ID:           dmID,
@@ -1594,7 +1600,7 @@ func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blockl
 
 func testServer_TeamAccount_Refused(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	team := model.MustGenerateUserID()
-	e := newServerEnv(t, badges, blocklists, chats, messages, profiles, messaging.WithTeamAccount(team))
+	e := newServerEnvWithTeam(t, badges, blocklists, chats, messages, profiles, team)
 	teamKeys := model.MustGenerateKeyPair()
 	e.authz.Add(team, teamKeys)
 

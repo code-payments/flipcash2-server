@@ -21,7 +21,7 @@ const (
 func TestChat_DynamoDBServer(t *testing.T) {
 	require.NoError(t, CreateTables(context.Background(), testEnv.Client, serverChatsTable, serverDmInboxTable, serverGroupMembersTable, serverUserStateTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, serverChatsTable, serverDmInboxTable, serverGroupMembersTable, serverUserStateTable)
+	testStore := NewInDynamoDB(testEnv.Client, serverChatsTable, serverDmInboxTable, serverGroupMembersTable, serverUserStateTable, nil)
 	teardown := func() {
 		testStore.(*store).reset()
 	}

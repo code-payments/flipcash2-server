@@ -72,8 +72,8 @@ type Sender struct {
 	// running unboundedly many page sends at once.
 	pushPageSlots chan struct{}
 
-	// teamUserID is the Flipcash team account (see WithTeamAccount), nil when
-	// there is none.
+	// teamUserID is the Flipcash team account (see NewSender), nil when there
+	// is none.
 	teamUserID *commonpb.UserId
 }
 
@@ -110,31 +110,33 @@ func WithPushPageConcurrency(n int) SenderOption {
 	}
 }
 
-// WithTeamAccount names the Flipcash team account (see flipcashteam), an
-// account the server writes as and nobody reads as, in a DM with every user.
-// A send by it does not advance its read pointer, which would only claim, to
-// the user it talks to, that it had read what they sent. And nothing in its
-// DMs is delivered to it, on the event stream or by push (see
-// publishChatUpdate): a stream opened as it would carry every event in every
-// one of its DMs, and a push to it is a profile, mute, blocklist and token
-// read spent on an account with no devices. The user it talks to hears about
-// everything as usual. Nil, the default, names no one.
+// NewSender returns a Sender. teamUserID is the Flipcash team account (see
+// flipcashteam), nil when there is none: it is an argument rather than an
+// option so that a parent cannot build a Sender without deciding it, since a
+// Sender that does not know the team delivers every event in its DMs to it.
 //
-// Its DMs are the team's to write in alone: the Server refuses every send, edit,
-// deletion and typing notification in one (see Server.canSpeak), whoever
-// asks, the team account included, so the team only ever writes through the
-// Sender, and a user cannot message it.
+// The team account is one the server writes as and nobody reads as, in a DM
+// with every user. A send by it does not advance its read pointer, which
+// would only claim, to the user it talks to, that it had read what they
+// sent. And nothing in its DMs is delivered to it, on the event stream or by
+// push (see publishChatUpdate): a stream opened as it would carry every event
+// in every one of its DMs, and a push to it is a profile, mute, blocklist and
+// token read spent on an account with no devices. The user it talks to hears
+// about everything as usual.
+//
+// Its DMs are the team's to write in alone: they carry a Never speaker rule
+// (see chat.RuleEvaluator, which the parent builds with the same team
+// account), so the Server refuses every send, edit, deletion and typing
+// notification in one, whoever asks, the team account included, and the team
+// only ever writes through the Sender, which no rule gates. A user cannot
+// message it.
 //
 // Its DMs are created with it excluded from the feed, which the parent
 // configures the chat store to do for every DM with it (see
-// chat.WithExcludedFromFeed), so no send in them moves its copy of the chat's
-// activity either: its copies of every DM share one partition, which would take a
-// write from every message in all of them, and the feed they order is one
-// nobody reads.
-func WithTeamAccount(teamUserID *commonpb.UserId) SenderOption {
-	return func(s *Sender) { s.teamUserID = teamUserID }
-}
-
+// chat.FeedExclusions), so no send in them moves its copy of the chat's
+// activity either: its copies of every DM share one partition, which would
+// take a write from every message in all of them, and the feed they order is
+// one nobody reads.
 func NewSender(
 	log *zap.Logger,
 	badges badge.Store,
@@ -147,6 +149,7 @@ func NewSender(
 	pusher push.Pusher,
 	userEventBus *event.Bus[*commonpb.UserId, *eventpb.Event],
 	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent],
+	teamUserID *commonpb.UserId,
 	opts ...SenderOption,
 ) *Sender {
 	s := &Sender{
@@ -161,6 +164,8 @@ func NewSender(
 		pusher:       pusher,
 		userEventBus: userEventBus,
 		chatEventBus: chatEventBus,
+
+		teamUserID: teamUserID,
 
 		pushPageSize:         defaultPushPageSize,
 		pushMutedWholeSetCap: defaultPushMutedWholeSetCap,
@@ -309,7 +314,7 @@ func (s *Sender) SendBatch(
 	// persisted, so their existence is guaranteed — advance directly without a
 	// separate existence read. Best-effort: it's reconstructable and self-heals.
 	// A system message (no sender) has no pointer to advance, and neither does
-	// the team account, which reads nothing (see WithTeamAccount).
+	// the team account, which reads nothing (see NewSender).
 	var advancedPointers []*messagingpb.Pointer
 	for _, last := range lastMessagePerSender(msgs) {
 		if s.isTeamAccount(last.SenderID) {
@@ -376,7 +381,7 @@ func (s *Sender) SendBatch(
 }
 
 // TeamAccount returns the team account the Sender was built with (see
-// WithTeamAccount), or nil when there is none. It is for sending as the team
+// NewSender), or nil when there is none. It is for sending as the team
 // (see flipcashteam.SendMessages), so that the account sent as is the one the
 // Sender treats as the team, from one configuration.
 func (s *Sender) TeamAccount() *commonpb.UserId {
@@ -387,30 +392,13 @@ func (s *Sender) TeamAccount() *commonpb.UserId {
 }
 
 // isTeamAccount reports whether userID is the team account (see
-// WithTeamAccount).
+// NewSender).
 func (s *Sender) isTeamAccount(userID *commonpb.UserId) bool {
 	return s.teamUserID != nil && bytes.Equal(userID.GetValue(), s.teamUserID.Value)
 }
 
-// inTeamDm reports whether chatID is a DM that userID shares with the team
-// account (see WithTeamAccount), or, when userID is the team account itself,
-// any DM. It is decided off the IDs alone, with no read: a DM's ID is derived
-// from its members, so it is a DM with the team exactly when it derives from
-// the team and userID under one of the DM types. It says nothing of whether
-// the chat exists or userID is in it.
-func (s *Sender) inTeamDm(chatID *commonpb.ChatId, userID *commonpb.UserId) bool {
-	if s.teamUserID == nil || chat.IsGroupChatID(chatID) {
-		return false
-	}
-	if s.isTeamAccount(userID) {
-		return true
-	}
-	members := []*commonpb.UserId{s.teamUserID, userID}
-	return chat.DeriveDmChatType(chatID, members) != chatpb.ChatType_UNKNOWN
-}
-
 // withoutTeamAccount returns userIDs less the team account (see
-// WithTeamAccount), or userIDs itself when it holds no team account.
+// NewSender), or userIDs itself when it holds no team account.
 func (s *Sender) withoutTeamAccount(userIDs []*commonpb.UserId) []*commonpb.UserId {
 	if s.teamUserID == nil || !slices.ContainsFunc(userIDs, s.isTeamAccount) {
 		return userIDs

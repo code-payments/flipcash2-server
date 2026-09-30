@@ -243,14 +243,16 @@ type store struct {
 	groupMembersTable string
 	userStateTable    string
 
-	opts chat.StoreOptions
+	exclusions chat.FeedExclusions
 }
 
-// NewInDynamoDB returns a chat.Store backed by the given DynamoDB tables. Use
-// CreateTables to provision them.
-func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable string, opts ...chat.StoreOption) chat.Store {
+// NewInDynamoDB returns a chat.Store backed by the given DynamoDB tables,
+// creating every DM with a user in excludedFromFeed excluding them from the
+// feed (see chat.FeedExclusions); nil excludes no one. Use CreateTables to
+// provision the tables.
+func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
 	return &store{
-		opts:              chat.NewStoreOptions(opts...),
+		exclusions:        chat.NewFeedExclusions(excludedFromFeed),
 		client:            client,
 		chatsTable:        chatsTable,
 		dmInboxTable:      dmInboxTable,
@@ -282,8 +284,8 @@ func (s *store) PutChat(ctx context.Context, c *chat.Chat) error {
 
 // putDmChat creates a DM chat: the canonical metadata item plus each
 // participant's dm_inbox row, in one transaction. The canonical item's
-// condition enforces uniqueness for the whole write. The members the store's
-// options exclude from the feed, if the DM has any, are recorded on the
+// condition enforces uniqueness for the whole write. The members the store
+// excludes from the feed, if the DM has any, are recorded on the
 // canonical item as a binary set, where every advance reads them, and each
 // gets a row that records membership alone (see dmInboxItem). A set cannot be
 // empty, so a DM excluding no one has no attribute at all.
@@ -292,7 +294,7 @@ func (s *store) putDmChat(ctx context.Context, c *chat.Chat) error {
 		return chat.ErrNoMembers
 	}
 
-	excluded := s.opts.ExcludedFromFeed(c)
+	excluded := s.exclusions.For(c)
 	canonical := s.chatItem(c)
 	if len(excluded) > 0 {
 		canonical[attrExcludedFromFeed] = avBS(excluded)

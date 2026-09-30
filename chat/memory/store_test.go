@@ -3,20 +3,19 @@ package memory
 import (
 	"testing"
 
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/chat/tests"
 )
 
 func TestChat_MemoryStore(t *testing.T) {
-	testStore := NewInMemory()
+	testStore := NewInMemory(nil)
 	teardown := func() {
 		testStore.(*memory).reset()
 	}
-	tests.RunStoreTests(t, testStore, teardown)
-}
-
-func TestChat_MemoryStoreOptions(t *testing.T) {
-	tests.RunStoreOptionTests(t, func(opts ...chat.StoreOption) chat.Store {
-		return NewInMemory(opts...)
-	})
+	newStore := func(excludedFromFeed []*commonpb.UserId) chat.Store {
+		return NewInMemory(excludedFromFeed)
+	}
+	tests.RunStoreTests(t, testStore, newStore, teardown)
 }

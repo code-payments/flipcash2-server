@@ -22,10 +22,12 @@ func TestSendWelcomeV1(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.team, e.user).Value, chatID.Value)
 
+	// Every line is text but the third, a widget sharing the user's profile
+	// (empty here).
 	expected := []string{
 		"Welcome to Flipcash!",
 		"Tell people your Flipcash username is alice_1 to connect with you",
-		"https://flipcash.com/alice_1",
+		"",
 		"Flipcash is the only chat app where people have to send you cash before they can message you, so you can say goodbye to spam",
 		"Happy chatting!",
 	}
@@ -33,6 +35,10 @@ func TestSendWelcomeV1(t *testing.T) {
 	for i, text := range expected {
 		require.Equal(t, uint64(i+1), sent[i].MessageId.Value)
 		require.Equal(t, e.team.Value, sent[i].SenderId.Value)
+		if i == 2 {
+			require.Equal(t, "alice_1", sent[i].Content[0].GetWidget().GetShareProfile().GetUsername().GetValue())
+			continue
+		}
 		require.Equal(t, text, sent[i].Content[0].GetText().Text)
 	}
 
@@ -42,6 +48,7 @@ func TestSendWelcomeV1(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, replayed, len(expected))
 	require.Equal(t, expected[1], replayed[1].Content[0].GetText().Text)
+	require.Equal(t, "alice_1", replayed[2].Content[0].GetWidget().GetShareProfile().GetUsername().GetValue())
 	stored, err := e.messages.GetMessages(e.ctx, chatID)
 	require.NoError(t, err)
 	require.Len(t, stored, len(expected))

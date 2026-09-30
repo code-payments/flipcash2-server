@@ -93,8 +93,9 @@ func (m *Message) Clone() *Message {
 // IsReplyable reports whether this message may be the target of a reply. Only
 // user-facing messages are replyable; this is a whitelist so that content types
 // added later (and non-conversational ones like system messages) are treated as
-// non-replyable until explicitly allowed. Deleted messages remain replyable —
-// the tombstone is still a real message in the thread.
+// non-replyable until explicitly allowed. A widget is server-authored but
+// conversational, so it is replyable. Deleted messages remain replyable — the
+// tombstone is still a real message in the thread.
 func (m *Message) IsReplyable() bool {
 	if len(m.Content) == 0 {
 		return false
@@ -105,6 +106,7 @@ func (m *Message) IsReplyable() bool {
 		*messagingpb.Content_Media,
 		*messagingpb.Content_Reply,
 		*messagingpb.Content_Encrypted,
+		*messagingpb.Content_Widget,
 		*messagingpb.Content_Deleted:
 		return true
 	default:
@@ -115,8 +117,8 @@ func (m *Message) IsReplyable() bool {
 // IsReactable reports whether this message may be the target of an emoji
 // reaction. Like IsReplyable this is a whitelist, so content types added later
 // (and non-conversational ones like system messages) are non-reactable until
-// explicitly allowed. A Deleted tombstone remains reactable — it is still a real
-// message in the thread.
+// explicitly allowed. A widget is reactable, as it is replyable. A Deleted
+// tombstone remains reactable — it is still a real message in the thread.
 func (m *Message) IsReactable() bool {
 	if len(m.Content) == 0 {
 		return false
@@ -127,6 +129,7 @@ func (m *Message) IsReactable() bool {
 		*messagingpb.Content_Media,
 		*messagingpb.Content_Reply,
 		*messagingpb.Content_Encrypted,
+		*messagingpb.Content_Widget,
 		*messagingpb.Content_Deleted:
 		return true
 	default:

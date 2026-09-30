@@ -417,8 +417,9 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 // author via SendMessage or EditMessage, and extracts the replied-to message ID
 // when it is a reply. The permitted set is a whitelist — currently a text or media
 // message, a reply whose own body is text or media, or encrypted content — so it
-// excludes server-injected content (e.g. cash payment messages) and any content
-// type added later until it is explicitly allowed. repliedMessageID is non-nil
+// excludes server-injected content (e.g. cash payment messages, and widgets,
+// which only the server sends; see flipcashteam) and any content type added
+// later until it is explicitly allowed. repliedMessageID is non-nil
 // only for a valid reply, signaling the caller to verify the replied-to message
 // exists and is repliable. Encrypted content is allowed in a DM only, which
 // depends on the chat and so is the caller's to enforce (see isEncrypted), as

@@ -26,8 +26,9 @@ const welcomeV1IdempotencyKey = "welcome_v1"
 // handle is username, as one batch (see SendMessages): each line of the
 // welcome is its own message. username must be a valid handle as held, in
 // canonical form (see profile.ValidateUsername), since it is shown to the user
-// and linked to: anything else did not come from the store and is refused
-// rather than repaired. It is the caller's to know that userID holds it.
+// and shared as their profile (messagingpb.ShareProfileWidget): anything else
+// did not come from the store and is refused rather than repaired. It is the
+// caller's to know that userID holds it.
 //
 // It is idempotent on the user: every call for them sends under the same key,
 // so a retry returns what the first call sent, the username it was sent with
@@ -96,18 +97,22 @@ func (w *Welcomer) OnFirstUsername(ctx context.Context, userID *commonpb.UserId,
 }
 
 // welcomeV1Messages is the content of the first version of the welcome to the
-// holder of username, one message per line.
+// holder of username, one message per line: text, but for a widget sharing
+// their profile after the line that names their handle.
 func welcomeV1Messages(username string) []*messagingpb.Content {
-	lines := []string{
-		"Welcome to Flipcash!",
-		fmt.Sprintf("Tell people your Flipcash username is %s to connect with you", username),
-		fmt.Sprintf("https://flipcash.com/%s", username),
-		"Flipcash is the only chat app where people have to send you cash before they can message you, so you can say goodbye to spam",
-		"Happy chatting!",
+	return []*messagingpb.Content{
+		textContent("Welcome to Flipcash!"),
+		textContent(fmt.Sprintf("Tell people your Flipcash username is %s to connect with you", username)),
+		{Type: &messagingpb.Content_Widget{Widget: &messagingpb.WidgetContent{
+			Type: &messagingpb.WidgetContent_ShareProfile{ShareProfile: &messagingpb.ShareProfileWidget{
+				Username: &commonpb.Username{Value: username},
+			}},
+		}}},
+		textContent("Flipcash is the only chat app where people have to send you cash before they can message you, so you can say goodbye to spam"),
+		textContent("Happy chatting!"),
 	}
-	content := make([]*messagingpb.Content, len(lines))
-	for i, line := range lines {
-		content[i] = &messagingpb.Content{Type: &messagingpb.Content_Text{Text: &messagingpb.TextContent{Text: line}}}
-	}
-	return content
+}
+
+func textContent(text string) *messagingpb.Content {
+	return &messagingpb.Content{Type: &messagingpb.Content_Text{Text: &messagingpb.TextContent{Text: text}}}
 }

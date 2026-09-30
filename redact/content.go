@@ -49,6 +49,10 @@ import (
 //     only the DM's two members hold the key. Encrypted content is DM-only
 //     and a DM's only readers are its members, so the one viewer who reaches
 //     this is a member reading REDACTED, who could decrypt it anyway.
+//   - Widget: the same variant, built field by field like the content that
+//     holds it. A ShareProfileWidget's username becomes redactedUsername, so
+//     the viewer sees a profile was shared but not whose. A variant this
+//     function does not know is ErrUnsupportedContent.
 //
 // A nil content, or one of a kind this function does not know, is
 // ErrUnsupportedContent: nothing unknown is passed through, and the caller
@@ -108,6 +112,12 @@ func content(seed []byte, c *messagingpb.Content) (*messagingpb.Content, error) 
 		return &messagingpb.Content{Type: &messagingpb.Content_Encrypted{
 			Encrypted: proto.Clone(t.Encrypted).(*messagingpb.EncryptedContent),
 		}}, nil
+	case *messagingpb.Content_Widget:
+		widget, err := widgetContent(t.Widget)
+		if err != nil {
+			return nil, err
+		}
+		return &messagingpb.Content{Type: &messagingpb.Content_Widget{Widget: widget}}, nil
 	default:
 		return nil, ErrUnsupportedContent
 	}
@@ -148,4 +158,23 @@ func mediaContent(seed []byte, m *messagingpb.MediaContent) *messagingpb.MediaCo
 		out.Caption = textContent(seed, m.GetCaption())
 	}
 	return out
+}
+
+// redactedUsername stands in for the username a redacted widget names. It is
+// a valid handle (see commonpb.Username), so the placeholder passes the same
+// validation as the original; the message's redacted flag is what tells the
+// client not to act on it.
+const redactedUsername = "redacted"
+
+func widgetContent(w *messagingpb.WidgetContent) (*messagingpb.WidgetContent, error) {
+	switch w.GetType().(type) {
+	case *messagingpb.WidgetContent_ShareProfile:
+		return &messagingpb.WidgetContent{Type: &messagingpb.WidgetContent_ShareProfile{
+			ShareProfile: &messagingpb.ShareProfileWidget{
+				Username: &commonpb.Username{Value: redactedUsername},
+			},
+		}}, nil
+	default:
+		return nil, ErrUnsupportedContent
+	}
 }

@@ -2365,6 +2365,18 @@ func replyMediaContent(repliedMessageID uint64, blobID *blobpb.BlobId) []*messag
 	}}
 }
 
+// widgetContent builds a widget sharing username's profile, content only the
+// server sends.
+func widgetContent(username string) []*messagingpb.Content {
+	return []*messagingpb.Content{{
+		Type: &messagingpb.Content_Widget{Widget: &messagingpb.WidgetContent{
+			Type: &messagingpb.WidgetContent_ShareProfile{ShareProfile: &messagingpb.ShareProfileWidget{
+				Username: &commonpb.Username{Value: username},
+			}},
+		}},
+	}}
+}
+
 // encryptedContent builds an end-to-end encrypted message. The server never
 // reads the ciphertext, so any bytes of a valid length stand in for one.
 func encryptedContent(ciphertext byte) []*messagingpb.Content {

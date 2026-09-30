@@ -59,6 +59,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_ResolvesMediaOnRead,
 		testServer_EncryptedContent,
 		testServer_EncryptedContent_NotInGroups,
+		testServer_WidgetContent,
 		testServer_SendMessage_Broadcast,
 		testServer_SendBatch,
 		testServer_SendBatch_SideEffects,
@@ -1011,6 +1012,52 @@ func testServer_SendMessage_DisallowedContent(t *testing.T, badges badge.Store, 
 	extraResp, err := e.sendContent(e.keysA, extraRendition, generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_DENIED, extraResp.Result)
+}
+
+// testServer_WidgetContent: a widget is server-authored, so no client may send
+// one, directly, as a reply's body or as an edit. Once sent it is a message
+// in the thread like any other: replyable and reactable, but its sender
+// cannot edit or delete it.
+func testServer_WidgetContent(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	sendResp, err := e.sendContent(e.keysA, widgetContent("alice_1"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
+
+	original, err := e.send(e.keysA, "original", generateClientID())
+	require.NoError(t, err)
+	replyWidget := []*messagingpb.Content{{Type: &messagingpb.Content_Reply{Reply: &messagingpb.ReplyContent{
+		RepliedMessageId: original.Message.MessageId,
+		Content:          widgetContent("alice_1"),
+	}}}}
+	replyWidgetResp, err := e.sendContent(e.keysA, replyWidget, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, replyWidgetResp.Result)
+
+	editToWidget, err := e.editMessage(e.keysA, original.Message.MessageId, widgetContent("alice_1"), original.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_DENIED, editToWidget.Result)
+
+	// The server sends one, as the team's welcome does.
+	widget, _, err := messages.PutMessage(e.ctx, e.chatID, e.userA, widgetContent("alice_1"), at(100), generateClientID(), false)
+	require.NoError(t, err)
+
+	reply, err := e.sendContent(e.keysB, replyContent(widget.ID.Value, "thanks"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, reply.Result)
+
+	reacted, err := e.addReaction(e.keysB, widget.ID, "👍")
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, reacted.Result)
+
+	edited, err := e.editMessage(e.keysA, widget.ID, textContent("edited"), widget.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_CANNOT_EDIT, edited.Result)
+
+	deleted, err := e.deleteMessage(e.keysA, widget.ID, widget.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_CANNOT_DELETE, deleted.Result)
 }
 
 // testServer_EncryptedContent: a DM carries encrypted content like any other

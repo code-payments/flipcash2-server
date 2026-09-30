@@ -326,6 +326,12 @@ func renderGroupChatMessagePushBody(ctx context.Context, ocpData ocp_data.Provid
 			return "", false, nil
 		}
 		body = fmt.Sprintf("%s: %s", senderDisplayName, textContent.Text.Text)
+	case *messagingpb.Content_Widget:
+		widgetBody, ok := renderWidgetPushBody(content.Widget)
+		if !ok {
+			return "", false, nil
+		}
+		body = fmt.Sprintf("%s: %s", senderDisplayName, widgetBody)
 	case *messagingpb.Content_Cash:
 		currencyName, err := resolveCurrencyName(ctx, ocpData, content.Cash.Amount.Mint)
 		if err != nil {
@@ -403,6 +409,11 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 		// to decrypt it before display can replace the body with the plaintext;
 		// a larger one carries only the message ID, for the client to fetch.
 		body = encryptedDmMessagePushBody
+	case *messagingpb.Content_Widget:
+		body, ok = renderWidgetPushBody(content.Widget)
+		if !ok {
+			return "", false, nil
+		}
 	case *messagingpb.Content_Cash:
 		currencyName, err := resolveCurrencyName(ctx, ocpData, content.Cash.Amount.Mint)
 		if err != nil {
@@ -428,6 +439,19 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 	}
 
 	return truncatePushBody(body), true, nil
+}
+
+// renderWidgetPushBody renders the push body for a widget: the plain-text
+// stand-in for what the client renders natively, which the payload carries in
+// full (see maxChatPushBytes). A profile share is the profile's link. ok is
+// false for a variant that doesn't produce a push.
+func renderWidgetPushBody(widget *messagingpb.WidgetContent) (body string, ok bool) {
+	switch w := widget.Type.(type) {
+	case *messagingpb.WidgetContent_ShareProfile:
+		return fmt.Sprintf("https://flipcash.com/%s", w.ShareProfile.Username.GetValue()), true
+	default:
+		return "", false
+	}
 }
 
 // ChatRecipients is a chat push's audience, split by whether each recipient has

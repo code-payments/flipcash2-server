@@ -21,7 +21,7 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/profile"
-	"github.com/code-payments/flipcash2-server/tip"
+	"github.com/code-payments/flipcash2-server/send"
 	currency_lib "github.com/code-payments/ocp-server/currency"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
@@ -38,9 +38,9 @@ const (
 	// message into the sender and recipient's DM after a contact DM payment.
 	TaskTypeSendContactDmPaymentMessage uint32 = 1
 
-	// TaskTypeSendTipDmPaymentMessage is the task that injects the cash message
-	// into the sender and recipient's tip DM after a tip DM payment.
-	TaskTypeSendTipDmPaymentMessage uint32 = 2
+	// TaskTypeSendDmPaymentMessage is the task that injects the cash message
+	// into the sender and recipient's DM after a DM payment.
+	TaskTypeSendDmPaymentMessage uint32 = 2
 )
 
 // NewSendContactDmPaymentMessageTask creates the task that injects the cash
@@ -56,15 +56,15 @@ func NewSendContactDmPaymentMessageTask(intentRecord *ocp_intent.Record) *ocp_ta
 	}
 }
 
-// NewSendTipDmPaymentMessageTask creates the task that injects the cash
-// message into the sender and recipient's tip DM after a tip DM payment. Only
+// NewSendDmPaymentMessageTask creates the task that injects the cash
+// message into the sender and recipient's DM after a DM payment. Only
 // the intent ID is carried, via the reference ID; the executor reloads the
 // authoritative intent record at execution time.
-func NewSendTipDmPaymentMessageTask(intentRecord *ocp_intent.Record) *ocp_task.Record {
+func NewSendDmPaymentMessageTask(intentRecord *ocp_intent.Record) *ocp_task.Record {
 	intentID := intentRecord.IntentId
 	return &ocp_task.Record{
 		TaskId:      uuid.NewString(),
-		Type:        TaskTypeSendTipDmPaymentMessage,
+		Type:        TaskTypeSendDmPaymentMessage,
 		ReferenceId: &intentID,
 	}
 }
@@ -97,10 +97,10 @@ func GetContactDmPayment(appMetadata []byte) *intentpb.ChatMetadata_ContactDmPay
 	return GetChatMetadata(appMetadata).GetContactDmPayment()
 }
 
-// GetTipDmPayment extracts the tip DM payment from app metadata, if present. It
+// GetDmPayment extracts the DM payment from app metadata, if present. It
 // returns nil when there is no app metadata, the metadata fails to decode, or it
-// is not a tip DM payment.
-func GetTipDmPayment(appMetadata []byte) *intentpb.ChatMetadata_DmPayment {
+// is not a DM payment.
+func GetDmPayment(appMetadata []byte) *intentpb.ChatMetadata_DmPayment {
 	return GetChatMetadata(appMetadata).GetDmPayment()
 }
 
@@ -126,7 +126,7 @@ var sendByDefaultCutoff = time.Date(2026, time.September, 30, 0, 0, 0, 0, time.U
 // and copies onto the intent's history records, so every caller passes the
 // same time for the same payment.
 func GetDmPaymentVerb(appMetadata []byte, createdAt time.Time) messagingpb.CashContent_Verb {
-	dmPayment := GetTipDmPayment(appMetadata)
+	dmPayment := GetDmPayment(appMetadata)
 	if dmPayment == nil {
 		return messagingpb.CashContent_SENT
 	}
@@ -240,8 +240,8 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 	return nil
 }
 
-// validateTipDmAppMetadata enforces that a SendPublicPayment carrying chat app
-// metadata is a well-formed tip DM payment. Unlike contact DMs, tip DMs are
+// validateDmAppMetadata enforces that a SendPublicPayment carrying chat app
+// metadata is a well-formed DM payment. Unlike contact DMs, these DMs are
 // keyed on user IDs alone — neither party is required to have a phone number
 // linked for payment, since a payment can come from a stranger who only has
 // the recipient's Flipcard.
@@ -257,14 +257,14 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 // rather than stacking on it. Once the chat exists the gate has been paid, and
 // every later payment into it may be any amount. No payment either way between
 // a user and the Flipcash team account is allowed, tip or send.
-func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
+func (i *Integration) validateDmAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
 	chatMetadata := appMetadata.GetChat()
-	tipDmPayment := chatMetadata.GetDmPayment()
-	if tipDmPayment == nil {
+	dmPayment := chatMetadata.GetDmPayment()
+	if dmPayment == nil {
 		return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
 	}
 
-	senderUserID, recipientUserID, err := i.resolveDirectDmPaymentParties(ctx, intentRecord, "tip dm")
+	senderUserID, recipientUserID, err := i.resolveDirectDmPaymentParties(ctx, intentRecord, "dm")
 	if err != nil {
 		return err
 	}
@@ -281,13 +281,13 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 	// the message of a payment already made. The team sends nothing this way
 	// either.
 	if i.isTeamAccount(senderUserID) || i.isTeamAccount(recipientUserID) {
-		return ocp_transaction.NewIntentDeniedError("tip dm payments with the flipcash team are not allowed")
+		return ocp_transaction.NewIntentDeniedError("dm payments with the flipcash team are not allowed")
 	}
 
-	// The chat must be the canonical tip DM between the sender and recipient.
+	// The chat must be the canonical DM between the sender and recipient.
 	expectedChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
 	if !bytes.Equal(chatMetadata.GetChatId().GetValue(), expectedChatID.Value) {
-		return ocp_transaction.NewIntentValidationError("chat id does not match the tip dm between sender and recipient")
+		return ocp_transaction.NewIntentValidationError("chat id does not match the dm between sender and recipient")
 	}
 
 	_, err = i.chats.GetChatByID(ctx, expectedChatID)
@@ -316,7 +316,7 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 	}
 
 	if fee == nil {
-		return validateMinimumTipAmount(intentRecord.SendPublicPaymentMetadata)
+		return validateDefaultMinimumToChat(intentRecord.SendPublicPaymentMetadata)
 	}
 	return i.validateMinDmChatInitFee(ctx, intentRecord.SendPublicPaymentMetadata, fee)
 }
@@ -379,21 +379,22 @@ func (i *Integration) validateMinDmChatInitFee(ctx context.Context, paymentMetad
 	return nil
 }
 
-// validateMinimumTipAmount enforces the tip preset minimum for the payment's
-// exchange currency on the payment that initializes a chat with a recipient who
-// has set no minimum DM chat initialization fee. Clients surface the minimum
-// as the first tip preset, but the amount is ultimately client-chosen, so the
-// floor is enforced here too.
+// validateDefaultMinimumToChat enforces the tip preset minimum for the
+// payment's exchange currency on the payment that initializes a chat with a
+// recipient who has set no minimum DM chat initialization fee. Clients surface
+// the minimum as the first tip preset, but the amount is ultimately
+// client-chosen, so the floor is enforced here too.
 // Currencies without a preset fall back to a USD floor applied to the payment's
 // USD market value, so no currency is left without a minimum.
-func validateMinimumTipAmount(paymentMetadata *ocp_intent.SendPublicPaymentMetadata) error {
+func validateDefaultMinimumToChat(paymentMetadata *ocp_intent.SendPublicPaymentMetadata) error {
 	currencyCode := paymentMetadata.ExchangeCurrency
 	amount := paymentMetadata.NativeAmount
-	presets, ok := tip.PresetsFor(currencyCode)
+	presets, ok := send.PresetsFor(currencyCode)
 	minimum := presets.Minimum
 	if !ok {
-		// USD always has presets; tip's tests pin the row the fallback reads.
-		usdPresets, _ := tip.PresetsFor(currency_lib.USD)
+		// USD always has presets; the send package's tests pin the row the
+		// fallback reads.
+		usdPresets, _ := send.PresetsFor(currency_lib.USD)
 		currencyCode, amount, minimum = currency_lib.USD, paymentMetadata.UsdMarketValue, usdPresets.Minimum
 	}
 

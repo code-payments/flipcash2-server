@@ -139,15 +139,15 @@ func dmPaymentIntentRecord(t *testing.T, chatMetadata *intentpb.ChatMetadata, in
 	}
 }
 
-func tipDmChatMetadata(chatID *commonpb.ChatId) *intentpb.ChatMetadata {
-	return tipDmChatMetadataFrom(chatID, intentpb.ChatMetadata_DmPayment_FLIPCARD)
+func dmChatMetadata(chatID *commonpb.ChatId) *intentpb.ChatMetadata {
+	return dmChatMetadataFrom(chatID, intentpb.ChatMetadata_DmPayment_FLIPCARD)
 }
 
-func tipDmChatMetadataFrom(chatID *commonpb.ChatId, location intentpb.ChatMetadata_DmPayment_Location) *intentpb.ChatMetadata {
-	return tipDmChatMetadataWithAction(chatID, location, intentpb.ChatMetadata_DmPayment_DEFAULT)
+func dmChatMetadataFrom(chatID *commonpb.ChatId, location intentpb.ChatMetadata_DmPayment_Location) *intentpb.ChatMetadata {
+	return dmChatMetadataWithAction(chatID, location, intentpb.ChatMetadata_DmPayment_DEFAULT)
 }
 
-func tipDmChatMetadataWithAction(chatID *commonpb.ChatId, location intentpb.ChatMetadata_DmPayment_Location, action intentpb.ChatMetadata_DmPayment_Action) *intentpb.ChatMetadata {
+func dmChatMetadataWithAction(chatID *commonpb.ChatId, location intentpb.ChatMetadata_DmPayment_Location, action intentpb.ChatMetadata_DmPayment_Action) *intentpb.ChatMetadata {
 	return &intentpb.ChatMetadata{
 		ChatId: chatID,
 		Type: &intentpb.ChatMetadata_DmPayment_{
@@ -168,19 +168,19 @@ func contactDmChatMetadata(chatID *commonpb.ChatId, sourcePhone, destinationPhon
 	}
 }
 
-func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
+func TestIntegration_AllowCreation_DmPayment(t *testing.T) {
 	e := newIntegrationEnv(t)
 
 	senderUserID, senderKeys := e.bindUser(t)
 	recipientUserID, recipientKeys := e.bindUser(t)
 
-	tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
 
 	validRecord := func() *ocp_intent.Record {
-		return dmPaymentIntentRecord(t, tipDmChatMetadata(tipChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+		return dmPaymentIntentRecord(t, dmChatMetadata(dmChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
 	}
 
-	// A valid tip requires no phone numbers anywhere: neither party has one
+	// A valid payment requires no phone numbers anywhere: neither party has one
 	// linked in this env, which is the defining difference from contact DMs.
 	t.Run("valid", func(t *testing.T) {
 		require.NoError(t, e.integration.AllowCreation(e.ctx, validRecord(), nil, nil))
@@ -216,9 +216,9 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "recipient is not a flipcash user")
 	})
 
-	t.Run("denied_self_tip", func(t *testing.T) {
+	t.Run("denied_self_payment", func(t *testing.T) {
 		selfChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, senderUserID)
-		record := dmPaymentIntentRecord(t, tipDmChatMetadata(selfChatID), base58.Encode(senderKeys.Public()), base58.Encode(senderKeys.Public()))
+		record := dmPaymentIntentRecord(t, dmChatMetadata(selfChatID), base58.Encode(senderKeys.Public()), base58.Encode(senderKeys.Public()))
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "payment to yourself")
 	})
 
@@ -263,11 +263,11 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		}
 	})
 
-	// A tip payment referencing the pair's *contact* DM must fail: the two
+	// A DM payment referencing the pair's *contact* DM must fail: the two
 	// chat types derive distinct canonical IDs.
 	t.Run("rejected_contact_dm_chat_id", func(t *testing.T) {
 		contactChatID := chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, senderUserID, recipientUserID)
-		record := dmPaymentIntentRecord(t, tipDmChatMetadata(contactChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+		record := dmPaymentIntentRecord(t, dmChatMetadata(contactChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "chat id does not match")
 	})
 
@@ -291,10 +291,10 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 				e := newIntegrationEnv(t)
 				senderUserID, senderKeys := e.bindUser(t)
 				recipientUserID, recipientKeys := e.bindUser(t)
-				tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
+				dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
 
 				record := func(nativeAmount float64) *ocp_intent.Record {
-					record := dmPaymentIntentRecord(t, tipDmChatMetadataWithAction(tipChatID, tc.location, tc.action), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+					record := dmPaymentIntentRecord(t, dmChatMetadataWithAction(dmChatID, tc.location, tc.action), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
 					record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.USD
 					record.SendPublicPaymentMetadata.NativeAmount = nativeAmount
 					record.SendPublicPaymentMetadata.UsdMarketValue = nativeAmount
@@ -306,7 +306,7 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 				require.NoError(t, e.integration.AllowCreation(e.ctx, record(1.0), nil, nil))
 
 				require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
-					ID:      tipChatID,
+					ID:      dmChatID,
 					Type:    chatpb.ChatType_DM,
 					Members: []*commonpb.UserId{senderUserID, recipientUserID},
 				}))
@@ -325,10 +325,10 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		e := newIntegrationEnv(t)
 		senderUserID, senderKeys := e.bindUser(t)
 		recipientUserID, recipientKeys := e.bindUser(t)
-		tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
+		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
 
 		record := func(location intentpb.ChatMetadata_DmPayment_Location, currency string, nativeAmount float64) *ocp_intent.Record {
-			record := dmPaymentIntentRecord(t, tipDmChatMetadataFrom(tipChatID, location), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+			record := dmPaymentIntentRecord(t, dmChatMetadataFrom(dmChatID, location), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
 			record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.Code(currency)
 			record.SendPublicPaymentMetadata.NativeAmount = nativeAmount
 			record.SendPublicPaymentMetadata.UsdMarketValue = nativeAmount
@@ -337,7 +337,7 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 			}
 			return record
 		}
-		tip := func(currency string, nativeAmount float64) *ocp_intent.Record {
+		pay := func(currency string, nativeAmount float64) *ocp_intent.Record {
 			return record(intentpb.ChatMetadata_DmPayment_FLIPCARD, currency, nativeAmount)
 		}
 		setFee := func(currency string, nativeAmount float64) {
@@ -345,7 +345,7 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		}
 
 		// No fee set: only the preset minimum applies.
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 1.0), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("usd", 1.0), nil, nil))
 
 		setFee("usd", 10)
 		for _, tc := range []struct {
@@ -365,7 +365,7 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 			{"eur", 9.0, true, ""},
 			{"eur", 8.9, false, "chat initialization fee"},
 		} {
-			err := e.integration.AllowCreation(e.ctx, tip(tc.currency, tc.nativeAmount), nil, nil)
+			err := e.integration.AllowCreation(e.ctx, pay(tc.currency, tc.nativeAmount), nil, nil)
 			if tc.allowed {
 				require.NoError(t, err, "%s %v", tc.currency, tc.nativeAmount)
 			} else {
@@ -377,25 +377,25 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		// through the live rate otherwise, with the rounding slack in the fee's
 		// currency.
 		setFee("jpy", 1_000)
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("jpy", 1_000), nil, nil))
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("jpy", 999.5), nil, nil))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("jpy", 999), nil, nil), "chat initialization fee")
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 6.67), nil, nil))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("usd", 6.66), nil, nil), "chat initialization fee")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("jpy", 1_000), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("jpy", 999.5), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay("jpy", 999), nil, nil), "chat initialization fee")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("usd", 6.67), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay("usd", 6.66), nil, nil), "chat initialization fee")
 
 		// The fee replaces the preset minimum of the payer's currency: a fee at
 		// JPY's preset minimum is cleared by EUR 0.70 (JPY 116.67 at the live
 		// rate) even though EUR's own preset minimum is 1.00, while EUR 0.59
 		// (JPY 98.33) is short of the fee, not the preset.
 		setFee("jpy", 100)
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("eur", 0.7), nil, nil))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("eur", 0.59), nil, nil), "chat initialization fee")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("eur", 0.7), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay("eur", 0.59), nil, nil), "chat initialization fee")
 
 		// A fee in a currency with no live rate cannot be compared against a
 		// payment in another currency, and is denied rather than waved through.
 		setFee("kwd", 1)
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("kwd", 1), nil, nil))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("usd", 100), nil, nil), "no exchange rate")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("kwd", 1), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay("usd", 100), nil, nil), "no exchange rate")
 
 		// A send from within the chat is held to the same fee before
 		// initialization.
@@ -406,19 +406,19 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		// Once the chat exists nothing applies: tips and sends alike are any
 		// amount, below the fee and below the preset minimum.
 		require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
-			ID:      tipChatID,
+			ID:      dmChatID,
 			Type:    chatpb.ChatType_DM,
 			Members: []*commonpb.UserId{senderUserID, recipientUserID},
 		}))
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 1.0), nil, nil))
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 0.5), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("usd", 1.0), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("usd", 0.5), nil, nil))
 		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_DmPayment_CHAT, "usd", 0.01), nil, nil))
 	})
 }
 
-// No tip DM payment is allowed to or from the Flipcash team account, tip or
+// No DM payment is allowed to or from the Flipcash team account, tip or
 // send, whether or not the DM exists (the team's welcome creates it).
-func TestIntegration_AllowCreation_TipDmPayment_TeamAccount(t *testing.T) {
+func TestIntegration_AllowCreation_DmPayment_TeamAccount(t *testing.T) {
 	e := newIntegrationEnv(t)
 	userID, userKeys := e.bindUser(t)
 	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, userID, e.team)
@@ -431,7 +431,7 @@ func TestIntegration_AllowCreation_TipDmPayment_TeamAccount(t *testing.T) {
 		{"from_team", e.teamKeys, userKeys},
 	}
 	payment := func(from, to model.KeyPair, action intentpb.ChatMetadata_DmPayment_Action) *ocp_intent.Record {
-		metadata := tipDmChatMetadataWithAction(chatID, intentpb.ChatMetadata_DmPayment_CHAT, action)
+		metadata := dmChatMetadataWithAction(chatID, intentpb.ChatMetadata_DmPayment_CHAT, action)
 		return dmPaymentIntentRecord(t, metadata, base58.Encode(from.Public()), base58.Encode(to.Public()))
 	}
 	requireDenied := func(t *testing.T) {
@@ -528,28 +528,28 @@ func TestIntegration_AllowCreation_ContactDmPayment(t *testing.T) {
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, r, nil, nil), "recipient is not linked to the destination phone number")
 	})
 
-	// A contact payment referencing the pair's *tip* DM must fail: the two
+	// A contact payment referencing the pair's DM must fail: the two
 	// chat types derive distinct canonical IDs.
-	t.Run("rejected_tip_dm_chat_id", func(t *testing.T) {
-		tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
-		r := record(contactDmChatMetadata(tipChatID, senderPhone, recipientPhone))
+	t.Run("rejected_dm_chat_id", func(t *testing.T) {
+		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
+		r := record(contactDmChatMetadata(dmChatID, senderPhone, recipientPhone))
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, r, nil, nil), "chat id does not match")
 	})
 }
 
-func TestIntegration_GetTasksToSchedule_TipDmPayment(t *testing.T) {
+func TestIntegration_GetTasksToSchedule_DmPayment(t *testing.T) {
 	e := newIntegrationEnv(t)
 
 	senderUserID, senderKeys := e.bindUser(t)
 	recipientUserID, recipientKeys := e.bindUser(t)
 
-	tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
-	record := dmPaymentIntentRecord(t, tipDmChatMetadata(tipChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
+	record := dmPaymentIntentRecord(t, dmChatMetadata(dmChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
 
 	tasks, err := e.integration.GetTasksToSchedule(e.ctx, record)
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
-	assert.Equal(t, intent.TaskTypeSendTipDmPaymentMessage, tasks[0].Type)
+	assert.Equal(t, intent.TaskTypeSendDmPaymentMessage, tasks[0].Type)
 	require.NotNil(t, tasks[0].ReferenceId)
 	assert.Equal(t, record.IntentId, *tasks[0].ReferenceId)
 	require.NoError(t, tasks[0].Validate())

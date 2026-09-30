@@ -31,18 +31,18 @@ var clientMessageIDNamespace = uuid.MustParse("0fea31a1-c7d6-4084-b481-fde267cf1
 // SendMessages sends messages from the team account to userID, in the chat
 // between them, creating the chat first if it does not exist yet, and returns
 // the chat's ID and the messages as persisted, in order. The chat is their
-// canonical tip DM, the type DMs open as, so a tip the user sends the team
-// lands in the same conversation. Each element of messages is one message's
-// content, and they land as one batch (see messaging.Sender.SendBatch): the
-// user sees all of them or none, in order, each counting toward their unread
-// and earning its own push. At most messaging.MaxMessagesPerPut messages go in
-// one call. The team account is the one sender was built with (see
-// messaging.NewSender), so the account these messages are sent as is
-// the one the Sender treats as the team, and the one the parent configured
-// the chat store to exclude from the feed (see chat.FeedExclusions):
-// the parent resolves it once, at startup, with GetUserID. It fails with
-// ErrNoTeamAccount when sender has none, as it has when the process started
-// before the team account was set up; setting it up takes a restart.
+// canonical DM (ChatType_DM), the type DMs open as. Each element of messages is
+// one message's content, and they land as one batch (see
+// messaging.Sender.SendBatch): the user sees all of them or none, in order,
+// each counting toward their unread and earning its own push. At most
+// messaging.MaxMessagesPerPut messages go in one call. The team account is the
+// one sender was built with (see messaging.NewSender), so the account these
+// messages are sent as is the one the Sender treats as the team, and the one
+// the parent configured the chat store to exclude from the feed (see
+// chat.FeedExclusions): the parent resolves it once, at startup, with
+// GetUserID. It fails with ErrNoTeamAccount when sender has none, as it has
+// when the process started before the team account was set up; setting it up
+// takes a restart.
 //
 // It is idempotent on (the chat, idempotencyKey): the messages' client message
 // IDs are derived from the pair and each message's position, so a retry with
@@ -104,14 +104,14 @@ func SendMessages(
 	return chatID, sent, nil
 }
 
-// ensureChat creates the tip DM chatID between the team account and userID
+// ensureChat creates the DM chatID between the team account and userID
 // unless it already exists. An earlier call, a prior attempt of this one, or a
-// tip between the two may have created it, so an existing chat is expected,
-// not a failure.
+// DM payment between the two (made before those were refused) may have
+// created it, so an existing chat is expected, not a failure.
 //
 // The chat store excludes the team account from the feed of every DM it
-// creates with it (see chat.FeedExclusions), this one and one a tip the
-// user sent the team first created alike, so nothing here asks for it.
+// creates with it (see chat.FeedExclusions), this one and one a payment
+// created first alike, so nothing here asks for it.
 //
 // The chat is looked up before it is created, rather than created and
 // ErrChatExists ignored, because a create that finds the chat already there is

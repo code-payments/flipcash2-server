@@ -1765,9 +1765,9 @@ func testStore_GetDmFeedPage_TypeScoped(t *testing.T, s chat.Store) {
 	other := model.MustGenerateUserID()
 
 	contact1 := putDmChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, other, at(100))
-	tip1 := putDmChatOfType(t, s, chatpb.ChatType_DM, user, other, at(200))
+	dm1 := putDmChatOfType(t, s, chatpb.ChatType_DM, user, other, at(200))
 	contact2 := putDmChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, other, at(300))
-	tip2 := putDmChatOfType(t, s, chatpb.ChatType_DM, user, other, at(400))
+	dm2 := putDmChatOfType(t, s, chatpb.ChatType_DM, user, other, at(400))
 
 	// Each feed contains only its own type, most recent first.
 	contacts, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
@@ -1777,22 +1777,22 @@ func testStore_GetDmFeedPage_TypeScoped(t *testing.T, s chat.Store) {
 		require.Equal(t, chatpb.ChatType_CONTACT_DM, c.Type)
 	}
 
-	tips, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), nil, 0)
+	dms, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), nil, 0)
 	require.NoError(t, err)
-	require.Equal(t, [][]byte{tip2.ID.Value, tip1.ID.Value}, chatIDValues(tips))
-	for _, c := range tips {
+	require.Equal(t, [][]byte{dm2.ID.Value, dm1.ID.Value}, chatIDValues(dms))
+	for _, c := range dms {
 		require.Equal(t, chatpb.ChatType_DM, c.Type)
 	}
 
 	// Paging within one feed steps over the other type's activity: a limit-1
-	// tip page resumes at the older tip, not at the interleaved contact chats.
-	tipPage1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), nil, 1)
+	// DM page resumes at the older DM, not at the interleaved contact chats.
+	dmPage1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), nil, 1)
 	require.NoError(t, err)
-	require.Equal(t, [][]byte{tip2.ID.Value}, chatIDValues(tipPage1))
+	require.Equal(t, [][]byte{dm2.ID.Value}, chatIDValues(dmPage1))
 
-	tipPage2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), cursorOf(tipPage1[0]), 1)
+	dmPage2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), cursorOf(dmPage1[0]), 1)
 	require.NoError(t, err)
-	require.Equal(t, [][]byte{tip1.ID.Value}, chatIDValues(tipPage2))
+	require.Equal(t, [][]byte{dm1.ID.Value}, chatIDValues(dmPage2))
 }
 
 func cursorOf(c *chat.Chat) *chat.DmFeedCursor {

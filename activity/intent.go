@@ -101,7 +101,7 @@ type unlocalizedNotification struct {
 }
 
 func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, userOwnerAccount *ocp_common.Account, intentRecords []*ocp_intent.Record) ([]*activitypb.Notification, error) {
-	counterpartyUserIDs, err := s.resolveTipDmCounterparties(ctx, userOwnerAccount, intentRecords)
+	counterpartyUserIDs, err := s.resolveDmCounterparties(ctx, userOwnerAccount, intentRecords)
 	if err != nil {
 		return nil, err
 	}
@@ -192,9 +192,9 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 							Phone: contactPayment.GetDestination(),
 						}
 					} else if recipientUserID, ok := counterpartyUserIDs[intentMetadata.DestinationOwnerAccount]; ok {
-						// A tip DM identifies the recipient by user ID instead, so the
-						// client can render their profile without either party's phone
-						// number, which stays private in a tip DM.
+						// A DM payment identifies the recipient by user ID instead, so
+						// the client can render their profile without either party's
+						// phone number, which stays private outside contact DMs.
 						directlySentMetadata.DestinationIdentifier = &activitypb.DirectlySentCryptoNotificationMetadata_UserId{
 							UserId: recipientUserID,
 						}
@@ -289,19 +289,19 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 	return notifications, nil
 }
 
-// resolveTipDmCounterparties returns the user ID of the other party to each tip
-// DM payment in intentRecords, keyed by that party's owner account. Unlike a
-// contact DM, a tip DM carries no phone number for either side, so the feed
+// resolveDmCounterparties returns the user ID of the other party to each DM
+// payment in intentRecords, keyed by that party's owner account. Unlike a
+// contact DM payment, a DM payment carries no phone number for either side, so the feed
 // identifies the counterparty by user ID — resolved here for the whole page in
 // one lookup rather than once per notification.
 //
-// Only tip DM payments are resolved. A payment handed off in person also has an
+// Only DM payments are resolved. A payment handed off in person also has an
 // owner account that would resolve, but no identity was exchanged there, so
 // naming the counterparty would disclose one that neither party shared.
-func (s *Server) resolveTipDmCounterparties(ctx context.Context, userOwnerAccount *ocp_common.Account, intentRecords []*ocp_intent.Record) (map[string]*commonpb.UserId, error) {
+func (s *Server) resolveDmCounterparties(ctx context.Context, userOwnerAccount *ocp_common.Account, intentRecords []*ocp_intent.Record) (map[string]*commonpb.UserId, error) {
 	var pubKeys []*commonpb.PublicKey
 	for _, intentRecord := range intentRecords {
-		if intentRecord.IntentType != ocp_intent.SendPublicPayment || intent.GetTipDmPayment(intentRecord.AppMetadata) == nil {
+		if intentRecord.IntentType != ocp_intent.SendPublicPayment || intent.GetDmPayment(intentRecord.AppMetadata) == nil {
 			continue
 		}
 

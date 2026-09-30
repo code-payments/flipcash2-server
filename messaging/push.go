@@ -232,7 +232,7 @@ func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, cha
 		if senderProfile.DisplayName == "" {
 			return nil
 		}
-		p.push, err = push.BuildTipDmPush(ctx, p.sender.ocpData, p.chatID, p.message, p.message.SenderId, senderProfile.DisplayName)
+		p.push, err = push.BuildDmPush(ctx, p.sender.ocpData, p.chatID, p.message, p.message.SenderId, senderProfile.DisplayName)
 	case chatpb.ChatType_GROUP:
 		if senderProfile.DisplayName == "" {
 			return nil

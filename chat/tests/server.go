@@ -54,7 +54,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_Denied,
 		testServer_GetChat_Hydrates,
 		testServer_GetChat_HydrationFailureCancelsSiblings,
-		testServer_GetChat_TipDm_HidesPhoneNumbers,
+		testServer_GetChat_Dm_HidesPhoneNumbers,
 		testServer_GetChat_Dm_NoCreator,
 		testServer_GetChat_Dm_UseE2ee,
 		testServer_GetChat_Dm_UseE2ee_TeamAccount,
@@ -1229,7 +1229,7 @@ func testServer_GetChat_HydrationFailureCancelsSiblings(t *testing.T, s chat.Sto
 	require.True(t, <-cancelled)
 }
 
-func testServer_GetChat_TipDm_HidesPhoneNumbers(t *testing.T, s chat.Store) {
+func testServer_GetChat_Dm_HidesPhoneNumbers(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
 	peer := model.MustGenerateUserID()
@@ -1918,7 +1918,7 @@ func testServer_GetDmChatFeed_TypeScoped(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
 	contactID := e.putDMOfType(chatpb.ChatType_CONTACT_DM, at(1))
-	tipID := e.putDMOfType(chatpb.ChatType_DM, at(2))
+	dmID := e.putDMOfType(chatpb.ChatType_DM, at(2))
 
 	contactResp, err := e.getDmFeedOfType(chatpb.ChatType_CONTACT_DM, &commonpb.QueryOptions{})
 	require.NoError(t, err)
@@ -1927,12 +1927,12 @@ func testServer_GetDmChatFeed_TypeScoped(t *testing.T, s chat.Store) {
 	require.Equal(t, contactID.Value, contactResp.Chats[0].ChatId.Value)
 	require.Equal(t, chatpb.ChatType_CONTACT_DM, contactResp.Chats[0].Type)
 
-	tipResp, err := e.getDmFeedOfType(chatpb.ChatType_DM, &commonpb.QueryOptions{})
+	dmResp, err := e.getDmFeedOfType(chatpb.ChatType_DM, &commonpb.QueryOptions{})
 	require.NoError(t, err)
-	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, tipResp.Result)
-	require.Len(t, tipResp.Chats, 1)
-	require.Equal(t, tipID.Value, tipResp.Chats[0].ChatId.Value)
-	require.Equal(t, chatpb.ChatType_DM, tipResp.Chats[0].Type)
+	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, dmResp.Result)
+	require.Len(t, dmResp.Chats, 1)
+	require.Equal(t, dmID.Value, dmResp.Chats[0].ChatId.Value)
+	require.Equal(t, chatpb.ChatType_DM, dmResp.Chats[0].Type)
 }
 
 func testServer_GetDmChatFeed_TokenBoundToType(t *testing.T, s chat.Store) {

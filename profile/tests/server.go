@@ -32,9 +32,9 @@ import (
 	"github.com/code-payments/flipcash2-server/moderation"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/protoutil"
+	"github.com/code-payments/flipcash2-server/send"
 	"github.com/code-payments/flipcash2-server/social/x"
 	"github.com/code-payments/flipcash2-server/testutil"
-	"github.com/code-payments/flipcash2-server/tip"
 )
 
 func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store, teardown func()) {
@@ -417,7 +417,7 @@ func testMinDmChatInitFee(t *testing.T, accounts account.Store, profiles profile
 		return resp.UserProfile.MinDmChatInitFee
 	}
 
-	usdMinimum, ok := tip.PresetsFor("usd")
+	usdMinimum, ok := send.PresetsFor("usd")
 	require.True(t, ok)
 
 	t.Run("Unregistered user is denied", func(t *testing.T) {

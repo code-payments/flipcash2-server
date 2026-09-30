@@ -57,8 +57,8 @@ func TestChatMessagePush_MessageOrID(t *testing.T) {
 		"contact dm": func(m *messagingpb.Message) (*ChatMessagePush, error) {
 			return BuildContactDmPush(ctx, nil, chatID, m, senderID, phone)
 		},
-		"tip dm": func(m *messagingpb.Message) (*ChatMessagePush, error) {
-			return BuildTipDmPush(ctx, nil, chatID, m, senderID, "Sender Name")
+		"dm": func(m *messagingpb.Message) (*ChatMessagePush, error) {
+			return BuildDmPush(ctx, nil, chatID, m, senderID, "Sender Name")
 		},
 		"group": func(m *messagingpb.Message) (*ChatMessagePush, error) {
 			return BuildGroupChatPush(ctx, nil, groupID, m, senderID, "Sender Name", "Group Title")
@@ -141,7 +141,7 @@ func TestChatMessagePush_Widget(t *testing.T) {
 		}},
 	}})
 
-	dm, err := BuildTipDmPush(ctx, nil, chatID, message, senderID, "Flipcash")
+	dm, err := BuildDmPush(ctx, nil, chatID, message, senderID, "Flipcash")
 	require.NoError(t, err)
 	require.NotNil(t, dm)
 	require.Equal(t, "https://flipcash.com/alice_1", dm.body)
@@ -155,7 +155,7 @@ func TestChatMessagePush_Widget(t *testing.T) {
 
 	// A widget variant this server does not know earns no push.
 	unknown := testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Widget{Widget: &messagingpb.WidgetContent{}}})
-	none, err := BuildTipDmPush(ctx, nil, chatID, unknown, senderID, "Flipcash")
+	none, err := BuildDmPush(ctx, nil, chatID, unknown, senderID, "Flipcash")
 	require.NoError(t, err)
 	require.Nil(t, none)
 }

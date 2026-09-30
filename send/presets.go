@@ -1,4 +1,4 @@
-package tip
+package send
 
 import (
 	"slices"
@@ -7,9 +7,11 @@ import (
 	currency_lib "github.com/code-payments/ocp-server/currency"
 )
 
-// Presets are the tip amounts offered for a currency, in major currency units.
-// Minimum is the floor enforced on any tip; the remaining tiers are the amounts
-// clients surface as one-tap presets.
+// Presets are the payment amounts offered for a currency, in major currency
+// units. Minimum is the floor enforced on the payment that opens a DM, send or
+// tip, when the recipient has set no DM chat initialization fee, and the least
+// such a fee may be; the remaining tiers are the amounts clients surface as
+// one-tap presets.
 type Presets struct {
 	Minimum float64
 	Low     float64
@@ -40,12 +42,12 @@ func PresetsFor(region currency_lib.Code) (Presets, bool) {
 	return presets, ok
 }
 
-// All returns every currency's presets, ordered by currency code.
-func All() []Entry {
+// AllPresets returns every currency's presets, ordered by currency code.
+func AllPresets() []Entry {
 	return slices.Clone(ordered)
 }
 
-// presetsByRegion is the fiat tip preset table. Each minimum is a locally
+// presetsByRegion is the fiat preset table. Each minimum is a locally
 // recognizable cash denomination near a one-dollar gesture, chosen for product
 // familiarity rather than exact exchange-rate parity, and always sits below the
 // currency's low preset. Clients receive this table through user flags, so

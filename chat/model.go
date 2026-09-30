@@ -115,7 +115,7 @@ func MustGenerateGroupChatID() *commonpb.ChatId {
 // ID derived for another purpose, even if that purpose hashes the same members.
 //
 // Contact DMs hash under this bare domain; every other DM type appends its
-// ChatType number (e.g. "flipcash:chat:dm:2" for tip DMs), so the same pair of
+// ChatType number (e.g. "flipcash:chat:dm:2" for DM), so the same pair of
 // users derives a distinct chat per DM type.
 const dmChatIDDomain = "flipcash:chat:dm"
 

@@ -20,7 +20,7 @@ import (
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/rpc"
-	"github.com/code-payments/flipcash2-server/tip"
+	"github.com/code-payments/flipcash2-server/send"
 	ocp_client "github.com/code-payments/ocp-server/grpc/client"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 )
@@ -105,7 +105,7 @@ var (
 )
 
 func init() {
-	entries := tip.All()
+	entries := send.AllPresets()
 	tipPresets = make([]*accountpb.TipPresets, 0, len(entries))
 	for _, entry := range entries {
 		tipPresets = append(tipPresets, &accountpb.TipPresets{

@@ -1521,7 +1521,7 @@ func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blockl
 	team := model.MustGenerateUserID()
 	e := newServerEnvWithTeam(t, badges, blocklists, chats, messages, profiles, team)
 
-	// A display name is what a tip-DM push renders, so both have one: a push
+	// A display name is what a DM push renders, so both have one: a push
 	// that is missing is missing because of the team account, not the name.
 	require.NoError(t, profiles.SetDisplayName(e.ctx, team, "Flipcash"))
 	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
@@ -1575,8 +1575,8 @@ func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blockl
 	e.waitForNewMessage(e.userA, fromTeam.MessageId.Value)
 	require.Eventually(t, func() bool { return pushedTo(e.userA) }, time.Second, 20*time.Millisecond)
 
-	// A message from the user, which only the Sender can put in the DM (a tip's
-	// payment message, say; the server refuses a user's own send, see
+	// A message from the user, which only the Sender can put in the DM (a DM
+	// payment's message, say; the server refuses a user's own send, see
 	// testServer_TeamAccount_Refused), advances their own pointer as usual.
 	reply, err := e.sender.Send(e.ctx, dmID, e.userA, textContent("thanks"), generateClientID(), true)
 	require.NoError(t, err)
@@ -1605,7 +1605,7 @@ func testServer_TeamAccount_Refused(t *testing.T, badges badge.Store, blocklists
 	e.authz.Add(team, teamKeys)
 
 	// A DM of each type between userA and the team, each with a message from
-	// userA put there through the Sender (as a tip's payment message is), so
+	// userA put there through the Sender (as a DM payment's message is), so
 	// an edit and a deletion have something of userA's to target.
 	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_DM} {
 		dmID := chat.MustDeriveDmChatID(chatType, e.userA, team)
@@ -1615,7 +1615,7 @@ func testServer_TeamAccount_Refused(t *testing.T, badges badge.Store, blocklists
 			Members:      []*commonpb.UserId{e.userA, team},
 			LastActivity: at(1),
 		}))
-		own, err := e.sender.Send(e.ctx, dmID, e.userA, textContent("tip"), generateClientID(), true)
+		own, err := e.sender.Send(e.ctx, dmID, e.userA, textContent("hello"), generateClientID(), true)
 		require.NoError(t, err)
 
 		// Nobody speaks in it through the server: not the user, and not the
@@ -1644,7 +1644,7 @@ func testServer_TeamAccount_Refused(t *testing.T, badges badge.Store, blocklists
 		require.Equal(t, messagingpb.GetMessagesResponse_OK, read.Result)
 		require.Len(t, read.Messages.Messages, 1)
 		require.Equal(t, own.MessageId.Value, read.Messages.Messages[0].MessageId.Value)
-		require.Equal(t, "tip", read.Messages.Messages[0].Content[0].GetText().GetText())
+		require.Equal(t, "hello", read.Messages.Messages[0].Content[0].GetText().GetText())
 	}
 
 	// A DM with anyone else is unaffected.
@@ -3399,7 +3399,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	// The sender has both a display name and a phone number, so each chat type
 	// must actively pick the right identifier.
 	const senderPhone = "+15551234567"
-	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Tipper Name"))
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
 	require.NoError(t, profiles.LinkPhoneNumber(e.ctx, e.userA, senderPhone, &commonpb.Hash{Value: make([]byte, 32)}))
 
 	// The push path recovers the chat type from the canonical DM derivation,
@@ -3429,24 +3429,24 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 		return pushes
 	}
 
-	tipMessage := send(chatpb.ChatType_DM, "tip message")
+	dmMessage := send(chatpb.ChatType_DM, "dm message")
 	pushes := waitForPushes(1)
 
-	tipPush := pushes[0]
-	require.Equal(t, "Tipper Name", tipPush.title)
-	require.Equal(t, "tip message", tipPush.body)
-	require.Empty(t, tipPush.payload.TitleSubstitutions)
-	require.Len(t, tipPush.users, 1)
-	require.Equal(t, e.userB.Value, tipPush.users[0].Value)
+	dmPush := pushes[0]
+	require.Equal(t, "Sender Name", dmPush.title)
+	require.Equal(t, "dm message", dmPush.body)
+	require.Empty(t, dmPush.payload.TitleSubstitutions)
+	require.Len(t, dmPush.users, 1)
+	require.Equal(t, e.userB.Value, dmPush.users[0].Value)
 	// The chat metadata carries the entire sent message, so a client can
 	// render the notification from it without a round trip to the server.
-	require.Equal(t, chatpb.ChatType_DM, tipPush.payload.ChatMetadata.Type)
-	require.Equal(t, e.userA.Value, tipPush.payload.ChatMetadata.SendingUserId.Value)
-	require.True(t, proto.Equal(tipMessage, tipPush.payload.ChatMetadata.GetMessage()))
+	require.Equal(t, chatpb.ChatType_DM, dmPush.payload.ChatMetadata.Type)
+	require.Equal(t, e.userA.Value, dmPush.payload.ChatMetadata.SendingUserId.Value)
+	require.True(t, proto.Equal(dmMessage, dmPush.payload.ChatMetadata.GetMessage()))
 	// Nothing in the push may carry the sender's phone number.
-	require.NotContains(t, tipPush.title, senderPhone)
-	require.NotContains(t, tipPush.body, senderPhone)
-	require.NotContains(t, tipPush.payload.String(), strings.TrimPrefix(senderPhone, "+"))
+	require.NotContains(t, dmPush.title, senderPhone)
+	require.NotContains(t, dmPush.body, senderPhone)
+	require.NotContains(t, dmPush.payload.String(), strings.TrimPrefix(senderPhone, "+"))
 
 	contactMessage := send(chatpb.ChatType_CONTACT_DM, "contact message")
 	pushes = waitForPushes(2)
@@ -3637,7 +3637,7 @@ func testServer_SendMessage_GroupChatPush(t *testing.T, badges badge.Store, bloc
 func testServer_SendMessage_SuppressedForBlockedSender(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
-	// A display name is what a tip-DM push renders, so its presence rules out a
+	// A display name is what a DM push renders, so its presence rules out a
 	// missing-name early return as the reason no push is sent.
 	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
 

@@ -97,7 +97,7 @@ func TestSendMessages(t *testing.T) {
 	chatID, sent, err := flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi"), text("welcome")})
 	require.NoError(t, err)
 
-	// The chat is the pair's canonical tip DM.
+	// The chat is the pair's canonical DM.
 	require.Equal(t, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user).Value, chatID.Value)
 	record, err := e.chats.GetChatByID(e.ctx, chatID)
 	require.NoError(t, err)

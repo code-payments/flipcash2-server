@@ -29,9 +29,9 @@ func TestMustDeriveDmChatID(t *testing.T) {
 	require.NotEqual(t, id.Value, MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, c).Value)
 
 	// Distinct DM types derive distinct IDs for the same pair.
-	tipID := MustDeriveDmChatID(chatpb.ChatType_DM, a, b)
-	require.NotEqual(t, id.Value, tipID.Value)
-	require.Equal(t, tipID.Value, MustDeriveDmChatID(chatpb.ChatType_DM, b, a).Value)
+	dmID := MustDeriveDmChatID(chatpb.ChatType_DM, a, b)
+	require.NotEqual(t, id.Value, dmID.Value)
+	require.Equal(t, dmID.Value, MustDeriveDmChatID(chatpb.ChatType_DM, b, a).Value)
 
 	// A self-DM collapses to a single member and is still derivable.
 	self := MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, a)

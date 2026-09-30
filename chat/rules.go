@@ -26,14 +26,19 @@ import (
 // evaluates (RuleEvaluator), so the two can never disagree about what a chat
 // requires.
 //
-// Every requirement a group carries is a listener rule: a StaffRequirement for
-// a staff-only group, a MinimumBalanceRequirement for a group with a minimum
-// listener balance, or both. Listener rules gate reading and joining, and a
-// member must be able to listen before they can speak, so restricting the
-// audience restricts the speakers too without repeating a rule in the speaker
-// class — which no group carries yet. The rules are listed cheapest to evaluate
-// first, since an evaluator stops at the first one a user fails: a staff check
-// is a flag read, a balance check a valuation.
+// A group's listener rules are a StaffRequirement for a staff-only group, a
+// MinimumBalanceRequirement for a group with a minimum listener balance, or
+// both. Listener rules gate reading and joining, and a member must be able to
+// listen before they can speak, so restricting the audience restricts the
+// speakers too without repeating a rule in the speaker class. The rules are
+// listed cheapest to evaluate first, since an evaluator stops at the first
+// one a user fails: a staff check is a flag read, a balance check a
+// valuation.
+//
+// The one speaker rule a group can carry is a CreatorRequirement, for a group
+// only its creator may speak in (see Chat.IsCreatorOnlySpeaker). It names no
+// user: it is evaluated against the creator the group recorded, which is read
+// with the rules (see GroupRules).
 //
 // A DM's record carries none, but a DM with the Flipcash team account carries
 // a Never speaker rule, which only the RuleEvaluator, knowing the team, can
@@ -54,10 +59,48 @@ func (c *Chat) Rules() *chatpb.Rules {
 			Kind: &chatpb.ListenerRules_MinimumBalance{MinimumBalance: c.MinimumListenerBalance.ToProto()},
 		})
 	}
-	if len(listener) == 0 {
+	var speaker []*chatpb.SpeakerRules
+	if c.IsCreatorOnlySpeaker {
+		speaker = append(speaker, &chatpb.SpeakerRules{
+			Kind: &chatpb.SpeakerRules_Creator{Creator: &chatpb.CreatorRequirement{}},
+		})
+	}
+	if len(listener) == 0 && len(speaker) == 0 {
 		return nil
 	}
-	return &chatpb.Rules{Listener: listener}
+	return &chatpb.Rules{Listener: listener, Speaker: speaker}
+}
+
+// GroupRules is what a chat's rules are evaluated against: the rules, and the
+// creator a CreatorRequirement names, since the rule itself names no one. Both
+// are fixed at creation and read together (see Store.GetGroupRules), so a
+// store that caches one caches the other with it, and evaluating a
+// creator-only group costs no read beyond its rules.
+//
+// Everything beside Rules is metadata carried only so that evaluation is
+// efficient: it is what a rule is relative to, read with the rules rather
+// than looked up per evaluation. It is not part of what a client is shown
+// (Metadata.rules is Rules alone), and a field belongs here only if it is
+// fixed at creation like the rules, since it is cached with them forever.
+type GroupRules struct {
+	// Rules are the chat's rules, nil when it has none (see Chat.Rules).
+	Rules *chatpb.Rules
+
+	// CreatorID is the group's creator, nil when it has none recorded (see
+	// Chat.CreatorID), in which case a CreatorRequirement admits no one.
+	CreatorID *commonpb.UserId
+}
+
+// GroupRules returns the chat's rules and creator as a RuleEvaluator
+// evaluates them (see GroupRules).
+func (c *Chat) GroupRules() GroupRules {
+	return GroupRules{Rules: c.Rules(), CreatorID: c.CreatorID}
+}
+
+// isCreator reports whether userID is the recorded creator; false when none
+// is recorded.
+func (r GroupRules) isCreator(userID *commonpb.UserId) bool {
+	return r.CreatorID != nil && bytes.Equal(r.CreatorID.Value, userID.GetValue())
 }
 
 // ErrInvalidRules is returned by RulesFromProto for a rule set a group cannot
@@ -68,9 +111,10 @@ var ErrInvalidRules = errors.New("invalid chat rules")
 // projects it onto the stored fields Rules projects back from, so that a group
 // created with rules shows exactly the rules it was asked for.
 //
-// It accepts what a group can store today, and nothing more, so that a rule
-// is never accepted and then silently dropped: listener rules only, since no
-// group carries a speaker rule yet; each kind at most once, since the record
+// It accepts what a group can be created with today, and nothing more, so
+// that a rule is never accepted and then silently dropped: listener rules
+// only, since no client sets a speaker rule (a creator-only group is made by
+// writing its record, see Chat.IsCreatorOnlySpeaker); each kind at most once, since the record
 // holds one of each; and a minimum balance of at least the currency's minimum
 // transfer value — one unit at its last decimal place, a penny for USD, a yen
 // for JPY, the smallest amount OCP lets anyone hold or move in that currency
@@ -158,9 +202,11 @@ func minimumTransferValue(code currency_lib.Code) float64 {
 //
 // Rules are read through Store.GetGroupRules — in production the caching
 // store, which holds every group's rules after its first read. A
-// StaffRequirement is answered by the account store's staff flag, and a
+// StaffRequirement is answered by the account store's staff flag, a
 // MinimumBalanceRequirement by the balance client's valuation of the user's
-// holdings (see satisfiesMinimumBalance).
+// holdings (see satisfiesMinimumBalance), and a CreatorRequirement by the
+// creator read and cached with the rules (see GroupRules), so it costs no
+// read of its own.
 //
 // Rules are evaluated against the current state of their subject, not the
 // state at join time: a member who no longer satisfies a listener rule (a
@@ -223,9 +269,11 @@ func (e *RuleEvaluator) CanListen(ctx context.Context, chatID *commonpb.ChatId, 
 // CanListenWithRules is CanListen for a caller that already holds the chat's
 // rules — read off a canonical record it loaded for its own purposes, or
 // taken from a request for a chat that does not exist yet — so the rules are
-// not read a second time. A nil rules admits everyone, as a chat with none
-// does.
-func (e *RuleEvaluator) CanListenWithRules(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+// not read a second time. A nil rules.Rules admits everyone, as a chat with
+// none does. chatID is the chat the rules are evaluated for; no rule reads it
+// today, since what a rule is relative to comes with the rules (see
+// GroupRules).
+func (e *RuleEvaluator) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules, userID *commonpb.UserId) (bool, error) {
 	return e.satisfiesListener(ctx, rules, userID)
 }
 
@@ -242,14 +290,16 @@ func (e *RuleEvaluator) CanSpeak(ctx context.Context, chatID *commonpb.ChatId, u
 }
 
 // CanSpeakWithRules is CanSpeak for a caller that already holds the chat's
-// rules (see CanListenWithRules). A nil rules admits everyone.
-func (e *RuleEvaluator) CanSpeakWithRules(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+// rules (see CanListenWithRules). A nil rules.Rules admits everyone. Rules
+// taken from a request for a chat that does not exist yet carry their would-be
+// creator, the caller.
+func (e *RuleEvaluator) CanSpeakWithRules(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules, userID *commonpb.UserId) (bool, error) {
 	return e.satisfiesSpeaker(ctx, rules, userID)
 }
 
-func (e *RuleEvaluator) satisfiesListener(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
-	for _, rule := range rules.GetListener() {
-		ok, err := e.satisfies(ctx, rule.GetKind(), userID)
+func (e *RuleEvaluator) satisfiesListener(ctx context.Context, rules GroupRules, userID *commonpb.UserId) (bool, error) {
+	for _, rule := range rules.Rules.GetListener() {
+		ok, err := e.satisfies(ctx, rules, rule.GetKind(), userID)
 		if err != nil || !ok {
 			return false, err
 		}
@@ -259,12 +309,12 @@ func (e *RuleEvaluator) satisfiesListener(ctx context.Context, rules *chatpb.Rul
 
 // satisfiesSpeaker evaluates the listener rules and then the speaker rules,
 // stopping at the first the user fails.
-func (e *RuleEvaluator) satisfiesSpeaker(ctx context.Context, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+func (e *RuleEvaluator) satisfiesSpeaker(ctx context.Context, rules GroupRules, userID *commonpb.UserId) (bool, error) {
 	if ok, err := e.satisfiesListener(ctx, rules, userID); err != nil || !ok {
 		return false, err
 	}
-	for _, rule := range rules.GetSpeaker() {
-		ok, err := e.satisfies(ctx, rule.GetKind(), userID)
+	for _, rule := range rules.Rules.GetSpeaker() {
+		ok, err := e.satisfies(ctx, rules, rule.GetKind(), userID)
 		if err != nil || !ok {
 			return false, err
 		}
@@ -272,17 +322,17 @@ func (e *RuleEvaluator) satisfiesSpeaker(ctx context.Context, rules *chatpb.Rule
 	return true, nil
 }
 
-// rulesFor returns chatID's rules as userID is evaluated against them, nil
-// when it has none. A DM is answered without a read: a DM stores no rules, and
+// rulesFor returns chatID's rules as userID is evaluated against them, with a
+// nil Rules when it has none. A DM is answered without a read: a DM stores no rules, and
 // whether it is one with the team account is decided off the IDs (see
 // inTeamDm). That is exact for a member, which every caller has established
 // first, since a DM's members are userID and one other.
-func (e *RuleEvaluator) rulesFor(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (*chatpb.Rules, error) {
+func (e *RuleEvaluator) rulesFor(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (GroupRules, error) {
 	if !IsGroupChatID(chatID) {
 		if e.inTeamDm(chatID, userID) {
-			return teamDmRules(), nil
+			return GroupRules{Rules: teamDmRules()}, nil
 		}
-		return nil, nil
+		return GroupRules{}, nil
 	}
 	return e.chats.GetGroupRules(ctx, chatID)
 }
@@ -316,12 +366,14 @@ func teamDmRules() *chatpb.Rules {
 
 // satisfies evaluates one rule, of either class, for userID. The two classes
 // share a vocabulary of requirement kinds, so a single switch covers both.
+// rules are the rules the kind was taken from, whose creator a
+// CreatorRequirement is answered by.
 //
 // A kind the evaluator does not know how to answer is an error, not a pass:
 // a rule is a restriction, and the safe failure for a restriction the server
 // cannot evaluate is to admit no one. The Server projects such an error as an
 // Internal failure, never as an OK.
-func (e *RuleEvaluator) satisfies(ctx context.Context, kind any, userID *commonpb.UserId) (bool, error) {
+func (e *RuleEvaluator) satisfies(ctx context.Context, rules GroupRules, kind any, userID *commonpb.UserId) (bool, error) {
 	switch k := kind.(type) {
 	case *chatpb.ListenerRules_Staff, *chatpb.SpeakerRules_Staff:
 		return e.accounts.IsStaff(ctx, userID)
@@ -334,6 +386,12 @@ func (e *RuleEvaluator) satisfies(ctx context.Context, kind any, userID *commonp
 		// carries one, never from its record (see teamDmRules), and this is
 		// what refuses every send in one.
 		return false, nil
+	case *chatpb.SpeakerRules_Creator:
+		// Only a group written as creator-only carries the rule (see
+		// Chat.IsCreatorOnlySpeaker), and one with no recorded creator admits
+		// no one. Membership is the caller's check, so a creator who has left
+		// speaks no more than any other non-member.
+		return rules.isCreator(userID), nil
 	default:
 		return false, fmt.Errorf("unsupported chat rule %T", k)
 	}

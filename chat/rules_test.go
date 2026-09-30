@@ -126,7 +126,8 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 // fakeChats is a Store that serves rules from a map of group records and
 // membership from a set, counting the reads of each, so a test can see which
 // evaluations touched the store. Only GetGroupRules and IsMember are
-// exercised, as above.
+// exercised, as above; any other read, the record's included, panics on the
+// nil embedded Store.
 type fakeChats struct {
 	Store
 
@@ -159,16 +160,16 @@ func (f *fakeChats) IsMember(_ context.Context, chatID *commonpb.ChatId, userID 
 	return f.members[string(chatID.Value)+string(userID.Value)], nil
 }
 
-func (f *fakeChats) GetGroupRules(_ context.Context, chatID *commonpb.ChatId) (*chatpb.Rules, error) {
+func (f *fakeChats) GetGroupRules(_ context.Context, chatID *commonpb.ChatId) (GroupRules, error) {
 	f.reads++
 	if !IsGroupChatID(chatID) {
-		return nil, errors.New("not a group chat id")
+		return GroupRules{}, errors.New("not a group chat id")
 	}
 	c, ok := f.chats[string(chatID.Value)]
 	if !ok {
-		return nil, ErrChatNotFound
+		return GroupRules{}, ErrChatNotFound
 	}
-	return c.Rules(), nil
+	return c.GroupRules(), nil
 }
 
 // TestRulesFromProto_MinimumTransferValue pins the floor on a minimum balance
@@ -400,12 +401,64 @@ func TestRuleEvaluator(t *testing.T) {
 	staff.staff[string(staffUser.Value)] = true
 	asked := staff.asked
 	for _, u := range []*commonpb.UserId{staffUser, nonStaffUser} {
-		ok, err = e.CanSpeakWithRules(ctx, neverSpeak, u)
+		ok, err = e.CanSpeakWithRules(ctx, MustGenerateGroupChatID(), GroupRules{Rules: neverSpeak}, u)
 		require.NoError(t, err)
 		require.False(t, ok)
 	}
 	require.Equal(t, asked, staff.asked)
 
+	// A creator-only group admits its creator to speak and no one else, and
+	// everyone who satisfies its listener rules to listen. The creator comes
+	// with the rules, so evaluating the rule reads nothing more: one rules read
+	// per evaluation here, since the fake does not cache.
+	creator := model.MustGenerateUserID()
+	creatorOnly := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsCreatorOnlySpeaker: true, CreatorID: creator})
+	reads := chats.reads
+	for _, u := range []*commonpb.UserId{creator, staffUser, nonStaffUser} {
+		ok, err = e.CanListen(ctx, creatorOnly.ID, u)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	ok, err = e.CanSpeak(ctx, creatorOnly.ID, creator)
+	require.NoError(t, err)
+	require.True(t, ok)
+	for _, u := range []*commonpb.UserId{staffUser, nonStaffUser} {
+		ok, err = e.CanSpeak(ctx, creatorOnly.ID, u)
+		require.NoError(t, err)
+		require.False(t, ok)
+	}
+	require.Equal(t, reads+6, chats.reads)
+
+	// Speaker rules apply on top of listener rules: a creator who cannot
+	// listen cannot speak either.
+	staffCreatorOnly := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsStaffOnly: true, IsCreatorOnlySpeaker: true, CreatorID: nonStaffUser})
+	ok, err = e.CanSpeak(ctx, staffCreatorOnly.ID, nonStaffUser)
+	require.NoError(t, err)
+	require.False(t, ok)
+	ok, err = e.CanSpeak(ctx, staffCreatorOnly.ID, staffUser)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// A creator-only group with no recorded creator admits no one to speak.
+	orphaned := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsCreatorOnlySpeaker: true})
+	for _, u := range []*commonpb.UserId{creator, staffUser, nonStaffUser} {
+		ok, err = e.CanSpeak(ctx, orphaned.ID, u)
+		require.NoError(t, err)
+		require.False(t, ok)
+	}
+
+	// Rules held by the caller are evaluated against the creator they carry,
+	// with no read: those of a group not written yet (StartChat's) carry the
+	// caller as its creator.
+	reads = chats.reads
+	creatorOnlyRules := GroupRules{Rules: creatorOnly.Rules(), CreatorID: creator}
+	ok, err = e.CanSpeakWithRules(ctx, MustGenerateGroupChatID(), creatorOnlyRules, creator)
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, err = e.CanSpeakWithRules(ctx, MustGenerateGroupChatID(), creatorOnlyRules, nonStaffUser)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Equal(t, reads, chats.reads)
 }
 
 func TestRuleEvaluator_TeamDm(t *testing.T) {

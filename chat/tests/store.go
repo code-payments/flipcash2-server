@@ -522,11 +522,13 @@ func testStore_GroupChat_MinimumListenerBalance(t *testing.T, s chat.Store) {
 func testStore_GroupChat_Rules(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
-	// A group without a requirement has no rules — nil, not an empty set.
+	// A group without a requirement has no rules — nil, not an empty set —
+	// and one written without a creator reads back with none.
 	plain := putGroupChat(t, s, "Weekend Trip", at(100), model.MustGenerateUserID())
-	rules, err := s.GetGroupRules(ctx, plain.ID)
+	got, err := s.GetGroupRules(ctx, plain.ID)
 	require.NoError(t, err)
-	require.Nil(t, rules)
+	require.Nil(t, got.Rules)
+	require.Nil(t, got.CreatorID)
 
 	// A staff-only group's rules are the projection of its record.
 	staff := &chat.Chat{
@@ -539,8 +541,9 @@ func testStore_GroupChat_Rules(t *testing.T, s chat.Store) {
 	}
 	require.NoError(t, s.PutChat(ctx, staff))
 
-	rules, err = s.GetGroupRules(ctx, staff.ID)
+	got, err = s.GetGroupRules(ctx, staff.ID)
 	require.NoError(t, err)
+	rules := got.Rules
 	require.True(t, proto.Equal(staff.Rules(), rules))
 	require.Len(t, rules.GetListener(), 1)
 	require.NotNil(t, rules.GetListener()[0].GetStaff())
@@ -563,8 +566,9 @@ func testStore_GroupChat_Rules(t *testing.T, s chat.Store) {
 	}
 	require.NoError(t, s.PutChat(ctx, gated))
 
-	rules, err = s.GetGroupRules(ctx, gated.ID)
+	got, err = s.GetGroupRules(ctx, gated.ID)
 	require.NoError(t, err)
+	rules = got.Rules
 	require.True(t, proto.Equal(gated.Rules(), rules))
 	require.Len(t, rules.GetListener(), 1)
 	require.True(t, proto.Equal(gated.MinimumListenerBalance.ToProto(), rules.GetListener()[0].GetMinimumBalance()))
@@ -576,13 +580,56 @@ func testStore_GroupChat_Rules(t *testing.T, s chat.Store) {
 	both.IsStaffOnly = true
 	require.NoError(t, s.PutChat(ctx, both))
 
-	rules, err = s.GetGroupRules(ctx, both.ID)
+	got, err = s.GetGroupRules(ctx, both.ID)
 	require.NoError(t, err)
+	rules = got.Rules
 	require.True(t, proto.Equal(both.Rules(), rules))
 	require.Len(t, rules.GetListener(), 2)
 	require.NotNil(t, rules.GetListener()[0].GetStaff())
 	require.NotNil(t, rules.GetListener()[1].GetMinimumBalance())
 	require.Empty(t, rules.GetSpeaker())
+
+	// A creator-only group carries a creator speaker rule beside its listener
+	// rules. The rule names no one: the creator is read beside it.
+	creator := model.MustGenerateUserID()
+	creatorOnly := gated.Clone()
+	creatorOnly.ID = chat.MustGenerateGroupChatID()
+	creatorOnly.Members = []*commonpb.UserId{creator}
+	creatorOnly.IsCreatorOnlySpeaker = true
+	creatorOnly.CreatorID = creator
+	require.NoError(t, s.PutChat(ctx, creatorOnly))
+
+	got, err = s.GetGroupRules(ctx, creatorOnly.ID)
+	require.NoError(t, err)
+	rules = got.Rules
+	require.Equal(t, creator.Value, got.CreatorID.GetValue())
+	require.True(t, proto.Equal(creatorOnly.Rules(), rules))
+	require.Len(t, rules.GetListener(), 1)
+	require.NotNil(t, rules.GetListener()[0].GetMinimumBalance())
+	require.Len(t, rules.GetSpeaker(), 1)
+	require.NotNil(t, rules.GetSpeaker()[0].GetCreator())
+
+	// The flag is part of the canonical record.
+	record, err := s.GetChatByID(ctx, creatorOnly.ID)
+	require.NoError(t, err)
+	require.True(t, record.IsCreatorOnlySpeaker)
+	require.Equal(t, creator.Value, record.CreatorID.GetValue())
+	require.True(t, proto.Equal(creatorOnly.Rules(), record.Rules()))
+
+	// The creator is read for any group that recorded one, whatever its rules.
+	withCreator := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{creator},
+		Title:        "Open",
+		CreatorID:    creator,
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, withCreator))
+	got, err = s.GetGroupRules(ctx, withCreator.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.Rules)
+	require.Equal(t, creator.Value, got.CreatorID.GetValue())
 
 	// An unknown group is not found; a DM ID is not a group.
 	_, err = s.GetGroupRules(ctx, chat.MustGenerateGroupChatID())

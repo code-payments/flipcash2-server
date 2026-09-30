@@ -155,29 +155,30 @@ const (
 	// skMeta is the sort key of a group's aggregates item in group_members.
 	skMeta = "#meta"
 
-	attrPK                 = "pk"
-	attrSK                 = "sk"
-	attrType               = "type"
-	attrFeed               = "feed"
-	attrMembers            = "members"
-	attrExcludedFromFeed   = "excluded_from_feed" // DM chats item: binary set of the members the DM excludes from the feed (see chat.Store.PutChat), absent when none
-	attrTitle              = "title"
-	attrIsStaffOnly        = "is_staff_only"
-	attrMinListenerBalance = "min_listener_balance" // map: see minimumBalanceAttr
-	attrCreator            = "creator"
-	attrPictureBlobID      = "picture"
-	attrState              = "state"
-	attrUser               = "user" // member id, bare hex — see userIndexKey
-	attrJoinedAt           = "joined_at"
-	attrLeftAt             = "left_at"
-	attrExpiresAt          = "expires_at" // tombstones only: DynamoDB TTL, epoch seconds — see tombstoneTTL
-	attrLastActivity       = "last_activity"
-	attrLastMessageID      = "last_message_id"
-	attrMemberCount        = "member_count" // #meta item: joined member count
-	attrVersion            = "version"
-	attrChat               = "chat"        // chat_user_state records: the raw chat ID bytes (B), keying gsiByMuted and gsiUserStateByUser
-	attrMutedUntil         = "muted_until" // chat_user_state: epoch seconds, present only while a mute is recorded — see muteForeverUntil
-	attrMutedCount         = "muted_count" // chat_user_state #meta item: records with a mute recorded
+	attrPK                   = "pk"
+	attrSK                   = "sk"
+	attrType                 = "type"
+	attrFeed                 = "feed"
+	attrMembers              = "members"
+	attrExcludedFromFeed     = "excluded_from_feed" // DM chats item: binary set of the members the DM excludes from the feed (see chat.Store.PutChat), absent when none
+	attrTitle                = "title"
+	attrIsStaffOnly          = "is_staff_only"
+	attrMinListenerBalance   = "min_listener_balance" // map: see minimumBalanceAttr
+	attrIsCreatorOnlySpeaker = "is_creator_only_speaker"
+	attrCreator              = "creator"
+	attrPictureBlobID        = "picture"
+	attrState                = "state"
+	attrUser                 = "user" // member id, bare hex — see userIndexKey
+	attrJoinedAt             = "joined_at"
+	attrLeftAt               = "left_at"
+	attrExpiresAt            = "expires_at" // tombstones only: DynamoDB TTL, epoch seconds — see tombstoneTTL
+	attrLastActivity         = "last_activity"
+	attrLastMessageID        = "last_message_id"
+	attrMemberCount          = "member_count" // #meta item: joined member count
+	attrVersion              = "version"
+	attrChat                 = "chat"        // chat_user_state records: the raw chat ID bytes (B), keying gsiByMuted and gsiUserStateByUser
+	attrMutedUntil           = "muted_until" // chat_user_state: epoch seconds, present only while a mute is recorded — see muteForeverUntil
+	attrMutedCount           = "muted_count" // chat_user_state #meta item: records with a mute recorded
 
 	// Keys of the min_listener_balance map.
 	attrBalanceCurrency     = "currency"
@@ -1389,44 +1390,52 @@ func (s *store) GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb
 	return out, nil
 }
 
-func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (*chatpb.Rules, error) {
+func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (chat.GroupRules, error) {
 	if !chat.IsGroupChatID(chatID) {
-		return nil, fmt.Errorf("not a group chat id")
+		return chat.GroupRules{}, fmt.Errorf("not a group chat id")
 	}
 
-	// Only the attributes the rules are projected from: the type, and the
-	// attributes that stand for a rule. The rest of the record — title, picture,
-	// activity — is neither fetched nor deserialized.
+	// Only the attributes the rules are projected from: the type, the
+	// attributes that stand for a rule, and the creator a CreatorRequirement
+	// names. The rest of the record — title, picture, activity — is neither
+	// fetched nor deserialized.
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:            aws.String(s.chatsTable),
 		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
-		ProjectionExpression: aws.String("#type, #staff, #balance"),
+		ProjectionExpression: aws.String("#type, #staff, #balance, #creatorOnly, #creator"),
 		ExpressionAttributeNames: map[string]string{
-			"#type":    attrType,
-			"#staff":   attrIsStaffOnly,
-			"#balance": attrMinListenerBalance,
+			"#type":        attrType,
+			"#staff":       attrIsStaffOnly,
+			"#balance":     attrMinListenerBalance,
+			"#creatorOnly": attrIsCreatorOnlySpeaker,
+			"#creator":     attrCreator,
 		},
 	})
 	if err != nil {
-		return nil, err
+		return chat.GroupRules{}, err
 	}
 	if len(out.Item) == 0 {
-		return nil, chat.ErrChatNotFound
+		return chat.GroupRules{}, chat.ErrChatNotFound
 	}
 	typeVal, err := parseN(out.Item[attrType])
 	if err != nil {
-		return nil, err
+		return chat.GroupRules{}, err
 	}
 	balance, err := minimumBalanceFromItem(out.Item)
 	if err != nil {
-		return nil, err
+		return chat.GroupRules{}, err
 	}
 	c := &chat.Chat{
 		Type:                   protoChatType(uint64(typeVal)),
 		IsStaffOnly:            asBool(out.Item[attrIsStaffOnly]),
 		MinimumListenerBalance: balance,
+		IsCreatorOnlySpeaker:   asBool(out.Item[attrIsCreatorOnlySpeaker]),
 	}
-	return c.Rules(), nil
+	// creator is absent for groups written before it was recorded.
+	if creator := asB(out.Item[attrCreator]); len(creator) > 0 {
+		c.CreatorID = &commonpb.UserId{Value: append([]byte(nil), creator...)}
+	}
+	return c.GroupRules(), nil
 }
 
 // rosterSummaryFromItem reads a #meta item. version is absent on an item
@@ -1573,7 +1582,8 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 	}
 	// A group's membership lives in group_members, not on the canonical item —
 	// an inline list could not hold a large group. Title, the staff-only flag,
-	// the minimum listener balance, the creator and the picture are group-only;
+	// the minimum listener balance, the creator-only speaker flag, the creator
+	// and the picture are group-only;
 	// each is written only when set, so an absent attribute (including on every
 	// item written before it existed) reads as its zero value.
 	if c.Type == chatpb.ChatType_GROUP {
@@ -1585,6 +1595,9 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 		}
 		if c.MinimumListenerBalance != nil {
 			item[attrMinListenerBalance] = minimumBalanceAttr(c.MinimumListenerBalance)
+		}
+		if c.IsCreatorOnlySpeaker {
+			item[attrIsCreatorOnlySpeaker] = avBool(true)
 		}
 		if c.CreatorID != nil {
 			item[attrCreator] = avB(c.CreatorID.Value)
@@ -1679,6 +1692,7 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 		Title:                  asS(item[attrTitle]),
 		IsStaffOnly:            asBool(item[attrIsStaffOnly]),
 		MinimumListenerBalance: balance,
+		IsCreatorOnlySpeaker:   asBool(item[attrIsCreatorOnlySpeaker]),
 		LastActivity:           time.Unix(0, nanos).UTC(),
 	}
 	// creator is absent for DMs and for groups written before it was recorded.

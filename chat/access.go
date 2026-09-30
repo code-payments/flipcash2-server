@@ -7,7 +7,6 @@ import (
 
 	"github.com/ReneKroon/ttlcache"
 
-	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 )
@@ -222,7 +221,7 @@ func (a *Access) CanListen(ctx context.Context, chatID *commonpb.ChatId, userID 
 
 // CanListenWithRules is CanListen for a caller already holding the chat's rules
 // (see StandingWithRules).
-func (a *Access) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId, rules *chatpb.Rules, userID *commonpb.UserId) (bool, error) {
+func (a *Access) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules, userID *commonpb.UserId) (bool, error) {
 	standing, err := a.StandingWithRules(ctx, chatID, rules, userID, messagingpb.ViewMode_FULL)
 	return standing.CanListen, err
 }
@@ -235,19 +234,19 @@ func (a *Access) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId
 // blurred never pays a valuation for it. The standing is zero, not an error,
 // for a chat that does not exist.
 func (a *Access) Standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (Standing, error) {
-	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(ctx context.Context) (*chatpb.Rules, error) {
+	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(ctx context.Context) (GroupRules, error) {
 		return a.chats.GetGroupRules(ctx, chatID)
 	})
 }
 
 // StandingWithRules is Standing for a caller already holding the chat's rules
 // (read off a canonical record it loaded for its own purposes, see
-// Chat.Rules), so they are not read a second time. The chat is taken as
+// Chat.GroupRules), so they are not read a second time. The chat is taken as
 // existing: a caller that has its rules has already told NOT_FOUND from
-// everything else. A nil rules is a chat with none, which admits no
+// everything else. A nil rules.Rules is a chat with none, which admits no
 // non-member in any form (see Access). On error the standing is zero.
-func (a *Access) StandingWithRules(ctx context.Context, chatID *commonpb.ChatId, rules *chatpb.Rules, userID *commonpb.UserId, mode messagingpb.ViewMode) (Standing, error) {
-	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(context.Context) (*chatpb.Rules, error) {
+func (a *Access) StandingWithRules(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules, userID *commonpb.UserId, mode messagingpb.ViewMode) (Standing, error) {
+	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(context.Context) (GroupRules, error) {
 		return rules, nil
 	})
 }
@@ -261,8 +260,8 @@ func (a *Access) StandingWithRules(ctx context.Context, chatID *commonpb.ChatId,
 // every gate reads it. The chat is taken as existing, as a caller holding
 // its record has established.
 func (a *Access) StandingWithChat(ctx context.Context, c *Chat, userID *commonpb.UserId, mode messagingpb.ViewMode) (Standing, error) {
-	return a.standing(ctx, c.ID, userID, mode, a.recordMembership(c, userID), func(context.Context) (*chatpb.Rules, error) {
-		return c.Rules(), nil
+	return a.standing(ctx, c.ID, userID, mode, a.recordMembership(c, userID), func(context.Context) (GroupRules, error) {
+		return c.GroupRules(), nil
 	})
 }
 
@@ -311,7 +310,7 @@ func (a *Access) recordMembership(c *Chat, userID *commonpb.UserId) func(context
 // membership question — from the store, or off a record the caller holds — and
 // loadRules supplies the group's rules likewise, called only when they decide
 // the answer; ErrChatNotFound from it is a plain refusal.
-func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode, membership func(context.Context) (bool, error), loadRules func(context.Context) (*chatpb.Rules, error)) (Standing, error) {
+func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode, membership func(context.Context) (bool, error), loadRules func(context.Context) (GroupRules, error)) (Standing, error) {
 	isMember, err := membership(ctx)
 	if err != nil {
 		return Standing{}, err
@@ -346,13 +345,13 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 	}
 	// No listener rules, no admission of any kind: only a rule can admit a
 	// non-member (see above).
-	if len(rules.GetListener()) == 0 {
+	if len(rules.Rules.GetListener()) == 0 {
 		return Standing{}, nil
 	}
 	if !evaluate {
 		return Standing{CanPreview: true}, nil
 	}
-	ok, err := a.rules.CanListenWithRules(ctx, rules, userID)
+	ok, err := a.rules.CanListenWithRules(ctx, chatID, rules, userID)
 	if err != nil {
 		return Standing{}, err
 	}

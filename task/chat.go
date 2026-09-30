@@ -86,7 +86,7 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 	}
 
 	// The verb is how the client renders the payment.
-	verb := intent.GetDmPaymentVerb(intentRecord.AppMetadata)
+	verb := intent.GetDmPaymentVerb(intentRecord.AppMetadata, intentRecord.CreatedAt)
 
 	senderOwner, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
 	if err != nil {

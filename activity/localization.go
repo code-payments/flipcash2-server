@@ -27,7 +27,7 @@ func injectLocalizedTextForHistory(record *history.Record, notification *activit
 		localizedText = "Gave"
 
 		if notification.GetDirectlySentCrypto().GetDestinationIdentifier() != nil {
-			switch intent.GetDmPaymentVerb(record.AppMetadata) {
+			switch intent.GetDmPaymentVerb(record.AppMetadata, record.CreatedAt) {
 			case messagingpb.CashContent_TIPPED:
 				localizedText = "Tipped"
 			default:

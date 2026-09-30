@@ -270,7 +270,7 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 
 		unlocalized = append(unlocalized, unlocalizedNotification{
 			notification:    notification,
-			cashMessageVerb: intent.GetDmPaymentVerb(intentRecord.AppMetadata),
+			cashMessageVerb: intent.GetDmPaymentVerb(intentRecord.AppMetadata, intentRecord.CreatedAt),
 		})
 	}
 

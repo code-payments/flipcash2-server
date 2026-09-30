@@ -146,7 +146,7 @@ func MustDeriveDmChatID(chatType chatpb.ChatType, a, b *commonpb.UserId) *common
 	switch chatType {
 	case chatpb.ChatType_CONTACT_DM:
 		// Bare legacy domain: contact DM IDs predate typed derivation.
-	case chatpb.ChatType_TIP_DM:
+	case chatpb.ChatType_DM:
 		// Every other DM chat type appends its enum value to the domain
 		domain = fmt.Sprintf("%s:%d", dmChatIDDomain, chatType)
 	default:
@@ -181,7 +181,7 @@ func MustDeriveDmChatID(chatType chatpb.ChatType, a, b *commonpb.UserId) *common
 // dmChatTypes are the DM chat types with a canonical member-derived ID.
 var dmChatTypes = []chatpb.ChatType{
 	chatpb.ChatType_CONTACT_DM,
-	chatpb.ChatType_TIP_DM,
+	chatpb.ChatType_DM,
 }
 
 // IsDmChatType reports whether chatType is a direct-message chat type — one

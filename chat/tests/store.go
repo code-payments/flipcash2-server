@@ -242,7 +242,7 @@ func testStore_FeedExclusions(t *testing.T, newStore func(excludedFromFeed []*co
 	// feed is the member's own DM feed in s, whole.
 	feed := func(s chat.Store, member *commonpb.UserId) []*chat.Chat {
 		t.Helper()
-		page, err := s.GetDmFeedPage(ctx, member, chatpb.ChatType_TIP_DM, at(1000), nil, 0)
+		page, err := s.GetDmFeedPage(ctx, member, chatpb.ChatType_DM, at(1000), nil, 0)
 		require.NoError(t, err)
 		return page
 	}
@@ -252,7 +252,7 @@ func testStore_FeedExclusions(t *testing.T, newStore func(excludedFromFeed []*co
 	user := model.MustGenerateUserID()
 	c := &chat.Chat{
 		ID:           generateDmChatID(),
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{user, team},
 		LastActivity: at(100),
 	}
@@ -285,7 +285,7 @@ func testStore_FeedExclusions(t *testing.T, newStore func(excludedFromFeed []*co
 	// both are members, and an advance still moves the record.
 	both := &chat.Chat{
 		ID:           generateDmChatID(),
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{team, support},
 		LastActivity: at(100),
 	}
@@ -310,7 +310,7 @@ func testStore_FeedExclusions(t *testing.T, newStore func(excludedFromFeed []*co
 	a, b := model.MustGenerateUserID(), model.MustGenerateUserID()
 	plain := &chat.Chat{
 		ID:           generateDmChatID(),
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{a, b},
 		LastActivity: at(100),
 	}
@@ -337,7 +337,7 @@ func testStore_FeedExclusions(t *testing.T, newStore func(excludedFromFeed []*co
 	other := model.MustGenerateUserID()
 	listed := &chat.Chat{
 		ID:           generateDmChatID(),
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{other, team},
 		LastActivity: at(100),
 	}
@@ -1765,9 +1765,9 @@ func testStore_GetDmFeedPage_TypeScoped(t *testing.T, s chat.Store) {
 	other := model.MustGenerateUserID()
 
 	contact1 := putDmChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, other, at(100))
-	tip1 := putDmChatOfType(t, s, chatpb.ChatType_TIP_DM, user, other, at(200))
+	tip1 := putDmChatOfType(t, s, chatpb.ChatType_DM, user, other, at(200))
 	contact2 := putDmChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, other, at(300))
-	tip2 := putDmChatOfType(t, s, chatpb.ChatType_TIP_DM, user, other, at(400))
+	tip2 := putDmChatOfType(t, s, chatpb.ChatType_DM, user, other, at(400))
 
 	// Each feed contains only its own type, most recent first.
 	contacts, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
@@ -1777,20 +1777,20 @@ func testStore_GetDmFeedPage_TypeScoped(t *testing.T, s chat.Store) {
 		require.Equal(t, chatpb.ChatType_CONTACT_DM, c.Type)
 	}
 
-	tips, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_TIP_DM, at(1000), nil, 0)
+	tips, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{tip2.ID.Value, tip1.ID.Value}, chatIDValues(tips))
 	for _, c := range tips {
-		require.Equal(t, chatpb.ChatType_TIP_DM, c.Type)
+		require.Equal(t, chatpb.ChatType_DM, c.Type)
 	}
 
 	// Paging within one feed steps over the other type's activity: a limit-1
 	// tip page resumes at the older tip, not at the interleaved contact chats.
-	tipPage1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_TIP_DM, at(1000), nil, 1)
+	tipPage1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), nil, 1)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{tip2.ID.Value}, chatIDValues(tipPage1))
 
-	tipPage2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_TIP_DM, at(1000), cursorOf(tipPage1[0]), 1)
+	tipPage2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), cursorOf(tipPage1[0]), 1)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{tip1.ID.Value}, chatIDValues(tipPage2))
 }

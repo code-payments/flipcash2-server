@@ -82,7 +82,7 @@ func SendMessages(
 		return nil, nil, errors.New("the team account cannot message itself")
 	}
 
-	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, teamUserID, userID)
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, teamUserID, userID)
 
 	if err := ensureChat(ctx, chats, chatID, teamUserID, userID); err != nil {
 		return nil, nil, err
@@ -132,7 +132,7 @@ func ensureChat(ctx context.Context, chats chat.Store, chatID *commonpb.ChatId, 
 
 	err = chats.PutChat(ctx, &chat.Chat{
 		ID:           chatID,
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{teamUserID, userID},
 		LastActivity: time.Now().UTC(),
 	})

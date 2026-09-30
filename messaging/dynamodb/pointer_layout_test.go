@@ -35,7 +35,7 @@ func TestMessaging_DynamoDBStore_PointerLayout(t *testing.T) {
 	userB := model.MustGenerateUserID()
 
 	t.Run("dm", func(t *testing.T) {
-		chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, userA, userB)
+		chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, userA, userB)
 
 		_, advanced, err := s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 3})
 		require.NoError(t, err)

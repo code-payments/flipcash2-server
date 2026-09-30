@@ -151,14 +151,14 @@ func TestExecutor_SendTipDmPaymentMessage(t *testing.T) {
 	// plain send. An explicit action overrides that default either way.
 	for _, tc := range []struct {
 		name         string
-		location     intentpb.ChatMetadata_TipDmPayment_Location
-		action       intentpb.ChatMetadata_TipDmPayment_Action
+		location     intentpb.ChatMetadata_DmPayment_Location
+		action       intentpb.ChatMetadata_DmPayment_Action
 		expectedVerb messagingpb.CashContent_Verb
 	}{
-		{"tipcard", intentpb.ChatMetadata_TipDmPayment_TIPCARD, intentpb.ChatMetadata_TipDmPayment_DEFAULT, messagingpb.CashContent_TIPPED},
-		{"chat", intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_DEFAULT, messagingpb.CashContent_SENT},
-		{"tipcard_send", intentpb.ChatMetadata_TipDmPayment_TIPCARD, intentpb.ChatMetadata_TipDmPayment_SEND, messagingpb.CashContent_SENT},
-		{"chat_tip", intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_TIP, messagingpb.CashContent_TIPPED},
+		{"tipcard", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_DEFAULT, messagingpb.CashContent_TIPPED},
+		{"chat", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_DEFAULT, messagingpb.CashContent_SENT},
+		{"tipcard_send", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_SEND, messagingpb.CashContent_SENT},
+		{"chat_tip", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_TIP, messagingpb.CashContent_TIPPED},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testExecutor_SendTipDmPaymentMessage(t, tc.location, tc.action, tc.expectedVerb, false)
@@ -168,14 +168,14 @@ func TestExecutor_SendTipDmPaymentMessage(t *testing.T) {
 	// A tip to the team account creates the DM with the team excluded from the
 	// feed, by the store's configuration alone.
 	t.Run("to_team", func(t *testing.T) {
-		testExecutor_SendTipDmPaymentMessage(t, intentpb.ChatMetadata_TipDmPayment_TIPCARD, intentpb.ChatMetadata_TipDmPayment_DEFAULT, messagingpb.CashContent_TIPPED, true)
+		testExecutor_SendTipDmPaymentMessage(t, intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_DEFAULT, messagingpb.CashContent_TIPPED, true)
 	})
 }
 
 // testExecutor_SendTipDmPaymentMessage pays a tip DM payment through the task.
 // toTeam makes the recipient the team account, which the chat store is built
 // to exclude from the feed as the parent builds it.
-func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMetadata_TipDmPayment_Location, action intentpb.ChatMetadata_TipDmPayment_Action, expectedVerb messagingpb.CashContent_Verb, toTeam bool) {
+func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMetadata_DmPayment_Location, action intentpb.ChatMetadata_DmPayment_Action, expectedVerb messagingpb.CashContent_Verb, toTeam bool) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
@@ -209,7 +209,7 @@ func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMe
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
 	integration := intent.NewIntegration(accounts, chats, profiles, nil, nil)
 
-	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
 
 	rawIntentID := []byte(model.MustGenerateKeyPair().Public())
 	intentID := base58.Encode(rawIntentID)
@@ -218,8 +218,8 @@ func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMe
 		Domain: &intentpb.AppMetadata_Chat{
 			Chat: &intentpb.ChatMetadata{
 				ChatId: chatID,
-				Type: &intentpb.ChatMetadata_TipDmPayment_{
-					TipDmPayment: &intentpb.ChatMetadata_TipDmPayment{
+				Type: &intentpb.ChatMetadata_DmPayment_{
+					DmPayment: &intentpb.ChatMetadata_DmPayment{
 						Location: location,
 						Action:   action,
 					},
@@ -262,11 +262,11 @@ func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMe
 
 	created, err := chats.GetChatByID(ctx, chatID)
 	require.NoError(t, err)
-	assert.Equal(t, chatpb.ChatType_TIP_DM, created.Type)
+	assert.Equal(t, chatpb.ChatType_DM, created.Type)
 
 	// Only the team account is ever excluded from the feed, and it is a
 	// member all the same.
-	recipientFeed, err := chats.GetDmFeedPage(ctx, recipientUserID, chatpb.ChatType_TIP_DM, time.Now().Add(time.Hour), nil, 0)
+	recipientFeed, err := chats.GetDmFeedPage(ctx, recipientUserID, chatpb.ChatType_DM, time.Now().Add(time.Hour), nil, 0)
 	require.NoError(t, err)
 	if toTeam {
 		require.Empty(t, recipientFeed)

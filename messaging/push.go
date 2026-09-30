@@ -228,7 +228,7 @@ func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, cha
 			return nil
 		}
 		p.push, err = push.BuildContactDmPush(ctx, p.sender.ocpData, p.chatID, p.message, p.message.SenderId, senderProfile.PhoneNumber)
-	case chatpb.ChatType_TIP_DM:
+	case chatpb.ChatType_DM:
 		if senderProfile.DisplayName == "" {
 			return nil
 		}

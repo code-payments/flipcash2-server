@@ -1078,10 +1078,10 @@ func testServer_EncryptedContent(t *testing.T, badges badge.Store, blocklists bl
 
 	// The push path recovers the chat type from the canonical DM derivation, so
 	// the DM lives at its derived ID.
-	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.userA, e.userB)
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.userA, e.userB)
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 		ID:           chatID,
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{e.userA, e.userB},
 		LastActivity: at(1),
 	}))
@@ -1323,10 +1323,10 @@ func testServer_SendBatch_SideEffects(t *testing.T, badges badge.Store, blocklis
 	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Alice"))
 	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userB, "Bob"))
 
-	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.userA, e.userB)
+	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.userA, e.userB)
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 		ID:           dmID,
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{e.userA, e.userB},
 		LastActivity: at(1),
 	}))
@@ -1364,7 +1364,7 @@ func testServer_SendBatch_SideEffects(t *testing.T, badges badge.Store, blocklis
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), record.LastMessageID.GetValue())
 	for _, member := range []*commonpb.UserId{e.userA, e.userB} {
-		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_TIP_DM, time.Now().Add(time.Hour), nil, 0)
+		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_DM, time.Now().Add(time.Hour), nil, 0)
 		require.NoError(t, err)
 		require.Len(t, page, 1)
 		require.Equal(t, uint64(4), page[0].LastMessageID.GetValue())
@@ -1540,10 +1540,10 @@ func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blockl
 
 	// Whether the team's feed lists the DM is the chat store's to decide (see
 	// chat.FeedExclusions), and not what this test is about.
-	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.userA, team)
+	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.userA, team)
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 		ID:           dmID,
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{e.userA, team},
 		LastActivity: at(1),
 	}))
@@ -1551,7 +1551,7 @@ func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blockl
 	// feedEntry is the DM as the member's own DM feed lists it.
 	feedEntry := func(member *commonpb.UserId) *chat.Chat {
 		t.Helper()
-		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_TIP_DM, time.Now().Add(time.Hour), nil, 0)
+		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_DM, time.Now().Add(time.Hour), nil, 0)
 		require.NoError(t, err)
 		require.Len(t, page, 1)
 		return page[0]
@@ -1607,7 +1607,7 @@ func testServer_TeamAccount_Refused(t *testing.T, badges badge.Store, blocklists
 	// A DM of each type between userA and the team, each with a message from
 	// userA put there through the Sender (as a tip's payment message is), so
 	// an edit and a deletion have something of userA's to target.
-	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_TIP_DM} {
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_DM} {
 		dmID := chat.MustDeriveDmChatID(chatType, e.userA, team)
 		require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 			ID:           dmID,
@@ -3429,7 +3429,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 		return pushes
 	}
 
-	tipMessage := send(chatpb.ChatType_TIP_DM, "tip message")
+	tipMessage := send(chatpb.ChatType_DM, "tip message")
 	pushes := waitForPushes(1)
 
 	tipPush := pushes[0]
@@ -3440,7 +3440,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	require.Equal(t, e.userB.Value, tipPush.users[0].Value)
 	// The chat metadata carries the entire sent message, so a client can
 	// render the notification from it without a round trip to the server.
-	require.Equal(t, chatpb.ChatType_TIP_DM, tipPush.payload.ChatMetadata.Type)
+	require.Equal(t, chatpb.ChatType_DM, tipPush.payload.ChatMetadata.Type)
 	require.Equal(t, e.userA.Value, tipPush.payload.ChatMetadata.SendingUserId.Value)
 	require.True(t, proto.Equal(tipMessage, tipPush.payload.ChatMetadata.GetMessage()))
 	// Nothing in the push may carry the sender's phone number.
@@ -3643,10 +3643,10 @@ func testServer_SendMessage_SuppressedForBlockedSender(t *testing.T, badges badg
 
 	// The push path recovers the chat type from the canonical DM derivation, so
 	// the chat must live at its derived ID (unlike the env's default random-ID chat).
-	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.userA, e.userB)
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.userA, e.userB)
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 		ID:           chatID,
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{e.userA, e.userB},
 		LastActivity: at(1),
 	}))
@@ -3880,10 +3880,10 @@ func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.St
 	}
 
 	// A DM whose recipient has it muted: one push, flagged, unbadged.
-	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.userA, e.userB)
+	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.userA, e.userB)
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 		ID:           dmID,
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{e.userA, e.userB},
 		LastActivity: at(1),
 	}))

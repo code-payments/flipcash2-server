@@ -99,8 +99,8 @@ func GetContactDmPayment(appMetadata []byte) *intentpb.ChatMetadata_ContactDmPay
 // GetTipDmPayment extracts the tip DM payment from app metadata, if present. It
 // returns nil when there is no app metadata, the metadata fails to decode, or it
 // is not a tip DM payment.
-func GetTipDmPayment(appMetadata []byte) *intentpb.ChatMetadata_TipDmPayment {
-	return GetChatMetadata(appMetadata).GetTipDmPayment()
+func GetTipDmPayment(appMetadata []byte) *intentpb.ChatMetadata_DmPayment {
+	return GetChatMetadata(appMetadata).GetDmPayment()
 }
 
 // GetDmPaymentVerb reports how a DM payment should be rendered. A tip DM
@@ -121,9 +121,9 @@ func GetDmPaymentVerb(appMetadata []byte) messagingpb.CashContent_Verb {
 	}
 
 	switch tipDmPayment.GetAction() {
-	case intentpb.ChatMetadata_TipDmPayment_SEND:
+	case intentpb.ChatMetadata_DmPayment_SEND:
 		return messagingpb.CashContent_SENT
-	case intentpb.ChatMetadata_TipDmPayment_TIP:
+	case intentpb.ChatMetadata_DmPayment_TIP:
 		return messagingpb.CashContent_TIPPED
 	}
 
@@ -131,7 +131,7 @@ func GetDmPaymentVerb(appMetadata []byte) messagingpb.CashContent_Verb {
 	// unset falls back to the default for its location. TIPCARD is likewise the
 	// zero value, so an unset location is treated as having come from the tip
 	// card.
-	if tipDmPayment.GetLocation() == intentpb.ChatMetadata_TipDmPayment_TIPCARD {
+	if tipDmPayment.GetLocation() == intentpb.ChatMetadata_DmPayment_FLIPCARD {
 		return messagingpb.CashContent_TIPPED
 	}
 	return messagingpb.CashContent_SENT
@@ -256,7 +256,7 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 // and the Flipcash team account is allowed, tip or send.
 func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
 	chatMetadata := appMetadata.GetChat()
-	tipDmPayment := chatMetadata.GetTipDmPayment()
+	tipDmPayment := chatMetadata.GetDmPayment()
 	if tipDmPayment == nil {
 		return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
 	}
@@ -284,7 +284,7 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 	}
 
 	// The chat must be the canonical tip DM between the sender and recipient.
-	expectedChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
+	expectedChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
 	if !bytes.Equal(chatMetadata.GetChatId().GetValue(), expectedChatID.Value) {
 		return ocp_transaction.NewIntentValidationError("chat id does not match the tip dm between sender and recipient")
 	}

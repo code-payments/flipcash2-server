@@ -30,7 +30,7 @@ func (e *Executor) sendContactDmPaymentMessage(ctx context.Context, record *ocp_
 // sendTipDmPaymentMessage injects the cash message for a tip DM payment into
 // the tip DM between the sender and recipient.
 func (e *Executor) sendTipDmPaymentMessage(ctx context.Context, record *ocp_task.Record) error {
-	return e.sendDmPaymentMessage(ctx, record, chatpb.ChatType_TIP_DM)
+	return e.sendDmPaymentMessage(ctx, record, chatpb.ChatType_DM)
 }
 
 // sendDmPaymentMessage injects the cash message for a DM payment into the
@@ -77,8 +77,8 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 		if chatMetadata.GetContactDmPayment() == nil {
 			return errors.New("intent is not a contact dm payment")
 		}
-	case chatpb.ChatType_TIP_DM:
-		if chatMetadata.GetTipDmPayment() == nil {
+	case chatpb.ChatType_DM:
+		if chatMetadata.GetDmPayment() == nil {
 			return errors.New("intent is not a tip dm payment")
 		}
 	default:

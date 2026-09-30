@@ -219,7 +219,7 @@ func BuildTipDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *comm
 		},
 		ChatMetadata: &pushpb.ChatMetadata{
 			SendingUserId: senderID,
-			Type:          chatpb.ChatType_TIP_DM,
+			Type:          chatpb.ChatType_DM,
 			MessageRef:    &pushpb.ChatMetadata_Message{Message: message},
 		},
 	}

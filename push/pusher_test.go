@@ -76,7 +76,7 @@ func TestPayloadSize_MatchesSentPush(t *testing.T) {
 			GroupKey:   "group",
 			Navigation: &pushpb.Navigation{Type: &pushpb.Navigation_ChatId{ChatId: chatID}},
 			ChatMetadata: &pushpb.ChatMetadata{
-				Type: chatpb.ChatType_TIP_DM,
+				Type: chatpb.ChatType_DM,
 				MessageRef: &pushpb.ChatMetadata_Message{Message: testChatMessage(&messagingpb.Content{
 					Type: &messagingpb.Content_Text{Text: &messagingpb.TextContent{Text: "hello <world> & \"friends\" 😀"}},
 				})},

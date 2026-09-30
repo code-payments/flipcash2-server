@@ -72,6 +72,10 @@ func (s *store) SetUsername(ctx context.Context, id *commonpb.UserId, username s
 	return dbSetUsername(ctx, s.pool, id, username)
 }
 
+func (s *store) IsUsernameAutoAssigned(ctx context.Context, id *commonpb.UserId) (bool, error) {
+	return dbIsUsernameAutoAssigned(ctx, s.pool, id)
+}
+
 func (s *store) GetUserIdByUsername(ctx context.Context, username string) (*commonpb.UserId, error) {
 	return dbGetUserIdByUsername(ctx, s.pool, username)
 }
@@ -167,7 +171,7 @@ func (s *store) GetXProfile(ctx context.Context, userID *commonpb.UserId) (*prof
 }
 
 func (s *store) reset() {
-	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "username" = NULL, "profilePictureBlobId" = NULL, "flipcardColor" = NULL, "minDmChatInitFeeCurrency" = NULL, "minDmChatInitFeeNativeAmount" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL, "isPhoneNumberLinkedForPayment" = FALSE`)
+	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "username" = NULL, "isUsernameAutoAssigned" = FALSE, "profilePictureBlobId" = NULL, "flipcardColor" = NULL, "minDmChatInitFeeCurrency" = NULL, "minDmChatInitFeeNativeAmount" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL, "isPhoneNumberLinkedForPayment" = FALSE`)
 	if err != nil {
 		panic(err)
 	}

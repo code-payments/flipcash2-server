@@ -27,6 +27,7 @@ type InMemoryStore struct {
 	createdAtByUser        map[string]time.Time
 	flipcardColorByUser    map[string]string
 	usernameByUser         map[string]string
+	autoAssignedByUser     map[string]struct{} // users whose current handle was assigned by default
 	minDmChatInitFeeByUser map[string]*commonpb.FiatPaymentAmount
 }
 
@@ -39,6 +40,7 @@ func NewInMemory() profile.Store {
 		createdAtByUser:        make(map[string]time.Time),
 		flipcardColorByUser:    make(map[string]string),
 		usernameByUser:         make(map[string]string),
+		autoAssignedByUser:     make(map[string]struct{}),
 		minDmChatInitFeeByUser: make(map[string]*commonpb.FiatPaymentAmount),
 	}
 }
@@ -219,6 +221,7 @@ func (m *InMemoryStore) SetDisplayNameWithDefaultUsername(ctx context.Context, i
 	m.ensureProfile(key).DisplayName = displayName
 	if result.Username != "" {
 		m.usernameByUser[key] = result.Username
+		m.autoAssignedByUser[key] = struct{}{}
 	}
 
 	return result, nil
@@ -257,9 +260,24 @@ func (m *InMemoryStore) SetUsername(_ context.Context, id *commonpb.UserId, user
 	}
 
 	m.ensureProfile(targetKey)
-	m.usernameByUser[targetKey] = username
+	if m.usernameByUser[targetKey] != username {
+		m.usernameByUser[targetKey] = username
+		delete(m.autoAssignedByUser, targetKey)
+	}
 
 	return nil
+}
+
+func (m *InMemoryStore) IsUsernameAutoAssigned(_ context.Context, id *commonpb.UserId) (bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	key := userIDCacheKey(id)
+	if _, ok := m.profiles[key]; !ok {
+		return false, profile.ErrNotFound
+	}
+	_, autoAssigned := m.autoAssignedByUser[key]
+	return autoAssigned, nil
 }
 
 func (m *InMemoryStore) GetUserIdByUsername(_ context.Context, username string) (*commonpb.UserId, error) {
@@ -619,6 +637,7 @@ func (m *InMemoryStore) reset() {
 	m.createdAtByUser = make(map[string]time.Time)
 	m.flipcardColorByUser = make(map[string]string)
 	m.usernameByUser = make(map[string]string)
+	m.autoAssignedByUser = make(map[string]struct{})
 	m.minDmChatInitFeeByUser = make(map[string]*commonpb.FiatPaymentAmount)
 }
 

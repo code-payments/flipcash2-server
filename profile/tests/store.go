@@ -34,6 +34,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testMinDmChatInitFeeStore,
 		testUsername,
 		testDefaultUsernameStore,
+		testUsernameAutoAssigned,
 		testJoinTs,
 	} {
 		tf(t, s)
@@ -546,6 +547,80 @@ func testUsername(t *testing.T, s profile.Store) {
 	for _, publicProfile := range publicProfiles {
 		require.NoError(t, publicProfile.Validate())
 	}
+}
+
+func testUsernameAutoAssigned(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	autoAssigned := func(userID *commonpb.UserId) bool {
+		t.Helper()
+		autoAssigned, err := s.IsUsernameAutoAssigned(ctx, userID)
+		require.NoError(t, err)
+		return autoAssigned
+	}
+
+	// A user the store does not know has no answer.
+	_, err := s.IsUsernameAutoAssigned(ctx, model.MustGenerateUserID())
+	require.ErrorIs(t, err, profile.ErrNotFound)
+
+	// A user holding no handle holds no auto-assigned one.
+	unnamed := model.MustGenerateUserID()
+	require.NoError(t, s.SetDisplayName(ctx, unnamed, "No Handle"))
+	require.False(t, autoAssigned(unnamed))
+
+	// A claimed handle is chosen, and stays so when a later display name would
+	// otherwise have earned a default.
+	claimed := model.MustGenerateUserID()
+	require.NoError(t, s.SetUsername(ctx, claimed, "claimed"))
+	require.False(t, autoAssigned(claimed))
+	_, err = s.SetDisplayNameWithDefaultUsername(ctx, claimed, "Jeff Yanta", "jeff_yanta")
+	require.NoError(t, err)
+	require.False(t, autoAssigned(claimed))
+
+	// A default handle is auto-assigned, and a rename afterwards, which leaves the
+	// handle alone, leaves the flag alone too.
+	defaulted := model.MustGenerateUserID()
+	result, err := s.SetDisplayNameWithDefaultUsername(ctx, defaulted, "Jeff Yanta", "jeff_yanta")
+	require.NoError(t, err)
+	require.Equal(t, "jeff_yanta_2", result.Username)
+	require.True(t, autoAssigned(defaulted))
+	_, err = s.SetDisplayNameWithDefaultUsername(ctx, defaulted, "Someone Else", "someone_else")
+	require.NoError(t, err)
+	require.True(t, autoAssigned(defaulted))
+	require.NoError(t, s.SetDisplayName(ctx, defaulted, "Another Name"))
+	require.True(t, autoAssigned(defaulted))
+
+	// A failed claim changes neither the handle nor the flag.
+	require.ErrorIs(t, s.SetUsername(ctx, defaulted, "claimed"), profile.ErrUsernameTaken)
+	require.True(t, autoAssigned(defaulted))
+
+	// Re-claiming the default handle already held is a no-op, so it stays
+	// auto-assigned.
+	require.NoError(t, s.SetUsername(ctx, defaulted, "jeff_yanta_2"))
+	require.True(t, autoAssigned(defaulted))
+	p, err := s.GetProfile(ctx, defaulted, false)
+	require.NoError(t, err)
+	require.Equal(t, "jeff_yanta_2", p.Username.Value)
+
+	// And re-claiming a chosen handle leaves it chosen.
+	require.NoError(t, s.SetUsername(ctx, claimed, "claimed"))
+	require.False(t, autoAssigned(claimed))
+
+	// Claiming a different handle over a default one makes it chosen too.
+	renamed := model.MustGenerateUserID()
+	result, err = s.SetDisplayNameWithDefaultUsername(ctx, renamed, "Jeff Yanta", "jeff_yanta")
+	require.NoError(t, err)
+	require.Equal(t, "jeff_yanta_3", result.Username)
+	require.True(t, autoAssigned(renamed))
+	require.NoError(t, s.SetUsername(ctx, renamed, "renamed"))
+	require.False(t, autoAssigned(renamed))
+
+	// A default assigned to a user the store did not know yet is flagged as well.
+	fresh := model.MustGenerateUserID()
+	result, err = s.SetDisplayNameWithDefaultUsername(ctx, fresh, "Fresh User", "fresh_user")
+	require.NoError(t, err)
+	require.Equal(t, "fresh_user_2", result.Username)
+	require.True(t, autoAssigned(fresh))
 }
 
 func testDefaultUsernameStore(t *testing.T, s profile.Store) {

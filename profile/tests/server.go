@@ -853,6 +853,41 @@ func testSetUsernameBalanceGated(t *testing.T, accounts account.Store, profiles 
 		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_RESERVED_WORD}, resp))
 		require.Zero(t, ocpBalance.calls)
 	})
+
+	// Claiming the default handle a user was assigned, as-is, is a re-claim like
+	// any other: nothing is written, so it stays auto-assigned, and neither the
+	// gate nor moderation gets a say.
+	t.Run("Claiming a default handle as-is leaves it auto-assigned", func(t *testing.T) {
+		defaultedID := model.MustGenerateUserID()
+		defaultedKeyPair := model.MustGenerateKeyPair()
+		_, err := accounts.Bind(ctx, defaultedID, defaultedKeyPair.Proto())
+		require.NoError(t, err)
+		require.NoError(t, accounts.SetRegistrationFlag(ctx, defaultedID, true))
+
+		result, err := profiles.SetDisplayNameWithDefaultUsername(ctx, defaultedID, "Default User", "default_user")
+		require.NoError(t, err)
+		require.Equal(t, "default_user_2", result.Username)
+		autoAssigned, err := profiles.IsUsernameAutoAssigned(ctx, defaultedID)
+		require.NoError(t, err)
+		require.True(t, autoAssigned)
+
+		ocpBalance.coreMintValue = 0
+		ocpBalance.calls = 0
+		moderator.classifiedUsername = ""
+
+		req := &profilepb.SetUsernameRequest{Username: &commonpb.Username{Value: "default_user_2"}}
+		require.NoError(t, defaultedKeyPair.Auth(req, &req.Auth))
+		resp, err := client.SetUsername(ctx, req)
+		require.NoError(t, err)
+		require.NoError(t, protoutil.ProtoEqualError(&profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_OK}, resp))
+
+		require.Equal(t, "default_user_2", usernameOf(defaultedID))
+		autoAssigned, err = profiles.IsUsernameAutoAssigned(ctx, defaultedID)
+		require.NoError(t, err)
+		require.True(t, autoAssigned)
+		require.Zero(t, ocpBalance.calls)
+		require.Empty(t, moderator.classifiedUsername)
+	})
 }
 
 // fakeOcpBalance stands in for the OCP Balance service, answering every owner

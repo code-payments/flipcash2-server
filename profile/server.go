@@ -309,7 +309,8 @@ func (s *Server) SetUsername(ctx context.Context, req *profilepb.SetUsernameRequ
 	case err == nil && bytes.Equal(holder.Value, userID.Value):
 		// The user already holds this handle, so there is nothing to persist and
 		// nothing new to judge — it was moderated when it was first claimed. A client
-		// retrying a claim it already made lands here.
+		// retrying a claim it already made lands here, and a default handle claimed
+		// as-is stays auto-assigned (see Store.IsUsernameAutoAssigned).
 		return &profilepb.SetUsernameResponse{}, nil
 	case err == nil:
 		return &profilepb.SetUsernameResponse{Result: profilepb.SetUsernameResponse_ALREADY_TAKEN}, nil

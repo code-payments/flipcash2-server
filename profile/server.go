@@ -39,11 +39,15 @@ type Server struct {
 
 	xClient *x.Client
 
+	// firstUsername is told about every user's first handle (see
+	// WithFirstUsernameHandler), nil when nothing is.
+	firstUsername FirstUsernameHandler
+
 	profilepb.UnimplementedProfileServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, media Media, moderator moderation.Client, balances *balance.Client, xClient *x.Client) *Server {
-	return &Server{
+func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, profiles Store, media Media, moderator moderation.Client, balances *balance.Client, xClient *x.Client, opts ...ServerOption) *Server {
+	s := &Server{
 		log: log,
 
 		authz: authz,
@@ -59,6 +63,10 @@ func NewServer(log *zap.Logger, authz auth.Authorizer, accounts account.Store, p
 
 		xClient: xClient,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 func (s *Server) GetProfile(ctx context.Context, req *profilepb.GetProfileRequest) (*profilepb.GetProfileResponse, error) {
@@ -210,7 +218,6 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 	}
 	if err != nil {
 		if errors.Is(err, ErrInvalidDisplayName) {
-			log.Info("Invalid display name")
 			return nil, status.Error(codes.InvalidArgument, "invalid display name")
 		}
 
@@ -220,8 +227,11 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 
 	switch {
 	case defaultUsername.Username != "":
-		log.Info("Assigned default username", zap.String("username", defaultUsername.Username))
 		username = &commonpb.Username{Value: defaultUsername.Username}
+
+		// The store assigns a default handle only to a user holding none, in the
+		// same transaction that checks, so this is exactly their first.
+		s.onFirstUsername(ctx, userID, defaultUsername.Username)
 	case defaultUsername.NoneAvailable:
 		// The user is left without a handle until a later display name finds one.
 		// This only happens once a name's low numbers are all held and its cuts for
@@ -310,6 +320,24 @@ func (s *Server) SetUsername(ctx context.Context, req *profilepb.SetUsernameRequ
 		return nil, status.Error(codes.Internal, "failed to set username")
 	}
 
+	// Whether this is the caller's first handle, known only by reading what they
+	// hold before the claim, and read only when something is told of a first one
+	// (see FirstUsernameHandler). Two claims by the caller racing can both read
+	// none, which the handler tolerates. A failed read costs the handler its
+	// call, never the claim.
+	var isFirstUsername bool
+	if s.firstUsername != nil {
+		current, err := s.profiles.GetProfile(ctx, userID, false)
+		switch {
+		case err == nil:
+			isFirstUsername = current.Username == nil
+		case errors.Is(err, ErrNotFound):
+			isFirstUsername = true
+		default:
+			log.Warn("Failed to get profile to check for a first username", zap.Error(err))
+		}
+	}
+
 	// Gate on balance only once the handle is known to be claimable, so a user
 	// re-claiming the handle they already hold is never turned away for a balance
 	// that has since dropped, and a claim that would fail anyway costs no RPC. The
@@ -391,6 +419,10 @@ func (s *Server) SetUsername(ctx context.Context, req *profilepb.SetUsernameRequ
 			log.Warn("Failed to set username", zap.Error(err))
 			return nil, status.Error(codes.Internal, "failed to set username")
 		}
+	}
+
+	if isFirstUsername {
+		s.onFirstUsername(ctx, userID, username)
 	}
 
 	return &profilepb.SetUsernameResponse{}, nil

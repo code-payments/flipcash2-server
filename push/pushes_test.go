@@ -125,3 +125,37 @@ func TestChatMessagePush_MessageOrID(t *testing.T) {
 		})
 	}
 }
+
+// TestChatMessagePush_Widget: a widget's body is its plain-text stand-in, a
+// shared profile's link, and the payload carries the whole message, widget
+// included, for the client to render natively.
+func TestChatMessagePush_Widget(t *testing.T) {
+	ctx := context.Background()
+	chatID := &commonpb.ChatId{Value: bytes.Repeat([]byte{3}, 32)}
+	groupID := &commonpb.ChatId{Value: bytes.Repeat([]byte{4}, 16)}
+	senderID := &commonpb.UserId{Value: bytes.Repeat([]byte{2}, 16)}
+
+	message := testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Widget{
+		Widget: &messagingpb.WidgetContent{Type: &messagingpb.WidgetContent_ShareProfile{
+			ShareProfile: &messagingpb.ShareProfileWidget{Username: &commonpb.Username{Value: "alice_1"}},
+		}},
+	}})
+
+	dm, err := BuildTipDmPush(ctx, nil, chatID, message, senderID, "Flipcash")
+	require.NoError(t, err)
+	require.NotNil(t, dm)
+	require.Equal(t, "https://flipcash.com/alice_1", dm.body)
+	require.True(t, proto.Equal(message, dm.payload.ChatMetadata.GetMessage()))
+
+	group, err := BuildGroupChatPush(ctx, nil, groupID, message, senderID, "Flipcash", "Group Title")
+	require.NoError(t, err)
+	require.NotNil(t, group)
+	require.Equal(t, "Flipcash: https://flipcash.com/alice_1", group.body)
+	require.True(t, proto.Equal(message, group.payload.ChatMetadata.GetMessage()))
+
+	// A widget variant this server does not know earns no push.
+	unknown := testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Widget{Widget: &messagingpb.WidgetContent{}}})
+	none, err := BuildTipDmPush(ctx, nil, chatID, unknown, senderID, "Flipcash")
+	require.NoError(t, err)
+	require.Nil(t, none)
+}

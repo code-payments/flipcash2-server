@@ -160,6 +160,11 @@ type Server struct {
 	moderator moderation.Client
 	profiles  ProfileReader
 
+	// teamUserID is the Flipcash team account (see flipcashteam), whose DMs are
+	// never end-to-end encrypted (see useE2ee) and are shown with a Never
+	// speaker rule (see teamDmRules). Nil when there is none.
+	teamUserID *commonpb.UserId
+
 	rules  *RuleEvaluator
 	access *Access
 
@@ -209,6 +214,8 @@ func NewServer(
 	userEventBus UserEventPublisher,
 	chatEventBus ChatEventPublisher,
 
+	teamUserID *commonpb.UserId,
+
 	requireStaffForGroupManagement bool,
 	disableGetRoster bool,
 ) *Server {
@@ -230,6 +237,8 @@ func NewServer(
 
 		userEventBus: userEventBus,
 		chatEventBus: chatEventBus,
+
+		teamUserID: teamUserID,
 
 		requireStaffForGroupManagement: requireStaffForGroupManagement,
 		disableGetRoster:               disableGetRoster,
@@ -648,7 +657,10 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 			md.IsHidden = blockedPeers[string(peer.Value)]
 		}
 		if IsDmChatType(c.Type) {
-			md.UseE2Ee = useE2ee(c, staffByUserId)
+			md.UseE2Ee = useE2ee(c, staffByUserId, s.teamUserID)
+			if hasTeamMember(c, s.teamUserID) {
+				md.Rules = teamDmRules()
+			}
 		}
 		if c.PictureBlobID != nil {
 			// ToProto seeds the picture with its stored ORIGINAL; swap in the full
@@ -710,17 +722,45 @@ func assignPointers(members []*chatpb.Member, pointers []*messagingpb.Pointer) {
 	}
 }
 
+// hasTeamMember reports whether the Flipcash team account is one of the DM's
+// members. teamUserID is nil when there is no team account.
+func hasTeamMember(c *Chat, teamUserID *commonpb.UserId) bool {
+	return teamUserID != nil && c.HasMember(teamUserID)
+}
+
+// teamDmRules are the rules a DM with the Flipcash team account is shown with:
+// a Never speaker rule, since nobody sends in one. The messaging server
+// refuses every send there (see messaging.WithTeamAccount); this is how a
+// client learns it before trying, so it can leave the composer out. The rule
+// is not stored: a DM's record carries no rules (see Chat.Rules), and the
+// team is known only from the ID the server was built with, so it is decided
+// per read, like use_e2ee. The team itself writes through the messaging
+// Sender, which no rule gates.
+func teamDmRules() *chatpb.Rules {
+	return &chatpb.Rules{
+		Speaker: []*chatpb.SpeakerRules{{
+			Kind: &chatpb.SpeakerRules_Never{Never: &chatpb.Never{}},
+		}},
+	}
+}
+
 // useE2ee reports whether a DM's messages are to be end-to-end encrypted (see
 // chat.v1.Metadata.use_e2ee): today, exactly when every member of the DM is a
-// staff user, so the transitional rollout reaches staff DMs and no one else.
-// staffByUserId is the staff flag per member, as staffFlags returns it; a
-// member it does not name is not staff.
-func useE2ee(c *Chat, staffByUserId map[string]bool) bool {
+// staff user and none is the Flipcash team account, so the transitional rollout
+// reaches staff DMs and no one else. The team account is left out even when it
+// is staff: its DMs are opened and written to by the server (see flipcashteam),
+// which holds no keys for it. staffByUserId is the staff flag per member, as
+// staffFlags returns it; a member it does not name is not staff. teamUserID is
+// nil when there is no team account.
+func useE2ee(c *Chat, staffByUserId map[string]bool, teamUserID *commonpb.UserId) bool {
 	if !IsDmChatType(c.Type) || len(c.Members) == 0 {
 		return false
 	}
 	for _, m := range c.Members {
 		if !staffByUserId[string(m.Value)] {
+			return false
+		}
+		if teamUserID != nil && bytes.Equal(m.Value, teamUserID.Value) {
 			return false
 		}
 	}

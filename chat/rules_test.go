@@ -391,6 +391,21 @@ func TestRuleEvaluator(t *testing.T) {
 	_, err = e.CanListen(ctx, MustGenerateGroupChatID(), nonStaffUser)
 	require.ErrorIs(t, err, ErrChatNotFound)
 
+	// A Never speaker rule admits no one to speak, staff included, and is
+	// answered without a read.
+	neverSpeak := &chatpb.Rules{Speaker: []*chatpb.SpeakerRules{{
+		Kind: &chatpb.SpeakerRules_Never{Never: &chatpb.Never{}},
+	}}}
+	staff.err = nil
+	staff.staff[string(staffUser.Value)] = true
+	asked := staff.asked
+	for _, u := range []*commonpb.UserId{staffUser, nonStaffUser} {
+		ok, err = e.CanSpeakWithRules(ctx, neverSpeak, u)
+		require.NoError(t, err)
+		require.False(t, ok)
+	}
+	require.Equal(t, asked, staff.asked)
+
 }
 
 func TestRuleEvaluator_MinimumBalance(t *testing.T) {

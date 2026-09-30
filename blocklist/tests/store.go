@@ -332,6 +332,18 @@ func testStore_GetBlockers_ManyBlockers(t *testing.T, s blocklist.Store) {
 	got, err := s.GetBlockers(ctx, blocked, []*commonpb.UserId{blocker, notBlocking})
 	require.NoError(t, err)
 	require.Equal(t, map[string]bool{string(blocker.Value): true}, got)
+
+	// A single candidate, as a DM's push asks, is resolved exactly too, whether
+	// or not they are a blocker; a repeat of them is still one candidate.
+	got, err = s.GetBlockers(ctx, blocked, []*commonpb.UserId{blocker})
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{string(blocker.Value): true}, got)
+	got, err = s.GetBlockers(ctx, blocked, []*commonpb.UserId{blocker, blocker})
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{string(blocker.Value): true}, got)
+	got, err = s.GetBlockers(ctx, blocked, []*commonpb.UserId{notBlocking})
+	require.NoError(t, err)
+	require.Empty(t, got)
 }
 
 func testStore_GetBlocklistPage_Order(t *testing.T, s blocklist.Store) {

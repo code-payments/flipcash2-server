@@ -82,6 +82,14 @@ func replyFixture(body *messagingpb.Content) *messagingpb.Content {
 	}}
 }
 
+func widgetFixture() *messagingpb.Content {
+	return &messagingpb.Content{Type: &messagingpb.Content_Widget{
+		Widget: &messagingpb.WidgetContent{Type: &messagingpb.WidgetContent_ShareProfile{
+			ShareProfile: &messagingpb.ShareProfileWidget{Username: &commonpb.Username{Value: "alice_1"}},
+		}},
+	}}
+}
+
 func systemFixture() *messagingpb.Content {
 	return &messagingpb.Content{Type: &messagingpb.Content_System{
 		System: &messagingpb.SystemContent{FallbackText: "Alice added Bob to the chat"},
@@ -194,6 +202,24 @@ func TestContent_Encrypted(t *testing.T) {
 	assert.NotSame(t, in.GetEncrypted(), out.GetEncrypted())
 }
 
+// TestContent_Widget: a widget keeps its variant, so the viewer sees a
+// profile was shared, but not whose.
+func TestContent_Widget(t *testing.T) {
+	out := mustContent(t, chatID, messageID, widgetFixture())
+	username := out.GetWidget().GetShareProfile().GetUsername()
+	assert.Equal(t, redactedUsername, username.GetValue())
+	assert.NoError(t, out.Validate())
+
+	// A widget variant this function does not know is not passed through.
+	for _, in := range []*messagingpb.Content{
+		{Type: &messagingpb.Content_Widget{}},
+		{Type: &messagingpb.Content_Widget{Widget: &messagingpb.WidgetContent{}}},
+	} {
+		_, err := Content(chatID, messageID, in)
+		assert.ErrorIs(t, err, ErrUnsupportedContent)
+	}
+}
+
 func TestContent_Deleted(t *testing.T) {
 	in := deletedFixture()
 	out := mustContent(t, chatID, messageID, in)
@@ -258,5 +284,6 @@ func fixturesForAllKinds() []*messagingpb.Content {
 		systemFixture(),
 		deletedFixture(),
 		encryptedFixture(),
+		widgetFixture(),
 	}
 }

@@ -38,6 +38,10 @@ const broadcastTimeout = 5 * time.Second
 // (e.g. from AdvanceLastMessage), avoiding a redundant read; when nil, they
 // are loaded here. A group's members are never loaded whole: the argument is
 // ignored for a group.
+//
+// The team account is never delivered to, on the stream or by push, whatever
+// happened in its DMs (see WithTeamAccount): nobody reads as it. The user it
+// talks to hears about everything as usual.
 func (s *Sender) publishChatUpdate(
 	ctx context.Context,
 	log *zap.Logger,
@@ -87,6 +91,9 @@ func (s *Sender) publishChatUpdate(
 	} else {
 		for _, m := range members {
 			if exclude != nil && bytes.Equal(m.Value, exclude.Value) {
+				continue
+			}
+			if s.isTeamAccount(m) {
 				continue
 			}
 			s.userEventBus.OnEvent(m, e)

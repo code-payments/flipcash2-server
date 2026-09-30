@@ -38,6 +38,14 @@ type memory struct {
 	// by chat ID, moved as the persistent stores move theirs (see
 	// chat.Store.GetMutedCount). Absent reads as zero.
 	mutedCounts map[string]uint64
+
+	// excludedFromFeed is the set of members each DM excludes from the feed,
+	// keyed by chat ID then user ID, recorded at creation as the persistent
+	// stores record it (see chat.Store.PutChat). Absent for a DM excluding no
+	// one.
+	excludedFromFeed map[string]map[string]struct{}
+
+	opts chat.StoreOptions
 }
 
 // memberRecord is one group membership record, as the persistent stores keep
@@ -51,13 +59,15 @@ type memberRecord struct {
 }
 
 // NewInMemory returns an in-memory chat.Store, for tests.
-func NewInMemory() chat.Store {
+func NewInMemory(opts ...chat.StoreOption) chat.Store {
 	return &memory{
-		chats:         make(map[string]*chat.Chat),
-		groupMembers:  make(map[string]map[string]*memberRecord),
-		groupVersions: make(map[string]uint64),
-		viewerStates:  make(map[string]map[string]*chat.ViewerState),
-		mutedCounts:   make(map[string]uint64),
+		opts:             chat.NewStoreOptions(opts...),
+		excludedFromFeed: make(map[string]map[string]struct{}),
+		chats:            make(map[string]*chat.Chat),
+		groupMembers:     make(map[string]map[string]*memberRecord),
+		groupVersions:    make(map[string]uint64),
+		viewerStates:     make(map[string]map[string]*chat.ViewerState),
+		mutedCounts:      make(map[string]uint64),
 	}
 }
 
@@ -70,6 +80,7 @@ func (m *memory) reset() {
 	m.groupVersions = make(map[string]uint64)
 	m.viewerStates = make(map[string]map[string]*chat.ViewerState)
 	m.mutedCounts = make(map[string]uint64)
+	m.excludedFromFeed = make(map[string]map[string]struct{})
 }
 
 // isJoinedLocked reports whether the user's record on the group has them
@@ -127,6 +138,13 @@ func (m *memory) PutChat(_ context.Context, c *chat.Chat) error {
 
 	stored.RosterSummary = chat.RosterSummary{MemberCount: uint64(len(stored.Members))}
 	m.chats[key] = stored
+	if excluded := m.opts.ExcludedFromFeed(c); len(excluded) > 0 {
+		set := make(map[string]struct{}, len(excluded))
+		for _, userID := range excluded {
+			set[string(userID.Value)] = struct{}{}
+		}
+		m.excludedFromFeed[key] = set
+	}
 	return nil
 }
 
@@ -311,7 +329,12 @@ func (m *memory) GetDmFeedPage(_ context.Context, userID *commonpb.UserId, chatT
 	// after the snapshot has moved above the watermark and is excluded from the
 	// read.
 	var chats []*chat.Chat
-	for _, c := range m.chats {
+	for key, c := range m.chats {
+		// A member the DM excludes from the feed never has it listed (see
+		// chat.Store.PutChat).
+		if _, ok := m.excludedFromFeed[key][string(userID.Value)]; ok {
+			continue
+		}
 		if c.Type == chatType && hasInlineMember(c, userID) && !c.LastActivity.After(snapshot) {
 			chats = append(chats, c.Clone())
 		}

@@ -57,6 +57,8 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_TipDm_HidesPhoneNumbers,
 		testServer_GetChat_Dm_NoCreator,
 		testServer_GetChat_Dm_UseE2ee,
+		testServer_GetChat_Dm_UseE2ee_TeamAccount,
+		testServer_GetChat_Dm_TeamAccount_NeverSpeak,
 		testServer_GetChat_HiddenWhenPeerBlocked,
 		testServer_GetChat_Group_Hydrates,
 		testServer_GetChat_Group_Picture,
@@ -148,6 +150,9 @@ type serverEnv struct {
 
 	userID *commonpb.UserId
 	keys   model.KeyPair
+
+	// teamUserID is the Flipcash team account the server is built with.
+	teamUserID *commonpb.UserId
 }
 
 // serverConfig is the configuration a test env's server is built with; the
@@ -168,6 +173,7 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	userID := model.MustGenerateUserID()
 	keys := model.MustGenerateKeyPair()
 	authz.Add(userID, keys)
+	teamUserID := model.MustGenerateUserID()
 
 	accounts := newStaffAccounts(accountmemory.NewInMemory())
 	ocpBalance := &fakeOcpBalance{byOwner: make(map[string]uint64)}
@@ -186,7 +192,7 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	media := newFakeMedia()
 	moderator := &fakeModerator{}
 	access := chat.NewAccess(s, chat.NewRuleEvaluator(accounts, balances, s))
-	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, access, userBus, chatBus, false, cfg.disableGetRoster)
+	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, access, userBus, chatBus, teamUserID, false, cfg.disableGetRoster)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
@@ -208,6 +214,7 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 		chatObserver: chatObserver,
 		userID:       userID,
 		keys:         keys,
+		teamUserID:   teamUserID,
 	}
 }
 
@@ -1268,6 +1275,63 @@ func testServer_GetChat_Dm_NoCreator(t *testing.T, s chat.Store) {
 		require.Len(t, feed.Chats, 1)
 		require.Equal(t, chatID.Value, feed.Chats[0].ChatId.Value)
 		require.Nil(t, feed.Chats[0].Creator)
+	}
+}
+
+func testServer_GetChat_Dm_UseE2ee_TeamAccount(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// The Flipcash team account's DMs never carry use_e2ee, even when both
+	// members are staff: the server writes into them on the team's behalf and
+	// holds no keys for it.
+	chatID := e.putDMWithPeer(chatpb.ChatType_TIP_DM, e.teamUserID, at(1))
+	e.accounts.setStaff(e.userID, true)
+	e.accounts.setStaff(e.teamUserID, true)
+
+	resp := e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.False(t, resp.Metadata.UseE2Ee)
+
+	feed, err := e.getDmFeedOfType(chatpb.ChatType_TIP_DM, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Len(t, feed.Chats, 1)
+	require.Equal(t, chatID.Value, feed.Chats[0].ChatId.Value)
+	require.False(t, feed.Chats[0].UseE2Ee)
+}
+
+func testServer_GetChat_Dm_TeamAccount_NeverSpeak(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// A DM with the Flipcash team account is shown with a Never speaker rule,
+	// whatever its type and whichever read serves it; any other DM carries no
+	// rules.
+	neverSpeak := &chatpb.Rules{
+		Speaker: []*chatpb.SpeakerRules{{
+			Kind: &chatpb.SpeakerRules_Never{Never: &chatpb.Never{}},
+		}},
+	}
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_TIP_DM} {
+		teamChatID := e.putDMWithPeer(chatType, e.teamUserID, at(2))
+		otherChatID := e.putDMWithPeer(chatType, model.MustGenerateUserID(), at(1))
+
+		resp := e.getChat(e.keys, teamChatID)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+		require.True(t, proto.Equal(neverSpeak, resp.Metadata.Rules), "%s", chatType)
+
+		resp = e.getChat(e.keys, otherChatID)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+		require.Nil(t, resp.Metadata.Rules, "%s", chatType)
+
+		feed, err := e.getDmFeedOfType(chatType, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Len(t, feed.Chats, 2)
+		for _, md := range feed.Chats {
+			if bytes.Equal(md.ChatId.Value, teamChatID.Value) {
+				require.True(t, proto.Equal(neverSpeak, md.Rules), "%s", chatType)
+			} else {
+				require.Nil(t, md.Rules, "%s", chatType)
+			}
+		}
 	}
 }
 

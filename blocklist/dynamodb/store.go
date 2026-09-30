@@ -35,8 +35,9 @@ import (
 //	           GetBlockers answers the reverse question — which of these owners
 //	           have blocked one user — off the reverse GSI, intersecting one
 //	           blocker set against the candidates in memory, with a keyed
-//	           BatchGetItem fallback once that set outgrows a bounded probe. See
-//	           there for why the index rather than the keys is the default.
+//	           BatchGetItem fallback once that set outgrows a bounded probe. A
+//	           single candidate skips the index for a point read of its one key.
+//	           See there for why the index rather than the keys is the default.
 //
 //	           Each owner also has one metadata item (sk = "#meta") holding
 //	           per-owner aggregates — currently just their blocklist size in a
@@ -297,6 +298,32 @@ func (s *store) GetBlockers(ctx context.Context, blockedID *commonpb.UserId, can
 		}
 		wanted[string(ownerID.Value)] = struct{}{}
 		ownerIDs = append(ownerIDs, ownerID)
+	}
+
+	// A single candidate — a DM's recipient — is answered by the one item that
+	// would record them blocking blockedID, in their own partition. That is never
+	// dearer than the probe below (0.5 RCU, the probe's minimum), and it keeps a
+	// sender who DMs very many users, each push asking about one recipient, from
+	// concentrating every one of those reads on their single reverse-index
+	// partition, where a heavily blocked sender would also pay for a full probe
+	// before falling back to the keys anyway.
+	if len(ownerIDs) == 1 {
+		out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName: aws.String(s.table),
+			Key: map[string]types.AttributeValue{
+				attrPK: avS(ownerPK(ownerIDs[0])),
+				attrSK: avS(blockedSK(blockedID)),
+			},
+			ProjectionExpression: aws.String(attrPK),
+		})
+		if err != nil {
+			return nil, err
+		}
+		blockers := make(map[string]bool)
+		if len(out.Item) > 0 {
+			blockers[string(ownerIDs[0].Value)] = true
+		}
+		return blockers, nil
 	}
 
 	// Read the reverse index for blockedID — everyone who has blocked them — and

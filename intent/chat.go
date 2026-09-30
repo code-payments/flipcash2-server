@@ -252,7 +252,8 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 // later payment into it, tip or send, may be any amount. A send has no
 // minimum, but the chat must already be initialized — a send is made from
 // within the chat, and the client can only be inside a chat that exists, so a
-// send into one that doesn't is denied.
+// send into one that doesn't is denied. No payment either way between a user
+// and the Flipcash team account is allowed, tip or send.
 func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
 	chatMetadata := appMetadata.GetChat()
 	tipDmPayment := chatMetadata.GetTipDmPayment()
@@ -269,6 +270,15 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 
 	if bytes.Equal(senderUserID.Value, recipientUserID.Value) {
 		return ocp_transaction.NewIntentDeniedError("payment is a no-op tip to yourself")
+	}
+
+	// Nobody messages the Flipcash team, and a DM payment is a message: the
+	// task it schedules puts a cash message in the DM (see
+	// messaging.WithTeamAccount). Refused here, before any money moves, rather
+	// than by the task, which could only drop the message of a payment already
+	// made. The team sends nothing this way either.
+	if i.isTeamAccount(senderUserID) || i.isTeamAccount(recipientUserID) {
+		return ocp_transaction.NewIntentDeniedError("tip dm payments with the flipcash team are not allowed")
 	}
 
 	// The chat must be the canonical tip DM between the sender and recipient.
@@ -310,6 +320,12 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 		return validateMinimumTipAmount(intentRecord.SendPublicPaymentMetadata)
 	}
 	return i.validateMinDmChatInitFee(ctx, intentRecord.SendPublicPaymentMetadata, fee)
+}
+
+// isTeamAccount reports whether userID is the Flipcash team account (see
+// NewIntegration).
+func (i *Integration) isTeamAccount(userID *commonpb.UserId) bool {
+	return i.teamUserID != nil && bytes.Equal(userID.GetValue(), i.teamUserID.Value)
 }
 
 // validateMinDmChatInitFee enforces the recipient's minimum DM chat

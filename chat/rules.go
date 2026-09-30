@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -34,8 +35,10 @@ import (
 // first, since an evaluator stops at the first one a user fails: a staff check
 // is a flag read, a balance check a valuation.
 //
-// A DM's record carries none, but a read of a DM with the Flipcash team
-// account is shown a Never speaker rule, added per read (see teamDmRules).
+// A DM's record carries none, but a DM with the Flipcash team account carries
+// a Never speaker rule, which only the RuleEvaluator, knowing the team, can
+// add (see RuleEvaluator.RulesOf): a chat's rules for display or evaluation
+// come from there, not from here.
 func (c *Chat) Rules() *chatpb.Rules {
 	if c.Type != chatpb.ChatType_GROUP {
 		return nil
@@ -142,8 +145,16 @@ func minimumTransferValue(code currency_lib.Code) float64 {
 // (see Chat.Rules). It evaluates rules only: membership is a separate, cheaper
 // check the caller makes first, so a chat's rules are evaluated on behalf of a
 // non-member only where the rules are what admits them — a join, or a
-// qualifying non-member's read of a group (see Access). Only a group can
-// carry rules; a DM's evaluation never touches the store.
+// qualifying non-member's read of a group (see Access). Only a group stores
+// rules; a DM's evaluation never touches the store.
+//
+// A DM with the Flipcash team account carries one rule no record stores: a
+// Never speaker rule, since nobody sends in one (see teamDmRules). The team
+// writes through the messaging Sender, which no rule gates, and nobody reads
+// as it, so a message to it would be read by no one. The rule is decided per
+// read off the team account the evaluator is built with, like use_e2ee, so
+// that the rule a client is shown (RulesOf, through Metadata.rules) and the
+// rule a send is refused by (CanSpeak) are one decision.
 //
 // Rules are read through Store.GetGroupRules — in production the caching
 // store, which holds every group's rules after its first read. A
@@ -167,17 +178,42 @@ type RuleEvaluator struct {
 	accounts account.Store
 	balances *balance.Client
 	chats    Store
+
+	// teamUserID is the Flipcash team account, nil when there is none.
+	teamUserID *commonpb.UserId
 }
 
-func NewRuleEvaluator(accounts account.Store, balances *balance.Client, chats Store) *RuleEvaluator {
-	return &RuleEvaluator{accounts: accounts, balances: balances, chats: chats}
+// NewRuleEvaluator returns a RuleEvaluator. teamUserID is the Flipcash team
+// account (see flipcashteam), nil when there is none; it is an argument rather
+// than an option so that a parent cannot build an evaluator without deciding
+// it, since an evaluator that does not know the team lets users message it.
+func NewRuleEvaluator(accounts account.Store, balances *balance.Client, chats Store, teamUserID *commonpb.UserId) *RuleEvaluator {
+	var team *commonpb.UserId
+	if teamUserID != nil {
+		team = &commonpb.UserId{Value: bytes.Clone(teamUserID.Value)}
+	}
+	return &RuleEvaluator{accounts: accounts, balances: balances, chats: chats, teamUserID: team}
+}
+
+// RulesOf returns c's rules as the evaluator evaluates them, nil when it has
+// none: a group's stored rules (see Chat.Rules), and for a DM, the Never
+// speaker rule when the team account is one of its members (see
+// teamDmRules). It is what a client is shown as Metadata.rules.
+func (e *RuleEvaluator) RulesOf(c *Chat) *chatpb.Rules {
+	if IsGroupChatID(c.ID) {
+		return c.Rules()
+	}
+	if e.teamUserID != nil && c.HasMember(e.teamUserID) {
+		return teamDmRules()
+	}
+	return nil
 }
 
 // CanListen reports whether userID satisfies every listener rule of chatID —
 // the requirements to read (and join) the chat. A chat with no listener rules
 // admits everyone. It returns ErrChatNotFound if a group chat does not exist.
 func (e *RuleEvaluator) CanListen(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
-	rules, err := e.rulesFor(ctx, chatID)
+	rules, err := e.rulesFor(ctx, chatID, userID)
 	if err != nil {
 		return false, err
 	}
@@ -198,7 +234,7 @@ func (e *RuleEvaluator) CanListenWithRules(ctx context.Context, rules *chatpb.Ru
 // on top of listener rules: a user who cannot listen cannot speak, whatever the
 // speaker rules say. It returns ErrChatNotFound if a group chat does not exist.
 func (e *RuleEvaluator) CanSpeak(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
-	rules, err := e.rulesFor(ctx, chatID)
+	rules, err := e.rulesFor(ctx, chatID, userID)
 	if err != nil {
 		return false, err
 	}
@@ -236,13 +272,46 @@ func (e *RuleEvaluator) satisfiesSpeaker(ctx context.Context, rules *chatpb.Rule
 	return true, nil
 }
 
-// rulesFor returns chatID's rules, nil when it has none. A DM is answered
-// without a read: rules are group-only, and a DM's ID says which it is.
-func (e *RuleEvaluator) rulesFor(ctx context.Context, chatID *commonpb.ChatId) (*chatpb.Rules, error) {
+// rulesFor returns chatID's rules as userID is evaluated against them, nil
+// when it has none. A DM is answered without a read: a DM stores no rules, and
+// whether it is one with the team account is decided off the IDs (see
+// inTeamDm). That is exact for a member, which every caller has established
+// first, since a DM's members are userID and one other.
+func (e *RuleEvaluator) rulesFor(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (*chatpb.Rules, error) {
 	if !IsGroupChatID(chatID) {
+		if e.inTeamDm(chatID, userID) {
+			return teamDmRules(), nil
+		}
 		return nil, nil
 	}
 	return e.chats.GetGroupRules(ctx, chatID)
+}
+
+// inTeamDm reports whether chatID is a DM that userID shares with the team
+// account, or, when userID is the team account itself, any DM. It is decided
+// off the IDs alone, with no read: a DM's ID is derived from its members, so
+// it is a DM with the team exactly when it derives from the team and userID
+// under one of the DM types. It says nothing of whether the chat exists or
+// userID is in it.
+func (e *RuleEvaluator) inTeamDm(chatID *commonpb.ChatId, userID *commonpb.UserId) bool {
+	if e.teamUserID == nil || IsGroupChatID(chatID) {
+		return false
+	}
+	if bytes.Equal(userID.GetValue(), e.teamUserID.Value) {
+		return true
+	}
+	return DeriveDmChatType(chatID, []*commonpb.UserId{e.teamUserID, userID}) != chatpb.ChatType_UNKNOWN
+}
+
+// teamDmRules are the rules of a DM with the Flipcash team account (see
+// RuleEvaluator): a Never speaker rule, which no one satisfies, the team
+// included. A client shown it leaves the composer out.
+func teamDmRules() *chatpb.Rules {
+	return &chatpb.Rules{
+		Speaker: []*chatpb.SpeakerRules{{
+			Kind: &chatpb.SpeakerRules_Never{Never: &chatpb.Never{}},
+		}},
+	}
 }
 
 // satisfies evaluates one rule, of either class, for userID. The two classes
@@ -261,10 +330,9 @@ func (e *RuleEvaluator) satisfies(ctx context.Context, kind any, userID *commonp
 	case *chatpb.SpeakerRules_MinimumBalance:
 		return e.satisfiesMinimumBalance(ctx, k.MinimumBalance, userID)
 	case *chatpb.SpeakerRules_Never:
-		// No one satisfies it. Only a DM with the Flipcash team account is
-		// shown one, and never from its record (see teamDmRules), so nothing
-		// stored reaches here today; it is answered so that the rule a client
-		// is shown is one the evaluator can evaluate.
+		// No one satisfies it. Only a DM with the Flipcash team account
+		// carries one, never from its record (see teamDmRules), and this is
+		// what refuses every send in one.
 		return false, nil
 	default:
 		return false, fmt.Errorf("unsupported chat rule %T", k)

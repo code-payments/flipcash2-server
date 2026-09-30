@@ -13,7 +13,7 @@ import (
 func TestMessaging_MemoryServer(t *testing.T) {
 	badges := badge_memory.NewInMemory()
 	blocklists := blocklist_memory.NewInMemory()
-	chats := chat_memory.NewInMemory()
+	chats := chat_memory.NewInMemory(nil)
 	profiles := profile_memory.NewInMemory()
 	messages := NewInMemory()
 	teardown := func() {

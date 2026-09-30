@@ -22,138 +22,12 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 )
 
-// RunStoreOptionTests runs the shared tests of chat.StoreOption against
-// stores newStore builds with the options given. The stores it builds may
-// share storage: every test names chats and users of its own.
-func RunStoreOptionTests(t *testing.T, newStore func(opts ...chat.StoreOption) chat.Store) {
-	for _, tf := range []func(t *testing.T, newStore func(opts ...chat.StoreOption) chat.Store){
-		testStoreOption_ExcludedFromFeed,
-	} {
-		tf(t, newStore)
-	}
-}
-
-func testStoreOption_ExcludedFromFeed(t *testing.T, newStore func(opts ...chat.StoreOption) chat.Store) {
-	ctx := context.Background()
-
-	// Two accounts excluded across two options, one of them named twice: a
-	// user named more than once is excluded once, and options add up.
-	team := model.MustGenerateUserID()
-	support := model.MustGenerateUserID()
-	s := newStore(chat.WithExcludedFromFeed(team, team), chat.WithExcludedFromFeed(support))
-
-	// feed is the member's own DM feed in s, whole.
-	feed := func(s chat.Store, member *commonpb.UserId) []*chat.Chat {
-		t.Helper()
-		page, err := s.GetDmFeedPage(ctx, member, chatpb.ChatType_TIP_DM, at(1000), nil, 0)
-		require.NoError(t, err)
-		return page
-	}
-
-	// A DM with the configured user excludes them from the feed: they are a
-	// member whose feed does not list it, while the other member's does.
-	user := model.MustGenerateUserID()
-	c := &chat.Chat{
-		ID:           generateDmChatID(),
-		Type:         chatpb.ChatType_TIP_DM,
-		Members:      []*commonpb.UserId{user, team},
-		LastActivity: at(100),
-	}
-	require.NoError(t, s.PutChat(ctx, c))
-	require.Empty(t, feed(s, team))
-	require.Len(t, feed(s, user), 1)
-	isMember, err := s.IsMember(ctx, c.ID, team)
-	require.NoError(t, err)
-	require.True(t, isMember)
-
-	// Every advance moves the record and the other member's feed, and still
-	// lists nothing for the excluded member.
-	for i, ts := range []time.Time{at(200), at(300)} {
-		advanced, members, err := s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: uint64(i + 1)}, ts)
-		require.NoError(t, err)
-		require.True(t, advanced)
-		require.Len(t, members, 2)
-
-		got, err := s.GetChatByID(ctx, c.ID)
-		require.NoError(t, err)
-		require.True(t, got.LastActivity.Equal(ts))
-		userFeed := feed(s, user)
-		require.Len(t, userFeed, 1)
-		require.True(t, userFeed[0].LastActivity.Equal(ts))
-		require.Equal(t, uint64(i+1), userFeed[0].LastMessageID.GetValue())
-		require.Empty(t, feed(s, team))
-	}
-
-	// A DM between two excluded users excludes both: neither feed lists it,
-	// both are members, and an advance still moves the record.
-	both := &chat.Chat{
-		ID:           generateDmChatID(),
-		Type:         chatpb.ChatType_TIP_DM,
-		Members:      []*commonpb.UserId{team, support},
-		LastActivity: at(100),
-	}
-	require.NoError(t, s.PutChat(ctx, both))
-	require.Empty(t, feed(s, team))
-	require.Empty(t, feed(s, support))
-	for _, member := range []*commonpb.UserId{team, support} {
-		isMember, err := s.IsMember(ctx, both.ID, member)
-		require.NoError(t, err)
-		require.True(t, isMember)
-	}
-	advanced, _, err := s.AdvanceLastMessage(ctx, both.ID, &messagingpb.MessageId{Value: 1}, at(200))
-	require.NoError(t, err)
-	require.True(t, advanced)
-	got, err := s.GetChatByID(ctx, both.ID)
-	require.NoError(t, err)
-	require.True(t, got.LastActivity.Equal(at(200)))
-	require.Empty(t, feed(s, team))
-	require.Empty(t, feed(s, support))
-
-	// A DM without them excludes no one.
-	a, b := model.MustGenerateUserID(), model.MustGenerateUserID()
-	plain := &chat.Chat{
-		ID:           generateDmChatID(),
-		Type:         chatpb.ChatType_TIP_DM,
-		Members:      []*commonpb.UserId{a, b},
-		LastActivity: at(100),
-	}
-	require.NoError(t, s.PutChat(ctx, plain))
-	require.Len(t, feed(s, a), 1)
-	require.Len(t, feed(s, b), 1)
-
-	// A group they are created in is created as for anyone: a group keeps no
-	// per-member feed copies to exclude them from.
-	group := &chat.Chat{
-		ID:           chat.MustGenerateGroupChatID(),
-		Type:         chatpb.ChatType_GROUP,
-		Members:      []*commonpb.UserId{a, team},
-		LastActivity: at(100),
-	}
-	require.NoError(t, s.PutChat(ctx, group))
-	isMember, err = s.IsMember(ctx, group.ID, team)
-	require.NoError(t, err)
-	require.True(t, isMember)
-
-	// A nil user ID, what a parent with no team account configured passes,
-	// excludes no one.
-	none := newStore(chat.WithExcludedFromFeed(nil))
-	other := model.MustGenerateUserID()
-	listed := &chat.Chat{
-		ID:           generateDmChatID(),
-		Type:         chatpb.ChatType_TIP_DM,
-		Members:      []*commonpb.UserId{other, team},
-		LastActivity: at(100),
-	}
-	require.NoError(t, none.PutChat(ctx, listed))
-	require.Len(t, feed(none, other), 1)
-	teamFeed := feed(none, team)
-	require.Len(t, teamFeed, 1)
-	require.Equal(t, listed.ID.Value, teamFeed[0].ID.Value)
-}
-
-// RunStoreTests runs the shared chat.Store test suite against s. teardown is
-// called between tests to reset the store.
-func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
+// RunStoreTests runs the shared chat.Store test suite against s, a store
+// excluding no one from the feed, and stores newStore builds excluding the
+// users given (see chat.FeedExclusions). teardown is called between tests to
+// reset the store; the stores newStore builds may share s's storage, and every
+// test using them names chats and users of its own.
+func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []*commonpb.UserId) chat.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, s chat.Store){
 		testStore_PutAndGet,
 		testStore_PutChat_Duplicate,
@@ -163,6 +37,7 @@ func RunStoreTests(t *testing.T, s chat.Store, teardown func()) {
 		testStore_Members,
 		testStore_IsMember,
 		testStore_AdvanceLastMessage,
+		func(t *testing.T, _ chat.Store) { testStore_FeedExclusions(t, newStore) },
 		testStore_GroupChat_PutAndGet,
 		testStore_GroupChat_StaffOnly,
 		testStore_GroupChat_MinimumListenerBalance,
@@ -351,6 +226,126 @@ func testStore_AdvanceLastMessage(t *testing.T, s chat.Store) {
 	_, members, err = s.AdvanceLastMessage(ctx, generateDmChatID(), &messagingpb.MessageId{Value: 1}, at(1))
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 	require.Nil(t, members)
+}
+
+// testStore_FeedExclusions runs against stores newStore builds, since what it
+// tests is how a store is built.
+func testStore_FeedExclusions(t *testing.T, newStore func(excludedFromFeed []*commonpb.UserId) chat.Store) {
+	ctx := context.Background()
+
+	// Two accounts excluded, one of them named twice: a user named more than
+	// once is excluded once.
+	team := model.MustGenerateUserID()
+	support := model.MustGenerateUserID()
+	s := newStore([]*commonpb.UserId{team, team, support})
+
+	// feed is the member's own DM feed in s, whole.
+	feed := func(s chat.Store, member *commonpb.UserId) []*chat.Chat {
+		t.Helper()
+		page, err := s.GetDmFeedPage(ctx, member, chatpb.ChatType_TIP_DM, at(1000), nil, 0)
+		require.NoError(t, err)
+		return page
+	}
+
+	// A DM with the configured user excludes them from the feed: they are a
+	// member whose feed does not list it, while the other member's does.
+	user := model.MustGenerateUserID()
+	c := &chat.Chat{
+		ID:           generateDmChatID(),
+		Type:         chatpb.ChatType_TIP_DM,
+		Members:      []*commonpb.UserId{user, team},
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, c))
+	require.Empty(t, feed(s, team))
+	require.Len(t, feed(s, user), 1)
+	isMember, err := s.IsMember(ctx, c.ID, team)
+	require.NoError(t, err)
+	require.True(t, isMember)
+
+	// Every advance moves the record and the other member's feed, and still
+	// lists nothing for the excluded member.
+	for i, ts := range []time.Time{at(200), at(300)} {
+		advanced, members, err := s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: uint64(i + 1)}, ts)
+		require.NoError(t, err)
+		require.True(t, advanced)
+		require.Len(t, members, 2)
+
+		got, err := s.GetChatByID(ctx, c.ID)
+		require.NoError(t, err)
+		require.True(t, got.LastActivity.Equal(ts))
+		userFeed := feed(s, user)
+		require.Len(t, userFeed, 1)
+		require.True(t, userFeed[0].LastActivity.Equal(ts))
+		require.Equal(t, uint64(i+1), userFeed[0].LastMessageID.GetValue())
+		require.Empty(t, feed(s, team))
+	}
+
+	// A DM between two excluded users excludes both: neither feed lists it,
+	// both are members, and an advance still moves the record.
+	both := &chat.Chat{
+		ID:           generateDmChatID(),
+		Type:         chatpb.ChatType_TIP_DM,
+		Members:      []*commonpb.UserId{team, support},
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, both))
+	require.Empty(t, feed(s, team))
+	require.Empty(t, feed(s, support))
+	for _, member := range []*commonpb.UserId{team, support} {
+		isMember, err := s.IsMember(ctx, both.ID, member)
+		require.NoError(t, err)
+		require.True(t, isMember)
+	}
+	advanced, _, err := s.AdvanceLastMessage(ctx, both.ID, &messagingpb.MessageId{Value: 1}, at(200))
+	require.NoError(t, err)
+	require.True(t, advanced)
+	got, err := s.GetChatByID(ctx, both.ID)
+	require.NoError(t, err)
+	require.True(t, got.LastActivity.Equal(at(200)))
+	require.Empty(t, feed(s, team))
+	require.Empty(t, feed(s, support))
+
+	// A DM without them excludes no one.
+	a, b := model.MustGenerateUserID(), model.MustGenerateUserID()
+	plain := &chat.Chat{
+		ID:           generateDmChatID(),
+		Type:         chatpb.ChatType_TIP_DM,
+		Members:      []*commonpb.UserId{a, b},
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, plain))
+	require.Len(t, feed(s, a), 1)
+	require.Len(t, feed(s, b), 1)
+
+	// A group they are created in is created as for anyone: a group keeps no
+	// per-member feed copies to exclude them from.
+	group := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{a, team},
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, group))
+	isMember, err = s.IsMember(ctx, group.ID, team)
+	require.NoError(t, err)
+	require.True(t, isMember)
+
+	// A nil user ID, what a parent with no team account configured passes,
+	// excludes no one.
+	none := newStore([]*commonpb.UserId{nil})
+	other := model.MustGenerateUserID()
+	listed := &chat.Chat{
+		ID:           generateDmChatID(),
+		Type:         chatpb.ChatType_TIP_DM,
+		Members:      []*commonpb.UserId{other, team},
+		LastActivity: at(100),
+	}
+	require.NoError(t, none.PutChat(ctx, listed))
+	require.Len(t, feed(none, other), 1)
+	teamFeed := feed(none, team)
+	require.Len(t, teamFeed, 1)
+	require.Equal(t, listed.ID.Value, teamFeed[0].ID.Value)
 }
 
 func testStore_PutChat_TypeIDMismatch(t *testing.T, s chat.Store) {

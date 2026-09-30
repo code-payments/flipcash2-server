@@ -45,7 +45,7 @@ func newAccessFixture(t *testing.T) *accessFixture {
 		chats:      newFakeChats(),
 		usdf:       model.MustGenerateKeyPair().Proto(),
 	}
-	f.rules = NewRuleEvaluator(f.accounts, balance.NewClient(zaptest.NewLogger(t), f.accounts, f.ocpBalance), f.chats)
+	f.rules = NewRuleEvaluator(f.accounts, balance.NewClient(zaptest.NewLogger(t), f.accounts, f.ocpBalance), f.chats, nil)
 
 	f.funded = model.MustGenerateUserID()
 	f.ocpBalance.set(f.accounts.bind(f.funded), f.usdf, ocp_common.ToCoreMintQuarks(accessRequirement))

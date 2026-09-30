@@ -191,7 +191,7 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	blocklist := newFakeBlocklistReader()
 	media := newFakeMedia()
 	moderator := &fakeModerator{}
-	access := chat.NewAccess(s, chat.NewRuleEvaluator(accounts, balances, s))
+	access := chat.NewAccess(s, chat.NewRuleEvaluator(accounts, balances, s, teamUserID))
 	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, access, userBus, chatBus, teamUserID, false, cfg.disableGetRoster)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)

@@ -45,7 +45,7 @@ type memory struct {
 	// one.
 	excludedFromFeed map[string]map[string]struct{}
 
-	opts chat.StoreOptions
+	exclusions chat.FeedExclusions
 }
 
 // memberRecord is one group membership record, as the persistent stores keep
@@ -58,10 +58,12 @@ type memberRecord struct {
 	version  uint64
 }
 
-// NewInMemory returns an in-memory chat.Store, for tests.
-func NewInMemory(opts ...chat.StoreOption) chat.Store {
+// NewInMemory returns an in-memory chat.Store, for tests, creating every DM
+// with a user in excludedFromFeed excluding them from the feed (see
+// chat.FeedExclusions); nil excludes no one.
+func NewInMemory(excludedFromFeed []*commonpb.UserId) chat.Store {
 	return &memory{
-		opts:             chat.NewStoreOptions(opts...),
+		exclusions:       chat.NewFeedExclusions(excludedFromFeed),
 		excludedFromFeed: make(map[string]map[string]struct{}),
 		chats:            make(map[string]*chat.Chat),
 		groupMembers:     make(map[string]map[string]*memberRecord),
@@ -138,7 +140,7 @@ func (m *memory) PutChat(_ context.Context, c *chat.Chat) error {
 
 	stored.RosterSummary = chat.RosterSummary{MemberCount: uint64(len(stored.Members))}
 	m.chats[key] = stored
-	if excluded := m.opts.ExcludedFromFeed(c); len(excluded) > 0 {
+	if excluded := m.exclusions.For(c); len(excluded) > 0 {
 		set := make(map[string]struct{}, len(excluded))
 		for _, userID := range excluded {
 			set[string(userID.Value)] = struct{}{}

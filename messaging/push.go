@@ -119,7 +119,7 @@ func (s *Sender) pushSentMessages(ctx context.Context, log *zap.Logger, chatID *
 	} else {
 		chatType = chat.DeriveDmChatType(chatID, members)
 
-		// The team account is never pushed to (see WithTeamAccount). It is
+		// The team account is never pushed to (see NewSender). It is
 		// dropped only now: the type derivation above needs the pair whole.
 		members = s.withoutTeamAccount(members)
 	}

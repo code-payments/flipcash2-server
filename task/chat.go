@@ -122,7 +122,7 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 	// message, a concurrent payment, or a prior attempt of this task may have
 	// already created it, so an existing chat is the expected steady state, not
 	// a failure. A DM with the team account excludes it from the feed, which
-	// the store does on its own (see chat.WithExcludedFromFeed).
+	// the store does on its own (see chat.FeedExclusions).
 	err = e.chats.PutChat(ctx, &chat.Chat{
 		ID:           chatID,
 		Type:         chatType,

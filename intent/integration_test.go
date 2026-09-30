@@ -62,7 +62,7 @@ func newIntegrationEnv(t *testing.T) *integrationEnv {
 
 	accounts := accountmemory.NewInMemory()
 	profiles := profilememory.NewInMemory()
-	chats := chatmemory.NewInMemory()
+	chats := chatmemory.NewInMemory(nil)
 
 	// The mint data provider signs the rates it serves with the subsidizer, so
 	// one has to exist before its first poll.

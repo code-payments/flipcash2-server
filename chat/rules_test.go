@@ -331,7 +331,7 @@ func TestRuleEvaluator(t *testing.T) {
 	staff := &fakeAccounts{staff: map[string]bool{string(staffUser.Value): true}, keys: make(map[string]*commonpb.PublicKey)}
 	ocpBalance := &fakeOcpBalance{ledger: make(map[string]map[string]uint64)}
 	chats := &fakeChats{chats: make(map[string]*Chat)}
-	e := NewRuleEvaluator(staff, balance.NewClient(zaptest.NewLogger(t), staff, ocpBalance), chats)
+	e := NewRuleEvaluator(staff, balance.NewClient(zaptest.NewLogger(t), staff, ocpBalance), chats, nil)
 
 	// A DM is answered without a read: it can carry no rules.
 	dmID := MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, staffUser, nonStaffUser)
@@ -408,12 +408,62 @@ func TestRuleEvaluator(t *testing.T) {
 
 }
 
+func TestRuleEvaluator_TeamDm(t *testing.T) {
+	ctx := context.Background()
+	team := model.MustGenerateUserID()
+	user := model.MustGenerateUserID()
+	other := model.MustGenerateUserID()
+	accounts := &fakeAccounts{staff: make(map[string]bool), keys: make(map[string]*commonpb.PublicKey)}
+	balances := balance.NewClient(zaptest.NewLogger(t), accounts, &fakeOcpBalance{ledger: make(map[string]map[string]uint64)})
+	chats := &fakeChats{chats: make(map[string]*Chat)}
+	e := NewRuleEvaluator(accounts, balances, chats, team)
+	never := &chatpb.Rules{Speaker: []*chatpb.SpeakerRules{{Kind: &chatpb.SpeakerRules_Never{Never: &chatpb.Never{}}}}}
+
+	// A DM with the team, of any DM type, refuses every send, the team's
+	// included, and still admits its members to listen. It is decided off the
+	// IDs, with no read.
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_TIP_DM, chatpb.ChatType_CONTACT_DM} {
+		teamDmID := MustDeriveDmChatID(chatType, user, team)
+		for _, u := range []*commonpb.UserId{user, team} {
+			ok, err := e.CanSpeak(ctx, teamDmID, u)
+			require.NoError(t, err)
+			require.False(t, ok)
+			ok, err = e.CanListen(ctx, teamDmID, u)
+			require.NoError(t, err)
+			require.True(t, ok)
+		}
+
+		// What it is shown with is the rule it is refused by.
+		teamDm := &Chat{ID: teamDmID, Type: chatType, Members: []*commonpb.UserId{user, team}}
+		require.NoError(t, protoutil.ProtoEqualError(never, e.RulesOf(teamDm)))
+	}
+
+	// A DM without the team carries no rules and admits both members.
+	dmID := MustDeriveDmChatID(chatpb.ChatType_TIP_DM, user, other)
+	ok, err := e.CanSpeak(ctx, dmID, user)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Nil(t, e.RulesOf(&Chat{ID: dmID, Type: chatpb.ChatType_TIP_DM, Members: []*commonpb.UserId{user, other}}))
+	require.Zero(t, chats.reads)
+
+	// A group's rules are its stored ones, whoever its members are.
+	group := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsStaffOnly: true}
+	require.NoError(t, protoutil.ProtoEqualError(group.Rules(), e.RulesOf(group)))
+
+	// An evaluator with no team account treats no DM specially.
+	none := NewRuleEvaluator(accounts, balances, chats, nil)
+	ok, err = none.CanSpeak(ctx, MustDeriveDmChatID(chatpb.ChatType_TIP_DM, user, team), user)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Nil(t, none.RulesOf(&Chat{ID: MustDeriveDmChatID(chatpb.ChatType_TIP_DM, user, team), Type: chatpb.ChatType_TIP_DM, Members: []*commonpb.UserId{user, team}}))
+}
+
 func TestRuleEvaluator_MinimumBalance(t *testing.T) {
 	ctx := context.Background()
 	accounts := &fakeAccounts{staff: make(map[string]bool), keys: make(map[string]*commonpb.PublicKey)}
 	ocpBalance := &fakeOcpBalance{ledger: make(map[string]map[string]uint64)}
 	chats := &fakeChats{chats: make(map[string]*Chat)}
-	e := NewRuleEvaluator(accounts, balance.NewClient(zaptest.NewLogger(t), accounts, ocpBalance), chats)
+	e := NewRuleEvaluator(accounts, balance.NewClient(zaptest.NewLogger(t), accounts, ocpBalance), chats, nil)
 
 	usdf := model.MustGenerateKeyPair().Proto()
 	other := model.MustGenerateKeyPair().Proto()

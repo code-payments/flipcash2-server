@@ -44,7 +44,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	accounts := accountmemory.NewInMemory()
 	badges := badgememory.NewInMemory()
 	blocklists := blocklistmemory.NewInMemory()
-	chats := chatmemory.NewInMemory()
+	chats := chatmemory.NewInMemory(nil)
 	messages := messagingmemory.NewInMemory()
 	profiles := profilememory.NewInMemory()
 	ocpData := ocp_data.NewTestDataProvider()
@@ -52,7 +52,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	chatBus := event.NewBus[*commonpb.ChatId, *eventpb.ChatEvent]()
 
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus)
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, nil)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
 	integration := intent.NewIntegration(accounts, chats, profiles, nil, nil)
 
@@ -200,14 +200,12 @@ func testExecutor_SendTipDmPaymentMessage(t *testing.T, location intentpb.ChatMe
 	_, err = accounts.Bind(ctx, recipientUserID, recipientKeys.Proto())
 	require.NoError(t, err)
 
-	var chatOpts []chat.StoreOption
-	var senderOpts []messaging.SenderOption
+	var teamUserID *commonpb.UserId
 	if toTeam {
-		chatOpts = append(chatOpts, chat.WithExcludedFromFeed(recipientUserID))
-		senderOpts = append(senderOpts, messaging.WithTeamAccount(recipientUserID))
+		teamUserID = recipientUserID
 	}
-	chats := chatmemory.NewInMemory(chatOpts...)
-	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, senderOpts...)
+	chats := chatmemory.NewInMemory([]*commonpb.UserId{teamUserID})
+	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, teamUserID)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
 	integration := intent.NewIntegration(accounts, chats, profiles, nil, nil)
 

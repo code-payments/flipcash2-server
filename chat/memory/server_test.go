@@ -7,7 +7,7 @@ import (
 )
 
 func TestChat_MemoryServer(t *testing.T) {
-	testStore := NewInMemory()
+	testStore := NewInMemory(nil)
 	teardown := func() {
 		testStore.(*memory).reset()
 	}

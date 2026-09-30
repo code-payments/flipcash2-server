@@ -273,10 +273,12 @@ func (i *Integration) validateTipDmAppMetadata(ctx context.Context, intentRecord
 	}
 
 	// Nobody messages the Flipcash team, and a DM payment is a message: the
-	// task it schedules puts a cash message in the DM (see
-	// messaging.WithTeamAccount). Refused here, before any money moves, rather
-	// than by the task, which could only drop the message of a payment already
-	// made. The team sends nothing this way either.
+	// task it schedules puts a cash message in the DM, which the DM's Never
+	// speaker rule does not stop (see chat.RuleEvaluator), since the task
+	// sends through the messaging Sender, which no rule gates. Refused here,
+	// before any money moves, rather than by the task, which could only drop
+	// the message of a payment already made. The team sends nothing this way
+	// either.
 	if i.isTeamAccount(senderUserID) || i.isTeamAccount(recipientUserID) {
 		return ocp_transaction.NewIntentDeniedError("tip dm payments with the flipcash team are not allowed")
 	}

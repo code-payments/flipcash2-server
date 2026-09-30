@@ -41,8 +41,9 @@ import (
 //     reaction is something other members see, so neither is open to a
 //     non-member however well they satisfy the rules.
 //   - canSpeak: every send — a message, an edit, a deletion, a typing
-//     notification. Members who satisfy the listener and speaker rules, and
-//     never in a DM with the Flipcash team account (see canSpeak).
+//     notification. Members who satisfy the listener and speaker rules, which
+//     in a DM with the Flipcash team account include a Never rule no one
+//     satisfies (see chat.RuleEvaluator).
 //
 // A member's read is answered on membership alone, without evaluating a rule,
 // even though a listener rule is what admitted them: reads are the hot path,
@@ -91,16 +92,7 @@ func (s *Server) isMember(ctx context.Context, log *zap.Logger, chatID *commonpb
 	return ok, nil
 }
 
-// canSpeak is the send gate (see above), with one refusal of this server's own
-// ahead of it: nobody speaks in a DM with the Flipcash team account through
-// this server (see WithTeamAccount). The team writes as a Sender, not as a
-// client, and nobody reads as it, so a user's message to it would be read by
-// no one. Decided off the IDs before anything is read.
 func (s *Server) canSpeak(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
-	if s.sender.inTeamDm(chatID, userID) {
-		return false, nil
-	}
-
 	ok, err := s.access.CanSpeak(ctx, chatID, userID)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure checking chat speak access")

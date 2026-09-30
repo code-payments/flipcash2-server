@@ -29,40 +29,30 @@ const (
 func TestChat_DynamoDBStore(t *testing.T) {
 	require.NoError(t, CreateTables(context.Background(), testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable)
+	testStore := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, nil)
 	teardown := func() {
 		testStore.(*store).reset()
 	}
-	tests.RunStoreTests(t, testStore, teardown)
-}
-
-func TestChat_DynamoDBStoreOptions(t *testing.T) {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable))
-
-	var built []chat.Store
-	t.Cleanup(func() {
-		for _, s := range built {
-			s.(*store).reset()
-		}
-	})
-	tests.RunStoreOptionTests(t, func(opts ...chat.StoreOption) chat.Store {
-		s := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, opts...)
-		built = append(built, s)
-		return s
-	})
+	// The stores newStore builds share testStore's tables, so its teardown
+	// resets theirs too.
+	newStore := func(excludedFromFeed []*commonpb.UserId) chat.Store {
+		return NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, excludedFromFeed)
+	}
+	tests.RunStoreTests(t, testStore, newStore, teardown)
 }
 
 // TestChat_DynamoDBExclusionOutlivesConfig checks that a DM's exclusion from
-// the feed is kept with the DM, not read from the store's options: a process
-// built without the option, sharing the tables, advances a DM another created
-// with it, leaves the excluded member's row alone, and moves the other's.
+// the feed is kept with the DM, not read from the store's configuration: a
+// process built excluding no one, sharing the tables, advances a DM another
+// created excluding someone, leaves the excluded member's row alone, and moves
+// the other's.
 func TestChat_DynamoDBExclusionOutlivesConfig(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, CreateTables(ctx, testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable))
 
 	team := model.MustGenerateUserID()
-	configured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, chat.WithExcludedFromFeed(team))
-	unconfigured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable)
+	configured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, []*commonpb.UserId{team})
+	unconfigured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, nil)
 	t.Cleanup(func() { configured.(*store).reset() })
 
 	chatIDValue := make([]byte, chat.DmChatIDSize)

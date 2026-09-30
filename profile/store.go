@@ -54,7 +54,8 @@ type Store interface {
 	// lowest-numbered one nobody holds, or under contention one of the next few or
 	// a random one (see AssignDefaultUsername). Both are written in one
 	// transaction, so a handle is never assigned without the display name that
-	// earned it, and no reader sees that display name before its handle.
+	// earned it, and no reader sees that display name before its handle. A handle
+	// assigned here is recorded as auto-assigned (see IsUsernameAutoAssigned).
 	//
 	// The result carries the handle assigned, if any. None is when the user
 	// already held a handle, or when no number yields a handle
@@ -66,13 +67,22 @@ type Store interface {
 
 	// SetUsername claims username as the user's handle, replacing any handle they
 	// already hold — which, having no holder any more, is immediately claimable by
-	// anyone else.
+	// anyone else. A new handle is recorded as chosen, not auto-assigned (see
+	// IsUsernameAutoAssigned).
 	//
 	// username must already be in canonical form, so callers normalize what a user
 	// typed before claiming it; ErrInvalidUsername is returned otherwise. A handle
 	// has one holder at a time: ErrUsernameTaken is returned when another user
-	// holds it, while re-claiming the handle the user already holds is a no-op.
+	// holds it, while re-claiming the handle the user already holds is a no-op
+	// that leaves it as it was, auto-assigned included.
 	SetUsername(ctx context.Context, id *commonpb.UserId, username string) error
+
+	// IsUsernameAutoAssigned reports whether the user's current handle was
+	// assigned by SetDisplayNameWithDefaultUsername rather than claimed through
+	// SetUsername. It is false for a user who holds no handle, and for a handle
+	// assigned before this was recorded, until those are backfilled. Returns
+	// ErrNotFound when the store does not know the user.
+	IsUsernameAutoAssigned(ctx context.Context, id *commonpb.UserId) (bool, error)
 
 	// GetUserIdByUsername returns the user currently holding the given handle,
 	// matched case-insensitively since handles are only ever held in canonical

@@ -94,7 +94,8 @@ model User {
   displayName                   String?
   username                      String?            @unique // the user's handle, lowercase and canonical; null until they claim one
   profilePictureBlobId          String?
-  tipCardColor                  String?            // Flipcard colour as a hex string (e.g. "#19191a"); null until the user picks one, in which case the server resolves the default. Named for the card's former name, the Tip Card
+  tipCardColor                  String?            // Deprecated: superseded by flipcardColor, which is what the server reads. Still written alongside it so a rollback to a server that reads this column stays correct; to be dropped
+  flipcardColor                 String?            // Flipcard colour as a hex string (e.g. "#19191a"); null until the user picks one, in which case the server resolves the default
   minDmChatInitFeeCurrency      String?            // ISO 4217 code of the minimum DM chat initialization fee; set together with minDmChatInitFeeNativeAmount, null until the user sets one
   minDmChatInitFeeNativeAmount  Float?             // the minimum DM chat initialization fee in major units of minDmChatInitFeeCurrency
   phoneNumber                   String?            @unique

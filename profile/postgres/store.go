@@ -167,7 +167,7 @@ func (s *store) GetXProfile(ctx context.Context, userID *commonpb.UserId) (*prof
 }
 
 func (s *store) reset() {
-	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "username" = NULL, "profilePictureBlobId" = NULL, "tipCardColor" = NULL, "minDmChatInitFeeCurrency" = NULL, "minDmChatInitFeeNativeAmount" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL, "isPhoneNumberLinkedForPayment" = FALSE`)
+	_, err := s.pool.Exec(context.Background(), `UPDATE `+usersTableName+` SET "displayName" = NULL, "username" = NULL, "profilePictureBlobId" = NULL, "tipCardColor" = NULL, "flipcardColor" = NULL, "minDmChatInitFeeCurrency" = NULL, "minDmChatInitFeeNativeAmount" = NULL, "phoneNumber" = NULL, "phoneNumberHash" = NULL, "emailAddress" = NULL, "isPhoneNumberLinkedForPayment" = FALSE`)
 	if err != nil {
 		panic(err)
 	}

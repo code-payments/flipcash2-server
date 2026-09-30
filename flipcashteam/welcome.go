@@ -15,6 +15,8 @@ import (
 	"github.com/code-payments/flipcash2-server/messaging"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
+	"github.com/code-payments/flipcash2-server/rpc"
+	ocp_client "github.com/code-payments/ocp-server/grpc/client"
 )
 
 // welcomeV1IdempotencyKey is the key SendWelcomeV1 sends under. A later
@@ -57,6 +59,12 @@ const welcomeTimeout = 30 * time.Second
 // profile server with (see profile.WithFirstUsernameHandler), from the chat
 // store and the Sender built with the team account.
 //
+// A welcome goes only to a user whose handle was assigned from a client at or
+// above minWelcomeClientVersion, read off the request that assigned it (see
+// rpc.GetClientVersion); a user whose first handle came from an older client,
+// or one that cannot be identified, is never welcomed, since there is no
+// later first handle to try again on.
+//
 // A welcome is best effort: it is sent in the background, detached from the
 // request that assigned the handle, and a failure is logged, never retried.
 // Nothing records a welcome that was never sent, so a process that stops
@@ -74,9 +82,18 @@ func NewWelcomer(log *zap.Logger, chats chat.Store, sender *messaging.Sender) *W
 	return &Welcomer{log: log, chats: chats, sender: sender}
 }
 
-// OnFirstUsername sends userID the welcome for username in the background.
+// minWelcomeClientVersion is the first client release, on iOS and Android
+// alike, that renders the welcome (its ShareProfileWidget).
+var minWelcomeClientVersion = &ocp_client.Version{Major: 2026, Minor: 9, Patch: 5}
+
+// OnFirstUsername sends userID the welcome for username in the background,
+// if the client that assigned it can render it.
 func (w *Welcomer) OnFirstUsername(ctx context.Context, userID *commonpb.UserId, username string) {
 	log := w.log.With(zap.String("user_id", model.UserIDString(userID)), zap.String("username", username))
+
+	if clientVersion := rpc.GetClientVersion(ctx); clientVersion == nil || clientVersion.Before(minWelcomeClientVersion) {
+		return
+	}
 
 	// The request that assigned the handle returns without waiting, so its
 	// cancellation must not abort the send. Context values are kept.

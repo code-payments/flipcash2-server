@@ -54,7 +54,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_Denied,
 		testServer_GetChat_Hydrates,
 		testServer_GetChat_HydrationFailureCancelsSiblings,
-		testServer_GetChat_TipDm_HidesPhoneNumbers,
+		testServer_GetChat_Dm_HidesPhoneNumbers,
 		testServer_GetChat_Dm_NoCreator,
 		testServer_GetChat_Dm_UseE2ee,
 		testServer_GetChat_Dm_UseE2ee_TeamAccount,
@@ -526,11 +526,11 @@ func (f *fakeProfileReader) GetPublicProfiles(_ context.Context, userIDs []*comm
 		}
 
 		out[key] = &profilepb.UserProfile{
-			UserId:               userID,
-			DisplayName:          f.displayNames[key],
-			ProfilePicture:       f.profilePictures[key],
-			JoinTs:               timestamppb.New(joinedAt),
-			TipCardCustomization: profile.DefaultTipCardCustomization(),
+			UserId:                userID,
+			DisplayName:           f.displayNames[key],
+			ProfilePicture:        f.profilePictures[key],
+			JoinTs:                timestamppb.New(joinedAt),
+			FlipcardCustomization: profile.DefaultFlipcardCustomization(),
 		}
 	}
 	return out, nil
@@ -1229,14 +1229,14 @@ func testServer_GetChat_HydrationFailureCancelsSiblings(t *testing.T, s chat.Sto
 	require.True(t, <-cancelled)
 }
 
-func testServer_GetChat_TipDm_HidesPhoneNumbers(t *testing.T, s chat.Store) {
+func testServer_GetChat_Dm_HidesPhoneNumbers(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
 	peer := model.MustGenerateUserID()
 	chatID := generateDmChatID()
 	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
 		ID:           chatID,
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{e.userID, peer},
 		LastActivity: at(1),
 	}))
@@ -1247,7 +1247,7 @@ func testServer_GetChat_TipDm_HidesPhoneNumbers(t *testing.T, s chat.Store) {
 
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-	require.Equal(t, chatpb.ChatType_TIP_DM, resp.Metadata.Type)
+	require.Equal(t, chatpb.ChatType_DM, resp.Metadata.Type)
 
 	members := byUserID(resp.Metadata.Members)
 	profile := members[string(peer.Value)].UserProfile
@@ -1261,7 +1261,7 @@ func testServer_GetChat_Dm_NoCreator(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
 	// A DM has no creator, whatever its type and whichever read serves it.
-	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_TIP_DM} {
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_DM} {
 		chatID := e.putDMOfType(chatType, at(1))
 
 		resp := e.getChat(e.keys, chatID)
@@ -1284,7 +1284,7 @@ func testServer_GetChat_Dm_UseE2ee_TeamAccount(t *testing.T, s chat.Store) {
 	// The Flipcash team account's DMs never carry use_e2ee, even when both
 	// members are staff: the server writes into them on the team's behalf and
 	// holds no keys for it.
-	chatID := e.putDMWithPeer(chatpb.ChatType_TIP_DM, e.teamUserID, at(1))
+	chatID := e.putDMWithPeer(chatpb.ChatType_DM, e.teamUserID, at(1))
 	e.accounts.setStaff(e.userID, true)
 	e.accounts.setStaff(e.teamUserID, true)
 
@@ -1292,7 +1292,7 @@ func testServer_GetChat_Dm_UseE2ee_TeamAccount(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.False(t, resp.Metadata.UseE2Ee)
 
-	feed, err := e.getDmFeedOfType(chatpb.ChatType_TIP_DM, &commonpb.QueryOptions{})
+	feed, err := e.getDmFeedOfType(chatpb.ChatType_DM, &commonpb.QueryOptions{})
 	require.NoError(t, err)
 	require.Len(t, feed.Chats, 1)
 	require.Equal(t, chatID.Value, feed.Chats[0].ChatId.Value)
@@ -1310,7 +1310,7 @@ func testServer_GetChat_Dm_TeamAccount_NeverSpeak(t *testing.T, s chat.Store) {
 			Kind: &chatpb.SpeakerRules_Never{Never: &chatpb.Never{}},
 		}},
 	}
-	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_TIP_DM} {
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_DM} {
 		teamChatID := e.putDMWithPeer(chatType, e.teamUserID, at(2))
 		otherChatID := e.putDMWithPeer(chatType, model.MustGenerateUserID(), at(1))
 
@@ -1340,7 +1340,7 @@ func testServer_GetChat_Dm_UseE2ee(t *testing.T, s chat.Store) {
 
 	// use_e2ee is set exactly when both members of a DM are staff, whatever the
 	// DM's type and whichever read serves it, and never on a group.
-	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_TIP_DM} {
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_DM} {
 		peer := model.MustGenerateUserID()
 		chatID := e.putDMWithPeer(chatType, peer, at(1))
 
@@ -1918,7 +1918,7 @@ func testServer_GetDmChatFeed_TypeScoped(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
 	contactID := e.putDMOfType(chatpb.ChatType_CONTACT_DM, at(1))
-	tipID := e.putDMOfType(chatpb.ChatType_TIP_DM, at(2))
+	dmID := e.putDMOfType(chatpb.ChatType_DM, at(2))
 
 	contactResp, err := e.getDmFeedOfType(chatpb.ChatType_CONTACT_DM, &commonpb.QueryOptions{})
 	require.NoError(t, err)
@@ -1927,12 +1927,12 @@ func testServer_GetDmChatFeed_TypeScoped(t *testing.T, s chat.Store) {
 	require.Equal(t, contactID.Value, contactResp.Chats[0].ChatId.Value)
 	require.Equal(t, chatpb.ChatType_CONTACT_DM, contactResp.Chats[0].Type)
 
-	tipResp, err := e.getDmFeedOfType(chatpb.ChatType_TIP_DM, &commonpb.QueryOptions{})
+	dmResp, err := e.getDmFeedOfType(chatpb.ChatType_DM, &commonpb.QueryOptions{})
 	require.NoError(t, err)
-	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, tipResp.Result)
-	require.Len(t, tipResp.Chats, 1)
-	require.Equal(t, tipID.Value, tipResp.Chats[0].ChatId.Value)
-	require.Equal(t, chatpb.ChatType_TIP_DM, tipResp.Chats[0].Type)
+	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, dmResp.Result)
+	require.Len(t, dmResp.Chats, 1)
+	require.Equal(t, dmID.Value, dmResp.Chats[0].ChatId.Value)
+	require.Equal(t, chatpb.ChatType_DM, dmResp.Chats[0].Type)
 }
 
 func testServer_GetDmChatFeed_TokenBoundToType(t *testing.T, s chat.Store) {
@@ -1954,7 +1954,7 @@ func testServer_GetDmChatFeed_TokenBoundToType(t *testing.T, s chat.Store) {
 	require.Len(t, resumed.Chats, 1)
 
 	// ...but is rejected against the other feed.
-	_, err = e.getDmFeedOfType(chatpb.ChatType_TIP_DM, &commonpb.QueryOptions{PageSize: 1, PagingToken: resp.PagingToken})
+	_, err = e.getDmFeedOfType(chatpb.ChatType_DM, &commonpb.QueryOptions{PageSize: 1, PagingToken: resp.PagingToken})
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 

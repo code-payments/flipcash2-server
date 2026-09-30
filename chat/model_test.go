@@ -29,9 +29,9 @@ func TestMustDeriveDmChatID(t *testing.T) {
 	require.NotEqual(t, id.Value, MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, c).Value)
 
 	// Distinct DM types derive distinct IDs for the same pair.
-	tipID := MustDeriveDmChatID(chatpb.ChatType_TIP_DM, a, b)
-	require.NotEqual(t, id.Value, tipID.Value)
-	require.Equal(t, tipID.Value, MustDeriveDmChatID(chatpb.ChatType_TIP_DM, b, a).Value)
+	dmID := MustDeriveDmChatID(chatpb.ChatType_DM, a, b)
+	require.NotEqual(t, id.Value, dmID.Value)
+	require.Equal(t, dmID.Value, MustDeriveDmChatID(chatpb.ChatType_DM, b, a).Value)
 
 	// A self-DM collapses to a single member and is still derivable.
 	self := MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, a)
@@ -56,7 +56,7 @@ func TestDeriveDmChatType(t *testing.T) {
 
 	// Each DM type's canonical ID maps back to that type, regardless of member
 	// order.
-	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_TIP_DM} {
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_DM} {
 		id := MustDeriveDmChatID(chatType, a, b)
 		require.Equal(t, chatType, DeriveDmChatType(id, members))
 		require.Equal(t, chatType, DeriveDmChatType(id, []*commonpb.UserId{b, a}))
@@ -101,7 +101,7 @@ func TestMustDeriveDmChatID_Domains(t *testing.T) {
 	}
 
 	require.Equal(t, expected("flipcash:chat:dm"), MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, a, b).Value)
-	require.Equal(t, expected("flipcash:chat:dm:2"), MustDeriveDmChatID(chatpb.ChatType_TIP_DM, a, b).Value)
+	require.Equal(t, expected("flipcash:chat:dm:2"), MustDeriveDmChatID(chatpb.ChatType_DM, a, b).Value)
 }
 
 func TestMustDeriveGroupChatID(t *testing.T) {

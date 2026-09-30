@@ -25,7 +25,7 @@ type InMemoryStore struct {
 	linkedForPaymentByUser map[string]bool
 	xProfilesByUser        map[string]*profilepb.XProfile
 	createdAtByUser        map[string]time.Time
-	tipCardColorByUser     map[string]string
+	flipcardColorByUser    map[string]string
 	usernameByUser         map[string]string
 	minDmChatInitFeeByUser map[string]*commonpb.FiatPaymentAmount
 }
@@ -37,7 +37,7 @@ func NewInMemory() profile.Store {
 		linkedForPaymentByUser: make(map[string]bool),
 		xProfilesByUser:        make(map[string]*profilepb.XProfile),
 		createdAtByUser:        make(map[string]time.Time),
-		tipCardColorByUser:     make(map[string]string),
+		flipcardColorByUser:    make(map[string]string),
 		usernameByUser:         make(map[string]string),
 		minDmChatInitFeeByUser: make(map[string]*commonpb.FiatPaymentAmount),
 	}
@@ -53,14 +53,14 @@ func (m *InMemoryStore) minDmChatInitFee(key string) *commonpb.FiatPaymentAmount
 	return proto.Clone(fee).(*commonpb.FiatPaymentAmount)
 }
 
-// tipCardCustomization resolves the Tip Card customization for key, filling in
+// flipcardCustomization resolves the Flipcard customization for key, filling in
 // defaults for anything the user has not picked. Callers hold the lock.
-func (m *InMemoryStore) tipCardCustomization(key string) *profilepb.TipCardCustomization {
+func (m *InMemoryStore) flipcardCustomization(key string) *profilepb.FlipcardCustomization {
 	var storedColorHex *string
-	if colorHex, ok := m.tipCardColorByUser[key]; ok {
+	if colorHex, ok := m.flipcardColorByUser[key]; ok {
 		storedColorHex = &colorHex
 	}
-	return profile.TipCardCustomizationFromStored(storedColorHex)
+	return profile.FlipcardCustomizationFromStored(storedColorHex)
 }
 
 // username resolves the handle for key, leaving it unset for a user who has not
@@ -99,7 +99,7 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 	clonedBaseProfile := proto.Clone(baseProfile).(*profilepb.UserProfile)
 	clonedBaseProfile.UserId = proto.Clone(id).(*commonpb.UserId)
 	clonedBaseProfile.JoinTs = timestamppb.New(m.createdAtByUser[key])
-	clonedBaseProfile.TipCardCustomization = m.tipCardCustomization(key)
+	clonedBaseProfile.FlipcardCustomization = m.flipcardCustomization(key)
 	clonedBaseProfile.Username = m.username(key)
 	clonedBaseProfile.MinDmChatInitFee = m.minDmChatInitFee(key)
 
@@ -138,13 +138,13 @@ func (m *InMemoryStore) SetProfilePicture(_ context.Context, id *commonpb.UserId
 	return nil
 }
 
-func (m *InMemoryStore) SetTipCardColor(_ context.Context, id *commonpb.UserId, colorHex string) error {
+func (m *InMemoryStore) SetFlipcardColor(_ context.Context, id *commonpb.UserId, colorHex string) error {
 	m.Lock()
 	defer m.Unlock()
 
 	key := userIDCacheKey(id)
 	m.ensureProfile(key)
-	m.tipCardColorByUser[key] = colorHex
+	m.flipcardColorByUser[key] = colorHex
 
 	return nil
 }
@@ -299,12 +299,12 @@ func (m *InMemoryStore) GetPublicProfiles(_ context.Context, userIDs []*commonpb
 		// Only the public fields, and a fresh proto per user so a caller mutating
 		// what it gets back cannot reach into the store.
 		publicProfile := &profilepb.UserProfile{
-			UserId:               proto.Clone(userID).(*commonpb.UserId),
-			DisplayName:          p.DisplayName,
-			Username:             m.username(key),
-			JoinTs:               timestamppb.New(m.createdAtByUser[key]),
-			TipCardCustomization: m.tipCardCustomization(key),
-			MinDmChatInitFee:     m.minDmChatInitFee(key),
+			UserId:                proto.Clone(userID).(*commonpb.UserId),
+			DisplayName:           p.DisplayName,
+			Username:              m.username(key),
+			JoinTs:                timestamppb.New(m.createdAtByUser[key]),
+			FlipcardCustomization: m.flipcardCustomization(key),
+			MinDmChatInitFee:      m.minDmChatInitFee(key),
 		}
 		if blobID := profilePictureBlob(p.ProfilePicture); blobID != nil {
 			publicProfile.ProfilePicture = &blobpb.Media{
@@ -617,7 +617,7 @@ func (m *InMemoryStore) reset() {
 	m.linkedForPaymentByUser = make(map[string]bool)
 	m.xProfilesByUser = make(map[string]*profilepb.XProfile)
 	m.createdAtByUser = make(map[string]time.Time)
-	m.tipCardColorByUser = make(map[string]string)
+	m.flipcardColorByUser = make(map[string]string)
 	m.usernameByUser = make(map[string]string)
 	m.minDmChatInitFeeByUser = make(map[string]*commonpb.FiatPaymentAmount)
 }

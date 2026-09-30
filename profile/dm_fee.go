@@ -7,22 +7,22 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	currency_lib "github.com/code-payments/ocp-server/currency"
 
-	"github.com/code-payments/flipcash2-server/tip"
+	"github.com/code-payments/flipcash2-server/send"
 )
 
 var ErrInvalidMinDmChatInitFee = errors.New("invalid min dm chat init fee")
 
 // ValidateMinDmChatInitFee reports whether fee is one a user may set as their
 // minimum DM chat initialization fee. The fee may be in any currency that has
-// tip presets, and must be finite and no smaller than that currency's tip
-// minimum, so the floor enforced on a tip is also the floor on what a user may
-// ask of whoever initializes a DM with them. Returns ErrInvalidMinDmChatInitFee
-// otherwise.
+// send presets, and must be finite and no smaller than that currency's preset
+// minimum, so the floor enforced on a payment that opens a DM is also the floor
+// on what a user may ask of whoever initializes a DM with them. Returns
+// ErrInvalidMinDmChatInitFee otherwise.
 func ValidateMinDmChatInitFee(fee *commonpb.FiatPaymentAmount) error {
 	if fee == nil {
 		return ErrInvalidMinDmChatInitFee
 	}
-	presets, ok := tip.PresetsFor(currency_lib.Code(fee.Currency))
+	presets, ok := send.PresetsFor(currency_lib.Code(fee.Currency))
 	if !ok {
 		return ErrInvalidMinDmChatInitFee
 	}

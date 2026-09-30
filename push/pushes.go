@@ -196,11 +196,11 @@ func BuildContactDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *
 	return newChatMessagePush(title, body, customPayload)
 }
 
-// BuildTipDmPush renders a new message in a tip DM. The sender is typically
-// not in the recipient's contacts, so the title carries the sender's display
-// name directly rather than a contact substitution — and never the sender's
-// phone number, which is private in a tip DM.
-func BuildTipDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName string) (*ChatMessagePush, error) {
+// BuildDmPush renders a new message in a DM (ChatType_DM). The sender is
+// typically not in the recipient's contacts, so the title carries the
+// sender's display name directly rather than a contact substitution — and
+// never the sender's phone number, which is private outside contact DMs.
+func BuildDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName string) (*ChatMessagePush, error) {
 	body, ok, err := renderDmMessagePushBody(ctx, ocpData, message)
 	if err != nil {
 		return nil, err
@@ -219,7 +219,7 @@ func BuildTipDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *comm
 		},
 		ChatMetadata: &pushpb.ChatMetadata{
 			SendingUserId: senderID,
-			Type:          chatpb.ChatType_TIP_DM,
+			Type:          chatpb.ChatType_DM,
 			MessageRef:    &pushpb.ChatMetadata_Message{Message: message},
 		},
 	}
@@ -229,7 +229,7 @@ func BuildTipDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *comm
 
 // BuildGroupChatPush renders a new message in a group chat. The notification
 // is titled by the group ("Untitled Group" when it has none), with the sender
-// identified by display name in the body ("Alice: hello"). Like a tip DM, a
+// identified by display name in the body ("Alice: hello"). Like a DM, a
 // group push never carries the sender's phone number, which is private
 // outside contact DMs.
 func BuildGroupChatPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName, chatTitle string) (*ChatMessagePush, error) {

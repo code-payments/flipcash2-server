@@ -22,7 +22,7 @@ func TestSendWelcomeV1(t *testing.T) {
 
 	chatID, sent, err := flipcashteam.SendWelcomeV1(e.ctx, e.chats, e.sender, e.user, "alice_1")
 	require.NoError(t, err)
-	require.Equal(t, chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.team, e.user).Value, chatID.Value)
+	require.Equal(t, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user).Value, chatID.Value)
 
 	// Every line is text but the third, a widget sharing the user's profile
 	// (empty here).
@@ -59,7 +59,7 @@ func TestSendWelcomeV1(t *testing.T) {
 func TestWelcomer(t *testing.T) {
 	e := newChatEnv(t)
 	welcomer := flipcashteam.NewWelcomer(zap.NewNop(), e.chats, e.sender)
-	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.team, e.user)
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user)
 
 	// The request that assigned the handle may be gone by the time the welcome
 	// is sent; it is sent all the same. Told twice, as racing claims would, it
@@ -98,7 +98,7 @@ func TestWelcomer_MinClientVersion(t *testing.T) {
 		t.Run(tc.userAgent, func(t *testing.T) {
 			e := newChatEnv(t)
 			welcomer := flipcashteam.NewWelcomer(zap.NewNop(), e.chats, e.sender)
-			chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.team, e.user)
+			chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user)
 
 			ctx := e.ctx
 			if tc.userAgent != "" {
@@ -140,6 +140,6 @@ func TestSendWelcomeV1_InvalidUsername(t *testing.T) {
 	}
 
 	// Nothing was created.
-	_, err := e.chats.GetChatByID(e.ctx, chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.team, e.user))
+	_, err := e.chats.GetChatByID(e.ctx, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user))
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 }

@@ -97,11 +97,11 @@ func TestSendMessages(t *testing.T) {
 	chatID, sent, err := flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi"), text("welcome")})
 	require.NoError(t, err)
 
-	// The chat is the pair's canonical tip DM.
-	require.Equal(t, chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.team, e.user).Value, chatID.Value)
+	// The chat is the pair's canonical DM.
+	require.Equal(t, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user).Value, chatID.Value)
 	record, err := e.chats.GetChatByID(e.ctx, chatID)
 	require.NoError(t, err)
-	require.Equal(t, chatpb.ChatType_TIP_DM, record.Type)
+	require.Equal(t, chatpb.ChatType_DM, record.Type)
 	isMember, err := e.chats.IsMember(e.ctx, chatID, e.user)
 	require.NoError(t, err)
 	require.True(t, isMember)
@@ -111,10 +111,10 @@ func TestSendMessages(t *testing.T) {
 	isMember, err = e.chats.IsMember(e.ctx, chatID, e.team)
 	require.NoError(t, err)
 	require.True(t, isMember)
-	teamFeed, err := e.chats.GetDmFeedPage(e.ctx, e.team, chatpb.ChatType_TIP_DM, time.Now().Add(time.Hour), nil, 0)
+	teamFeed, err := e.chats.GetDmFeedPage(e.ctx, e.team, chatpb.ChatType_DM, time.Now().Add(time.Hour), nil, 0)
 	require.NoError(t, err)
 	require.Empty(t, teamFeed)
-	userFeed, err := e.chats.GetDmFeedPage(e.ctx, e.user, chatpb.ChatType_TIP_DM, time.Now().Add(time.Hour), nil, 0)
+	userFeed, err := e.chats.GetDmFeedPage(e.ctx, e.user, chatpb.ChatType_DM, time.Now().Add(time.Hour), nil, 0)
 	require.NoError(t, err)
 	require.Len(t, userFeed, 1)
 	require.Equal(t, chatID.Value, userFeed[0].ID.Value)
@@ -242,6 +242,6 @@ func TestSendMessages_NoTeamAccount(t *testing.T) {
 	require.ErrorIs(t, err, flipcashteam.ErrNoTeamAccount)
 
 	// Nothing was created.
-	_, err = e.chats.GetChatByID(e.ctx, chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, e.team, e.user))
+	_, err = e.chats.GetChatByID(e.ctx, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user))
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 }

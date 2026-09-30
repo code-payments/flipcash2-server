@@ -41,8 +41,8 @@ func (e *Executor) Execute(ctx context.Context, record *ocp_task.Record) error {
 	switch record.Type {
 	case intent.TaskTypeSendContactDmPaymentMessage:
 		return e.sendContactDmPaymentMessage(ctx, record)
-	case intent.TaskTypeSendTipDmPaymentMessage:
-		return e.sendTipDmPaymentMessage(ctx, record)
+	case intent.TaskTypeSendDmPaymentMessage:
+		return e.sendDmPaymentMessage(ctx, record)
 	default:
 		return fmt.Errorf("unknown task type %d", record.Type)
 	}

@@ -30,7 +30,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testGetUserIdByPhoneNumber,
 		testLinkPhoneNumberForPayment,
 		testProfilePictures,
-		testTipCardColor,
+		testFlipcardColor,
 		testMinDmChatInitFeeStore,
 		testUsername,
 		testDefaultUsernameStore,
@@ -360,7 +360,7 @@ func testGetPhoneNumbersForPayment(t *testing.T, s profile.Store) {
 	require.False(t, ok)
 }
 
-func testTipCardColor(t *testing.T, s profile.Store) {
+func testFlipcardColor(t *testing.T, s profile.Store) {
 	ctx := context.Background()
 
 	user1 := model.MustGenerateUserID()
@@ -371,31 +371,31 @@ func testTipCardColor(t *testing.T, s profile.Store) {
 	require.NoError(t, s.SetDisplayName(ctx, user1, "user one"))
 	p, err := s.GetProfile(ctx, user1, false)
 	require.NoError(t, err)
-	require.NoError(t, protoutil.ProtoEqualError(profile.DefaultTipCardCustomization(), p.TipCardCustomization))
+	require.NoError(t, protoutil.ProtoEqualError(profile.DefaultFlipcardCustomization(), p.FlipcardCustomization))
 
 	// Setting a colour is enough on its own to make the store know a user, the
 	// same way setting any other profile field is.
-	require.NoError(t, s.SetTipCardColor(ctx, user2, "#19191A"))
+	require.NoError(t, s.SetFlipcardColor(ctx, user2, "#19191A"))
 	p, err = s.GetProfile(ctx, user2, false)
 	require.NoError(t, err)
-	require.Equal(t, "#19191A", p.TipCardCustomization.Color.Hex)
+	require.Equal(t, "#19191A", p.FlipcardCustomization.Color.Hex)
 
 	// Colours are per user: user2's choice does not reach user1.
 	p, err = s.GetProfile(ctx, user1, false)
 	require.NoError(t, err)
-	require.Equal(t, profile.DefaultTipCardColorHex, p.TipCardCustomization.Color.Hex)
+	require.Equal(t, profile.DefaultFlipcardColorHex, p.FlipcardCustomization.Color.Hex)
 
 	// A second set replaces the first rather than accumulating.
-	require.NoError(t, s.SetTipCardColor(ctx, user2, "#FFFFFF"))
+	require.NoError(t, s.SetFlipcardColor(ctx, user2, "#FFFFFF"))
 	p, err = s.GetProfile(ctx, user2, false)
 	require.NoError(t, err)
-	require.Equal(t, "#FFFFFF", p.TipCardCustomization.Color.Hex)
+	require.Equal(t, "#FFFFFF", p.FlipcardCustomization.Color.Hex)
 
 	// Whatever casing reached the store, reads are canonical.
-	require.NoError(t, s.SetTipCardColor(ctx, user2, "#abcdef"))
+	require.NoError(t, s.SetFlipcardColor(ctx, user2, "#abcdef"))
 	p, err = s.GetProfile(ctx, user2, false)
 	require.NoError(t, err)
-	require.Equal(t, "#ABCDEF", p.TipCardCustomization.Color.Hex)
+	require.Equal(t, "#ABCDEF", p.FlipcardCustomization.Color.Hex)
 
 	// The batch read resolves the same way as the single one — it is the path
 	// chat member rows are built from, so a default missed here would leave a
@@ -405,8 +405,8 @@ func testTipCardColor(t *testing.T, s profile.Store) {
 	require.Len(t, got, 2)
 	require.NoError(t, got[string(user1.Value)].Validate())
 	require.NoError(t, got[string(user2.Value)].Validate())
-	require.Equal(t, profile.DefaultTipCardColorHex, got[string(user1.Value)].TipCardCustomization.Color.Hex)
-	require.Equal(t, "#ABCDEF", got[string(user2.Value)].TipCardCustomization.Color.Hex)
+	require.Equal(t, profile.DefaultFlipcardColorHex, got[string(user1.Value)].FlipcardCustomization.Color.Hex)
+	require.Equal(t, "#ABCDEF", got[string(user2.Value)].FlipcardCustomization.Color.Hex)
 }
 
 func testMinDmChatInitFeeStore(t *testing.T, s profile.Store) {

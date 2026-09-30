@@ -1,4 +1,4 @@
-package tip
+package send
 
 import (
 	"strings"
@@ -20,7 +20,7 @@ func TestPresets(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, Presets{Minimum: 1, Low: 5, Medium: 10, High: 20}, usd)
 
-	for _, entry := range All() {
+	for _, entry := range AllPresets() {
 		region, presets := entry.Region, entry.Presets
 
 		assert.Len(t, string(region), 3, "%s is not an iso 4217 code", region)
@@ -42,7 +42,7 @@ func TestPresetsFor_UnknownCurrency(t *testing.T) {
 // All is what user flags are built from, so it must cover the whole table in a
 // stable order.
 func TestAll(t *testing.T) {
-	entries := All()
+	entries := AllPresets()
 	require.Len(t, entries, len(presetsByRegion))
 
 	for i, entry := range entries {

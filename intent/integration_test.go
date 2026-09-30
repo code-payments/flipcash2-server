@@ -139,19 +139,19 @@ func dmPaymentIntentRecord(t *testing.T, chatMetadata *intentpb.ChatMetadata, in
 	}
 }
 
-func tipDmChatMetadata(chatID *commonpb.ChatId) *intentpb.ChatMetadata {
-	return tipDmChatMetadataFrom(chatID, intentpb.ChatMetadata_TipDmPayment_TIPCARD)
+func dmChatMetadata(chatID *commonpb.ChatId) *intentpb.ChatMetadata {
+	return dmChatMetadataFrom(chatID, intentpb.ChatMetadata_DmPayment_FLIPCARD)
 }
 
-func tipDmChatMetadataFrom(chatID *commonpb.ChatId, location intentpb.ChatMetadata_TipDmPayment_Location) *intentpb.ChatMetadata {
-	return tipDmChatMetadataWithAction(chatID, location, intentpb.ChatMetadata_TipDmPayment_DEFAULT)
+func dmChatMetadataFrom(chatID *commonpb.ChatId, location intentpb.ChatMetadata_DmPayment_Location) *intentpb.ChatMetadata {
+	return dmChatMetadataWithAction(chatID, location, intentpb.ChatMetadata_DmPayment_DEFAULT)
 }
 
-func tipDmChatMetadataWithAction(chatID *commonpb.ChatId, location intentpb.ChatMetadata_TipDmPayment_Location, action intentpb.ChatMetadata_TipDmPayment_Action) *intentpb.ChatMetadata {
+func dmChatMetadataWithAction(chatID *commonpb.ChatId, location intentpb.ChatMetadata_DmPayment_Location, action intentpb.ChatMetadata_DmPayment_Action) *intentpb.ChatMetadata {
 	return &intentpb.ChatMetadata{
 		ChatId: chatID,
-		Type: &intentpb.ChatMetadata_TipDmPayment_{
-			TipDmPayment: &intentpb.ChatMetadata_TipDmPayment{Location: location, Action: action},
+		Type: &intentpb.ChatMetadata_DmPayment_{
+			DmPayment: &intentpb.ChatMetadata_DmPayment{Location: location, Action: action},
 		},
 	}
 }
@@ -168,19 +168,19 @@ func contactDmChatMetadata(chatID *commonpb.ChatId, sourcePhone, destinationPhon
 	}
 }
 
-func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
+func TestIntegration_AllowCreation_DmPayment(t *testing.T) {
 	e := newIntegrationEnv(t)
 
 	senderUserID, senderKeys := e.bindUser(t)
 	recipientUserID, recipientKeys := e.bindUser(t)
 
-	tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
 
 	validRecord := func() *ocp_intent.Record {
-		return dmPaymentIntentRecord(t, tipDmChatMetadata(tipChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+		return dmPaymentIntentRecord(t, dmChatMetadata(dmChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
 	}
 
-	// A valid tip requires no phone numbers anywhere: neither party has one
+	// A valid payment requires no phone numbers anywhere: neither party has one
 	// linked in this env, which is the defining difference from contact DMs.
 	t.Run("valid", func(t *testing.T) {
 		require.NoError(t, e.integration.AllowCreation(e.ctx, validRecord(), nil, nil))
@@ -216,13 +216,13 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "recipient is not a flipcash user")
 	})
 
-	t.Run("denied_self_tip", func(t *testing.T) {
-		selfChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, senderUserID)
-		record := dmPaymentIntentRecord(t, tipDmChatMetadata(selfChatID), base58.Encode(senderKeys.Public()), base58.Encode(senderKeys.Public()))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "tip to yourself")
+	t.Run("denied_self_payment", func(t *testing.T) {
+		selfChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, senderUserID)
+		record := dmPaymentIntentRecord(t, dmChatMetadata(selfChatID), base58.Encode(senderKeys.Public()), base58.Encode(senderKeys.Public()))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "payment to yourself")
 	})
 
-	// Tips that initialize the chat and fall below the per-currency minimum are
+	// Payments that initialize the chat and fall below the per-currency minimum are
 	// denied. The minimum itself, and anything above it, is allowed, as is
 	// anything within half of the currency's smallest transferable unit below
 	// the minimum. The chat is uninitialized throughout this case.
@@ -258,106 +258,77 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 			if tc.allowed {
 				require.NoError(t, err, "%s %v", tc.currency, tc.nativeAmount)
 			} else {
-				require.ErrorContains(t, err, "tip amount is below the minimum", "%s %v", tc.currency, tc.nativeAmount)
+				require.ErrorContains(t, err, "payment amount is below the minimum", "%s %v", tc.currency, tc.nativeAmount)
 			}
 		}
 	})
 
-	// A tip payment referencing the pair's *contact* DM must fail: the two
+	// A DM payment referencing the pair's *contact* DM must fail: the two
 	// chat types derive distinct canonical IDs.
 	t.Run("rejected_contact_dm_chat_id", func(t *testing.T) {
 		contactChatID := chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, senderUserID, recipientUserID)
-		record := dmPaymentIntentRecord(t, tipDmChatMetadata(contactChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+		record := dmPaymentIntentRecord(t, dmChatMetadata(contactChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "chat id does not match")
 	})
 
-	// A send from within the chat is only allowed once the tip DM has been
-	// initialized (by a tip card tip), and has no minimum amount. Once it is,
-	// neither does a tip. The env is fresh here, so a separate pair keeps the
-	// uninitialized case isolated.
-	t.Run("send_from_chat", func(t *testing.T) {
-		sendRecord := func(amount float64) *ocp_intent.Record {
-			record := dmPaymentIntentRecord(t, tipDmChatMetadataFrom(tipChatID, intentpb.ChatMetadata_TipDmPayment_CHAT), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
-			record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.USD
-			record.SendPublicPaymentMetadata.NativeAmount = amount
-			record.SendPublicPaymentMetadata.UsdMarketValue = amount
-			return record
+	// Any payment initializes the chat, whatever its location or action, and
+	// the one that does is held to the minimum. Once the chat exists, every
+	// payment is any amount. A fresh env per case keeps the chat uninitialized.
+	t.Run("any_payment_initializes", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			location intentpb.ChatMetadata_DmPayment_Location
+			action   intentpb.ChatMetadata_DmPayment_Action
+		}{
+			{"flipcard_default", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_DEFAULT},
+			{"flipcard_send", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_SEND},
+			{"flipcard_tip", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_TIP},
+			{"chat_default", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_DEFAULT},
+			{"chat_send", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_SEND},
+			{"chat_tip", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_TIP},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				e := newIntegrationEnv(t)
+				senderUserID, senderKeys := e.bindUser(t)
+				recipientUserID, recipientKeys := e.bindUser(t)
+				dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
+
+				record := func(nativeAmount float64) *ocp_intent.Record {
+					record := dmPaymentIntentRecord(t, dmChatMetadataWithAction(dmChatID, tc.location, tc.action), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+					record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.USD
+					record.SendPublicPaymentMetadata.NativeAmount = nativeAmount
+					record.SendPublicPaymentMetadata.UsdMarketValue = nativeAmount
+					return record
+				}
+
+				// Uninitialized: held to the minimum.
+				require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(0.5), nil, nil), "below the minimum")
+				require.NoError(t, e.integration.AllowCreation(e.ctx, record(1.0), nil, nil))
+
+				require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+					ID:      dmChatID,
+					Type:    chatpb.ChatType_DM,
+					Members: []*commonpb.UserId{senderUserID, recipientUserID},
+				}))
+
+				// Initialized: the gate was paid, so any amount.
+				require.NoError(t, e.integration.AllowCreation(e.ctx, record(0.01), nil, nil))
+			})
 		}
-
-		// Chat doesn't exist yet: denied regardless of amount, while a tip card
-		// tip into the same uninitialized chat is still allowed.
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, sendRecord(5.0), nil, nil), "not been initialized")
-		require.NoError(t, e.integration.AllowCreation(e.ctx, validRecord(), nil, nil))
-
-		require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
-			ID:      tipChatID,
-			Type:    chatpb.ChatType_TIP_DM,
-			Members: []*commonpb.UserId{senderUserID, recipientUserID},
-		}))
-
-		// Initialized: allowed, including amounts below the tip minimum.
-		require.NoError(t, e.integration.AllowCreation(e.ctx, sendRecord(5.0), nil, nil))
-		require.NoError(t, e.integration.AllowCreation(e.ctx, sendRecord(0.01), nil, nil))
-
-		// The tip minimum no longer applies to tip card tips either: the gate
-		// was paid when the chat was initialized.
-		tipRecord := validRecord()
-		tipRecord.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.USD
-		tipRecord.SendPublicPaymentMetadata.NativeAmount = 0.01
-		tipRecord.SendPublicPaymentMetadata.UsdMarketValue = 0.01
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tipRecord, nil, nil))
 	})
 
-	// An explicit action overrides the default for the location, and the rules
-	// follow it: a tip from within the chat initializes the DM and is held to
-	// the minimum, a send from the tip card is not. A fresh env keeps the chat
-	// uninitialized here.
-	t.Run("action_overrides_location", func(t *testing.T) {
-		e := newIntegrationEnv(t)
-		senderUserID, senderKeys := e.bindUser(t)
-		recipientUserID, recipientKeys := e.bindUser(t)
-		tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
-
-		record := func(location intentpb.ChatMetadata_TipDmPayment_Location, action intentpb.ChatMetadata_TipDmPayment_Action, nativeAmount float64) *ocp_intent.Record {
-			record := dmPaymentIntentRecord(t, tipDmChatMetadataWithAction(tipChatID, location, action), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
-			record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.USD
-			record.SendPublicPaymentMetadata.NativeAmount = nativeAmount
-			record.SendPublicPaymentMetadata.UsdMarketValue = nativeAmount
-			return record
-		}
-
-		// A tip from within the chat may initialize it, but is held to the tip
-		// minimum, where the same location would have no minimum by default.
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_TIP, 0.5), nil, nil), "below the minimum")
-		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_TIP, 1.0), nil, nil))
-
-		// A send from the tip card is still a send, so it cannot initialize the
-		// chat, where the same location would have by default.
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_TIPCARD, intentpb.ChatMetadata_TipDmPayment_SEND, 100), nil, nil), "not been initialized")
-
-		require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
-			ID:      tipChatID,
-			Type:    chatpb.ChatType_TIP_DM,
-			Members: []*commonpb.UserId{senderUserID, recipientUserID},
-		}))
-
-		// Initialized: neither the send nor the tip carries a minimum.
-		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_TIPCARD, intentpb.ChatMetadata_TipDmPayment_SEND, 0.01), nil, nil))
-		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, intentpb.ChatMetadata_TipDmPayment_TIP, 0.5), nil, nil))
-	})
-
-	// A recipient's minimum DM chat initialization fee applies only to the tip
-	// that initializes the chat, and where set it replaces the preset minimum
-	// as that tip's floor rather than stacking on it. A fresh env keeps the
+	// A recipient's minimum DM chat initialization fee applies only to the
+	// payment that initializes the chat, and where set it replaces the preset
+	// minimum as that payment's floor rather than stacking on it. A fresh env keeps the
 	// chat uninitialized here.
 	t.Run("min_dm_chat_init_fee", func(t *testing.T) {
 		e := newIntegrationEnv(t)
 		senderUserID, senderKeys := e.bindUser(t)
 		recipientUserID, recipientKeys := e.bindUser(t)
-		tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
+		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
 
-		record := func(location intentpb.ChatMetadata_TipDmPayment_Location, currency string, nativeAmount float64) *ocp_intent.Record {
-			record := dmPaymentIntentRecord(t, tipDmChatMetadataFrom(tipChatID, location), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+		record := func(location intentpb.ChatMetadata_DmPayment_Location, currency string, nativeAmount float64) *ocp_intent.Record {
+			record := dmPaymentIntentRecord(t, dmChatMetadataFrom(dmChatID, location), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
 			record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.Code(currency)
 			record.SendPublicPaymentMetadata.NativeAmount = nativeAmount
 			record.SendPublicPaymentMetadata.UsdMarketValue = nativeAmount
@@ -366,15 +337,15 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 			}
 			return record
 		}
-		tip := func(currency string, nativeAmount float64) *ocp_intent.Record {
-			return record(intentpb.ChatMetadata_TipDmPayment_TIPCARD, currency, nativeAmount)
+		pay := func(currency string, nativeAmount float64) *ocp_intent.Record {
+			return record(intentpb.ChatMetadata_DmPayment_FLIPCARD, currency, nativeAmount)
 		}
 		setFee := func(currency string, nativeAmount float64) {
 			require.NoError(t, e.profiles.SetMinDmChatInitFee(e.ctx, recipientUserID, &commonpb.FiatPaymentAmount{Currency: currency, NativeAmount: nativeAmount}))
 		}
 
 		// No fee set: only the preset minimum applies.
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 1.0), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("usd", 1.0), nil, nil))
 
 		setFee("usd", 10)
 		for _, tc := range []struct {
@@ -394,7 +365,7 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 			{"eur", 9.0, true, ""},
 			{"eur", 8.9, false, "chat initialization fee"},
 		} {
-			err := e.integration.AllowCreation(e.ctx, tip(tc.currency, tc.nativeAmount), nil, nil)
+			err := e.integration.AllowCreation(e.ctx, pay(tc.currency, tc.nativeAmount), nil, nil)
 			if tc.allowed {
 				require.NoError(t, err, "%s %v", tc.currency, tc.nativeAmount)
 			} else {
@@ -406,49 +377,51 @@ func TestIntegration_AllowCreation_TipDmPayment(t *testing.T) {
 		// through the live rate otherwise, with the rounding slack in the fee's
 		// currency.
 		setFee("jpy", 1_000)
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("jpy", 1_000), nil, nil))
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("jpy", 999.5), nil, nil))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("jpy", 999), nil, nil), "chat initialization fee")
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 6.67), nil, nil))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("usd", 6.66), nil, nil), "chat initialization fee")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("jpy", 1_000), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("jpy", 999.5), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay("jpy", 999), nil, nil), "chat initialization fee")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("usd", 6.67), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay("usd", 6.66), nil, nil), "chat initialization fee")
 
-		// The fee replaces the preset minimum of the tipper's currency: a fee at
+		// The fee replaces the preset minimum of the payer's currency: a fee at
 		// JPY's preset minimum is cleared by EUR 0.70 (JPY 116.67 at the live
 		// rate) even though EUR's own preset minimum is 1.00, while EUR 0.59
 		// (JPY 98.33) is short of the fee, not the preset.
 		setFee("jpy", 100)
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("eur", 0.7), nil, nil))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("eur", 0.59), nil, nil), "chat initialization fee")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("eur", 0.7), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay("eur", 0.59), nil, nil), "chat initialization fee")
 
 		// A fee in a currency with no live rate cannot be compared against a
 		// payment in another currency, and is denied rather than waved through.
 		setFee("kwd", 1)
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("kwd", 1), nil, nil))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tip("usd", 100), nil, nil), "no exchange rate")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("kwd", 1), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay("usd", 100), nil, nil), "no exchange rate")
 
-		// A send from within the chat is still denied before initialization,
-		// whatever the amount.
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, "usd", 100), nil, nil), "not been initialized")
+		// A send from within the chat is held to the same fee before
+		// initialization.
+		setFee("usd", 10)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_DmPayment_CHAT, "usd", 9.99), nil, nil), "chat initialization fee")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_DmPayment_CHAT, "usd", 10), nil, nil))
 
 		// Once the chat exists nothing applies: tips and sends alike are any
 		// amount, below the fee and below the preset minimum.
 		require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
-			ID:      tipChatID,
-			Type:    chatpb.ChatType_TIP_DM,
+			ID:      dmChatID,
+			Type:    chatpb.ChatType_DM,
 			Members: []*commonpb.UserId{senderUserID, recipientUserID},
 		}))
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 1.0), nil, nil))
-		require.NoError(t, e.integration.AllowCreation(e.ctx, tip("usd", 0.5), nil, nil))
-		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_TipDmPayment_CHAT, "usd", 0.01), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("usd", 1.0), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay("usd", 0.5), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, record(intentpb.ChatMetadata_DmPayment_CHAT, "usd", 0.01), nil, nil))
 	})
 }
 
-// No tip DM payment is allowed to or from the Flipcash team account, tip or
+// No DM payment is allowed to or from the Flipcash team account, tip or
 // send, whether or not the DM exists (the team's welcome creates it).
-func TestIntegration_AllowCreation_TipDmPayment_TeamAccount(t *testing.T) {
+func TestIntegration_AllowCreation_DmPayment_TeamAccount(t *testing.T) {
 	e := newIntegrationEnv(t)
 	userID, userKeys := e.bindUser(t)
-	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, userID, e.team)
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, userID, e.team)
 
 	parties := []struct {
 		name     string
@@ -457,13 +430,13 @@ func TestIntegration_AllowCreation_TipDmPayment_TeamAccount(t *testing.T) {
 		{"to_team", userKeys, e.teamKeys},
 		{"from_team", e.teamKeys, userKeys},
 	}
-	payment := func(from, to model.KeyPair, action intentpb.ChatMetadata_TipDmPayment_Action) *ocp_intent.Record {
-		metadata := tipDmChatMetadataWithAction(chatID, intentpb.ChatMetadata_TipDmPayment_CHAT, action)
+	payment := func(from, to model.KeyPair, action intentpb.ChatMetadata_DmPayment_Action) *ocp_intent.Record {
+		metadata := dmChatMetadataWithAction(chatID, intentpb.ChatMetadata_DmPayment_CHAT, action)
 		return dmPaymentIntentRecord(t, metadata, base58.Encode(from.Public()), base58.Encode(to.Public()))
 	}
 	requireDenied := func(t *testing.T) {
 		for _, p := range parties {
-			for _, action := range []intentpb.ChatMetadata_TipDmPayment_Action{intentpb.ChatMetadata_TipDmPayment_TIP, intentpb.ChatMetadata_TipDmPayment_SEND} {
+			for _, action := range []intentpb.ChatMetadata_DmPayment_Action{intentpb.ChatMetadata_DmPayment_TIP, intentpb.ChatMetadata_DmPayment_SEND} {
 				err := e.integration.AllowCreation(e.ctx, payment(p.from, p.to, action), nil, nil)
 				require.ErrorContains(t, err, "flipcash team", "%s %s", p.name, action)
 			}
@@ -474,7 +447,7 @@ func TestIntegration_AllowCreation_TipDmPayment_TeamAccount(t *testing.T) {
 
 	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
 		ID:      chatID,
-		Type:    chatpb.ChatType_TIP_DM,
+		Type:    chatpb.ChatType_DM,
 		Members: []*commonpb.UserId{userID, e.team},
 	}))
 	t.Run("initialized", requireDenied)
@@ -482,7 +455,7 @@ func TestIntegration_AllowCreation_TipDmPayment_TeamAccount(t *testing.T) {
 	// Without a team account configured, the same user is anyone else.
 	t.Run("no_team_configured", func(t *testing.T) {
 		unconfigured := intent.NewIntegration(e.accounts, e.chats, e.profiles, nil, nil)
-		require.NoError(t, unconfigured.AllowCreation(e.ctx, payment(userKeys, e.teamKeys, intentpb.ChatMetadata_TipDmPayment_SEND), nil, nil))
+		require.NoError(t, unconfigured.AllowCreation(e.ctx, payment(userKeys, e.teamKeys, intentpb.ChatMetadata_DmPayment_SEND), nil, nil))
 	})
 }
 
@@ -555,28 +528,28 @@ func TestIntegration_AllowCreation_ContactDmPayment(t *testing.T) {
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, r, nil, nil), "recipient is not linked to the destination phone number")
 	})
 
-	// A contact payment referencing the pair's *tip* DM must fail: the two
+	// A contact payment referencing the pair's DM must fail: the two
 	// chat types derive distinct canonical IDs.
-	t.Run("rejected_tip_dm_chat_id", func(t *testing.T) {
-		tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
-		r := record(contactDmChatMetadata(tipChatID, senderPhone, recipientPhone))
+	t.Run("rejected_dm_chat_id", func(t *testing.T) {
+		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
+		r := record(contactDmChatMetadata(dmChatID, senderPhone, recipientPhone))
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, r, nil, nil), "chat id does not match")
 	})
 }
 
-func TestIntegration_GetTasksToSchedule_TipDmPayment(t *testing.T) {
+func TestIntegration_GetTasksToSchedule_DmPayment(t *testing.T) {
 	e := newIntegrationEnv(t)
 
 	senderUserID, senderKeys := e.bindUser(t)
 	recipientUserID, recipientKeys := e.bindUser(t)
 
-	tipChatID := chat.MustDeriveDmChatID(chatpb.ChatType_TIP_DM, senderUserID, recipientUserID)
-	record := dmPaymentIntentRecord(t, tipDmChatMetadata(tipChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
+	record := dmPaymentIntentRecord(t, dmChatMetadata(dmChatID), base58.Encode(senderKeys.Public()), base58.Encode(recipientKeys.Public()))
 
 	tasks, err := e.integration.GetTasksToSchedule(e.ctx, record)
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
-	assert.Equal(t, intent.TaskTypeSendTipDmPaymentMessage, tasks[0].Type)
+	assert.Equal(t, intent.TaskTypeSendDmPaymentMessage, tasks[0].Type)
 	require.NotNil(t, tasks[0].ReferenceId)
 	assert.Equal(t, record.IntentId, *tasks[0].ReferenceId)
 	require.NoError(t, tasks[0].Validate())

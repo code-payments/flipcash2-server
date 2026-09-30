@@ -63,7 +63,7 @@ func TestChat_DynamoDBExclusionOutlivesConfig(t *testing.T) {
 	created := time.Unix(1_700_000_100, 0).UTC()
 	require.NoError(t, configured.PutChat(ctx, &chat.Chat{
 		ID:           chatID,
-		Type:         chatpb.ChatType_TIP_DM,
+		Type:         chatpb.ChatType_DM,
 		Members:      []*commonpb.UserId{user, team},
 		LastActivity: created,
 	}))
@@ -74,11 +74,11 @@ func TestChat_DynamoDBExclusionOutlivesConfig(t *testing.T) {
 	require.True(t, advanced)
 
 	snapshot := advancedTo.Add(time.Hour)
-	userFeed, err := unconfigured.GetDmFeedPage(ctx, user, chatpb.ChatType_TIP_DM, snapshot, nil, 0)
+	userFeed, err := unconfigured.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, snapshot, nil, 0)
 	require.NoError(t, err)
 	require.Len(t, userFeed, 1)
 	require.True(t, userFeed[0].LastActivity.Equal(advancedTo))
-	teamFeed, err := unconfigured.GetDmFeedPage(ctx, team, chatpb.ChatType_TIP_DM, snapshot, nil, 0)
+	teamFeed, err := unconfigured.GetDmFeedPage(ctx, team, chatpb.ChatType_DM, snapshot, nil, 0)
 	require.NoError(t, err)
 	require.Empty(t, teamFeed)
 }

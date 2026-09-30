@@ -28,8 +28,8 @@ type Integration struct {
 	mintDataProvider *ocp_currency_util.MintDataProvider
 
 	// teamUserID is the Flipcash team account (see flipcashteam), nil when
-	// there is none. No tip DM payment is allowed to or from it (see
-	// validateTipDmAppMetadata).
+	// there is none. No DM payment is allowed to or from it (see
+	// validateDmAppMetadata).
 	teamUserID *commonpb.UserId
 }
 
@@ -96,8 +96,8 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 			case *intentpb.ChatMetadata_ContactDmPayment_:
 				// return i.validateContactDmAppMetadata(ctx, intentRecord, &appMetadata)
 				return ocp_transaction.NewIntentDeniedError("contact send feature is disabled")
-			case *intentpb.ChatMetadata_TipDmPayment_:
-				return i.validateTipDmAppMetadata(ctx, intentRecord, &appMetadata)
+			case *intentpb.ChatMetadata_DmPayment_:
+				return i.validateDmAppMetadata(ctx, intentRecord, &appMetadata)
 			default:
 				return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
 			}
@@ -114,16 +114,16 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 }
 
 // GetTasksToSchedule returns the guaranteed work derived from a submitted
-// intent. A DM payment (contact or tip) schedules the cash message injected
-// into the DM between the sender and recipient; execution is handled by
-// task.Executor.
+// intent. A DM payment of either type (contact DM or DM) schedules the cash
+// message injected into the DM between the sender and recipient; execution is
+// handled by task.Executor.
 func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_intent.Record) ([]*ocp_task.Record, error) {
 	if intentRecord.IntentType == ocp_intent.SendPublicPayment {
 		if GetContactDmPayment(intentRecord.AppMetadata) != nil {
 			return []*ocp_task.Record{NewSendContactDmPaymentMessageTask(intentRecord)}, nil
 		}
-		if GetTipDmPayment(intentRecord.AppMetadata) != nil {
-			return []*ocp_task.Record{NewSendTipDmPaymentMessageTask(intentRecord)}, nil
+		if GetDmPayment(intentRecord.AppMetadata) != nil {
+			return []*ocp_task.Record{NewSendDmPaymentMessageTask(intentRecord)}, nil
 		}
 	}
 

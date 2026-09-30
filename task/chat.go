@@ -24,23 +24,23 @@ import (
 // sendContactDmPaymentMessage injects the cash message for a contact DM
 // payment into the DM between the sender and recipient.
 func (e *Executor) sendContactDmPaymentMessage(ctx context.Context, record *ocp_task.Record) error {
-	return e.sendDmPaymentMessage(ctx, record, chatpb.ChatType_CONTACT_DM)
+	return e.sendPaymentMessage(ctx, record, chatpb.ChatType_CONTACT_DM)
 }
 
-// sendTipDmPaymentMessage injects the cash message for a tip DM payment into
-// the tip DM between the sender and recipient.
-func (e *Executor) sendTipDmPaymentMessage(ctx context.Context, record *ocp_task.Record) error {
-	return e.sendDmPaymentMessage(ctx, record, chatpb.ChatType_TIP_DM)
+// sendDmPaymentMessage injects the cash message for a DM payment into the DM
+// between the sender and recipient.
+func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Record) error {
+	return e.sendPaymentMessage(ctx, record, chatpb.ChatType_DM)
 }
 
-// sendDmPaymentMessage injects the cash message for a DM payment into the
+// sendPaymentMessage injects the cash message for a DM payment into the
 // canonical DM of the given type between the sender and recipient. A returned
 // error means the task is retried with backoff.
 //
 // Idempotency under at-least-once delivery comes from the messaging layer:
 // sends dedupe on (chatID, clientMessageID), and the client message ID is the
 // task's UUID, which is stable across retries.
-func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Record, chatType chatpb.ChatType) error {
+func (e *Executor) sendPaymentMessage(ctx context.Context, record *ocp_task.Record, chatType chatpb.ChatType) error {
 	taskID, err := uuid.Parse(record.TaskId)
 	if err != nil {
 		return fmt.Errorf("task id is not a uuid: %w", err)
@@ -77,16 +77,16 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 		if chatMetadata.GetContactDmPayment() == nil {
 			return errors.New("intent is not a contact dm payment")
 		}
-	case chatpb.ChatType_TIP_DM:
-		if chatMetadata.GetTipDmPayment() == nil {
-			return errors.New("intent is not a tip dm payment")
+	case chatpb.ChatType_DM:
+		if chatMetadata.GetDmPayment() == nil {
+			return errors.New("intent is not a dm payment")
 		}
 	default:
 		return fmt.Errorf("unsupported dm chat type %d", chatType)
 	}
 
 	// The verb is how the client renders the payment.
-	verb := intent.GetDmPaymentVerb(intentRecord.AppMetadata)
+	verb := intent.GetDmPaymentVerb(intentRecord.AppMetadata, intentRecord.CreatedAt)
 
 	senderOwner, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
 	if err != nil {

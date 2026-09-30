@@ -422,7 +422,7 @@ func TestRuleEvaluator_TeamDm(t *testing.T) {
 	// A DM with the team, of any DM type, refuses every send, the team's
 	// included, and still admits its members to listen. It is decided off the
 	// IDs, with no read.
-	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_TIP_DM, chatpb.ChatType_CONTACT_DM} {
+	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_DM, chatpb.ChatType_CONTACT_DM} {
 		teamDmID := MustDeriveDmChatID(chatType, user, team)
 		for _, u := range []*commonpb.UserId{user, team} {
 			ok, err := e.CanSpeak(ctx, teamDmID, u)
@@ -439,11 +439,11 @@ func TestRuleEvaluator_TeamDm(t *testing.T) {
 	}
 
 	// A DM without the team carries no rules and admits both members.
-	dmID := MustDeriveDmChatID(chatpb.ChatType_TIP_DM, user, other)
+	dmID := MustDeriveDmChatID(chatpb.ChatType_DM, user, other)
 	ok, err := e.CanSpeak(ctx, dmID, user)
 	require.NoError(t, err)
 	require.True(t, ok)
-	require.Nil(t, e.RulesOf(&Chat{ID: dmID, Type: chatpb.ChatType_TIP_DM, Members: []*commonpb.UserId{user, other}}))
+	require.Nil(t, e.RulesOf(&Chat{ID: dmID, Type: chatpb.ChatType_DM, Members: []*commonpb.UserId{user, other}}))
 	require.Zero(t, chats.reads)
 
 	// A group's rules are its stored ones, whoever its members are.
@@ -452,10 +452,10 @@ func TestRuleEvaluator_TeamDm(t *testing.T) {
 
 	// An evaluator with no team account treats no DM specially.
 	none := NewRuleEvaluator(accounts, balances, chats, nil)
-	ok, err = none.CanSpeak(ctx, MustDeriveDmChatID(chatpb.ChatType_TIP_DM, user, team), user)
+	ok, err = none.CanSpeak(ctx, MustDeriveDmChatID(chatpb.ChatType_DM, user, team), user)
 	require.NoError(t, err)
 	require.True(t, ok)
-	require.Nil(t, none.RulesOf(&Chat{ID: MustDeriveDmChatID(chatpb.ChatType_TIP_DM, user, team), Type: chatpb.ChatType_TIP_DM, Members: []*commonpb.UserId{user, team}}))
+	require.Nil(t, none.RulesOf(&Chat{ID: MustDeriveDmChatID(chatpb.ChatType_DM, user, team), Type: chatpb.ChatType_DM, Members: []*commonpb.UserId{user, team}}))
 }
 
 func TestRuleEvaluator_MinimumBalance(t *testing.T) {

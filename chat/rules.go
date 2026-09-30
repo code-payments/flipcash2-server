@@ -354,8 +354,8 @@ func (e *RuleEvaluator) satisfies(ctx context.Context, kind any, userID *commonp
 // rate applied to a quark total, so it can land a fraction of a minor unit
 // under a requirement it meets through rounding alone; half of the currency's
 // smallest transferable unit of slack is allowed, as intent validation allows
-// on a rate-derived tip. A currency OCP cannot value is, like an unknown rule
-// kind, an error and never a pass.
+// on a rate-derived payment. A currency OCP cannot value is, like an unknown
+// rule kind, an error and never a pass.
 //
 // A user with no owner account holds nothing, and fails as a zero balance would;
 // a balance that cannot be read is an error, so the gate is never left

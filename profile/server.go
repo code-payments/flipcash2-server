@@ -498,7 +498,7 @@ func setProfilePictureResultForErr(err error) (profilepb.SetProfilePictureRespon
 	}
 }
 
-func (s *Server) UpdateTipCard(ctx context.Context, req *profilepb.UpdateTipCardRequest) (*profilepb.UpdateTipCardResponse, error) {
+func (s *Server) UpdateFlipcard(ctx context.Context, req *profilepb.UpdateFlipcardRequest) (*profilepb.UpdateFlipcardResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
 		return nil, err
@@ -511,7 +511,7 @@ func (s *Server) UpdateTipCard(ctx context.Context, req *profilepb.UpdateTipCard
 		log.Warn("Failed to get registration flag")
 		return nil, status.Errorf(codes.Internal, "failed to get registration flag")
 	} else if !isRegistered {
-		return &profilepb.UpdateTipCardResponse{Result: profilepb.UpdateTipCardResponse_DENIED}, nil
+		return &profilepb.UpdateFlipcardResponse{Result: profilepb.UpdateFlipcardResponse_DENIED}, nil
 	}
 
 	// Every field of the customization is optional, so whatever is left unset
@@ -519,13 +519,13 @@ func (s *Server) UpdateTipCard(ctx context.Context, req *profilepb.UpdateTipCard
 	if req.Color != nil {
 		colorHex := NormalizeColorHex(req.Color.Hex)
 
-		if err := s.profiles.SetTipCardColor(ctx, userID, colorHex); err != nil {
-			log.Warn("Failed to set tip card color", zap.Error(err), zap.String("color", colorHex))
-			return nil, status.Error(codes.Internal, "failed to set tip card color")
+		if err := s.profiles.SetFlipcardColor(ctx, userID, colorHex); err != nil {
+			log.Warn("Failed to set flipcard color", zap.Error(err), zap.String("color", colorHex))
+			return nil, status.Error(codes.Internal, "failed to set flipcard color")
 		}
 	}
 
-	return &profilepb.UpdateTipCardResponse{}, nil
+	return &profilepb.UpdateFlipcardResponse{}, nil
 }
 
 func (s *Server) SetMinDmChatInitFee(ctx context.Context, req *profilepb.SetMinDmChatInitFeeRequest) (*profilepb.SetMinDmChatInitFeeResponse, error) {

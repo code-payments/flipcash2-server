@@ -20,7 +20,7 @@ import (
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/rpc"
-	"github.com/code-payments/flipcash2-server/tip"
+	"github.com/code-payments/flipcash2-server/send"
 	ocp_client "github.com/code-payments/ocp-server/grpc/client"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 )
@@ -101,14 +101,14 @@ var (
 		commonpb.Platform_APPLE: {Major: 1, Minor: 13, Patch: 0},
 	}
 
-	tipPresets []*accountpb.TipPresets
+	sendPresets []*accountpb.SendPresets
 )
 
 func init() {
-	entries := tip.All()
-	tipPresets = make([]*accountpb.TipPresets, 0, len(entries))
+	entries := send.AllPresets()
+	sendPresets = make([]*accountpb.SendPresets, 0, len(entries))
 	for _, entry := range entries {
-		tipPresets = append(tipPresets, &accountpb.TipPresets{
+		sendPresets = append(sendPresets, &accountpb.SendPresets{
 			Region:  &commonpb.Region{Value: string(entry.Region)},
 			Minimum: entry.Presets.Minimum,
 			Low:     entry.Presets.Low,
@@ -292,7 +292,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			MinimumHolderValue:               MinHolderValue,
 			RequireCoinbaseEmailVerification: RequireCoinbaseEmailVerification,
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
-			TipPresets:                       tipPresets,
+			SendPresets:                      sendPresets,
 			UsernameMinBalance:               MinUsernameTotalBalance,
 			MessageEditWindow:                durationpb.New(DefaultMessageEditWindow),
 			MessageDeleteWindow:              durationpb.New(DefaultMessageDeleteWindow),
@@ -332,7 +332,7 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			MinimumHolderValue:               MinHolderValue,
 			RequireCoinbaseEmailVerification: RequireCoinbaseEmailVerification,
 			EnablePhoneNumberSend:            isPhoneNumberSendEnabled(ctx, req.Platform),
-			TipPresets:                       tipPresets,
+			SendPresets:                      sendPresets,
 			UsernameMinBalance:               MinUsernameTotalBalance,
 			MessageEditWindow:                durationpb.New(DefaultMessageEditWindow),
 			MessageDeleteWindow:              durationpb.New(DefaultMessageDeleteWindow),

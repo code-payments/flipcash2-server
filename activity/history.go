@@ -115,9 +115,9 @@ func toNotification(
 				Phone: contactPayment.GetDestination(),
 			}
 		} else if userID, ok := counterpartyUserIDs[counterpartyOwnerAccount(record)]; ok {
-			// A tip DM identifies the recipient by user ID instead, so the client
-			// can render their profile without either party's phone number, which
-			// stays private in a tip DM.
+			// A DM payment identifies the recipient by user ID instead, so the
+			// client can render their profile without either party's phone number,
+			// which stays private outside contact DMs.
 			metadata.DestinationIdentifier = &activitypb.DirectlySentCryptoNotificationMetadata_UserId{
 				UserId: userID,
 			}
@@ -285,16 +285,16 @@ func toSwapState(record *history.Record) activitypb.SwapState {
 }
 
 // resolveHistoryCounterparties returns the user ID of the other party to each
-// tip DM payment in records, keyed by that party's owner account, resolved for
+// DM payment in records, keyed by that party's owner account, resolved for
 // the whole page in one lookup rather than once per record.
 //
-// Only tip DM payments are resolved. A payment handed off in person also has a
+// Only DM payments are resolved. A payment handed off in person also has a
 // counterparty whose owner account would resolve, but no identity was exchanged
 // there, so naming them would disclose one that neither party shared.
 func (s *Server) resolveHistoryCounterparties(ctx context.Context, records []*history.Record) (map[string]*commonpb.UserId, error) {
 	var pubKeys []*commonpb.PublicKey
 	for _, record := range records {
-		if intent.GetTipDmPayment(record.AppMetadata) == nil {
+		if intent.GetDmPayment(record.AppMetadata) == nil {
 			continue
 		}
 

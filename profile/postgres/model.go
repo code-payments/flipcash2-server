@@ -384,13 +384,16 @@ func dbSetMinDmChatInitFee(ctx context.Context, pool *pgxpool.Pool, userID *comm
 	})
 }
 
-func dbGetPrivateProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (phoneNumber, emailAddress *string, err error) {
-	var res struct {
-		PhoneNumber  *string `db:"phoneNumber"`
-		EmailAddress *string `db:"emailAddress"`
-	}
-	query := `SELECT "phoneNumber", "emailAddress" FROM ` + usersTableName + ` WHERE "id" = $1`
-	err = pgxscan.Get(
+type privateProfileModel struct {
+	PhoneNumber            *string `db:"phoneNumber"`
+	EmailAddress           *string `db:"emailAddress"`
+	IsUsernameAutoAssigned bool    `db:"isUsernameAutoAssigned"`
+}
+
+func dbGetPrivateProfile(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (*privateProfileModel, error) {
+	var res privateProfileModel
+	query := `SELECT "phoneNumber", "emailAddress", "isUsernameAutoAssigned" FROM ` + usersTableName + ` WHERE "id" = $1`
+	err := pgxscan.Get(
 		ctx,
 		pool,
 		&res,
@@ -399,11 +402,11 @@ func dbGetPrivateProfile(ctx context.Context, pool *pgxpool.Pool, userID *common
 	)
 	if err != nil {
 		if pgxscan.NotFound(err) {
-			return nil, nil, profile.ErrNotFound
+			return nil, profile.ErrNotFound
 		}
-		return nil, nil, err
+		return nil, err
 	}
-	return res.PhoneNumber, res.EmailAddress, nil
+	return &res, nil
 }
 
 func dbLinkPhoneNumber(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, phoneNumber string, phoneNumberHash *commonpb.Hash) error {

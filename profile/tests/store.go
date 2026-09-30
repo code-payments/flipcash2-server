@@ -552,10 +552,18 @@ func testUsername(t *testing.T, s profile.Store) {
 func testUsernameAutoAssigned(t *testing.T, s profile.Store) {
 	ctx := context.Background()
 
+	// Every answer is checked against the profile too: a private read carries the
+	// same flag, and a public read never carries it.
 	autoAssigned := func(userID *commonpb.UserId) bool {
 		t.Helper()
 		autoAssigned, err := s.IsUsernameAutoAssigned(ctx, userID)
 		require.NoError(t, err)
+		privateProfile, err := s.GetProfile(ctx, userID, true)
+		require.NoError(t, err)
+		require.Equal(t, autoAssigned, privateProfile.IsUsernameAutoAssigned)
+		publicProfile, err := s.GetProfile(ctx, userID, false)
+		require.NoError(t, err)
+		require.False(t, publicProfile.IsUsernameAutoAssigned)
 		return autoAssigned
 	}
 

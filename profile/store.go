@@ -40,7 +40,9 @@ type DefaultUsernameResult struct {
 
 type Store interface {
 	// GetProfile returns the user profile for a user, or ErrNotFound when the store
-	// does not know the user.
+	// does not know the user. The private fields — phone number, email address and
+	// whether the handle is auto-assigned (see IsUsernameAutoAssigned) — are set
+	// only when includePrivateProfile is.
 	GetProfile(ctx context.Context, id *commonpb.UserId, includePrivateProfile bool) (*profilepb.UserProfile, error)
 
 	// SetDisplayName sets the display name for a user, provided they exist.

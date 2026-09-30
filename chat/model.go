@@ -240,7 +240,8 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // a group chat: group membership is mutable and lives in its own store records,
 // which no path that reads the canonical record touches. A caller that needs a
 // group's members reads them explicitly via Store.GetMembers. Title,
-// IsStaffOnly, CreatorID and PictureBlobID are group-only and zero for DMs.
+// IsStaffOnly, IsCreatorOnlySpeaker, CreatorID and PictureBlobID are
+// group-only and zero for DMs.
 //
 // RosterSummary describes the member list without containing it. Like Members,
 // it is complete for a DM on any read and left zero for a group by the
@@ -256,6 +257,13 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // alike, gate on membership alone, so a member a rule excludes can still see
 // the chat and what it requires of them; enforcing rules on membership changes
 // is the job of whatever path mutates membership.
+//
+// IsCreatorOnlySpeaker marks a group in which only its creator may speak. It
+// is stored state, surfaced to clients as a CreatorRequirement speaker rule
+// (see Rules) and enforced on sends like any other rule. No RPC sets it —
+// StartChat refuses speaker rules (see RulesFromProto) — so a group carries
+// it only when its record was written with it. A group that carries it but
+// has no recorded creator admits no one to speak.
 //
 // CreatorID is the user who created the group, or nil when unknown (a DM has
 // none, and so does any group written before the field existed). It is fixed
@@ -278,6 +286,7 @@ type Chat struct {
 	Title                  string
 	IsStaffOnly            bool
 	MinimumListenerBalance *MinimumBalance
+	IsCreatorOnlySpeaker   bool
 	CreatorID              *commonpb.UserId
 	PictureBlobID          *blobpb.BlobId
 	LastActivity           time.Time
@@ -429,6 +438,7 @@ func (c *Chat) Clone() *Chat {
 		Title:                  c.Title,
 		IsStaffOnly:            c.IsStaffOnly,
 		MinimumListenerBalance: minimumListenerBalance,
+		IsCreatorOnlySpeaker:   c.IsCreatorOnlySpeaker,
 		CreatorID:              creatorID,
 		PictureBlobID:          pictureBlobID,
 		LastActivity:           c.LastActivity,

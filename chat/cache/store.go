@@ -16,7 +16,7 @@ import (
 
 // Cache wraps a chat.Store, caching what is fixed at a chat's creation and so
 // can never go stale: DM membership checks, a DM's member list, and a group's
-// participation rules. A DM's membership never changes, so a confirmed DM
+// participation rules with its creator. A DM's membership never changes, so a confirmed DM
 // member, and the DM's member pair, are safe to cache. Group membership is
 // mutable — and can be mutated by other processes, which this cache can never
 // observe — so group membership checks and member lists always defer to the
@@ -126,21 +126,24 @@ func (c *Cache) GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb
 	return c.db.GetGroupRosterSummaries(ctx, chatIDs)
 }
 
-// GetGroupRules is cached, including the absence of rules (a nil result), so a
-// group without any is read once too. Rules are fixed at creation (see
-// chat.Store), so a cached entry is never stale: if rules ever become mutable,
-// this needs invalidation on write. A cached entry is shared by every caller
-// and must be treated as read-only. Errors — including ErrChatNotFound, since
-// the group may be created later — are not cached.
-func (c *Cache) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (*chatpb.Rules, error) {
+// GetGroupRules is cached, including the absence of rules (a nil Rules), so a
+// group without any is read once too. Rules and the creator are fixed at
+// creation (see chat.Store), so a cached entry is never stale: if either ever
+// becomes mutable, this needs invalidation on write. That holds only while
+// both are written with the group: a creator backfilled onto a legacy group,
+// or IsCreatorOnlySpeaker set on a group that already exists, reaches a
+// process that has read the group only when it restarts. A cached entry is
+// shared by every caller and must be treated as read-only. Errors — including
+// ErrChatNotFound, since the group may be created later — are not cached.
+func (c *Cache) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (chat.GroupRules, error) {
 	key := string(chatID.Value)
 	if cached, ok := c.rulesCache.Get(key); ok {
-		return cached.(*chatpb.Rules), nil
+		return cached.(chat.GroupRules), nil
 	}
 
 	rules, err := c.db.GetGroupRules(ctx, chatID)
 	if err != nil {
-		return nil, err
+		return chat.GroupRules{}, err
 	}
 	c.rulesCache.Set(key, rules)
 	return rules, nil

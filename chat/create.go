@@ -106,14 +106,15 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 	// included: a group whose creator cannot read it is a group nobody can
 	// reach, and one whose creator cannot post in it is a room they opened and
 	// cannot use. The rules are evaluated from the request rather than a
-	// stored record, since there is no record yet.
+	// stored record, since there is no record yet, with the caller as the
+	// creator they will record.
 	//
 	// This is also where the requirement's currency is first put to OCP. One
 	// OCP cannot value is a rule the server cannot enforce, refused as
 	// INVALID_RULES like any other (see RulesFromProto) rather than failed:
 	// the currency is the client's choice, and no group is written that no one
 	// could ever be admitted to.
-	satisfied, err := s.rules.CanSpeakWithRules(ctx, params.Rules, userID)
+	satisfied, err := s.rules.CanSpeakWithRules(ctx, chatID, GroupRules{Rules: params.Rules, CreatorID: userID}, userID)
 	if errors.Is(err, balance.ErrUnsupportedCurrency) {
 		return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_INVALID_RULES}, nil
 	}
@@ -227,7 +228,7 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 // creation, and the creator may even have left, in which case they see it as
 // the non-member they are. Nothing is published; a retry is not news.
 func (s *Server) replayStartChat(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, c *Chat) (*chatpb.StartChatResponse, error) {
-	standing, err := s.access.StandingWithRules(ctx, c.ID, c.Rules(), userID, messagingpb.ViewMode_FULL)
+	standing, err := s.access.StandingWithRules(ctx, c.ID, c.GroupRules(), userID, messagingpb.ViewMode_FULL)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure determining chat standing")
 		return nil, status.Error(codes.Internal, "")

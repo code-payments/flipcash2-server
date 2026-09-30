@@ -93,6 +93,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_NonMember_Group_Reads,
 		testServer_ViewMode,
 		testServer_StaffOnlyGroup_Rules,
+		testServer_CreatorOnlyGroup_Rules,
 		testServer_BalanceGatedGroup_Rules,
 		testServer_Broadcast_IncludesActor,
 		testServer_SendMessage_PushPerChatType,
@@ -3271,6 +3272,73 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 	dmResp, err := e.send(e.keysA, "still a dm", generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, dmResp.Result)
+}
+
+// testServer_CreatorOnlyGroup_Rules pins that a creator-only group's speaker
+// rule is enforced on the send paths: its creator speaks, and every other
+// member is refused as a non-member is, while still reading and reacting,
+// which gate on membership alone.
+func testServer_CreatorOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	const emoji = "👍"
+
+	// userA created the group; userB is a member who did not. No RPC makes a
+	// group creator-only, so it is written by hand.
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:                   groupID,
+		Type:                 chatpb.ChatType_GROUP,
+		Members:              []*commonpb.UserId{e.userA, e.userB},
+		Title:                "Announcements",
+		IsCreatorOnlySpeaker: true,
+		CreatorID:            e.userA,
+		LastActivity:         at(1),
+	}))
+
+	// The creator speaks.
+	sent, err := e.sendContentToChat(e.keysA, groupID, textContent("announcement"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	msgID := sent.Message.MessageId
+
+	// The other member can neither send nor signal typing...
+	sendResp, err := e.sendContentToChat(e.keysB, groupID, textContent("reply"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
+
+	typingReq := &messagingpb.NotifyIsTypingRequest{ChatId: groupID, State: messagingpb.IsTypingNotification_STARTED_TYPING}
+	require.NoError(t, e.keysB.Auth(typingReq, &typingReq.Auth))
+	typingResp, err := e.client.NotifyIsTyping(e.ctx, typingReq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
+
+	// ...but reads and reacts, which gate on membership alone.
+	getResp, err := e.getMessageInChat(e.keysB, groupID, msgID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+
+	addResp, err := e.addReactionInChat(e.keysB, groupID, msgID, emoji)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, addResp.Result)
+
+	// Being the creator is not membership: a creator who is not a member
+	// speaks no more than anyone else outside the group.
+	otherID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:                   otherID,
+		Type:                 chatpb.ChatType_GROUP,
+		Members:              []*commonpb.UserId{e.userB},
+		Title:                "Elsewhere",
+		IsCreatorOnlySpeaker: true,
+		CreatorID:            e.userA,
+		LastActivity:         at(1),
+	}))
+	outsideResp, err := e.sendContentToChat(e.keysA, otherID, textContent("hello?"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, outsideResp.Result)
+	memberResp, err := e.sendContentToChat(e.keysB, otherID, textContent("hello?"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, memberResp.Result)
 }
 
 // testServer_BalanceGatedGroup_Rules pins that a group's minimum listener

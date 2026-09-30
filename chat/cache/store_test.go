@@ -50,11 +50,11 @@ type countingRulesStore struct {
 
 	mu    sync.Mutex
 	calls int
-	rules *chatpb.Rules
+	rules chat.GroupRules
 	err   error
 }
 
-func (s *countingRulesStore) GetGroupRules(_ context.Context, _ *commonpb.ChatId) (*chatpb.Rules, error) {
+func (s *countingRulesStore) GetGroupRules(_ context.Context, _ *commonpb.ChatId) (chat.GroupRules, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
@@ -211,31 +211,35 @@ func TestCache_GetMembers_GroupNeverCached(t *testing.T) {
 func TestCache_GetGroupRules_Cached(t *testing.T) {
 	ctx := context.Background()
 	staffOnly := &chatpb.Rules{Listener: []*chatpb.ListenerRules{{Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}}}}}
-	backing := &countingRulesStore{rules: staffOnly}
+	creator := model.MustGenerateUserID()
+	backing := &countingRulesStore{rules: chat.GroupRules{Rules: staffOnly, CreatorID: creator}}
 	c := cache.NewInCache(backing)
 
 	chatID := chat.MustGenerateGroupChatID()
 	for i := 0; i < 3; i++ {
-		rules, err := c.GetGroupRules(ctx, chatID)
+		got, err := c.GetGroupRules(ctx, chatID)
 		require.NoError(t, err)
-		require.True(t, proto.Equal(staffOnly, rules))
+		require.True(t, proto.Equal(staffOnly, got.Rules))
+		require.Equal(t, creator.Value, got.CreatorID.GetValue())
 	}
 	require.Equal(t, 1, backing.callCount())
 
-	// Rules are fixed at creation, so the cache is what answers even once the
-	// backing store would say otherwise.
-	backing.rules = nil
-	rules, err := c.GetGroupRules(ctx, chatID)
+	// Rules and the creator are fixed at creation, so the cache is what
+	// answers even once the backing store would say otherwise.
+	backing.rules = chat.GroupRules{}
+	got, err := c.GetGroupRules(ctx, chatID)
 	require.NoError(t, err)
-	require.True(t, proto.Equal(staffOnly, rules))
+	require.True(t, proto.Equal(staffOnly, got.Rules))
+	require.Equal(t, creator.Value, got.CreatorID.GetValue())
 	require.Equal(t, 1, backing.callCount())
 
 	// The absence of rules is cached too: a group without any is read once.
 	plainID := chat.MustGenerateGroupChatID()
 	for i := 0; i < 2; i++ {
-		rules, err := c.GetGroupRules(ctx, plainID)
+		got, err := c.GetGroupRules(ctx, plainID)
 		require.NoError(t, err)
-		require.Nil(t, rules)
+		require.Nil(t, got.Rules)
+		require.Nil(t, got.CreatorID)
 	}
 	require.Equal(t, 2, backing.callCount())
 }
@@ -256,9 +260,9 @@ func TestCache_GetGroupRules_DoesNotCacheErrors(t *testing.T) {
 	// Once it exists, its rules are served and then held.
 	backing.err = nil
 	for i := 0; i < 2; i++ {
-		rules, err := c.GetGroupRules(ctx, chatID)
+		got, err := c.GetGroupRules(ctx, chatID)
 		require.NoError(t, err)
-		require.Nil(t, rules)
+		require.Nil(t, got.Rules)
 	}
 	require.Equal(t, 3, backing.callCount())
 }

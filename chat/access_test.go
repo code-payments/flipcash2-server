@@ -234,7 +234,7 @@ func TestAccess_GroupNonMember(t *testing.T) {
 	ok, err = a.CanListen(ctx, open.ID, f.funded)
 	require.NoError(t, err)
 	require.False(t, ok)
-	ok, err = a.CanListenWithRules(ctx, open.ID, open.Rules(), f.funded)
+	ok, err = a.CanListenWithRules(ctx, open.ID, open.GroupRules(), f.funded)
 	require.NoError(t, err)
 	require.False(t, ok)
 	require.Equal(t, asked, f.ocpBalance.asked)
@@ -290,10 +290,10 @@ func TestAccess_CanListenWithRules(t *testing.T) {
 	// With the rules in hand they are not read from the store, and the
 	// answer — and the remembered admission — is the same as CanListen's.
 	reads := f.chats.reads
-	ok, err := a.CanListenWithRules(ctx, f.gated.ID, f.gated.Rules(), f.funded)
+	ok, err := a.CanListenWithRules(ctx, f.gated.ID, f.gated.GroupRules(), f.funded)
 	require.NoError(t, err)
 	require.True(t, ok)
-	ok, err = a.CanListenWithRules(ctx, f.gated.ID, f.gated.Rules(), f.unfunded)
+	ok, err = a.CanListenWithRules(ctx, f.gated.ID, f.gated.GroupRules(), f.unfunded)
 	require.NoError(t, err)
 	require.False(t, ok)
 	require.Equal(t, reads, f.chats.reads)
@@ -307,11 +307,11 @@ func TestAccess_CanListenWithRules(t *testing.T) {
 	// A DM record admits only its members, as CanListen does.
 	peer := model.MustGenerateUserID()
 	dm := &Chat{ID: MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, f.funded, peer), Type: chatpb.ChatType_CONTACT_DM, Members: []*commonpb.UserId{f.funded, peer}}
-	ok, err = a.CanListenWithRules(ctx, dm.ID, dm.Rules(), f.funded)
+	ok, err = a.CanListenWithRules(ctx, dm.ID, dm.GroupRules(), f.funded)
 	require.NoError(t, err)
 	require.False(t, ok)
 	f.chats.join(dm.ID, f.funded)
-	ok, err = a.CanListenWithRules(ctx, dm.ID, dm.Rules(), f.funded)
+	ok, err = a.CanListenWithRules(ctx, dm.ID, dm.GroupRules(), f.funded)
 	require.NoError(t, err)
 	require.True(t, ok)
 }
@@ -384,7 +384,7 @@ func TestAccess_Errors(t *testing.T) {
 	ok, err := a.CanListen(ctx, f.gated.ID, f.funded)
 	require.Error(t, err)
 	require.False(t, ok)
-	ok, err = a.CanListenWithRules(ctx, f.gated.ID, f.gated.Rules(), f.funded)
+	ok, err = a.CanListenWithRules(ctx, f.gated.ID, f.gated.GroupRules(), f.funded)
 	require.Error(t, err)
 	require.False(t, ok)
 
@@ -481,12 +481,12 @@ func TestAccess_ViewMode(t *testing.T) {
 
 	// With the rules in hand the answer is the same, without a store read.
 	reads := f.chats.reads
-	standing, err = a.StandingWithRules(ctx, f.gated.ID, f.gated.Rules(), third, messagingpb.ViewMode_REDACTED)
+	standing, err = a.StandingWithRules(ctx, f.gated.ID, f.gated.GroupRules(), third, messagingpb.ViewMode_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, preview, standing)
 	require.Equal(t, reads, f.chats.reads)
 	require.Equal(t, asked, f.ocpBalance.asked)
-	standing, err = a.StandingWithRules(ctx, f.gated.ID, f.gated.Rules(), third, messagingpb.ViewMode_FULL_OR_REDACTED)
+	standing, err = a.StandingWithRules(ctx, f.gated.ID, f.gated.GroupRules(), third, messagingpb.ViewMode_FULL_OR_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, full, standing)
 	require.Equal(t, reads, f.chats.reads)

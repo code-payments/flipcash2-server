@@ -88,7 +88,7 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 		// The rules come from the canonical record already in hand rather than
 		// a second read through the evaluator: the record is what they are
 		// projected from.
-		canListen, err := s.rules.CanListenWithRules(ctx, c.Rules(), userID)
+		canListen, err := s.rules.CanListenWithRules(ctx, c.ID, c.GroupRules(), userID)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure evaluating chat rules")
 			return nil, status.Error(codes.Internal, "")

@@ -115,7 +115,9 @@ func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, inclu
 		})
 	}
 
-	if !includePrivateProfile {
+	if includePrivateProfile {
+		_, clonedBaseProfile.IsUsernameAutoAssigned = m.autoAssignedByUser[key]
+	} else {
 		clonedBaseProfile.PhoneNumber = nil
 		clonedBaseProfile.EmailAddress = nil
 	}

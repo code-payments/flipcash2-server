@@ -259,8 +259,11 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 			require.NoError(t, err)
 			require.NoError(t, protoutil.ProtoEqualError(expected, getResp.UserProfile))
 
+			// The user's own read adds the private fields, including that their
+			// handle was the default one assigned with their display name.
 			expected.PhoneNumber = &commonpb.PhoneNumber{Value: "+12223334444"}
 			expected.EmailAddress = &commonpb.EmailAddress{Value: "someone@gmail.com"}
+			expected.IsUsernameAutoAssigned = true
 			require.NoError(t, keyPair.Auth(get, &get.Auth))
 
 			getResp, err = client.GetProfile(ctx, get)

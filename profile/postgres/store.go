@@ -29,16 +29,17 @@ func (s *store) GetProfile(ctx context.Context, id *commonpb.UserId, includePriv
 	}
 
 	if includePrivateProfile {
-		phoneNumber, emailAddress, err := dbGetPrivateProfile(ctx, s.pool, id)
+		privateProfile, err := dbGetPrivateProfile(ctx, s.pool, id)
 		if err != nil {
 			return nil, err
 		}
-		if phoneNumber != nil {
-			userProfile.PhoneNumber = &commonpb.PhoneNumber{Value: *phoneNumber}
+		if privateProfile.PhoneNumber != nil {
+			userProfile.PhoneNumber = &commonpb.PhoneNumber{Value: *privateProfile.PhoneNumber}
 		}
-		if emailAddress != nil {
-			userProfile.EmailAddress = &commonpb.EmailAddress{Value: *emailAddress}
+		if privateProfile.EmailAddress != nil {
+			userProfile.EmailAddress = &commonpb.EmailAddress{Value: *privateProfile.EmailAddress}
 		}
+		userProfile.IsUsernameAutoAssigned = privateProfile.IsUsernameAutoAssigned
 	}
 
 	xProfileModel, err := dbGetXProfile(ctx, s.pool, id)

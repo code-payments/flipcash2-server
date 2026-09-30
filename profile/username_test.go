@@ -27,7 +27,7 @@ func TestIsUsernameReserved(t *testing.T) {
 	for _, username := range []string{
 		"api", "app", "login", "me", "settings", "support",
 		"seed", "seed_phrase", "seedphrase", "recovery", "claim", "report",
-		"deleted", "404",
+		"deleted", "404", "flipcard", "flipcards", "flipcardcreator",
 	} {
 		require.True(t, IsUsernameReserved(username), "username: %q", username)
 	}

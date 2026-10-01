@@ -94,7 +94,8 @@ type ProfileReader interface {
 }
 
 // BlocklistReader is the read slice of the blocklist domain the Chat service
-// needs to compute per-viewer hidden state. Like the other readers it is
+// needs to compute per-viewer hidden state and to keep users the viewer
+// blocked out of mention suggestions. Like the other readers it is
 // declared here (consumer side) so the chat package need not import blocklist;
 // the blocklist package supplies the concrete adapter.
 type BlocklistReader interface {

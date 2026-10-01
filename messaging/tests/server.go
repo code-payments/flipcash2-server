@@ -64,6 +64,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_SendBatch,
 		testServer_SendBatch_SideEffects,
 		testServer_SendBatch_Group,
+		testServer_SendBatch_RecordsGroupSenders,
 		testServer_SendMessage_TeamAccount,
 		testServer_TeamAccount_Refused,
 		testServer_EditMessage,
@@ -1516,6 +1517,50 @@ func testServer_SendBatch_Group(t *testing.T, badges badge.Store, blocklists blo
 		pushedIDs = append(pushedIDs, p.payload.GetChatMetadata().GetMessage().GetMessageId().GetValue())
 	}
 	require.Equal(t, []uint64{1, 2}, pushedIDs)
+}
+
+func testServer_SendBatch_RecordsGroupSenders(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+
+	senders, err := chats.GetRecentSenders(e.ctx, groupID, 0)
+	require.NoError(t, err)
+	require.Empty(t, senders)
+
+	// Each sender in the batch is recorded once, at their last message; the
+	// system message has no sender to record.
+	sent, err := e.sender.SendBatch(e.ctx, groupID, []messaging.OutgoingMessage{
+		{SenderID: e.userA, Content: textContent("one"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: e.userB, Content: textContent("two"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: e.userA, Content: textContent("three"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{Content: textContent("system"), ClientMessageID: generateClientID()},
+	})
+	require.NoError(t, err)
+
+	senders, err = chats.GetRecentSenders(e.ctx, groupID, 0)
+	require.NoError(t, err)
+	require.Len(t, senders, 2)
+	sentAt := time.UnixMilli(sent[2].Ts.AsTime().UnixMilli()).UTC()
+	recorded := make(map[string]time.Time)
+	for _, sender := range senders {
+		recorded[string(sender.UserID.Value)] = sender.LastSentAt
+	}
+	require.Contains(t, recorded, string(e.userA.Value))
+	require.Contains(t, recorded, string(e.userB.Value))
+	for _, at := range recorded {
+		require.True(t, at.Equal(sentAt), "recorded %v, want %v", at, sentAt)
+	}
+
+	// A DM send records nothing and fails nothing.
+	_, err = e.sender.Send(e.ctx, e.chatID, e.userA, textContent("hi"), generateClientID(), true)
+	require.NoError(t, err)
 }
 
 func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

@@ -79,6 +79,11 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_UserState_GetMutedUsers,
 		testStore_UserState_GetMutedUsersPage_Bounds,
 		testStore_UserState_MutedCount,
+		testStore_Activity_RecentSenders,
+		testStore_Activity_Throttle,
+		testStore_Activity_Precision,
+		testStore_Activity_Scope,
+		testStore_Activity_Concurrent,
 	} {
 		tf(t, s)
 		teardown()
@@ -2367,4 +2372,175 @@ func testStore_UserState_MutedCount(t *testing.T, s chat.Store) {
 	require.NoError(t, err)
 	requireMutedCount(t, us, other, 1)
 	requireMutedCount(t, us, group, 2)
+}
+
+func testStore_Activity_RecentSenders(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	group := putGroupChat(t, s, "activity", at(0), model.MustGenerateUserID())
+	a, b, c := model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()
+
+	senders, err := s.GetRecentSenders(ctx, group.ID, 0)
+	require.NoError(t, err)
+	require.Empty(t, senders)
+
+	for _, send := range []struct {
+		user *commonpb.UserId
+		at   time.Time
+	}{
+		{a, at(100)},
+		{b, at(300)},
+		{c, at(200)},
+	} {
+		recorded, err := s.RecordSend(ctx, group.ID, send.user, send.at)
+		require.NoError(t, err)
+		require.True(t, recorded)
+	}
+
+	// Most recently sent first, whole when unbounded.
+	senders, err = s.GetRecentSenders(ctx, group.ID, 0)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, b, at(300), c, at(200), a, at(100))
+
+	// A limit keeps the most recent.
+	senders, err = s.GetRecentSenders(ctx, group.ID, 2)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, b, at(300), c, at(200))
+
+	// A later send moves its sender to the front.
+	recorded, err := s.RecordSend(ctx, group.ID, a, at(400))
+	require.NoError(t, err)
+	require.True(t, recorded)
+	senders, err = s.GetRecentSenders(ctx, group.ID, 0)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, a, at(400), b, at(300), c, at(200))
+}
+
+func testStore_Activity_Throttle(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+	interval := chat.ActivityRecordInterval
+
+	recorded, err := s.RecordSend(ctx, groupID, user, at(1000))
+	require.NoError(t, err)
+	require.True(t, recorded)
+
+	// Within the interval: not recorded, and the record keeps its time.
+	for _, sentAt := range []time.Time{
+		at(1000),
+		at(1000).Add(interval / 2),
+		at(1000).Add(interval - time.Millisecond),
+	} {
+		recorded, err = s.RecordSend(ctx, groupID, user, sentAt)
+		require.NoError(t, err)
+		require.False(t, recorded, "sent at %v", sentAt)
+	}
+	senders, err := s.GetRecentSenders(ctx, groupID, 0)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, user, at(1000))
+
+	// A send older than the record never moves it back.
+	recorded, err = s.RecordSend(ctx, groupID, user, at(1000).Add(-time.Hour))
+	require.NoError(t, err)
+	require.False(t, recorded)
+
+	// A full interval later is recorded.
+	recorded, err = s.RecordSend(ctx, groupID, user, at(1000).Add(interval))
+	require.NoError(t, err)
+	require.True(t, recorded)
+	senders, err = s.GetRecentSenders(ctx, groupID, 0)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, user, at(1000).Add(interval))
+}
+
+func testStore_Activity_Precision(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+
+	// Recorded at millisecond precision.
+	recorded, err := s.RecordSend(ctx, groupID, user, at(10).Add(1_234_567*time.Microsecond))
+	require.NoError(t, err)
+	require.True(t, recorded)
+	senders, err := s.GetRecentSenders(ctx, groupID, 0)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, user, at(10).Add(1_234*time.Millisecond))
+
+	_, err = s.RecordSend(ctx, groupID, user, time.Unix(0, 0))
+	require.Error(t, err)
+}
+
+func testStore_Activity_Scope(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// Recorded against the chat ID alone: no canonical record or membership
+	// is read, so neither a group nobody created nor a non-member stops it.
+	groupID := chat.MustGenerateGroupChatID()
+	other := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+	recorded, err := s.RecordSend(ctx, groupID, user, at(50))
+	require.NoError(t, err)
+	require.True(t, recorded)
+
+	// Records belong to their group.
+	senders, err := s.GetRecentSenders(ctx, other, 0)
+	require.NoError(t, err)
+	require.Empty(t, senders)
+	recorded, err = s.RecordSend(ctx, other, user, at(50))
+	require.NoError(t, err)
+	require.True(t, recorded, "the throttle is per group")
+
+	// Groups only.
+	dmID := generateDmChatID()
+	_, err = s.RecordSend(ctx, dmID, user, at(50))
+	require.Error(t, err)
+	_, err = s.GetRecentSenders(ctx, dmID, 0)
+	require.Error(t, err)
+}
+
+func testStore_Activity_Concurrent(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+
+	// A send delivered many times at once is recorded exactly once.
+	const writers = 8
+	var wg sync.WaitGroup
+	results := make([]bool, writers)
+	errs := make([]error, writers)
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = s.RecordSend(ctx, groupID, user, at(70))
+		}()
+	}
+	wg.Wait()
+
+	recordedCount := 0
+	for i := range writers {
+		require.NoError(t, errs[i])
+		if results[i] {
+			recordedCount++
+		}
+	}
+	require.Equal(t, 1, recordedCount)
+	senders, err := s.GetRecentSenders(ctx, groupID, 0)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, user, at(70))
+}
+
+// requireRecentSenders asserts senders is exactly the given (user, last sent)
+// pairs, in order.
+func requireRecentSenders(t *testing.T, senders []chat.RecentSender, want ...any) {
+	t.Helper()
+	require.Len(t, senders, len(want)/2)
+	for i, sender := range senders {
+		require.Equal(t, want[2*i].(*commonpb.UserId).Value, sender.UserID.Value, "sender %d", i)
+		require.True(t, want[2*i+1].(time.Time).Equal(sender.LastSentAt), "sender %d sent at %v, want %v", i, sender.LastSentAt, want[2*i+1])
+	}
 }

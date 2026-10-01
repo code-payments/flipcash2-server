@@ -34,7 +34,8 @@ const sideEffectTimeout = 5 * time.Second
 
 // Sender is the engine behind a message send: it persists the message and
 // performs every side effect — advancing the sender's read pointer, bumping the
-// chat's last message, and broadcasting (with pushes) to members. It carries no
+// chat's last message, broadcasting (with pushes) to members, and, in a group,
+// recording the sender's activity. It carries no
 // authentication or transport concerns, so internal callers (e.g. injecting a
 // cash message after a payment) can construct just a Sender rather than the full
 // gRPC Server. The Server holds one and delegates SendMessage to it.
@@ -215,8 +216,9 @@ func (s *Sender) Send(
 // Store.PutMessages) and performs every side effect of a send once for the
 // whole batch: it advances each sender's own read pointer past the last message
 // they sent in it, records the batch's last message as the chat's most recent,
-// and broadcasts one update carrying every message to all members. The result
-// is in batch order.
+// broadcasts one update carrying every message to all members, and in a group
+// records each sender's activity (see recordGroupSenders). The result is in
+// batch order.
 //
 // A SenderID may be nil to denote a system message, in which case no read
 // pointer is advanced for it. CountsTowardUnread controls whether a message
@@ -377,7 +379,29 @@ func (s *Sender) SendBatch(
 	// chat or if it failed, in which case publishChatUpdate loads them itself).
 	s.publishChatUpdate(ctx, log, chatID, update, nil, members)
 
+	s.recordGroupSenders(ctx, log, chatID, msgs)
+
 	return msgProtos, nil
+}
+
+// recordGroupSenders records each sender's last message in a group batch in
+// the group's activity records (see chat.Store.RecordSend), which order the
+// group's recent senders for mention suggestions. It runs after the broadcast
+// so it never delays delivery, and is best effort like the other side
+// effects: a failed record costs a suggestion, never the send, and the
+// sender's next message repairs it. A DM records nothing, since its only
+// candidate is the other member, and neither does a system message, which
+// has no sender. Most calls are a throttled no-op answered without a write
+// when the store is cached (see chat/cache).
+func (s *Sender) recordGroupSenders(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, msgs []*Message) {
+	if !chat.IsGroupChatID(chatID) {
+		return
+	}
+	for _, last := range lastMessagePerSender(msgs) {
+		if _, err := s.chats.RecordSend(ctx, chatID, last.SenderID, last.Timestamp); err != nil {
+			log.With(zap.Error(err), zap.String("sender_id", model.UserIDString(last.SenderID))).Warn("Failure recording group sender activity")
+		}
+	}
 }
 
 // TeamAccount returns the team account the Sender was built with (see

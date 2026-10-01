@@ -376,3 +376,149 @@ func TestCache_UserState_PassesThrough(t *testing.T) {
 	require.True(t, changed)
 	require.Equal(t, chat.ViewerState{Version: 2}, state)
 }
+
+// countingSendStore is a real in-memory chat.Store whose RecordSend calls are
+// counted, so what the cache answers itself can be told from what it forwards.
+type countingSendStore struct {
+	chat.Store
+
+	mu    sync.Mutex
+	calls int
+}
+
+func newCountingSendStore() *countingSendStore {
+	return &countingSendStore{Store: memory.NewInMemory(nil)}
+}
+
+func (s *countingSendStore) RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, sentAt time.Time) (bool, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	return s.Store.RecordSend(ctx, chatID, userID, sentAt)
+}
+
+func (s *countingSendStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestCache_RecordSend_AnswersThrottledSends(t *testing.T) {
+	ctx := context.Background()
+	backing := newCountingSendStore()
+	c := cache.NewInCache(backing)
+
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+	start := time.Now().Truncate(time.Millisecond)
+	interval := chat.ActivityRecordInterval
+
+	recorded, err := c.RecordSend(ctx, groupID, user, start)
+	require.NoError(t, err)
+	require.True(t, recorded)
+	require.Equal(t, 1, backing.callCount())
+
+	// A burst within the interval is answered without reaching the store.
+	for _, sentAt := range []time.Time{
+		start,
+		start.Add(interval / 2),
+		start.Add(interval - time.Millisecond),
+	} {
+		recorded, err = c.RecordSend(ctx, groupID, user, sentAt)
+		require.NoError(t, err)
+		require.False(t, recorded)
+	}
+	require.Equal(t, 1, backing.callCount())
+
+	// A full interval later reaches the store and is recorded.
+	recorded, err = c.RecordSend(ctx, groupID, user, start.Add(interval))
+	require.NoError(t, err)
+	require.True(t, recorded)
+	require.Equal(t, 2, backing.callCount())
+
+	// The read passes through and reflects what was recorded.
+	senders, err := c.GetRecentSenders(ctx, groupID, 0)
+	require.NoError(t, err)
+	require.Len(t, senders, 1)
+	require.True(t, senders[0].LastSentAt.Equal(start.Add(interval)))
+
+	// Entries are per (group, user).
+	recorded, err = c.RecordSend(ctx, groupID, model.MustGenerateUserID(), start.Add(interval))
+	require.NoError(t, err)
+	require.True(t, recorded)
+	recorded, err = c.RecordSend(ctx, chat.MustGenerateGroupChatID(), user, start.Add(interval))
+	require.NoError(t, err)
+	require.True(t, recorded)
+	require.Equal(t, 4, backing.callCount())
+}
+
+func TestCache_RecordSend_DoesNotHoldRefusals(t *testing.T) {
+	ctx := context.Background()
+	backing := newCountingSendStore()
+	c := cache.NewInCache(backing)
+
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+	start := time.Now().Truncate(time.Millisecond)
+
+	// Another process recorded the send; this one has never seen it.
+	recorded, err := backing.Store.RecordSend(ctx, groupID, user, start)
+	require.NoError(t, err)
+	require.True(t, recorded)
+
+	// Each send goes to the store, which refuses it; a refusal is not held,
+	// since it does not say what the record holds.
+	for i, sentAt := range []time.Time{start.Add(10 * time.Second), start.Add(20 * time.Second)} {
+		recorded, err = c.RecordSend(ctx, groupID, user, sentAt)
+		require.NoError(t, err)
+		require.False(t, recorded)
+		require.Equal(t, i+1, backing.callCount())
+	}
+}
+
+func TestCache_RecordSend_StaleEntryNeverSkipsAWrite(t *testing.T) {
+	ctx := context.Background()
+	backing := newCountingSendStore()
+	processA := cache.NewInCache(backing)
+	processB := cache.NewInCache(backing)
+
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+	start := time.Now().Truncate(time.Millisecond)
+	interval := chat.ActivityRecordInterval
+
+	recorded, err := processA.RecordSend(ctx, groupID, user, start)
+	require.NoError(t, err)
+	require.True(t, recorded)
+
+	// Another process records a later send, which A's entry knows nothing of.
+	recorded, err = processB.RecordSend(ctx, groupID, user, start.Add(interval))
+	require.NoError(t, err)
+	require.True(t, recorded)
+
+	// A's entry no longer covers this send, so it goes to the store, which
+	// gives the true answer from the later record.
+	calls := backing.callCount()
+	recorded, err = processA.RecordSend(ctx, groupID, user, start.Add(interval+10*time.Second))
+	require.NoError(t, err)
+	require.False(t, recorded)
+	require.Equal(t, calls+1, backing.callCount())
+}
+
+func TestCache_RecordSend_InvalidInputsReachTheStore(t *testing.T) {
+	ctx := context.Background()
+	backing := newCountingSendStore()
+	c := cache.NewInCache(backing)
+
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+	recorded, err := c.RecordSend(ctx, groupID, user, time.Now())
+	require.NoError(t, err)
+	require.True(t, recorded)
+
+	// Never answered from an entry, so the store's errors surface.
+	_, err = c.RecordSend(ctx, groupID, user, time.Unix(0, 0))
+	require.Error(t, err)
+	_, err = c.RecordSend(ctx, generateDmChatID(), user, time.Now())
+	require.Error(t, err)
+}

@@ -45,6 +45,12 @@ type memory struct {
 	// one.
 	excludedFromFeed map[string]map[string]struct{}
 
+	// lastSent is each group's activity records, keyed by chat ID then user
+	// ID: the latest recorded send, at the persistent store's millisecond
+	// precision (see chat.Store.RecordSend). Records never expire here; the
+	// contract lets a reader see one past chat.ActivityRetention.
+	lastSent map[string]map[string]time.Time
+
 	exclusions chat.FeedExclusions
 }
 
@@ -70,6 +76,7 @@ func NewInMemory(excludedFromFeed []*commonpb.UserId) chat.Store {
 		groupVersions:    make(map[string]uint64),
 		viewerStates:     make(map[string]map[string]*chat.ViewerState),
 		mutedCounts:      make(map[string]uint64),
+		lastSent:         make(map[string]map[string]time.Time),
 	}
 }
 
@@ -83,6 +90,7 @@ func (m *memory) reset() {
 	m.viewerStates = make(map[string]map[string]*chat.ViewerState)
 	m.mutedCounts = make(map[string]uint64)
 	m.excludedFromFeed = make(map[string]map[string]struct{})
+	m.lastSent = make(map[string]map[string]time.Time)
 }
 
 // isJoinedLocked reports whether the user's record on the group has them
@@ -738,4 +746,56 @@ func (m *memory) GetMutedCount(_ context.Context, chatID *commonpb.ChatId) (uint
 	defer m.Unlock()
 
 	return m.mutedCounts[string(chatID.Value)], nil
+}
+
+func (m *memory) RecordSend(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, sentAt time.Time) (bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return false, fmt.Errorf("not a group chat id")
+	}
+	if sentAt.UnixMilli() <= 0 {
+		return false, fmt.Errorf("send time %v is not after the epoch", sentAt)
+	}
+	sentAt = time.UnixMilli(sentAt.UnixMilli()).UTC()
+
+	m.Lock()
+	defer m.Unlock()
+
+	chatKey := string(chatID.Value)
+	if last, ok := m.lastSent[chatKey][string(userID.Value)]; ok && last.After(sentAt.Add(-chat.ActivityRecordInterval)) {
+		return false, nil
+	}
+	if m.lastSent[chatKey] == nil {
+		m.lastSent[chatKey] = make(map[string]time.Time)
+	}
+	m.lastSent[chatKey][string(userID.Value)] = sentAt
+	return true, nil
+}
+
+func (m *memory) GetRecentSenders(_ context.Context, chatID *commonpb.ChatId, limit int) ([]chat.RecentSender, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	senders := make([]chat.RecentSender, 0, len(m.lastSent[string(chatID.Value)]))
+	for user, last := range m.lastSent[string(chatID.Value)] {
+		senders = append(senders, chat.RecentSender{
+			UserID:     &commonpb.UserId{Value: []byte(user)},
+			LastSentAt: last,
+		})
+	}
+	// Ties are in no particular order by contract; break them by user so
+	// this store is at least deterministic.
+	sort.Slice(senders, func(i, j int) bool {
+		if !senders[i].LastSentAt.Equal(senders[j].LastSentAt) {
+			return senders[i].LastSentAt.After(senders[j].LastSentAt)
+		}
+		return bytes.Compare(senders[i].UserID.Value, senders[j].UserID.Value) > 0
+	})
+	if limit > 0 && len(senders) > limit {
+		senders = senders[:limit]
+	}
+	return senders, nil
 }

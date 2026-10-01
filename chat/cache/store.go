@@ -21,21 +21,34 @@ import (
 // mutable — and can be mutated by other processes, which this cache can never
 // observe — so group membership checks and member lists always defer to the
 // backing store. The rest of the store is passed straight through, viewer
-// state included: a user's state is theirs to change at any time, and its
-// reads are already one strongly consistent query, so nothing of it is held.
+// state and activity reads included: a user's state is theirs to change at any
+// time, a group's recent senders change with every send, and both reads are
+// already one strongly consistent query, so nothing of either is held.
+//
+// One thing is held that is not fixed at creation: a lower bound on each
+// activity record, so a throttled send costs no write (see RecordSend). It can
+// be out of date but never wrong in the direction that matters, because the
+// record only moves forward.
 type Cache struct {
-	db             chat.Store
-	memberCache    *ttlcache.Cache
-	dmMembersCache *ttlcache.Cache
-	rulesCache     *ttlcache.Cache
+	db                chat.Store
+	memberCache       *ttlcache.Cache
+	dmMembersCache    *ttlcache.Cache
+	rulesCache        *ttlcache.Cache
+	sendActivityCache *ttlcache.Cache
 }
 
 func NewInCache(db chat.Store) chat.Store {
+	sendActivityCache := ttlcache.NewCache()
+	// An entry stops being able to answer a send once its interval is up, so
+	// it lives that long from when it was recorded and no longer, however
+	// often it is read.
+	sendActivityCache.SkipTtlExtensionOnHit(true)
 	return &Cache{
-		db:             db,
-		memberCache:    ttlcache.NewCache(),
-		dmMembersCache: ttlcache.NewCache(),
-		rulesCache:     ttlcache.NewCache(),
+		db:                db,
+		memberCache:       ttlcache.NewCache(),
+		dmMembersCache:    ttlcache.NewCache(),
+		rulesCache:        ttlcache.NewCache(),
+		sendActivityCache: sendActivityCache,
 	}
 }
 
@@ -212,6 +225,54 @@ func (c *Cache) GetMutedUsersPage(ctx context.Context, chatID *commonpb.ChatId, 
 
 func (c *Cache) GetMutedCount(ctx context.Context, chatID *commonpb.ChatId) (uint64, error) {
 	return c.db.GetMutedCount(ctx, chatID)
+}
+
+// RecordSend answers a throttled send itself, with no write: the backing
+// store is billed for a conditional write whether or not its condition holds,
+// so leaving the throttle to it would cost a write per message. Each send this
+// process saw recorded is held for ActivityRecordInterval, keyed by (group,
+// user), and a send the interval has not yet cleared since it is answered
+// false, exactly as the store would answer it: the record only moves forward,
+// so it holds at least what was seen recorded here, whatever other processes
+// have written since. A send this process has not seen within the interval,
+// or one the store refused, goes to the store, so a stale entry can cost a
+// write but never skip one. Each process throttles on its own, so a user's
+// sends spread across several processes cost up to one write per process per
+// interval. A send the store would reject outright (a DM ID, a time before the
+// epoch) is never answered here.
+func (c *Cache) RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, sentAt time.Time) (bool, error) {
+	sentAtMillis := sentAt.UnixMilli()
+	if !chat.IsGroupChatID(chatID) || sentAtMillis <= 0 {
+		return c.db.RecordSend(ctx, chatID, userID, sentAt)
+	}
+
+	key := sendActivityCacheKey(chatID, userID)
+	cached, ok := c.sendActivityCache.Get(key)
+	if ok && cached.(int64) > sentAtMillis-chat.ActivityRecordInterval.Milliseconds() {
+		return false, nil
+	}
+
+	recorded, err := c.db.RecordSend(ctx, chatID, userID, sentAt)
+	if err != nil || !recorded {
+		return recorded, err
+	}
+	// A concurrent record may have held a later send; keep whichever bound is
+	// higher. The read and write race, but either value is a true bound.
+	if cached, ok := c.sendActivityCache.Get(key); !ok || cached.(int64) < sentAtMillis {
+		c.sendActivityCache.SetWithTTL(key, sentAtMillis, chat.ActivityRecordInterval)
+	}
+	return true, nil
+}
+
+func (c *Cache) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]chat.RecentSender, error) {
+	return c.db.GetRecentSenders(ctx, chatID, limit)
+}
+
+// sendActivityCacheKey keys the activity cache by (group, user). Only group
+// IDs are held, and they are fixed width (chat.GroupChatIDSize), so
+// concatenating the raw bytes is unambiguous.
+func sendActivityCacheKey(chatID *commonpb.ChatId, userID *commonpb.UserId) string {
+	return string(chatID.Value) + string(userID.Value)
 }
 
 // memberCacheKey keys the membership cache by (chat, user). Only DM memberships

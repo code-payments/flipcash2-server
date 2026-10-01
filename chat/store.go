@@ -399,4 +399,27 @@ type Store interface {
 	// alone: like them, it may lag a write by a moment, which a choice of
 	// shape tolerates. A chat nobody has muted reads as zero.
 	GetMutedCount(ctx context.Context, chatID *commonpb.ChatId) (uint64, error)
+
+	// RecordSend records that userID sent in the group chatID at sentAt (see
+	// the activity record, RecentSender), and reports whether it did. It
+	// does not when the record already holds a send later than
+	// sentAt − ActivityRecordInterval, which is what throttles a burst and
+	// keeps a delayed or retried send from moving the record backwards, so
+	// any number of retries is safe. It records against the chat ID alone,
+	// reading neither the canonical record nor the roster: the caller is the
+	// send path, which has already gated both. A caching decorator may
+	// answer a throttled send itself, with no write (see cache.Cache). It
+	// returns an error if chatID is not a group chat ID, or if sentAt is not
+	// after the Unix epoch.
+	RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, sentAt time.Time) (recorded bool, err error)
+
+	// GetRecentSenders returns the group's activity records most recently
+	// sent first, at most limit of them (limit <= 0 means unbounded), from a
+	// strongly consistent read, so a send just recorded is in it. Ties come
+	// back in no particular order. Records of users who have since left are
+	// included (see the activity record), and a record past
+	// ActivityRetention may be. A group with no records, or that does not
+	// exist, is an empty result. It returns an error if chatID is not a group
+	// chat ID.
+	GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]RecentSender, error)
 }

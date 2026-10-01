@@ -695,3 +695,42 @@ func (v ViewerState) Clone() ViewerState {
 	}
 	return out
 }
+
+// A group's activity record is what the chat remembers of each user's recent
+// sends in it, one record per (group, user): today only when they last sent
+// (see RecentSender), which orders a group's recent senders for mention
+// suggestions, most recent first. It is a fact about the message log, not
+// about membership: a record outlives its user's departure, and nothing reads
+// the roster to answer it, because a user sees the senders in a chat's log
+// without knowing who still belongs to it. Everyone it names was a member
+// when they sent, since sending requires it.
+//
+// It is derived and best effort. A send is recorded after it lands and
+// outside its write, so a failed record costs a suggestion and never a
+// message, and the next send repairs it. Records are throttled: a send
+// within ActivityRecordInterval of the last one recorded is not recorded, so
+// a burst costs one write and a recorded time may trail the latest send by up
+// to the interval. Records expire ActivityRetention after the last recorded
+// send; expiry is garbage collection, not semantics, so a reader may still
+// see a record past it.
+//
+// The record is meant to grow a frequency-weighted ordering beside recency
+// (an activity score, see the DynamoDB store's chat_activity table), which is
+// why it is an activity record and not a send time alone; nothing computes or
+// reads one yet.
+const (
+	// ActivityRecordInterval is the least time between two recorded sends by
+	// one user in one group.
+	ActivityRecordInterval = time.Minute
+
+	// ActivityRetention is how long a group's activity record is kept after
+	// its last recorded send.
+	ActivityRetention = 90 * 24 * time.Hour
+)
+
+// RecentSender is one user's activity record in a group, as recency reads
+// it: who, and when their latest recorded send was, at millisecond precision.
+type RecentSender struct {
+	UserID     *commonpb.UserId
+	LastSentAt time.Time
+}

@@ -24,7 +24,7 @@ import (
 	"github.com/code-payments/flipcash2-server/chat"
 )
 
-// The chat store spans four tables:
+// The chat store spans five tables:
 //
 //	chats     pk = "chat#<id>" (one item per chat). Canonical metadata: type,
 //	          members (the DM participants; absent for groups), title, creator
@@ -109,6 +109,29 @@ import (
 //	          an item. Nothing deletes an item: a cleared mute drops
 //	          muted_until (and so its gsiByMuted entry) and keeps the record
 //	          and its version.
+//
+//	chat_activity  pk = "chat#<id>", sk = "user#<id>" (one item per (group,
+//	          user) the user has sent in; see chat.RecentSender). A group's
+//	          activity records, independent of membership: last_sent_at
+//	          (epoch ms) and expires_at (DynamoDB TTL, epoch seconds,
+//	          ActivityRetention after it). Keyed by (chat, user) so a send
+//	          is a blind conditional update of one known item — no read
+//	          first, no duplicate rows — while lsiByLastSentAt orders the
+//	          partition by recency, which is the read: a group's recent
+//	          senders are one strongly consistent query, billed by the page.
+//
+//	          lsiByActivityScore orders the same partition by activity_score,
+//	          a frequency-weighted ordering that nothing writes yet. It exists
+//	          now only because an LSI cannot be added to a table later; while
+//	          no item carries activity_score it is empty and costs nothing.
+//	          The score is meant to be epoch-ms-denominated, equal to
+//	          last_sent_at for a user with one recorded send and running ahead
+//	          of it (possibly past now) as their sends accumulate, so rows
+//	          written before it existed can be given activity_score =
+//	          last_sent_at and compare correctly with the rest. The write that
+//	          maintains it will need the item's prior score, so it will read
+//	          first and condition its update on last_sent_at as read, which
+//	          every recorded send moves forward.
 const (
 	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
 	// all of a user's DM types. Superseded by gsiByTypeActivity; retained until
@@ -145,6 +168,14 @@ const (
 	// chat_user_state: a chat's records in user order, full item projected.
 	gsiUserStateByUser = "by_user"
 
+	// lsiByLastSentAt is the (chat, last_sent_at) LSI on chat_activity: a
+	// group's activity records in recency order (see GetRecentSenders).
+	lsiByLastSentAt = "by_last_sent_at"
+
+	// lsiByActivityScore is the (chat, activity_score) LSI on chat_activity,
+	// reserved for a frequency-weighted ordering; nothing writes its key yet.
+	lsiByActivityScore = "by_activity_score"
+
 	// chatKeyPrefix prefixes a chat ID in the chats table pk, the dm_inbox sk
 	// and the chat_user_state sk. The chat ID is recovered from the key, so it
 	// is not stored as its own attribute — except in chat_user_state, where a
@@ -171,14 +202,16 @@ const (
 	attrUser                 = "user" // member id, bare hex — see userIndexKey
 	attrJoinedAt             = "joined_at"
 	attrLeftAt               = "left_at"
-	attrExpiresAt            = "expires_at" // tombstones only: DynamoDB TTL, epoch seconds — see tombstoneTTL
+	attrExpiresAt            = "expires_at" // DynamoDB TTL, epoch seconds: group_members tombstones (see tombstoneTTL) and chat_activity records (see chat.ActivityRetention)
 	attrLastActivity         = "last_activity"
 	attrLastMessageID        = "last_message_id"
 	attrMemberCount          = "member_count" // #meta item: joined member count
 	attrVersion              = "version"
-	attrChat                 = "chat"        // chat_user_state records: the raw chat ID bytes (B), keying gsiByMuted and gsiUserStateByUser
-	attrMutedUntil           = "muted_until" // chat_user_state: epoch seconds, present only while a mute is recorded — see muteForeverUntil
-	attrMutedCount           = "muted_count" // chat_user_state #meta item: records with a mute recorded
+	attrChat                 = "chat"           // chat_user_state records: the raw chat ID bytes (B), keying gsiByMuted and gsiUserStateByUser
+	attrMutedUntil           = "muted_until"    // chat_user_state: epoch seconds, present only while a mute is recorded — see muteForeverUntil
+	attrMutedCount           = "muted_count"    // chat_user_state #meta item: records with a mute recorded
+	attrLastSentAt           = "last_sent_at"   // chat_activity: epoch ms of the latest recorded send
+	attrActivityScore        = "activity_score" // chat_activity: reserved, see lsiByActivityScore
 
 	// Keys of the min_listener_balance map.
 	attrBalanceCurrency     = "currency"
@@ -243,6 +276,7 @@ type store struct {
 	dmInboxTable      string
 	groupMembersTable string
 	userStateTable    string
+	activityTable     string
 
 	exclusions chat.FeedExclusions
 }
@@ -251,7 +285,7 @@ type store struct {
 // creating every DM with a user in excludedFromFeed excluding them from the
 // feed (see chat.FeedExclusions); nil excludes no one. Use CreateTables to
 // provision the tables.
-func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
+func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
 	return &store{
 		exclusions:        chat.NewFeedExclusions(excludedFromFeed),
 		client:            client,
@@ -259,6 +293,7 @@ func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembe
 		dmInboxTable:      dmInboxTable,
 		groupMembersTable: groupMembersTable,
 		userStateTable:    userStateTable,
+		activityTable:     activityTable,
 	}
 }
 
@@ -2439,4 +2474,101 @@ func viewerStateFromItem(item map[string]types.AttributeValue) (chat.ViewerState
 		}
 	}
 	return state, nil
+}
+
+// RecordSend is one conditional update of the user's chat_activity item,
+// with no read first: the condition is the throttle, and its failure is the
+// not-recorded answer, so the no-op path costs no second request and never
+// creates an item. last_sent_at is epoch milliseconds, which keeps the
+// throttle's arithmetic and the index's order exact.
+func (s *store) RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, sentAt time.Time) (bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return false, fmt.Errorf("not a group chat id")
+	}
+	sentAtMillis := sentAt.UnixMilli()
+	if sentAtMillis <= 0 {
+		return false, fmt.Errorf("send time %v is not after the epoch", sentAt)
+	}
+
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.activityTable),
+		Key: map[string]types.AttributeValue{
+			attrPK: avS(chatPK(chatID)),
+			attrSK: avS(userPK(userID)),
+		},
+		UpdateExpression:    aws.String("SET #sent = :sent, #expires = :expires"),
+		ConditionExpression: aws.String("attribute_not_exists(#sent) OR #sent <= :stale"),
+		ExpressionAttributeNames: map[string]string{
+			"#sent":    attrLastSentAt,
+			"#expires": attrExpiresAt,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":sent":    avInt(sentAtMillis),
+			":stale":   avInt(sentAtMillis - chat.ActivityRecordInterval.Milliseconds()),
+			":expires": avInt(sentAt.Add(chat.ActivityRetention).Unix()),
+		},
+	})
+	if isConditionalCheckFailed(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// GetRecentSenders queries lsiByLastSentAt descending. The index is local,
+// so the read is strongly consistent, and it projects last_sent_at as its own
+// key, so nothing is fetched from the table. Every item in the partition is
+// an activity record carrying last_sent_at, so the index holds them all.
+func (s *store) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]chat.RecentSender, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, fmt.Errorf("not a group chat id")
+	}
+
+	senders := make([]chat.RecentSender, 0)
+	var startKey map[string]types.AttributeValue
+	for {
+		input := &dynamodb.QueryInput{
+			TableName:                aws.String(s.activityTable),
+			IndexName:                aws.String(lsiByLastSentAt),
+			KeyConditionExpression:   aws.String("#pk = :pk"),
+			ProjectionExpression:     aws.String("#sk, #sent"),
+			ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#sk": attrSK, "#sent": attrLastSentAt},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk": avS(chatPK(chatID)),
+			},
+			ScanIndexForward:  aws.Bool(false),
+			ConsistentRead:    aws.Bool(true),
+			ExclusiveStartKey: startKey,
+		}
+		if limit > 0 {
+			input.Limit = aws.Int32(int32(limit - len(senders)))
+		}
+		res, err := s.client.Query(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range res.Items {
+			userID, err := userIDFromSK(item)
+			if err != nil {
+				return nil, err
+			}
+			sentAtMillis, err := parseInt(item[attrLastSentAt])
+			if err != nil {
+				return nil, fmt.Errorf("parsing %s: %w", attrLastSentAt, err)
+			}
+			senders = append(senders, chat.RecentSender{
+				UserID:     userID,
+				LastSentAt: time.UnixMilli(sentAtMillis).UTC(),
+			})
+		}
+		if limit > 0 && len(senders) >= limit {
+			return senders[:limit], nil
+		}
+		if len(res.LastEvaluatedKey) == 0 {
+			return senders, nil
+		}
+		startKey = res.LastEvaluatedKey
+	}
 }

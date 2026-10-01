@@ -21,9 +21,11 @@ import (
 // chat_user_state is keyed by (pk, sk) = (user, chat) — plus one "#meta"
 // aggregates item per chat — with a sparse GSI of a chat's recorded mutes by
 // when they end (see gsiByMuted) and an inverted GSI of a chat's records by
-// user (see gsiUserStateByUser). It is idempotent and blocks until all tables
-// are ACTIVE.
-func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable string) error {
+// user (see gsiUserStateByUser); chat_activity is keyed by (pk, sk) = (chat,
+// user) with two LSIs, one by last_sent_at (lsiByLastSentAt) and one by
+// activity_score (lsiByActivityScore, reserved and empty today), and TTL on
+// expires_at. It is idempotent and blocks until all tables are ACTIVE.
+func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
 			TableName:   aws.String(chatsTable),
@@ -157,6 +159,49 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				},
 			},
 		},
+		{
+			TableName:   aws.String(activityTable),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrLastSentAt), AttributeType: types.ScalarAttributeTypeN},
+				{AttributeName: aws.String(attrActivityScore), AttributeType: types.ScalarAttributeTypeN},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+			},
+			// LSIs, not GSIs: a group's suggestions are read right after a
+			// send, and only a local index serves a strongly consistent
+			// read. Both must exist from the table's creation, since an LSI
+			// cannot be added later. Each projects the other's sort key, so
+			// rows read from either can be ordered by both.
+			LocalSecondaryIndexes: []types.LocalSecondaryIndex{
+				{
+					IndexName: aws.String(lsiByLastSentAt),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrLastSentAt), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{
+						ProjectionType:   types.ProjectionTypeInclude,
+						NonKeyAttributes: []string{attrActivityScore},
+					},
+				},
+				{
+					IndexName: aws.String(lsiByActivityScore),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrActivityScore), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{
+						ProjectionType:   types.ProjectionTypeInclude,
+						NonKeyAttributes: []string{attrLastSentAt},
+					},
+				},
+			},
+		},
 	}
 
 	for _, input := range inputs {
@@ -174,7 +219,10 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 		}
 	}
 
-	return ensureTTL(ctx, client, groupMembersTable, attrExpiresAt)
+	if err := ensureTTL(ctx, client, groupMembersTable, attrExpiresAt); err != nil {
+		return err
+	}
+	return ensureTTL(ctx, client, activityTable, attrExpiresAt)
 }
 
 // ensureTTL idempotently enables DynamoDB TTL on table's attr. Enabling TTL when
@@ -217,6 +265,9 @@ func (s *store) reset() {
 		panic(err)
 	}
 	if err := clearTable(ctx, s.client, s.userStateTable, []string{attrPK, attrSK}); err != nil {
+		panic(err)
+	}
+	if err := clearTable(ctx, s.client, s.activityTable, []string{attrPK, attrSK}); err != nil {
 		panic(err)
 	}
 }

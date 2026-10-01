@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"testing"
@@ -71,6 +72,9 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetRoster_Dm,
 		testServer_GetRoster_Gates,
 		testServer_GetRoster_Disabled,
+		testServer_GetMentionSuggestions,
+		testServer_GetMentionSuggestions_Size,
+		testServer_GetMentionSuggestions_Gates,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
 		testServer_GetDmChatFeed_Paging,
@@ -462,6 +466,7 @@ func (f *fakeMessagingReader) LatestEventSequences(_ context.Context, chatIDs []
 type fakeProfileReader struct {
 	phoneNumbers    map[string]*commonpb.PhoneNumber
 	displayNames    map[string]string
+	usernames       map[string]string
 	profilePictures map[string]*blobpb.Media
 	joinedAt        map[string]time.Time
 
@@ -473,6 +478,7 @@ func newFakeProfileReader() *fakeProfileReader {
 	return &fakeProfileReader{
 		phoneNumbers:    make(map[string]*commonpb.PhoneNumber),
 		displayNames:    make(map[string]string),
+		usernames:       make(map[string]string),
 		profilePictures: make(map[string]*blobpb.Media),
 		joinedAt:        make(map[string]time.Time),
 	}
@@ -531,6 +537,9 @@ func (f *fakeProfileReader) GetPublicProfiles(_ context.Context, userIDs []*comm
 			ProfilePicture:        f.profilePictures[key],
 			JoinTs:                timestamppb.New(joinedAt),
 			FlipcardCustomization: profile.DefaultFlipcardCustomization(),
+		}
+		if username, ok := f.usernames[key]; ok {
+			out[key].Username = &commonpb.Username{Value: username}
 		}
 	}
 	return out, nil
@@ -978,6 +987,149 @@ func testServer_GetRoster_Dm(t *testing.T, s chat.Store) {
 // non-member a group's listener rules admit; and no one else — not a DM's
 // stranger, not a non-member of a group without rules, and not a non-member
 // who fails them, who may preview the group but not its roster.
+func (e *serverEnv) getMentionSuggestions(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.GetMentionSuggestionsResponse {
+	req := &chatpb.GetMentionSuggestionsRequest{ChatId: chatID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.GetMentionSuggestions(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// recordSend records userID's send in a group at sentAt, as the send path
+// does, and requires that it was recorded.
+func (e *serverEnv) recordSend(chatID *commonpb.ChatId, userID *commonpb.UserId, sentAt time.Time) {
+	recorded, err := e.store.RecordSend(e.ctx, chatID, userID, sentAt)
+	require.NoError(e.t, err)
+	require.True(e.t, recorded)
+}
+
+// suggestedUserIDs projects suggestions onto their users' IDs, in order.
+func suggestedUserIDs(suggestions []*chatpb.MentionSuggestion) [][]byte {
+	out := make([][]byte, len(suggestions))
+	for i, suggestion := range suggestions {
+		out[i] = suggestion.UserProfile.UserId.Value
+	}
+	return out
+}
+
+func testServer_GetMentionSuggestions(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	recent := model.MustGenerateUserID()   // most recent sender
+	departed := model.MustGenerateUserID() // sent, then left
+	earlier := model.MustGenerateUserID()  // sent before the others
+	blocked := model.MustGenerateUserID()  // the caller blocked them
+	blocker := model.MustGenerateUserID()  // they blocked the caller; still suggested
+	nameless := model.MustGenerateUserID() // holds no username
+	quiet := model.MustGenerateUserID()    // a member who never sent
+	groupID := e.putGroup("Mentions", at(1), recent, departed, earlier, blocked, blocker, nameless, quiet)
+
+	for userID, username := range map[*commonpb.UserId]string{
+		recent:   "recent",
+		departed: "departed",
+		earlier:  "earlier",
+		blocked:  "blocked",
+		blocker:  "blocker",
+		quiet:    "quiet",
+	} {
+		e.profiles.usernames[string(userID.Value)] = username
+	}
+	e.blocklist.block(e.userID, blocked)
+	e.blocklist.block(blocker, e.userID)
+
+	e.recordSend(groupID, earlier, at(10))
+	e.recordSend(groupID, departed, at(25))
+	e.recordSend(groupID, recent, at(30))
+	e.recordSend(groupID, blocked, at(40))
+	e.recordSend(groupID, blocker, at(45))
+	e.recordSend(groupID, nameless, at(50))
+	e.recordSend(groupID, e.userID, at(60))
+	_, _, err := s.RemoveGroupMember(e.ctx, groupID, departed)
+	require.NoError(t, err)
+
+	// Most recent first; someone who left is still suggested, and so is
+	// someone who blocked the caller. The caller, the user the caller blocked
+	// and the user without a username are dropped, and a member who never
+	// sent is not suggested.
+	resp := e.getMentionSuggestions(e.keys, groupID)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_OK, resp.Result)
+	require.Equal(t, [][]byte{blocker.Value, recent.Value, departed.Value, earlier.Value}, suggestedUserIDs(resp.Suggestions))
+	for i, want := range []struct {
+		username string
+		sentAt   time.Time
+	}{
+		{"blocker", at(45)},
+		{"recent", at(30)},
+		{"departed", at(25)},
+		{"earlier", at(10)},
+	} {
+		require.Equal(t, want.username, resp.Suggestions[i].UserProfile.GetUsername().GetValue())
+		require.True(t, resp.Suggestions[i].LastSentAt.AsTime().Equal(want.sentAt))
+	}
+
+	// A group nobody has sent in has no suggestions.
+	empty := e.putGroup("Quiet", at(1), recent)
+	resp = e.getMentionSuggestions(e.keys, empty)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_OK, resp.Result)
+	require.Empty(t, resp.Suggestions)
+}
+
+func testServer_GetMentionSuggestions_Size(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	groupID := e.putGroup("Busy", at(1))
+
+	// More senders than a response carries: the most recent are kept.
+	const senders = 80
+	userIDs := make([]*commonpb.UserId, senders)
+	for i := range senders {
+		userIDs[i] = model.MustGenerateUserID()
+		e.profiles.usernames[string(userIDs[i].Value)] = fmt.Sprintf("user_%d", i)
+		e.recordSend(groupID, userIDs[i], at(int64(i+1)))
+	}
+
+	resp := e.getMentionSuggestions(e.keys, groupID)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_OK, resp.Result)
+	require.Len(t, resp.Suggestions, 50)
+	for i, suggestion := range resp.Suggestions {
+		require.Equal(t, userIDs[senders-1-i].Value, suggestion.UserProfile.UserId.Value, "suggestion %d", i)
+	}
+}
+
+func testServer_GetMentionSuggestions_Gates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	_, strangerKeys := e.addUser()
+
+	resp := e.getMentionSuggestions(e.keys, chat.MustGenerateGroupChatID())
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_NOT_FOUND, resp.Result)
+
+	// A DM is refused, even to its members.
+	dm := e.putDM(at(1))
+	resp = e.getMentionSuggestions(e.keys, dm)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, resp.Result)
+
+	// A non-member cannot speak, so is refused.
+	groupID := e.putGroup("Members only", at(1))
+	resp = e.getMentionSuggestions(strangerKeys, groupID)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, resp.Result)
+	resp = e.getMentionSuggestions(e.keys, groupID)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_OK, resp.Result)
+
+	// In a creator-only group, a member who is not the creator cannot speak.
+	creator := model.MustGenerateUserID()
+	creatorOnly := &chat.Chat{
+		ID:                   chat.MustGenerateGroupChatID(),
+		Type:                 chatpb.ChatType_GROUP,
+		Members:              []*commonpb.UserId{creator, e.userID},
+		Title:                "Announcements",
+		IsCreatorOnlySpeaker: true,
+		CreatorID:            creator,
+		LastActivity:         at(1),
+	}
+	require.NoError(t, s.PutChat(e.ctx, creatorOnly))
+	resp = e.getMentionSuggestions(e.keys, creatorOnly.ID)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, resp.Result)
+}
+
 func testServer_GetRoster_Gates(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	_, strangerKeys := e.addUser()

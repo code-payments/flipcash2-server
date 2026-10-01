@@ -48,16 +48,13 @@ import (
 // The RPC is retry-safe. The group's ID is derived from the caller and the
 // request's idempotency key (see MustDeriveGroupChatID), so a retry names the
 // same group, and one that already exists is answered from its record before
-// any check runs: a title the moderator has since learned to flag, a balance
-// that has since fallen below the minimum, or a staff gate since closed are
-// facts about a new group, not this one. Which parameters the retry carries
-// does not matter either; the key is the request's identity. A retry that
+// any check runs: a title the moderator has since learned to flag, or a
+// balance that has since fallen below the minimum, are facts about a new
+// group, not this one. Which parameters the retry carries does not matter
+// either; the key is the request's identity. A retry that
 // loses a race with its twin — both pass the read, one write lands — is caught
 // by the store's uniqueness condition and answered the same way. Nothing is
 // published for a retry: the creation was announced when it happened.
-//
-// The RPC shares the membership RPCs' staff gate (see
-// requireStaffForGroupManagementRPC).
 func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*chatpb.StartChatResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
@@ -87,14 +84,6 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 	case !errors.Is(err, ErrChatNotFound):
 		log.With(zap.Error(err)).Warn("Failure getting chat")
 		return nil, status.Error(codes.Internal, "")
-	}
-
-	allowed, err := s.requireStaffForGroupManagementRPC(ctx, log, userID)
-	if err != nil {
-		return nil, err
-	}
-	if !allowed {
-		return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_DENIED}, nil
 	}
 
 	isStaffOnly, minimumListenerBalance, err := RulesFromProto(params.Rules)

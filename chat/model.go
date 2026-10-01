@@ -724,8 +724,12 @@ const (
 	ActivityRecordInterval = time.Minute
 
 	// ActivityRetention is how long a group's activity record is kept after
-	// its last recorded send.
-	ActivityRetention = 90 * 24 * time.Hour
+	// its last recorded send. Old records cost nothing to a read, which takes
+	// only the most recent, and are exactly the suggestions a group revived
+	// after a long quiet needs, so this is long; it is finite so the records
+	// of users who stopped using the app, deleted accounts included, age out
+	// on their own.
+	ActivityRetention = 365 * 24 * time.Hour
 )
 
 // RecentSender is one user's activity record in a group, as recency reads

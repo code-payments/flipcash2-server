@@ -35,12 +35,6 @@ import (
 // chat's members and to the affected user (see publishRosterUpdate). A join or
 // departure that is a no-op broadcasts nothing: the roster did not move, and a
 // client applying updates by version would drop it anyway.
-//
-// Both RPCs can be gated to staff users (see
-// requireStaffForGroupManagementRPC), which is how they are held back from the
-// wider user base until they are ready for it. The gate
-// is applied before the chat is looked up, so a non-staff caller learns
-// nothing — not even whether the chat exists.
 
 func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*chatpb.JoinChatResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
@@ -49,14 +43,6 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	}
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
-
-	allowed, err := s.requireStaffForGroupManagementRPC(ctx, log, userID)
-	if err != nil {
-		return nil, err
-	}
-	if !allowed {
-		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_DENIED}, nil
-	}
 
 	if !IsGroupChatID(req.ChatId) {
 		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_DENIED}, nil
@@ -163,14 +149,6 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	allowed, err := s.requireStaffForGroupManagementRPC(ctx, log, userID)
-	if err != nil {
-		return nil, err
-	}
-	if !allowed {
-		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_DENIED}, nil
-	}
-
 	// The ID's length is the type check: a group ID names a group or nothing,
 	// so there is no canonical record to read here. Unlike a join, a departure
 	// needs nothing from it — no rules to evaluate, no metadata to return — and
@@ -260,24 +238,6 @@ func (s *Server) clearMuteOnLeave(ctx context.Context, log *zap.Logger, chatID *
 	if changed {
 		s.publishViewerStateChanged(userID, chatID, state, Permissions{})
 	}
-}
-
-// requireStaffForGroupManagementRPC reports whether userID passes the staff
-// gate on the group management RPCs (StartChat, JoinChat, LeaveChat): everyone
-// does when the server is not configured to require staff, and only staff
-// users otherwise. A staff flag that cannot be read is a gRPC
-// Internal error, never a pass: the gate is a restriction, and a restriction
-// the server cannot evaluate admits no one.
-func (s *Server) requireStaffForGroupManagementRPC(ctx context.Context, log *zap.Logger, userID *commonpb.UserId) (bool, error) {
-	if !s.requireStaffForGroupManagement {
-		return true, nil
-	}
-	isStaff, err := s.accounts.IsStaff(ctx, userID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure getting user staff status")
-		return false, status.Error(codes.Internal, "")
-	}
-	return isStaff, nil
 }
 
 // publishRosterUpdate broadcasts one roster transition on chatID whose subject

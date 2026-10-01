@@ -173,11 +173,6 @@ type Server struct {
 	userEventBus UserEventPublisher
 	chatEventBus ChatEventPublisher
 
-	// requireStaffForGroupManagement gates the self-service group management
-	// RPCs (StartChat, JoinChat, LeaveChat) to staff users when set (see
-	// requireStaffForGroupManagementRPC).
-	requireStaffForGroupManagement bool
-
 	// disableGetRoster turns the GetRoster RPC off when set: every call is
 	// refused with UNAVAILABLE before anything is read (see roster.go). It is
 	// an operator's switch on the one read that walks a whole roster, so the
@@ -218,7 +213,6 @@ func NewServer(
 
 	teamUserID *commonpb.UserId,
 
-	requireStaffForGroupManagement bool,
 	disableGetRoster bool,
 ) *Server {
 	return &Server{
@@ -242,8 +236,7 @@ func NewServer(
 
 		teamUserID: teamUserID,
 
-		requireStaffForGroupManagement: requireStaffForGroupManagement,
-		disableGetRoster:               disableGetRoster,
+		disableGetRoster: disableGetRoster,
 
 		maxGroupFeedChats:  maxGroupFeedChats,
 		rosterWholeReadCap: rosterWholeReadCap,

@@ -27,9 +27,7 @@ import (
 // else is DENIED — the same answer ViewerState.Permissions.can_edit gives
 // them, so a client never shows an affordance this refuses. Creatorship is
 // decided off the record before membership is read, so the store is asked
-// nothing on behalf of a caller who could never edit. The staff gate on the
-// membership RPCs does not apply: while it holds, every creator is staff by
-// construction, and one who predates it keeps their own group.
+// nothing on behalf of a caller who could never edit.
 //
 // A field set to the value the record already holds is dropped before
 // anything is checked, so a retried request, or a client that sends every

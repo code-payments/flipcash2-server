@@ -51,6 +51,10 @@ type memory struct {
 	// contract lets a reader see one past chat.ActivityRetention.
 	lastSent map[string]map[string]time.Time
 
+	// keyEnvelopes holds each user's key envelope per chat, keyed by user ID
+	// then chat ID, mirroring the persistent layout (see chat.Store).
+	keyEnvelopes map[string]map[string]chat.KeyEnvelope
+
 	exclusions chat.FeedExclusions
 }
 
@@ -77,6 +81,7 @@ func NewInMemory(excludedFromFeed []*commonpb.UserId) chat.Store {
 		viewerStates:     make(map[string]map[string]*chat.ViewerState),
 		mutedCounts:      make(map[string]uint64),
 		lastSent:         make(map[string]map[string]time.Time),
+		keyEnvelopes:     make(map[string]map[string]chat.KeyEnvelope),
 	}
 }
 
@@ -91,6 +96,7 @@ func (m *memory) reset() {
 	m.mutedCounts = make(map[string]uint64)
 	m.excludedFromFeed = make(map[string]map[string]struct{})
 	m.lastSent = make(map[string]map[string]time.Time)
+	m.keyEnvelopes = make(map[string]map[string]chat.KeyEnvelope)
 }
 
 // isJoinedLocked reports whether the user's record on the group has them
@@ -193,7 +199,7 @@ func (m *memory) AddGroupMembers(_ context.Context, chatID *commonpb.ChatId, use
 	return changed, m.rosterSummaryLocked(chatID), nil
 }
 
-func (m *memory) RemoveGroupMember(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, chat.RosterSummary, error) {
+func (m *memory) RemoveGroupMember(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, discardKeyEnvelope bool) (bool, chat.RosterSummary, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return false, chat.RosterSummary{}, fmt.Errorf("not a group chat id")
 	}
@@ -212,6 +218,9 @@ func (m *memory) RemoveGroupMember(_ context.Context, chatID *commonpb.ChatId, u
 	// do; the join time is meaningless once departed and is dropped with it.
 	m.groupVersions[key]++
 	m.groupMembers[key][string(userID.Value)] = &memberRecord{version: m.groupVersions[key]}
+	if discardKeyEnvelope {
+		delete(m.keyEnvelopes[string(userID.Value)], key)
+	}
 	return true, m.rosterSummaryLocked(chatID), nil
 }
 
@@ -798,4 +807,39 @@ func (m *memory) GetRecentSenders(_ context.Context, chatID *commonpb.ChatId, li
 		senders = senders[:limit]
 	}
 	return senders, nil
+}
+
+func (m *memory) SetKeyEnvelope(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (chat.KeyEnvelope, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.KeyEnvelope{}, fmt.Errorf("not a group chat id")
+	}
+	if envelope.WrappedBy == nil {
+		return chat.KeyEnvelope{}, fmt.Errorf("key envelope has no wrapper")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	byChat := m.keyEnvelopes[string(userID.Value)]
+	if byChat == nil {
+		byChat = make(map[string]chat.KeyEnvelope)
+		m.keyEnvelopes[string(userID.Value)] = byChat
+	}
+	// An envelope the user wrapped themself stands.
+	if stored, ok := byChat[string(chatID.Value)]; ok && stored.IsWrappedBy(userID) {
+		return stored.Clone(), nil
+	}
+	byChat[string(chatID.Value)] = envelope.Clone()
+	return envelope.Clone(), nil
+}
+
+func (m *memory) GetKeyEnvelope(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.KeyEnvelope, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	stored, ok := m.keyEnvelopes[string(userID.Value)][string(chatID.Value)]
+	if !ok {
+		return chat.KeyEnvelope{}, chat.ErrKeyEnvelopeNotFound
+	}
+	return stored.Clone(), nil
 }

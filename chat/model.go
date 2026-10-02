@@ -277,12 +277,12 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // shown to any registered user.
 //
 // A private group's chat key reaches the server only as its members' key
-// envelopes, and nothing can happen in one until its creator has stored
-// theirs. Key envelopes are not built, so every private group is in that
-// state and stays there: it exists, is visible, and can be left and rejoined
-// by its creator, and no one speaks in it (see Access.CanSpeak). The lobby a
-// user would enter to be admitted is not built either, so its creator is the
-// only member it can have.
+// envelopes (see KeyEnvelope), and nothing is meant to happen in one until
+// its creator has stored theirs. Speaking in a private group is not built:
+// messaging does not yet require its content to be encrypted, so no one
+// speaks in one, keyed or not (see Access.CanSpeak). The lobby a user would
+// enter to be admitted is not built either, so its creator is the only
+// member it can have.
 //
 // CreatorID is the user who created the group, or nil when unknown (a DM has
 // none, and so does any group written before the field existed). It is fixed
@@ -502,6 +502,80 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 		}
 	}
 	return md
+}
+
+// KeyEnvelope is one user's key envelope for a private group (see
+// chatpb.KeyEnvelope and Chat.IsPrivate): the group's chat key, encrypted so
+// that only that user can open it. The server stores an envelope and hands it
+// back to the user it is for. It cannot open one and never holds the chat
+// key, so nothing in an envelope is checked beyond its shape, which is the
+// boundary's job (proto validation), not the record's.
+//
+// WrappedBy is who stored the envelope, as the server authenticated them: the
+// user it is for, or the group's creator admitting them. It is the server's
+// record, never a client's claim, and it is what a client is told to open the
+// envelope against (GetKeyEnvelopeResponse.wrapped_by). It also decides
+// whether the envelope can be replaced: one a user wrapped for themself
+// stands (see Store.SetKeyEnvelope).
+//
+// A private group has a key exactly when its creator has an envelope stored.
+// Nothing else records it: the creator's envelope is the only one that can
+// be the group's first, it is always one they wrapped themself, and it is
+// never deleted, so its presence is one-way. Every other member's envelope is
+// deleted with their departure (see Server.LeaveChat).
+type KeyEnvelope struct {
+	Scheme     chatpb.KeyEnvelope_Scheme
+	Nonce      []byte
+	Ciphertext []byte
+	WrappedBy  *commonpb.UserId
+}
+
+// KeyEnvelopeFromProto returns the envelope pb describes, recorded as stored
+// by wrappedBy.
+func KeyEnvelopeFromProto(pb *chatpb.KeyEnvelope, wrappedBy *commonpb.UserId) KeyEnvelope {
+	return KeyEnvelope{
+		Scheme:     pb.GetScheme(),
+		Nonce:      pb.GetNonce(),
+		Ciphertext: pb.GetCiphertext(),
+		WrappedBy:  wrappedBy,
+	}.Clone()
+}
+
+// ToProto projects the envelope onto a chatpb.KeyEnvelope. Who wrapped it is
+// not part of the proto envelope; a response carries it beside the envelope.
+func (e KeyEnvelope) ToProto() *chatpb.KeyEnvelope {
+	return &chatpb.KeyEnvelope{
+		Scheme:     e.Scheme,
+		Nonce:      bytes.Clone(e.Nonce),
+		Ciphertext: bytes.Clone(e.Ciphertext),
+	}
+}
+
+// Equal reports whether the two envelopes are the same envelope: the same
+// bytes under the same scheme, stored by the same user.
+func (e KeyEnvelope) Equal(other KeyEnvelope) bool {
+	return e.Scheme == other.Scheme &&
+		bytes.Equal(e.Nonce, other.Nonce) &&
+		bytes.Equal(e.Ciphertext, other.Ciphertext) &&
+		bytes.Equal(e.WrappedBy.GetValue(), other.WrappedBy.GetValue())
+}
+
+// IsWrappedBy reports whether userID stored the envelope.
+func (e KeyEnvelope) IsWrappedBy(userID *commonpb.UserId) bool {
+	return e.WrappedBy != nil && bytes.Equal(e.WrappedBy.Value, userID.GetValue())
+}
+
+// Clone returns a deep copy of the envelope.
+func (e KeyEnvelope) Clone() KeyEnvelope {
+	clone := KeyEnvelope{
+		Scheme:     e.Scheme,
+		Nonce:      bytes.Clone(e.Nonce),
+		Ciphertext: bytes.Clone(e.Ciphertext),
+	}
+	if e.WrappedBy != nil {
+		clone.WrappedBy = &commonpb.UserId{Value: bytes.Clone(e.WrappedBy.Value)}
+	}
+	return clone
 }
 
 // ErrMuteUntilOutOfRange indicates that a timed mute ends outside the range a

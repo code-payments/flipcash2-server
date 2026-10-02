@@ -24,7 +24,7 @@ import (
 	"github.com/code-payments/flipcash2-server/chat"
 )
 
-// The chat store spans five tables:
+// The chat store spans six tables:
 //
 //	chats     pk = "chat#<id>" (one item per chat). Canonical metadata: type,
 //	          members (the DM participants; absent for groups), title, creator
@@ -132,6 +132,24 @@ import (
 //	          maintains it will need the item's prior score, so it will read
 //	          first and condition its update on last_sent_at as read, which
 //	          every recorded send moves forward.
+//
+//	chat_key_envelopes  pk = "user#<id>", sk = "chat#<id>" (one item per
+//	          (user, private group) the user holds a key envelope for; see
+//	          chat.KeyEnvelope). The envelope as stored: scheme, nonce,
+//	          ciphertext, and wrapped_by, the user who stored it. Keyed by
+//	          user, like chat_user_state, since every read is a user's read
+//	          of their own envelope: a strongly consistent point read. There
+//	          is no index and no read by chat, because nothing needs one: a
+//	          group's size is unbounded and nothing enumerates its envelopes.
+//
+//	          A write is one conditional put of the one item, refused when
+//	          the stored envelope is one the user wrapped themself
+//	          (wrapped_by is the user), and the refusal returns the stored
+//	          item, so the caller learns which envelope stands without a
+//	          read. An item is deleted when its user leaves the group, in
+//	          the transaction that records the departure (see
+//	          RemoveGroupMember), so no departed user keeps one. No item
+//	          expires.
 const (
 	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
 	// all of a user's DM types. Superseded by gsiByTypeActivity; retained until
@@ -213,6 +231,10 @@ const (
 	attrMutedCount           = "muted_count"    // chat_user_state #meta item: records with a mute recorded
 	attrLastSentAt           = "last_sent_at"   // chat_activity: epoch ms of the latest recorded send
 	attrActivityScore        = "activity_score" // chat_activity: reserved, see lsiByActivityScore
+	attrScheme               = "scheme"         // chat_key_envelopes: chatpb.KeyEnvelope_Scheme, by number
+	attrNonce                = "nonce"          // chat_key_envelopes: the envelope's nonce (B)
+	attrCiphertext           = "ciphertext"     // chat_key_envelopes: the wrapped chat key (B)
+	attrWrappedBy            = "wrapped_by"     // chat_key_envelopes: the raw ID of the user who stored the envelope (B)
 
 	// Keys of the min_listener_balance map.
 	attrBalanceCurrency     = "currency"
@@ -278,6 +300,7 @@ type store struct {
 	groupMembersTable string
 	userStateTable    string
 	activityTable     string
+	keyEnvelopesTable string
 
 	exclusions chat.FeedExclusions
 }
@@ -286,7 +309,7 @@ type store struct {
 // creating every DM with a user in excludedFromFeed excluding them from the
 // feed (see chat.FeedExclusions); nil excludes no one. Use CreateTables to
 // provision the tables.
-func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
+func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
 	return &store{
 		exclusions:        chat.NewFeedExclusions(excludedFromFeed),
 		client:            client,
@@ -295,6 +318,7 @@ func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembe
 		groupMembersTable: groupMembersTable,
 		userStateTable:    userStateTable,
 		activityTable:     activityTable,
+		keyEnvelopesTable: keyEnvelopesTable,
 	}
 }
 
@@ -475,7 +499,7 @@ func (s *store) addGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 				":now":    avN(uint64(time.Now().UTC().UnixNano())),
 			},
 		}
-		joined, err := s.transitionMembership(ctx, chatID, join, 1, &roster)
+		joined, err := s.transitionMembership(ctx, chatID, join, 1, &roster, nil)
 		if err != nil {
 			return changed, roster, err
 		}
@@ -484,7 +508,7 @@ func (s *store) addGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 	return changed, roster, nil
 }
 
-func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, chat.RosterSummary, error) {
+func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, discardKeyEnvelope bool) (bool, chat.RosterSummary, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return false, chat.RosterSummary{}, fmt.Errorf("not a group chat id")
 	}
@@ -518,7 +542,17 @@ func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, 
 			":expires": avN(uint64(now.Add(tombstoneTTL).Unix())),
 		},
 	}
-	changed, err := s.transitionMembership(ctx, chatID, leave, -1, &roster)
+	// The departing user's key envelope goes in the same transaction, so it
+	// is deleted iff the departure happens. The delete is unconditional: a
+	// user with no envelope leaves all the same.
+	var alongside []types.TransactWriteItem
+	if discardKeyEnvelope {
+		alongside = append(alongside, types.TransactWriteItem{Delete: &types.Delete{
+			TableName: aws.String(s.keyEnvelopesTable),
+			Key:       keyEnvelopeKey(chatID, userID),
+		}})
+	}
+	changed, err := s.transitionMembership(ctx, chatID, leave, -1, &roster, alongside)
 	return changed, roster, err
 }
 
@@ -558,14 +592,20 @@ func (s *store) readRosterSummaryForWrite(ctx context.Context, chatID *commonpb.
 // success *roster is advanced to match; the next transition in a batch chains
 // from it without another read.
 //
+// alongside are further writes the transition carries: they commit iff it
+// does, and are not made when it is a no-op. They must be unconditional, so
+// the only way one can cancel the transaction is by losing to a concurrent
+// write on its own item.
+//
 // Cancellation reasons are positional over the transaction's items: [0] is the
-// membership transition and [1] the summary. A failed [1] condition means a
+// membership transition, [1] the summary, and the rest alongside's. A failed
+// [1] condition means a
 // concurrent writer moved the version — the failed item is returned with the
 // cancellation, so *roster is refreshed from it and the transition retried
 // with no extra read. Losing the write itself to a concurrent transaction on
-// the same item surfaces as TransactionConflict and is retried with backoff.
-// Both share the attempt budget (see maxMembershipAttempts).
-func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatId, transition *types.Update, delta int64, roster *chat.RosterSummary) (bool, error) {
+// the same item, any of them, surfaces as TransactionConflict and is retried
+// with backoff. Both share the attempt budget (see maxMembershipAttempts).
+func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatId, transition *types.Update, delta int64, roster *chat.RosterSummary, alongside []types.TransactWriteItem) (bool, error) {
 	backoff := membershipBackoffBase
 	for attempt := 0; ; attempt++ {
 		next := chat.RosterSummary{
@@ -591,6 +631,7 @@ func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatI
 				ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 			}},
 		}
+		transactItems = append(transactItems, alongside...)
 
 		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
 		if err == nil {
@@ -601,7 +642,10 @@ func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatI
 		if !ok || len(reasons) != len(transactItems) {
 			return false, err
 		}
-		codes := []string{aws.ToString(reasons[0].Code), aws.ToString(reasons[1].Code)}
+		codes := make([]string, len(reasons))
+		for i, reason := range reasons {
+			codes[i] = aws.ToString(reason.Code)
+		}
 
 		// The budget applies to the retries alone: a no-op is a no-op on the
 		// last attempt too, and is reported as one, not as an exhausted retry.
@@ -2578,4 +2622,87 @@ func (s *store) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, l
 		}
 		startKey = res.LastEvaluatedKey
 	}
+}
+
+func (s *store) SetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (chat.KeyEnvelope, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.KeyEnvelope{}, fmt.Errorf("not a group chat id")
+	}
+	if envelope.WrappedBy == nil {
+		return chat.KeyEnvelope{}, fmt.Errorf("key envelope has no wrapper")
+	}
+
+	item := keyEnvelopeKey(chatID, userID)
+	item[attrScheme] = avN(uint64(envelope.Scheme))
+	item[attrNonce] = avB(envelope.Nonce)
+	item[attrCiphertext] = avB(envelope.Ciphertext)
+	item[attrWrappedBy] = avB(envelope.WrappedBy.Value)
+
+	// An envelope the user wrapped themself stands: the put is refused when
+	// one is stored, and the refusal returns it.
+	_, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           aws.String(s.keyEnvelopesTable),
+		Item:                item,
+		ConditionExpression: aws.String("attribute_not_exists(#pk) OR #wrappedBy <> :user"),
+		ExpressionAttributeNames: map[string]string{
+			"#pk":        attrPK,
+			"#wrappedBy": attrWrappedBy,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":user": avB(userID.Value),
+		},
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	})
+	if err == nil {
+		return envelope.Clone(), nil
+	}
+	var ccf *types.ConditionalCheckFailedException
+	if !errors.As(err, &ccf) {
+		return chat.KeyEnvelope{}, err
+	}
+	return keyEnvelopeFromItem(ccf.Item)
+}
+
+func (s *store) GetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.KeyEnvelope, error) {
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(s.keyEnvelopesTable),
+		Key:            keyEnvelopeKey(chatID, userID),
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return chat.KeyEnvelope{}, err
+	}
+	if len(out.Item) == 0 {
+		return chat.KeyEnvelope{}, chat.ErrKeyEnvelopeNotFound
+	}
+	return keyEnvelopeFromItem(out.Item)
+}
+
+// keyEnvelopeKey is the key of userID's envelope for chatID in
+// chat_key_envelopes.
+func keyEnvelopeKey(chatID *commonpb.ChatId, userID *commonpb.UserId) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		attrPK: avS(userPK(userID)),
+		attrSK: avS(chatSK(chatID)),
+	}
+}
+
+// keyEnvelopeFromItem decodes a chat_key_envelopes item. Every attribute is
+// written with every item, so one missing its wrapper is a corrupt item
+// rather than a default.
+func keyEnvelopeFromItem(item map[string]types.AttributeValue) (chat.KeyEnvelope, error) {
+	scheme, err := parseN(item[attrScheme])
+	if err != nil {
+		return chat.KeyEnvelope{}, err
+	}
+	wrappedBy := asB(item[attrWrappedBy])
+	if len(wrappedBy) == 0 {
+		return chat.KeyEnvelope{}, fmt.Errorf("key envelope item has no wrapper")
+	}
+	return chat.KeyEnvelope{
+		Scheme:     chatpb.KeyEnvelope_Scheme(scheme),
+		Nonce:      bytes.Clone(asB(item[attrNonce])),
+		Ciphertext: bytes.Clone(asB(item[attrCiphertext])),
+		WrappedBy:  &commonpb.UserId{Value: bytes.Clone(wrappedBy)},
+	}, nil
 }

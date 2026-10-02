@@ -3344,9 +3344,9 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 }
 
 // testServer_PrivateGroup_NoOneSpeaks pins that nothing is sent in a private
-// group, whose key cannot be stored yet: a member's send is DENIED whatever it
-// carries, encrypted content included, as is their typing notification, and
-// nothing is written.
+// group, before its key is stored or after: a member's send is DENIED whatever
+// it carries, encrypted content included, as is their typing notification,
+// and nothing is written.
 func testServer_PrivateGroup_NoOneSpeaks(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
@@ -3361,16 +3361,31 @@ func testServer_PrivateGroup_NoOneSpeaks(t *testing.T, badges badge.Store, block
 		LastActivity: at(1),
 	}))
 
-	for _, content := range [][]*messagingpb.Content{
-		textContent("plaintext"),
-		encryptedContent(1),
-		chatKeyEncryptedContent(1),
-	} {
-		resp, err := e.sendContentToChat(e.keysA, groupID, content, generateClientID())
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.SendMessageResponse_DENIED, resp.Result)
-		require.Nil(t, resp.Message)
+	requireNoSends := func() {
+		t.Helper()
+		for _, content := range [][]*messagingpb.Content{
+			textContent("plaintext"),
+			encryptedContent(1),
+			chatKeyEncryptedContent(1),
+		} {
+			resp, err := e.sendContentToChat(e.keysA, groupID, content, generateClientID())
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.SendMessageResponse_DENIED, resp.Result)
+			require.Nil(t, resp.Message)
+		}
 	}
+	requireNoSends()
+
+	// Storing the group's key lifts nothing yet: speaking in a private group
+	// is not built, and a keyed group must not take plaintext meanwhile.
+	_, err := chats.SetKeyEnvelope(e.ctx, groupID, e.userA, chat.KeyEnvelope{
+		Scheme:     chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305,
+		Nonce:      bytes.Repeat([]byte{1}, 24),
+		Ciphertext: bytes.Repeat([]byte{1}, 48),
+		WrappedBy:  e.userA,
+	})
+	require.NoError(t, err)
+	requireNoSends()
 
 	typingResp, err := e.notifyIsTypingInChat(e.keysA, groupID, messagingpb.IsTypingNotification_STARTED_TYPING)
 	require.NoError(t, err)
@@ -3926,7 +3941,7 @@ func testServer_SendMessage_GroupPushPaged(t *testing.T, badges badge.Store, blo
 			// recipients.
 			_, _, err = chats.SetMute(e.ctx, groupID, departed, chat.Mute{Forever: true})
 			require.NoError(t, err)
-			changed, _, err := chats.RemoveGroupMember(e.ctx, groupID, departed)
+			changed, _, err := chats.RemoveGroupMember(e.ctx, groupID, departed, false)
 			require.NoError(t, err)
 			require.True(t, changed)
 			_, _, err = chats.SetMute(e.ctx, groupID, model.MustGenerateUserID(), chat.Mute{Forever: true})

@@ -162,17 +162,34 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 
 	// The ID's length is the type check: a group ID names a group or nothing,
 	// so there is no canonical record to read here. Unlike a join, a departure
-	// needs nothing from it — no rules to evaluate, no metadata to return — and
-	// the store's write reports a missing chat itself, so leaving is the one
-	// write and nothing else.
+	// has no rules to evaluate and no metadata to return.
 	if !IsGroupChatID(req.ChatId) {
 		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_DENIED}, nil
 	}
 
+	// A departure from a private group takes the caller's key envelope with
+	// it, as the proto promises: a user who returns enters the lobby and is
+	// given a new one. The creator's is kept, since no one else could give
+	// them another, and it is what marks the group as having a key (see
+	// KeyEnvelope). The envelope is removed in the write that records the
+	// departure, so the two cannot disagree, which means deciding it before
+	// that write. Whether the group is private, and who created it, come from
+	// the rules read: it is the one a store caches, so a leave pays nothing
+	// for it in steady state.
+	rules, err := s.chats.GetGroupRules(ctx, req.ChatId)
+	switch {
+	case errors.Is(err, ErrChatNotFound):
+		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_NOT_FOUND}, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure getting chat rules")
+		return nil, status.Error(codes.Internal, "")
+	}
+	discardKeyEnvelope := rules.IsPrivate && !rules.isCreator(userID)
+
 	// Leaving a group the caller is not in — never joined, or already gone —
 	// is a no-op that already holds: the caller asked not to be a member, and
 	// they are not. The store answers it without a transition.
-	changed, roster, err := s.chats.RemoveGroupMember(ctx, req.ChatId, userID)
+	changed, roster, err := s.chats.RemoveGroupMember(ctx, req.ChatId, userID, discardKeyEnvelope)
 	switch {
 	case errors.Is(err, ErrChatNotFound):
 		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_NOT_FOUND}, nil

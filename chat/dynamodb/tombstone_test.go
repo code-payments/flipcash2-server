@@ -27,9 +27,9 @@ import (
 // any of these would delete live memberships silently.
 func TestChat_TombstoneTTL(t *testing.T) {
 	ctx := context.Background()
-	require.NoError(t, CreateTables(ctx, testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable))
+	require.NoError(t, CreateTables(ctx, testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, nil)
+	testStore := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, nil)
 	defer testStore.(*store).reset()
 
 	ttl, err := testEnv.Client.DescribeTimeToLive(ctx, &dynamodb.DescribeTimeToLiveInput{TableName: aws.String(groupMembersTable)})
@@ -63,7 +63,7 @@ func TestChat_TombstoneTTL(t *testing.T) {
 	require.NotContains(t, memberItem(), attrExpiresAt)
 
 	// A departure stamps expiry at left_at plus the TTL, in epoch seconds.
-	changed, _, err := testStore.RemoveGroupMember(ctx, c.ID, userID)
+	changed, _, err := testStore.RemoveGroupMember(ctx, c.ID, userID, false)
 	require.NoError(t, err)
 	require.True(t, changed)
 	item := memberItem()
@@ -83,7 +83,7 @@ func TestChat_TombstoneTTL(t *testing.T) {
 	require.Contains(t, item, attrJoinedAt)
 
 	// Leaving again stamps it afresh.
-	changed, _, err = testStore.RemoveGroupMember(ctx, c.ID, userID)
+	changed, _, err = testStore.RemoveGroupMember(ctx, c.ID, userID, false)
 	require.NoError(t, err)
 	require.True(t, changed)
 	require.Contains(t, memberItem(), attrExpiresAt)

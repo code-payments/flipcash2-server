@@ -10,8 +10,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// CreateTables provisions the chats, dm_inbox, group_members and
-// chat_user_state tables with on-demand billing. The chats table is keyed by
+// CreateTables provisions the chats, dm_inbox, group_members,
+// chat_user_state, chat_activity and chat_key_envelopes tables with on-demand
+// billing. The chats table is keyed by
 // pk only; dm_inbox is keyed by (pk, sk) with a GSI ordering each user's DMs
 // by last_activity; group_members is keyed by (pk, sk) = (chat, user) — plus
 // one "#meta" aggregates item per group — with an inverted GSI for listing a
@@ -24,8 +25,9 @@ import (
 // user (see gsiUserStateByUser); chat_activity is keyed by (pk, sk) = (chat,
 // user) with two LSIs, one by last_sent_at (lsiByLastSentAt) and one by
 // activity_score (lsiByActivityScore, reserved and empty today), and TTL on
-// expires_at. It is idempotent and blocks until all tables are ACTIVE.
-func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable string) error {
+// expires_at; chat_key_envelopes is keyed by (pk, sk) = (user, chat) with no
+// index. It is idempotent and blocks until all tables are ACTIVE.
+func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
 			TableName:   aws.String(chatsTable),
@@ -202,6 +204,18 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				},
 			},
 		},
+		{
+			TableName:   aws.String(keyEnvelopesTable),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+			},
+		},
 	}
 
 	for _, input := range inputs {
@@ -268,6 +282,9 @@ func (s *store) reset() {
 		panic(err)
 	}
 	if err := clearTable(ctx, s.client, s.activityTable, []string{attrPK, attrSK}); err != nil {
+		panic(err)
+	}
+	if err := clearTable(ctx, s.client, s.keyEnvelopesTable, []string{attrPK, attrSK}); err != nil {
 		panic(err)
 	}
 }

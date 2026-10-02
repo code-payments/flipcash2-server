@@ -26,6 +26,10 @@ var (
 	// A chat nobody belongs to is unreachable: no one can read it, send to it,
 	// or be added to it, since every such path gates on membership.
 	ErrNoMembers = errors.New("chat must have at least one member")
+
+	// ErrKeyEnvelopeNotFound indicates that a user has no key envelope stored
+	// for a chat.
+	ErrKeyEnvelopeNotFound = errors.New("key envelope not found")
 )
 
 // MaxGroupChatCreationMembers is the largest initial member set a group chat
@@ -89,6 +93,15 @@ type DmFeedCursor struct {
 // aggregate alongside the record — and moves Version by exactly one on a real
 // change and not at all on a no-op, so a retried or duplicated request is
 // harmless.
+//
+// A key envelope (see KeyEnvelope) is likewise one record per (user, chat),
+// for a private group: the group's chat key as that user can open it. It is
+// written against the IDs alone, like viewer state, and knows nothing of the
+// group or its roster: that the chat is a private group, and that the user is
+// a member, are the caller's gates. The one tie to the roster is a departure,
+// which removes the envelope in the same write when the caller asks it to
+// (see RemoveGroupMember). A store of one is one conditional write of the one
+// record, so a retried or duplicated request is harmless.
 type Store interface {
 	// PutChat persists a new chat and its membership. It returns ErrChatExists
 	// if a chat with the same ID already exists, ErrNoMembers if the member set
@@ -134,7 +147,15 @@ type Store interface {
 	// the record; changed and roster are as for AddGroupMembers. It returns
 	// ErrChatNotFound if the chat does not exist, and an error if chatID is not
 	// a group chat ID.
-	RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (changed bool, roster RosterSummary, err error)
+	//
+	// With discardKeyEnvelope, a departure that actually happens also removes
+	// the user's key envelope for the chat (see KeyEnvelope), atomically with
+	// it: the user stops being a member and stops holding an envelope
+	// together, or neither. A no-op removes nothing, the envelope included.
+	// Whether a departure takes the envelope is the caller's to say, since
+	// the store knows neither that a group is private nor who created it (see
+	// Server.LeaveChat).
+	RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, discardKeyEnvelope bool) (changed bool, roster RosterSummary, err error)
 
 	// SetGroupPicture sets a group chat's picture to the blob holding its
 	// ORIGINAL rendition, replacing any picture already set; a nil blobID clears
@@ -422,4 +443,25 @@ type Store interface {
 	// exist, is an empty result. It returns an error if chatID is not a group
 	// chat ID.
 	GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]RecentSender, error)
+
+	// SetKeyEnvelope stores envelope as userID's key envelope for the group
+	// chatID, and returns the envelope that stands after the call. An
+	// envelope the user wrapped themself (KeyEnvelope.IsWrappedBy userID) is
+	// never replaced: when one is stored, nothing is written and it is
+	// returned, whatever the call carried. Otherwise the call's envelope is
+	// stored, over none or over one someone else wrapped for the user, and
+	// returned. So the first envelope a user stores for themself stands, a
+	// repeat of the stored envelope is the no-op it looks like, and a caller
+	// learns whether its envelope is the one stored by comparing it with the
+	// one returned (KeyEnvelope.Equal). The check and the write are one
+	// conditional write, so two concurrent calls agree on which envelope
+	// stands. It returns an error if chatID is not a group chat ID, or if
+	// envelope.WrappedBy is nil.
+	SetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope KeyEnvelope) (KeyEnvelope, error)
+
+	// GetKeyEnvelope returns userID's key envelope for chatID, or
+	// ErrKeyEnvelopeNotFound when they have none. The read is strongly
+	// consistent: it reflects every write that completed before it, so a
+	// user who just stored an envelope, or was just given one, reads it.
+	GetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (KeyEnvelope, error)
 }

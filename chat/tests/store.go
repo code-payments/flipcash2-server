@@ -84,6 +84,10 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_Activity_Precision,
 		testStore_Activity_Scope,
 		testStore_Activity_Concurrent,
+		testStore_KeyEnvelope_SetAndGet,
+		testStore_KeyEnvelope_OwnWrapStands,
+		testStore_KeyEnvelope_DiscardedOnLeave,
+		testStore_KeyEnvelope_Concurrent,
 	} {
 		tf(t, s)
 		teardown()
@@ -1066,7 +1070,7 @@ func addGroupMembers(t *testing.T, s chat.Store, chatID *commonpb.ChatId, userID
 
 func removeGroupMember(t *testing.T, s chat.Store, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, chat.RosterSummary) {
 	t.Helper()
-	changed, roster, err := s.RemoveGroupMember(context.Background(), chatID, userID)
+	changed, roster, err := s.RemoveGroupMember(context.Background(), chatID, userID, false)
 	require.NoError(t, err)
 	return changed, roster
 }
@@ -1290,7 +1294,7 @@ func testStore_GroupChat_MembersPage(t *testing.T, s chat.Store) {
 
 	// A departed member sits between the others in key order and must be
 	// stepped over, not counted against the limit.
-	changed, _, err := s.RemoveGroupMember(ctx, c.ID, users[2])
+	changed, _, err := s.RemoveGroupMember(ctx, c.ID, users[2], false)
 	require.NoError(t, err)
 	require.True(t, changed)
 	joined := []*commonpb.UserId{users[0], users[1], users[3], users[4]}
@@ -1678,14 +1682,14 @@ func testStore_GroupChat_AddMembersErrors(t *testing.T, s chat.Store) {
 	// orphaned records, and report the chat missing rather than a no-op.
 	_, _, err := s.AddGroupMembers(ctx, chat.MustGenerateGroupChatID(), []*commonpb.UserId{user})
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
-	_, _, err = s.RemoveGroupMember(ctx, chat.MustGenerateGroupChatID(), user)
+	_, _, err = s.RemoveGroupMember(ctx, chat.MustGenerateGroupChatID(), user, false)
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 
 	// Group membership methods reject DM chat IDs outright.
 	dm := putDmChat(t, s, user, model.MustGenerateUserID(), at(1))
 	_, _, err = s.AddGroupMembers(ctx, dm.ID, []*commonpb.UserId{user})
 	require.Error(t, err)
-	_, _, err = s.RemoveGroupMember(ctx, dm.ID, user)
+	_, _, err = s.RemoveGroupMember(ctx, dm.ID, user, false)
 	require.Error(t, err)
 
 	// An unknown group chat has no members, as opposed to an empty set.
@@ -2569,5 +2573,215 @@ func requireRecentSenders(t *testing.T, senders []chat.RecentSender, want ...any
 	for i, sender := range senders {
 		require.Equal(t, want[2*i].(*commonpb.UserId).Value, sender.UserID.Value, "sender %d", i)
 		require.True(t, want[2*i+1].(time.Time).Equal(sender.LastSentAt), "sender %d sent at %v, want %v", i, sender.LastSentAt, want[2*i+1])
+	}
+}
+
+// keyEnvelope builds a key envelope stored by wrappedBy. The store never
+// opens one, so any bytes of the right length stand in for a wrapped key.
+func keyEnvelope(fill byte, wrappedBy *commonpb.UserId) chat.KeyEnvelope {
+	return chat.KeyEnvelope{
+		Scheme:     chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305,
+		Nonce:      bytes.Repeat([]byte{fill}, 24),
+		Ciphertext: bytes.Repeat([]byte{fill}, 48),
+		WrappedBy:  wrappedBy,
+	}
+}
+
+func testStore_KeyEnvelope_SetAndGet(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// Stored against the IDs alone: no canonical record or membership is
+	// read, so neither a group nobody created nor a non-member stops it.
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+
+	_, err := s.GetKeyEnvelope(ctx, groupID, user)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// The first envelope a user stores for themself is stored as given, and
+	// read back exactly.
+	first := keyEnvelope(1, user)
+	stored, err := s.SetKeyEnvelope(ctx, groupID, user, first)
+	require.NoError(t, err)
+	require.True(t, first.Equal(stored))
+	got, err := s.GetKeyEnvelope(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, first.Equal(got))
+	require.Equal(t, chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305, got.Scheme)
+	require.Equal(t, user.Value, got.WrappedBy.Value)
+
+	// Storing it again is a no-op that returns it.
+	stored, err = s.SetKeyEnvelope(ctx, groupID, user, first)
+	require.NoError(t, err)
+	require.True(t, first.Equal(stored))
+
+	// An envelope belongs to one user on one chat.
+	_, err = s.GetKeyEnvelope(ctx, groupID, model.MustGenerateUserID())
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	_, err = s.GetKeyEnvelope(ctx, chat.MustGenerateGroupChatID(), user)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	otherGroup := chat.MustGenerateGroupChatID()
+	second := keyEnvelope(2, user)
+	stored, err = s.SetKeyEnvelope(ctx, otherGroup, user, second)
+	require.NoError(t, err)
+	require.True(t, second.Equal(stored))
+	got, err = s.GetKeyEnvelope(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, first.Equal(got))
+
+	// Groups only, and an envelope names who stored it.
+	_, err = s.SetKeyEnvelope(ctx, generateDmChatID(), user, first)
+	require.Error(t, err)
+	_, err = s.SetKeyEnvelope(ctx, groupID, user, keyEnvelope(3, nil))
+	require.Error(t, err)
+}
+
+// testStore_KeyEnvelope_OwnWrapStands pins which envelope stands (see
+// chat.Store.SetKeyEnvelope): one the user wrapped themself is never
+// replaced, and one someone else wrapped for them always is.
+func testStore_KeyEnvelope_OwnWrapStands(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	groupID := chat.MustGenerateGroupChatID()
+	creator := model.MustGenerateUserID()
+	member := model.MustGenerateUserID()
+
+	// A different envelope of the user's own changes nothing, and the stored
+	// one is returned.
+	first := keyEnvelope(1, creator)
+	_, err := s.SetKeyEnvelope(ctx, groupID, creator, first)
+	require.NoError(t, err)
+	stored, err := s.SetKeyEnvelope(ctx, groupID, creator, keyEnvelope(2, creator))
+	require.NoError(t, err)
+	require.True(t, first.Equal(stored))
+	got, err := s.GetKeyEnvelope(ctx, groupID, creator)
+	require.NoError(t, err)
+	require.True(t, first.Equal(got))
+
+	// An envelope the creator wrapped for a member is stored, and replaced
+	// by a later one from the creator...
+	admitted := keyEnvelope(3, creator)
+	stored, err = s.SetKeyEnvelope(ctx, groupID, member, admitted)
+	require.NoError(t, err)
+	require.True(t, admitted.Equal(stored))
+	readmitted := keyEnvelope(4, creator)
+	stored, err = s.SetKeyEnvelope(ctx, groupID, member, readmitted)
+	require.NoError(t, err)
+	require.True(t, readmitted.Equal(stored))
+
+	// ...and by the member's own, which then stands against both.
+	rewrapped := keyEnvelope(5, member)
+	stored, err = s.SetKeyEnvelope(ctx, groupID, member, rewrapped)
+	require.NoError(t, err)
+	require.True(t, rewrapped.Equal(stored))
+	for _, later := range []chat.KeyEnvelope{keyEnvelope(6, creator), keyEnvelope(7, member)} {
+		stored, err = s.SetKeyEnvelope(ctx, groupID, member, later)
+		require.NoError(t, err)
+		require.True(t, rewrapped.Equal(stored))
+	}
+	got, err = s.GetKeyEnvelope(ctx, groupID, member)
+	require.NoError(t, err)
+	require.True(t, rewrapped.Equal(got))
+	require.Equal(t, member.Value, got.WrappedBy.Value)
+
+	// The same bytes stored by someone else are not the same envelope.
+	require.False(t, rewrapped.Equal(keyEnvelope(5, creator)))
+}
+
+// testStore_KeyEnvelope_DiscardedOnLeave pins that a departure removes the
+// departing user's envelope exactly when the caller asks, and only when the
+// departure actually happens (see chat.Store.RemoveGroupMember).
+func testStore_KeyEnvelope_DiscardedOnLeave(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	creator := model.MustGenerateUserID()
+	member := model.MustGenerateUserID()
+	stranger := model.MustGenerateUserID()
+	c := putGroupChat(t, s, "Private", at(100), creator, member)
+
+	creatorEnvelope := keyEnvelope(1, creator)
+	_, err := s.SetKeyEnvelope(ctx, c.ID, creator, creatorEnvelope)
+	require.NoError(t, err)
+	_, err = s.SetKeyEnvelope(ctx, c.ID, member, keyEnvelope(2, member))
+	require.NoError(t, err)
+	strangerEnvelope := keyEnvelope(3, stranger)
+	_, err = s.SetKeyEnvelope(ctx, c.ID, stranger, strangerEnvelope)
+	require.NoError(t, err)
+
+	// A departure asked to discard takes the envelope with it, and no one
+	// else's.
+	changed, _, err := s.RemoveGroupMember(ctx, c.ID, member, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, err = s.GetKeyEnvelope(ctx, c.ID, member)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	got, err := s.GetKeyEnvelope(ctx, c.ID, creator)
+	require.NoError(t, err)
+	require.True(t, creatorEnvelope.Equal(got))
+
+	// Nothing stands once it is gone: a returning member's next envelope is
+	// stored.
+	_, _, err = s.AddGroupMembers(ctx, c.ID, []*commonpb.UserId{member})
+	require.NoError(t, err)
+	next := keyEnvelope(4, creator)
+	stored, err := s.SetKeyEnvelope(ctx, c.ID, member, next)
+	require.NoError(t, err)
+	require.True(t, next.Equal(stored))
+
+	// A departure not asked to discard keeps it, as the creator's is kept.
+	changed, _, err = s.RemoveGroupMember(ctx, c.ID, creator, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	got, err = s.GetKeyEnvelope(ctx, c.ID, creator)
+	require.NoError(t, err)
+	require.True(t, creatorEnvelope.Equal(got))
+
+	// A user with no envelope leaves all the same.
+	changed, _, err = s.RemoveGroupMember(ctx, c.ID, member, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+	changed, _, err = s.AddGroupMembers(ctx, c.ID, []*commonpb.UserId{member})
+	require.NoError(t, err)
+	require.True(t, changed)
+	changed, _, err = s.RemoveGroupMember(ctx, c.ID, member, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	// A no-op removes nothing: the envelope goes with a departure, not with
+	// the request for one.
+	changed, _, err = s.RemoveGroupMember(ctx, c.ID, stranger, true)
+	require.NoError(t, err)
+	require.False(t, changed)
+	got, err = s.GetKeyEnvelope(ctx, c.ID, stranger)
+	require.NoError(t, err)
+	require.True(t, strangerEnvelope.Equal(got))
+}
+
+// testStore_KeyEnvelope_Concurrent pins that concurrent first writes agree:
+// exactly one envelope is stored, and every caller is told which.
+func testStore_KeyEnvelope_Concurrent(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+
+	const writers = 8
+	results := make([]chat.KeyEnvelope, writers)
+	errs := make([]error, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = s.SetKeyEnvelope(ctx, groupID, user, keyEnvelope(byte(i+1), user))
+		}()
+	}
+	wg.Wait()
+
+	got, err := s.GetKeyEnvelope(ctx, groupID, user)
+	require.NoError(t, err)
+	for i := 0; i < writers; i++ {
+		require.NoError(t, errs[i])
+		require.True(t, got.Equal(results[i]))
 	}
 }

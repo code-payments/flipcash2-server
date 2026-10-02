@@ -585,7 +585,9 @@ func testMembershipFollowsStreams(t *testing.T, accounts account.Store) {
 		func() (bool, chat.RosterSummary, error) {
 			return testEnv.chats.AddGroupMembers(ctx, group, []*commonpb.UserId{userA})
 		},
-		func() (bool, chat.RosterSummary, error) { return testEnv.chats.RemoveGroupMember(ctx, group, userA) },
+		func() (bool, chat.RosterSummary, error) {
+			return testEnv.chats.RemoveGroupMember(ctx, group, userA, false)
+		},
 		func() (bool, chat.RosterSummary, error) {
 			return testEnv.chats.AddGroupMembers(ctx, group, []*commonpb.UserId{userA})
 		},
@@ -712,7 +714,7 @@ func testMembershipReconciles(t *testing.T, accounts account.Store) {
 	// streams off the topic, server1's row goes, and a chat publish from
 	// either side no longer reaches them — their next event is the user event
 	// that follows.
-	changed, _, err = testEnv.chats.RemoveGroupMember(ctx, group, userA)
+	changed, _, err = testEnv.chats.RemoveGroupMember(ctx, group, userA, false)
 	require.NoError(t, err)
 	require.True(t, changed)
 	waitForChatSubscribers(map[string]bool{self(testEnv.server2): true})

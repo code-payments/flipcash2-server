@@ -21,9 +21,10 @@ import (
 // mutable — and can be mutated by other processes, which this cache can never
 // observe — so group membership checks and member lists always defer to the
 // backing store. The rest of the store is passed straight through, viewer
-// state and activity reads included: a user's state is theirs to change at any
-// time, a group's recent senders change with every send, and both reads are
-// already one strongly consistent query, so nothing of either is held.
+// state, activity reads and key envelopes included: a user's state is theirs
+// to change at any time, a group's recent senders change with every send, and
+// both reads are already one strongly consistent query, so nothing of either
+// is held.
 //
 // One thing is held that is not fixed at creation: a lower bound on each
 // activity record, so a throttled send costs no write (see RecordSend). It can
@@ -60,8 +61,8 @@ func (c *Cache) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 	return c.db.AddGroupMembers(ctx, chatID, userIDs)
 }
 
-func (c *Cache) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, chat.RosterSummary, error) {
-	return c.db.RemoveGroupMember(ctx, chatID, userID)
+func (c *Cache) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, discardKeyEnvelope bool) (bool, chat.RosterSummary, error) {
+	return c.db.RemoveGroupMember(ctx, chatID, userID, discardKeyEnvelope)
 }
 
 func (c *Cache) SetGroupPicture(ctx context.Context, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
@@ -267,6 +268,17 @@ func (c *Cache) RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID 
 
 func (c *Cache) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]chat.RecentSender, error) {
 	return c.db.GetRecentSenders(ctx, chatID, limit)
+}
+
+// The key envelope methods pass through: an envelope is read once per chat
+// per install, and one a user wrapped for themself replaces the one they were
+// admitted with, so there is nothing worth holding and something to get wrong.
+func (c *Cache) SetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (chat.KeyEnvelope, error) {
+	return c.db.SetKeyEnvelope(ctx, chatID, userID, envelope)
+}
+
+func (c *Cache) GetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.KeyEnvelope, error) {
+	return c.db.GetKeyEnvelope(ctx, chatID, userID)
 }
 
 // sendActivityCacheKey keys the activity cache by (group, user). Only group

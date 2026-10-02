@@ -51,8 +51,9 @@ import (
 // And while private groups are being built, only a staff user may create one
 // (DENIED otherwise, see canCreatePrivateGroup). What is created is a group
 // without a key: the creator's client stores the chat key's envelope as a
-// second step, since the envelope is bound to the chat ID this RPC returns,
-// and until it has, nothing happens in the group (see Chat.IsPrivate).
+// second step (see SetKeyEnvelope), since the envelope is bound to the chat
+// ID this RPC returns, and until it has, nothing happens in the group (see
+// Chat.IsPrivate).
 //
 // The RPC is retry-safe. The group's ID is derived from the caller and the
 // request's idempotency key (see MustDeriveGroupChatID), so a retry names the
@@ -250,9 +251,10 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 
 // canCreatePrivateGroup reports whether userID may create a private group:
 // today, only a staff user. It is a transitional gate, like use_e2ee's (see
-// useE2ee): private groups are being built in steps, and one created now has
-// no key and no lobby, so it is a group nobody can join or speak in. Opening
-// creation to everyone is removing this check, once the rest is built.
+// useE2ee): private groups are being built in steps, and one created now can
+// be given its key but has no lobby and takes no messages, so it is a group
+// nobody can join or speak in. Opening creation to everyone is removing this
+// check, once the rest is built.
 func (s *Server) canCreatePrivateGroup(ctx context.Context, userID *commonpb.UserId) (bool, error) {
 	return s.accounts.IsStaff(ctx, userID)
 }

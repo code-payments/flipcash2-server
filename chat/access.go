@@ -378,14 +378,17 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 // first, so a chat's rules are never evaluated for a send on behalf of a
 // non-member. It is false, not an error, for a chat that does not exist.
 //
-// No one speaks in a private group: nothing happens in one until its creator
-// has stored its key, and no key can be stored yet (see Chat.IsPrivate). The
-// refusal is decided off the rules read, which a store caches with the rules,
-// so it costs nothing a send did not already pay. It is every gate CanSpeak
-// stands behind at once: a send, an edit, a deletion, a typing notification,
-// and mention suggestions. The RuleEvaluator would refuse a private group
-// too, since no rule admits anyone to one; the refusal is made here because
-// it is this one that a stored key will lift.
+// No one speaks in a private group, whether or not its key is stored (see
+// Chat.IsPrivate). A group with no key takes nothing by contract. A group
+// with one is meant to take encrypted content from its members and nothing
+// else, and messaging does not enforce that yet, so lifting the refusal for a
+// keyed group now would let plaintext into it. The refusal is decided off the
+// rules read, which a store caches with the rules, so it costs nothing a send
+// did not already pay. It is every gate CanSpeak stands behind at once: a
+// send, an edit, a deletion, a typing notification, and mention suggestions.
+// The RuleEvaluator would refuse a private group too, since no rule admits
+// anyone to one; the refusal is made here because it is this one that a
+// stored key will lift, on membership and the key alone.
 func (a *Access) CanSpeak(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
 	isMember, err := a.chats.IsMember(ctx, chatID, userID)
 	if err != nil || !isMember {

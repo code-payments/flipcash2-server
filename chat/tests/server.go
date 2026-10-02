@@ -112,6 +112,9 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_StartChat_PrivateGroup,
 		testServer_PrivateGroup_Visibility,
 		testServer_PrivateGroup_Membership,
+		testServer_KeyEnvelope_Gates,
+		testServer_KeyEnvelope_Creator,
+		testServer_KeyEnvelope_Member,
 		testServer_StartChat_InvalidRules,
 		testServer_StartChat_RulesNotSatisfied,
 		testServer_StartChat_WithRules,
@@ -1047,7 +1050,7 @@ func testServer_GetMentionSuggestions(t *testing.T, s chat.Store) {
 	e.recordSend(groupID, blocker, at(45))
 	e.recordSend(groupID, nameless, at(50))
 	e.recordSend(groupID, e.userID, at(60))
-	_, _, err := s.RemoveGroupMember(e.ctx, groupID, departed)
+	_, _, err := s.RemoveGroupMember(e.ctx, groupID, departed, false)
 	require.NoError(t, err)
 
 	// Most recent first; someone who left is still suggested, and so is
@@ -1684,7 +1687,7 @@ func testServer_GetChat_Group_MembershipLifecycle(t *testing.T, s chat.Store) {
 
 	// A removed member is a non-member — the tombstone is not membership — and
 	// is shown the group as one...
-	_, _, err := s.RemoveGroupMember(e.ctx, chatID, e.userID)
+	_, _, err := s.RemoveGroupMember(e.ctx, chatID, e.userID, false)
 	require.NoError(t, err)
 	resp = e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
@@ -2328,7 +2331,7 @@ func testServer_GetGroupChatFeed_DropsDepartedBetweenPages(t *testing.T, s chat.
 	require.Equal(t, [][]byte{g3.Value}, metadataChatIDs(page1.Chats))
 	require.True(t, page1.HasMore)
 
-	_, _, err := s.RemoveGroupMember(e.ctx, g2, e.userID)
+	_, _, err := s.RemoveGroupMember(e.ctx, g2, e.userID, false)
 	require.NoError(t, err)
 
 	page2 := e.mustGetGroupFeed(&commonpb.QueryOptions{PageSize: 10, PagingToken: page1.PagingToken})
@@ -2892,6 +2895,188 @@ func (e *serverEnv) mustStartGroupChatWithKey(keys model.KeyPair, key *chatpb.Id
 	resp, err := e.startGroupChatWithKey(keys, key, params)
 	require.NoError(e.t, err)
 	return resp
+}
+
+// keyEnvelopeProto builds a key envelope as a client sends one. The server
+// never opens it, so any bytes of the right length stand in for a wrapped key.
+func keyEnvelopeProto(fill byte) *chatpb.KeyEnvelope {
+	return &chatpb.KeyEnvelope{
+		Scheme:     chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305,
+		Nonce:      bytes.Repeat([]byte{fill}, 24),
+		Ciphertext: bytes.Repeat([]byte{fill}, 48),
+	}
+}
+
+func (e *serverEnv) setKeyEnvelope(keys model.KeyPair, chatID *commonpb.ChatId, envelope *chatpb.KeyEnvelope) (*chatpb.SetKeyEnvelopeResponse, error) {
+	req := &chatpb.SetKeyEnvelopeRequest{ChatId: chatID, KeyEnvelope: envelope}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.SetKeyEnvelope(e.ctx, req)
+}
+
+func (e *serverEnv) mustSetKeyEnvelope(keys model.KeyPair, chatID *commonpb.ChatId, envelope *chatpb.KeyEnvelope) *chatpb.SetKeyEnvelopeResponse {
+	resp, err := e.setKeyEnvelope(keys, chatID, envelope)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) mustGetKeyEnvelope(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.GetKeyEnvelopeResponse {
+	req := &chatpb.GetKeyEnvelopeRequest{ChatId: chatID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.GetKeyEnvelope(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// putPrivateGroup persists a private group created by the env user, whose
+// members are the env user and the given others.
+func (e *serverEnv) putPrivateGroup(title string, others ...*commonpb.UserId) *commonpb.ChatId {
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      append([]*commonpb.UserId{e.userID}, others...),
+		Title:        title,
+		IsPrivate:    true,
+		CreatorID:    e.userID,
+		LastActivity: at(1),
+	}))
+	return chatID
+}
+
+// testServer_KeyEnvelope_Gates pins who may store and fetch a key envelope:
+// a member of a private group, and no one else of anything else.
+func testServer_KeyEnvelope_Gates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	_, strangerKeys := e.addUser()
+
+	requireBoth := func(keys model.KeyPair, chatID *commonpb.ChatId, set chatpb.SetKeyEnvelopeResponse_Result, get chatpb.GetKeyEnvelopeResponse_Result) {
+		t.Helper()
+		require.Equal(t, set, e.mustSetKeyEnvelope(keys, chatID, keyEnvelopeProto(1)).Result)
+		got := e.mustGetKeyEnvelope(keys, chatID)
+		require.Equal(t, get, got.Result)
+		require.Nil(t, got.KeyEnvelope)
+		require.Nil(t, got.WrappedBy)
+	}
+
+	// A DM has no key envelopes, for its members or anyone.
+	dm := e.putDM(at(1))
+	requireBoth(e.keys, dm, chatpb.SetKeyEnvelopeResponse_DENIED, chatpb.GetKeyEnvelopeResponse_DENIED)
+	requireBoth(strangerKeys, dm, chatpb.SetKeyEnvelopeResponse_DENIED, chatpb.GetKeyEnvelopeResponse_DENIED)
+
+	// A group that does not exist.
+	requireBoth(e.keys, chat.MustGenerateGroupChatID(), chatpb.SetKeyEnvelopeResponse_NOT_FOUND, chatpb.GetKeyEnvelopeResponse_NOT_FOUND)
+
+	// Nor has a public group, for its members.
+	public := e.putGroup("Public", at(1))
+	requireBoth(e.keys, public, chatpb.SetKeyEnvelopeResponse_DENIED, chatpb.GetKeyEnvelopeResponse_DENIED)
+
+	// A private group's are its members' alone, and nothing was stored for
+	// anyone refused.
+	private := e.putPrivateGroup("Private")
+	requireBoth(strangerKeys, private, chatpb.SetKeyEnvelopeResponse_DENIED, chatpb.GetKeyEnvelopeResponse_DENIED)
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_NO_ENVELOPE, e.mustGetKeyEnvelope(e.keys, private).Result)
+	_, err := s.GetKeyEnvelope(e.ctx, public, e.userID)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// An envelope of the wrong shape never reaches the store.
+	for _, malformed := range []*chatpb.KeyEnvelope{
+		nil,
+		{Scheme: chatpb.KeyEnvelope_UNKNOWN, Nonce: bytes.Repeat([]byte{1}, 24), Ciphertext: bytes.Repeat([]byte{1}, 48)},
+		{Scheme: chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305, Nonce: bytes.Repeat([]byte{1}, 23), Ciphertext: bytes.Repeat([]byte{1}, 48)},
+		{Scheme: chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305, Nonce: bytes.Repeat([]byte{1}, 24), Ciphertext: bytes.Repeat([]byte{1}, 49)},
+	} {
+		_, err := e.setKeyEnvelope(e.keys, private, malformed)
+		require.Equal(t, codes.InvalidArgument, status.Code(err))
+	}
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_NO_ENVELOPE, e.mustGetKeyEnvelope(e.keys, private).Result)
+}
+
+// testServer_KeyEnvelope_Creator pins the second step of creating a private
+// group: its creator stores the chat key's envelope, the first one stored
+// stands whatever a later call carries, and it is kept when they leave.
+func testServer_KeyEnvelope_Creator(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.accounts.setStaff(e.userID, true)
+
+	created := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, created.Result)
+	chatID := created.Chat.ChatId
+
+	// A new group has no key.
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_NO_ENVELOPE, e.mustGetKeyEnvelope(e.keys, chatID).Result)
+
+	// The creator stores it, and reads it back as their own.
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_OK, e.mustSetKeyEnvelope(e.keys, chatID, keyEnvelopeProto(1)).Result)
+	requireStored := func() {
+		t.Helper()
+		got := e.mustGetKeyEnvelope(e.keys, chatID)
+		require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, got.Result)
+		require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(1), got.KeyEnvelope))
+		require.Equal(t, e.userID.Value, got.WrappedBy.GetValue())
+	}
+	requireStored()
+
+	// A retry of the same envelope is OK; a different one, as a second device
+	// setting up the same group would send, is ALREADY_SET and changes
+	// nothing.
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_OK, e.mustSetKeyEnvelope(e.keys, chatID, keyEnvelopeProto(1)).Result)
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_ALREADY_SET, e.mustSetKeyEnvelope(e.keys, chatID, keyEnvelopeProto(2)).Result)
+	requireStored()
+
+	// Leaving keeps the creator's envelope, though only a member reads it:
+	// it is there again when they rejoin.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_DENIED, e.mustGetKeyEnvelope(e.keys, chatID).Result)
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_DENIED, e.mustSetKeyEnvelope(e.keys, chatID, keyEnvelopeProto(3)).Result)
+	_, err := s.GetKeyEnvelope(e.ctx, chatID, e.userID)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, chatID).Result)
+	requireStored()
+}
+
+// testServer_KeyEnvelope_Member pins a member's envelope: the one the creator
+// wrapped for them is read back as the creator's, they replace it once with
+// one of their own, and it is discarded when they leave.
+func testServer_KeyEnvelope_Member(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// No RPC admits a member to a private group yet, so the membership and
+	// the envelope the creator would have wrapped are written by hand.
+	memberID, memberKeys := e.addUser()
+	chatID := e.putPrivateGroup("Sunday Hikers", memberID)
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_OK, e.mustSetKeyEnvelope(e.keys, chatID, keyEnvelopeProto(1)).Result)
+	_, err := s.SetKeyEnvelope(e.ctx, chatID, memberID, chat.KeyEnvelopeFromProto(keyEnvelopeProto(2), e.userID))
+	require.NoError(t, err)
+
+	got := e.mustGetKeyEnvelope(memberKeys, chatID)
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, got.Result)
+	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(2), got.KeyEnvelope))
+	require.Equal(t, e.userID.Value, got.WrappedBy.GetValue())
+
+	// The member wraps the key for themself, which replaces the creator's
+	// envelope and then stands.
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_OK, e.mustSetKeyEnvelope(memberKeys, chatID, keyEnvelopeProto(3)).Result)
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_ALREADY_SET, e.mustSetKeyEnvelope(memberKeys, chatID, keyEnvelopeProto(4)).Result)
+	got = e.mustGetKeyEnvelope(memberKeys, chatID)
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, got.Result)
+	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(3), got.KeyEnvelope))
+	require.Equal(t, memberID.Value, got.WrappedBy.GetValue())
+
+	// Each member's envelope is their own: the creator's is untouched.
+	got = e.mustGetKeyEnvelope(e.keys, chatID)
+	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(1), got.KeyEnvelope))
+
+	// Leaving discards the member's envelope and no one else's.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(memberKeys, chatID).Result)
+	_, err = s.GetKeyEnvelope(e.ctx, chatID, memberID)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	_, err = s.GetKeyEnvelope(e.ctx, chatID, e.userID)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_DENIED, e.mustGetKeyEnvelope(memberKeys, chatID).Result)
+
+	// A leave of a public group is unaffected.
+	public := e.putGroup("Public", at(1), memberID)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(memberKeys, public).Result)
 }
 
 // mustStartPrivateGroupChat starts a private group under the given

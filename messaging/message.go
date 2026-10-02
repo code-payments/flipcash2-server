@@ -467,8 +467,10 @@ func isEncrypted(content []*messagingpb.Content) bool {
 // goes: plaintext always, and encrypted content only under the scheme the chat
 // uses, the one thing in it the server reads. A DM uses the pairwise scheme,
 // X25519_XCHACHA20POLY1305. A group takes no encrypted content at all:
-// CHAT_KEY_XCHACHA20POLY1305 is a private group's scheme, and no group is
-// private yet. A refusal is ENCRYPTION_NOT_ALLOWED on either RPC.
+// CHAT_KEY_XCHACHA20POLY1305 is a private group's scheme, and a private group
+// never reaches this rule, since no one speaks in one yet (see
+// chat.Access.CanSpeak) and its sends are DENIED at the speaker gate before
+// it. A refusal is ENCRYPTION_NOT_ALLOWED on either RPC.
 func encryptionAllowed(chatID *commonpb.ChatId, content []*messagingpb.Content) bool {
 	if !isEncrypted(content) {
 		return true

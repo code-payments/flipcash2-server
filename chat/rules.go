@@ -71,11 +71,13 @@ func (c *Chat) Rules() *chatpb.Rules {
 	return &chatpb.Rules{Listener: listener, Speaker: speaker}
 }
 
-// GroupRules is what a chat's rules are evaluated against: the rules, and the
-// creator a CreatorRequirement names, since the rule itself names no one. Both
-// are fixed at creation and read together (see Store.GetGroupRules), so a
-// store that caches one caches the other with it, and evaluating a
-// creator-only group costs no read beyond its rules.
+// GroupRules is what a chat's rules are evaluated against: the rules, the
+// creator a CreatorRequirement names, since the rule itself names no one, and
+// whether the group is private, which decides who speaks in it before any
+// rule does (see Access.CanSpeak). All are fixed at creation and read
+// together (see Store.GetGroupRules), so a store that caches one caches the
+// others with it, and evaluating a creator-only group, or refusing a send in
+// a private one, costs no read beyond its rules.
 //
 // Everything beside Rules is metadata carried only so that evaluation is
 // efficient: it is what a rule is relative to, read with the rules rather
@@ -89,12 +91,17 @@ type GroupRules struct {
 	// CreatorID is the group's creator, nil when it has none recorded (see
 	// Chat.CreatorID), in which case a CreatorRequirement admits no one.
 	CreatorID *commonpb.UserId
+
+	// IsPrivate is whether the group is private (see Chat.IsPrivate). It is
+	// not a rule, and it overrides them: no rule admits anyone to a private
+	// group, whatever rules its record carries (see RuleEvaluator).
+	IsPrivate bool
 }
 
-// GroupRules returns the chat's rules and creator as a RuleEvaluator
-// evaluates them (see GroupRules).
+// GroupRules returns the chat's rules, creator and privacy as they are
+// evaluated (see GroupRules).
 func (c *Chat) GroupRules() GroupRules {
-	return GroupRules{Rules: c.Rules(), CreatorID: c.CreatorID}
+	return GroupRules{Rules: c.Rules(), CreatorID: c.CreatorID, IsPrivate: c.IsPrivate}
 }
 
 // isCreator reports whether userID is the recorded creator; false when none
@@ -200,6 +207,15 @@ func minimumTransferValue(code currency_lib.Code) float64 {
 // that the rule a client is shown (RulesOf, through Metadata.rules) and the
 // rule a send is refused by (CanSpeak) are one decision.
 //
+// A private group (see Chat.IsPrivate) is not the rules' to open. Its members
+// are admitted by its creator, so the evaluator admits no one to one: every
+// listen and speak evaluation of a private group is false, before any rule is
+// read. StartChat writes a private group with no rules, and an empty rule set
+// admits everyone, so without this a caller that asked the evaluator alone
+// would find a private group open to all; with it, the answer does not depend
+// on what rules the record carries. Who reads and speaks in a private group
+// is decided on membership, by Access.
+//
 // Rules are read through Store.GetGroupRules — in production the caching
 // store, which holds every group's rules after its first read. A
 // StaffRequirement is answered by the account store's staff flag, a
@@ -257,7 +273,8 @@ func (e *RuleEvaluator) RulesOf(c *Chat) *chatpb.Rules {
 
 // CanListen reports whether userID satisfies every listener rule of chatID —
 // the requirements to read (and join) the chat. A chat with no listener rules
-// admits everyone. It returns ErrChatNotFound if a group chat does not exist.
+// admits everyone, except a private group, which admits no one (see
+// RuleEvaluator). It returns ErrChatNotFound if a group chat does not exist.
 func (e *RuleEvaluator) CanListen(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
 	rules, err := e.rulesFor(ctx, chatID, userID)
 	if err != nil {
@@ -270,7 +287,7 @@ func (e *RuleEvaluator) CanListen(ctx context.Context, chatID *commonpb.ChatId, 
 // rules — read off a canonical record it loaded for its own purposes, or
 // taken from a request for a chat that does not exist yet — so the rules are
 // not read a second time. A nil rules.Rules admits everyone, as a chat with
-// none does. chatID is the chat the rules are evaluated for; no rule reads it
+// none does, unless rules.IsPrivate. chatID is the chat the rules are evaluated for; no rule reads it
 // today, since what a rule is relative to comes with the rules (see
 // GroupRules).
 func (e *RuleEvaluator) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules, userID *commonpb.UserId) (bool, error) {
@@ -297,7 +314,12 @@ func (e *RuleEvaluator) CanSpeakWithRules(ctx context.Context, chatID *commonpb.
 	return e.satisfiesSpeaker(ctx, rules, userID)
 }
 
+// satisfiesListener evaluates the listener rules, stopping at the first the
+// user fails. No one satisfies a private group's (see RuleEvaluator).
 func (e *RuleEvaluator) satisfiesListener(ctx context.Context, rules GroupRules, userID *commonpb.UserId) (bool, error) {
+	if rules.IsPrivate {
+		return false, nil
+	}
 	for _, rule := range rules.Rules.GetListener() {
 		ok, err := e.satisfies(ctx, rules, rule.GetKind(), userID)
 		if err != nil || !ok {
@@ -308,7 +330,8 @@ func (e *RuleEvaluator) satisfiesListener(ctx context.Context, rules GroupRules,
 }
 
 // satisfiesSpeaker evaluates the listener rules and then the speaker rules,
-// stopping at the first the user fails.
+// stopping at the first the user fails. A private group fails at the listener
+// rules, like any chat the user cannot listen to.
 func (e *RuleEvaluator) satisfiesSpeaker(ctx context.Context, rules GroupRules, userID *commonpb.UserId) (bool, error) {
 	if ok, err := e.satisfiesListener(ctx, rules, userID); err != nil || !ok {
 		return false, err

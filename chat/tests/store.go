@@ -621,6 +621,33 @@ func testStore_GroupChat_Rules(t *testing.T, s chat.Store) {
 	require.Equal(t, creator.Value, record.CreatorID.GetValue())
 	require.True(t, proto.Equal(creatorOnly.Rules(), record.Rules()))
 
+	// A private group carries no rules, and reads back as private beside
+	// them and on its canonical record. Every other group reads as not.
+	private := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{creator},
+		Title:        "Private",
+		IsPrivate:    true,
+		CreatorID:    creator,
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, private))
+	got, err = s.GetGroupRules(ctx, private.ID)
+	require.NoError(t, err)
+	require.True(t, got.IsPrivate)
+	require.Nil(t, got.Rules)
+	require.Equal(t, creator.Value, got.CreatorID.GetValue())
+	record, err = s.GetChatByID(ctx, private.ID)
+	require.NoError(t, err)
+	require.True(t, record.IsPrivate)
+	got, err = s.GetGroupRules(ctx, creatorOnly.ID)
+	require.NoError(t, err)
+	require.False(t, got.IsPrivate)
+	record, err = s.GetChatByID(ctx, creatorOnly.ID)
+	require.NoError(t, err)
+	require.False(t, record.IsPrivate)
+
 	// The creator is read for any group that recorded one, whatever its rules.
 	withCreator := &chat.Chat{
 		ID:           chat.MustGenerateGroupChatID(),

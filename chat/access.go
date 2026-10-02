@@ -75,6 +75,14 @@ const DefaultListenerAdmissionTTL = 30 * time.Second
 // a client that wants a group blurred asks for REDACTED, and is answered from
 // membership and the rules' existence without the rules being evaluated.
 //
+// A private group (see Chat.IsPrivate) is its members' alone in every form:
+// no non-member listens to it or previews it, whatever mode they ask under,
+// and it has no public view. That is decided on the flag itself, before its
+// rules are looked at. StartChat writes a private group with no rules, which
+// would keep non-members out by the rule above, but a record written with
+// one must not open it. Its record is still shown to any registered user
+// (see Server.GetChat), which is how a user sees what they would ask to join.
+//
 // A chat that does not exist admits no one: IsMember, CanListen and CanSpeak all
 // report false, not ErrChatNotFound, for a chat ID nothing is stored under. A
 // caller that must tell NOT_FOUND from DENIED reads the canonical record itself
@@ -273,7 +281,7 @@ func (a *Access) StandingWithChat(ctx context.Context, c *Chat, userID *commonpb
 // rule may be previewed, and nothing else admits them in any form. Nothing
 // is read: the rules come off the record.
 func (a *Access) PublicStanding(c *Chat) Standing {
-	if !IsGroupChatID(c.ID) || len(c.Rules().GetListener()) == 0 {
+	if !IsGroupChatID(c.ID) || c.IsPrivate || len(c.Rules().GetListener()) == 0 {
 		return Standing{}
 	}
 	return Standing{CanPreview: true}
@@ -343,9 +351,10 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 	if err != nil {
 		return Standing{}, err
 	}
-	// No listener rules, no admission of any kind: only a rule can admit a
-	// non-member (see above).
-	if len(rules.Rules.GetListener()) == 0 {
+	// A private group admits no non-member in any form, whatever its rules.
+	// Otherwise, no listener rules, no admission of any kind: only a rule can
+	// admit a non-member (see above).
+	if rules.IsPrivate || len(rules.Rules.GetListener()) == 0 {
 		return Standing{}, nil
 	}
 	if !evaluate {
@@ -368,18 +377,33 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 // they satisfy the chat's listener and speaker rules. Membership is checked
 // first, so a chat's rules are never evaluated for a send on behalf of a
 // non-member. It is false, not an error, for a chat that does not exist.
+//
+// No one speaks in a private group: nothing happens in one until its creator
+// has stored its key, and no key can be stored yet (see Chat.IsPrivate). The
+// refusal is decided off the rules read, which a store caches with the rules,
+// so it costs nothing a send did not already pay. It is every gate CanSpeak
+// stands behind at once: a send, an edit, a deletion, a typing notification,
+// and mention suggestions. The RuleEvaluator would refuse a private group
+// too, since no rule admits anyone to one; the refusal is made here because
+// it is this one that a stored key will lift.
 func (a *Access) CanSpeak(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
 	isMember, err := a.chats.IsMember(ctx, chatID, userID)
 	if err != nil || !isMember {
 		return false, err
 	}
-	ok, err := a.rules.CanSpeak(ctx, chatID, userID)
+	rules, err := a.rules.rulesFor(ctx, chatID, userID)
 	if errors.Is(err, ErrChatNotFound) {
 		// Membership just confirmed the chat; a not-found here is a chat deleted
 		// between the two reads, which admits no one.
 		return false, nil
 	}
-	return ok, err
+	if err != nil {
+		return false, err
+	}
+	if rules.IsPrivate {
+		return false, nil
+	}
+	return a.rules.CanSpeakWithRules(ctx, chatID, rules, userID)
 }
 
 // admissionKey keys the admission cache by (group, user). Group IDs are fixed

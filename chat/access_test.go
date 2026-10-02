@@ -160,6 +160,85 @@ func TestAccess_GroupMember(t *testing.T) {
 	require.Equal(t, asked+2, f.ocpBalance.asked)
 }
 
+// TestAccess_PrivateGroup: a private group is its members' alone in every
+// form, and no one speaks in it, a member included.
+func TestAccess_PrivateGroup(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	a := NewAccess(f.chats, f.rules)
+
+	creator := model.MustGenerateUserID()
+	private := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: creator})
+	f.chats.join(private.ID, creator)
+
+	// A member reads, and does not speak.
+	ok, err := a.CanListen(ctx, private.ID, creator)
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, err = a.CanSpeak(ctx, private.ID, creator)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// A non-member has no standing under any mode, however funded, whether
+	// the rules are read from the store or come with the record.
+	modes := []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED}
+	for _, mode := range modes {
+		standing, err := a.Standing(ctx, private.ID, f.funded, mode)
+		require.NoError(t, err)
+		require.Equal(t, Standing{}, standing, mode)
+		standing, err = a.StandingWithChat(ctx, private, f.funded, mode)
+		require.NoError(t, err)
+		require.Equal(t, Standing{}, standing, mode)
+	}
+	ok, err = a.CanSpeak(ctx, private.ID, f.funded)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Equal(t, Standing{}, a.PublicStanding(private))
+
+	// The rules admit no one to it either: asked alone, the evaluator refuses
+	// a private group that an empty rule set would open to everyone.
+	for _, u := range []*commonpb.UserId{creator, f.funded} {
+		ok, err = f.rules.CanListen(ctx, private.ID, u)
+		require.NoError(t, err)
+		require.False(t, ok)
+		ok, err = f.rules.CanListenWithRules(ctx, private.ID, private.GroupRules(), u)
+		require.NoError(t, err)
+		require.False(t, ok)
+		ok, err = f.rules.CanSpeak(ctx, private.ID, u)
+		require.NoError(t, err)
+		require.False(t, ok)
+		ok, err = f.rules.CanSpeakWithRules(ctx, private.ID, private.GroupRules(), u)
+		require.NoError(t, err)
+		require.False(t, ok)
+	}
+
+	// None of it rests on the group having no rules. StartChat writes none,
+	// but a private group whose record carries a listener rule a non-member
+	// satisfies is no more open to them: the flag decides, not the rules.
+	ruled := f.chats.put(&Chat{
+		ID:                     MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		IsPrivate:              true,
+		CreatorID:              creator,
+		MinimumListenerBalance: &MinimumBalance{Currency: "usd", NativeAmount: accessRequirement},
+	})
+	for _, mode := range modes {
+		standing, err := a.Standing(ctx, ruled.ID, f.funded, mode)
+		require.NoError(t, err)
+		require.Equal(t, Standing{}, standing, mode)
+		standing, err = a.StandingWithChat(ctx, ruled, f.funded, mode)
+		require.NoError(t, err)
+		require.Equal(t, Standing{}, standing, mode)
+	}
+	require.Equal(t, Standing{}, a.PublicStanding(ruled))
+	ok, err = f.rules.CanListen(ctx, ruled.ID, f.funded)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// No rule was evaluated for any of it.
+	require.Zero(t, f.ocpBalance.asked)
+}
+
 func TestAccess_GroupNonMember(t *testing.T) {
 	ctx := context.Background()
 	f := newAccessFixture(t)

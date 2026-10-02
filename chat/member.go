@@ -31,6 +31,13 @@ import (
 // current member re-joining — a member's reads gate on membership alone (see
 // Access), and so does a no-op join. Leaving has no rule to satisfy.
 //
+// A private group (see Chat.IsPrivate) is not joined here: its members are
+// admitted by its creator from its lobby, which is not built, so JoinChat
+// refuses everyone as DENIED. Everyone but the creator, that is, who needs no
+// one's approval and rejoins a private group they left. No rule is evaluated
+// for them: a private group's rules admit no one (see RuleEvaluator), and
+// being its creator is what admits them.
+//
 // Each transition that actually happens is broadcast as a RosterUpdate to the
 // chat's members and to the affected user (see publishRosterUpdate). A join or
 // departure that is a no-op broadcasts nothing: the roster did not move, and a
@@ -59,6 +66,9 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	if c.Type != chatpb.ChatType_GROUP {
 		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_DENIED}, nil
 	}
+	if c.IsPrivate && !c.IsCreator(userID) {
+		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_DENIED}, nil
+	}
 
 	// A current member re-joining is a no-op answered on membership alone,
 	// before the rules: a member whose balance has since dipped under the
@@ -70,7 +80,8 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	if !isMember {
+	// A private group's caller is its creator by now, whom no rule gates.
+	if !isMember && !c.IsPrivate {
 		// The rules come from the canonical record already in hand rather than
 		// a second read through the evaluator: the record is what they are
 		// projected from.

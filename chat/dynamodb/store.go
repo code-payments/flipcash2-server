@@ -196,6 +196,7 @@ const (
 	attrIsStaffOnly          = "is_staff_only"
 	attrMinListenerBalance   = "min_listener_balance" // map: see minimumBalanceAttr
 	attrIsCreatorOnlySpeaker = "is_creator_only_speaker"
+	attrIsPrivate            = "is_private"
 	attrCreator              = "creator"
 	attrPictureBlobID        = "picture"
 	attrState                = "state"
@@ -1431,19 +1432,20 @@ func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (cha
 	}
 
 	// Only the attributes the rules are projected from: the type, the
-	// attributes that stand for a rule, and the creator a CreatorRequirement
-	// names. The rest of the record — title, picture, activity — is neither
-	// fetched nor deserialized.
+	// attributes that stand for a rule, the creator a CreatorRequirement
+	// names, and whether the group is private. The rest of the record — title,
+	// picture, activity — is neither fetched nor deserialized.
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:            aws.String(s.chatsTable),
 		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
-		ProjectionExpression: aws.String("#type, #staff, #balance, #creatorOnly, #creator"),
+		ProjectionExpression: aws.String("#type, #staff, #balance, #creatorOnly, #creator, #private"),
 		ExpressionAttributeNames: map[string]string{
 			"#type":        attrType,
 			"#staff":       attrIsStaffOnly,
 			"#balance":     attrMinListenerBalance,
 			"#creatorOnly": attrIsCreatorOnlySpeaker,
 			"#creator":     attrCreator,
+			"#private":     attrIsPrivate,
 		},
 	})
 	if err != nil {
@@ -1465,6 +1467,7 @@ func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (cha
 		IsStaffOnly:            asBool(out.Item[attrIsStaffOnly]),
 		MinimumListenerBalance: balance,
 		IsCreatorOnlySpeaker:   asBool(out.Item[attrIsCreatorOnlySpeaker]),
+		IsPrivate:              asBool(out.Item[attrIsPrivate]),
 	}
 	// creator is absent for groups written before it was recorded.
 	if creator := asB(out.Item[attrCreator]); len(creator) > 0 {
@@ -1617,8 +1620,8 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 	}
 	// A group's membership lives in group_members, not on the canonical item —
 	// an inline list could not hold a large group. Title, the staff-only flag,
-	// the minimum listener balance, the creator-only speaker flag, the creator
-	// and the picture are group-only;
+	// the minimum listener balance, the creator-only speaker flag, the private
+	// flag, the creator and the picture are group-only;
 	// each is written only when set, so an absent attribute (including on every
 	// item written before it existed) reads as its zero value.
 	if c.Type == chatpb.ChatType_GROUP {
@@ -1633,6 +1636,9 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 		}
 		if c.IsCreatorOnlySpeaker {
 			item[attrIsCreatorOnlySpeaker] = avBool(true)
+		}
+		if c.IsPrivate {
+			item[attrIsPrivate] = avBool(true)
 		}
 		if c.CreatorID != nil {
 			item[attrCreator] = avB(c.CreatorID.Value)
@@ -1728,6 +1734,7 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 		IsStaffOnly:            asBool(item[attrIsStaffOnly]),
 		MinimumListenerBalance: balance,
 		IsCreatorOnlySpeaker:   asBool(item[attrIsCreatorOnlySpeaker]),
+		IsPrivate:              asBool(item[attrIsPrivate]),
 		LastActivity:           time.Unix(0, nanos).UTC(),
 	}
 	// creator is absent for DMs and for groups written before it was recorded.

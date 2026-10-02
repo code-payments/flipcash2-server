@@ -95,6 +95,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_ViewMode,
 		testServer_StaffOnlyGroup_Rules,
 		testServer_CreatorOnlyGroup_Rules,
+		testServer_PrivateGroup_NoOneSpeaks,
 		testServer_BalanceGatedGroup_Rules,
 		testServer_Broadcast_IncludesActor,
 		testServer_SendMessage_PushPerChatType,
@@ -3340,6 +3341,53 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 	dmResp, err := e.send(e.keysA, "still a dm", generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, dmResp.Result)
+}
+
+// testServer_PrivateGroup_NoOneSpeaks pins that nothing is sent in a private
+// group, whose key cannot be stored yet: a member's send is DENIED whatever it
+// carries, encrypted content included, as is their typing notification, and
+// nothing is written.
+func testServer_PrivateGroup_NoOneSpeaks(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA},
+		Title:        "Private",
+		IsPrivate:    true,
+		CreatorID:    e.userA,
+		LastActivity: at(1),
+	}))
+
+	for _, content := range [][]*messagingpb.Content{
+		textContent("plaintext"),
+		encryptedContent(1),
+		chatKeyEncryptedContent(1),
+	} {
+		resp, err := e.sendContentToChat(e.keysA, groupID, content, generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_DENIED, resp.Result)
+		require.Nil(t, resp.Message)
+	}
+
+	typingResp, err := e.notifyIsTypingInChat(e.keysA, groupID, messagingpb.IsTypingNotification_STARTED_TYPING)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
+
+	// The member still reads it, and finds it empty.
+	got, err := e.getMessagesByOptionsInChat(e.keysA, groupID, nil)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, got.Result)
+
+	// A non-member reads nothing of it under any mode.
+	_, strangerKeys := e.addUser()
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		denied, err := e.getMessagesByOptionsInChatWithMode(strangerKeys, groupID, nil, mode)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_DENIED, denied.Result, mode)
+	}
 }
 
 // testServer_CreatorOnlyGroup_Rules pins that a creator-only group's speaker

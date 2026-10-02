@@ -140,12 +140,13 @@ func (c *Cache) GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb
 }
 
 // GetGroupRules is cached, including the absence of rules (a nil Rules), so a
-// group without any is read once too. Rules and the creator are fixed at
-// creation (see chat.Store), so a cached entry is never stale: if either ever
-// becomes mutable, this needs invalidation on write. That holds only while
-// both are written with the group: a creator backfilled onto a legacy group,
-// or IsCreatorOnlySpeaker set on a group that already exists, reaches a
-// process that has read the group only when it restarts. A cached entry is
+// group without any is read once too. Rules, the creator and whether the
+// group is private are fixed at creation (see chat.Store), so a cached entry
+// is never stale: if any ever becomes mutable, this needs invalidation on
+// write. That holds only while all are written with the group: a creator
+// backfilled onto a legacy group, or IsCreatorOnlySpeaker or IsPrivate set on
+// a group that already exists, reaches a process that has read the group only
+// when it restarts. A cached entry is
 // shared by every caller and must be treated as read-only. Errors — including
 // ErrChatNotFound, since the group may be created later — are not cached.
 func (c *Cache) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (chat.GroupRules, error) {

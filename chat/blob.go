@@ -13,7 +13,9 @@ import (
 // It lives here rather than in blob because blob must not import chat; the
 // dependency is one-way. Keeping it here also keeps the chat ID discriminator
 // (see DmChatIDSize) in the package that owns it: a group ID is refused before
-// membership is ever read, because encrypted content is a DM's alone.
+// membership is ever read, because encrypted content is a DM's alone. That
+// includes a private group's (see Chat.IsPrivate): nothing is uploaded for one
+// before its key is stored, and no key can be stored yet.
 type dmMembership struct {
 	store Store
 }

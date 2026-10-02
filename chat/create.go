@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -45,13 +46,22 @@ import (
 // so they insert the new chat without a refetch. There is no one else to
 // tell.
 //
+// A private group (see Chat.IsPrivate) is created the same way, with two
+// differences. It carries no rules, so there are none to validate or satisfy.
+// And while private groups are being built, only a staff user may create one
+// (DENIED otherwise, see canCreatePrivateGroup). What is created is a group
+// without a key: the creator's client stores the chat key's envelope as a
+// second step, since the envelope is bound to the chat ID this RPC returns,
+// and until it has, nothing happens in the group (see Chat.IsPrivate).
+//
 // The RPC is retry-safe. The group's ID is derived from the caller and the
 // request's idempotency key (see MustDeriveGroupChatID), so a retry names the
 // same group, and one that already exists is answered from its record before
-// any check runs: a title the moderator has since learned to flag, or a
-// balance that has since fallen below the minimum, are facts about a new
-// group, not this one. Which parameters the retry carries does not matter
-// either; the key is the request's identity. A retry that
+// any check runs: a title the moderator has since learned to flag, a balance
+// that has since fallen below the minimum, or a staff flag since revoked, are
+// facts about a new group, not this one. Which parameters the retry carries
+// does not matter either, the kind of group included; the key is the
+// request's identity. A retry that
 // loses a race with its twin — both pass the read, one write lands — is caught
 // by the store's uniqueness condition and answered the same way. Nothing is
 // published for a retry: the creation was announced when it happened.
@@ -63,11 +73,22 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	// Validation requires the oneof to be set. Only a public group can be
-	// created: the private group variant is refused until private groups are
-	// built, like any variant this server predates.
-	params := req.GetPublicGroup()
-	if params == nil {
+	// Validation requires the oneof to be set, so anything but the two kinds
+	// of group here is a variant this server predates. The two differ in what
+	// a group is created with: a public group has rules, a private one has
+	// none.
+	var (
+		title     string
+		picture   *blobpb.BlobId
+		rules     *chatpb.Rules
+		isPrivate bool
+	)
+	switch params := req.Parameters.(type) {
+	case *chatpb.StartChatRequest_PublicGroup:
+		title, picture, rules = params.PublicGroup.GetTitle(), params.PublicGroup.GetPicture(), params.PublicGroup.GetRules()
+	case *chatpb.StartChatRequest_PrivateGroup:
+		title, picture, isPrivate = params.PrivateGroup.GetTitle(), params.PrivateGroup.GetPicture(), true
+	default:
 		return nil, status.Error(codes.InvalidArgument, "unsupported chat parameters")
 	}
 
@@ -87,36 +108,51 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	isStaffOnly, minimumListenerBalance, err := RulesFromProto(params.Rules)
-	if err != nil {
-		return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_INVALID_RULES}, nil
+	var (
+		isStaffOnly            bool
+		minimumListenerBalance *MinimumBalance
+	)
+	if isPrivate {
+		allowed, err := s.canCreatePrivateGroup(ctx, userID)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure checking private group creation")
+			return nil, status.Error(codes.Internal, "")
+		}
+		if !allowed {
+			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_DENIED}, nil
+		}
+	} else {
+		isStaffOnly, minimumListenerBalance, err = RulesFromProto(rules)
+		if err != nil {
+			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_INVALID_RULES}, nil
+		}
+
+		// The creator must satisfy the group's own rules in full, speaker rules
+		// included: a group whose creator cannot read it is a group nobody can
+		// reach, and one whose creator cannot post in it is a room they opened and
+		// cannot use. The rules are evaluated from the request rather than a
+		// stored record, since there is no record yet, with the caller as the
+		// creator they will record.
+		//
+		// This is also where the requirement's currency is first put to OCP. One
+		// OCP cannot value is a rule the server cannot enforce, refused as
+		// INVALID_RULES like any other (see RulesFromProto) rather than failed:
+		// the currency is the client's choice, and no group is written that no one
+		// could ever be admitted to.
+		satisfied, err := s.rules.CanSpeakWithRules(ctx, chatID, GroupRules{Rules: rules, CreatorID: userID}, userID)
+		if errors.Is(err, balance.ErrUnsupportedCurrency) {
+			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_INVALID_RULES}, nil
+		}
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure evaluating chat rules")
+			return nil, status.Error(codes.Internal, "")
+		}
+		if !satisfied {
+			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_RULES_NOT_SATISFIED}, nil
+		}
 	}
 
-	// The creator must satisfy the group's own rules in full, speaker rules
-	// included: a group whose creator cannot read it is a group nobody can
-	// reach, and one whose creator cannot post in it is a room they opened and
-	// cannot use. The rules are evaluated from the request rather than a
-	// stored record, since there is no record yet, with the caller as the
-	// creator they will record.
-	//
-	// This is also where the requirement's currency is first put to OCP. One
-	// OCP cannot value is a rule the server cannot enforce, refused as
-	// INVALID_RULES like any other (see RulesFromProto) rather than failed:
-	// the currency is the client's choice, and no group is written that no one
-	// could ever be admitted to.
-	satisfied, err := s.rules.CanSpeakWithRules(ctx, chatID, GroupRules{Rules: params.Rules, CreatorID: userID}, userID)
-	if errors.Is(err, balance.ErrUnsupportedCurrency) {
-		return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_INVALID_RULES}, nil
-	}
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure evaluating chat rules")
-		return nil, status.Error(codes.Internal, "")
-	}
-	if !satisfied {
-		return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_RULES_NOT_SATISFIED}, nil
-	}
-
-	flagged, category, err := s.moderateTitle(ctx, log, params.Title)
+	flagged, category, err := s.moderateTitle(ctx, log, title)
 	if err != nil {
 		return nil, status.Error(codes.Internal, "")
 	}
@@ -132,8 +168,8 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 	// same for each of them. Anything else is a failure to attach, and the
 	// server's fault. The grant is keyed by the chat ID, so a retry that
 	// reaches here again repeats it rather than orphaning one.
-	if params.Picture != nil {
-		err := s.media.SetAsChatPicture(ctx, userID, chatID, params.Picture)
+	if picture != nil {
+		err := s.media.SetAsChatPicture(ctx, userID, chatID, picture)
 		switch {
 		case errors.Is(err, blob.ErrBlobNotFound),
 			errors.Is(err, blob.ErrBlobNotReady),
@@ -151,11 +187,12 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		ID:                     chatID,
 		Type:                   chatpb.ChatType_GROUP,
 		Members:                []*commonpb.UserId{userID},
-		Title:                  params.Title,
+		Title:                  title,
 		IsStaffOnly:            isStaffOnly,
 		MinimumListenerBalance: minimumListenerBalance,
+		IsPrivate:              isPrivate,
 		CreatorID:              userID,
-		PictureBlobID:          params.Picture,
+		PictureBlobID:          picture,
 		LastActivity:           time.Now().UTC(),
 	}
 	err = s.chats.PutChat(ctx, c)
@@ -209,6 +246,15 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		Result: chatpb.StartChatResponse_OK,
 		Chat:   md,
 	}, nil
+}
+
+// canCreatePrivateGroup reports whether userID may create a private group:
+// today, only a staff user. It is a transitional gate, like use_e2ee's (see
+// useE2ee): private groups are being built in steps, and one created now has
+// no key and no lobby, so it is a group nobody can join or speak in. Opening
+// creation to everyone is removing this check, once the rest is built.
+func (s *Server) canCreatePrivateGroup(ctx context.Context, userID *commonpb.UserId) (bool, error) {
+	return s.accounts.IsStaff(ctx, userID)
 }
 
 // replayStartChat answers a StartChat whose group c already exists: an earlier

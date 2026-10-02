@@ -109,7 +109,9 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_StartChat_PictureNotAccepted,
 		testServer_StartChat_TitleModerated,
 		testServer_StartChat_ModerationFailureIsInternal,
-		testServer_StartChat_PrivateGroupRefused,
+		testServer_StartChat_PrivateGroup,
+		testServer_PrivateGroup_Visibility,
+		testServer_PrivateGroup_Membership,
 		testServer_StartChat_InvalidRules,
 		testServer_StartChat_RulesNotSatisfied,
 		testServer_StartChat_WithRules,
@@ -2892,6 +2894,25 @@ func (e *serverEnv) mustStartGroupChatWithKey(keys model.KeyPair, key *chatpb.Id
 	return resp
 }
 
+// mustStartPrivateGroupChat starts a private group under the given
+// idempotency key.
+func (e *serverEnv) mustStartPrivateGroupChat(keys model.KeyPair, key *chatpb.IdempotencyKey, params *chatpb.StartChatRequest_PrivateGroupChatParameters) *chatpb.StartChatResponse {
+	req := &chatpb.StartChatRequest{
+		Parameters:     &chatpb.StartChatRequest_PrivateGroup{PrivateGroup: params},
+		IdempotencyKey: key,
+	}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.StartChat(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// privateGroupParams builds StartChat parameters for a private group with the
+// given title.
+func privateGroupParams(title string) *chatpb.StartChatRequest_PrivateGroupChatParameters {
+	return &chatpb.StartChatRequest_PrivateGroupChatParameters{Title: title}
+}
+
 // startChatMinimumBalance is the minimum listener balance, in USD, the
 // StartChat tests ask their groups to carry when the rules are not what is
 // under test. Every group must carry one (see chat.RulesFromProto).
@@ -3231,24 +3252,223 @@ func testServer_StartChat_ModerationFailureIsInternal(t *testing.T, s chat.Store
 	require.Empty(t, groups)
 }
 
-// testServer_StartChat_PrivateGroupRefused pins that a private group cannot
-// be created yet: the variant is refused and nothing is written.
-func testServer_StartChat_PrivateGroupRefused(t *testing.T, s chat.Store) {
+// testServer_StartChat_PrivateGroup pins the creation of a private group: only
+// a staff user may create one while private groups are being built, it has no
+// rules to satisfy, and it is otherwise created as any group is — title
+// moderated, the creator its only member, announced to their devices, and
+// retry-safe.
+func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.profiles.displayNames[string(e.userID.Value)] = "Founder"
+
+	groups := func() []*chat.Chat {
+		t.Helper()
+		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+		require.NoError(t, err)
+		return groups
+	}
+
+	// Anyone but a staff user is refused, and nothing is written.
+	resp := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_DENIED, resp.Result)
+	require.Nil(t, resp.Chat)
+	require.Empty(t, groups())
+
+	// A staff user creates one holding nothing: there is no rule to satisfy.
+	e.accounts.setStaff(e.userID, true)
+	key := newIdempotencyKey()
+	resp = e.mustStartPrivateGroupChat(e.keys, key, privateGroupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
+	md := resp.Chat
+	require.NotNil(t, md)
+	require.True(t, chat.IsGroupChatID(md.ChatId))
+	require.Equal(t, chatpb.ChatType_GROUP, md.Type)
+	require.True(t, md.IsPrivate)
+	require.Nil(t, md.Rules)
+	require.Equal(t, e.userID.Value, md.GetCreator().GetValue())
+	require.Equal(t, "Sunday Hikers", md.Title)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 0}, md.GetRosterSummary()))
+	require.Len(t, md.Members, 1)
+	require.Equal(t, e.userID.Value, md.Members[0].UserId.Value)
+	require.True(t, md.GetViewerState().GetPermissions().GetCanEdit())
+	require.Equal(t, "Sunday Hikers", e.moderator.classifiedTitle)
+
+	stored, err := s.GetChatByID(e.ctx, md.ChatId)
+	require.NoError(t, err)
+	require.True(t, stored.IsPrivate)
+	require.Nil(t, stored.Rules())
+	require.Equal(t, e.userID.Value, stored.CreatorID.Value)
+	members, err := s.GetMembers(e.ctx, md.ChatId)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.Equal(t, e.userID.Value, members[0].Value)
+
+	// The creator's other devices learn of it as a join carrying the metadata.
+	e.userObserver.WaitFor(t, func([]*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
+		return len(e.rosterUpdatesOnUserTopic(e.userID, md.ChatId)) >= 1
+	})
+	toCreator := e.rosterUpdatesOnUserTopic(e.userID, md.ChatId)
+	require.Len(t, toCreator, 1)
+	require.True(t, toCreator[0].GetMemberJoined().GetMetadata().GetIsPrivate())
+
+	// A retry names the same group and is answered from its record, whatever
+	// it carries and whether or not the caller is still staff.
+	e.accounts.setStaff(e.userID, false)
+	again := e.mustStartPrivateGroupChat(e.keys, key, privateGroupParams("Renamed"))
+	require.Equal(t, chatpb.StartChatResponse_OK, again.Result)
+	require.Equal(t, md.ChatId.Value, again.Chat.ChatId.Value)
+	require.Equal(t, "Sunday Hikers", again.Chat.Title)
+	require.True(t, again.Chat.IsPrivate)
+	asPublic := e.mustStartGroupChatWithKey(e.keys, key, groupParams("Renamed"))
+	require.Equal(t, chatpb.StartChatResponse_OK, asPublic.Result)
+	require.Equal(t, md.ChatId.Value, asPublic.Chat.ChatId.Value)
+	require.True(t, asPublic.Chat.IsPrivate)
+	require.Len(t, groups(), 1)
+
+	// Its title is moderated like any group's.
+	e.accounts.setStaff(e.userID, true)
+	e.moderator.titleFlagged = true
+	e.moderator.titleCategories = []string{"gibberish", "solicitation"}
+	resp = e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("DM for signals"))
+	require.Equal(t, chatpb.StartChatResponse_TITLE_MODERATED, resp.Result)
+	require.Equal(t, moderationpb.FlaggedCategory_SPAM, resp.FlaggedCategory)
+	require.Nil(t, resp.Chat)
+	require.Len(t, groups(), 1)
+}
+
+// testServer_PrivateGroup_Visibility pins who sees what of a private group:
+// any registered user its record and nothing else under every view mode, its
+// members its messaging state, and an unauthenticated caller nothing at all.
+func testServer_PrivateGroup_Visibility(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
-	req := &chatpb.StartChatRequest{
-		Parameters: &chatpb.StartChatRequest_PrivateGroup{PrivateGroup: &chatpb.StartChatRequest_PrivateGroupChatParameters{
-			Title: "Sunday Hikers",
-		}},
-		IdempotencyKey: newIdempotencyKey(),
+	private := &chat.Chat{
+		ID:            chat.MustGenerateGroupChatID(),
+		Type:          chatpb.ChatType_GROUP,
+		Members:       []*commonpb.UserId{e.userID},
+		Title:         "Sunday Hikers",
+		IsPrivate:     true,
+		CreatorID:     e.userID,
+		LastActivity:  at(1),
+		LastMessageID: &messagingpb.MessageId{Value: 2},
 	}
-	require.NoError(t, e.keys.Auth(req, &req.Auth))
-	_, err := e.client.StartChat(e.ctx, req)
-	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.NoError(t, s.PutChat(e.ctx, private))
+	e.messaging.lastMessages[string(private.ID.Value)] = textMessage(2, e.userID, "members only")
+	e.messaging.latestEventSeqs[string(private.ID.Value)] = 2
 
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	// A member reads it like any group they are in.
+	resp := e.getChat(e.keys, private.ID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.True(t, resp.Metadata.IsPrivate)
+	require.Len(t, resp.Metadata.Members, 1)
+	require.Equal(t, "members only", resp.Metadata.LastMessage.Content[0].GetText().GetText())
+	require.Equal(t, uint64(2), resp.Metadata.LatestEventSequence)
+	require.NotNil(t, resp.Metadata.ViewerState)
+
+	// A non-member sees the record alone, whatever they ask for and whoever
+	// they are: nothing about a staff user admits them.
+	strangerID, strangerKeys := e.addUser()
+	e.accounts.setStaff(strangerID, true)
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		resp = e.getChatWithMode(strangerKeys, private.ID, mode)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result, mode)
+		require.True(t, resp.Metadata.IsPrivate, mode)
+		require.Equal(t, "Sunday Hikers", resp.Metadata.Title, mode)
+		require.Equal(t, e.userID.Value, resp.Metadata.GetCreator().GetValue(), mode)
+		require.Nil(t, resp.Metadata.Rules, mode)
+		require.Empty(t, resp.Metadata.Members, mode)
+		require.Nil(t, resp.Metadata.LastMessage, mode)
+		require.Zero(t, resp.Metadata.LatestEventSequence, mode)
+		require.Nil(t, resp.Metadata.ViewerState, mode)
+	}
+
+	// It has no public view.
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		resp = e.getPublicChat(private.ID, mode)
+		require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result, mode)
+		require.Nil(t, resp.Metadata, mode)
+	}
+
+	// None of that rests on a private group having no rules. One whose record
+	// carries a listener rule shows a non-member who satisfies it the record
+	// alone all the same, and admits them no more than any other.
+	_, err := e.accounts.Bind(e.ctx, strangerID, strangerKeys.Proto())
 	require.NoError(t, err)
-	require.Empty(t, groups)
+	e.ocpBalance.setBalance(strangerKeys.Proto(), ocp_common.ToCoreMintQuarks(startChatMinimumBalance))
+	ruled := private.Clone()
+	ruled.ID = chat.MustGenerateGroupChatID()
+	ruled.Members = []*commonpb.UserId{model.MustGenerateUserID()}
+	ruled.MinimumListenerBalance = &chat.MinimumBalance{Currency: "usd", NativeAmount: startChatMinimumBalance}
+	require.NoError(t, s.PutChat(e.ctx, ruled))
+	e.messaging.lastMessages[string(ruled.ID.Value)] = textMessage(2, e.userID, "members only")
+	e.messaging.latestEventSeqs[string(ruled.ID.Value)] = 2
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		resp = e.getChatWithMode(strangerKeys, ruled.ID, mode)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result, mode)
+		require.True(t, resp.Metadata.IsPrivate, mode)
+		require.Empty(t, resp.Metadata.Members, mode)
+		require.Nil(t, resp.Metadata.LastMessage, mode)
+		require.Zero(t, resp.Metadata.LatestEventSequence, mode)
+		require.Equal(t, chatpb.GetChatResponse_DENIED, e.getPublicChat(ruled.ID, mode).Result, mode)
+	}
+	require.Equal(t, chatpb.JoinChatResponse_DENIED, e.mustJoinChat(strangerKeys, ruled.ID).Result)
+
+	// It is in its member's feed, marked private.
+	feed := e.mustGetGroupFeed(nil)
+	require.Equal(t, chatpb.GetGroupChatFeedResponse_OK, feed.Result)
+	require.Len(t, feed.Chats, 1)
+	require.True(t, feed.Chats[0].IsPrivate)
+}
+
+// testServer_PrivateGroup_Membership pins that a private group is not joined
+// with JoinChat by anyone but its creator, who leaves and rejoins it like any
+// group, and that nobody speaks in one, its creator included.
+func testServer_PrivateGroup_Membership(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.accounts.setStaff(e.userID, true)
+
+	created := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, created.Result)
+	chatID := created.Chat.ChatId
+
+	isMember := func(userID *commonpb.UserId) bool {
+		t.Helper()
+		ok, err := s.IsMember(e.ctx, chatID, userID)
+		require.NoError(t, err)
+		return ok
+	}
+
+	// No one else joins, a staff user included.
+	strangerID, strangerKeys := e.addUser()
+	e.accounts.setStaff(strangerID, true)
+	joined := e.mustJoinChat(strangerKeys, chatID)
+	require.Equal(t, chatpb.JoinChatResponse_DENIED, joined.Result)
+	require.Nil(t, joined.Chat)
+	require.False(t, isMember(strangerID))
+
+	// The creator's join of a group they are in is the no-op it always is.
+	joined = e.mustJoinChat(e.keys, chatID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 0}, joined.Chat.GetRosterSummary()))
+
+	// The creator leaves, and rejoins on their own: no one need approve them.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	require.False(t, isMember(e.userID))
+	joined = e.mustJoinChat(strangerKeys, chatID)
+	require.Equal(t, chatpb.JoinChatResponse_DENIED, joined.Result)
+	joined = e.mustJoinChat(e.keys, chatID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	require.True(t, joined.Chat.IsPrivate)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 2}, joined.Chat.GetRosterSummary()))
+	require.True(t, isMember(e.userID))
+
+	// The creator edits it like any group they created.
+	title := "Monday Hikers"
+	edited := e.mustEditChat(e.keys, chatID, &title, nil)
+	require.Equal(t, chatpb.EditChatResponse_OK, edited.Result)
+
+	// No one speaks in it, so its creator is refused what a speaker is given.
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, e.getMentionSuggestions(e.keys, chatID).Result)
 }
 
 func testServer_StartChat_InvalidRules(t *testing.T, s chat.Store) {

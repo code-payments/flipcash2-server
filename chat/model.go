@@ -240,8 +240,8 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // a group chat: group membership is mutable and lives in its own store records,
 // which no path that reads the canonical record touches. A caller that needs a
 // group's members reads them explicitly via Store.GetMembers. Title,
-// IsStaffOnly, IsCreatorOnlySpeaker, CreatorID and PictureBlobID are
-// group-only and zero for DMs.
+// IsStaffOnly, IsCreatorOnlySpeaker, IsPrivate, CreatorID and PictureBlobID
+// are group-only and zero for DMs.
 //
 // RosterSummary describes the member list without containing it. Like Members,
 // it is complete for a DM on any read and left zero for a group by the
@@ -265,6 +265,25 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // it only when its record was written with it. A group that carries it but
 // has no recorded creator admits no one to speak.
 //
+// IsPrivate marks a private group (see chatpb.Metadata.is_private): one whose
+// creator admits each member, and whose messages are end-to-end encrypted
+// with a chat key the server never holds. It is fixed at creation, like the
+// rules, and read with them (see GroupRules). A private group carries no
+// rules: StartChat writes none. No non-member is admitted to it in any form
+// (see Access), no rule admits anyone to it (see RuleEvaluator), and
+// JoinChat refuses everyone but its creator; each is decided on this flag,
+// not on the absence of rules. Its
+// title and picture are plaintext on the record like any group's, and are
+// shown to any registered user.
+//
+// A private group's chat key reaches the server only as its members' key
+// envelopes, and nothing can happen in one until its creator has stored
+// theirs. Key envelopes are not built, so every private group is in that
+// state and stays there: it exists, is visible, and can be left and rejoined
+// by its creator, and no one speaks in it (see Access.CanSpeak). The lobby a
+// user would enter to be admitted is not built either, so its creator is the
+// only member it can have.
+//
 // CreatorID is the user who created the group, or nil when unknown (a DM has
 // none, and so does any group written before the field existed). It is fixed
 // at creation and records provenance only: creating a group does not by itself
@@ -287,6 +306,7 @@ type Chat struct {
 	IsStaffOnly            bool
 	MinimumListenerBalance *MinimumBalance
 	IsCreatorOnlySpeaker   bool
+	IsPrivate              bool
 	CreatorID              *commonpb.UserId
 	PictureBlobID          *blobpb.BlobId
 	LastActivity           time.Time
@@ -439,6 +459,7 @@ func (c *Chat) Clone() *Chat {
 		IsStaffOnly:            c.IsStaffOnly,
 		MinimumListenerBalance: minimumListenerBalance,
 		IsCreatorOnlySpeaker:   c.IsCreatorOnlySpeaker,
+		IsPrivate:              c.IsPrivate,
 		CreatorID:              creatorID,
 		PictureBlobID:          pictureBlobID,
 		LastActivity:           c.LastActivity,
@@ -448,8 +469,8 @@ func (c *Chat) Clone() *Chat {
 
 // ToProto projects the stored chat onto a chatpb.Metadata. Only the fields
 // owned by the chat domain are populated: chat_id, type, title, last_activity,
-// roster_summary, rules, creator (a group's, when recorded), a Member entry per
-// member with just user_id set, and — for a group with a picture — a picture
+// roster_summary, rules, is_private, creator (a group's, when recorded), a
+// Member entry per member with just user_id set, and — for a group with a picture — a picture
 // carrying only its ORIGINAL rendition's blob id. The caller is responsible for hydrating member profiles, pointers,
 // the last message, and the picture's resolved rendition set.
 func (c *Chat) ToProto() *chatpb.Metadata {
@@ -466,6 +487,7 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 		RosterSummary: c.RosterSummary.ToProto(),
 		Title:         c.Title,
 		Rules:         c.Rules(),
+		IsPrivate:     c.IsPrivate,
 		LastActivity:  timestamppb.New(c.LastActivity),
 	}
 	if c.CreatorID != nil {

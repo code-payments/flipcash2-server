@@ -270,6 +270,13 @@ func NewServer(
 //     sees its last message redacted, and the rules are not evaluated for a
 //     non-member (see Access.Standing).
 //
+// A private group (see Chat.IsPrivate) falls out of the same rules. Its record
+// is returned to any registered user, with is_private set, so that one who is
+// not a member can see what they would ask to join. It carries no rules, so a
+// non-member's standing is none under every mode and they see the record
+// alone: its messaging state is its members'. A private group whose key has
+// not been stored is returned like any other.
+//
 // The group's picture is returned in every case: it is part of the record, as
 // the title is, and the two are what identify a group — a group's picture is
 // readable by anyone. Its download URLs are resolved here without a blob ACL
@@ -338,7 +345,8 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 // per-viewer fields, since there is no viewer: no hydrated member, no
 // is_hidden, no viewer_state. It is REDACTED or nothing: any other mode is
 // DENIED, as is a DM, before anything is read, so an anonymous caller cannot
-// learn whether a DM exists.
+// learn whether a DM exists. A private group has no public view either and is
+// DENIED off its record: its title and picture are for registered users.
 func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) (*chatpb.GetChatResponse, error) {
 	if req.GetViewMode() != messagingpb.ViewMode_REDACTED || !IsGroupChatID(req.ChatId) {
 		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
@@ -353,6 +361,10 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 	case err != nil:
 		log.With(zap.Error(err)).Warn("Failure getting chat")
 		return nil, status.Error(codes.Internal, "")
+	}
+
+	if c.IsPrivate {
+		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
 	}
 
 	standing := s.access.PublicStanding(c)

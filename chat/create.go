@@ -63,9 +63,10 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	// Validation requires the oneof to be set, and GROUP is its only variant, so
-	// anything else here is a proto this server predates.
-	params := req.GetGroup()
+	// Validation requires the oneof to be set. Only a public group can be
+	// created: the private group variant is refused until private groups are
+	// built, like any variant this server predates.
+	params := req.GetPublicGroup()
 	if params == nil {
 		return nil, status.Error(codes.InvalidArgument, "unsupported chat parameters")
 	}

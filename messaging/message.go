@@ -156,10 +156,10 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
 	}
 
-	// Encrypted content is between a DM's two members (see
-	// messagingpb.EncryptedContent). Checked after the speaker gate so a
-	// non-member is DENIED like any other send.
-	if isEncrypted(req.Content) && chat.IsGroupChatID(req.ChatId) {
+	// Encrypted content is between a DM's two members, under the DM's scheme
+	// (see encryptionAllowed). Checked after the speaker gate so a non-member
+	// is DENIED like any other send.
+	if !encryptionAllowed(req.ChatId, req.Content) {
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED}, nil
 	}
 
@@ -220,8 +220,8 @@ func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRe
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
 	}
 
-	// The same DM-only rule as a send.
-	if isEncrypted(req.Content) && chat.IsGroupChatID(req.ChatId) {
+	// The same rule as a send.
+	if !encryptionAllowed(req.ChatId, req.Content) {
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_ENCRYPTION_NOT_ALLOWED}, nil
 	}
 
@@ -421,10 +421,10 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 // which only the server sends; see flipcashteam) and any content type added
 // later until it is explicitly allowed. repliedMessageID is non-nil
 // only for a valid reply, signaling the caller to verify the replied-to message
-// exists and is repliable. Encrypted content is allowed in a DM only, which
-// depends on the chat and so is the caller's to enforce (see isEncrypted), as
-// is the rule that an edit never downgrades an encrypted message to plaintext,
-// which depends on the message being edited.
+// exists and is repliable. Whether encrypted content is allowed depends on the
+// chat and so is the caller's to enforce (see encryptionAllowed), as is the
+// rule that an edit never downgrades an encrypted message to plaintext, which
+// depends on the message being edited.
 //
 // Encrypted content is opaque: whatever it wraps — the proto allows text, media,
 // or a reply whose body is either — is the recipient's to check, not the
@@ -456,11 +456,27 @@ func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *mes
 	}
 }
 
-// isEncrypted reports whether content is end-to-end encrypted, which is allowed
-// in a DM only (see messagingpb.EncryptedContent). Encrypted content is only
-// ever top-level, never a reply's body (see clientAllowedContent).
+// isEncrypted reports whether content is end-to-end encrypted (see
+// messagingpb.EncryptedContent). Encrypted content is only ever top-level,
+// never a reply's body (see clientAllowedContent).
 func isEncrypted(content []*messagingpb.Content) bool {
 	return len(content) == 1 && content[0].GetEncrypted() != nil
+}
+
+// encryptionAllowed reports whether a chat takes content as far as encryption
+// goes: plaintext always, and encrypted content only under the scheme the chat
+// uses, the one thing in it the server reads. A DM uses the pairwise scheme,
+// X25519_XCHACHA20POLY1305. A group takes no encrypted content at all:
+// CHAT_KEY_XCHACHA20POLY1305 is a private group's scheme, and no group is
+// private yet. A refusal is ENCRYPTION_NOT_ALLOWED on either RPC.
+func encryptionAllowed(chatID *commonpb.ChatId, content []*messagingpb.Content) bool {
+	if !isEncrypted(content) {
+		return true
+	}
+	if chat.IsGroupChatID(chatID) {
+		return false
+	}
+	return content[0].GetEncrypted().Scheme == messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305
 }
 
 // validReplyBody reports whether a reply's body is content a client may author:

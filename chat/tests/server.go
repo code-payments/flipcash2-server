@@ -109,6 +109,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_StartChat_PictureNotAccepted,
 		testServer_StartChat_TitleModerated,
 		testServer_StartChat_ModerationFailureIsInternal,
+		testServer_StartChat_PrivateGroupRefused,
 		testServer_StartChat_InvalidRules,
 		testServer_StartChat_RulesNotSatisfied,
 		testServer_StartChat_WithRules,
@@ -2866,26 +2867,26 @@ func newIdempotencyKey() *chatpb.IdempotencyKey {
 
 // startGroupChat starts a new group under a fresh idempotency key. A test
 // exercising retries supplies its own key via startGroupChatWithKey.
-func (e *serverEnv) startGroupChat(keys model.KeyPair, params *chatpb.StartChatRequest_GroupChatParameters) (*chatpb.StartChatResponse, error) {
+func (e *serverEnv) startGroupChat(keys model.KeyPair, params *chatpb.StartChatRequest_PublicGroupChatParameters) (*chatpb.StartChatResponse, error) {
 	return e.startGroupChatWithKey(keys, newIdempotencyKey(), params)
 }
 
-func (e *serverEnv) startGroupChatWithKey(keys model.KeyPair, key *chatpb.IdempotencyKey, params *chatpb.StartChatRequest_GroupChatParameters) (*chatpb.StartChatResponse, error) {
+func (e *serverEnv) startGroupChatWithKey(keys model.KeyPair, key *chatpb.IdempotencyKey, params *chatpb.StartChatRequest_PublicGroupChatParameters) (*chatpb.StartChatResponse, error) {
 	req := &chatpb.StartChatRequest{
-		Parameters:     &chatpb.StartChatRequest_Group{Group: params},
+		Parameters:     &chatpb.StartChatRequest_PublicGroup{PublicGroup: params},
 		IdempotencyKey: key,
 	}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.StartChat(e.ctx, req)
 }
 
-func (e *serverEnv) mustStartGroupChat(keys model.KeyPair, params *chatpb.StartChatRequest_GroupChatParameters) *chatpb.StartChatResponse {
+func (e *serverEnv) mustStartGroupChat(keys model.KeyPair, params *chatpb.StartChatRequest_PublicGroupChatParameters) *chatpb.StartChatResponse {
 	resp, err := e.startGroupChat(keys, params)
 	require.NoError(e.t, err)
 	return resp
 }
 
-func (e *serverEnv) mustStartGroupChatWithKey(keys model.KeyPair, key *chatpb.IdempotencyKey, params *chatpb.StartChatRequest_GroupChatParameters) *chatpb.StartChatResponse {
+func (e *serverEnv) mustStartGroupChatWithKey(keys model.KeyPair, key *chatpb.IdempotencyKey, params *chatpb.StartChatRequest_PublicGroupChatParameters) *chatpb.StartChatResponse {
 	resp, err := e.startGroupChatWithKey(keys, key, params)
 	require.NoError(e.t, err)
 	return resp
@@ -2905,8 +2906,8 @@ func minimumBalanceRule(currency string, amount float64) *chatpb.ListenerRules {
 
 // groupParams builds StartChat parameters for a group with the given title and
 // the default minimum balance rule.
-func groupParams(title string) *chatpb.StartChatRequest_GroupChatParameters {
-	return &chatpb.StartChatRequest_GroupChatParameters{
+func groupParams(title string) *chatpb.StartChatRequest_PublicGroupChatParameters {
+	return &chatpb.StartChatRequest_PublicGroupChatParameters{
 		Title: title,
 		Rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", startChatMinimumBalance)}},
 	}
@@ -3091,7 +3092,7 @@ func testServer_StartChat_Idempotent(t *testing.T, s chat.Store) {
 	// before anything is read or written.
 	for _, key := range []*chatpb.IdempotencyKey{nil, {Value: []byte("short")}} {
 		req := &chatpb.StartChatRequest{
-			Parameters:     &chatpb.StartChatRequest_Group{Group: groupParams("Keyless")},
+			Parameters:     &chatpb.StartChatRequest_PublicGroup{PublicGroup: groupParams("Keyless")},
 			IdempotencyKey: key,
 		}
 		require.NoError(t, e.keys.Auth(req, &req.Auth))
@@ -3230,6 +3231,26 @@ func testServer_StartChat_ModerationFailureIsInternal(t *testing.T, s chat.Store
 	require.Empty(t, groups)
 }
 
+// testServer_StartChat_PrivateGroupRefused pins that a private group cannot
+// be created yet: the variant is refused and nothing is written.
+func testServer_StartChat_PrivateGroupRefused(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	req := &chatpb.StartChatRequest{
+		Parameters: &chatpb.StartChatRequest_PrivateGroup{PrivateGroup: &chatpb.StartChatRequest_PrivateGroupChatParameters{
+			Title: "Sunday Hikers",
+		}},
+		IdempotencyKey: newIdempotencyKey(),
+	}
+	require.NoError(t, e.keys.Auth(req, &req.Auth))
+	_, err := e.client.StartChat(e.ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	require.NoError(t, err)
+	require.Empty(t, groups)
+}
+
 func testServer_StartChat_InvalidRules(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
@@ -3269,7 +3290,7 @@ func testServer_StartChat_InvalidRules(t *testing.T, s chat.Store) {
 		"unpriced minimum balance": {Listener: []*chatpb.ListenerRules{minimumBalanceRule("xyz", 1)}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			resp := e.mustStartGroupChat(e.keys, &chatpb.StartChatRequest_GroupChatParameters{Title: "Ruled", Rules: rules})
+			resp := e.mustStartGroupChat(e.keys, &chatpb.StartChatRequest_PublicGroupChatParameters{Title: "Ruled", Rules: rules})
 			require.Equal(t, chatpb.StartChatResponse_INVALID_RULES, resp.Result)
 			require.Nil(t, resp.Chat)
 		})
@@ -3329,7 +3350,7 @@ func testServer_StartChat_WithRules(t *testing.T, s chat.Store) {
 	require.NoError(t, err)
 	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
 
-	resp := e.mustStartGroupChat(e.keys, &chatpb.StartChatRequest_GroupChatParameters{Title: "Staff Whales", Rules: rules})
+	resp := e.mustStartGroupChat(e.keys, &chatpb.StartChatRequest_PublicGroupChatParameters{Title: "Staff Whales", Rules: rules})
 	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
 	require.NoError(t, protoutil.ProtoEqualError(rules, resp.Chat.GetRules()))
 
@@ -3362,7 +3383,7 @@ func testServer_StartChat_FiatMinimumBalance(t *testing.T, s chat.Store) {
 	// 0.9 EUR per USDF, so 90 EUR is 100 USDF.
 	const requirement = 90
 	e.ocpBalance.setRate("eur", 0.9)
-	params := &chatpb.StartChatRequest_GroupChatParameters{
+	params := &chatpb.StartChatRequest_PublicGroupChatParameters{
 		Title: "Euro Whales",
 		Rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{minimumBalanceRule("eur", requirement)}},
 	}

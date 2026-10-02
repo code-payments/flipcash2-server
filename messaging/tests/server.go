@@ -1164,6 +1164,19 @@ func testServer_EncryptedContent(t *testing.T, badges badge.Store, blocklists bl
 	require.Equal(t, messagingpb.EditMessageResponse_OK, upgraded.Result)
 	require.True(t, proto.Equal(encryptedContent(4)[0], upgraded.Message.Content[0]))
 
+	// A DM takes only its own scheme: a private group's is refused on a send
+	// and on an edit, and the edited message stays as it was.
+	wrongScheme, err := e.sendContentToChat(e.keysA, chatID, chatKeyEncryptedContent(6), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED, wrongScheme.Result)
+	require.Nil(t, wrongScheme.Message)
+	wrongSchemeEdit, err := e.editMessageInChat(e.keysA, chatID, msgID, chatKeyEncryptedContent(6), edited.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_ENCRYPTION_NOT_ALLOWED, wrongSchemeEdit.Result)
+	stillEdited, err := e.getMessageInChat(e.keysA, chatID, msgID)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(encryptedContent(3)[0], stillEdited.Message.Content[0]))
+
 	// A message too large to carry in a push is pushed by its ID alone, for
 	// the recipient to fetch; the sender and generic body are still there.
 	large := encryptedContent(5)
@@ -1193,8 +1206,9 @@ func testServer_EncryptedContent(t *testing.T, badges badge.Store, blocklists bl
 }
 
 // testServer_EncryptedContent_NotInGroups: encrypted content is a DM's alone.
-// A group member's send or edit carrying it is ENCRYPTION_NOT_ALLOWED and
-// nothing is written; a non-member is DENIED before the chat type matters.
+// A group member's send or edit carrying it is ENCRYPTION_NOT_ALLOWED under
+// either scheme and nothing is written; a non-member is DENIED before the chat
+// type matters.
 func testServer_EncryptedContent_NotInGroups(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
@@ -1211,6 +1225,11 @@ func testServer_EncryptedContent_NotInGroups(t *testing.T, badges badge.Store, b
 	require.Equal(t, messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED, resp.Result)
 	require.Nil(t, resp.Message)
 
+	chatKeyResp, err := e.sendContentToChat(e.keysA, groupID, chatKeyEncryptedContent(1), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED, chatKeyResp.Result)
+	require.Nil(t, chatKeyResp.Message)
+
 	_, strangerKeys := e.addUser()
 	strangerResp, err := e.sendContentToChat(strangerKeys, groupID, encryptedContent(1), generateClientID())
 	require.NoError(t, err)
@@ -1223,6 +1242,10 @@ func testServer_EncryptedContent_NotInGroups(t *testing.T, badges badge.Store, b
 	edit, err := e.editMessageInChat(e.keysA, groupID, sent.Message.MessageId, encryptedContent(2), sent.Message.EventSequence)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.EditMessageResponse_ENCRYPTION_NOT_ALLOWED, edit.Result)
+
+	chatKeyEdit, err := e.editMessageInChat(e.keysA, groupID, sent.Message.MessageId, chatKeyEncryptedContent(2), sent.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_ENCRYPTION_NOT_ALLOWED, chatKeyEdit.Result)
 
 	// Only the plaintext message was written, and it is unchanged.
 	got, err := e.getMessagesByOptionsInChat(e.keysA, groupID, nil)

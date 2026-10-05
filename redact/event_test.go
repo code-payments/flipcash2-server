@@ -49,8 +49,14 @@ func chatUpdateFixture() *eventpb.ChatUpdate {
 			{Kind: &chatpb.MetadataUpdate_TitleChanged_{TitleChanged: &chatpb.MetadataUpdate_TitleChanged{
 				NewTitle: "New Title",
 			}}},
-			{Kind: &chatpb.MetadataUpdate_PictureChanged_{PictureChanged: &chatpb.MetadataUpdate_PictureChanged{
-				NewPicture: &blobpb.Media{Renditions: []*blobpb.Rendition{{Role: blobpb.Rendition_ORIGINAL, BlobId: &blobpb.BlobId{Value: bytes.Repeat([]byte{7}, 16)}}}},
+			{Kind: &chatpb.MetadataUpdate_ProfilePictureChanged_{ProfilePictureChanged: &chatpb.MetadataUpdate_ProfilePictureChanged{
+				NewProfilePicture: &blobpb.Media{Renditions: []*blobpb.Rendition{{Role: blobpb.Rendition_ORIGINAL, BlobId: &blobpb.BlobId{Value: bytes.Repeat([]byte{7}, 16)}}}},
+			}}},
+			{Kind: &chatpb.MetadataUpdate_DescriptionChanged_{DescriptionChanged: &chatpb.MetadataUpdate_DescriptionChanged{
+				NewDescription: "New description",
+			}}},
+			{Kind: &chatpb.MetadataUpdate_CoverPictureChanged_{CoverPictureChanged: &chatpb.MetadataUpdate_CoverPictureChanged{
+				NewCoverPicture: &blobpb.Media{Renditions: []*blobpb.Rendition{{Role: blobpb.Rendition_ORIGINAL, BlobId: &blobpb.BlobId{Value: bytes.Repeat([]byte{8}, 16)}}}},
 			}}},
 		},
 		Events: &messagingpb.EventBatch{Events: []*messagingpb.Event{{
@@ -115,15 +121,15 @@ func TestChatUpdate(t *testing.T) {
 	}
 
 	// A metadata refresh keeps its record with the last message redacted; a
-	// last-activity change, a viewer-state change, a title change and a
-	// picture change are as they were.
-	require.Len(t, out.MetadataUpdates, 5)
+	// last-activity change, a viewer-state change, and a title, profile
+	// picture, description or cover picture change are as they were.
+	require.Len(t, out.MetadataUpdates, 7)
 	refreshed := out.MetadataUpdates[0].GetFullRefresh().GetMetadata()
 	assert.Equal(t, "Title", refreshed.Title)
 	expected, err := Message(chatID, in.MetadataUpdates[0].GetFullRefresh().GetMetadata().LastMessage)
 	require.NoError(t, err)
 	assert.True(t, proto.Equal(expected, refreshed.LastMessage))
-	for i := 1; i < 5; i++ {
+	for i := 1; i < 7; i++ {
 		assert.True(t, proto.Equal(in.MetadataUpdates[i], out.MetadataUpdates[i]), "metadata update %d", i)
 		assert.NotSame(t, in.MetadataUpdates[i], out.MetadataUpdates[i])
 	}

@@ -46,6 +46,7 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_GroupChat_Creator,
 		testStore_GroupChat_Picture,
 		testStore_GroupChat_Edit,
+		testStore_GroupChat_DescriptionAndCover,
 		testStore_GroupChat_Membership,
 		testStore_GroupChat_MembersPage,
 		testStore_GroupChat_MembersPage_MuteOrder,
@@ -386,6 +387,115 @@ func testStore_PutChat_TypeIDMismatch(t *testing.T, s chat.Store) {
 	})
 	require.Error(t, err)
 	require.NotErrorIs(t, err, chat.ErrChatExists)
+}
+
+func testStore_GroupChat_DescriptionAndCover(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// A group has neither unless one was set.
+	creator := model.MustGenerateUserID()
+	plain := putGroupChat(t, s, "Plain", at(100), creator)
+	got, err := s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Empty(t, got.Description)
+	require.Nil(t, got.CoverPictureBlobID)
+
+	// Both given at creation are on the canonical record, beside the profile
+	// picture and apart from it.
+	profile := &blobpb.BlobId{Value: []byte("picture-blob-0001")}
+	cover := &blobpb.BlobId{Value: []byte("cover-blob-00001")}
+	group := &chat.Chat{
+		ID:                   chat.MustGenerateGroupChatID(),
+		Type:                 chatpb.ChatType_GROUP,
+		Members:              []*commonpb.UserId{creator},
+		Title:                "Described",
+		CreatorID:            creator,
+		Description:          "Two\nlines, kept as written ",
+		ProfilePictureBlobID: profile,
+		CoverPictureBlobID:   cover,
+		LastActivity:         at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, group))
+	got, err = s.GetChatByID(ctx, group.ID)
+	require.NoError(t, err)
+	require.Equal(t, "Two\nlines, kept as written ", got.Description)
+	require.Equal(t, profile.Value, got.ProfilePictureBlobID.GetValue())
+	require.Equal(t, cover.Value, got.CoverPictureBlobID.GetValue())
+
+	// Each edits alone, leaving every other field as it was.
+	description := "Edited"
+	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{Description: &description}))
+	got, err = s.GetChatByID(ctx, group.ID)
+	require.NoError(t, err)
+	require.Equal(t, "Edited", got.Description)
+	require.Equal(t, "Described", got.Title)
+	require.Equal(t, profile.Value, got.ProfilePictureBlobID.GetValue())
+	require.Equal(t, cover.Value, got.CoverPictureBlobID.GetValue())
+
+	newCover := &blobpb.BlobId{Value: []byte("cover-blob-00002")}
+	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{CoverPictureBlobID: newCover}))
+	got, err = s.GetChatByID(ctx, group.ID)
+	require.NoError(t, err)
+	require.Equal(t, "Edited", got.Description)
+	require.Equal(t, profile.Value, got.ProfilePictureBlobID.GetValue())
+	require.Equal(t, newCover.Value, got.CoverPictureBlobID.GetValue())
+
+	// The empty description clears it, alone or beside a field it sets.
+	cleared := ""
+	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{Description: &cleared}))
+	got, err = s.GetChatByID(ctx, group.ID)
+	require.NoError(t, err)
+	require.Empty(t, got.Description)
+	require.Equal(t, "Described", got.Title)
+	require.Equal(t, newCover.Value, got.CoverPictureBlobID.GetValue())
+
+	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{Description: &description}))
+	title := "Retitled"
+	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{Title: &title, Description: &cleared}))
+	got, err = s.GetChatByID(ctx, group.ID)
+	require.NoError(t, err)
+	require.Empty(t, got.Description)
+	require.Equal(t, "Retitled", got.Title)
+
+	// Clearing one that was never set is harmless.
+	require.NoError(t, s.EditGroup(ctx, plain.ID, chat.GroupEdit{Description: &cleared}))
+	got, err = s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Empty(t, got.Description)
+
+	// Every field at once, on a group that had none of them.
+	all := "All"
+	require.NoError(t, s.EditGroup(ctx, plain.ID, chat.GroupEdit{
+		Title:                &all,
+		Description:          &description,
+		ProfilePictureBlobID: profile,
+		CoverPictureBlobID:   cover,
+	}))
+	got, err = s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Equal(t, "All", got.Title)
+	require.Equal(t, "Edited", got.Description)
+	require.Equal(t, profile.Value, got.ProfilePictureBlobID.GetValue())
+	require.Equal(t, cover.Value, got.CoverPictureBlobID.GetValue())
+
+	// The edits survive the updates that touch the rest of the record, and
+	// the profile picture's own write leaves the cover alone.
+	advanced, _, err := s.AdvanceLastMessage(ctx, plain.ID, &messagingpb.MessageId{Value: 1}, at(200))
+	require.NoError(t, err)
+	require.True(t, advanced)
+	require.NoError(t, s.SetGroupPicture(ctx, plain.ID, nil))
+	got, err = s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Equal(t, "Edited", got.Description)
+	require.Nil(t, got.ProfilePictureBlobID)
+	require.Equal(t, cover.Value, got.CoverPictureBlobID.GetValue())
+
+	// A group that does not exist is refused, and no phantom is left behind,
+	// even by an edit that only clears.
+	unknown := chat.MustGenerateGroupChatID()
+	require.ErrorIs(t, s.EditGroup(ctx, unknown, chat.GroupEdit{Description: &cleared}), chat.ErrChatNotFound)
+	_, err = s.GetChatByID(ctx, unknown)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
 }
 
 func testStore_GroupChat_PutAndGet(t *testing.T, s chat.Store) {
@@ -740,36 +850,36 @@ func testStore_GroupChat_Picture(t *testing.T, s chat.Store) {
 	plain := putGroupChat(t, s, "No Picture", at(100), model.MustGenerateUserID())
 	got, err := s.GetChatByID(ctx, plain.ID)
 	require.NoError(t, err)
-	require.Nil(t, got.PictureBlobID)
+	require.Nil(t, got.ProfilePictureBlobID)
 
 	// A picture given at creation is on the canonical record.
 	original := &blobpb.BlobId{Value: []byte("picture-blob-0001")}
 	withPicture := &chat.Chat{
-		ID:            chat.MustGenerateGroupChatID(),
-		Type:          chatpb.ChatType_GROUP,
-		Members:       []*commonpb.UserId{model.MustGenerateUserID()},
-		Title:         "With Picture",
-		PictureBlobID: original,
-		LastActivity:  at(100),
+		ID:                   chat.MustGenerateGroupChatID(),
+		Type:                 chatpb.ChatType_GROUP,
+		Members:              []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:                "With Picture",
+		ProfilePictureBlobID: original,
+		LastActivity:         at(100),
 	}
 	require.NoError(t, s.PutChat(ctx, withPicture))
 	got, err = s.GetChatByID(ctx, withPicture.ID)
 	require.NoError(t, err)
-	require.NotNil(t, got.PictureBlobID)
-	require.Equal(t, original.Value, got.PictureBlobID.Value)
+	require.NotNil(t, got.ProfilePictureBlobID)
+	require.Equal(t, original.Value, got.ProfilePictureBlobID.Value)
 
 	// Setting a picture on a group that had none, and replacing one that did.
 	first := &blobpb.BlobId{Value: []byte("picture-blob-0002")}
 	require.NoError(t, s.SetGroupPicture(ctx, plain.ID, first))
 	got, err = s.GetChatByID(ctx, plain.ID)
 	require.NoError(t, err)
-	require.Equal(t, first.Value, got.PictureBlobID.Value)
+	require.Equal(t, first.Value, got.ProfilePictureBlobID.Value)
 
 	second := &blobpb.BlobId{Value: []byte("picture-blob-0003")}
 	require.NoError(t, s.SetGroupPicture(ctx, plain.ID, second))
 	got, err = s.GetChatByID(ctx, plain.ID)
 	require.NoError(t, err)
-	require.Equal(t, second.Value, got.PictureBlobID.Value)
+	require.Equal(t, second.Value, got.ProfilePictureBlobID.Value)
 
 	// The picture is part of the canonical record and survives the updates that
 	// touch it; the rest of the record survives the picture update.
@@ -778,7 +888,7 @@ func testStore_GroupChat_Picture(t *testing.T, s chat.Store) {
 	require.True(t, advanced)
 	got, err = s.GetChatByID(ctx, plain.ID)
 	require.NoError(t, err)
-	require.Equal(t, second.Value, got.PictureBlobID.Value)
+	require.Equal(t, second.Value, got.ProfilePictureBlobID.Value)
 	require.Equal(t, "No Picture", got.Title)
 	require.True(t, got.LastActivity.Equal(at(200)))
 
@@ -786,7 +896,7 @@ func testStore_GroupChat_Picture(t *testing.T, s chat.Store) {
 	require.NoError(t, s.SetGroupPicture(ctx, plain.ID, nil))
 	got, err = s.GetChatByID(ctx, plain.ID)
 	require.NoError(t, err)
-	require.Nil(t, got.PictureBlobID)
+	require.Nil(t, got.ProfilePictureBlobID)
 	require.Equal(t, "No Picture", got.Title)
 
 	// Setting a picture on a group that does not exist is refused, and must not
@@ -801,7 +911,7 @@ func testStore_GroupChat_Picture(t *testing.T, s chat.Store) {
 	require.Error(t, s.SetGroupPicture(ctx, dm.ID, first))
 	got, err = s.GetChatByID(ctx, dm.ID)
 	require.NoError(t, err)
-	require.Nil(t, got.PictureBlobID)
+	require.Nil(t, got.ProfilePictureBlobID)
 }
 
 func testStore_GroupChat_Edit(t *testing.T, s chat.Store) {
@@ -817,7 +927,7 @@ func testStore_GroupChat_Edit(t *testing.T, s chat.Store) {
 		IsStaffOnly:            true,
 		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: 5},
 		CreatorID:              creator,
-		PictureBlobID:          original,
+		ProfilePictureBlobID:   original,
 		LastActivity:           at(100),
 	}
 	require.NoError(t, s.PutChat(ctx, group))
@@ -828,7 +938,7 @@ func testStore_GroupChat_Edit(t *testing.T, s chat.Store) {
 	got, err := s.GetChatByID(ctx, group.ID)
 	require.NoError(t, err)
 	require.Equal(t, "After", got.Title)
-	require.Equal(t, original.Value, got.PictureBlobID.GetValue())
+	require.Equal(t, original.Value, got.ProfilePictureBlobID.GetValue())
 	require.True(t, got.IsStaffOnly)
 	require.Equal(t, "usd", got.MinimumListenerBalance.Currency)
 	require.Equal(t, float64(5), got.MinimumListenerBalance.NativeAmount)
@@ -837,20 +947,20 @@ func testStore_GroupChat_Edit(t *testing.T, s chat.Store) {
 
 	// The picture alone: the title stays edited.
 	replacement := &blobpb.BlobId{Value: []byte("picture-blob-0002")}
-	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{PictureBlobID: replacement}))
+	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{ProfilePictureBlobID: replacement}))
 	got, err = s.GetChatByID(ctx, group.ID)
 	require.NoError(t, err)
 	require.Equal(t, "After", got.Title)
-	require.Equal(t, replacement.Value, got.PictureBlobID.GetValue())
+	require.Equal(t, replacement.Value, got.ProfilePictureBlobID.GetValue())
 
 	// Both at once, on a group that had no picture.
 	plain := putGroupChat(t, s, "Plain", at(100), creator)
 	both := "Plain, Edited"
-	require.NoError(t, s.EditGroup(ctx, plain.ID, chat.GroupEdit{Title: &both, PictureBlobID: original}))
+	require.NoError(t, s.EditGroup(ctx, plain.ID, chat.GroupEdit{Title: &both, ProfilePictureBlobID: original}))
 	got, err = s.GetChatByID(ctx, plain.ID)
 	require.NoError(t, err)
 	require.Equal(t, "Plain, Edited", got.Title)
-	require.Equal(t, original.Value, got.PictureBlobID.GetValue())
+	require.Equal(t, original.Value, got.ProfilePictureBlobID.GetValue())
 
 	// The edit survives the updates that touch the rest of the record.
 	advanced, _, err := s.AdvanceLastMessage(ctx, plain.ID, &messagingpb.MessageId{Value: 1}, at(200))
@@ -859,7 +969,7 @@ func testStore_GroupChat_Edit(t *testing.T, s chat.Store) {
 	got, err = s.GetChatByID(ctx, plain.ID)
 	require.NoError(t, err)
 	require.Equal(t, "Plain, Edited", got.Title)
-	require.Equal(t, original.Value, got.PictureBlobID.GetValue())
+	require.Equal(t, original.Value, got.ProfilePictureBlobID.GetValue())
 
 	// An edit that names nothing is refused.
 	require.Error(t, s.EditGroup(ctx, plain.ID, chat.GroupEdit{}))
@@ -876,7 +986,7 @@ func testStore_GroupChat_Edit(t *testing.T, s chat.Store) {
 	got, err = s.GetChatByID(ctx, dm.ID)
 	require.NoError(t, err)
 	require.Empty(t, got.Title)
-	require.Nil(t, got.PictureBlobID)
+	require.Nil(t, got.ProfilePictureBlobID)
 }
 
 func testStore_GroupChat_Membership(t *testing.T, s chat.Store) {

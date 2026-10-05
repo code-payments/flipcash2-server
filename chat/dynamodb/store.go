@@ -251,7 +251,9 @@ const (
 	attrIsCreatorOnlySpeaker = "is_creator_only_speaker"
 	attrIsPrivate            = "is_private"
 	attrCreator              = "creator"
-	attrPictureBlobID        = "picture"
+	attrDescription          = "description"   // group chats item: absent when the group has none
+	attrProfilePictureBlobID = "picture"       // group chats item: the profile picture's ORIGINAL, named before cover pictures existed
+	attrCoverPictureBlobID   = "cover_picture" // group chats item: the cover picture's ORIGINAL
 	attrState                = "state"
 	attrUser                 = "user" // member id, bare hex — see userIndexKey
 	attrJoinedAt             = "joined_at"
@@ -756,9 +758,9 @@ func (s *store) SetGroupPicture(ctx context.Context, chatID *commonpb.ChatId, bl
 		ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
 	}
 	if blobID == nil {
-		input.UpdateExpression = aws.String(fmt.Sprintf("REMOVE %s", attrPictureBlobID))
+		input.UpdateExpression = aws.String(fmt.Sprintf("REMOVE %s", attrProfilePictureBlobID))
 	} else {
-		input.UpdateExpression = aws.String(fmt.Sprintf("SET %s = :picture", attrPictureBlobID))
+		input.UpdateExpression = aws.String(fmt.Sprintf("SET %s = :picture", attrProfilePictureBlobID))
 		input.ExpressionAttributeValues = map[string]types.AttributeValue{":picture": avB(blobID.Value)}
 	}
 
@@ -774,7 +776,9 @@ func (s *store) SetGroupPicture(ctx context.Context, chatID *commonpb.ChatId, bl
 
 // EditGroup is one update of the canonical item that SETs exactly the
 // attributes the edit names, so two edits of different fields never clobber
-// each other, conditioned on the item existing as SetGroupPicture is.
+// each other, conditioned on the item existing as SetGroupPicture is. An
+// empty description is REMOVEd rather than stored, so a group without one
+// never carries the attribute, whichever way it came to have none.
 func (s *store) EditGroup(ctx context.Context, chatID *commonpb.ChatId, edit chat.GroupEdit) error {
 	if !chat.IsGroupChatID(chatID) {
 		return fmt.Errorf("not a group chat id")
@@ -783,24 +787,48 @@ func (s *store) EditGroup(ctx context.Context, chatID *commonpb.ChatId, edit cha
 		return fmt.Errorf("edit names nothing")
 	}
 
-	var sets []string
+	var sets, removes []string
 	values := make(map[string]types.AttributeValue)
 	if edit.Title != nil {
 		sets = append(sets, fmt.Sprintf("%s = :title", attrTitle))
 		values[":title"] = avS(*edit.Title)
 	}
-	if edit.PictureBlobID != nil {
-		sets = append(sets, fmt.Sprintf("%s = :picture", attrPictureBlobID))
-		values[":picture"] = avB(edit.PictureBlobID.Value)
+	if edit.Description != nil {
+		if *edit.Description == "" {
+			removes = append(removes, attrDescription)
+		} else {
+			sets = append(sets, fmt.Sprintf("%s = :description", attrDescription))
+			values[":description"] = avS(*edit.Description)
+		}
+	}
+	if edit.ProfilePictureBlobID != nil {
+		sets = append(sets, fmt.Sprintf("%s = :picture", attrProfilePictureBlobID))
+		values[":picture"] = avB(edit.ProfilePictureBlobID.Value)
+	}
+	if edit.CoverPictureBlobID != nil {
+		sets = append(sets, fmt.Sprintf("%s = :cover_picture", attrCoverPictureBlobID))
+		values[":cover_picture"] = avB(edit.CoverPictureBlobID.Value)
 	}
 
-	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:                 aws.String(s.chatsTable),
-		Key:                       map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
-		UpdateExpression:          aws.String("SET " + strings.Join(sets, ", ")),
-		ConditionExpression:       aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
-		ExpressionAttributeValues: values,
-	})
+	var clauses []string
+	if len(sets) > 0 {
+		clauses = append(clauses, "SET "+strings.Join(sets, ", "))
+	}
+	if len(removes) > 0 {
+		clauses = append(clauses, "REMOVE "+strings.Join(removes, ", "))
+	}
+	input := &dynamodb.UpdateItemInput{
+		TableName:           aws.String(s.chatsTable),
+		Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
+		UpdateExpression:    aws.String(strings.Join(clauses, " ")),
+		ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
+	}
+	// An edit that only removes binds no values, and DynamoDB refuses an empty
+	// value map.
+	if len(values) > 0 {
+		input.ExpressionAttributeValues = values
+	}
+	_, err := s.client.UpdateItem(ctx, input)
 	if err != nil {
 		if isConditionalCheckFailed(err) {
 			return chat.ErrChatNotFound
@@ -1740,8 +1768,14 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 		if c.CreatorID != nil {
 			item[attrCreator] = avB(c.CreatorID.Value)
 		}
-		if c.PictureBlobID != nil {
-			item[attrPictureBlobID] = avB(c.PictureBlobID.Value)
+		if c.Description != "" {
+			item[attrDescription] = avS(c.Description)
+		}
+		if c.ProfilePictureBlobID != nil {
+			item[attrProfilePictureBlobID] = avB(c.ProfilePictureBlobID.Value)
+		}
+		if c.CoverPictureBlobID != nil {
+			item[attrCoverPictureBlobID] = avB(c.CoverPictureBlobID.Value)
 		}
 	} else {
 		item[attrMembers] = membersAttr(c.Members)
@@ -1828,6 +1862,7 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 		Members:                members,
 		RosterSummary:          chat.RosterSummary{MemberCount: uint64(len(members))},
 		Title:                  asS(item[attrTitle]),
+		Description:            asS(item[attrDescription]),
 		IsStaffOnly:            asBool(item[attrIsStaffOnly]),
 		MinimumListenerBalance: balance,
 		IsCreatorOnlySpeaker:   asBool(item[attrIsCreatorOnlySpeaker]),
@@ -1838,9 +1873,12 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 	if creator := asB(item[attrCreator]); len(creator) > 0 {
 		c.CreatorID = &commonpb.UserId{Value: append([]byte(nil), creator...)}
 	}
-	// picture_blob_id is absent for DMs and for groups without a picture.
-	if picture := asB(item[attrPictureBlobID]); len(picture) > 0 {
-		c.PictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), picture...)}
+	// picture and cover_picture are absent for DMs and for groups without one.
+	if picture := asB(item[attrProfilePictureBlobID]); len(picture) > 0 {
+		c.ProfilePictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), picture...)}
+	}
+	if cover := asB(item[attrCoverPictureBlobID]); len(cover) > 0 {
+		c.CoverPictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), cover...)}
 	}
 	// last_message_id is absent until the chat's first message.
 	if _, ok := item[attrLastMessageID]; ok {

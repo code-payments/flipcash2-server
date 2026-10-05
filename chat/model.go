@@ -240,8 +240,8 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // a group chat: group membership is mutable and lives in its own store records,
 // which no path that reads the canonical record touches. A caller that needs a
 // group's members reads them explicitly via Store.GetMembers. Title,
-// IsStaffOnly, IsCreatorOnlySpeaker, IsPrivate, CreatorID and PictureBlobID
-// are group-only and zero for DMs.
+// IsStaffOnly, IsCreatorOnlySpeaker, IsPrivate, CreatorID, Description,
+// ProfilePictureBlobID and CoverPictureBlobID are group-only and zero for DMs.
 //
 // RosterSummary describes the member list without containing it. Like Members,
 // it is complete for a DM on any read and left zero for a group by the
@@ -273,8 +273,8 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // (see Access), no rule admits anyone to it (see RuleEvaluator), and
 // JoinChat refuses everyone but its creator; each is decided on this flag,
 // not on the absence of rules. Its
-// title and picture are plaintext on the record like any group's, and are
-// shown to any registered user.
+// title, description and pictures are plaintext on the record like any
+// group's, and are shown to any registered user.
 //
 // A private group's chat key reaches the server only as its members' key
 // envelopes (see KeyEnvelope), and nothing happens in one until its creator
@@ -291,13 +291,19 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // make the creator a member, and whether they are is answered by the membership
 // records, never by this field.
 //
-// PictureBlobID is the blob holding the ORIGINAL rendition of the group's
-// picture, or nil when the group has none. The chat domain stores only that
-// handle: the full rendition set (and its download URLs) is resolved from blob
-// storage by the server layer on read, exactly as a profile picture is. Read
-// access is a blob-domain grant to the chat's members, made when the picture
-// is set (see blob.Integration.SetAsChatPicture), so the record here carries
-// no authorization of its own.
+// Description is the group's free-form description, written by its creator,
+// or empty when it has none. It is stored exactly as written (see
+// ValidateDescription for what may be written).
+//
+// ProfilePictureBlobID is the blob holding the ORIGINAL rendition of the
+// group's profile picture — its avatar — or nil when the group has none, and
+// CoverPictureBlobID likewise for its cover picture, the banner behind its
+// profile view. The chat domain stores only those handles: the full rendition
+// sets (and their download URLs) are resolved from blob storage by the server
+// layer on read, exactly as a user's pictures are. Read access is a
+// blob-domain grant to the chat and to its public profile, made when a picture
+// is set (see blob.Integration.SetAsChatMedia), so the record here carries no
+// authorization of its own.
 type Chat struct {
 	ID                     *commonpb.ChatId
 	Type                   chatpb.ChatType
@@ -309,7 +315,9 @@ type Chat struct {
 	IsCreatorOnlySpeaker   bool
 	IsPrivate              bool
 	CreatorID              *commonpb.UserId
-	PictureBlobID          *blobpb.BlobId
+	Description            string
+	ProfilePictureBlobID   *blobpb.BlobId
+	CoverPictureBlobID     *blobpb.BlobId
 	LastActivity           time.Time
 	LastMessageID          *messagingpb.MessageId
 }
@@ -414,19 +422,23 @@ func (c *Chat) PermissionsFor(userID *commonpb.UserId, isMember bool) Permission
 }
 
 // GroupEdit is a change to a group's editable record fields (see
-// Store.EditGroup): the title, and the blob holding its picture's ORIGINAL. A
-// nil field is left as it is, so an edit names only what it changes and two
-// edits of different fields never overwrite each other. Neither field can be
-// cleared through an edit — a picture is removed with Store.SetGroupPicture —
-// and an edit that names nothing is invalid.
+// Store.EditGroup): the title, the description, and the blobs holding the
+// ORIGINALs of its profile picture and cover picture. A nil field is left as
+// it is, so an edit names only what it changes and two edits of different
+// fields never overwrite each other. The description is cleared by naming the
+// empty one; the title and pictures cannot be cleared through an edit — a
+// profile picture is removed with Store.SetGroupPicture — and an edit that
+// names nothing is invalid.
 type GroupEdit struct {
-	Title         *string
-	PictureBlobID *blobpb.BlobId
+	Title                *string
+	Description          *string
+	ProfilePictureBlobID *blobpb.BlobId
+	CoverPictureBlobID   *blobpb.BlobId
 }
 
 // IsEmpty reports whether the edit names nothing.
 func (e GroupEdit) IsEmpty() bool {
-	return e.Title == nil && e.PictureBlobID == nil
+	return e.Title == nil && e.Description == nil && e.ProfilePictureBlobID == nil && e.CoverPictureBlobID == nil
 }
 
 // Clone returns a deep copy of the chat.
@@ -443,9 +455,12 @@ func (c *Chat) Clone() *Chat {
 	if c.CreatorID != nil {
 		creatorID = &commonpb.UserId{Value: append([]byte(nil), c.CreatorID.Value...)}
 	}
-	var pictureBlobID *blobpb.BlobId
-	if c.PictureBlobID != nil {
-		pictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), c.PictureBlobID.Value...)}
+	var profilePictureBlobID, coverPictureBlobID *blobpb.BlobId
+	if c.ProfilePictureBlobID != nil {
+		profilePictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), c.ProfilePictureBlobID.Value...)}
+	}
+	if c.CoverPictureBlobID != nil {
+		coverPictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), c.CoverPictureBlobID.Value...)}
 	}
 	var lastMessageID *messagingpb.MessageId
 	if c.LastMessageID != nil {
@@ -462,18 +477,22 @@ func (c *Chat) Clone() *Chat {
 		IsCreatorOnlySpeaker:   c.IsCreatorOnlySpeaker,
 		IsPrivate:              c.IsPrivate,
 		CreatorID:              creatorID,
-		PictureBlobID:          pictureBlobID,
+		Description:            c.Description,
+		ProfilePictureBlobID:   profilePictureBlobID,
+		CoverPictureBlobID:     coverPictureBlobID,
 		LastActivity:           c.LastActivity,
 		LastMessageID:          lastMessageID,
 	}
 }
 
 // ToProto projects the stored chat onto a chatpb.Metadata. Only the fields
-// owned by the chat domain are populated: chat_id, type, title, last_activity,
-// roster_summary, rules, is_private, creator (a group's, when recorded), a
-// Member entry per member with just user_id set, and — for a group with a picture — a picture
-// carrying only its ORIGINAL rendition's blob id. The caller is responsible for hydrating member profiles, pointers,
-// the last message, and the picture's resolved rendition set.
+// owned by the chat domain are populated: chat_id, type, title, description,
+// last_activity, roster_summary, rules, is_private, creator (a group's, when
+// recorded), a Member entry per member with just user_id set, and — for a
+// group with a profile picture or cover picture — each picture carrying only
+// its ORIGINAL rendition's blob id. The caller is responsible for hydrating
+// member profiles, pointers, the last message, and each picture's resolved
+// rendition set.
 func (c *Chat) ToProto() *chatpb.Metadata {
 	members := make([]*chatpb.Member, len(c.Members))
 	for i, m := range c.Members {
@@ -487,6 +506,7 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 		Members:       members,
 		RosterSummary: c.RosterSummary.ToProto(),
 		Title:         c.Title,
+		Description:   c.Description,
 		Rules:         c.Rules(),
 		IsPrivate:     c.IsPrivate,
 		LastActivity:  timestamppb.New(c.LastActivity),
@@ -494,15 +514,24 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 	if c.CreatorID != nil {
 		md.Creator = &commonpb.UserId{Value: append([]byte(nil), c.CreatorID.Value...)}
 	}
-	if c.PictureBlobID != nil {
-		md.Picture = &blobpb.Media{
-			Renditions: []*blobpb.Rendition{{
-				Role:   blobpb.Rendition_ORIGINAL,
-				BlobId: &blobpb.BlobId{Value: append([]byte(nil), c.PictureBlobID.Value...)},
-			}},
-		}
+	if c.ProfilePictureBlobID != nil {
+		md.ProfilePicture = originalMedia(c.ProfilePictureBlobID)
+	}
+	if c.CoverPictureBlobID != nil {
+		md.CoverPicture = originalMedia(c.CoverPictureBlobID)
 	}
 	return md
+}
+
+// originalMedia is a picture as the record knows it: its ORIGINAL rendition's
+// blob id, with nothing resolved.
+func originalMedia(blobID *blobpb.BlobId) *blobpb.Media {
+	return &blobpb.Media{
+		Renditions: []*blobpb.Rendition{{
+			Role:   blobpb.Rendition_ORIGINAL,
+			BlobId: &blobpb.BlobId{Value: append([]byte(nil), blobID.Value...)},
+		}},
+	}
 }
 
 // KeyEnvelope is one user's key envelope for a private group (see

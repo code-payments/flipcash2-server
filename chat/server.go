@@ -119,8 +119,9 @@ type Media interface {
 	// reader may see.
 	ResolveRenditions(ctx context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error)
 
-	// SetAsChatPicture attaches the blob holding a picture's ORIGINAL to chatID
-	// as its picture: it verifies that ownerID owns the blob and that it is a
+	// SetAsChatMedia attaches the blob holding a picture's ORIGINAL to chatID
+	// as its profile picture or cover picture — the two are one surface to the
+	// blob domain: it verifies that ownerID owns the blob and that it is a
 	// READY image original, then grants read access to it on the surfaces the
 	// picture is shown from. It is idempotent. It returns one of
 	// blob.ErrBlobNotFound, blob.ErrBlobNotReady, blob.ErrBlobRejected, or
@@ -130,7 +131,7 @@ type Media interface {
 	// It touches only blob-domain state, so it may be called for a chat that
 	// does not exist yet — which is how a group is created with its picture in
 	// place, rather than briefly without one.
-	SetAsChatPicture(ctx context.Context, ownerID *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error
+	SetAsChatMedia(ctx context.Context, ownerID *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error
 }
 
 // UserEventPublisher is the write slice of the event domain the Chat service
@@ -302,9 +303,9 @@ func NewServer(
 // in_lobby, whether they are waiting in its lobby (see lobby.go). A private
 // group whose key has not been stored is returned like any other.
 //
-// The group's picture is returned in every case: it is part of the record, as
-// the title is, and the two are what identify a group — a group's picture is
-// readable by anyone. Its download URLs are resolved here without a blob ACL
+// The group's pictures and description are returned in every case: they are
+// part of the record, as the title is, and are what identify a group — a
+// group's pictures are readable by anyone. Its download URLs are resolved here without a blob ACL
 // check on that basis. The blob domain itself still resolves a chat-scoped
 // grant against membership, so a non-member's GetBlobs on the same picture, or
 // on media in a message they previewed, is denied; that is accepted, since a
@@ -351,7 +352,7 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
 	}
 
-	metadata, err := s.hydrate(ctx, userID, standing, standing.Reading(req.GetViewMode()), []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, standing, standing.Reading(req.GetViewMode()), fullDetail, []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
 		return nil, status.Error(codes.Internal, "")
@@ -371,7 +372,8 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 // is_hidden, no viewer_state. It is REDACTED or nothing: any other mode is
 // DENIED, as is a DM, before anything is read, so an anonymous caller cannot
 // learn whether a DM exists. A private group has no public view either and is
-// DENIED off its record: its title and picture are for registered users.
+// DENIED off its record: its title, description and pictures are for
+// registered users.
 func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) (*chatpb.GetChatResponse, error) {
 	if req.GetViewMode() != messagingpb.ViewMode_REDACTED || !IsGroupChatID(req.ChatId) {
 		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
@@ -393,7 +395,7 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 	}
 
 	standing := s.access.PublicListenerStanding(c)
-	metadata, err := s.hydrate(ctx, nil, standing, standing.Reading(req.GetViewMode()), []*Chat{c})
+	metadata, err := s.hydrate(ctx, nil, standing, standing.Reading(req.GetViewMode()), fullDetail, []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
 		return nil, status.Error(codes.Internal, "")
@@ -404,6 +406,26 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 		Metadata: metadata[0],
 	}, nil
 }
+
+// metadataDetail is how much of a chat's record hydrate returns.
+type metadataDetail int
+
+const (
+	// fullDetail is the whole record, for a caller showing one chat — GetChat,
+	// a creation, an edit, a join, a lobby — or carrying it to a client that
+	// may.
+	fullDetail metadataDetail = iota
+
+	// listDetail is the record as a list view shows it: everything but the
+	// group's description and cover picture, which only its profile view
+	// shows. A feed page is many chats a client renders as rows, so they cost
+	// it bytes and the cover's renditions cost the server a resolve and a
+	// download URL per group, for fields no row renders. The proto allows a
+	// feed to omit them (see chat.v1.Metadata.description and cover_picture),
+	// and tells the client to fetch them with GetChat and never to let a feed
+	// result clear what it holds.
+	listDetail
+)
 
 // hydrate builds the proto metadata for a set of chats as a viewer of the given
 // standing sees them, batching the reads across the whole set: every chat's
@@ -427,8 +449,8 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 //     theirs to see. A DM's members are its record's, whoever the viewer is.
 //   - A viewer whose reading is denied gets no messaging state: no last
 //     message, no head event sequence, no pointers. The record's own fields —
-//     title, picture, rules, roster summary, last activity — are hydrated for
-//     anyone the caller admits to the record at all.
+//     title, description, pictures, rules, roster summary, last activity —
+//     are hydrated for anyone the caller admits to the record at all.
 //   - A viewer whose reading is redacted gets the messaging state with the
 //     last message redacted (see redact.Message), after its media is
 //     resolved, so the placeholder carries the blurhash a client renders. The
@@ -489,16 +511,22 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 // permissions computed off the record (see Chat.PermissionsFor and
 // ViewerState.ToProto). A non-member gets none.
 //
-// A group's picture is stored as the blob holding its ORIGINAL; every picture
-// across the set is expanded to its full rendition set, each with a short-lived
-// download URL, in one batched read — so a client renders the group's avatar
-// without a follow-up GetBlobs. That is done without an ACL check here: a
-// chat's picture is granted to the chat's members when it is set, and a
-// non-member is shown it as part of the record that identifies the group (see
-// GetChat). A picture whose original no longer resolves is left with its stored
-// ORIGINAL for the client to treat as unavailable, rather than failing the
-// whole read.
-func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standing ListenerStanding, reading Reading, chats []*Chat) ([]*chatpb.Metadata, error) {
+// A group's profile picture and cover picture are each stored as the blob
+// holding its ORIGINAL; every picture across the set is expanded to its full
+// rendition set, each with a short-lived download URL, in one batched read —
+// so a client renders the group's avatar and banner without a follow-up
+// GetBlobs. That is done without an ACL check here: a chat's pictures are
+// granted to the chat and its public profile when they are set (see
+// blob.Integration.SetAsChatMedia), and a non-member is shown them as part of
+// the record that identifies the group (see GetChat). A picture whose
+// original no longer resolves is left with its stored ORIGINAL for the client
+// to treat as unavailable, rather than failing the whole read.
+//
+// The detail is how much of the record is returned (see metadataDetail): a
+// feed asks for listDetail, and its chats carry no description and no cover
+// picture — the cover's renditions are never resolved, not resolved and
+// dropped — while every other caller asks for fullDetail.
+func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standing ListenerStanding, reading Reading, detail metadataDetail, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
 	var pointerRefs []PointerRef
@@ -540,8 +568,11 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 				seqChatIDs = append(seqChatIDs, c.ID)
 			}
 		}
-		if c.PictureBlobID != nil {
-			uniquePictureBlobIDs[string(c.PictureBlobID.Value)] = c.PictureBlobID
+		if c.ProfilePictureBlobID != nil {
+			uniquePictureBlobIDs[string(c.ProfilePictureBlobID.Value)] = c.ProfilePictureBlobID
+		}
+		if c.CoverPictureBlobID != nil && detail == fullDetail {
+			uniquePictureBlobIDs[string(c.CoverPictureBlobID.Value)] = c.CoverPictureBlobID
 		}
 		for _, m := range members {
 			uniqueUserIDs[string(m.Value)] = m
@@ -712,12 +743,23 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 			md.UseE2Ee = useE2ee(c, staffByUserId, s.teamUserID)
 			md.Rules = s.rules.RulesOf(c)
 		}
-		if c.PictureBlobID != nil {
-			// ToProto seeds the picture with its stored ORIGINAL; swap in the full
-			// resolved set when the original is servable, else leave that seed.
-			if renditions, ok := pictureRenditions[string(c.PictureBlobID.Value)]; ok {
-				md.Picture.Renditions = renditions
+		// ToProto seeds each picture with its stored ORIGINAL; swap in the full
+		// resolved set when the original is servable, else leave that seed.
+		if c.ProfilePictureBlobID != nil {
+			if renditions, ok := pictureRenditions[string(c.ProfilePictureBlobID.Value)]; ok {
+				md.ProfilePicture.Renditions = renditions
 			}
+		}
+		switch detail {
+		case fullDetail:
+			if c.CoverPictureBlobID != nil {
+				if renditions, ok := pictureRenditions[string(c.CoverPictureBlobID.Value)]; ok {
+					md.CoverPicture.Renditions = renditions
+				}
+			}
+		case listDetail:
+			md.Description = ""
+			md.CoverPicture = nil
 		}
 		assignPointers(md.Members, pointers[key])
 		for _, m := range md.Members {

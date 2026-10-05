@@ -23,6 +23,10 @@ import (
 // pinned to a snapshot watermark and reconciled by the client against the
 // event stream (see the Chat service proto for the contract).
 //
+// Both feeds are list views, so their chats are hydrated with listDetail: a
+// group's description and cover picture are left out, for GetChat to serve
+// when the client opens the group's profile view.
+//
 // The DM feed and the group feed share that contract but not an index. A DM
 // send fans last_activity out to each member's inbox row, so a DM feed page is
 // one index query. A group send touches only the canonical item, so a user's
@@ -99,7 +103,7 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 		chats = chats[:limit]
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, chats)
+	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, listDetail, chats)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating DM feed metadata")
 		return nil, status.Error(codes.Internal, "")
@@ -292,7 +296,7 @@ func (s *Server) GetGroupChatFeed(ctx context.Context, req *chatpb.GetGroupChatF
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, page)
+	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, listDetail, page)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating group feed metadata")
 		return nil, status.Error(codes.Internal, "")

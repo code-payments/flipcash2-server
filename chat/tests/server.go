@@ -107,6 +107,9 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_StartChat_Idempotent,
 		testServer_StartChat_WithPicture,
 		testServer_StartChat_PictureNotAccepted,
+		testServer_StartChat_WithDescriptionAndCover,
+		testServer_StartChat_CoverPictureNotAccepted,
+		testServer_StartChat_Description,
 		testServer_StartChat_TitleModerated,
 		testServer_StartChat_ModerationFailureIsInternal,
 		testServer_StartChat_PrivateGroup,
@@ -139,6 +142,10 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_EditChat_NotFound,
 		testServer_EditChat_TitleModerated,
 		testServer_EditChat_PictureNotAccepted,
+		testServer_EditChat_Description,
+		testServer_EditChat_CoverPicture,
+		testServer_EditChat_AllFields,
+		testServer_ChatProfileDetail_Carriers,
 		testServer_EditChat_ModerationFailureIsInternal,
 		testServer_ViewerState_Permissions,
 	} {
@@ -332,18 +339,23 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 // whatever rendition sets a test registers per ORIGINAL blob ID, and omits the
 // rest the way the real reader omits an unknown or not-yet-servable original.
 // It attaches, as a chat picture, only the blobs a test has registered as
-// attachable, and records what it attached to which chat.
+// attachable, records what it attached to which chat, and records every
+// original it was asked to resolve.
 type fakeMedia struct {
 	renditions map[string][]*blobpb.Rendition
 
-	// attachable is the set of blob IDs SetAsChatPicture accepts, standing in
+	// attachable is the set of blob IDs SetAsChatMedia accepts, standing in
 	// for "a READY image original the caller owns"; any other blob is refused
 	// as blob.ErrBlobNotFound.
 	attachable map[string]bool
-	// chatPictures records the blob attached to each chat, keyed by chat ID.
-	chatPictures map[string]*blobpb.BlobId
+	// chatPictures records the blobs attached to each chat, in attach order,
+	// keyed by chat ID.
+	chatPictures map[string][]*blobpb.BlobId
+	// resolved records every original ResolveRenditions was asked for, keyed
+	// by blob ID.
+	resolved map[string]bool
 
-	// attachErr, when set, fails every SetAsChatPicture call with it, standing
+	// attachErr, when set, fails every SetAsChatMedia call with it, standing
 	// in for a blob-domain outage.
 	attachErr error
 }
@@ -352,26 +364,37 @@ func newFakeMedia() *fakeMedia {
 	return &fakeMedia{
 		renditions:   make(map[string][]*blobpb.Rendition),
 		attachable:   make(map[string]bool),
-		chatPictures: make(map[string]*blobpb.BlobId),
+		chatPictures: make(map[string][]*blobpb.BlobId),
+		resolved:     make(map[string]bool),
 	}
 }
 
-// setAttachable registers a blob SetAsChatPicture will accept, with its
+// setAttachable registers a blob SetAsChatMedia will accept, with its
 // rendition set resolvable the way a READY original's is.
 func (f *fakeMedia) setAttachable(originalID *blobpb.BlobId) []*blobpb.Rendition {
 	f.attachable[string(originalID.Value)] = true
 	return f.setRenditions(originalID)
 }
 
-func (f *fakeMedia) SetAsChatPicture(_ context.Context, _ *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
+func (f *fakeMedia) SetAsChatMedia(_ context.Context, _ *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
 	if f.attachErr != nil {
 		return f.attachErr
 	}
 	if !f.attachable[string(blobID.Value)] {
 		return blob.ErrBlobNotFound
 	}
-	f.chatPictures[string(chatID.Value)] = blobID
+	f.chatPictures[string(chatID.Value)] = append(f.chatPictures[string(chatID.Value)], blobID)
 	return nil
+}
+
+// attachedTo returns the raw IDs of the blobs attached to chatID, in attach
+// order.
+func (f *fakeMedia) attachedTo(chatID *commonpb.ChatId) [][]byte {
+	var out [][]byte
+	for _, id := range f.chatPictures[string(chatID.Value)] {
+		out = append(out, id.Value)
+	}
+	return out
 }
 
 // setRenditions registers the resolved rendition set for an original: the
@@ -413,6 +436,7 @@ func (f *fakeMedia) setRenditions(originalID *blobpb.BlobId) []*blobpb.Rendition
 func (f *fakeMedia) ResolveRenditions(_ context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error) {
 	out := make(map[string][]*blobpb.Rendition)
 	for _, id := range ids {
+		f.resolved[string(id.Value)] = true
 		if r, ok := f.renditions[string(id.Value)]; ok {
 			out[string(id.Value)] = r
 		}
@@ -636,12 +660,12 @@ func (e *serverEnv) putGroup(title string, lastActivity time.Time, others ...*co
 func (e *serverEnv) putGroupWithPicture(title string, pictureBlobID *blobpb.BlobId, lastActivity time.Time, others ...*commonpb.UserId) *commonpb.ChatId {
 	chatID := chat.MustGenerateGroupChatID()
 	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
-		ID:            chatID,
-		Type:          chatpb.ChatType_GROUP,
-		Members:       append([]*commonpb.UserId{e.userID}, others...),
-		Title:         title,
-		PictureBlobID: pictureBlobID,
-		LastActivity:  lastActivity,
+		ID:                   chatID,
+		Type:                 chatpb.ChatType_GROUP,
+		Members:              append([]*commonpb.UserId{e.userID}, others...),
+		Title:                title,
+		ProfilePictureBlobID: pictureBlobID,
+		LastActivity:         lastActivity,
 	}))
 	return chatID
 }
@@ -803,7 +827,7 @@ func testServer_GetChat_OK(t *testing.T, s chat.Store) {
 	require.True(t, resp.Metadata.LastActivity.AsTime().Equal(at(1)))
 
 	// Pictures are a group-only feature; a DM never carries one.
-	require.Nil(t, resp.Metadata.Picture)
+	require.Nil(t, resp.Metadata.ProfilePicture)
 }
 
 func testServer_GetChat_NotFound(t *testing.T, s chat.Store) {
@@ -1627,7 +1651,7 @@ func testServer_GetChat_Group_Picture(t *testing.T, s chat.Store) {
 
 	resp := e.getChat(e.keys, withPicture)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-	picture := resp.Metadata.GetPicture()
+	picture := resp.Metadata.GetProfilePicture()
 	require.NotNil(t, picture)
 	require.Len(t, picture.Renditions, len(want))
 	for i, r := range picture.Renditions {
@@ -1642,7 +1666,7 @@ func testServer_GetChat_Group_Picture(t *testing.T, s chat.Store) {
 	withoutPicture := e.putGroup("No Picture", at(1), model.MustGenerateUserID())
 	resp = e.getChat(e.keys, withoutPicture)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-	require.Nil(t, resp.Metadata.GetPicture())
+	require.Nil(t, resp.Metadata.GetProfilePicture())
 
 	// A picture whose original no longer resolves (unknown to blob storage, or
 	// not servable) is not an error: the metadata still names the stored
@@ -1651,7 +1675,7 @@ func testServer_GetChat_Group_Picture(t *testing.T, s chat.Store) {
 	stale := e.putGroupWithPicture("Stale Picture", unresolvable, at(1), model.MustGenerateUserID())
 	resp = e.getChat(e.keys, stale)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-	picture = resp.Metadata.GetPicture()
+	picture = resp.Metadata.GetProfilePicture()
 	require.NotNil(t, picture)
 	require.Len(t, picture.Renditions, 1)
 	require.Equal(t, blobpb.Rendition_ORIGINAL, picture.Renditions[0].Role)
@@ -1664,13 +1688,13 @@ func testServer_GetChat_Group_Picture(t *testing.T, s chat.Store) {
 	require.NoError(t, s.SetGroupPicture(e.ctx, withPicture, replacement))
 	resp = e.getChat(e.keys, withPicture)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-	require.Equal(t, replacement.Value, resp.Metadata.GetPicture().GetRenditions()[0].GetBlobId().GetValue())
+	require.Equal(t, replacement.Value, resp.Metadata.GetProfilePicture().GetRenditions()[0].GetBlobId().GetValue())
 
 	// And clearing it removes it.
 	require.NoError(t, s.SetGroupPicture(e.ctx, withPicture, nil))
 	resp = e.getChat(e.keys, withPicture)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-	require.Nil(t, resp.Metadata.GetPicture())
+	require.Nil(t, resp.Metadata.GetProfilePicture())
 }
 
 func testServer_GetChat_Group_MembershipLifecycle(t *testing.T, s chat.Store) {
@@ -1733,7 +1757,7 @@ func testServer_GetChat_Group_NonMember(t *testing.T, s chat.Store) {
 		Type:                   chatpb.ChatType_GROUP,
 		Members:                []*commonpb.UserId{founder},
 		Title:                  "Whales",
-		PictureBlobID:          pictureBlobID,
+		ProfilePictureBlobID:   pictureBlobID,
 		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: requirement},
 		LastActivity:           at(1),
 		LastMessageID:          &messagingpb.MessageId{Value: 7},
@@ -1763,8 +1787,8 @@ func testServer_GetChat_Group_NonMember(t *testing.T, s chat.Store) {
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 0}, md.GetRosterSummary()))
 	require.Len(t, md.GetRules().GetListener(), 1)
 	require.Equal(t, float64(requirement), md.GetRules().GetListener()[0].GetMinimumBalance().GetAmount().GetNativeAmount())
-	require.Len(t, md.GetPicture().GetRenditions(), len(wantPicture))
-	require.NotEmpty(t, md.GetPicture().GetRenditions()[0].GetBlob().GetDownloadUrl().GetUrl())
+	require.Len(t, md.GetProfilePicture().GetRenditions(), len(wantPicture))
+	require.NotEmpty(t, md.GetProfilePicture().GetRenditions()[0].GetBlob().GetDownloadUrl().GetUrl())
 	require.Empty(t, md.Members)
 	require.Nil(t, md.LastMessage)
 	require.Zero(t, md.LatestEventSequence)
@@ -2258,13 +2282,13 @@ func testServer_GetGroupChatFeed_Hydrates(t *testing.T, s chat.Store) {
 	renditions := e.media.setRenditions(pictureBlobID)
 	withMsg := chat.MustGenerateGroupChatID()
 	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
-		ID:            withMsg,
-		Type:          chatpb.ChatType_GROUP,
-		Members:       []*commonpb.UserId{e.userID, model.MustGenerateUserID()},
-		Title:         "With Message",
-		PictureBlobID: pictureBlobID,
-		LastActivity:  at(2),
-		LastMessageID: &messagingpb.MessageId{Value: 3},
+		ID:                   withMsg,
+		Type:                 chatpb.ChatType_GROUP,
+		Members:              []*commonpb.UserId{e.userID, model.MustGenerateUserID()},
+		Title:                "With Message",
+		ProfilePictureBlobID: pictureBlobID,
+		LastActivity:         at(2),
+		LastMessageID:        &messagingpb.MessageId{Value: 3},
 	}))
 	withoutMsg := e.putGroup("Without", at(1), model.MustGenerateUserID())
 
@@ -2285,14 +2309,14 @@ func testServer_GetGroupChatFeed_Hydrates(t *testing.T, s chat.Store) {
 	require.NotNil(t, hydrated.LastMessage)
 	require.Equal(t, uint64(3), hydrated.LastMessage.MessageId.Value)
 	require.Equal(t, uint64(3), hydrated.LatestEventSequence)
-	require.NotNil(t, hydrated.Picture)
-	require.Len(t, hydrated.Picture.Renditions, len(renditions))
-	require.NotNil(t, hydrated.Picture.Renditions[0].Blob)
+	require.NotNil(t, hydrated.ProfilePicture)
+	require.Len(t, hydrated.ProfilePicture.Renditions, len(renditions))
+	require.NotNil(t, hydrated.ProfilePicture.Renditions[0].Blob)
 
 	bare := byChat[string(withoutMsg.Value)]
 	require.Nil(t, bare.LastMessage)
 	require.Zero(t, bare.LatestEventSequence)
-	require.Nil(t, bare.Picture)
+	require.Nil(t, bare.ProfilePicture)
 
 	// The viewer's own pointers ride on their member entry; a group with none
 	// stored leaves the entry without any.
@@ -2818,12 +2842,20 @@ func testServer_LeaveChat_ThenRejoin(t *testing.T, s chat.Store) {
 }
 
 // fakeModerator is a canned moderation.Client for server tests. Only the two
-// classifiers a chat title runs through do anything; the rest satisfy the
-// interface and never flag.
+// classifiers a chat title or description runs through do anything; the rest
+// satisfy the interface and never flag.
 type fakeModerator struct {
 	textFlagged    bool
 	textCategories []string
 	textErr        error
+
+	// flaggedTexts flags the texts it names alone, with their categories, and
+	// textErrs fails them alone, so a test can refuse a description and not
+	// the title sent beside it.
+	flaggedTexts map[string][]string
+	textErrs     map[string]error
+	// classifiedTexts records every text ClassifyText saw, in order.
+	classifiedTexts []string
 
 	titleFlagged    bool
 	titleCategories []string
@@ -2834,7 +2866,14 @@ type fakeModerator struct {
 	classifiedTitle string
 }
 
-func (m *fakeModerator) ClassifyText(context.Context, string) (*moderation.Result, error) {
+func (m *fakeModerator) ClassifyText(_ context.Context, text string) (*moderation.Result, error) {
+	m.classifiedTexts = append(m.classifiedTexts, text)
+	if err, ok := m.textErrs[text]; ok {
+		return nil, err
+	}
+	if categories, ok := m.flaggedTexts[text]; ok {
+		return fakeModerationResult(true, categories, nil)
+	}
 	return fakeModerationResult(m.textFlagged, m.textCategories, m.textErr)
 }
 
@@ -3165,7 +3204,7 @@ func testServer_StartChat_OK(t *testing.T, s chat.Store) {
 	require.Equal(t, e.userID.Value, md.GetCreator().GetValue())
 	require.Equal(t, "Sunday Hikers", md.Title)
 	require.NoError(t, protoutil.ProtoEqualError(groupParams("Sunday Hikers").Rules, md.Rules))
-	require.Nil(t, md.Picture)
+	require.Nil(t, md.ProfilePicture)
 	require.Nil(t, md.LastMessage)
 	require.False(t, md.LastActivity.AsTime().Before(before))
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 0}, md.GetRosterSummary()))
@@ -3185,7 +3224,7 @@ func testServer_StartChat_OK(t *testing.T, s chat.Store) {
 	require.False(t, stored.IsStaffOnly)
 	require.NotNil(t, stored.MinimumListenerBalance)
 	require.Equal(t, float64(startChatMinimumBalance), stored.MinimumListenerBalance.NativeAmount)
-	require.Nil(t, stored.PictureBlobID)
+	require.Nil(t, stored.ProfilePictureBlobID)
 	members, err := s.GetMembers(e.ctx, md.ChatId)
 	require.NoError(t, err)
 	require.Len(t, members, 1)
@@ -3331,22 +3370,22 @@ func testServer_StartChat_WithPicture(t *testing.T, s chat.Store) {
 	renditions := e.media.setAttachable(pictureBlobID)
 
 	params := groupParams("Picture Group")
-	params.Picture = pictureBlobID
+	params.ProfilePicture = pictureBlobID
 	resp := e.mustStartGroupChat(e.keys, params)
 	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
 	md := resp.Chat
 
 	// The picture was attached against the new group's ID before the record
 	// was written, and comes back hydrated with its full rendition set.
-	require.Equal(t, pictureBlobID.Value, e.media.chatPictures[string(md.ChatId.Value)].GetValue())
-	require.NotNil(t, md.Picture)
-	require.Len(t, md.Picture.Renditions, len(renditions))
-	require.Equal(t, pictureBlobID.Value, md.Picture.Renditions[0].GetBlobId().GetValue())
-	require.NotNil(t, md.Picture.Renditions[0].Blob)
+	require.Equal(t, [][]byte{pictureBlobID.Value}, e.media.attachedTo(md.ChatId))
+	require.NotNil(t, md.ProfilePicture)
+	require.Len(t, md.ProfilePicture.Renditions, len(renditions))
+	require.Equal(t, pictureBlobID.Value, md.ProfilePicture.Renditions[0].GetBlobId().GetValue())
+	require.NotNil(t, md.ProfilePicture.Renditions[0].Blob)
 
 	stored, err := s.GetChatByID(e.ctx, md.ChatId)
 	require.NoError(t, err)
-	require.Equal(t, pictureBlobID.Value, stored.PictureBlobID.GetValue())
+	require.Equal(t, pictureBlobID.Value, stored.ProfilePictureBlobID.GetValue())
 }
 
 func testServer_StartChat_PictureNotAccepted(t *testing.T, s chat.Store) {
@@ -3356,9 +3395,9 @@ func testServer_StartChat_PictureNotAccepted(t *testing.T, s chat.Store) {
 	// A blob the media domain will not attach — unknown, not the caller's, not
 	// READY, or not an image — refuses the whole creation: no group is written.
 	params := groupParams("Picture Group")
-	params.Picture = &blobpb.BlobId{Value: []byte("not-attachable01")}
+	params.ProfilePicture = &blobpb.BlobId{Value: []byte("not-attachable01")}
 	resp := e.mustStartGroupChat(e.keys, params)
-	require.Equal(t, chatpb.StartChatResponse_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
+	require.Equal(t, chatpb.StartChatResponse_PROFILE_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
 	require.Nil(t, resp.Chat)
 
 	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
@@ -3370,7 +3409,7 @@ func testServer_StartChat_PictureNotAccepted(t *testing.T, s chat.Store) {
 	// picture's: the RPC fails rather than telling the client to pick another.
 	e.media.setAttachable(&blobpb.BlobId{Value: []byte("group-picture-01")})
 	e.media.attachErr = errors.New("blob store down")
-	params.Picture = &blobpb.BlobId{Value: []byte("group-picture-01")}
+	params.ProfilePicture = &blobpb.BlobId{Value: []byte("group-picture-01")}
 	_, err = e.startGroupChat(e.keys, params)
 	require.Equal(t, codes.Internal, status.Code(err))
 	groups, err = s.GetGroupChatsForUser(e.ctx, e.userID)
@@ -4211,13 +4250,13 @@ func testServer_GetDmChatFeed_ViewerState(t *testing.T, s chat.Store) {
 func (e *serverEnv) putOwnedGroup(title string, pictureBlobID *blobpb.BlobId, others ...*commonpb.UserId) *commonpb.ChatId {
 	chatID := chat.MustGenerateGroupChatID()
 	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
-		ID:            chatID,
-		Type:          chatpb.ChatType_GROUP,
-		Members:       append([]*commonpb.UserId{e.userID}, others...),
-		Title:         title,
-		CreatorID:     e.userID,
-		PictureBlobID: pictureBlobID,
-		LastActivity:  at(1),
+		ID:                   chatID,
+		Type:                 chatpb.ChatType_GROUP,
+		Members:              append([]*commonpb.UserId{e.userID}, others...),
+		Title:                title,
+		CreatorID:            e.userID,
+		ProfilePictureBlobID: pictureBlobID,
+		LastActivity:         at(1),
 	}))
 	return chatID
 }
@@ -4228,10 +4267,30 @@ func (e *serverEnv) editChat(keys model.KeyPair, chatID *commonpb.ChatId, title 
 		req.Title = &chatpb.EditChatRequest_Title{Value: *title}
 	}
 	if picture != nil {
-		req.Picture = &chatpb.EditChatRequest_Picture{BlobId: picture}
+		req.ProfilePicture = &chatpb.EditChatRequest_ProfilePicture{BlobId: picture}
 	}
+	return e.sendEditChat(keys, req)
+}
+
+// sendEditChat signs and sends req as is, for a test that sets fields
+// editChat does not take.
+func (e *serverEnv) sendEditChat(keys model.KeyPair, req *chatpb.EditChatRequest) (*chatpb.EditChatResponse, error) {
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
 	return e.client.EditChat(e.ctx, req)
+}
+
+func (e *serverEnv) mustSendEditChat(keys model.KeyPair, req *chatpb.EditChatRequest) *chatpb.EditChatResponse {
+	resp, err := e.sendEditChat(keys, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// describeGroup gives an existing group a description and a resolvable cover
+// picture straight through the store, returning the cover's rendition set.
+func (e *serverEnv) describeGroup(chatID *commonpb.ChatId, description string, cover *blobpb.BlobId) []*blobpb.Rendition {
+	renditions := e.media.setRenditions(cover)
+	require.NoError(e.t, e.store.EditGroup(e.ctx, chatID, chat.GroupEdit{Description: &description, CoverPictureBlobID: cover}))
+	return renditions
 }
 
 func (e *serverEnv) mustEditChat(keys model.KeyPair, chatID *commonpb.ChatId, title *string, picture *blobpb.BlobId) *chatpb.EditChatResponse {
@@ -4290,7 +4349,7 @@ func testServer_EditChat_Title(t *testing.T, s chat.Store) {
 	require.NotNil(t, md)
 	require.Equal(t, chatID.Value, md.ChatId.Value)
 	require.Equal(t, "After", md.Title)
-	require.Nil(t, md.Picture)
+	require.Nil(t, md.ProfilePicture)
 	require.Len(t, md.Members, 1)
 	require.Equal(t, e.userID.Value, md.Members[0].UserId.Value)
 	require.NoError(t, protoutil.ProtoEqualError(viewerState(0, nil, true), md.ViewerState))
@@ -4328,23 +4387,23 @@ func testServer_EditChat_Picture(t *testing.T, s chat.Store) {
 
 	// The picture was attached against the group and comes back hydrated with
 	// the full rendition set; the title was left alone.
-	require.Equal(t, replacement.Value, e.media.chatPictures[string(chatID.Value)].GetValue())
+	require.Equal(t, [][]byte{replacement.Value}, e.media.attachedTo(chatID))
 	md := resp.Chat
 	require.Equal(t, "Group", md.Title)
-	require.NotNil(t, md.Picture)
-	require.Len(t, md.Picture.Renditions, len(renditions))
-	require.Equal(t, replacement.Value, md.Picture.Renditions[0].GetBlobId().GetValue())
-	require.NotNil(t, md.Picture.Renditions[0].Blob)
+	require.NotNil(t, md.ProfilePicture)
+	require.Len(t, md.ProfilePicture.Renditions, len(renditions))
+	require.Equal(t, replacement.Value, md.ProfilePicture.Renditions[0].GetBlobId().GetValue())
+	require.NotNil(t, md.ProfilePicture.Renditions[0].Blob)
 
 	stored, err := s.GetChatByID(e.ctx, chatID)
 	require.NoError(t, err)
-	require.Equal(t, replacement.Value, stored.PictureBlobID.GetValue())
+	require.Equal(t, replacement.Value, stored.ProfilePictureBlobID.GetValue())
 	require.Equal(t, "Group", stored.Title)
 
 	// The announcement carries the same hydrated picture, and no title.
 	updates := e.waitForMetadataUpdates(chatID, 1)
 	require.Len(t, updates[0], 1)
-	require.NoError(t, protoutil.ProtoEqualError(md.Picture, updates[0][0].GetPictureChanged().GetNewPicture()))
+	require.NoError(t, protoutil.ProtoEqualError(md.ProfilePicture, updates[0][0].GetProfilePictureChanged().GetNewProfilePicture()))
 
 	// No title was moderated.
 	require.Empty(t, e.moderator.classifiedTitle)
@@ -4361,18 +4420,445 @@ func testServer_EditChat_Both(t *testing.T, s chat.Store) {
 	resp := e.mustEditChat(e.keys, chatID, &title, picture)
 	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
 	require.Equal(t, "After", resp.Chat.Title)
-	require.Equal(t, picture.Value, resp.Chat.GetPicture().GetRenditions()[0].GetBlobId().GetValue())
+	require.Equal(t, picture.Value, resp.Chat.GetProfilePicture().GetRenditions()[0].GetBlobId().GetValue())
 
 	stored, err := s.GetChatByID(e.ctx, chatID)
 	require.NoError(t, err)
 	require.Equal(t, "After", stored.Title)
-	require.Equal(t, picture.Value, stored.PictureBlobID.GetValue())
+	require.Equal(t, picture.Value, stored.ProfilePictureBlobID.GetValue())
 
 	// One event, one update per field, title first.
 	updates := e.waitForMetadataUpdates(chatID, 1)
 	require.Len(t, updates[0], 2)
 	require.Equal(t, "After", updates[0][0].GetTitleChanged().GetNewTitle())
-	require.NoError(t, protoutil.ProtoEqualError(resp.Chat.Picture, updates[0][1].GetPictureChanged().GetNewPicture()))
+	require.NoError(t, protoutil.ProtoEqualError(resp.Chat.ProfilePicture, updates[0][1].GetProfilePictureChanged().GetNewProfilePicture()))
+}
+
+func testServer_StartChat_WithDescriptionAndCover(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(startChatMinimumBalance)
+
+	profile := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	cover := &blobpb.BlobId{Value: []byte("group-cover-0001")}
+	e.media.setAttachable(profile)
+	coverRenditions := e.media.setAttachable(cover)
+
+	params := groupParams("Described Group")
+	params.Description = "Hikes every Sunday.\nAll welcome."
+	params.ProfilePicture = profile
+	params.CoverPicture = cover
+	resp := e.mustStartGroupChat(e.keys, params)
+	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
+	md := resp.Chat
+
+	// Both pictures were attached against the new group, profile picture
+	// first, and the cover comes back hydrated beside the description.
+	require.Equal(t, [][]byte{profile.Value, cover.Value}, e.media.attachedTo(md.ChatId))
+	require.Equal(t, "Hikes every Sunday.\nAll welcome.", md.Description)
+	require.Equal(t, profile.Value, md.GetProfilePicture().GetRenditions()[0].GetBlobId().GetValue())
+	require.Len(t, md.GetCoverPicture().GetRenditions(), len(coverRenditions))
+	require.Equal(t, cover.Value, md.GetCoverPicture().GetRenditions()[0].GetBlobId().GetValue())
+	require.NotNil(t, md.GetCoverPicture().GetRenditions()[0].Blob)
+
+	// The description went through the text classifier, as written.
+	require.Contains(t, e.moderator.classifiedTexts, "Hikes every Sunday.\nAll welcome.")
+
+	stored, err := s.GetChatByID(e.ctx, md.ChatId)
+	require.NoError(t, err)
+	require.Equal(t, "Hikes every Sunday.\nAll welcome.", stored.Description)
+	require.Equal(t, profile.Value, stored.ProfilePictureBlobID.GetValue())
+	require.Equal(t, cover.Value, stored.CoverPictureBlobID.GetValue())
+
+	// The creation's announcement carries them too.
+	updates := e.rosterUpdatesOnUserTopic(e.userID, md.ChatId)
+	require.Len(t, updates, 1)
+	announced := updates[0].GetMemberJoined().GetMetadata()
+	require.Equal(t, md.Description, announced.GetDescription())
+	require.NoError(t, protoutil.ProtoEqualError(md.CoverPicture, announced.GetCoverPicture()))
+
+	// A private group takes both the same way.
+	e.accounts.setStaff(e.userID, true)
+	privateCover := &blobpb.BlobId{Value: []byte("group-cover-0002")}
+	e.media.setAttachable(privateCover)
+	privateParams := privateGroupParams("Private Described")
+	privateParams.Description = "Invite only"
+	privateParams.CoverPicture = privateCover
+	resp = e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateParams)
+	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
+	require.Equal(t, "Invite only", resp.Chat.Description)
+	require.Equal(t, privateCover.Value, resp.Chat.GetCoverPicture().GetRenditions()[0].GetBlobId().GetValue())
+	require.Nil(t, resp.Chat.ProfilePicture)
+	require.Equal(t, [][]byte{privateCover.Value}, e.media.attachedTo(resp.Chat.ChatId))
+
+	// A group created without either has neither, and moderates no
+	// description.
+	e.moderator.classifiedTexts = nil
+	resp = e.mustStartGroupChat(e.keys, groupParams("Bare"))
+	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
+	require.Empty(t, resp.Chat.Description)
+	require.Nil(t, resp.Chat.CoverPicture)
+	require.Equal(t, []string{"Bare"}, e.moderator.classifiedTexts)
+}
+
+func testServer_StartChat_CoverPictureNotAccepted(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(startChatMinimumBalance)
+
+	// A cover the media domain will not attach refuses the whole creation,
+	// with its own result, after the profile picture beside it was attached:
+	// no group is written.
+	profile := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	e.media.setAttachable(profile)
+	params := groupParams("Cover Group")
+	params.ProfilePicture = profile
+	params.CoverPicture = &blobpb.BlobId{Value: []byte("not-attachable01")}
+	resp := e.mustStartGroupChat(e.keys, params)
+	require.Equal(t, chatpb.StartChatResponse_COVER_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
+	require.Nil(t, resp.Chat)
+
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	require.NoError(t, err)
+	require.Empty(t, groups)
+
+	// A profile picture refused first is reported as such, and the cover is
+	// never tried.
+	cover := &blobpb.BlobId{Value: []byte("group-cover-0001")}
+	e.media.setAttachable(cover)
+	params.ProfilePicture = &blobpb.BlobId{Value: []byte("not-attachable02")}
+	params.CoverPicture = cover
+	resp = e.mustStartGroupChat(e.keys, params)
+	require.Equal(t, chatpb.StartChatResponse_PROFILE_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
+	for _, attached := range e.media.chatPictures {
+		for _, id := range attached {
+			require.NotEqual(t, cover.Value, id.Value)
+		}
+	}
+}
+
+func testServer_StartChat_Description(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(startChatMinimumBalance)
+
+	noGroups := func() {
+		t.Helper()
+		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+		require.NoError(t, err)
+		require.Empty(t, groups)
+	}
+
+	cover := &blobpb.BlobId{Value: []byte("group-cover-0001")}
+	e.media.setAttachable(cover)
+
+	// A flagged description is refused with its category, after the title
+	// passed and before the cover is attached: nothing is written.
+	e.moderator.flaggedTexts = map[string][]string{"Buy my coin": {"gibberish", "solicitation"}}
+	params := groupParams("Fine Title")
+	params.Description = "Buy my coin"
+	params.CoverPicture = cover
+	resp := e.mustStartGroupChat(e.keys, params)
+	require.Equal(t, chatpb.StartChatResponse_DESCRIPTION_MODERATED, resp.Result)
+	require.Equal(t, moderationpb.FlaggedCategory_SPAM, resp.FlaggedCategory)
+	require.Nil(t, resp.Chat)
+	require.Empty(t, e.media.chatPictures)
+	require.Equal(t, "Fine Title", e.moderator.classifiedTitle)
+	noGroups()
+
+	// A flagged title is reported before the description is looked at.
+	e.moderator.flaggedTexts["Bad Title"] = []string{"hate"}
+	e.moderator.classifiedTexts = nil
+	params.Title = "Bad Title"
+	resp = e.mustStartGroupChat(e.keys, params)
+	require.Equal(t, chatpb.StartChatResponse_TITLE_MODERATED, resp.Result)
+	require.Equal(t, []string{"Bad Title"}, e.moderator.classifiedTexts)
+	noGroups()
+
+	// A description that cannot be classified is never persisted — a language
+	// the classifier cannot score included, which a title would survive.
+	e.moderator.flaggedTexts = nil
+	params.Title = "Fine Title"
+	for _, err := range []error{moderation.ErrUnsupportedLanguage, errors.New("classifier down")} {
+		e.moderator.textErrs = map[string]error{"Buy my coin": err}
+		_, err := e.startGroupChat(e.keys, params)
+		require.Equal(t, codes.Internal, status.Code(err))
+		noGroups()
+	}
+	e.moderator.textErrs = nil
+
+	// A description no group may carry is malformed, refused before anything
+	// is moderated.
+	e.moderator.classifiedTexts = nil
+	for _, invalid := range []string{"   ", "tab\there", "nul\x00"} {
+		params.Description = invalid
+		_, err := e.startGroupChat(e.keys, params)
+		require.Equal(t, codes.InvalidArgument, status.Code(err), "description: %q", invalid)
+	}
+	require.Empty(t, e.moderator.classifiedTexts)
+	noGroups()
+}
+
+func testServer_EditChat_Description(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	other, otherKeys := e.addUser()
+	chatID := e.putOwnedGroup("Group", nil, other)
+	describe := func(value string) *chatpb.EditChatRequest {
+		return &chatpb.EditChatRequest{ChatId: chatID, Description: &chatpb.EditChatRequest_Description{Value: value}}
+	}
+
+	// Set: moderated, written, returned, and announced alone.
+	resp := e.mustSendEditChat(e.keys, describe("Sunday hikes"))
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.Equal(t, "Sunday hikes", resp.Chat.Description)
+	require.Equal(t, "Group", resp.Chat.Title)
+	require.Equal(t, []string{"Sunday hikes"}, e.moderator.classifiedTexts)
+	require.Empty(t, e.moderator.classifiedTitle)
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, "Sunday hikes", stored.Description)
+	require.Equal(t, "Sunday hikes", e.getChat(otherKeys, chatID).Metadata.Description)
+
+	updates := e.waitForMetadataUpdates(chatID, 1)
+	require.Len(t, updates[0], 1)
+	require.NotNil(t, updates[0][0].GetDescriptionChanged())
+	require.Equal(t, "Sunday hikes", updates[0][0].GetDescriptionChanged().GetNewDescription())
+
+	// Setting it again is the no-op, moderating nothing.
+	e.moderator.classifiedTexts = nil
+	resp = e.mustSendEditChat(e.keys, describe("Sunday hikes"))
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.Empty(t, e.moderator.classifiedTexts)
+
+	// The empty one clears it, with nothing to moderate, and is announced
+	// as an empty description.
+	resp = e.mustSendEditChat(e.keys, describe(""))
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.Empty(t, resp.Chat.Description)
+	require.Empty(t, e.moderator.classifiedTexts)
+	stored, err = s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Empty(t, stored.Description)
+	updates = e.waitForMetadataUpdates(chatID, 2)
+	require.Len(t, updates[1], 1)
+	require.NotNil(t, updates[1][0].GetDescriptionChanged())
+	require.Empty(t, updates[1][0].GetDescriptionChanged().GetNewDescription())
+
+	// Clearing one that is not set is the no-op too.
+	resp = e.mustSendEditChat(e.keys, describe(""))
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+
+	// A flagged description refuses the whole edit, the title beside it
+	// included.
+	e.moderator.flaggedTexts = map[string][]string{"Buy my coin": {"gibberish", "solicitation"}}
+	req := describe("Buy my coin")
+	req.Title = &chatpb.EditChatRequest_Title{Value: "Retitled"}
+	resp = e.mustSendEditChat(e.keys, req)
+	require.Equal(t, chatpb.EditChatResponse_DESCRIPTION_MODERATED, resp.Result)
+	require.Equal(t, moderationpb.FlaggedCategory_SPAM, resp.FlaggedCategory)
+	require.Nil(t, resp.Chat)
+
+	// A description that cannot be classified fails the RPC, whatever the
+	// reason.
+	e.moderator.flaggedTexts = nil
+	e.moderator.textErrs = map[string]error{"Hola amigos": moderation.ErrUnsupportedLanguage}
+	_, err = e.sendEditChat(e.keys, describe("Hola amigos"))
+	require.Equal(t, codes.Internal, status.Code(err))
+	e.moderator.textErrs = nil
+
+	// A description no group may carry is malformed, refused before the
+	// record is read: even a group that does not exist answers so.
+	_, err = e.sendEditChat(e.keys, describe("  \n "))
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = e.sendEditChat(e.keys, &chatpb.EditChatRequest{
+		ChatId:      chat.MustGenerateGroupChatID(),
+		Description: &chatpb.EditChatRequest_Description{Value: "tab\there"},
+	})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	// None of the refusals reached the record or the stream.
+	stored, err = s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Empty(t, stored.Description)
+	require.Equal(t, "Group", stored.Title)
+	time.Sleep(100 * time.Millisecond)
+	updates, _ = e.metadataUpdatesOnChatTopic(chatID)
+	require.Len(t, updates, 2)
+}
+
+func testServer_EditChat_CoverPicture(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	profile := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	e.media.setRenditions(profile)
+	chatID := e.putOwnedGroup("Group", profile, model.MustGenerateUserID())
+
+	cover := &blobpb.BlobId{Value: []byte("group-cover-0001")}
+	renditions := e.media.setAttachable(cover)
+
+	resp := e.mustSendEditChat(e.keys, &chatpb.EditChatRequest{
+		ChatId:       chatID,
+		CoverPicture: &chatpb.EditChatRequest_CoverPicture{BlobId: cover},
+	})
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+
+	// The cover was attached against the group and comes back hydrated; the
+	// profile picture was left alone.
+	require.Equal(t, [][]byte{cover.Value}, e.media.attachedTo(chatID))
+	md := resp.Chat
+	require.Len(t, md.GetCoverPicture().GetRenditions(), len(renditions))
+	require.Equal(t, cover.Value, md.GetCoverPicture().GetRenditions()[0].GetBlobId().GetValue())
+	require.NotNil(t, md.GetCoverPicture().GetRenditions()[0].Blob)
+	require.Equal(t, profile.Value, md.GetProfilePicture().GetRenditions()[0].GetBlobId().GetValue())
+
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, cover.Value, stored.CoverPictureBlobID.GetValue())
+	require.Equal(t, profile.Value, stored.ProfilePictureBlobID.GetValue())
+
+	// The announcement carries the same hydrated cover, and nothing else.
+	updates := e.waitForMetadataUpdates(chatID, 1)
+	require.Len(t, updates[0], 1)
+	require.NoError(t, protoutil.ProtoEqualError(md.CoverPicture, updates[0][0].GetCoverPictureChanged().GetNewCoverPicture()))
+
+	// The same cover again is the no-op.
+	resp = e.mustSendEditChat(e.keys, &chatpb.EditChatRequest{
+		ChatId:       chatID,
+		CoverPicture: &chatpb.EditChatRequest_CoverPicture{BlobId: cover},
+	})
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.Len(t, e.media.attachedTo(chatID), 1)
+
+	// A cover the media domain will not attach refuses the whole edit with
+	// its own result: the description beside it is not written.
+	resp = e.mustSendEditChat(e.keys, &chatpb.EditChatRequest{
+		ChatId:       chatID,
+		Description:  &chatpb.EditChatRequest_Description{Value: "Unwritten"},
+		CoverPicture: &chatpb.EditChatRequest_CoverPicture{BlobId: &blobpb.BlobId{Value: []byte("not-attachable01")}},
+	})
+	require.Equal(t, chatpb.EditChatResponse_COVER_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
+	require.Nil(t, resp.Chat)
+	stored, err = s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Empty(t, stored.Description)
+	require.Equal(t, cover.Value, stored.CoverPictureBlobID.GetValue())
+
+	// A blob domain that cannot attach at all is the server's fault.
+	other := &blobpb.BlobId{Value: []byte("group-cover-0002")}
+	e.media.setAttachable(other)
+	e.media.attachErr = errors.New("blob store down")
+	_, err = e.sendEditChat(e.keys, &chatpb.EditChatRequest{
+		ChatId:       chatID,
+		CoverPicture: &chatpb.EditChatRequest_CoverPicture{BlobId: other},
+	})
+	require.Equal(t, codes.Internal, status.Code(err))
+
+	time.Sleep(100 * time.Millisecond)
+	updates, _ = e.metadataUpdatesOnChatTopic(chatID)
+	require.Len(t, updates, 1)
+}
+
+func testServer_EditChat_AllFields(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	chatID := e.putOwnedGroup("Before", nil)
+	profile := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	cover := &blobpb.BlobId{Value: []byte("group-cover-0001")}
+	e.media.setAttachable(profile)
+	e.media.setAttachable(cover)
+
+	resp := e.mustSendEditChat(e.keys, &chatpb.EditChatRequest{
+		ChatId:         chatID,
+		Title:          &chatpb.EditChatRequest_Title{Value: "After"},
+		ProfilePicture: &chatpb.EditChatRequest_ProfilePicture{BlobId: profile},
+		Description:    &chatpb.EditChatRequest_Description{Value: "Described"},
+		CoverPicture:   &chatpb.EditChatRequest_CoverPicture{BlobId: cover},
+	})
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.Equal(t, "After", resp.Chat.Title)
+	require.Equal(t, "Described", resp.Chat.Description)
+	require.Equal(t, [][]byte{profile.Value, cover.Value}, e.media.attachedTo(chatID))
+
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, "After", stored.Title)
+	require.Equal(t, "Described", stored.Description)
+	require.Equal(t, profile.Value, stored.ProfilePictureBlobID.GetValue())
+	require.Equal(t, cover.Value, stored.CoverPictureBlobID.GetValue())
+
+	// One event, one update per field, in the order the proto declares them.
+	updates := e.waitForMetadataUpdates(chatID, 1)
+	require.Len(t, updates[0], 4)
+	require.Equal(t, "After", updates[0][0].GetTitleChanged().GetNewTitle())
+	require.NoError(t, protoutil.ProtoEqualError(resp.Chat.ProfilePicture, updates[0][1].GetProfilePictureChanged().GetNewProfilePicture()))
+	require.Equal(t, "Described", updates[0][2].GetDescriptionChanged().GetNewDescription())
+	require.NoError(t, protoutil.ProtoEqualError(resp.Chat.CoverPicture, updates[0][3].GetCoverPictureChanged().GetNewCoverPicture()))
+
+	// Every field again, as the record holds them: the no-op.
+	resp = e.mustSendEditChat(e.keys, &chatpb.EditChatRequest{
+		ChatId:         chatID,
+		Title:          &chatpb.EditChatRequest_Title{Value: "After"},
+		ProfilePicture: &chatpb.EditChatRequest_ProfilePicture{BlobId: profile},
+		Description:    &chatpb.EditChatRequest_Description{Value: "Described"},
+		CoverPicture:   &chatpb.EditChatRequest_CoverPicture{BlobId: cover},
+	})
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.Equal(t, "Described", resp.Chat.Description)
+	require.Len(t, e.media.attachedTo(chatID), 2)
+	time.Sleep(100 * time.Millisecond)
+	updates, _ = e.metadataUpdatesOnChatTopic(chatID)
+	require.Len(t, updates, 1)
+}
+
+// testServer_ChatProfileDetail_Carriers pins where a group's description and
+// cover picture are returned: on every carrier of a group's metadata but the
+// feeds, which are list views and leave both out without resolving the
+// cover.
+func testServer_ChatProfileDetail_Carriers(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	requireDetail := func(md *chatpb.Metadata, cover []*blobpb.Rendition) {
+		t.Helper()
+		require.Equal(t, "About us", md.GetDescription())
+		require.Len(t, md.GetCoverPicture().GetRenditions(), len(cover))
+		require.NotNil(t, md.GetCoverPicture().GetRenditions()[0].Blob)
+	}
+
+	// A group the env user is a member of: GetChat carries both, the feed
+	// neither, and the cover was never resolved for the feed.
+	profile := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	e.media.setRenditions(profile)
+	member := e.putGroupWithPicture("Member Of", profile, at(1), model.MustGenerateUserID())
+	cover := &blobpb.BlobId{Value: []byte("group-cover-0001")}
+	coverRenditions := e.describeGroup(member, "About us", cover)
+
+	feed := e.mustGetGroupFeed(&commonpb.QueryOptions{})
+	require.Len(t, feed.Chats, 1)
+	require.Equal(t, "Member Of", feed.Chats[0].Title)
+	require.Empty(t, feed.Chats[0].Description)
+	require.Nil(t, feed.Chats[0].CoverPicture)
+	require.NotNil(t, feed.Chats[0].GetProfilePicture().GetRenditions()[0].Blob)
+	require.False(t, e.media.resolved[string(cover.Value)])
+
+	requireDetail(e.getChat(e.keys, member).Metadata, coverRenditions)
+
+	// A group the env user is not in: GetChat, the public view, and the join
+	// all carry both.
+	open := e.putGroup("Not Yet", at(1), model.MustGenerateUserID())
+	openCover := &blobpb.BlobId{Value: []byte("group-cover-0002")}
+	openRenditions := e.describeGroup(open, "About us", openCover)
+	requireDetail(e.getChat(e.keys, open).Metadata, openRenditions)
+	requireDetail(e.getPublicChat(open, messagingpb.ViewMode_REDACTED).Metadata, openRenditions)
+	joined := e.mustJoinChat(e.keys, open)
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	requireDetail(joined.Chat, openRenditions)
+
+	// A private group's lobby carries both to the user waiting in it.
+	_, waiterKeys := e.addBoundUser("Waiter")
+	private := e.putKeyedPrivateGroup("Private")
+	privateCover := &blobpb.BlobId{Value: []byte("group-cover-0003")}
+	privateRenditions := e.describeGroup(private, "About us", privateCover)
+	entered := e.enterLobby(waiterKeys, private)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, entered.Result)
+	requireDetail(entered.Lobby.GetChat(), privateRenditions)
 }
 
 func testServer_EditChat_NoOp(t *testing.T, s chat.Store) {
@@ -4397,7 +4883,7 @@ func testServer_EditChat_NoOp(t *testing.T, s chat.Store) {
 	resp := e.mustEditChat(e.keys, chatID, &title, picture)
 	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
 	require.Equal(t, "Same", resp.Chat.Title)
-	require.Equal(t, picture.Value, resp.Chat.GetPicture().GetRenditions()[0].GetBlobId().GetValue())
+	require.Equal(t, picture.Value, resp.Chat.GetProfilePicture().GetRenditions()[0].GetBlobId().GetValue())
 	require.NoError(t, protoutil.ProtoEqualError(viewerState(0, nil, true), resp.Chat.ViewerState))
 	requireUntouched()
 
@@ -4488,7 +4974,7 @@ func testServer_EditChat_TitleModerated(t *testing.T, s chat.Store) {
 	stored, err := s.GetChatByID(e.ctx, chatID)
 	require.NoError(t, err)
 	require.Equal(t, "Before", stored.Title)
-	require.Nil(t, stored.PictureBlobID)
+	require.Nil(t, stored.ProfilePictureBlobID)
 	time.Sleep(100 * time.Millisecond)
 	updates, _ := e.metadataUpdatesOnChatTopic(chatID)
 	require.Empty(t, updates)
@@ -4503,14 +4989,14 @@ func testServer_EditChat_PictureNotAccepted(t *testing.T, s chat.Store) {
 	// title sent alongside it — already moderated — is not written.
 	title := "After"
 	resp := e.mustEditChat(e.keys, chatID, &title, &blobpb.BlobId{Value: []byte("not-attachable01")})
-	require.Equal(t, chatpb.EditChatResponse_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
+	require.Equal(t, chatpb.EditChatResponse_PROFILE_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
 	require.Nil(t, resp.Chat)
 	require.Equal(t, "After", e.moderator.classifiedTitle)
 
 	stored, err := s.GetChatByID(e.ctx, chatID)
 	require.NoError(t, err)
 	require.Equal(t, "Before", stored.Title)
-	require.Nil(t, stored.PictureBlobID)
+	require.Nil(t, stored.ProfilePictureBlobID)
 
 	// A blob domain that cannot attach at all is the server's fault.
 	picture := &blobpb.BlobId{Value: []byte("group-picture-01")}

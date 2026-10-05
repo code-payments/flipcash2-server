@@ -245,10 +245,10 @@ func (m *memory) SetGroupPicture(_ context.Context, chatID *commonpb.ChatId, blo
 		return chat.ErrChatNotFound
 	}
 	if blobID == nil {
-		c.PictureBlobID = nil
+		c.ProfilePictureBlobID = nil
 		return nil
 	}
-	c.PictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), blobID.Value...)}
+	c.ProfilePictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), blobID.Value...)}
 	return nil
 }
 
@@ -270,8 +270,14 @@ func (m *memory) EditGroup(_ context.Context, chatID *commonpb.ChatId, edit chat
 	if edit.Title != nil {
 		c.Title = *edit.Title
 	}
-	if edit.PictureBlobID != nil {
-		c.PictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), edit.PictureBlobID.Value...)}
+	if edit.Description != nil {
+		c.Description = *edit.Description
+	}
+	if edit.ProfilePictureBlobID != nil {
+		c.ProfilePictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), edit.ProfilePictureBlobID.Value...)}
+	}
+	if edit.CoverPictureBlobID != nil {
+		c.CoverPictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), edit.CoverPictureBlobID.Value...)}
 	}
 	return nil
 }

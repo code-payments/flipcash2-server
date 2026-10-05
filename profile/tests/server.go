@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -41,6 +42,8 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 	for _, tf := range []func(t *testing.T, accounts account.Store, profiles profile.Store){
 		testServer,
 		testProfilePicture,
+		testCoverPicture,
+		testBio,
 		testFlipcardCustomization,
 		testMinDmChatInitFee,
 		testUsernameIsPublic,
@@ -107,7 +110,9 @@ func requireProfileUnset(t *testing.T, resp *profilepb.GetProfileResponse) {
 	t.Helper()
 
 	require.Empty(t, resp.UserProfile.GetDisplayName())
+	require.Empty(t, resp.UserProfile.GetBio())
 	require.Nil(t, resp.UserProfile.GetProfilePicture())
+	require.Nil(t, resp.UserProfile.GetCoverPicture())
 	require.Empty(t, resp.UserProfile.GetSocialProfiles())
 	require.Nil(t, resp.UserProfile.GetPhoneNumber())
 	require.Nil(t, resp.UserProfile.GetEmailAddress())
@@ -1285,6 +1290,348 @@ func testProfilePicture(t *testing.T, accounts account.Store, profiles profile.S
 		require.Equal(t, profilepb.GetProfileResponse_OK, getResp.Result)
 		requireRenditionSet(t, getResp.UserProfile.GetProfilePicture().GetRenditions())
 	})
+}
+
+func testCoverPicture(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+
+	media, blobs, access := newMedia()
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient())
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+
+	client := profilepb.NewProfileClient(cc)
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
+	require.NoError(t, err)
+
+	setCoverPicture := func(blobID *blobpb.BlobId) *profilepb.SetCoverPictureResponse {
+		t.Helper()
+		req := &profilepb.SetCoverPictureRequest{BlobId: blobID}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		resp, err := client.SetCoverPicture(ctx, req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	getProfile := func() *profilepb.UserProfile {
+		t.Helper()
+		// Unauthenticated: a cover picture is public. The result is not asserted:
+		// a user who has set nothing yet reads as NOT_FOUND from a store that only
+		// learns of them on a write, and the getters are nil-safe either way.
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
+		require.NoError(t, err)
+		return resp.UserProfile
+	}
+
+	// A cover picture is granted to the same profile principal as the profile
+	// picture: one public surface, two pictures on it.
+	principal := blob.PrincipalForUserProfile(userID)
+	isGranted := func(blobID *blobpb.BlobId) bool {
+		t.Helper()
+		granted, err := access.HasGrant(ctx, blobID, principal, blob.PermissionRead)
+		require.NoError(t, err)
+		return granted
+	}
+
+	t.Run("Unregistered user is denied", func(t *testing.T) {
+		blobID := seedBlob(t, blobs, userID, blob.StateReady, "image/jpeg")
+
+		resp := setCoverPicture(blobID)
+		require.Equal(t, profilepb.SetCoverPictureResponse_DENIED, resp.Result)
+		require.Nil(t, resp.CoverPicture)
+		require.False(t, isGranted(blobID))
+	})
+
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
+
+	t.Run("Blob must be usable", func(t *testing.T) {
+		otherUser := model.MustGenerateUserID()
+
+		for _, tc := range []struct {
+			name     string
+			blobID   *blobpb.BlobId
+			expected profilepb.SetCoverPictureResponse_Result
+		}{
+			{
+				name:     "no such blob",
+				blobID:   blob.MustGenerateID(),
+				expected: profilepb.SetCoverPictureResponse_BLOB_NOT_FOUND,
+			},
+			{
+				name:     "owned by another user",
+				blobID:   seedBlob(t, blobs, otherUser, blob.StateReady, "image/jpeg"),
+				expected: profilepb.SetCoverPictureResponse_BLOB_NOT_FOUND,
+			},
+			{
+				name:     "still processing",
+				blobID:   seedBlob(t, blobs, userID, blob.StateUploaded, "image/jpeg"),
+				expected: profilepb.SetCoverPictureResponse_BLOB_NOT_READY,
+			},
+			{
+				name:     "failed moderation",
+				blobID:   seedBlob(t, blobs, userID, blob.StateRejected, "image/jpeg"),
+				expected: profilepb.SetCoverPictureResponse_BLOB_REJECTED,
+			},
+			{
+				name:     "not an image",
+				blobID:   seedBlob(t, blobs, userID, blob.StateReady, "application/pdf"),
+				expected: profilepb.SetCoverPictureResponse_INVALID_BLOB,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				resp := setCoverPicture(tc.blobID)
+				require.Equal(t, tc.expected, resp.Result)
+				require.Nil(t, resp.CoverPicture)
+				require.False(t, isGranted(tc.blobID))
+			})
+		}
+
+		require.Nil(t, getProfile().GetCoverPicture())
+	})
+
+	first := seedBlob(t, blobs, userID, blob.StateReady, "image/jpeg")
+
+	t.Run("Set a picture", func(t *testing.T) {
+		resp := setCoverPicture(first)
+		require.Equal(t, profilepb.SetCoverPictureResponse_OK, resp.Result)
+
+		require.Len(t, resp.CoverPicture.Renditions, 1)
+		rendition := resp.CoverPicture.Renditions[0]
+		require.Equal(t, blobpb.Rendition_ORIGINAL, rendition.Role)
+		require.Equal(t, first.Value, rendition.BlobId.Value)
+		require.NotNil(t, rendition.Blob)
+		require.Equal(t, "image/jpeg", rendition.Blob.MimeType)
+		require.NotEmpty(t, rendition.Blob.DownloadUrl.GetUrl())
+
+		require.True(t, isGranted(first))
+	})
+
+	t.Run("Get hydrates the picture", func(t *testing.T) {
+		renditions := getProfile().GetCoverPicture().GetRenditions()
+		require.Len(t, renditions, 1)
+		require.Equal(t, first.Value, renditions[0].BlobId.Value)
+		require.NotEmpty(t, renditions[0].Blob.GetDownloadUrl().GetUrl())
+	})
+
+	t.Run("Replace a picture", func(t *testing.T) {
+		second := seedBlob(t, blobs, userID, blob.StateReady, "image/png")
+
+		resp := setCoverPicture(second)
+		require.Equal(t, profilepb.SetCoverPictureResponse_OK, resp.Result)
+		require.Equal(t, second.Value, resp.CoverPicture.Renditions[0].BlobId.Value)
+		require.Equal(t, second.Value, getProfile().GetCoverPicture().GetRenditions()[0].BlobId.Value)
+
+		// Grants are never revoked, as for the profile picture.
+		require.True(t, isGranted(second))
+		require.True(t, isGranted(first))
+	})
+
+	t.Run("Setting the same picture again is idempotent", func(t *testing.T) {
+		current := seedBlob(t, blobs, userID, blob.StateReady, "image/webp")
+		require.Equal(t, profilepb.SetCoverPictureResponse_OK, setCoverPicture(current).Result)
+		require.Equal(t, profilepb.SetCoverPictureResponse_OK, setCoverPicture(current).Result)
+		require.True(t, isGranted(current))
+	})
+
+	t.Run("Both pictures hydrate together", func(t *testing.T) {
+		cover := seedBlob(t, blobs, userID, blob.StateReady, "image/jpeg")
+		picture := seedBlob(t, blobs, userID, blob.StateReady, "image/png")
+		require.Equal(t, profilepb.SetCoverPictureResponse_OK, setCoverPicture(cover).Result)
+
+		req := &profilepb.SetProfilePictureRequest{BlobId: picture}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		pictureResp, err := client.SetProfilePicture(ctx, req)
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetProfilePictureResponse_OK, pictureResp.Result)
+
+		// Each is its own picture, and both come back resolved on one read.
+		p := getProfile()
+		require.Equal(t, cover.Value, p.GetCoverPicture().GetRenditions()[0].BlobId.Value)
+		require.NotEmpty(t, p.GetCoverPicture().GetRenditions()[0].Blob.GetDownloadUrl().GetUrl())
+		require.Equal(t, picture.Value, p.GetProfilePicture().GetRenditions()[0].BlobId.Value)
+		require.NotEmpty(t, p.GetProfilePicture().GetRenditions()[0].Blob.GetDownloadUrl().GetUrl())
+	})
+}
+
+func testBio(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+	media, _, _ := newMedia()
+
+	moderator := &fakeModerator{}
+	serv := profile.NewServer(log, authz, accounts, profiles, media, moderator, nil, x.NewClient())
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+	client := profilepb.NewProfileClient(cc)
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, userID, keyPair.Proto())
+	require.NoError(t, err)
+
+	setBio := func(bio string) (*profilepb.SetBioResponse, error) {
+		t.Helper()
+		req := &profilepb.SetBioRequest{Bio: bio}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		return client.SetBio(ctx, req)
+	}
+
+	bio := func() string {
+		t.Helper()
+		// Unauthenticated: a bio is public.
+		resp, err := client.GetProfile(ctx, &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}})
+		require.NoError(t, err)
+		return resp.GetUserProfile().GetBio()
+	}
+
+	// Each subtest configures the moderator from a clean slate, so a verdict left
+	// behind by an earlier one cannot be what makes a later one pass.
+	reset := func() {
+		*moderator = fakeModerator{}
+	}
+
+	t.Run("Unregistered user is denied", func(t *testing.T) {
+		reset()
+
+		resp, err := setBio("hello")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetBioResponse_DENIED, resp.Result)
+	})
+
+	require.NoError(t, accounts.SetRegistrationFlag(ctx, userID, true))
+
+	t.Run("Clean bio is moderated and persisted", func(t *testing.T) {
+		reset()
+
+		resp, err := setBio("clean bio")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetBioResponse_OK, resp.Result)
+		require.Equal(t, "clean bio", bio())
+	})
+
+	t.Run("Invalid bio is refused and never classified", func(t *testing.T) {
+		reset()
+		// A classification would fail the call, so an INVALID_BIO shows none was
+		// attempted.
+		moderator.textErr = errors.New("classifier unavailable")
+
+		for _, invalid := range []string{
+			" ", "   ", "\t\n", "\u00a0", "\u3000", // nothing visible
+			"tab\tin it", "nul\x00", // control characters
+		} {
+			resp, err := setBio(invalid)
+			require.NoError(t, err, "bio: %q", invalid)
+			require.Equal(t, profilepb.SetBioResponse_INVALID_BIO, resp.Result, "bio: %q", invalid)
+		}
+
+		// A bio over the limit never reaches the handler: request validation
+		// refuses it on the wire. The handler's own check is covered in
+		// profile.ValidateBio's tests.
+		for _, tooLong := range []string{
+			strings.Repeat("x", profile.MaxBioLength+1),
+			strings.Repeat("é", profile.MaxBioLength+1), // characters, not bytes
+		} {
+			_, err := setBio(tooLong)
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+		}
+
+		// The prior bio is left untouched.
+		require.Equal(t, "clean bio", bio())
+	})
+
+	t.Run("Longest bio, line breaks and surrounding spaces are kept as written", func(t *testing.T) {
+		reset()
+
+		for _, valid := range []string{
+			strings.Repeat("é", profile.MaxBioLength),
+			" first line\nsecond line ",
+		} {
+			resp, err := setBio(valid)
+			require.NoError(t, err)
+			require.Equal(t, profilepb.SetBioResponse_OK, resp.Result, "bio: %q", valid)
+			require.Equal(t, valid, bio())
+		}
+	})
+
+	t.Run("Flagged bio is rejected and not persisted", func(t *testing.T) {
+		reset()
+		require.Equal(t, profilepb.SetBioResponse_OK, must(setBio("clean bio")).Result)
+
+		moderator.textFlagged = true
+		moderator.textCategories = []string{"general_nsfw"}
+
+		resp, err := setBio("bad bio")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetBioResponse_FAILED_MODERATED, resp.Result)
+		require.Equal(t, moderationpb.FlaggedCategory_NSFW, resp.FlaggedCategory)
+
+		require.Equal(t, "clean bio", bio())
+	})
+
+	t.Run("Gibberish is a verdict, unlike for a name", func(t *testing.T) {
+		reset()
+		moderator.textFlagged = true
+		moderator.textCategories = []string{moderation.CategoryGibberish}
+
+		resp, err := setBio("asdf qwer zxcv")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetBioResponse_FAILED_MODERATED, resp.Result)
+
+		require.Equal(t, "clean bio", bio())
+	})
+
+	t.Run("Classifier failure fails the call and persists nothing", func(t *testing.T) {
+		// An unsupported language included: with no second classifier to cover a
+		// bio, it is an error like any other, unlike for a display name.
+		for _, classifierErr := range []error{
+			errors.New("classifier unavailable"),
+			moderation.ErrUnsupportedLanguage,
+		} {
+			reset()
+			moderator.textErr = classifierErr
+
+			_, err := setBio("another bio")
+			require.Equal(t, codes.Internal, status.Code(err), "error: %v", classifierErr)
+
+			require.Equal(t, "clean bio", bio())
+		}
+	})
+
+	t.Run("Clearing is never classified", func(t *testing.T) {
+		reset()
+		moderator.textErr = errors.New("classifier unavailable")
+
+		resp, err := setBio("")
+		require.NoError(t, err)
+		require.Equal(t, profilepb.SetBioResponse_OK, resp.Result)
+		require.Empty(t, bio())
+
+		// An authenticated read of one's own profile agrees.
+		req := &profilepb.GetProfileRequest{Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID}}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		getResp, err := client.GetProfile(ctx, req)
+		require.NoError(t, err)
+		require.Empty(t, getResp.UserProfile.GetBio())
+	})
+}
+
+// must returns resp, failing nothing itself: it exists so a setup call can be
+// asserted on inline.
+func must[T any](resp T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return resp
 }
 
 func testDefaultUsername(t *testing.T, accounts account.Store, profiles profile.Store) {

@@ -537,10 +537,10 @@ func (f *fakeProfileReader) GetPhoneNumbers(_ context.Context, userIDs []*common
 	return out, nil
 }
 
-// GetPublicProfiles returns an entry for every user asked about, the way the real
+// GetLimitedPublicProfilesForRow returns an entry for every user asked about, the way the real
 // reader does for a chat's members: they are all users the profile domain knows,
 // so each has at least a join timestamp even with no name or picture set.
-func (f *fakeProfileReader) GetPublicProfiles(_ context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
+func (f *fakeProfileReader) GetLimitedPublicProfilesForRow(_ context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
 	out := make(map[string]*profilepb.UserProfile)
 	for _, userID := range userIDs {
 		key := string(userID.Value)

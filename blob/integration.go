@@ -16,12 +16,12 @@ import (
 //
 // It is deliberately coarse: a chat share is all-or-nothing over a batch, so
 // there is no single blob whose specific failure could be reported. Surfaces that
-// attach exactly one blob (SetAsProfilePicture) get the granular errors below
+// attach exactly one blob (SetAsProfileMedia) get the granular errors below
 // instead, since they can act on the distinction.
 var ErrBlobNotShareable = errors.New("blob not shareable")
 
 // The granular reasons a blob cannot be attached to a surface. They exist because
-// SetAsProfilePicture attaches a single blob and its caller must tell the client
+// SetAsProfileMedia attaches a single blob and its caller must tell the client
 // which of these happened — whether to retry (not ready) or upload again
 // (rejected).
 var (
@@ -46,7 +46,7 @@ var (
 
 // Integration is the surface other domains (messaging, profile and chat today)
 // use to attach blobs to a resource they own: it validates and grants read access
-// when the blob is attached (ShareIntoChat, SetAsProfilePicture,
+// when the blob is attached (ShareIntoChat, SetAsProfileMedia,
 // SetAsChatPicture), and resolves the blobs' metadata on read
 // (ResolveRenditions).
 type Integration struct {
@@ -110,10 +110,12 @@ func (i *Integration) ShareIntoChat(ctx context.Context, sharerID *commonpb.User
 	return i.access.Grants(ctx, grants)
 }
 
-// SetAsProfilePicture attaches a blob to ownerID's public profile: it verifies
-// that ownerID owns the blob and that it is a READY image original, then grants
-// the profile read access to it. It is idempotent, so re-setting the same picture
-// re-grants harmlessly.
+// SetAsProfileMedia attaches a blob to ownerID's public profile, as its profile
+// picture or its cover picture: it verifies that ownerID owns the blob and that
+// it is a READY image original, then grants the profile read access to it. It
+// is idempotent, so re-setting the same picture re-grants harmlessly. The two
+// pictures are one surface to the ACL — the profile — and the profile domain
+// records which blob plays which role.
 //
 // Granting the profile — rather than each viewer — is what makes a profile picture
 // public: every caller is covered by the user-profile principal (see UserProfileResolver),
@@ -126,7 +128,7 @@ func (i *Integration) ShareIntoChat(ctx context.Context, sharerID *commonpb.User
 //
 // It returns one of ErrBlobNotFound, ErrBlobNotReady, ErrBlobRejected, or
 // ErrBlobInvalid when the blob cannot back a picture. Nothing is granted then.
-func (i *Integration) SetAsProfilePicture(ctx context.Context, ownerID *commonpb.UserId, blobID *blobpb.BlobId) error {
+func (i *Integration) SetAsProfileMedia(ctx context.Context, ownerID *commonpb.UserId, blobID *blobpb.BlobId) error {
 	records, err := i.blobs.GetByIDs(ctx, []*blobpb.BlobId{blobID})
 	if err != nil {
 		return err

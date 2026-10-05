@@ -247,7 +247,7 @@ func (s *Server) hydrateRoster(ctx context.Context, c *Chat, members []GroupMemb
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) {
-		publicProfiles, err = s.profiles.GetPublicProfiles(gctx, userIDs)
+		publicProfiles, err = s.profiles.GetLimitedPublicProfilesForRow(gctx, userIDs)
 		return err
 	})
 	if c.Type == chatpb.ChatType_CONTACT_DM {

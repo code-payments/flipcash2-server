@@ -481,7 +481,7 @@ func (s *Server) hydrateLobbyMembers(ctx context.Context, entries []LobbyEntry) 
 	publicKeys := make([]*commonpb.PublicKey, len(entries))
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) {
-		publicProfiles, err = s.profiles.GetPublicProfiles(gctx, userIDs)
+		publicProfiles, err = s.profiles.GetLimitedPublicProfilesForRow(gctx, userIDs)
 		return err
 	})
 	for i, userID := range userIDs {

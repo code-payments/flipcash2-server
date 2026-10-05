@@ -22,7 +22,7 @@ func NewInPostgres(pool *pgxpool.Pool) profile.Store {
 	}
 }
 
-func (s *store) GetProfile(ctx context.Context, id *commonpb.UserId, includePrivateProfile bool) (*profilepb.UserProfile, error) {
+func (s *store) GetFullProfile(ctx context.Context, id *commonpb.UserId, includePrivateProfile bool) (*profilepb.UserProfile, error) {
 	userProfile, err := dbGetPublicProfile(ctx, s.pool, id)
 	if err != nil {
 		return nil, err
@@ -85,6 +85,14 @@ func (s *store) SetProfilePicture(ctx context.Context, id *commonpb.UserId, blob
 	return dbSetProfilePicture(ctx, s.pool, id, blobID)
 }
 
+func (s *store) SetCoverPicture(ctx context.Context, id *commonpb.UserId, blobID *blobpb.BlobId) error {
+	return dbSetCoverPicture(ctx, s.pool, id, blobID)
+}
+
+func (s *store) SetBio(ctx context.Context, id *commonpb.UserId, bio string) error {
+	return dbSetBio(ctx, s.pool, id, bio)
+}
+
 func (s *store) SetFlipcardColor(ctx context.Context, id *commonpb.UserId, colorHex string) error {
 	return dbSetFlipcardColor(ctx, s.pool, id, colorHex)
 }
@@ -93,8 +101,8 @@ func (s *store) SetMinDmChatInitFee(ctx context.Context, id *commonpb.UserId, fe
 	return dbSetMinDmChatInitFee(ctx, s.pool, id, fee)
 }
 
-func (s *store) GetPublicProfiles(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
-	return dbGetPublicProfiles(ctx, s.pool, userIDs)
+func (s *store) GetLimitedPublicProfilesForRow(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
+	return dbGetLimitedPublicProfilesForRow(ctx, s.pool, userIDs)
 }
 
 func (s *store) LinkPhoneNumber(ctx context.Context, id *commonpb.UserId, phoneNumber string, phoneNumberHash *commonpb.Hash) error {

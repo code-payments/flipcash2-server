@@ -31,8 +31,8 @@ func (r *chatProfileReader) GetPhoneNumbers(ctx context.Context, userIDs []*comm
 	return r.store.GetPhoneNumbersForPayment(ctx, userIDs)
 }
 
-func (r *chatProfileReader) GetPublicProfiles(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
-	publicProfiles, err := r.store.GetPublicProfiles(ctx, userIDs)
+func (r *chatProfileReader) GetLimitedPublicProfilesForRow(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
+	publicProfiles, err := r.store.GetLimitedPublicProfilesForRow(ctx, userIDs)
 	if err != nil {
 		return nil, err
 	}

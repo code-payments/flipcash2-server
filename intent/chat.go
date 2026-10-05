@@ -305,7 +305,7 @@ func (i *Integration) validateDmAppMetadata(ctx context.Context, intentRecord *o
 	// recipient asks of anyone reaching them for the first time: their fee
 	// where they have set one, the preset minimum otherwise.
 	var fee *commonpb.FiatPaymentAmount
-	recipientProfile, err := i.profiles.GetProfile(ctx, recipientUserID, false)
+	recipientProfile, err := i.profiles.GetFullProfile(ctx, recipientUserID, false)
 	switch {
 	case err == nil:
 		fee = recipientProfile.MinDmChatInitFee

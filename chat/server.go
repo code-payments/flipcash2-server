@@ -72,10 +72,11 @@ type ProfileReader interface {
 	// phone number are absent from the map.
 	GetPhoneNumbers(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*commonpb.PhoneNumber, error)
 
-	// GetPublicProfiles returns the public profile of each of the given users the
-	// profile domain knows, keyed by string(userID.Value). Unknown users are
-	// absent from the map. Every public field a member row shows — display name,
-	// profile picture, join timestamp — comes back in this one call.
+	// GetLimitedPublicProfilesForRow returns the row profile of each of the given
+	// users the profile domain knows, keyed by string(userID.Value). Unknown
+	// users are absent from the map. Every field a member row shows — display
+	// name, username, profile picture, join timestamp, Flipcard customization —
+	// comes back in this one call, and nothing a row does not show.
 	//
 	// A member who has set neither a name nor a picture still gets an entry,
 	// carrying just the join timestamp. Every chat member is a user the profile
@@ -90,7 +91,7 @@ type ProfileReader interface {
 	//
 	// There is one proto per user, so a caller that fills in per-member fields
 	// must copy before mutating: the same user can be a member of several chats.
-	GetPublicProfiles(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error)
+	GetLimitedPublicProfilesForRow(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error)
 }
 
 // BlocklistReader is the read slice of the blocklist domain the Chat service
@@ -633,7 +634,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		return err
 	})
 	g.Go(func() (err error) {
-		publicProfilesByUserId, err = s.profiles.GetPublicProfiles(gctx, userIDs)
+		publicProfilesByUserId, err = s.profiles.GetLimitedPublicProfilesForRow(gctx, userIDs)
 		return err
 	})
 	if len(peerIDs) > 0 {

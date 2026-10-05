@@ -126,7 +126,7 @@ func (s *Server) mentionSuggestions(ctx context.Context, viewerID *commonpb.User
 		return err
 	})
 	g.Go(func() (err error) {
-		publicProfiles, err = s.profiles.GetPublicProfiles(gctx, candidateIDs)
+		publicProfiles, err = s.profiles.GetLimitedPublicProfilesForRow(gctx, candidateIDs)
 		return err
 	})
 	if err := g.Wait(); err != nil {
@@ -149,7 +149,7 @@ func (s *Server) mentionSuggestions(ctx context.Context, viewerID *commonpb.User
 		}
 		out = append(out, &chatpb.MentionSuggestion{
 			// One proto per user is shared across callers (see
-			// ProfileReader.GetPublicProfiles), so the response carries a copy.
+			// ProfileReader.GetLimitedPublicProfilesForRow), so the response carries a copy.
 			UserProfile: proto.Clone(publicProfile).(*profilepb.UserProfile),
 			LastSentAt:  timestamppb.New(candidate.LastSentAt),
 		})

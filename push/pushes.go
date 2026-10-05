@@ -229,8 +229,9 @@ func BuildDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonp
 
 // BuildGroupChatPush renders a new message in a group chat. The notification
 // is titled by the group ("Untitled Group" when it has none), with the sender
-// identified by display name in the body ("Alice: hello"). Like a DM, a
-// group push never carries the sender's phone number, which is private
+// identified by display name in the body ("Alice: hello"; "Alice sent a
+// message" for encrypted content, see renderGroupChatMessagePushBody). Like a
+// DM, a group push never carries the sender's phone number, which is private
 // outside contact DMs.
 func BuildGroupChatPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName, chatTitle string) (*ChatMessagePush, error) {
 	body, ok, err := renderGroupChatMessagePushBody(ctx, ocpData, message, senderDisplayName)
@@ -332,6 +333,13 @@ func renderGroupChatMessagePushBody(ctx context.Context, ocpData ocp_data.Provid
 			return "", false, nil
 		}
 		body = fmt.Sprintf("%s: %s", senderDisplayName, widgetBody)
+	case *messagingpb.Content_Encrypted:
+		// The server cannot read encrypted content, so the body is generic,
+		// naming the sender in the third person like every group body. As in
+		// a DM, a payload within maxChatPushBytes carries the message for a
+		// client that can decrypt it before display; a larger one carries only
+		// the message ID.
+		body = fmt.Sprintf(encryptedGroupMessagePushBodyFormat, senderDisplayName)
 	case *messagingpb.Content_Cash:
 		currencyName, err := resolveCurrencyName(ctx, ocpData, content.Cash.Amount.Mint)
 		if err != nil {
@@ -384,8 +392,13 @@ func truncatePushBody(body string) string {
 }
 
 // encryptedDmMessagePushBody is the push body for an encrypted DM message,
-// whose content the server cannot render.
-const encryptedDmMessagePushBody = "Sent you a message"
+// whose content the server cannot render; encryptedGroupMessagePushBodyFormat
+// is the group one's, with the sender's display name in it ("Alice sent a
+// message").
+const (
+	encryptedDmMessagePushBody          = "Sent you a message"
+	encryptedGroupMessagePushBodyFormat = "%s sent a message"
+)
 
 // renderDmMessagePushBody renders the push body for a DM message. ok is false
 // for content types that don't produce a push.

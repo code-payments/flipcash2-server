@@ -20,7 +20,7 @@ import (
 //
 //   - reading: every read that returns messages — GetMessage, GetMessages,
 //     GetDelta. It answers not just whether the caller may read but how the
-//     read is answered, full or redacted (see chat.Standing.Reading), from the
+//     read is answered, full or redacted (see chat.ListenerStanding.Reading), from the
 //     caller's standing and the ViewMode they asked for. A member always
 //     reads in full; a non-member reads a group in full if they satisfy its
 //     listener rules, so a qualifying user can preview a group before joining,
@@ -30,7 +30,7 @@ import (
 //     no ViewMode, since they return no message, and are answered for anyone
 //     who may read the chat at all — a member, or a non-member of a group
 //     that carries a listener rule, whatever the rules say of them (see
-//     chat.Standing.CanPreview). Reactions are an overlay: who reacted, with
+//     chat.ListenerStanding.CanPreview). Reactions are an overlay: who reacted, with
 //     what, on which message is the conversation's movement, which a
 //     redacted view shows, not its words, and the event stream delivers the
 //     same overlay to a redacted preview (see redact.ChatUpdate). The gate is
@@ -40,10 +40,16 @@ import (
 //     A pointer advance leaves a per-user item in the chat's partition, and a
 //     reaction is something other members see, so neither is open to a
 //     non-member however well they satisfy the rules.
-//   - canSpeak: every send — a message, an edit, a deletion, a typing
-//     notification. Members who satisfy the listener and speaker rules, which
-//     in a DM with the Flipcash team account include a Never rule no one
-//     satisfies (see chat.RuleEvaluator).
+//   - canSpeak and speakerStanding: every send — a message, an edit, a deletion, a
+//     typing notification. Members who satisfy the listener and speaker
+//     rules, which in a DM with the Flipcash team account include a Never
+//     rule no one satisfies (see chat.RuleEvaluator); in a private group,
+//     members of one that has its chat key, with no rule asked (see
+//     chat.Access.SpeakerStanding). A send or edit asks for the whole standing,
+//     since it also says what the chat takes — plaintext, or encrypted
+//     content under which scheme — which encryptionVerdict applies to the
+//     content; a deletion or typing notification carries nothing to judge
+//     and asks the boolean.
 //
 // A member's read is answered on membership alone, without evaluating a rule,
 // even though a listener rule is what admitted them: reads are the hot path,
@@ -59,7 +65,7 @@ import (
 // rules, since nothing else can admit them; Access bounds what that costs.
 
 func (s *Server) reading(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (chat.Reading, error) {
-	standing, err := s.access.Standing(ctx, chatID, userID, mode)
+	standing, err := s.access.ListenerStanding(ctx, chatID, userID, mode)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure determining chat standing")
 		return chat.ReadingDenied, status.Error(codes.Internal, "")
@@ -71,14 +77,14 @@ func (s *Server) reading(ctx context.Context, log *zap.Logger, chatID *commonpb.
 // read of its reaction overlay: CanPreview says whether they are answered at
 // all, IsMember whether they can have an overlay entry of their own (see
 // applySelfReactions). It is found under ViewMode REDACTED so that no rule is
-// evaluated and no admission remembered (see chat.Access.Standing): a
+// evaluated and no admission remembered (see chat.Access.ListenerStanding): a
 // redacted reader and a full one see the same overlay, so its verdict is
 // never needed.
-func (s *Server) overlayStanding(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.Standing, error) {
-	standing, err := s.access.Standing(ctx, chatID, userID, messagingpb.ViewMode_REDACTED)
+func (s *Server) overlayStanding(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ListenerStanding, error) {
+	standing, err := s.access.ListenerStanding(ctx, chatID, userID, messagingpb.ViewMode_REDACTED)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure determining chat standing")
-		return chat.Standing{}, status.Error(codes.Internal, "")
+		return chat.ListenerStanding{}, status.Error(codes.Internal, "")
 	}
 	return standing, nil
 }
@@ -99,4 +105,13 @@ func (s *Server) canSpeak(ctx context.Context, log *zap.Logger, chatID *commonpb
 		return false, status.Error(codes.Internal, "")
 	}
 	return ok, nil
+}
+
+func (s *Server) speakerStanding(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.SpeakerStanding, error) {
+	speaker, err := s.access.SpeakerStanding(ctx, chatID, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure checking chat speak access")
+		return chat.SpeakerStanding{}, status.Error(codes.Internal, "")
+	}
+	return speaker, nil
 }

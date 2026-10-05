@@ -43,9 +43,11 @@ import (
 // Nothing is published by either: a user's other devices fetch the envelope
 // when they need it.
 //
-// Storing a key changes nothing else yet. Speaking in a private group, and
-// the lobby its members are admitted from, are not built (see
-// Chat.IsPrivate), so today the only envelope a group holds is its creator's.
+// Storing the creator's envelope is what opens the group to its members'
+// messages (see Access.SpeakerStanding); nothing is published for that
+// either, since the creator's client is the one that stored it. The lobby its
+// members are admitted from is not built (see Chat.IsPrivate), so today the
+// only envelope a group holds is its creator's.
 
 func (s *Server) SetKeyEnvelope(ctx context.Context, req *chatpb.SetKeyEnvelopeRequest) (*chatpb.SetKeyEnvelopeResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)

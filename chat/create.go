@@ -214,7 +214,7 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberStanding, ReadingFull, []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, []*Chat{c})
 	if err != nil {
 		// The group exists; only the read back failed. It will surface on the
 		// creator's next feed read.
@@ -252,8 +252,8 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 // canCreatePrivateGroup reports whether userID may create a private group:
 // today, only a staff user. It is a transitional gate, like use_e2ee's (see
 // useE2ee): private groups are being built in steps, and one created now can
-// be given its key but has no lobby and takes no messages, so it is a group
-// nobody can join or speak in. Opening creation to everyone is removing this
+// be given its key and messaged by its creator, but has no lobby, so it is a
+// group nobody else can join. Opening creation to everyone is removing this
 // check, once the rest is built.
 func (s *Server) canCreatePrivateGroup(ctx context.Context, userID *commonpb.UserId) (bool, error) {
 	return s.accounts.IsStaff(ctx, userID)
@@ -266,7 +266,7 @@ func (s *Server) canCreatePrivateGroup(ctx context.Context, userID *commonpb.Use
 // creation, and the creator may even have left, in which case they see it as
 // the non-member they are. Nothing is published; a retry is not news.
 func (s *Server) replayStartChat(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, c *Chat) (*chatpb.StartChatResponse, error) {
-	standing, err := s.access.StandingWithRules(ctx, c.ID, c.GroupRules(), userID, messagingpb.ViewMode_FULL)
+	standing, err := s.access.ListenerStandingWithRules(ctx, c.ID, c.GroupRules(), userID, messagingpb.ViewMode_FULL)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure determining chat standing")
 		return nil, status.Error(codes.Internal, "")

@@ -277,12 +277,12 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // shown to any registered user.
 //
 // A private group's chat key reaches the server only as its members' key
-// envelopes (see KeyEnvelope), and nothing is meant to happen in one until
-// its creator has stored theirs. Speaking in a private group is not built:
-// messaging does not yet require its content to be encrypted, so no one
-// speaks in one, keyed or not (see Access.CanSpeak). The lobby a user would
-// enter to be admitted is not built either, so its creator is the only
-// member it can have.
+// envelopes (see KeyEnvelope), and nothing happens in one until its creator
+// has stored theirs: a keyless group's members are refused every send, and
+// a keyed group's members send encrypted content under the group's scheme
+// and nothing else (see Access.SpeakerStanding and
+// messaging.Server.SendMessage). The lobby a user would enter to be admitted
+// is not built, so its creator is the only member it can have.
 //
 // CreatorID is the user who created the group, or nil when unknown (a DM has
 // none, and so does any group written before the field existed). It is fixed

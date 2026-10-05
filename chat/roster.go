@@ -123,7 +123,7 @@ func (s *Server) GetRoster(ctx context.Context, req *chatpb.GetRosterRequest) (*
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	standing, err := s.access.StandingWithChat(ctx, c, userID, messagingpb.ViewMode_FULL)
+	standing, err := s.access.ListenerStandingWithChat(ctx, c, userID, messagingpb.ViewMode_FULL)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure determining chat standing")
 		return nil, status.Error(codes.Internal, "")

@@ -33,9 +33,10 @@ type Server struct {
 	access   AccessStore
 	resolver PrincipalResolver
 
-	// dms gates end-to-end encrypted uploads: one is reserved only for a DM the
-	// caller is a member of (see initiateEncryptedUpload).
-	dms DMMembership
+	// encryptedUploads gates end-to-end encrypted uploads: one is reserved
+	// only for a chat that takes encrypted content from the caller (see
+	// initiateEncryptedUpload).
+	encryptedUploads EncryptedUploadGate
 
 	blobpb.UnimplementedBlobStorageServer
 }
@@ -48,17 +49,17 @@ func NewServer(
 	storage ObjectStorage,
 	access AccessStore,
 	resolver PrincipalResolver,
-	dms DMMembership,
+	encryptedUploads EncryptedUploadGate,
 ) *Server {
 	return &Server{
-		log:      log,
-		authz:    authz,
-		accounts: accounts,
-		blobs:    blobs,
-		storage:  storage,
-		access:   access,
-		resolver: resolver,
-		dms:      dms,
+		log:              log,
+		authz:            authz,
+		accounts:         accounts,
+		blobs:            blobs,
+		storage:          storage,
+		access:           access,
+		resolver:         resolver,
+		encryptedUploads: encryptedUploads,
 	}
 }
 
@@ -111,7 +112,7 @@ func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.Initiat
 	}
 
 	// An end-to-end encrypted upload is its own contract — an opaque type, its
-	// own size ceiling, and a DM it is pinned to — so it is reserved on its own
+	// own size ceiling, and a chat it is pinned to — so it is reserved on its own
 	// path. An ordinary upload has no surface named.
 	if chatID := req.GetChat(); chatID != nil {
 		return s.initiateEncryptedUpload(ctx, log, owner, chatID, req)
@@ -160,15 +161,16 @@ func (s *Server) InitiateExternalUpload(ctx context.Context, req *blobpb.Initiat
 	})
 }
 
-// initiateEncryptedUpload reserves an end-to-end encrypted blob for a DM
+// initiateEncryptedUpload reserves an end-to-end encrypted blob for a chat
 // (blobpb.InitiateExternalUploadRequest.end_to_end_encrypted_for). The server
 // cannot read the bytes, so the contract it pins is the one it can hold the
 // upload to: the opaque type (UNSUPPORTED_TYPE otherwise), the encrypted size
 // ceiling (TOO_LARGE otherwise; both policy-driven, so they echo the policy
-// version), and a DM the caller is a member of (DENIED otherwise — a group, an
-// unknown chat, and a non-member are indistinguishable, so a caller learns
-// nothing about a chat they are not in). The cheap checks run first; the
-// membership read runs only for a request that is otherwise acceptable.
+// version), and a chat that takes encrypted content from the caller (see
+// EncryptedUploadGate; DENIED otherwise — a chat that takes none, an unknown
+// chat, and a caller who may not send are indistinguishable, so a caller
+// learns nothing about a chat they are not in). The cheap checks run first;
+// the gate's reads run only for a request that is otherwise acceptable.
 //
 // Reservation pins the blob to the chat as the principal its grant will be made
 // to (Blob.EncryptedFor = PrincipalForChat) but grants nothing: the read grant
@@ -201,12 +203,12 @@ func (s *Server) initiateEncryptedUpload(ctx context.Context, log *zap.Logger, o
 		}, nil
 	}
 
-	isDMMember, err := s.dms.IsDMMember(ctx, chatID, owner)
+	allowed, err := s.encryptedUploads.CanUploadEncrypted(ctx, chatID, owner)
 	if err != nil {
-		log.Warn("Failed to check DM membership", zap.Error(err))
+		log.Warn("Failed to check encrypted upload gate", zap.Error(err))
 		return nil, status.Error(codes.Internal, "failed to initiate upload")
 	}
-	if !isDMMember {
+	if !allowed {
 		return &blobpb.InitiateExternalUploadResponse{Result: blobpb.InitiateExternalUploadResponse_DENIED}, nil
 	}
 

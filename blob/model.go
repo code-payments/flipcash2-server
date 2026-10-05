@@ -276,7 +276,7 @@ type Blob struct {
 	// EncryptedFor is set when the blob's bytes are end-to-end encrypted for one
 	// surface (blobpb.InitiateExternalUploadRequest.end_to_end_encrypted_for),
 	// naming that surface as the principal its read grant will be made to — a
-	// DM is PrincipalForChat(chat), the only surface today. It is pinned at
+	// chat is PrincipalForChat(chat), the only surface today. It is pinned at
 	// reservation and immutable. The server cannot read such a blob, so it
 	// derives no metadata or renditions from it, never moderates it, grants the
 	// principal read access in the step that makes it READY (see

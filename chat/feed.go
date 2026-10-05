@@ -99,7 +99,7 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 		chats = chats[:limit]
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberStanding, ReadingFull, chats)
+	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, chats)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating DM feed metadata")
 		return nil, status.Error(codes.Internal, "")
@@ -292,7 +292,7 @@ func (s *Server) GetGroupChatFeed(ctx context.Context, req *chatpb.GetGroupChatF
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberStanding, ReadingFull, page)
+	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, page)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating group feed metadata")
 		return nil, status.Error(codes.Internal, "")

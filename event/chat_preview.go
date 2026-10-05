@@ -114,17 +114,17 @@ func (p *chatPreview) shape(e *eventpb.Event) (*eventpb.Event, error) {
 }
 
 // chatStanding is userID's standing in chatID as needed to answer a read
-// under mode (see chat.Access.Standing), by the same rule as every other read
+// under mode (see chat.Access.ListenerStanding), by the same rule as every other read
 // under a ViewMode. It reads the chat's canonical record itself so that a
 // chat that does not exist is chat.ErrChatNotFound, which a preview's open
 // reports as NOT_FOUND, distinct from the DENIED that a standing alone would
 // give it.
-func (s *Server) chatStanding(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (chat.Standing, error) {
+func (s *Server) chatStanding(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (chat.ListenerStanding, error) {
 	c, err := s.chats.GetChatByID(ctx, chatID)
 	if err != nil {
-		return chat.Standing{}, err
+		return chat.ListenerStanding{}, err
 	}
-	return s.access.StandingWithChat(ctx, c, userID, mode)
+	return s.access.ListenerStandingWithChat(ctx, c, userID, mode)
 }
 
 // streamChatPreview serves a preview of one group chat (see chatPreview): it

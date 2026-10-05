@@ -918,12 +918,46 @@ func testEncryptedUpload(t *testing.T, accounts account.Store, blobs blob.Store,
 		require.Equal(t, blobpb.InitiateExternalUploadResponse_OK, resp.Result)
 	})
 
-	t.Run("a group chat is denied", func(t *testing.T) {
+	t.Run("a chat that takes no encrypted content is denied", func(t *testing.T) {
 		groupID := &commonpb.ChatId{Value: dmID.Value[:16]}
-		resolver.joinDM(groupID, senderID) // membership does not help: it is not a DM
+		resolver.join(groupID, senderID) // membership does not help: the gate refuses the chat
 		resp := initiateEncrypted(t, h, sender, groupID, blob.EncryptedMimeType, uint64(len(ciphertext)))
 		require.Equal(t, blobpb.InitiateExternalUploadResponse_DENIED, resp.Result)
 		require.Nil(t, resp.PolicyVersion)
+	})
+
+	t.Run("a keyed private group's member reserves a blob pinned to the group", func(t *testing.T) {
+		// The pipeline is surface-agnostic: a group the gate admits is pinned,
+		// finalized and granted exactly as a DM is, and read by its members
+		// through the chat context.
+		groupID := &commonpb.ChatId{Value: dmID.Value[16:]}
+		_, outsider := registerUser(t, accounts)
+		resolver.joinKeyedPrivateGroup(groupID, senderID)
+		resolver.joinKeyedPrivateGroup(groupID, recipientID)
+
+		resp := initiateEncrypted(t, h, sender, groupID, blob.EncryptedMimeType, uint64(len(ciphertext)))
+		require.Equal(t, blobpb.InitiateExternalUploadResponse_OK, resp.Result)
+		record, err := blobs.GetByID(context.Background(), resp.BlobId)
+		require.NoError(t, err)
+		require.Equal(t, blob.PrincipalForChat(groupID), *record.EncryptedFor)
+
+		upload(resp.UploadTarget, ciphertext)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_PROCESSING, completeResponse(t, h, sender, resp.BlobId).Status)
+		h.drain(t)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, completeResponse(t, h, sender, resp.BlobId).Status)
+		granted, err := access.HasGrant(context.Background(), resp.BlobId, blob.PrincipalForChat(groupID), blob.PermissionRead)
+		require.NoError(t, err)
+		require.True(t, granted)
+
+		got := getBlobs(t, h, recipient, []*blobpb.BlobId{resp.BlobId}, &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: groupID}})
+		require.Len(t, got, 1)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, got[0].Status)
+		require.NotNil(t, got[0].Metadata.GetEncrypted())
+		require.Empty(t, getBlobs(t, h, outsider, []*blobpb.BlobId{resp.BlobId}, &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: groupID}}))
+
+		// The DM's member has no business with the group's upload.
+		denied := initiateEncrypted(t, h, outsider, groupID, blob.EncryptedMimeType, uint64(len(ciphertext)))
+		require.Equal(t, blobpb.InitiateExternalUploadResponse_DENIED, denied.Result)
 	})
 
 	t.Run("a non-member is denied", func(t *testing.T) {
@@ -1161,34 +1195,40 @@ func makePNGWithExif(t *testing.T, width, height int) []byte {
 
 // fakeResolver is a controllable blob.PrincipalResolver for the server suite: a
 // (principal, user) pair resolves as covered only after allow records it. It
-// doubles as the suite's blob.DMMembership: joinDM records a user as a member
-// of a DM, which both admits their encrypted uploads for it and — as the
-// production ChatResolver would — covers them for the chat's grants.
+// doubles as the suite's blob.EncryptedUploadGate: joinDM records a user as a
+// member of a DM, and joinKeyedPrivateGroup as a member of a private group
+// that has its key, which both admits their encrypted uploads for the chat
+// and — as the production ChatResolver would — covers them for its grants. A
+// member of any other chat is covered by its grants (join) and not admitted
+// to upload for it, as the production gate refuses a public group's member.
 type fakeResolver struct {
 	covered   map[string]bool
-	dmMembers map[string]bool
+	uploaders map[string]bool
 }
 
 func newFakeResolver() *fakeResolver {
-	return &fakeResolver{covered: make(map[string]bool), dmMembers: make(map[string]bool)}
+	return &fakeResolver{covered: make(map[string]bool), uploaders: make(map[string]bool)}
 }
 
 func (r *fakeResolver) allow(principal blob.Principal, user *commonpb.UserId) {
 	r.covered[resolverKey(principal, user)] = true
 }
 
-func (r *fakeResolver) joinDM(chatID *commonpb.ChatId, user *commonpb.UserId) {
-	r.dmMembers[resolverKey(blob.PrincipalForChat(chatID), user)] = true
+func (r *fakeResolver) join(chatID *commonpb.ChatId, user *commonpb.UserId) {
 	r.allow(blob.PrincipalForChat(chatID), user)
 }
 
-func (r *fakeResolver) IsDMMember(_ context.Context, chatID *commonpb.ChatId, user *commonpb.UserId) (bool, error) {
-	// The production adapter refuses a group ID before reading membership; the
-	// fake mirrors that so the suite exercises the same shape.
-	if len(chatID.GetValue()) != 32 {
-		return false, nil
-	}
-	return r.dmMembers[resolverKey(blob.PrincipalForChat(chatID), user)], nil
+func (r *fakeResolver) joinDM(chatID *commonpb.ChatId, user *commonpb.UserId) {
+	r.uploaders[resolverKey(blob.PrincipalForChat(chatID), user)] = true
+	r.join(chatID, user)
+}
+
+func (r *fakeResolver) joinKeyedPrivateGroup(chatID *commonpb.ChatId, user *commonpb.UserId) {
+	r.joinDM(chatID, user)
+}
+
+func (r *fakeResolver) CanUploadEncrypted(_ context.Context, chatID *commonpb.ChatId, user *commonpb.UserId) (bool, error) {
+	return r.uploaders[resolverKey(blob.PrincipalForChat(chatID), user)], nil
 }
 
 func (r *fakeResolver) Covers(ctx context.Context, principal blob.Principal, user *commonpb.UserId) (bool, error) {

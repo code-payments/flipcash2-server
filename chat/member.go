@@ -31,6 +31,13 @@ import (
 // current member re-joining — a member's reads gate on membership alone (see
 // Access), and so does a no-op join. Leaving has no rule to satisfy.
 //
+// A private group (see Chat.IsPrivate) is not joined here: its members are
+// admitted by its creator from its lobby (see lobby.go), so JoinChat refuses
+// everyone as DENIED. Everyone but the creator, that is, who needs no one's
+// approval and rejoins a private group they left. No rule is evaluated for
+// them: a private group's rules admit no one (see RuleEvaluator), and being
+// its creator is what admits them.
+//
 // Each transition that actually happens is broadcast as a RosterUpdate to the
 // chat's members and to the affected user (see publishRosterUpdate). A join or
 // departure that is a no-op broadcasts nothing: the roster did not move, and a
@@ -59,6 +66,9 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	if c.Type != chatpb.ChatType_GROUP {
 		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_DENIED}, nil
 	}
+	if c.IsPrivate && !c.IsCreator(userID) {
+		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_DENIED}, nil
+	}
 
 	// A current member re-joining is a no-op answered on membership alone,
 	// before the rules: a member whose balance has since dipped under the
@@ -70,7 +80,8 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	if !isMember {
+	// A private group's caller is its creator by now, whom no rule gates.
+	if !isMember && !c.IsPrivate {
 		// The rules come from the canonical record already in hand rather than
 		// a second read through the evaluator: the record is what they are
 		// projected from.
@@ -93,7 +104,7 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberStanding, ReadingFull, []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, []*Chat{c})
 	if err != nil {
 		// The join has landed; only the read back failed. A retry is the
 		// idempotent path above and returns the metadata then.
@@ -151,17 +162,34 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 
 	// The ID's length is the type check: a group ID names a group or nothing,
 	// so there is no canonical record to read here. Unlike a join, a departure
-	// needs nothing from it — no rules to evaluate, no metadata to return — and
-	// the store's write reports a missing chat itself, so leaving is the one
-	// write and nothing else.
+	// has no rules to evaluate and no metadata to return.
 	if !IsGroupChatID(req.ChatId) {
 		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_DENIED}, nil
 	}
 
+	// A departure from a private group takes the caller's key envelope with
+	// it, as the proto promises: a user who returns enters the lobby and is
+	// given a new one. The creator's is kept, since no one else could give
+	// them another, and it is what marks the group as having a key (see
+	// KeyEnvelope). The envelope is removed in the write that records the
+	// departure, so the two cannot disagree, which means deciding it before
+	// that write. Whether the group is private, and who created it, come from
+	// the rules read: it is the one a store caches, so a leave pays nothing
+	// for it in steady state.
+	rules, err := s.chats.GetGroupRules(ctx, req.ChatId)
+	switch {
+	case errors.Is(err, ErrChatNotFound):
+		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_NOT_FOUND}, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure getting chat rules")
+		return nil, status.Error(codes.Internal, "")
+	}
+	discardKeyEnvelope := rules.IsPrivate && !rules.isCreator(userID)
+
 	// Leaving a group the caller is not in — never joined, or already gone —
 	// is a no-op that already holds: the caller asked not to be a member, and
 	// they are not. The store answers it without a transition.
-	changed, roster, err := s.chats.RemoveGroupMember(ctx, req.ChatId, userID)
+	changed, roster, err := s.chats.RemoveGroupMember(ctx, req.ChatId, userID, discardKeyEnvelope)
 	switch {
 	case errors.Is(err, ErrChatNotFound):
 		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_NOT_FOUND}, nil

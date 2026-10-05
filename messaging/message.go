@@ -150,17 +150,22 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
 	}
 
-	if allowed, err := s.canSpeak(ctx, log, req.ChatId, userID); err != nil {
+	speaker, err := s.speakerStanding(ctx, log, req.ChatId, userID)
+	if err != nil {
 		return nil, err
-	} else if !allowed {
+	}
+	if !speaker.CanSpeak {
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
 	}
 
-	// Encrypted content is between a DM's two members (see
-	// messagingpb.EncryptedContent). Checked after the speaker gate so a
-	// non-member is DENIED like any other send.
-	if isEncrypted(req.Content) && chat.IsGroupChatID(req.ChatId) {
+	// What the chat takes as far as encryption goes (see encryptionVerdict).
+	// Judged after the speaker gate so a non-member is DENIED like any other
+	// send.
+	switch encryptionVerdictOf(speaker, req.Content) {
+	case encryptionNotAllowed:
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED}, nil
+	case encryptionRequired:
+		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_ENCRYPTION_REQUIRED}, nil
 	}
 
 	// The replied-to message must exist in this chat and be repliable. Checked
@@ -214,15 +219,20 @@ func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRe
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
 	}
 
-	if allowed, err := s.canSpeak(ctx, log, req.ChatId, userID); err != nil {
+	speaker, err := s.speakerStanding(ctx, log, req.ChatId, userID)
+	if err != nil {
 		return nil, err
-	} else if !allowed {
+	}
+	if !speaker.CanSpeak {
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
 	}
 
-	// The same DM-only rule as a send.
-	if isEncrypted(req.Content) && chat.IsGroupChatID(req.ChatId) {
+	// The same rule as a send.
+	switch encryptionVerdictOf(speaker, req.Content) {
+	case encryptionNotAllowed:
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_ENCRYPTION_NOT_ALLOWED}, nil
+	case encryptionRequired:
+		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_ENCRYPTION_REQUIRED}, nil
 	}
 
 	// The target must exist in this chat. Checked after membership so non-members
@@ -421,16 +431,16 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 // which only the server sends; see flipcashteam) and any content type added
 // later until it is explicitly allowed. repliedMessageID is non-nil
 // only for a valid reply, signaling the caller to verify the replied-to message
-// exists and is repliable. Encrypted content is allowed in a DM only, which
-// depends on the chat and so is the caller's to enforce (see isEncrypted), as
-// is the rule that an edit never downgrades an encrypted message to plaintext,
-// which depends on the message being edited.
+// exists and is repliable. Whether encrypted content is allowed depends on the
+// chat and so is the caller's to enforce (see encryptionVerdictOf), as is the
+// rule that an edit never downgrades an encrypted message to plaintext, which
+// depends on the message being edited.
 //
 // Encrypted content is opaque: whatever it wraps — the proto allows text, media,
 // or a reply whose body is either — is the recipient's to check, not the
 // server's, so a reply inside it names a replied-to message the server never
 // sees or verifies, and media inside it names blobs the server never shares
-// into the chat (an encrypted blob is granted to its DM when it becomes READY,
+// into the chat (an encrypted blob is granted to its chat when it becomes READY,
 // see blob.Finalizer) and never hydrates.
 func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *messagingpb.MessageId, ok bool) {
 	if len(content) != 1 {
@@ -456,11 +466,51 @@ func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *mes
 	}
 }
 
-// isEncrypted reports whether content is end-to-end encrypted, which is allowed
-// in a DM only (see messagingpb.EncryptedContent). Encrypted content is only
-// ever top-level, never a reply's body (see clientAllowedContent).
+// isEncrypted reports whether content is end-to-end encrypted (see
+// messagingpb.EncryptedContent). Encrypted content is only ever top-level,
+// never a reply's body (see clientAllowedContent).
 func isEncrypted(content []*messagingpb.Content) bool {
 	return len(content) == 1 && content[0].GetEncrypted() != nil
+}
+
+// encryptionVerdict is what a chat says of content as far as encryption goes
+// (see encryptionVerdictOf): it takes it, it takes no encrypted content like
+// it, or it takes nothing but encrypted content.
+type encryptionVerdict uint8
+
+const (
+	encryptionOK encryptionVerdict = iota
+	encryptionNotAllowed
+	encryptionRequired
+)
+
+// encryptionVerdictOf judges content against the speaker's standing in the
+// chat (see chat.SpeakerStanding), the one thing in encrypted content the server
+// reads being its scheme. What a chat takes is the chat domain's to say and
+// comes with the standing; this only applies it:
+//
+//   - EncryptionNone (a public group) takes plaintext alone: any encrypted
+//     content is ENCRYPTION_NOT_ALLOWED.
+//   - EncryptionOptional (a DM) takes plaintext, and encrypted content under
+//     the standing's Scheme. Any other scheme is ENCRYPTION_NOT_ALLOWED.
+//   - EncryptionRequired (a private group with its key) takes encrypted
+//     content under the standing's Scheme and nothing else: plaintext is
+//     ENCRYPTION_REQUIRED, including a reply, which is encrypted whole, and
+//     any other scheme is ENCRYPTION_NOT_ALLOWED.
+//
+// It is asked only of a speaker the gate admitted, so a keyless private
+// group, whose members the gate refuses, never reaches it.
+func encryptionVerdictOf(speaker chat.SpeakerStanding, content []*messagingpb.Content) encryptionVerdict {
+	if !isEncrypted(content) {
+		if speaker.Encryption == chat.EncryptionRequired {
+			return encryptionRequired
+		}
+		return encryptionOK
+	}
+	if speaker.Encryption == chat.EncryptionNone || content[0].GetEncrypted().Scheme != speaker.Scheme {
+		return encryptionNotAllowed
+	}
+	return encryptionOK
 }
 
 // validReplyBody reports whether a reply's body is content a client may author:

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"slices"
 	"sync"
 	"testing"
@@ -84,6 +85,15 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_Activity_Precision,
 		testStore_Activity_Scope,
 		testStore_Activity_Concurrent,
+		testStore_KeyEnvelope_SetAndGet,
+		testStore_KeyEnvelope_OwnWrapStands,
+		testStore_KeyEnvelope_DiscardedOnLeave,
+		testStore_KeyEnvelope_Concurrent,
+		testStore_Lobby_EnterAndLeave,
+		testStore_Lobby_Limits,
+		testStore_Lobby_Page,
+		testStore_Lobby_Admit,
+		testStore_Lobby_Concurrent,
 	} {
 		tf(t, s)
 		teardown()
@@ -621,6 +631,33 @@ func testStore_GroupChat_Rules(t *testing.T, s chat.Store) {
 	require.Equal(t, creator.Value, record.CreatorID.GetValue())
 	require.True(t, proto.Equal(creatorOnly.Rules(), record.Rules()))
 
+	// A private group carries no rules, and reads back as private beside
+	// them and on its canonical record. Every other group reads as not.
+	private := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{creator},
+		Title:        "Private",
+		IsPrivate:    true,
+		CreatorID:    creator,
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, private))
+	got, err = s.GetGroupRules(ctx, private.ID)
+	require.NoError(t, err)
+	require.True(t, got.IsPrivate)
+	require.Nil(t, got.Rules)
+	require.Equal(t, creator.Value, got.CreatorID.GetValue())
+	record, err = s.GetChatByID(ctx, private.ID)
+	require.NoError(t, err)
+	require.True(t, record.IsPrivate)
+	got, err = s.GetGroupRules(ctx, creatorOnly.ID)
+	require.NoError(t, err)
+	require.False(t, got.IsPrivate)
+	record, err = s.GetChatByID(ctx, creatorOnly.ID)
+	require.NoError(t, err)
+	require.False(t, record.IsPrivate)
+
 	// The creator is read for any group that recorded one, whatever its rules.
 	withCreator := &chat.Chat{
 		ID:           chat.MustGenerateGroupChatID(),
@@ -1039,7 +1076,7 @@ func addGroupMembers(t *testing.T, s chat.Store, chatID *commonpb.ChatId, userID
 
 func removeGroupMember(t *testing.T, s chat.Store, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, chat.RosterSummary) {
 	t.Helper()
-	changed, roster, err := s.RemoveGroupMember(context.Background(), chatID, userID)
+	changed, roster, err := s.RemoveGroupMember(context.Background(), chatID, userID, false)
 	require.NoError(t, err)
 	return changed, roster
 }
@@ -1263,7 +1300,7 @@ func testStore_GroupChat_MembersPage(t *testing.T, s chat.Store) {
 
 	// A departed member sits between the others in key order and must be
 	// stepped over, not counted against the limit.
-	changed, _, err := s.RemoveGroupMember(ctx, c.ID, users[2])
+	changed, _, err := s.RemoveGroupMember(ctx, c.ID, users[2], false)
 	require.NoError(t, err)
 	require.True(t, changed)
 	joined := []*commonpb.UserId{users[0], users[1], users[3], users[4]}
@@ -1651,14 +1688,14 @@ func testStore_GroupChat_AddMembersErrors(t *testing.T, s chat.Store) {
 	// orphaned records, and report the chat missing rather than a no-op.
 	_, _, err := s.AddGroupMembers(ctx, chat.MustGenerateGroupChatID(), []*commonpb.UserId{user})
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
-	_, _, err = s.RemoveGroupMember(ctx, chat.MustGenerateGroupChatID(), user)
+	_, _, err = s.RemoveGroupMember(ctx, chat.MustGenerateGroupChatID(), user, false)
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 
 	// Group membership methods reject DM chat IDs outright.
 	dm := putDmChat(t, s, user, model.MustGenerateUserID(), at(1))
 	_, _, err = s.AddGroupMembers(ctx, dm.ID, []*commonpb.UserId{user})
 	require.Error(t, err)
-	_, _, err = s.RemoveGroupMember(ctx, dm.ID, user)
+	_, _, err = s.RemoveGroupMember(ctx, dm.ID, user, false)
 	require.Error(t, err)
 
 	// An unknown group chat has no members, as opposed to an empty set.
@@ -2543,4 +2580,553 @@ func requireRecentSenders(t *testing.T, senders []chat.RecentSender, want ...any
 		require.Equal(t, want[2*i].(*commonpb.UserId).Value, sender.UserID.Value, "sender %d", i)
 		require.True(t, want[2*i+1].(time.Time).Equal(sender.LastSentAt), "sender %d sent at %v, want %v", i, sender.LastSentAt, want[2*i+1])
 	}
+}
+
+// keyEnvelope builds a key envelope stored by wrappedBy. The store never
+// opens one, so any bytes of the right length stand in for a wrapped key.
+func keyEnvelope(fill byte, wrappedBy *commonpb.UserId) chat.KeyEnvelope {
+	return chat.KeyEnvelope{
+		Scheme:     chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305,
+		Nonce:      bytes.Repeat([]byte{fill}, 24),
+		Ciphertext: bytes.Repeat([]byte{fill}, 48),
+		WrappedBy:  wrappedBy,
+	}
+}
+
+func testStore_KeyEnvelope_SetAndGet(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// Stored against the IDs alone: no canonical record or membership is
+	// read, so neither a group nobody created nor a non-member stops it.
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+
+	_, err := s.GetKeyEnvelope(ctx, groupID, user)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// The first envelope a user stores for themself is stored as given, and
+	// read back exactly.
+	first := keyEnvelope(1, user)
+	stored, err := s.SetKeyEnvelope(ctx, groupID, user, first)
+	require.NoError(t, err)
+	require.True(t, first.Equal(stored))
+	got, err := s.GetKeyEnvelope(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, first.Equal(got))
+	require.Equal(t, chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305, got.Scheme)
+	require.Equal(t, user.Value, got.WrappedBy.Value)
+
+	// Storing it again is a no-op that returns it.
+	stored, err = s.SetKeyEnvelope(ctx, groupID, user, first)
+	require.NoError(t, err)
+	require.True(t, first.Equal(stored))
+
+	// An envelope belongs to one user on one chat.
+	_, err = s.GetKeyEnvelope(ctx, groupID, model.MustGenerateUserID())
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	_, err = s.GetKeyEnvelope(ctx, chat.MustGenerateGroupChatID(), user)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	otherGroup := chat.MustGenerateGroupChatID()
+	second := keyEnvelope(2, user)
+	stored, err = s.SetKeyEnvelope(ctx, otherGroup, user, second)
+	require.NoError(t, err)
+	require.True(t, second.Equal(stored))
+	got, err = s.GetKeyEnvelope(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, first.Equal(got))
+
+	// Groups only, and an envelope names who stored it.
+	_, err = s.SetKeyEnvelope(ctx, generateDmChatID(), user, first)
+	require.Error(t, err)
+	_, err = s.SetKeyEnvelope(ctx, groupID, user, keyEnvelope(3, nil))
+	require.Error(t, err)
+}
+
+// testStore_KeyEnvelope_OwnWrapStands pins which envelope stands (see
+// chat.Store.SetKeyEnvelope): one the user wrapped themself is never
+// replaced, and one someone else wrapped for them always is.
+func testStore_KeyEnvelope_OwnWrapStands(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	groupID := chat.MustGenerateGroupChatID()
+	creator := model.MustGenerateUserID()
+	member := model.MustGenerateUserID()
+
+	// A different envelope of the user's own changes nothing, and the stored
+	// one is returned.
+	first := keyEnvelope(1, creator)
+	_, err := s.SetKeyEnvelope(ctx, groupID, creator, first)
+	require.NoError(t, err)
+	stored, err := s.SetKeyEnvelope(ctx, groupID, creator, keyEnvelope(2, creator))
+	require.NoError(t, err)
+	require.True(t, first.Equal(stored))
+	got, err := s.GetKeyEnvelope(ctx, groupID, creator)
+	require.NoError(t, err)
+	require.True(t, first.Equal(got))
+
+	// An envelope the creator wrapped for a member is stored, and replaced
+	// by a later one from the creator...
+	admitted := keyEnvelope(3, creator)
+	stored, err = s.SetKeyEnvelope(ctx, groupID, member, admitted)
+	require.NoError(t, err)
+	require.True(t, admitted.Equal(stored))
+	readmitted := keyEnvelope(4, creator)
+	stored, err = s.SetKeyEnvelope(ctx, groupID, member, readmitted)
+	require.NoError(t, err)
+	require.True(t, readmitted.Equal(stored))
+
+	// ...and by the member's own, which then stands against both.
+	rewrapped := keyEnvelope(5, member)
+	stored, err = s.SetKeyEnvelope(ctx, groupID, member, rewrapped)
+	require.NoError(t, err)
+	require.True(t, rewrapped.Equal(stored))
+	for _, later := range []chat.KeyEnvelope{keyEnvelope(6, creator), keyEnvelope(7, member)} {
+		stored, err = s.SetKeyEnvelope(ctx, groupID, member, later)
+		require.NoError(t, err)
+		require.True(t, rewrapped.Equal(stored))
+	}
+	got, err = s.GetKeyEnvelope(ctx, groupID, member)
+	require.NoError(t, err)
+	require.True(t, rewrapped.Equal(got))
+	require.Equal(t, member.Value, got.WrappedBy.Value)
+
+	// The same bytes stored by someone else are not the same envelope.
+	require.False(t, rewrapped.Equal(keyEnvelope(5, creator)))
+}
+
+// testStore_KeyEnvelope_DiscardedOnLeave pins that a departure removes the
+// departing user's envelope exactly when the caller asks, and only when the
+// departure actually happens (see chat.Store.RemoveGroupMember).
+func testStore_KeyEnvelope_DiscardedOnLeave(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	creator := model.MustGenerateUserID()
+	member := model.MustGenerateUserID()
+	stranger := model.MustGenerateUserID()
+	c := putGroupChat(t, s, "Private", at(100), creator, member)
+
+	creatorEnvelope := keyEnvelope(1, creator)
+	_, err := s.SetKeyEnvelope(ctx, c.ID, creator, creatorEnvelope)
+	require.NoError(t, err)
+	_, err = s.SetKeyEnvelope(ctx, c.ID, member, keyEnvelope(2, member))
+	require.NoError(t, err)
+	strangerEnvelope := keyEnvelope(3, stranger)
+	_, err = s.SetKeyEnvelope(ctx, c.ID, stranger, strangerEnvelope)
+	require.NoError(t, err)
+
+	// A departure asked to discard takes the envelope with it, and no one
+	// else's.
+	changed, _, err := s.RemoveGroupMember(ctx, c.ID, member, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, err = s.GetKeyEnvelope(ctx, c.ID, member)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	got, err := s.GetKeyEnvelope(ctx, c.ID, creator)
+	require.NoError(t, err)
+	require.True(t, creatorEnvelope.Equal(got))
+
+	// Nothing stands once it is gone: a returning member's next envelope is
+	// stored.
+	_, _, err = s.AddGroupMembers(ctx, c.ID, []*commonpb.UserId{member})
+	require.NoError(t, err)
+	next := keyEnvelope(4, creator)
+	stored, err := s.SetKeyEnvelope(ctx, c.ID, member, next)
+	require.NoError(t, err)
+	require.True(t, next.Equal(stored))
+
+	// A departure not asked to discard keeps it, as the creator's is kept.
+	changed, _, err = s.RemoveGroupMember(ctx, c.ID, creator, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	got, err = s.GetKeyEnvelope(ctx, c.ID, creator)
+	require.NoError(t, err)
+	require.True(t, creatorEnvelope.Equal(got))
+
+	// A user with no envelope leaves all the same.
+	changed, _, err = s.RemoveGroupMember(ctx, c.ID, member, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+	changed, _, err = s.AddGroupMembers(ctx, c.ID, []*commonpb.UserId{member})
+	require.NoError(t, err)
+	require.True(t, changed)
+	changed, _, err = s.RemoveGroupMember(ctx, c.ID, member, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	// A no-op removes nothing: the envelope goes with a departure, not with
+	// the request for one.
+	changed, _, err = s.RemoveGroupMember(ctx, c.ID, stranger, true)
+	require.NoError(t, err)
+	require.False(t, changed)
+	got, err = s.GetKeyEnvelope(ctx, c.ID, stranger)
+	require.NoError(t, err)
+	require.True(t, strangerEnvelope.Equal(got))
+}
+
+// testStore_KeyEnvelope_Concurrent pins that concurrent first writes agree:
+// exactly one envelope is stored, and every caller is told which.
+func testStore_KeyEnvelope_Concurrent(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+
+	const writers = 8
+	results := make([]chat.KeyEnvelope, writers)
+	errs := make([]error, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = s.SetKeyEnvelope(ctx, groupID, user, keyEnvelope(byte(i+1), user))
+		}()
+	}
+	wg.Wait()
+
+	got, err := s.GetKeyEnvelope(ctx, groupID, user)
+	require.NoError(t, err)
+	for i := 0; i < writers; i++ {
+		require.NoError(t, errs[i])
+		require.True(t, got.Equal(results[i]))
+	}
+}
+
+// lobbyLimits are the caps the lobby tests run under unless one says
+// otherwise: wide enough never to be hit.
+var lobbyLimits = chat.LobbyLimits{LobbySize: 100, LobbiesPerUser: 100}
+
+// waitForLobbyPage reads chatID's lobby whole until it holds n entries: the
+// page is read off an index that may trail the writes (see
+// chat.Store.GetLobbyPage).
+func waitForLobbyPage(t *testing.T, s chat.Store, chatID *commonpb.ChatId, n int) []chat.LobbyEntry {
+	t.Helper()
+	var entries []chat.LobbyEntry
+	require.Eventually(t, func() bool {
+		var err error
+		entries, err = s.GetLobbyPage(context.Background(), chatID, nil, 0)
+		require.NoError(t, err)
+		return len(entries) == n
+	}, 5*time.Second, 10*time.Millisecond)
+	return entries
+}
+
+// testStore_Lobby_EnterAndLeave pins the lifecycle of one entry: recorded
+// against the IDs alone, read back strongly consistent, a repeat the no-op
+// that keeps the first entry's time, and a leave that is a no-op once gone.
+func testStore_Lobby_EnterAndLeave(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+
+	entries, err := s.GetLobbyEntries(ctx, user, []*commonpb.ChatId{groupID})
+	require.NoError(t, err)
+	require.Empty(t, entries)
+	changed, err := s.LeaveLobby(ctx, groupID, user)
+	require.NoError(t, err)
+	require.False(t, changed)
+
+	before := time.Now()
+	entry, changed, err := s.EnterLobby(ctx, groupID, user, lobbyLimits)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, user.Value, entry.UserID.Value)
+	require.False(t, entry.EnteredAt.Before(before.Add(-time.Second)))
+	require.False(t, entry.EnteredAt.After(time.Now().Add(time.Second)))
+
+	entries, err = s.GetLobbyEntries(ctx, user, []*commonpb.ChatId{groupID, chat.MustGenerateGroupChatID()})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, user.Value, entries[string(groupID.Value)].UserID.Value)
+	require.True(t, entry.EnteredAt.Equal(entries[string(groupID.Value)].EnteredAt))
+
+	// A repeat is a no-op that returns the entry as it stands.
+	again, changed, err := s.EnterLobby(ctx, groupID, user, lobbyLimits)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.True(t, entry.EnteredAt.Equal(again.EnteredAt))
+
+	// An entry belongs to one user in one lobby.
+	other := model.MustGenerateUserID()
+	entries, err = s.GetLobbyEntries(ctx, other, []*commonpb.ChatId{groupID})
+	require.NoError(t, err)
+	require.Empty(t, entries)
+	otherGroup := chat.MustGenerateGroupChatID()
+	_, changed, err = s.EnterLobby(ctx, otherGroup, user, lobbyLimits)
+	require.NoError(t, err)
+	require.True(t, changed)
+	entries, err = s.GetLobbyEntries(ctx, user, []*commonpb.ChatId{groupID, otherGroup})
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	changed, err = s.LeaveLobby(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, changed)
+	entries, err = s.GetLobbyEntries(ctx, user, []*commonpb.ChatId{groupID, otherGroup})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Contains(t, entries, string(otherGroup.Value))
+	changed, err = s.LeaveLobby(ctx, groupID, user)
+	require.NoError(t, err)
+	require.False(t, changed)
+
+	// Lobbies are a group's alone.
+	dm := generateDmChatID()
+	_, _, err = s.EnterLobby(ctx, dm, user, lobbyLimits)
+	require.Error(t, err)
+	_, err = s.LeaveLobby(ctx, dm, user)
+	require.Error(t, err)
+	_, err = s.GetLobbyPage(ctx, dm, nil, 0)
+	require.Error(t, err)
+}
+
+// testStore_Lobby_Limits pins the caps: a lobby at LobbySize refuses the
+// next user as ErrLobbyFull, a user in LobbiesPerUser lobbies is refused the
+// next as ErrTooManyLobbies, the lobby's cap is judged first, a user already
+// waiting is never refused, and a departure frees a place.
+func testStore_Lobby_Limits(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	limits := chat.LobbyLimits{LobbySize: 2, LobbiesPerUser: 2}
+	groupA, groupB, groupC := chat.MustGenerateGroupChatID(), chat.MustGenerateGroupChatID(), chat.MustGenerateGroupChatID()
+	user1, user2, user3 := model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()
+
+	for _, u := range []*commonpb.UserId{user1, user2} {
+		_, changed, err := s.EnterLobby(ctx, groupA, u, limits)
+		require.NoError(t, err)
+		require.True(t, changed)
+	}
+	_, _, err := s.EnterLobby(ctx, groupA, user3, limits)
+	require.ErrorIs(t, err, chat.ErrLobbyFull)
+	entries, err := s.GetLobbyEntries(ctx, user3, []*commonpb.ChatId{groupA})
+	require.NoError(t, err)
+	require.Empty(t, entries)
+
+	_, changed, err := s.EnterLobby(ctx, groupB, user1, limits)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, _, err = s.EnterLobby(ctx, groupC, user1, limits)
+	require.ErrorIs(t, err, chat.ErrTooManyLobbies)
+
+	// A user already waiting is the no-op whatever the counts say.
+	_, changed, err = s.EnterLobby(ctx, groupA, user1, limits)
+	require.NoError(t, err)
+	require.False(t, changed)
+
+	// A user at their cap entering a full lobby hears of the lobby first.
+	_, _, err = s.EnterLobby(ctx, groupA, user1, chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1})
+	require.NoError(t, err) // still the no-op: already in it
+	_, _, err = s.EnterLobby(ctx, groupA, user3, chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 0})
+	require.ErrorIs(t, err, chat.ErrLobbyFull)
+
+	// A departure frees the place, and the user's own count.
+	changed, err = s.LeaveLobby(ctx, groupA, user2)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, changed, err = s.EnterLobby(ctx, groupA, user3, limits)
+	require.NoError(t, err)
+	require.True(t, changed)
+	changed, err = s.LeaveLobby(ctx, groupB, user1)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, changed, err = s.EnterLobby(ctx, groupC, user1, limits)
+	require.NoError(t, err)
+	require.True(t, changed)
+}
+
+// testStore_Lobby_Page pins the lobby's order and its paging: earliest
+// entered first, a page resuming strictly after a position, no limit reading
+// the whole lobby, and an empty result for a lobby nobody is in.
+func testStore_Lobby_Page(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	groupID := chat.MustGenerateGroupChatID()
+
+	page, err := s.GetLobbyPage(ctx, groupID, nil, 0)
+	require.NoError(t, err)
+	require.Empty(t, page)
+
+	const n = 5
+	users := make([]*commonpb.UserId, n)
+	for i := range users {
+		users[i] = model.MustGenerateUserID()
+		_, changed, err := s.EnterLobby(ctx, groupID, users[i], lobbyLimits)
+		require.NoError(t, err)
+		require.True(t, changed)
+		// Entry times are the store's clock; a later entry must sort later.
+		time.Sleep(2 * time.Millisecond)
+	}
+	// A different lobby is not in the page.
+	_, _, err = s.EnterLobby(ctx, chat.MustGenerateGroupChatID(), model.MustGenerateUserID(), lobbyLimits)
+	require.NoError(t, err)
+
+	whole := waitForLobbyPage(t, s, groupID, n)
+	for i, e := range whole {
+		require.Equal(t, users[i].Value, e.UserID.Value, i)
+		if i > 0 {
+			require.Negative(t, whole[i-1].Position().Compare(e.Position()))
+		}
+	}
+
+	// Pages of two walk the same order and stop at the end.
+	var walked []chat.LobbyEntry
+	var after *chat.LobbyPosition
+	for {
+		page, err := s.GetLobbyPage(ctx, groupID, after, 2)
+		require.NoError(t, err)
+		require.LessOrEqual(t, len(page), 2)
+		walked = append(walked, page...)
+		if len(page) < 2 {
+			break
+		}
+		pos := page[len(page)-1].Position()
+		after = &pos
+	}
+	require.Len(t, walked, n)
+	for i, e := range walked {
+		require.Equal(t, users[i].Value, e.UserID.Value, i)
+		require.True(t, whole[i].EnteredAt.Equal(e.EnteredAt), i)
+	}
+
+	// Resuming from the last position reads nothing more.
+	last := whole[n-1].Position()
+	page, err = s.GetLobbyPage(ctx, groupID, &last, 10)
+	require.NoError(t, err)
+	require.Empty(t, page)
+}
+
+// testStore_Lobby_Admit pins the admission: in one write the user's entry
+// leaves the lobby, their envelope lands (over any they held) and they join
+// the roster at its next version; a member already is a no-op, a user not
+// waiting ErrNotInLobby with nothing written, and a group that does not exist
+// ErrChatNotFound. The lobby's count is freed by the admission.
+func testStore_Lobby_Admit(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	user := model.MustGenerateUserID()
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, s.PutChat(ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{creator},
+		Title:        "Private",
+		IsPrivate:    true,
+		CreatorID:    creator,
+		LastActivity: at(1),
+	}))
+	tight := chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 10}
+
+	// A member has no place in the lobby: the creator is refused in the
+	// write, and nothing is counted for the refusal.
+	_, _, err := s.EnterLobby(ctx, groupID, creator, tight)
+	require.ErrorIs(t, err, chat.ErrAlreadyMember)
+	entries, err := s.GetLobbyEntries(ctx, creator, []*commonpb.ChatId{groupID})
+	require.NoError(t, err)
+	require.Empty(t, entries)
+
+	// Not waiting: nothing happens.
+	_, _, err = s.AdmitFromLobby(ctx, groupID, user, keyEnvelope(1, creator))
+	require.ErrorIs(t, err, chat.ErrNotInLobby)
+	isMember, err := s.IsMember(ctx, groupID, user)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	_, err = s.GetKeyEnvelope(ctx, groupID, user)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// Waiting, holding a stale envelope of their own from an earlier stay.
+	_, changed, err := s.EnterLobby(ctx, groupID, user, tight)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, err = s.SetKeyEnvelope(ctx, groupID, user, keyEnvelope(9, user))
+	require.NoError(t, err)
+
+	_, _, err = s.AdmitFromLobby(ctx, groupID, user, chat.KeyEnvelope{Scheme: chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305})
+	require.Error(t, err) // no wrapper
+	_, _, err = s.AdmitFromLobby(ctx, chat.MustGenerateGroupChatID(), user, keyEnvelope(1, creator))
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+	_, _, err = s.AdmitFromLobby(ctx, generateDmChatID(), user, keyEnvelope(1, creator))
+	require.Error(t, err)
+
+	admitted := keyEnvelope(1, creator)
+	changed, roster, err := s.AdmitFromLobby(ctx, groupID, user, admitted)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 1}, roster)
+	isMember, err = s.IsMember(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, isMember)
+	got, err := s.GetKeyEnvelope(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, admitted.Equal(got))
+	entries, err = s.GetLobbyEntries(ctx, user, []*commonpb.ChatId{groupID})
+	require.NoError(t, err)
+	require.Empty(t, entries)
+	records, err := s.GetGroupMemberRecords(ctx, user, []*commonpb.ChatId{groupID})
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), records[string(groupID.Value)].Version)
+
+	// The admitted member cannot re-enter the lobby, and the refusal left the
+	// lobby's one place free.
+	_, _, err = s.EnterLobby(ctx, groupID, user, tight)
+	require.ErrorIs(t, err, chat.ErrAlreadyMember)
+
+	// A member already: nothing written, the summary as it stands.
+	changed, roster, err = s.AdmitFromLobby(ctx, groupID, user, keyEnvelope(2, creator))
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 1}, roster)
+	got, err = s.GetKeyEnvelope(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, admitted.Equal(got))
+
+	// The admission freed the lobby's one place.
+	_, changed, err = s.EnterLobby(ctx, groupID, model.MustGenerateUserID(), tight)
+	require.NoError(t, err)
+	require.True(t, changed)
+	waitForLobbyPage(t, s, groupID, 1)
+}
+
+// testStore_Lobby_Concurrent pins that the lobby's cap holds under
+// concurrent entries: exactly LobbySize of many simultaneous entrants are
+// recorded, every other is ErrLobbyFull, and the count agrees with the page.
+func testStore_Lobby_Concurrent(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	groupID := chat.MustGenerateGroupChatID()
+	limits := chat.LobbyLimits{LobbySize: 5, LobbiesPerUser: 10}
+
+	const entrants = 20
+	results := make([]error, entrants)
+	var wg sync.WaitGroup
+	for i := range entrants {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, results[i] = s.EnterLobby(ctx, groupID, model.MustGenerateUserID(), limits)
+		}()
+	}
+	wg.Wait()
+
+	var admitted, refused int
+	for _, err := range results {
+		switch {
+		case err == nil:
+			admitted++
+		case errors.Is(err, chat.ErrLobbyFull):
+			refused++
+		default:
+			require.NoError(t, err)
+		}
+	}
+	require.Equal(t, limits.LobbySize, admitted)
+	require.Equal(t, entrants-limits.LobbySize, refused)
+	waitForLobbyPage(t, s, groupID, limits.LobbySize)
+
+	// One leaves, one more gets in.
+	page, err := s.GetLobbyPage(ctx, groupID, nil, 1)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	changed, err := s.LeaveLobby(ctx, groupID, page[0].UserID)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, changed, err = s.EnterLobby(ctx, groupID, model.MustGenerateUserID(), limits)
+	require.NoError(t, err)
+	require.True(t, changed)
 }

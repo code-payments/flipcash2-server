@@ -190,7 +190,23 @@ type Server struct {
 	// thousands of members.
 	rosterWholeReadCap int
 
+	// lobbyLimits caps a private group's lobby and a user's lobbies (see
+	// lobby.go). DefaultLobbyLimits in production; tests lower them with
+	// WithLobbyLimits to exercise the refusals without thousands of users.
+	lobbyLimits LobbyLimits
+
 	chatpb.UnimplementedChatServer
+}
+
+// ServerOption configures a Server at construction beyond its required
+// dependencies.
+type ServerOption func(*Server)
+
+// WithLobbyLimits overrides DefaultLobbyLimits (see LobbyLimits).
+func WithLobbyLimits(limits LobbyLimits) ServerOption {
+	return func(s *Server) {
+		s.lobbyLimits = limits
+	}
 }
 
 func NewServer(
@@ -214,8 +230,10 @@ func NewServer(
 	teamUserID *commonpb.UserId,
 
 	disableGetRoster bool,
+
+	opts ...ServerOption,
 ) *Server {
-	return &Server{
+	s := &Server{
 		log: log,
 
 		authz: authz,
@@ -240,7 +258,12 @@ func NewServer(
 
 		maxGroupFeedChats:  maxGroupFeedChats,
 		rosterWholeReadCap: rosterWholeReadCap,
+		lobbyLimits:        DefaultLobbyLimits,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // GetChat returns one chat's metadata as the caller may see it.
@@ -250,7 +273,7 @@ func NewServer(
 // rules and roster summary are what a user weighs before joining, and what a
 // client renders for a group it was pointed at (see Access for the rules). What
 // the caller's standing decides, combined with the view mode they asked for
-// (see Standing.Reading), is how much of the group comes with it:
+// (see ListenerStanding.Reading), is how much of the group comes with it:
 //
 //   - A member sees everything, as before: the record, themselves as the
 //     hydrated member with their pointers, and the group's messaging state —
@@ -268,7 +291,15 @@ func NewServer(
 //     would admit them.
 //   - Under REDACTED anyone who may read the group at all — a member too —
 //     sees its last message redacted, and the rules are not evaluated for a
-//     non-member (see Access.Standing).
+//     non-member (see Access.ListenerStanding).
+//
+// A private group (see Chat.IsPrivate) falls out of the same rules. Its record
+// is returned to any registered user, with is_private set, so that one who is
+// not a member can see what they would ask to join. It carries no rules, so a
+// non-member's standing is none under every mode and they see the record
+// alone: its messaging state is its members'. What a non-member does get is
+// in_lobby, whether they are waiting in its lobby (see lobby.go). A private
+// group whose key has not been stored is returned like any other.
 //
 // The group's picture is returned in every case: it is part of the record, as
 // the title is, and the two are what identify a group — a group's picture is
@@ -310,7 +341,7 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 	// than a scan of the member list, so a group's membership is never
 	// enumerated on behalf of a caller who turns out not to be a member — and,
 	// for a non-member of a group, the listener rules.
-	standing, err := s.access.StandingWithChat(ctx, c, userID, req.GetViewMode())
+	standing, err := s.access.ListenerStandingWithChat(ctx, c, userID, req.GetViewMode())
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure determining chat standing")
 		return nil, status.Error(codes.Internal, "")
@@ -333,12 +364,13 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 
 // getPublicChat is GetChat for an unauthenticated caller: the chat's public
 // view, which is what a registered non-member previewing the group gets under
-// REDACTED (see Access.PublicStanding) — the record, and the redacted
+// REDACTED (see Access.PublicListenerStanding) — the record, and the redacted
 // messaging state when the group carries a listener rule — with none of the
 // per-viewer fields, since there is no viewer: no hydrated member, no
 // is_hidden, no viewer_state. It is REDACTED or nothing: any other mode is
 // DENIED, as is a DM, before anything is read, so an anonymous caller cannot
-// learn whether a DM exists.
+// learn whether a DM exists. A private group has no public view either and is
+// DENIED off its record: its title and picture are for registered users.
 func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) (*chatpb.GetChatResponse, error) {
 	if req.GetViewMode() != messagingpb.ViewMode_REDACTED || !IsGroupChatID(req.ChatId) {
 		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
@@ -355,7 +387,11 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	standing := s.access.PublicStanding(c)
+	if c.IsPrivate {
+		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
+	}
+
+	standing := s.access.PublicListenerStanding(c)
 	metadata, err := s.hydrate(ctx, nil, standing, standing.Reading(req.GetViewMode()), []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
@@ -376,12 +412,12 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 // phone number in one call. The calls are independent and run concurrently, so
 // a page costs the slowest of them rather than their sum.
 //
-// The standing is the viewer's towards every chat in the set (see Standing),
+// The standing is the viewer's towards every chat in the set (see ListenerStanding),
 // and the reading is what the viewer's read of every chat in the set is
-// answered with (see Standing.Reading). Together they decide what is hydrated
+// answered with (see ListenerStanding.Reading). Together they decide what is hydrated
 // at all: what they withhold is never read, not read and dropped. Most
 // callers hydrate chats the viewer is a member of — a feed built from their
-// memberships, a join or creation that just landed — and pass memberStanding
+// memberships, a join or creation that just landed — and pass memberListenerStanding
 // and ReadingFull. GetChat hydrates a group for whoever asks, and passes what
 // Access found under the mode the client asked for:
 //
@@ -436,6 +472,12 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 // standing is never a member's and it is never shown a DM, so no per-viewer
 // state is read on its behalf.
 //
+// in_lobby is per-viewer and a non-member's alone: whether the viewer is
+// waiting in a private group's lobby (see lobby.go), read for every private
+// group in the set when the viewer is not a member, one strongly consistent
+// read across the set, and never for a member, who is past waiting, or for a
+// group that is not private, which has no lobby. A nil viewer waits nowhere.
+//
 // viewer_state is per-viewer too, and a member's alone: it is what the chat
 // holds about the viewer (see ViewerState) plus what they may do in it, and
 // a non-member may do nothing and has no standing to see what the record
@@ -455,7 +497,7 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 // GetChat). A picture whose original no longer resolves is left with its stored
 // ORIGINAL for the client to treat as unavailable, rather than failing the
 // whole read.
-func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standing Standing, reading Reading, chats []*Chat) ([]*chatpb.Metadata, error) {
+func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standing ListenerStanding, reading Reading, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
 	var pointerRefs []PointerRef
@@ -466,8 +508,12 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 	uniquePeerIDs := make(map[string]*commonpb.UserId)
 	uniquePictureBlobIDs := make(map[string]*blobpb.BlobId)
 	uniqueDmMemberIDs := make(map[string]*commonpb.UserId)
+	var lobbyChatIDs []*commonpb.ChatId
 	hydratedMembers := make([][]*commonpb.UserId, len(chats))
 	for i, c := range chats {
+		if c.IsPrivate && !standing.IsMember && viewerID != nil {
+			lobbyChatIDs = append(lobbyChatIDs, c.ID)
+		}
 		// The members to hydrate: a DM's participants, or the viewer alone in a
 		// group they are a member of (see above).
 		members := c.Members
@@ -551,6 +597,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		pictureRenditions      map[string][]*blobpb.Rendition
 		viewerStates           map[string]ViewerState
 		staffByUserId          map[string]bool
+		lobbyEntries           map[string]LobbyEntry
 	)
 	chatIDs := make([]*commonpb.ChatId, len(chats))
 	for i, c := range chats {
@@ -607,6 +654,12 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 			return err
 		})
 	}
+	if len(lobbyChatIDs) > 0 {
+		g.Go(func() (err error) {
+			lobbyEntries, err = s.chats.GetLobbyEntries(gctx, viewerID, lobbyChatIDs)
+			return err
+		})
+	}
 	if len(dmMemberIDs) > 0 {
 		g.Go(func() (err error) {
 			staffByUserId, err = s.staffFlags(gctx, dmMemberIDs)
@@ -650,6 +703,9 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		md.LatestEventSequence = latestEventSeqs[key]
 		if peer, ok := dmPeerByChat[key]; ok {
 			md.IsHidden = blockedPeers[string(peer.Value)]
+		}
+		if _, ok := lobbyEntries[key]; ok {
+			md.InLobby = true
 		}
 		if IsDmChatType(c.Type) {
 			md.UseE2Ee = useE2ee(c, staffByUserId, s.teamUserID)

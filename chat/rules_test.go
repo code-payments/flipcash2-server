@@ -123,11 +123,11 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 	return resp, nil
 }
 
-// fakeChats is a Store that serves rules from a map of group records and
-// membership from a set, counting the reads of each, so a test can see which
-// evaluations touched the store. Only GetGroupRules and IsMember are
-// exercised, as above; any other read, the record's included, panics on the
-// nil embedded Store.
+// fakeChats is a Store that serves rules from a map of group records,
+// membership from a set, and key envelopes from another, counting the reads
+// of each, so a test can see which evaluations touched the store. Only
+// GetGroupRules, IsMember and GetKeyEnvelope are exercised, as above; any
+// other read, the record's included, panics on the nil embedded Store.
 type fakeChats struct {
 	Store
 
@@ -136,10 +136,31 @@ type fakeChats struct {
 
 	members         map[string]bool
 	membershipReads int
+
+	envelopes     map[string]bool
+	envelopeReads int
 }
 
 func newFakeChats() *fakeChats {
-	return &fakeChats{chats: make(map[string]*Chat), members: make(map[string]bool)}
+	return &fakeChats{chats: make(map[string]*Chat), members: make(map[string]bool), envelopes: make(map[string]bool)}
+}
+
+// storeKey records that userID has a key envelope for chatID; discardKey
+// removes it. What the envelope holds is never read, so none is kept.
+func (f *fakeChats) storeKey(chatID *commonpb.ChatId, userID *commonpb.UserId) {
+	f.envelopes[string(chatID.Value)+string(userID.Value)] = true
+}
+
+func (f *fakeChats) discardKey(chatID *commonpb.ChatId, userID *commonpb.UserId) {
+	delete(f.envelopes, string(chatID.Value)+string(userID.Value))
+}
+
+func (f *fakeChats) GetKeyEnvelope(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (KeyEnvelope, error) {
+	f.envelopeReads++
+	if !f.envelopes[string(chatID.Value)+string(userID.Value)] {
+		return KeyEnvelope{}, ErrKeyEnvelopeNotFound
+	}
+	return KeyEnvelope{WrappedBy: userID}, nil
 }
 
 func (f *fakeChats) put(c *Chat) *Chat {

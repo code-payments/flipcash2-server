@@ -125,7 +125,7 @@ func TestAccess_GroupMember(t *testing.T) {
 	require.True(t, ok)
 	require.Zero(t, f.ocpBalance.asked)
 
-	// Speaking is membership and the rules: the dipped member is refused, a
+	// SpeakerStanding is membership and the rules: the dipped member is refused, a
 	// funded member admitted.
 	ok, err = a.CanSpeak(ctx, f.gated.ID, f.unfunded)
 	require.NoError(t, err)
@@ -158,6 +158,204 @@ func TestAccess_GroupMember(t *testing.T) {
 	}
 	// A non-member's send is refused on membership, before any rule.
 	require.Equal(t, asked+2, f.ocpBalance.asked)
+}
+
+// TestAccess_PrivateGroup: a private group is its members' alone in every
+// form, and its members speak in it exactly when it has its key.
+func TestAccess_PrivateGroup(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	a := NewAccess(f.chats, f.rules)
+
+	creator := model.MustGenerateUserID()
+	private := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: creator})
+	f.chats.join(private.ID, creator)
+
+	// A member reads, and does not speak while the group has no key, which is
+	// one read of the creator's envelope per ask.
+	ok, err := a.CanListen(ctx, private.ID, creator)
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, err = a.CanSpeak(ctx, private.ID, creator)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Equal(t, 1, f.chats.envelopeReads)
+
+	// A non-member has no standing under any mode, however funded, whether
+	// the rules are read from the store or come with the record.
+	modes := []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED}
+	for _, mode := range modes {
+		standing, err := a.ListenerStanding(ctx, private.ID, f.funded, mode)
+		require.NoError(t, err)
+		require.Equal(t, ListenerStanding{}, standing, mode)
+		standing, err = a.ListenerStandingWithChat(ctx, private, f.funded, mode)
+		require.NoError(t, err)
+		require.Equal(t, ListenerStanding{}, standing, mode)
+	}
+	ok, err = a.CanSpeak(ctx, private.ID, f.funded)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Equal(t, ListenerStanding{}, a.PublicListenerStanding(private))
+
+	// The rules admit no one to it either: asked alone, the evaluator refuses
+	// a private group that an empty rule set would open to everyone.
+	for _, u := range []*commonpb.UserId{creator, f.funded} {
+		ok, err = f.rules.CanListen(ctx, private.ID, u)
+		require.NoError(t, err)
+		require.False(t, ok)
+		ok, err = f.rules.CanListenWithRules(ctx, private.ID, private.GroupRules(), u)
+		require.NoError(t, err)
+		require.False(t, ok)
+		ok, err = f.rules.CanSpeak(ctx, private.ID, u)
+		require.NoError(t, err)
+		require.False(t, ok)
+		ok, err = f.rules.CanSpeakWithRules(ctx, private.ID, private.GroupRules(), u)
+		require.NoError(t, err)
+		require.False(t, ok)
+	}
+
+	// None of it rests on the group having no rules. StartChat writes none,
+	// but a private group whose record carries a listener rule a non-member
+	// satisfies is no more open to them: the flag decides, not the rules.
+	ruled := f.chats.put(&Chat{
+		ID:                     MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		IsPrivate:              true,
+		CreatorID:              creator,
+		MinimumListenerBalance: &MinimumBalance{Currency: "usd", NativeAmount: accessRequirement},
+	})
+	for _, mode := range modes {
+		standing, err := a.ListenerStanding(ctx, ruled.ID, f.funded, mode)
+		require.NoError(t, err)
+		require.Equal(t, ListenerStanding{}, standing, mode)
+		standing, err = a.ListenerStandingWithChat(ctx, ruled, f.funded, mode)
+		require.NoError(t, err)
+		require.Equal(t, ListenerStanding{}, standing, mode)
+	}
+	require.Equal(t, ListenerStanding{}, a.PublicListenerStanding(ruled))
+	ok, err = f.rules.CanListen(ctx, ruled.ID, f.funded)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// The creator's envelope is the group's key. Once it is stored every
+	// member speaks — one who holds no envelope of their own included, since
+	// the key is the group's — and a non-member still does not. The key is
+	// found with one envelope read and remembered: it is never read again,
+	// so an envelope that vanished (which no store allows) would not be
+	// noticed.
+	member := model.MustGenerateUserID()
+	f.chats.join(private.ID, member)
+	ok, err = a.CanSpeak(ctx, private.ID, member)
+	require.NoError(t, err)
+	require.False(t, ok)
+	envelopeReads := f.chats.envelopeReads
+	f.chats.storeKey(private.ID, creator)
+	for _, u := range []*commonpb.UserId{creator, member, creator} {
+		ok, err = a.CanSpeak(ctx, private.ID, u)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	require.Equal(t, envelopeReads+1, f.chats.envelopeReads)
+	ok, err = a.CanSpeak(ctx, private.ID, f.funded)
+	require.NoError(t, err)
+	require.False(t, ok)
+	f.chats.discardKey(private.ID, creator)
+	ok, err = a.CanSpeak(ctx, private.ID, creator)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, envelopeReads+1, f.chats.envelopeReads)
+
+	// The key opens the group to its members' sends and to nothing else: a
+	// non-member has no more standing in a keyed group than in a keyless one.
+	for _, mode := range modes {
+		standing, err := a.ListenerStanding(ctx, private.ID, f.funded, mode)
+		require.NoError(t, err)
+		require.Equal(t, ListenerStanding{}, standing, mode)
+	}
+
+	// A member's own envelope is not the group's key: a group whose creator
+	// has stored nothing is keyless whatever its other members hold.
+	keyless := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: creator})
+	f.chats.join(keyless.ID, member)
+	f.chats.storeKey(keyless.ID, member)
+	ok, err = a.CanSpeak(ctx, keyless.ID, member)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// A private group with no recorded creator can have no key, and nothing
+	// is read to find that out.
+	orphan := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true})
+	f.chats.join(orphan.ID, member)
+	envelopeReads = f.chats.envelopeReads
+	ok, err = a.CanSpeak(ctx, orphan.ID, member)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Equal(t, envelopeReads, f.chats.envelopeReads)
+
+	// No rule was evaluated for any of it.
+	require.Zero(t, f.ocpBalance.asked)
+}
+
+// TestAccess_Speaking: what each kind of chat takes from a speaker comes with
+// the standing — a DM takes plaintext or its pairwise scheme, a public group
+// plaintext alone, a keyed private group its chat key's scheme alone — and a
+// refused speaker gets the zero value whatever the chat. A private group's
+// key is found with one envelope read and then remembered.
+func TestAccess_Speaking(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	a := NewAccess(f.chats, f.rules)
+
+	speaker := func(chatID *commonpb.ChatId, userID *commonpb.UserId) SpeakerStanding {
+		t.Helper()
+		s, err := a.SpeakerStanding(ctx, chatID, userID)
+		require.NoError(t, err)
+		return s
+	}
+	dmSpeaking := SpeakerStanding{CanSpeak: true, Encryption: EncryptionOptional, Scheme: messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305}
+	privateSpeaking := SpeakerStanding{CanSpeak: true, Encryption: EncryptionRequired, Scheme: messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305}
+
+	// A DM, with no read beyond membership.
+	peer := model.MustGenerateUserID()
+	dm := MustDeriveDmChatID(chatpb.ChatType_DM, f.funded, peer)
+	f.chats.join(dm, f.funded)
+	f.chats.join(dm, peer)
+	require.Equal(t, dmSpeaking, speaker(dm, f.funded))
+	require.Equal(t, dmSpeaking, speaker(dm, peer))
+	require.Equal(t, SpeakerStanding{}, speaker(dm, f.unfunded))
+	require.Zero(t, f.chats.reads)
+	require.Zero(t, f.chats.envelopeReads)
+	require.True(t, dmSpeaking.takesEncrypted())
+
+	// A public group: the rules decide, and nothing is said of encryption.
+	f.chats.join(f.gated.ID, f.funded)
+	f.chats.join(f.gated.ID, f.unfunded)
+	require.Equal(t, SpeakerStanding{CanSpeak: true}, speaker(f.gated.ID, f.funded))
+	require.Equal(t, SpeakerStanding{}, speaker(f.gated.ID, f.unfunded))
+	require.Equal(t, 2, f.ocpBalance.asked)
+	require.Zero(t, f.chats.envelopeReads)
+	require.False(t, SpeakerStanding{CanSpeak: true}.takesEncrypted())
+
+	// A private group: nothing until the key, then its scheme for every
+	// member, found once. No rule is evaluated for it.
+	creator := model.MustGenerateUserID()
+	private := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: creator})
+	f.chats.join(private.ID, creator)
+	f.chats.join(private.ID, f.unfunded)
+	require.Equal(t, SpeakerStanding{}, speaker(private.ID, creator))
+	require.Equal(t, SpeakerStanding{}, speaker(private.ID, f.unfunded))
+	require.Equal(t, 2, f.chats.envelopeReads)
+	f.chats.storeKey(private.ID, creator)
+	require.Equal(t, privateSpeaking, speaker(private.ID, creator))
+	require.Equal(t, privateSpeaking, speaker(private.ID, f.unfunded))
+	require.Equal(t, SpeakerStanding{}, speaker(private.ID, f.funded))
+	require.Equal(t, 3, f.chats.envelopeReads)
+	require.Equal(t, 2, f.ocpBalance.asked)
+	require.True(t, privateSpeaking.takesEncrypted())
+
+	// A chat that does not exist.
+	require.Equal(t, SpeakerStanding{}, speaker(MustGenerateGroupChatID(), f.funded))
+	require.False(t, SpeakerStanding{}.takesEncrypted())
 }
 
 func TestAccess_GroupNonMember(t *testing.T) {
@@ -319,7 +517,7 @@ func TestAccess_CanListenWithRules(t *testing.T) {
 // TestAccess_WithChat pins what a caller holding the canonical record saves:
 // a DM's standing and membership are answered off the record's inline
 // members with no store read at all, while a group's membership is still the
-// store's, and its rules come off the record as for StandingWithRules.
+// store's, and its rules come off the record as for ListenerStandingWithRules.
 func TestAccess_WithChat(t *testing.T) {
 	ctx := context.Background()
 	f := newAccessFixture(t)
@@ -337,16 +535,16 @@ func TestAccess_WithChat(t *testing.T) {
 		ok, err := a.IsMemberWithChat(ctx, dm, u)
 		require.NoError(t, err)
 		require.True(t, ok)
-		standing, err := a.StandingWithChat(ctx, dm, u, messagingpb.ViewMode_FULL)
+		standing, err := a.ListenerStandingWithChat(ctx, dm, u, messagingpb.ViewMode_FULL)
 		require.NoError(t, err)
-		require.Equal(t, memberStanding, standing)
+		require.Equal(t, memberListenerStanding, standing)
 	}
 	ok, err := a.IsMemberWithChat(ctx, dm, third)
 	require.NoError(t, err)
 	require.False(t, ok)
-	standing, err := a.StandingWithChat(ctx, dm, third, messagingpb.ViewMode_FULL_OR_REDACTED)
+	standing, err := a.ListenerStandingWithChat(ctx, dm, third, messagingpb.ViewMode_FULL_OR_REDACTED)
 	require.NoError(t, err)
-	require.Equal(t, Standing{}, standing)
+	require.Equal(t, ListenerStanding{}, standing)
 	require.Equal(t, reads, f.chats.reads)
 	require.Equal(t, membershipReads, f.chats.membershipReads)
 
@@ -359,17 +557,17 @@ func TestAccess_WithChat(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, membershipReads+1, f.chats.membershipReads)
-	standing, err = a.StandingWithChat(ctx, f.gated, f.unfunded, messagingpb.ViewMode_FULL)
+	standing, err = a.ListenerStandingWithChat(ctx, f.gated, f.unfunded, messagingpb.ViewMode_FULL)
 	require.NoError(t, err)
-	require.Equal(t, memberStanding, standing)
+	require.Equal(t, memberListenerStanding, standing)
 	require.Equal(t, membershipReads+2, f.chats.membershipReads)
 
 	// A group non-member is judged by the rules off the record, not the
 	// store's copy of them.
 	reads = f.chats.reads
-	standing, err = a.StandingWithChat(ctx, f.gated, f.funded, messagingpb.ViewMode_FULL)
+	standing, err = a.ListenerStandingWithChat(ctx, f.gated, f.funded, messagingpb.ViewMode_FULL)
 	require.NoError(t, err)
-	require.Equal(t, Standing{CanListen: true, CanPreview: true}, standing)
+	require.Equal(t, ListenerStanding{CanListen: true, CanPreview: true}, standing)
 	require.Equal(t, reads, f.chats.reads)
 }
 
@@ -408,8 +606,8 @@ func TestAccess_ViewMode(t *testing.T) {
 	f := newAccessFixture(t)
 	a := NewAccess(f.chats, f.rules)
 
-	preview := Standing{CanPreview: true}
-	full := Standing{CanListen: true, CanPreview: true}
+	preview := ListenerStanding{CanPreview: true}
+	full := ListenerStanding{CanListen: true, CanPreview: true}
 	evaluating := []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED}
 	every := append(evaluating, messagingpb.ViewMode_REDACTED)
 
@@ -418,13 +616,13 @@ func TestAccess_ViewMode(t *testing.T) {
 	// that out; under REDACTED the answer is the same without the valuation.
 	for _, mode := range evaluating {
 		asked := f.ocpBalance.asked
-		standing, err := a.Standing(ctx, f.gated.ID, f.unfunded, mode)
+		standing, err := a.ListenerStanding(ctx, f.gated.ID, f.unfunded, mode)
 		require.NoError(t, err)
 		require.Equal(t, preview, standing, mode)
 		require.Equal(t, asked+1, f.ocpBalance.asked, mode)
 	}
 	asked := f.ocpBalance.asked
-	standing, err := a.Standing(ctx, f.gated.ID, f.unfunded, messagingpb.ViewMode_REDACTED)
+	standing, err := a.ListenerStanding(ctx, f.gated.ID, f.unfunded, messagingpb.ViewMode_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, preview, standing)
 	require.Equal(t, asked, f.ocpBalance.asked)
@@ -433,19 +631,19 @@ func TestAccess_ViewMode(t *testing.T) {
 	// placeholder is the answer whatever the rules say — so their admission is
 	// neither found nor remembered by it: the next evaluating read still pays,
 	// and only then is remembered.
-	standing, err = a.Standing(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_REDACTED)
+	standing, err = a.ListenerStanding(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, preview, standing)
 	require.Equal(t, asked, f.ocpBalance.asked)
-	standing, err = a.Standing(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_FULL_OR_REDACTED)
+	standing, err = a.ListenerStanding(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_FULL_OR_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, full, standing)
 	require.Equal(t, asked+1, f.ocpBalance.asked)
-	standing, err = a.Standing(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_FULL)
+	standing, err = a.ListenerStanding(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_FULL)
 	require.NoError(t, err)
 	require.Equal(t, full, standing)
 	require.Equal(t, asked+1, f.ocpBalance.asked)
-	standing, err = a.Standing(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_REDACTED)
+	standing, err = a.ListenerStanding(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, preview, standing)
 	require.Equal(t, asked+1, f.ocpBalance.asked)
@@ -454,9 +652,9 @@ func TestAccess_ViewMode(t *testing.T) {
 	f.chats.join(f.gated.ID, f.unfunded)
 	asked = f.ocpBalance.asked
 	for _, mode := range every {
-		standing, err := a.Standing(ctx, f.gated.ID, f.unfunded, mode)
+		standing, err := a.ListenerStanding(ctx, f.gated.ID, f.unfunded, mode)
 		require.NoError(t, err)
-		require.Equal(t, memberStanding, standing, mode)
+		require.Equal(t, memberListenerStanding, standing, mode)
 	}
 	require.Equal(t, asked, f.ocpBalance.asked)
 
@@ -472,21 +670,21 @@ func TestAccess_ViewMode(t *testing.T) {
 	f.ocpBalance.set(f.accounts.bind(third), f.usdf, ocp_common.ToCoreMintQuarks(1_000_000))
 	for _, mode := range every {
 		for _, chatID := range []*commonpb.ChatId{open.ID, dm, MustGenerateGroupChatID()} {
-			standing, err := a.Standing(ctx, chatID, third, mode)
+			standing, err := a.ListenerStanding(ctx, chatID, third, mode)
 			require.NoError(t, err)
-			require.Equal(t, Standing{}, standing, mode)
+			require.Equal(t, ListenerStanding{}, standing, mode)
 		}
 	}
 	require.Equal(t, asked, f.ocpBalance.asked)
 
 	// With the rules in hand the answer is the same, without a store read.
 	reads := f.chats.reads
-	standing, err = a.StandingWithRules(ctx, f.gated.ID, f.gated.GroupRules(), third, messagingpb.ViewMode_REDACTED)
+	standing, err = a.ListenerStandingWithRules(ctx, f.gated.ID, f.gated.GroupRules(), third, messagingpb.ViewMode_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, preview, standing)
 	require.Equal(t, reads, f.chats.reads)
 	require.Equal(t, asked, f.ocpBalance.asked)
-	standing, err = a.StandingWithRules(ctx, f.gated.ID, f.gated.GroupRules(), third, messagingpb.ViewMode_FULL_OR_REDACTED)
+	standing, err = a.ListenerStandingWithRules(ctx, f.gated.ID, f.gated.GroupRules(), third, messagingpb.ViewMode_FULL_OR_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, full, standing)
 	require.Equal(t, reads, f.chats.reads)
@@ -498,9 +696,9 @@ func TestAccess_ViewMode(t *testing.T) {
 	fourth := model.MustGenerateUserID()
 	f.accounts.bind(fourth)
 	f.ocpBalance.err = errors.New("unavailable")
-	_, err = a.Standing(ctx, f.gated.ID, fourth, messagingpb.ViewMode_FULL_OR_REDACTED)
+	_, err = a.ListenerStanding(ctx, f.gated.ID, fourth, messagingpb.ViewMode_FULL_OR_REDACTED)
 	require.Error(t, err)
-	standing, err = a.Standing(ctx, f.gated.ID, fourth, messagingpb.ViewMode_REDACTED)
+	standing, err = a.ListenerStanding(ctx, f.gated.ID, fourth, messagingpb.ViewMode_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, preview, standing)
 }
@@ -508,33 +706,33 @@ func TestAccess_ViewMode(t *testing.T) {
 // TestStanding_Reading pins the mode table (see messagingpb.ViewMode): the
 // mode never widens a standing, and a mode this version does not know denies.
 func TestStanding_Reading(t *testing.T) {
-	none := Standing{}
-	preview := Standing{CanPreview: true}
-	full := Standing{CanListen: true, CanPreview: true}
+	none := ListenerStanding{}
+	preview := ListenerStanding{CanPreview: true}
+	full := ListenerStanding{CanListen: true, CanPreview: true}
 	for _, tc := range []struct {
-		standing Standing
+		standing ListenerStanding
 		mode     messagingpb.ViewMode
 		want     Reading
 	}{
 		{none, messagingpb.ViewMode_FULL, ReadingDenied},
 		{preview, messagingpb.ViewMode_FULL, ReadingDenied},
 		{full, messagingpb.ViewMode_FULL, ReadingFull},
-		{memberStanding, messagingpb.ViewMode_FULL, ReadingFull},
+		{memberListenerStanding, messagingpb.ViewMode_FULL, ReadingFull},
 
 		{none, messagingpb.ViewMode_FULL_OR_REDACTED, ReadingDenied},
 		{preview, messagingpb.ViewMode_FULL_OR_REDACTED, ReadingRedacted},
 		{full, messagingpb.ViewMode_FULL_OR_REDACTED, ReadingFull},
-		{memberStanding, messagingpb.ViewMode_FULL_OR_REDACTED, ReadingFull},
+		{memberListenerStanding, messagingpb.ViewMode_FULL_OR_REDACTED, ReadingFull},
 
 		{none, messagingpb.ViewMode_REDACTED, ReadingDenied},
 		{preview, messagingpb.ViewMode_REDACTED, ReadingRedacted},
 		{full, messagingpb.ViewMode_REDACTED, ReadingRedacted},
-		{memberStanding, messagingpb.ViewMode_REDACTED, ReadingRedacted},
+		{memberListenerStanding, messagingpb.ViewMode_REDACTED, ReadingRedacted},
 
 		{none, messagingpb.ViewMode(99), ReadingDenied},
 		{preview, messagingpb.ViewMode(99), ReadingDenied},
 		{full, messagingpb.ViewMode(99), ReadingDenied},
-		{memberStanding, messagingpb.ViewMode(99), ReadingDenied},
+		{memberListenerStanding, messagingpb.ViewMode(99), ReadingDenied},
 	} {
 		require.Equal(t, tc.want, tc.standing.Reading(tc.mode), "%+v under %v", tc.standing, tc.mode)
 	}

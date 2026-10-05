@@ -7,16 +7,17 @@ import (
 )
 
 // End-to-end encrypted blobs are the one kind of blob the server cannot read.
-// A client encrypts an image for a DM (see messagingpb.EncryptedContent, which
-// fixes the format) and uploads the ciphertext as an opaque octet stream, so
-// the server derives nothing from the bytes: no metadata, no renditions, no
-// moderation, no privacy-metadata check. What it does instead is pin the blob
-// to the DM at reservation — the caller must be a member, and the chat must be
-// a DM — check nothing but the size at finalization, grant the DM read access
-// in the same step that makes the blob READY, and refuse the blob on every
-// surface other than encrypted content in that chat (see validateAttachable).
-// Everything specific to that kind is gathered here; the pipeline arms live
-// beside their plaintext counterparts.
+// A client encrypts an image for a chat (see messagingpb.EncryptedContent,
+// which fixes the format) and uploads the ciphertext as an opaque octet
+// stream, so the server derives nothing from the bytes: no metadata, no
+// renditions, no moderation, no privacy-metadata check. What it does instead
+// is pin the blob to the chat at reservation — the chat must take encrypted
+// content and the caller must be able to send it there (see
+// EncryptedUploadGate) — check nothing but the size at finalization, grant
+// the chat read access in the same step that makes the blob READY, and refuse
+// the blob on every surface other than encrypted content in that chat (see
+// validateAttachable). Everything specific to that kind is gathered here; the
+// pipeline arms live beside their plaintext counterparts.
 const (
 	// MaxEncryptedBlobSizeBytes bounds the declared size of an end-to-end
 	// encrypted upload. It is the only constraint the server enforces on such a
@@ -43,16 +44,19 @@ const (
 	maxEncryptedImagePixels    = maxEncryptedImageDimension * maxEncryptedImageDimension
 )
 
-// DMMembership is the slice of the chat domain the upload path needs to admit
-// an end-to-end encrypted upload: whether a user is currently a member of a
-// chat that is a DM. It is declared here (consumer side) so this package need
-// not import chat — which imports this package to attach pictures and match
-// its errors — and the chat package supplies an adapter over its store that
-// also owns the DM-versus-group rule, so the chat ID discriminator is never
-// duplicated here.
-type DMMembership interface {
-	// IsDMMember reports whether chatID names a DM and userID is a member of
-	// it. A group chat ID, an unknown chat, or a non-member is false with no
-	// error.
-	IsDMMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error)
+// EncryptedUploadGate is the slice of the chat domain the upload path needs
+// to admit an end-to-end encrypted upload: whether a chat takes encrypted
+// content, and whether the caller may send it there right now. Which chats
+// do — a DM, and a private group once it has its chat key — and what admits
+// a sender are the chat domain's rules, and change there. It is declared here
+// (consumer side) so this package need not import chat — which imports this
+// package to attach pictures and match its errors — and the chat package
+// supplies the adapter (chat.NewBlobEncryptedUploadGate), so neither the chat
+// ID discriminator nor the rules are duplicated here.
+type EncryptedUploadGate interface {
+	// CanUploadEncrypted reports whether chatID takes end-to-end encrypted
+	// content and userID may send it there. A chat that takes none, an
+	// unknown chat, or a caller who may not send in it is false with no
+	// error, so a refused caller learns nothing of the chat.
+	CanUploadEncrypted(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error)
 }

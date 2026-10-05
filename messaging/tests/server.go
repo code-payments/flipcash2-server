@@ -95,6 +95,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_ViewMode,
 		testServer_StaffOnlyGroup_Rules,
 		testServer_CreatorOnlyGroup_Rules,
+		testServer_PrivateGroup_Keyless,
+		testServer_PrivateGroup_Keyed,
 		testServer_BalanceGatedGroup_Rules,
 		testServer_Broadcast_IncludesActor,
 		testServer_SendMessage_PushPerChatType,
@@ -1164,6 +1166,19 @@ func testServer_EncryptedContent(t *testing.T, badges badge.Store, blocklists bl
 	require.Equal(t, messagingpb.EditMessageResponse_OK, upgraded.Result)
 	require.True(t, proto.Equal(encryptedContent(4)[0], upgraded.Message.Content[0]))
 
+	// A DM takes only its own scheme: a private group's is refused on a send
+	// and on an edit, and the edited message stays as it was.
+	wrongScheme, err := e.sendContentToChat(e.keysA, chatID, chatKeyEncryptedContent(6), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED, wrongScheme.Result)
+	require.Nil(t, wrongScheme.Message)
+	wrongSchemeEdit, err := e.editMessageInChat(e.keysA, chatID, msgID, chatKeyEncryptedContent(6), edited.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_ENCRYPTION_NOT_ALLOWED, wrongSchemeEdit.Result)
+	stillEdited, err := e.getMessageInChat(e.keysA, chatID, msgID)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(encryptedContent(3)[0], stillEdited.Message.Content[0]))
+
 	// A message too large to carry in a push is pushed by its ID alone, for
 	// the recipient to fetch; the sender and generic body are still there.
 	large := encryptedContent(5)
@@ -1193,8 +1208,9 @@ func testServer_EncryptedContent(t *testing.T, badges badge.Store, blocklists bl
 }
 
 // testServer_EncryptedContent_NotInGroups: encrypted content is a DM's alone.
-// A group member's send or edit carrying it is ENCRYPTION_NOT_ALLOWED and
-// nothing is written; a non-member is DENIED before the chat type matters.
+// A group member's send or edit carrying it is ENCRYPTION_NOT_ALLOWED under
+// either scheme and nothing is written; a non-member is DENIED before the chat
+// type matters.
 func testServer_EncryptedContent_NotInGroups(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
@@ -1211,6 +1227,11 @@ func testServer_EncryptedContent_NotInGroups(t *testing.T, badges badge.Store, b
 	require.Equal(t, messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED, resp.Result)
 	require.Nil(t, resp.Message)
 
+	chatKeyResp, err := e.sendContentToChat(e.keysA, groupID, chatKeyEncryptedContent(1), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED, chatKeyResp.Result)
+	require.Nil(t, chatKeyResp.Message)
+
 	_, strangerKeys := e.addUser()
 	strangerResp, err := e.sendContentToChat(strangerKeys, groupID, encryptedContent(1), generateClientID())
 	require.NoError(t, err)
@@ -1223,6 +1244,10 @@ func testServer_EncryptedContent_NotInGroups(t *testing.T, badges badge.Store, b
 	edit, err := e.editMessageInChat(e.keysA, groupID, sent.Message.MessageId, encryptedContent(2), sent.Message.EventSequence)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.EditMessageResponse_ENCRYPTION_NOT_ALLOWED, edit.Result)
+
+	chatKeyEdit, err := e.editMessageInChat(e.keysA, groupID, sent.Message.MessageId, chatKeyEncryptedContent(2), sent.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_ENCRYPTION_NOT_ALLOWED, chatKeyEdit.Result)
 
 	// Only the plaintext message was written, and it is unchanged.
 	got, err := e.getMessagesByOptionsInChat(e.keysA, groupID, nil)
@@ -3319,6 +3344,192 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 	require.Equal(t, messagingpb.SendMessageResponse_OK, dmResp.Result)
 }
 
+// putPrivateGroup persists a private group created by userA, titled
+// "Private", whose members are userA and the given others.
+func (e *serverEnv) putPrivateGroup(chats chat.Store, others ...*commonpb.UserId) *commonpb.ChatId {
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      append([]*commonpb.UserId{e.userA}, others...),
+		Title:        "Private",
+		IsPrivate:    true,
+		CreatorID:    e.userA,
+		LastActivity: at(1),
+	}))
+	return groupID
+}
+
+// storeChatKey stores userID's key envelope for the group straight into the
+// store, as the chat service would on their SetKeyEnvelope. The creator's is
+// what makes the group keyed (see chat.Access.SpeakerStanding).
+func (e *serverEnv) storeChatKey(chats chat.Store, groupID *commonpb.ChatId, userID *commonpb.UserId) {
+	_, err := chats.SetKeyEnvelope(e.ctx, groupID, userID, chat.KeyEnvelope{
+		Scheme:     chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305,
+		Nonce:      bytes.Repeat([]byte{1}, 24),
+		Ciphertext: bytes.Repeat([]byte{1}, 48),
+		WrappedBy:  userID,
+	})
+	require.NoError(e.t, err)
+}
+
+// testServer_PrivateGroup_Keyless pins that nothing is sent in a private
+// group before its creator has stored their key envelope: a member's send is
+// DENIED whatever it carries, encrypted content under the group's own scheme
+// included, as is their typing notification, and nothing is written. Another
+// member's envelope is not the group's key. The member still reads it, and a
+// non-member reads nothing of it.
+func testServer_PrivateGroup_Keyless(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	groupID := e.putPrivateGroup(chats, e.userB)
+	e.storeChatKey(chats, groupID, e.userB)
+
+	for _, keys := range []model.KeyPair{e.keysA, e.keysB} {
+		for _, content := range [][]*messagingpb.Content{
+			textContent("plaintext"),
+			encryptedContent(1),
+			chatKeyEncryptedContent(1),
+		} {
+			resp, err := e.sendContentToChat(keys, groupID, content, generateClientID())
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.SendMessageResponse_DENIED, resp.Result)
+			require.Nil(t, resp.Message)
+		}
+		typingResp, err := e.notifyIsTypingInChat(keys, groupID, messagingpb.IsTypingNotification_STARTED_TYPING)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
+	}
+
+	// The members still read it, and find it empty.
+	got, err := e.getMessagesByOptionsInChat(e.keysA, groupID, nil)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, got.Result)
+
+	// A non-member reads nothing of it under any mode.
+	_, strangerKeys := e.addUser()
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		denied, err := e.getMessagesByOptionsInChatWithMode(strangerKeys, groupID, nil, mode)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_DENIED, denied.Result, mode)
+	}
+}
+
+// testServer_PrivateGroup_Keyed pins what a private group takes once its
+// creator has stored their envelope: encrypted content under the chat key's
+// scheme, from any member — one holding no envelope of their own included —
+// and nothing else. Plaintext, a reply included, is ENCRYPTION_REQUIRED and
+// the DM scheme ENCRYPTION_NOT_ALLOWED, on a send and on an edit alike, with
+// nothing written; a non-member is DENIED as before. The message's push names
+// the sender with a generic body, and the group's title.
+func testServer_PrivateGroup_Keyed(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Alice"))
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userB, "Bob"))
+	groupID := e.putPrivateGroup(chats, e.userB)
+	e.storeChatKey(chats, groupID, e.userA)
+
+	// Nothing but the group's scheme goes in.
+	for _, refused := range []struct {
+		content []*messagingpb.Content
+		result  messagingpb.SendMessageResponse_Result
+	}{
+		{textContent("plaintext"), messagingpb.SendMessageResponse_ENCRYPTION_REQUIRED},
+		{replyContent(1, "plaintext reply"), messagingpb.SendMessageResponse_ENCRYPTION_REQUIRED},
+		{encryptedContent(1), messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED},
+	} {
+		resp, err := e.sendContentToChat(e.keysA, groupID, refused.content, generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, refused.result, resp.Result)
+		require.Nil(t, resp.Message)
+	}
+	empty, err := e.getMessagesByOptionsInChat(e.keysA, groupID, nil)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_NOT_FOUND, empty.Result)
+
+	// The creator sends, and so does a member who has stored no envelope.
+	sent, err := e.sendContentToChat(e.keysA, groupID, chatKeyEncryptedContent(1), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	require.True(t, proto.Equal(chatKeyEncryptedContent(1)[0], sent.Message.Content[0]))
+	e.waitForNewMessage(e.userB, sent.Message.MessageId.Value)
+	sentB, err := e.sendContentToChat(e.keysB, groupID, chatKeyEncryptedContent(2), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sentB.Result)
+	e.waitForNewMessage(e.userA, sentB.Message.MessageId.Value)
+
+	// Both read the ciphertext back as sent; a non-member reads nothing.
+	for _, keys := range []model.KeyPair{e.keysA, e.keysB} {
+		got, err := e.getMessagesByOptionsInChat(keys, groupID, nil)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_OK, got.Result)
+		require.Len(t, got.Messages.Messages, 2)
+		require.True(t, proto.Equal(chatKeyEncryptedContent(1)[0], got.Messages.Messages[0].Content[0]))
+		require.True(t, proto.Equal(chatKeyEncryptedContent(2)[0], got.Messages.Messages[1].Content[0]))
+	}
+	_, strangerKeys := e.addUser()
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		denied, err := e.getMessagesByOptionsInChatWithMode(strangerKeys, groupID, nil, mode)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_DENIED, denied.Result, mode)
+	}
+	strangerSend, err := e.sendContentToChat(strangerKeys, groupID, chatKeyEncryptedContent(3), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, strangerSend.Result)
+	strangerTyping, err := e.notifyIsTypingInChat(strangerKeys, groupID, messagingpb.IsTypingNotification_STARTED_TYPING)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, strangerTyping.Result)
+
+	// An edit is held to the same rule, and a refused one changes nothing.
+	msgID := sent.Message.MessageId
+	for _, refused := range []struct {
+		content []*messagingpb.Content
+		result  messagingpb.EditMessageResponse_Result
+	}{
+		{textContent("plaintext"), messagingpb.EditMessageResponse_ENCRYPTION_REQUIRED},
+		{encryptedContent(4), messagingpb.EditMessageResponse_ENCRYPTION_NOT_ALLOWED},
+	} {
+		resp, err := e.editMessageInChat(e.keysA, groupID, msgID, refused.content, sent.Message.EventSequence)
+		require.NoError(t, err)
+		require.Equal(t, refused.result, resp.Result)
+	}
+	unchanged, err := e.getMessageInChat(e.keysA, groupID, msgID)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(chatKeyEncryptedContent(1)[0], unchanged.Message.Content[0]))
+	require.Equal(t, sent.Message.EventSequence, unchanged.Message.EventSequence)
+	edited, err := e.editMessageInChat(e.keysA, groupID, msgID, chatKeyEncryptedContent(5), sent.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_OK, edited.Result)
+	require.True(t, proto.Equal(chatKeyEncryptedContent(5)[0], edited.Message.Content[0]))
+
+	// Typing and deleting are a member's as in any group.
+	typing, err := e.notifyIsTypingInChat(e.keysB, groupID, messagingpb.IsTypingNotification_STARTED_TYPING)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.NotifyIsTypingResponse_OK, typing.Result)
+	deleted, err := e.deleteMessageInChat(e.keysA, groupID, msgID, edited.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, deleted.Result)
+	require.NotNil(t, deleted.Message.Content[0].GetDeleted())
+
+	// The push for the creator's message reached the other member with the
+	// group's title, a body that names the sender and nothing of the content,
+	// and the message in the payload for a client that can decrypt it.
+	var groupPush capturedPush
+	require.Eventually(t, func() bool {
+		for _, p := range e.pusher.snapshot() {
+			if proto.Equal(sent.Message.MessageId, p.payload.GetChatMetadata().GetMessage().GetMessageId()) {
+				groupPush = p
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, "Private", groupPush.title)
+	require.Equal(t, "Alice sent a message", groupPush.body)
+	require.True(t, proto.Equal(sent.Message, groupPush.payload.ChatMetadata.GetMessage()))
+	require.Len(t, groupPush.users, 1)
+	require.True(t, proto.Equal(e.userB, groupPush.users[0]))
+}
+
 // testServer_CreatorOnlyGroup_Rules pins that a creator-only group's speaker
 // rule is enforced on the send paths: its creator speaks, and every other
 // member is refused as a non-member is, while still reading and reacting,
@@ -3855,7 +4066,7 @@ func testServer_SendMessage_GroupPushPaged(t *testing.T, badges badge.Store, blo
 			// recipients.
 			_, _, err = chats.SetMute(e.ctx, groupID, departed, chat.Mute{Forever: true})
 			require.NoError(t, err)
-			changed, _, err := chats.RemoveGroupMember(e.ctx, groupID, departed)
+			changed, _, err := chats.RemoveGroupMember(e.ctx, groupID, departed, false)
 			require.NoError(t, err)
 			require.True(t, changed)
 			_, _, err = chats.SetMute(e.ctx, groupID, model.MustGenerateUserID(), chat.Mute{Forever: true})

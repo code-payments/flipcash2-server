@@ -240,8 +240,8 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // a group chat: group membership is mutable and lives in its own store records,
 // which no path that reads the canonical record touches. A caller that needs a
 // group's members reads them explicitly via Store.GetMembers. Title,
-// IsStaffOnly, IsCreatorOnlySpeaker, CreatorID and PictureBlobID are
-// group-only and zero for DMs.
+// IsStaffOnly, IsCreatorOnlySpeaker, IsPrivate, CreatorID and PictureBlobID
+// are group-only and zero for DMs.
 //
 // RosterSummary describes the member list without containing it. Like Members,
 // it is complete for a DM on any read and left zero for a group by the
@@ -265,6 +265,26 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // it only when its record was written with it. A group that carries it but
 // has no recorded creator admits no one to speak.
 //
+// IsPrivate marks a private group (see chatpb.Metadata.is_private): one whose
+// creator admits each member, and whose messages are end-to-end encrypted
+// with a chat key the server never holds. It is fixed at creation, like the
+// rules, and read with them (see GroupRules). A private group carries no
+// rules: StartChat writes none. No non-member is admitted to it in any form
+// (see Access), no rule admits anyone to it (see RuleEvaluator), and
+// JoinChat refuses everyone but its creator; each is decided on this flag,
+// not on the absence of rules. Its
+// title and picture are plaintext on the record like any group's, and are
+// shown to any registered user.
+//
+// A private group's chat key reaches the server only as its members' key
+// envelopes (see KeyEnvelope), and nothing happens in one until its creator
+// has stored theirs: a keyless group's members are refused every send, and
+// a keyed group's members send encrypted content under the group's scheme
+// and nothing else (see Access.SpeakerStanding and
+// messaging.Server.SendMessage). Its other members are admitted by its
+// creator from its lobby (see LobbyEntry and Server.EnterLobby), with the
+// chat key wrapped for each by the creator.
+//
 // CreatorID is the user who created the group, or nil when unknown (a DM has
 // none, and so does any group written before the field existed). It is fixed
 // at creation and records provenance only: creating a group does not by itself
@@ -287,6 +307,7 @@ type Chat struct {
 	IsStaffOnly            bool
 	MinimumListenerBalance *MinimumBalance
 	IsCreatorOnlySpeaker   bool
+	IsPrivate              bool
 	CreatorID              *commonpb.UserId
 	PictureBlobID          *blobpb.BlobId
 	LastActivity           time.Time
@@ -439,6 +460,7 @@ func (c *Chat) Clone() *Chat {
 		IsStaffOnly:            c.IsStaffOnly,
 		MinimumListenerBalance: minimumListenerBalance,
 		IsCreatorOnlySpeaker:   c.IsCreatorOnlySpeaker,
+		IsPrivate:              c.IsPrivate,
 		CreatorID:              creatorID,
 		PictureBlobID:          pictureBlobID,
 		LastActivity:           c.LastActivity,
@@ -448,8 +470,8 @@ func (c *Chat) Clone() *Chat {
 
 // ToProto projects the stored chat onto a chatpb.Metadata. Only the fields
 // owned by the chat domain are populated: chat_id, type, title, last_activity,
-// roster_summary, rules, creator (a group's, when recorded), a Member entry per
-// member with just user_id set, and — for a group with a picture — a picture
+// roster_summary, rules, is_private, creator (a group's, when recorded), a
+// Member entry per member with just user_id set, and — for a group with a picture — a picture
 // carrying only its ORIGINAL rendition's blob id. The caller is responsible for hydrating member profiles, pointers,
 // the last message, and the picture's resolved rendition set.
 func (c *Chat) ToProto() *chatpb.Metadata {
@@ -466,6 +488,7 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 		RosterSummary: c.RosterSummary.ToProto(),
 		Title:         c.Title,
 		Rules:         c.Rules(),
+		IsPrivate:     c.IsPrivate,
 		LastActivity:  timestamppb.New(c.LastActivity),
 	}
 	if c.CreatorID != nil {
@@ -480,6 +503,80 @@ func (c *Chat) ToProto() *chatpb.Metadata {
 		}
 	}
 	return md
+}
+
+// KeyEnvelope is one user's key envelope for a private group (see
+// chatpb.KeyEnvelope and Chat.IsPrivate): the group's chat key, encrypted so
+// that only that user can open it. The server stores an envelope and hands it
+// back to the user it is for. It cannot open one and never holds the chat
+// key, so nothing in an envelope is checked beyond its shape, which is the
+// boundary's job (proto validation), not the record's.
+//
+// WrappedBy is who stored the envelope, as the server authenticated them: the
+// user it is for, or the group's creator admitting them. It is the server's
+// record, never a client's claim, and it is what a client is told to open the
+// envelope against (GetKeyEnvelopeResponse.wrapped_by). It also decides
+// whether the envelope can be replaced: one a user wrapped for themself
+// stands (see Store.SetKeyEnvelope).
+//
+// A private group has a key exactly when its creator has an envelope stored.
+// Nothing else records it: the creator's envelope is the only one that can
+// be the group's first, it is always one they wrapped themself, and it is
+// never deleted, so its presence is one-way. Every other member's envelope is
+// deleted with their departure (see Server.LeaveChat).
+type KeyEnvelope struct {
+	Scheme     chatpb.KeyEnvelope_Scheme
+	Nonce      []byte
+	Ciphertext []byte
+	WrappedBy  *commonpb.UserId
+}
+
+// KeyEnvelopeFromProto returns the envelope pb describes, recorded as stored
+// by wrappedBy.
+func KeyEnvelopeFromProto(pb *chatpb.KeyEnvelope, wrappedBy *commonpb.UserId) KeyEnvelope {
+	return KeyEnvelope{
+		Scheme:     pb.GetScheme(),
+		Nonce:      pb.GetNonce(),
+		Ciphertext: pb.GetCiphertext(),
+		WrappedBy:  wrappedBy,
+	}.Clone()
+}
+
+// ToProto projects the envelope onto a chatpb.KeyEnvelope. Who wrapped it is
+// not part of the proto envelope; a response carries it beside the envelope.
+func (e KeyEnvelope) ToProto() *chatpb.KeyEnvelope {
+	return &chatpb.KeyEnvelope{
+		Scheme:     e.Scheme,
+		Nonce:      bytes.Clone(e.Nonce),
+		Ciphertext: bytes.Clone(e.Ciphertext),
+	}
+}
+
+// Equal reports whether the two envelopes are the same envelope: the same
+// bytes under the same scheme, stored by the same user.
+func (e KeyEnvelope) Equal(other KeyEnvelope) bool {
+	return e.Scheme == other.Scheme &&
+		bytes.Equal(e.Nonce, other.Nonce) &&
+		bytes.Equal(e.Ciphertext, other.Ciphertext) &&
+		bytes.Equal(e.WrappedBy.GetValue(), other.WrappedBy.GetValue())
+}
+
+// IsWrappedBy reports whether userID stored the envelope.
+func (e KeyEnvelope) IsWrappedBy(userID *commonpb.UserId) bool {
+	return e.WrappedBy != nil && bytes.Equal(e.WrappedBy.Value, userID.GetValue())
+}
+
+// Clone returns a deep copy of the envelope.
+func (e KeyEnvelope) Clone() KeyEnvelope {
+	clone := KeyEnvelope{
+		Scheme:     e.Scheme,
+		Nonce:      bytes.Clone(e.Nonce),
+		Ciphertext: bytes.Clone(e.Ciphertext),
+	}
+	if e.WrappedBy != nil {
+		clone.WrappedBy = &commonpb.UserId{Value: bytes.Clone(e.WrappedBy.Value)}
+	}
+	return clone
 }
 
 // ErrMuteUntilOutOfRange indicates that a timed mute ends outside the range a
@@ -738,3 +835,69 @@ type RecentSender struct {
 	UserID     *commonpb.UserId
 	LastSentAt time.Time
 }
+
+// A private group's lobby (see Chat.IsPrivate) is where a user waits to be
+// admitted to it by its creator: they enter it (Server.EnterLobby), and leave
+// it when they withdraw, are denied, or are admitted (Server.AdmitLobbyMember,
+// which stores the chat key wrapped for them and joins them in one write). A
+// lobby is the creator's alone to see; the waiting users are not shown to
+// each other or to the members. It is recorded as one entry per (user,
+// private group), written against the IDs alone like a key envelope, and is
+// not membership: a waiting user has no standing in the chat beyond the
+// record any registered user sees, with Metadata.in_lobby set for them.
+//
+// Both a lobby and a user's waiting are capped (see LobbyLimits), so a store
+// counts both and refuses an entry past either cap in the write that would
+// have made it. A lobby is read two ways: a user's own entries, strongly
+// consistent, for in_lobby and the entry EnterLobby returns, and one day the
+// listing of every lobby a user waits in; and a group's lobby paged
+// earliest-entered first (see LobbyPosition) off an index that trails writes
+// briefly, as the proto allows, since the creator reads it to act on it and
+// reconciles against the LobbyUpdates they receive.
+
+// LobbyEntry is one user's place in a private group's lobby: who, and when
+// they entered. It is what a lobby page carries per user and what
+// LobbyMember.entered_at and Lobby.entered_at are projected from.
+type LobbyEntry struct {
+	UserID    *commonpb.UserId
+	EnteredAt time.Time
+}
+
+// Position is the entry's place in its lobby's order.
+func (e LobbyEntry) Position() LobbyPosition {
+	return LobbyPosition{EnteredAt: e.EnteredAt, UserID: e.UserID}
+}
+
+// LobbyPosition is a place in a lobby's order: earliest entered first, ties
+// broken by user ID ascending, so the order is total and a page can resume
+// strictly after the last entry it carried. Ties in entry time are
+// nanosecond coincidences within one lobby, so the tie-break exists for
+// totality rather than for anything a client sees.
+type LobbyPosition struct {
+	EnteredAt time.Time
+	UserID    *commonpb.UserId
+}
+
+// Compare orders two positions: negative when p precedes o.
+func (p LobbyPosition) Compare(o LobbyPosition) int {
+	if c := p.EnteredAt.Compare(o.EnteredAt); c != 0 {
+		return c
+	}
+	return bytes.Compare(p.UserID.GetValue(), o.UserID.GetValue())
+}
+
+// LobbyLimits caps a lobby's size and how many lobbies one user may wait
+// in, enforced by Store.EnterLobby in the write that records the entry. The
+// server's are DefaultLobbyLimits; tests lower them.
+type LobbyLimits struct {
+	// LobbySize is the most users one group's lobby holds.
+	LobbySize int
+	// LobbiesPerUser is the most lobbies one user waits in at once.
+	LobbiesPerUser int
+}
+
+// DefaultLobbyLimits are the caps in production, deliberately modest to
+// start: a lobby of a hundred is as many as a creator admits in a sitting,
+// and a user waiting in a hundred groups is not waiting to join them. Either
+// is raised here when it binds.
+var DefaultLobbyLimits = LobbyLimits{LobbySize: 100, LobbiesPerUser: 100}

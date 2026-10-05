@@ -21,9 +21,10 @@ import (
 // mutable — and can be mutated by other processes, which this cache can never
 // observe — so group membership checks and member lists always defer to the
 // backing store. The rest of the store is passed straight through, viewer
-// state and activity reads included: a user's state is theirs to change at any
-// time, a group's recent senders change with every send, and both reads are
-// already one strongly consistent query, so nothing of either is held.
+// state, activity reads and key envelopes included: a user's state is theirs
+// to change at any time, a group's recent senders change with every send, and
+// both reads are already one strongly consistent query, so nothing of either
+// is held.
 //
 // One thing is held that is not fixed at creation: a lower bound on each
 // activity record, so a throttled send costs no write (see RecordSend). It can
@@ -60,8 +61,8 @@ func (c *Cache) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 	return c.db.AddGroupMembers(ctx, chatID, userIDs)
 }
 
-func (c *Cache) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, chat.RosterSummary, error) {
-	return c.db.RemoveGroupMember(ctx, chatID, userID)
+func (c *Cache) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, discardKeyEnvelope bool) (bool, chat.RosterSummary, error) {
+	return c.db.RemoveGroupMember(ctx, chatID, userID, discardKeyEnvelope)
 }
 
 func (c *Cache) SetGroupPicture(ctx context.Context, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
@@ -140,12 +141,13 @@ func (c *Cache) GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb
 }
 
 // GetGroupRules is cached, including the absence of rules (a nil Rules), so a
-// group without any is read once too. Rules and the creator are fixed at
-// creation (see chat.Store), so a cached entry is never stale: if either ever
-// becomes mutable, this needs invalidation on write. That holds only while
-// both are written with the group: a creator backfilled onto a legacy group,
-// or IsCreatorOnlySpeaker set on a group that already exists, reaches a
-// process that has read the group only when it restarts. A cached entry is
+// group without any is read once too. Rules, the creator and whether the
+// group is private are fixed at creation (see chat.Store), so a cached entry
+// is never stale: if any ever becomes mutable, this needs invalidation on
+// write. That holds only while all are written with the group: a creator
+// backfilled onto a legacy group, or IsCreatorOnlySpeaker or IsPrivate set on
+// a group that already exists, reaches a process that has read the group only
+// when it restarts. A cached entry is
 // shared by every caller and must be treated as read-only. Errors — including
 // ErrChatNotFound, since the group may be created later — are not cached.
 func (c *Cache) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (chat.GroupRules, error) {
@@ -266,6 +268,40 @@ func (c *Cache) RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID 
 
 func (c *Cache) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]chat.RecentSender, error) {
 	return c.db.GetRecentSenders(ctx, chatID, limit)
+}
+
+// The key envelope methods pass through: an envelope is read once per chat
+// per install, and one a user wrapped for themself replaces the one they were
+// admitted with, so there is nothing worth holding and something to get wrong.
+func (c *Cache) SetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (chat.KeyEnvelope, error) {
+	return c.db.SetKeyEnvelope(ctx, chatID, userID, envelope)
+}
+
+func (c *Cache) GetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.KeyEnvelope, error) {
+	return c.db.GetKeyEnvelope(ctx, chatID, userID)
+}
+
+// The lobby methods pass through: a lobby moves with every entry and
+// admission, from any process, and every read of one is already a single
+// query.
+func (c *Cache) EnterLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, limits chat.LobbyLimits) (chat.LobbyEntry, bool, error) {
+	return c.db.EnterLobby(ctx, chatID, userID, limits)
+}
+
+func (c *Cache) LeaveLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
+	return c.db.LeaveLobby(ctx, chatID, userID)
+}
+
+func (c *Cache) GetLobbyEntries(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.LobbyEntry, error) {
+	return c.db.GetLobbyEntries(ctx, userID, chatIDs)
+}
+
+func (c *Cache) GetLobbyPage(ctx context.Context, chatID *commonpb.ChatId, after *chat.LobbyPosition, limit int) ([]chat.LobbyEntry, error) {
+	return c.db.GetLobbyPage(ctx, chatID, after, limit)
+}
+
+func (c *Cache) AdmitFromLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (bool, chat.RosterSummary, error) {
+	return c.db.AdmitFromLobby(ctx, chatID, userID, envelope)
 }
 
 // sendActivityCacheKey keys the activity cache by (group, user). Only group

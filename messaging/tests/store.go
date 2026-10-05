@@ -2377,12 +2377,22 @@ func widgetContent(username string) []*messagingpb.Content {
 	}}
 }
 
-// encryptedContent builds an end-to-end encrypted message. The server never
-// reads the ciphertext, so any bytes of a valid length stand in for one.
+// encryptedContent builds an end-to-end encrypted message under the DM scheme.
+// The server never reads the ciphertext, so any bytes of a valid length stand
+// in for one.
 func encryptedContent(ciphertext byte) []*messagingpb.Content {
+	return encryptedContentWithScheme(messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305, ciphertext)
+}
+
+// chatKeyEncryptedContent is encryptedContent under a private group's scheme.
+func chatKeyEncryptedContent(ciphertext byte) []*messagingpb.Content {
+	return encryptedContentWithScheme(messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305, ciphertext)
+}
+
+func encryptedContentWithScheme(scheme messagingpb.EncryptedContent_Scheme, ciphertext byte) []*messagingpb.Content {
 	return []*messagingpb.Content{{
 		Type: &messagingpb.Content_Encrypted{Encrypted: &messagingpb.EncryptedContent{
-			Scheme:     messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305,
+			Scheme:     scheme,
 			Nonce:      bytes.Repeat([]byte{ciphertext}, 24),
 			Ciphertext: bytes.Repeat([]byte{ciphertext}, 48),
 		}},

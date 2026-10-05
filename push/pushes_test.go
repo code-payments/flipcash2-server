@@ -85,9 +85,6 @@ func TestChatMessagePush_MessageOrID(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var carried, referenced int
 			for _, content := range contents {
-				if name == "group" && content.GetEncrypted() != nil {
-					continue // encrypted content never reaches a group
-				}
 				message := testChatMessage(content)
 				p, err := build(message)
 				require.NoError(t, err)
@@ -124,6 +121,35 @@ func TestChatMessagePush_MessageOrID(t *testing.T) {
 			require.NotZero(t, referenced, "no push fell back to the message ID")
 		})
 	}
+}
+
+// TestChatMessagePush_Encrypted: the body of an encrypted message's push is
+// generic, since the server cannot read the content — second person in a DM,
+// naming the sender in a group — and the payload carries the message.
+func TestChatMessagePush_Encrypted(t *testing.T) {
+	ctx := context.Background()
+	dmID := &commonpb.ChatId{Value: bytes.Repeat([]byte{3}, 32)}
+	groupID := &commonpb.ChatId{Value: bytes.Repeat([]byte{4}, 16)}
+	senderID := &commonpb.UserId{Value: bytes.Repeat([]byte{2}, 16)}
+	message := testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Encrypted{
+		Encrypted: &messagingpb.EncryptedContent{
+			Scheme:     messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305,
+			Nonce:      bytes.Repeat([]byte{6}, 24),
+			Ciphertext: bytes.Repeat([]byte{9}, 48),
+		},
+	}})
+
+	dm, err := BuildDmPush(ctx, nil, dmID, message, senderID, "Alice")
+	require.NoError(t, err)
+	require.Equal(t, "Alice", dm.title)
+	require.Equal(t, "Sent you a message", dm.body)
+	require.True(t, proto.Equal(message, dm.payload.ChatMetadata.GetMessage()))
+
+	group, err := BuildGroupChatPush(ctx, nil, groupID, message, senderID, "Alice", "Sunday Hikers")
+	require.NoError(t, err)
+	require.Equal(t, "Sunday Hikers", group.title)
+	require.Equal(t, "Alice sent a message", group.body)
+	require.True(t, proto.Equal(message, group.payload.ChatMetadata.GetMessage()))
 }
 
 // TestChatMessagePush_Widget: a widget's body is its plain-text stand-in, a

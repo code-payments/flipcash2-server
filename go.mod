@@ -3,6 +3,7 @@ module github.com/code-payments/flipcash2-server
 go 1.27.0
 
 require (
+	filippo.io/edwards25519 v1.1.0
 	firebase.google.com/go/v4 v4.20.0
 	github.com/ReneKroon/ttlcache v1.7.0
 	github.com/aws/aws-sdk-go-v2 v1.43.5
@@ -14,7 +15,7 @@ require (
 	github.com/aws/smithy-go v1.27.7
 	github.com/buckket/go-blurhash v1.1.0
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/code-payments/flipcash2-protobuf-api v1.27.1-0.20261001124414-811dcdc76725
+	github.com/code-payments/flipcash2-protobuf-api v1.27.1-0.20261005171051-3eb894dec811
 	github.com/code-payments/ocp-protobuf-api v1.16.1-0.20260918154336-e3d25a85b1e1
 	github.com/code-payments/ocp-server v1.24.1-0.20260903184009-272d62754fdc
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2
@@ -32,6 +33,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/twilio/twilio-go v1.27.0
 	go.uber.org/zap v1.28.0
+	golang.org/x/crypto v0.55.0
 	golang.org/x/image v0.43.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/text v0.41.0
@@ -45,7 +47,6 @@ require (
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	dario.cat/mergo v1.0.0 // indirect
-	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5 // indirect
@@ -117,7 +118,6 @@ require (
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
-	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect

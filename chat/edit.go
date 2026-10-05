@@ -136,7 +136,7 @@ func (s *Server) EditChat(ctx context.Context, req *chatpb.EditChatRequest) (*ch
 		}
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberStanding, ReadingFull, []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, []*Chat{c})
 	if err != nil {
 		// The edit has landed; only the read back failed. A retry finds every
 		// field already set and answers from the record.

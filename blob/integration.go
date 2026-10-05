@@ -47,7 +47,7 @@ var (
 // Integration is the surface other domains (messaging, profile and chat today)
 // use to attach blobs to a resource they own: it validates and grants read access
 // when the blob is attached (ShareIntoChat, SetAsProfileMedia,
-// SetAsChatPicture), and resolves the blobs' metadata on read
+// SetAsChatMedia), and resolves the blobs' metadata on read
 // (ResolveRenditions).
 type Integration struct {
 	blobs   Store
@@ -151,10 +151,13 @@ func (i *Integration) SetAsProfileMedia(ctx context.Context, ownerID *commonpb.U
 	})
 }
 
-// SetAsChatPicture attaches a blob to a chat as its picture: it verifies that
-// ownerID owns the blob and that it is a READY image original, then grants read
-// access to it on both surfaces the picture is shown from. It is idempotent, so
-// re-setting the same picture re-grants harmlessly.
+// SetAsChatMedia attaches a blob to a chat's public face, as its profile
+// picture or its cover picture: it verifies that ownerID owns the blob and
+// that it is a READY image original, then grants read access to it on both
+// surfaces the picture is shown from. It is idempotent, so re-setting the same
+// picture re-grants harmlessly. The two pictures are one surface to the ACL,
+// as a user's are (see SetAsProfileMedia), and the chat domain records which
+// blob plays which role.
 //
 // A chat's picture is shown in two places, and each is its own grant:
 //
@@ -164,7 +167,7 @@ func (i *Integration) SetAsProfileMedia(ctx context.Context, ownerID *commonpb.U
 //   - On the chat's public profile, to anyone. That is the chat-profile
 //     principal, which covers every caller (see ChatProfileResolver) so the
 //     grant alone decides what is readable through it. It is what lets a
-//     non-member see a group's picture, e.g. in a preview before joining.
+//     non-member see a group's pictures, e.g. in a preview before joining.
 //
 // Granting both is deliberate rather than relying on the public grant alone:
 // the chat grant keeps the picture fetchable from within the chat by the scope
@@ -178,7 +181,7 @@ func (i *Integration) SetAsProfileMedia(ctx context.Context, ownerID *commonpb.U
 // It attaches a single blob, so it reports the granular reasons — one of
 // ErrBlobNotFound, ErrBlobNotReady, ErrBlobRejected, or ErrBlobInvalid — that the
 // caller can act on. Nothing is granted then.
-func (i *Integration) SetAsChatPicture(ctx context.Context, ownerID *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
+func (i *Integration) SetAsChatMedia(ctx context.Context, ownerID *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
 	records, err := i.blobs.GetByIDs(ctx, []*blobpb.BlobId{blobID})
 	if err != nil {
 		return err

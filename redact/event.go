@@ -123,9 +123,10 @@ func event(chatID *commonpb.ChatId, e *messagingpb.Event) (*messagingpb.Event, e
 // last-activity change carries only a time; a viewer-state change carries
 // the recipient's own state on the chat (a mute, their permissions and the
 // version), which is theirs whatever they may read of the chat and holds no
-// message, so it passes as it is; a title or picture change carries the
-// record's own fields, which identify the group to anyone who may read it in
-// any form (see chat.v1.GetChat), so it passes as it is too. A kind this
+// message, so it passes as it is; a title, description, profile picture or
+// cover picture change carries the record's own fields, which identify the
+// group to anyone who may read it in any form (see chat.v1.GetChat), so it
+// passes as it is too. A kind this
 // version does not know is an error.
 func metadataUpdate(chatID *commonpb.ChatId, md *chatpb.MetadataUpdate) (*chatpb.MetadataUpdate, error) {
 	switch kind := md.GetKind().(type) {
@@ -140,7 +141,9 @@ func metadataUpdate(chatID *commonpb.ChatId, md *chatpb.MetadataUpdate) (*chatpb
 	case *chatpb.MetadataUpdate_LastActivityChanged_,
 		*chatpb.MetadataUpdate_ViewerStateChanged_,
 		*chatpb.MetadataUpdate_TitleChanged_,
-		*chatpb.MetadataUpdate_PictureChanged_:
+		*chatpb.MetadataUpdate_ProfilePictureChanged_,
+		*chatpb.MetadataUpdate_DescriptionChanged_,
+		*chatpb.MetadataUpdate_CoverPictureChanged_:
 		return proto.Clone(md).(*chatpb.MetadataUpdate), nil
 	default:
 		return nil, fmt.Errorf("redact: unsupported metadata update %T", kind)

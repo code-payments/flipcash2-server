@@ -182,20 +182,21 @@ type Store interface {
 	// Server.LeaveChat).
 	RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, discardKeyEnvelope bool) (changed bool, roster RosterSummary, err error)
 
-	// SetGroupPicture sets a group chat's picture to the blob holding its
+	// SetGroupPicture sets a group chat's profile picture to the blob holding its
 	// ORIGINAL rendition, replacing any picture already set; a nil blobID clears
 	// it. It touches only the canonical record and performs no validation of the
 	// blob or granting of read access — that is the blob domain's job, done
-	// before this is called (see blob.Integration.SetAsChatPicture). It returns
+	// before this is called (see blob.Integration.SetAsChatMedia). It returns
 	// ErrChatNotFound if the chat does not exist, and an error if chatID is not
 	// a group chat ID.
 	SetGroupPicture(ctx context.Context, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error
 
 	// EditGroup applies edit to a group chat's canonical record (see
-	// GroupEdit): each field the edit names is set, and every other field is
-	// left as it is, in one write. Like SetGroupPicture it touches only the
-	// canonical record and validates nothing — the title is moderated and the
-	// picture attached before this is called (see Server.EditChat). It returns
+	// GroupEdit): each field the edit names is set (an empty description
+	// clears it), and every other field is left as it is, in one write. Like
+	// SetGroupPicture it touches only the canonical record and validates
+	// nothing — the title and description are validated and moderated, and the
+	// pictures attached, before this is called (see Server.EditChat). It returns
 	// ErrChatNotFound if the chat does not exist, and an error if chatID is
 	// not a group chat ID or the edit names nothing.
 	EditGroup(ctx context.Context, chatID *commonpb.ChatId, edit GroupEdit) error

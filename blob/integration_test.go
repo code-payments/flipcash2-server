@@ -156,7 +156,7 @@ func TestIntegration_EncryptedBlobIsNeverAttachable(t *testing.T) {
 	// through the grant its reservation made to its own DM.
 	require.ErrorIs(t, integration.ShareIntoChat(ctx, owner, chatID, []*blobpb.BlobId{id}), blob.ErrBlobNotShareable)
 	require.ErrorIs(t, integration.SetAsProfileMedia(ctx, owner, id), blob.ErrBlobInvalid)
-	require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, id), blob.ErrBlobInvalid)
+	require.ErrorIs(t, integration.SetAsChatMedia(ctx, owner, chatID, id), blob.ErrBlobInvalid)
 	for _, principal := range []blob.Principal{
 		blob.PrincipalForChat(chatID),
 		blob.PrincipalForChatProfile(chatID),
@@ -185,7 +185,7 @@ func TestIntegration_SetAsChatPicture(t *testing.T) {
 
 	t.Run("a ready image original owned by the caller is granted to the chat and its profile", func(t *testing.T) {
 		id := putReadyOriginal(t, store, owner)
-		require.NoError(t, integration.SetAsChatPicture(ctx, owner, chatID, id))
+		require.NoError(t, integration.SetAsChatMedia(ctx, owner, chatID, id))
 
 		// Readable from within the chat by its members...
 		has, err := access.HasGrant(ctx, id, chatPrincipal, blob.PermissionRead)
@@ -204,16 +204,16 @@ func TestIntegration_SetAsChatPicture(t *testing.T) {
 		require.False(t, has)
 
 		// Idempotent: setting again leaves the grants in place, not an error.
-		require.NoError(t, integration.SetAsChatPicture(ctx, owner, chatID, id))
+		require.NoError(t, integration.SetAsChatMedia(ctx, owner, chatID, id))
 	})
 
 	t.Run("an unknown blob is not found", func(t *testing.T) {
-		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, newBlobID(t)), blob.ErrBlobNotFound)
+		require.ErrorIs(t, integration.SetAsChatMedia(ctx, owner, chatID, newBlobID(t)), blob.ErrBlobNotFound)
 	})
 
 	t.Run("a blob owned by someone else is not found and grants nothing", func(t *testing.T) {
 		theirs := putReadyOriginal(t, store, model.MustGenerateUserID())
-		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, theirs), blob.ErrBlobNotFound)
+		require.ErrorIs(t, integration.SetAsChatMedia(ctx, owner, chatID, theirs), blob.ErrBlobNotFound)
 
 		for _, principal := range []blob.Principal{chatPrincipal, blob.PrincipalForChatProfile(chatID)} {
 			has, err := access.HasGrant(ctx, theirs, principal, blob.PermissionRead)
@@ -228,7 +228,7 @@ func TestIntegration_SetAsChatPicture(t *testing.T) {
 			ID: id, Rendition: blob.RenditionOriginal, Owner: owner, State: blob.StatePending,
 			StorageKey: "k", MimeType: "image/png", SizeBytes: 1,
 		}))
-		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, id), blob.ErrBlobNotReady)
+		require.ErrorIs(t, integration.SetAsChatMedia(ctx, owner, chatID, id), blob.ErrBlobNotReady)
 	})
 
 	t.Run("a rejected blob is rejected", func(t *testing.T) {
@@ -239,7 +239,7 @@ func TestIntegration_SetAsChatPicture(t *testing.T) {
 		}))
 		_, err := store.Reject(ctx, id, &blob.RejectionMetadata{Reason: blob.RejectionReasonModeration})
 		require.NoError(t, err)
-		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, id), blob.ErrBlobRejected)
+		require.ErrorIs(t, integration.SetAsChatMedia(ctx, owner, chatID, id), blob.ErrBlobRejected)
 	})
 
 	t.Run("a rendition is invalid (only originals back a picture)", func(t *testing.T) {
@@ -251,7 +251,7 @@ func TestIntegration_SetAsChatPicture(t *testing.T) {
 		}))
 		_, err := store.Advance(ctx, rendition, blob.StateReady, nil)
 		require.NoError(t, err)
-		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, rendition), blob.ErrBlobInvalid)
+		require.ErrorIs(t, integration.SetAsChatMedia(ctx, owner, chatID, rendition), blob.ErrBlobInvalid)
 	})
 
 	t.Run("a non-image blob is invalid", func(t *testing.T) {
@@ -262,7 +262,7 @@ func TestIntegration_SetAsChatPicture(t *testing.T) {
 		}))
 		_, err := store.Advance(ctx, id, blob.StateReady, nil)
 		require.NoError(t, err)
-		require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, id), blob.ErrBlobInvalid)
+		require.ErrorIs(t, integration.SetAsChatMedia(ctx, owner, chatID, id), blob.ErrBlobInvalid)
 	})
 }
 

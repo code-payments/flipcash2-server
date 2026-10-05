@@ -27,16 +27,21 @@ import (
 // for must be ones a group can carry — which today means they must include a
 // minimum listener balance, in a currency OCP can value (see RulesFromProto)
 // — and ones the caller satisfies (RULES_NOT_SATISFIED); the title must pass
-// moderation (TITLE_MODERATED); and the picture, if any, must be a READY image
-// the caller owns (PICTURE_BLOB_NOT_ACCEPTED). Only then is anything written. Rule checks
-// come first because they are local reads, moderation next because it is a
-// call out, and the picture last because attaching it grants read access —
-// against a chat ID minted for the purpose — and that grant, though harmless
-// against a chat that is never created, is best made only once everything
-// else has passed.
+// moderation (TITLE_MODERATED), and then the description, if any
+// (DESCRIPTION_MODERATED); and the profile picture and cover
+// picture, if any, must each be a READY image the caller owns
+// (PROFILE_PICTURE_BLOB_NOT_ACCEPTED, COVER_PICTURE_BLOB_NOT_ACCEPTED). Only
+// then is anything written. Rule checks come first because they are local
+// reads, moderation next because it is a call out, and the pictures last
+// because attaching one grants read access — against a chat ID minted for the
+// purpose — and that grant, though harmless against a chat that is never
+// created, is best made only once everything else has passed.
 //
-// The picture is attached before the record is written, so the group never
-// exists without its picture readable: a client that read the blob id from the
+// A description a group may not carry at all (see ValidateDescription) is
+// refused as malformed, with InvalidArgument, before any of that.
+//
+// The pictures are attached before the record is written, so the group never
+// exists without its pictures readable: a client that read a blob id from the
 // metadata but could not fetch the blob would render a broken image. The
 // creation itself is a single PutChat; it does not by itself make the creator
 // anything other than a member (see Chat.CreatorID).
@@ -79,16 +84,20 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 	// a group is created with: a public group has rules, a private one has
 	// none.
 	var (
-		title     string
-		picture   *blobpb.BlobId
-		rules     *chatpb.Rules
-		isPrivate bool
+		title          string
+		description    string
+		profilePicture *blobpb.BlobId
+		coverPicture   *blobpb.BlobId
+		rules          *chatpb.Rules
+		isPrivate      bool
 	)
 	switch params := req.Parameters.(type) {
 	case *chatpb.StartChatRequest_PublicGroup:
-		title, picture, rules = params.PublicGroup.GetTitle(), params.PublicGroup.GetPicture(), params.PublicGroup.GetRules()
+		p := params.PublicGroup
+		title, description, profilePicture, coverPicture, rules = p.GetTitle(), p.GetDescription(), p.GetProfilePicture(), p.GetCoverPicture(), p.GetRules()
 	case *chatpb.StartChatRequest_PrivateGroup:
-		title, picture, isPrivate = params.PrivateGroup.GetTitle(), params.PrivateGroup.GetPicture(), true
+		p := params.PrivateGroup
+		title, description, profilePicture, coverPicture, isPrivate = p.GetTitle(), p.GetDescription(), p.GetProfilePicture(), p.GetCoverPicture(), true
 	default:
 		return nil, status.Error(codes.InvalidArgument, "unsupported chat parameters")
 	}
@@ -99,6 +108,13 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		return nil, status.Error(codes.InvalidArgument, "idempotency key is required")
 	}
 	chatID := MustDeriveGroupChatID(userID, req.IdempotencyKey)
+
+	// A description the store would never hold is a malformed request, refused
+	// before anything is read like the key, and so the RPC is correct on its
+	// own rather than by virtue of the request validation in front of it.
+	if err := ValidateDescription(description); err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid description")
+	}
 
 	existing, err := s.chats.GetChatByID(ctx, chatID)
 	switch {
@@ -164,23 +180,40 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		}, nil
 	}
 
-	// Every reason the blob domain gives for refusing the picture reads as one
-	// result: a client's recourse — pick or upload another picture — is the
-	// same for each of them. Anything else is a failure to attach, and the
-	// server's fault. The grant is keyed by the chat ID, so a retry that
-	// reaches here again repeats it rather than orphaning one.
-	if picture != nil {
-		err := s.media.SetAsChatPicture(ctx, userID, chatID, picture)
-		switch {
-		case errors.Is(err, blob.ErrBlobNotFound),
-			errors.Is(err, blob.ErrBlobNotReady),
-			errors.Is(err, blob.ErrBlobRejected),
-			errors.Is(err, blob.ErrBlobInvalid):
-			log.With(zap.Error(err)).Info("Chat picture not accepted")
-			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_PICTURE_BLOB_NOT_ACCEPTED}, nil
-		case err != nil:
-			log.With(zap.Error(err)).Warn("Failure setting chat picture")
+	if description != "" {
+		flagged, category, err := s.moderateDescription(ctx, log, description)
+		if err != nil {
 			return nil, status.Error(codes.Internal, "")
+		}
+		if flagged {
+			return &chatpb.StartChatResponse{
+				Result:          chatpb.StartChatResponse_DESCRIPTION_MODERATED,
+				FlaggedCategory: category,
+			}, nil
+		}
+	}
+
+	// Every reason the blob domain gives for refusing a picture reads as one
+	// result per picture: a client's recourse — pick or upload another
+	// picture — is the same for each of them. Anything else is a failure to
+	// attach, and the server's fault. The grant is keyed by the chat ID, so a
+	// retry that reaches here again repeats it rather than orphaning one.
+	if profilePicture != nil {
+		accepted, err := s.attachChatPicture(ctx, log, userID, chatID, profilePicture)
+		if err != nil {
+			return nil, err
+		}
+		if !accepted {
+			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_PROFILE_PICTURE_BLOB_NOT_ACCEPTED}, nil
+		}
+	}
+	if coverPicture != nil {
+		accepted, err := s.attachChatPicture(ctx, log, userID, chatID, coverPicture)
+		if err != nil {
+			return nil, err
+		}
+		if !accepted {
+			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_COVER_PICTURE_BLOB_NOT_ACCEPTED}, nil
 		}
 	}
 
@@ -193,7 +226,9 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		MinimumListenerBalance: minimumListenerBalance,
 		IsPrivate:              isPrivate,
 		CreatorID:              userID,
-		PictureBlobID:          picture,
+		Description:            description,
+		ProfilePictureBlobID:   profilePicture,
+		CoverPictureBlobID:     coverPicture,
 		LastActivity:           time.Now().UTC(),
 	}
 	err = s.chats.PutChat(ctx, c)
@@ -214,7 +249,7 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, fullDetail, []*Chat{c})
 	if err != nil {
 		// The group exists; only the read back failed. It will surface on the
 		// creator's next feed read.
@@ -270,7 +305,7 @@ func (s *Server) replayStartChat(ctx context.Context, log *zap.Logger, userID *c
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, standing, standing.Reading(messagingpb.ViewMode_FULL), []*Chat{c})
+	metadata, err := s.hydrate(ctx, userID, standing, standing.Reading(messagingpb.ViewMode_FULL), fullDetail, []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
 		return nil, status.Error(codes.Internal, "")
@@ -316,4 +351,50 @@ func (s *Server) moderateTitle(ctx context.Context, log *zap.Logger, title strin
 		return true, moderation.HighestFlaggedCategory(result), nil
 	}
 	return false, moderationpb.FlaggedCategory_NONE, nil
+}
+
+// moderateDescription runs a group description through the general text
+// classifier alone, exactly as a user's bio is (see profile.Server.SetBio):
+// there is no description-specific classifier, and the group-title one is
+// tuned for a short name, not free text. It reports whether the description
+// is flagged and, if so, the best-fit category. The caller moderates only a
+// description it is setting, never the empty one.
+//
+// Any failure to classify is an error, and the caller persists nothing. That
+// includes ErrUnsupportedLanguage, which a title lets through because a second
+// classifier still covers it: a description has no second classifier, so for
+// now a language the text classifier cannot score is refused rather than set
+// unmoderated.
+func (s *Server) moderateDescription(ctx context.Context, log *zap.Logger, description string) (flagged bool, category moderationpb.FlaggedCategory, err error) {
+	result, err := s.moderator.ClassifyText(ctx, description)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure classifying chat description")
+		return false, moderationpb.FlaggedCategory_NONE, err
+	}
+	if result == nil || !result.Flagged {
+		return false, moderationpb.FlaggedCategory_NONE, nil
+	}
+	log.With(zap.String("description", description), zap.Strings("categories", result.FlaggedCategories)).Info("Chat description is flagged")
+	return true, moderation.HighestFlaggedCategory(result), nil
+}
+
+// attachChatPicture attaches blobID to chatID as one of its pictures (see
+// Media.SetAsChatMedia), reporting whether the blob domain accepted it. Every
+// reason it gives for refusing a blob reads as not accepted, since a client's
+// recourse is the same for each; anything else is a failure to attach, and
+// returned as the RPC's error.
+func (s *Server) attachChatPicture(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) (accepted bool, err error) {
+	err = s.media.SetAsChatMedia(ctx, userID, chatID, blobID)
+	switch {
+	case errors.Is(err, blob.ErrBlobNotFound),
+		errors.Is(err, blob.ErrBlobNotReady),
+		errors.Is(err, blob.ErrBlobRejected),
+		errors.Is(err, blob.ErrBlobInvalid):
+		log.With(zap.Error(err)).Info("Chat picture not accepted")
+		return false, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure setting chat picture")
+		return false, status.Error(codes.Internal, "")
+	}
+	return true, nil
 }

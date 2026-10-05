@@ -27,6 +27,22 @@ var (
 	// or be added to it, since every such path gates on membership.
 	ErrNoMembers = errors.New("chat must have at least one member")
 
+	// ErrLobbyFull indicates that a private group's lobby holds as many users
+	// as the limits allow (see LobbyLimits.LobbySize).
+	ErrLobbyFull = errors.New("lobby full")
+
+	// ErrTooManyLobbies indicates that a user is waiting in as many lobbies
+	// as the limits allow (see LobbyLimits.LobbiesPerUser).
+	ErrTooManyLobbies = errors.New("too many lobbies")
+
+	// ErrNotInLobby indicates that a user is not waiting in the lobby they
+	// were to be admitted from.
+	ErrNotInLobby = errors.New("not in lobby")
+
+	// ErrAlreadyMember indicates that a user is a member of the group whose
+	// lobby they were to enter.
+	ErrAlreadyMember = errors.New("already a member")
+
 	// ErrKeyEnvelopeNotFound indicates that a user has no key envelope stored
 	// for a chat.
 	ErrKeyEnvelopeNotFound = errors.New("key envelope not found")
@@ -102,6 +118,15 @@ type DmFeedCursor struct {
 // which removes the envelope in the same write when the caller asks it to
 // (see RemoveGroupMember). A store of one is one conditional write of the one
 // record, so a retried or duplicated request is harmless.
+//
+// A lobby entry (see LobbyEntry) is one record per (user, private group) too,
+// kept with two counts, the lobby's size and the user's lobbies, that move in
+// the same write as the entry (see EnterLobby). Like the rest, it is written
+// against the IDs alone; that the chat is a private group with its key, that
+// the user is not a member, and who may admit them are the caller's gates. An
+// admission (AdmitFromLobby) is where the lobby meets the roster: the entry
+// leaves, the key envelope lands and the membership transitions in one
+// write, so a user is never admitted without a key or left waiting after.
 type Store interface {
 	// PutChat persists a new chat and its membership. It returns ErrChatExists
 	// if a chat with the same ID already exists, ErrNoMembers if the member set
@@ -464,4 +489,54 @@ type Store interface {
 	// consistent: it reflects every write that completed before it, so a
 	// user who just stored an envelope, or was just given one, reads it.
 	GetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (KeyEnvelope, error)
+
+	// EnterLobby records userID as waiting in the group chatID's lobby, as
+	// of now, and returns their entry. A member of the group is refused as
+	// ErrAlreadyMember, judged in the write that would record the entry
+	// against the membership record as of that write, so an entry can never
+	// land for a user admitted meanwhile (see AdmitFromLobby, which removes
+	// the entry in the write that joins them): the lobby and the roster
+	// never hold the same user. A user already waiting is a no-op that
+	// returns the entry as it stands, with changed false; the entry's time
+	// is the first entry's. Both limits are enforced in the same write: a
+	// lobby at LobbySize is ErrLobbyFull and a user in LobbiesPerUser
+	// lobbies ErrTooManyLobbies, judged against the counts as of the write,
+	// with nothing recorded. Membership is judged before an existing entry,
+	// and the lobby's cap before the user's. It returns an error if chatID
+	// is not a group chat ID. It does not check that the chat exists or that
+	// it is a private group: those are the caller's.
+	EnterLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, limits LobbyLimits) (entry LobbyEntry, changed bool, err error)
+
+	// LeaveLobby removes userID from chatID's lobby, reporting whether they
+	// were in it. A user not waiting is a no-op. It returns an error if
+	// chatID is not a group chat ID.
+	LeaveLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (changed bool, err error)
+
+	// GetLobbyEntries returns userID's entry in each of the given lobbies
+	// they are waiting in, keyed by string(chatID.Value); lobbies they are
+	// not in are absent. The read is strongly consistent, like a key
+	// envelope's: it is what a user is told of their own waiting.
+	GetLobbyEntries(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]LobbyEntry, error)
+
+	// GetLobbyPage returns up to limit of chatID's lobby in lobby order (see
+	// LobbyPosition), strictly after the given position, or from the start
+	// when it is nil. A limit of zero or less means no limit. The read is
+	// eventually consistent: an entry just made may be absent and one just
+	// removed present, which the proto allows of this read alone. A group
+	// with no lobby, or that does not exist, is an empty result. It returns
+	// an error if chatID is not a group chat ID.
+	GetLobbyPage(ctx context.Context, chatID *commonpb.ChatId, after *LobbyPosition, limit int) ([]LobbyEntry, error)
+
+	// AdmitFromLobby admits userID, waiting in chatID's lobby, to the group:
+	// in one write it stores envelope as their key envelope (replacing any
+	// they hold, since the one the creator wraps now is the one that opens
+	// the chat), joins them as a member (one membership transition, as
+	// AddGroupMembers makes it) and removes their lobby entry with its
+	// counts. It returns the roster summary as of the write, as
+	// AddGroupMembers does, and changed false when the user was a member
+	// already (nothing is written, their entry included). It returns
+	// ErrNotInLobby when the user is not waiting, with nothing written;
+	// ErrChatNotFound if the chat does not exist; and an error if chatID is
+	// not a group chat ID or envelope.WrappedBy is nil.
+	AdmitFromLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope KeyEnvelope) (changed bool, roster RosterSummary, err error)
 }

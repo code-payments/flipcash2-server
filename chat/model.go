@@ -281,8 +281,9 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // has stored theirs: a keyless group's members are refused every send, and
 // a keyed group's members send encrypted content under the group's scheme
 // and nothing else (see Access.SpeakerStanding and
-// messaging.Server.SendMessage). The lobby a user would enter to be admitted
-// is not built, so its creator is the only member it can have.
+// messaging.Server.SendMessage). Its other members are admitted by its
+// creator from its lobby (see LobbyEntry and Server.EnterLobby), with the
+// chat key wrapped for each by the creator.
 //
 // CreatorID is the user who created the group, or nil when unknown (a DM has
 // none, and so does any group written before the field existed). It is fixed
@@ -834,3 +835,69 @@ type RecentSender struct {
 	UserID     *commonpb.UserId
 	LastSentAt time.Time
 }
+
+// A private group's lobby (see Chat.IsPrivate) is where a user waits to be
+// admitted to it by its creator: they enter it (Server.EnterLobby), and leave
+// it when they withdraw, are denied, or are admitted (Server.AdmitLobbyMember,
+// which stores the chat key wrapped for them and joins them in one write). A
+// lobby is the creator's alone to see; the waiting users are not shown to
+// each other or to the members. It is recorded as one entry per (user,
+// private group), written against the IDs alone like a key envelope, and is
+// not membership: a waiting user has no standing in the chat beyond the
+// record any registered user sees, with Metadata.in_lobby set for them.
+//
+// Both a lobby and a user's waiting are capped (see LobbyLimits), so a store
+// counts both and refuses an entry past either cap in the write that would
+// have made it. A lobby is read two ways: a user's own entries, strongly
+// consistent, for in_lobby and the entry EnterLobby returns, and one day the
+// listing of every lobby a user waits in; and a group's lobby paged
+// earliest-entered first (see LobbyPosition) off an index that trails writes
+// briefly, as the proto allows, since the creator reads it to act on it and
+// reconciles against the LobbyUpdates they receive.
+
+// LobbyEntry is one user's place in a private group's lobby: who, and when
+// they entered. It is what a lobby page carries per user and what
+// LobbyMember.entered_at and Lobby.entered_at are projected from.
+type LobbyEntry struct {
+	UserID    *commonpb.UserId
+	EnteredAt time.Time
+}
+
+// Position is the entry's place in its lobby's order.
+func (e LobbyEntry) Position() LobbyPosition {
+	return LobbyPosition{EnteredAt: e.EnteredAt, UserID: e.UserID}
+}
+
+// LobbyPosition is a place in a lobby's order: earliest entered first, ties
+// broken by user ID ascending, so the order is total and a page can resume
+// strictly after the last entry it carried. Ties in entry time are
+// nanosecond coincidences within one lobby, so the tie-break exists for
+// totality rather than for anything a client sees.
+type LobbyPosition struct {
+	EnteredAt time.Time
+	UserID    *commonpb.UserId
+}
+
+// Compare orders two positions: negative when p precedes o.
+func (p LobbyPosition) Compare(o LobbyPosition) int {
+	if c := p.EnteredAt.Compare(o.EnteredAt); c != 0 {
+		return c
+	}
+	return bytes.Compare(p.UserID.GetValue(), o.UserID.GetValue())
+}
+
+// LobbyLimits caps a lobby's size and how many lobbies one user may wait
+// in, enforced by Store.EnterLobby in the write that records the entry. The
+// server's are DefaultLobbyLimits; tests lower them.
+type LobbyLimits struct {
+	// LobbySize is the most users one group's lobby holds.
+	LobbySize int
+	// LobbiesPerUser is the most lobbies one user waits in at once.
+	LobbiesPerUser int
+}
+
+// DefaultLobbyLimits are the caps in production, deliberately modest to
+// start: a lobby of a hundred is as many as a creator admits in a sitting,
+// and a user waiting in a hundred groups is not waiting to join them. Either
+// is raised here when it binds.
+var DefaultLobbyLimits = LobbyLimits{LobbySize: 100, LobbiesPerUser: 100}

@@ -44,10 +44,11 @@ import (
 // when they need it.
 //
 // Storing the creator's envelope is what opens the group to its members'
-// messages (see Access.SpeakerStanding); nothing is published for that
-// either, since the creator's client is the one that stored it. The lobby its
-// members are admitted from is not built (see Chat.IsPrivate), so today the
-// only envelope a group holds is its creator's.
+// messages and its lobby to those who would join (see Access.SpeakerStanding
+// and Server.EnterLobby); nothing is published for that either, since the
+// creator's client is the one that stored it. Every other envelope a group
+// holds was stored by the creator admitting that member (see
+// Server.AdmitLobbyMember), until the member replaces it with their own.
 
 func (s *Server) SetKeyEnvelope(ctx context.Context, req *chatpb.SetKeyEnvelopeRequest) (*chatpb.SetKeyEnvelopeResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)

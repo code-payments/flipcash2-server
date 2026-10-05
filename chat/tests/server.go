@@ -115,6 +115,12 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_KeyEnvelope_Gates,
 		testServer_KeyEnvelope_Creator,
 		testServer_KeyEnvelope_Member,
+		testServer_Lobby_Gates,
+		testServer_Lobby_EnterAndLeave,
+		testServer_Lobby_Limits,
+		testServer_Lobby_GetLobbyMembers,
+		testServer_Lobby_Admit,
+		testServer_Lobby_Deny,
 		testServer_StartChat_InvalidRules,
 		testServer_StartChat_RulesNotSatisfied,
 		testServer_StartChat_WithRules,
@@ -169,6 +175,9 @@ type serverEnv struct {
 // zero value is what every test gets unless it asks otherwise.
 type serverConfig struct {
 	disableGetRoster bool
+
+	// lobbyLimits, when set, override chat.DefaultLobbyLimits.
+	lobbyLimits *chat.LobbyLimits
 }
 
 func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
@@ -202,7 +211,11 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	media := newFakeMedia()
 	moderator := &fakeModerator{}
 	access := chat.NewAccess(s, chat.NewRuleEvaluator(accounts, balances, s, teamUserID))
-	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, access, userBus, chatBus, teamUserID, cfg.disableGetRoster)
+	var opts []chat.ServerOption
+	if cfg.lobbyLimits != nil {
+		opts = append(opts, chat.WithLobbyLimits(*cfg.lobbyLimits))
+	}
+	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, access, userBus, chatBus, teamUserID, cfg.disableGetRoster, opts...)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
@@ -4612,4 +4625,463 @@ func testServer_ViewerState_Permissions(t *testing.T, s chat.Store) {
 	require.NoError(t, protoutil.ProtoEqualError(canEdit, created.Chat.ViewerState))
 	title := "Created, Edited"
 	require.Equal(t, chatpb.EditChatResponse_OK, e.mustEditChat(e.keys, created.Chat.ChatId, &title, nil).Result)
+}
+
+// addBoundUser is addUser with the user's public key bound in the account
+// store, as every registered user's is: a lobby member is shown with the key
+// the creator wraps the chat key for.
+func (e *serverEnv) addBoundUser(displayName string) (*commonpb.UserId, model.KeyPair) {
+	userID, keys := e.addUser()
+	_, err := e.accounts.Bind(e.ctx, userID, keys.Proto())
+	require.NoError(e.t, err)
+	e.profiles.displayNames[string(userID.Value)] = displayName
+	return userID, keys
+}
+
+// putKeyedPrivateGroup is putPrivateGroup with the creator's key envelope
+// stored, so the group has its key and a lobby.
+func (e *serverEnv) putKeyedPrivateGroup(title string, others ...*commonpb.UserId) *commonpb.ChatId {
+	chatID := e.putPrivateGroup(title, others...)
+	_, err := e.store.SetKeyEnvelope(e.ctx, chatID, e.userID, chat.KeyEnvelopeFromProto(keyEnvelopeProto(1), e.userID))
+	require.NoError(e.t, err)
+	return chatID
+}
+
+func (e *serverEnv) enterLobby(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.EnterLobbyResponse {
+	req := &chatpb.EnterLobbyRequest{ChatId: chatID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.EnterLobby(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) leaveLobby(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.LeaveLobbyResponse {
+	req := &chatpb.LeaveLobbyRequest{ChatId: chatID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.LeaveLobby(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) getLobbyMembers(keys model.KeyPair, chatID *commonpb.ChatId, opts *commonpb.QueryOptions) (*chatpb.GetLobbyMembersResponse, error) {
+	req := &chatpb.GetLobbyMembersRequest{ChatId: chatID, QueryOptions: opts}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.GetLobbyMembers(e.ctx, req)
+}
+
+// waitForLobbyMembers reads chatID's lobby as keys until it holds n members:
+// the page trails writes briefly (see chat.Store.GetLobbyPage).
+func (e *serverEnv) waitForLobbyMembers(keys model.KeyPair, chatID *commonpb.ChatId, n int) *chatpb.GetLobbyMembersResponse {
+	var resp *chatpb.GetLobbyMembersResponse
+	require.Eventually(e.t, func() bool {
+		var err error
+		resp, err = e.getLobbyMembers(keys, chatID, nil)
+		require.NoError(e.t, err)
+		require.Equal(e.t, chatpb.GetLobbyMembersResponse_OK, resp.Result)
+		return len(resp.Members) == n
+	}, 5*time.Second, 10*time.Millisecond)
+	return resp
+}
+
+func (e *serverEnv) admitLobbyMember(keys model.KeyPair, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope *chatpb.KeyEnvelope) *chatpb.AdmitLobbyMemberResponse {
+	req := &chatpb.AdmitLobbyMemberRequest{ChatId: chatID, UserId: userID, KeyEnvelope: envelope}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.AdmitLobbyMember(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) denyLobbyMember(keys model.KeyPair, chatID *commonpb.ChatId, userID *commonpb.UserId) *chatpb.DenyLobbyMemberResponse {
+	req := &chatpb.DenyLobbyMemberRequest{ChatId: chatID, UserId: userID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.DenyLobbyMember(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// lobbyUpdatesOnUserTopic collects every LobbyUpdate for chatID published on
+// userID's topic, in order.
+func (e *serverEnv) lobbyUpdatesOnUserTopic(userID *commonpb.UserId, chatID *commonpb.ChatId) []*chatpb.LobbyUpdate {
+	var updates []*chatpb.LobbyUpdate
+	for _, ev := range e.userObserver.GetEvents(func(k *commonpb.UserId) bool { return bytes.Equal(k.Value, userID.Value) }) {
+		update := ev.Event.GetChatUpdate()
+		if !bytes.Equal(update.GetChat().GetValue(), chatID.Value) {
+			continue
+		}
+		updates = append(updates, update.GetLobbyUpdates().GetLobbyUpdates()...)
+	}
+	return updates
+}
+
+// waitForLobbyUpdates waits for at least n lobby updates for chatID on
+// userID's topic and returns them.
+func (e *serverEnv) waitForLobbyUpdates(userID *commonpb.UserId, chatID *commonpb.ChatId, n int) []*chatpb.LobbyUpdate {
+	e.userObserver.WaitFor(e.t, func([]*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
+		return len(e.lobbyUpdatesOnUserTopic(userID, chatID)) >= n
+	})
+	return e.lobbyUpdatesOnUserTopic(userID, chatID)
+}
+
+// requireNoLobbyUpdatesOnChatTopic asserts, after giving the bus a moment,
+// that nothing published on chatID's topic carried a lobby update: the lobby
+// is the creator's alone.
+func (e *serverEnv) requireNoLobbyUpdatesOnChatTopic(chatID *commonpb.ChatId) {
+	time.Sleep(100 * time.Millisecond)
+	for _, ev := range e.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, chatID.Value) }) {
+		require.Nil(e.t, ev.Event.GetEvent().GetChatUpdate().GetLobbyUpdates())
+	}
+}
+
+// testServer_Lobby_Gates pins who may do what with a lobby: nothing of a
+// DM or a public group, NOT_FOUND for a group that is not there, no lobby for
+// a keyless private group, the creator's RPCs the creator's alone and only
+// while a member, and no place in a lobby for a member or the creator.
+func testServer_Lobby_Gates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	strangerID, strangerKeys := e.addBoundUser("Stranger")
+	memberID, memberKeys := e.addBoundUser("Member")
+
+	requireAllDenied := func(chatID *commonpb.ChatId, keys model.KeyPair) {
+		t.Helper()
+		require.Equal(t, chatpb.EnterLobbyResponse_DENIED, e.enterLobby(keys, chatID).Result)
+		require.Equal(t, chatpb.LeaveLobbyResponse_DENIED, e.leaveLobby(keys, chatID).Result)
+		got, err := e.getLobbyMembers(keys, chatID, nil)
+		require.NoError(t, err)
+		require.Equal(t, chatpb.GetLobbyMembersResponse_DENIED, got.Result)
+		require.Empty(t, got.Members)
+		require.Equal(t, chatpb.AdmitLobbyMemberResponse_DENIED, e.admitLobbyMember(keys, chatID, strangerID, keyEnvelopeProto(2)).Result)
+		require.Equal(t, chatpb.DenyLobbyMemberResponse_DENIED, e.denyLobbyMember(keys, chatID, strangerID).Result)
+	}
+
+	// A DM, for its members and anyone; a public group, for its creator and a
+	// stranger alike.
+	dm := e.putDM(at(1))
+	requireAllDenied(dm, e.keys)
+	requireAllDenied(dm, strangerKeys)
+	public := e.putGroup("Public", at(1))
+	requireAllDenied(public, e.keys)
+	requireAllDenied(public, strangerKeys)
+
+	// A group that does not exist.
+	missing := chat.MustGenerateGroupChatID()
+	require.Equal(t, chatpb.EnterLobbyResponse_NOT_FOUND, e.enterLobby(strangerKeys, missing).Result)
+	require.Equal(t, chatpb.LeaveLobbyResponse_NOT_FOUND, e.leaveLobby(strangerKeys, missing).Result)
+	got, err := e.getLobbyMembers(e.keys, missing, nil)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetLobbyMembersResponse_NOT_FOUND, got.Result)
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_NOT_FOUND, e.admitLobbyMember(e.keys, missing, strangerID, keyEnvelopeProto(2)).Result)
+	require.Equal(t, chatpb.DenyLobbyMemberResponse_NOT_FOUND, e.denyLobbyMember(e.keys, missing, strangerID).Result)
+
+	// A keyless private group has no lobby to enter and admits no one, while
+	// its creator may still read the (empty) lobby and leave or deny is the
+	// no-op it is.
+	keyless := e.putPrivateGroup("Keyless", memberID)
+	require.Equal(t, chatpb.EnterLobbyResponse_DENIED, e.enterLobby(strangerKeys, keyless).Result)
+	require.Equal(t, chatpb.LeaveLobbyResponse_OK, e.leaveLobby(strangerKeys, keyless).Result)
+	got, err = e.getLobbyMembers(e.keys, keyless, nil)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetLobbyMembersResponse_OK, got.Result)
+	require.Empty(t, got.Members)
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_DENIED, e.admitLobbyMember(e.keys, keyless, strangerID, keyEnvelopeProto(2)).Result)
+	require.Equal(t, chatpb.DenyLobbyMemberResponse_OK, e.denyLobbyMember(e.keys, keyless, strangerID).Result)
+
+	// A keyed one: the creator's RPCs are refused to a member who is not the
+	// creator and to a stranger, and the lobby is for neither the creator nor
+	// a member.
+	keyed := e.putKeyedPrivateGroup("Keyed", memberID)
+	for _, keys := range []model.KeyPair{memberKeys, strangerKeys} {
+		got, err := e.getLobbyMembers(keys, keyed, nil)
+		require.NoError(t, err)
+		require.Equal(t, chatpb.GetLobbyMembersResponse_DENIED, got.Result)
+		require.Equal(t, chatpb.AdmitLobbyMemberResponse_DENIED, e.admitLobbyMember(keys, keyed, strangerID, keyEnvelopeProto(2)).Result)
+		require.Equal(t, chatpb.DenyLobbyMemberResponse_DENIED, e.denyLobbyMember(keys, keyed, strangerID).Result)
+	}
+	require.Equal(t, chatpb.EnterLobbyResponse_DENIED, e.enterLobby(e.keys, keyed).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_ALREADY_MEMBER, e.enterLobby(memberKeys, keyed).Result)
+
+	// A creator who has left runs nothing until they rejoin.
+	left, err := e.leaveChat(e.keys, keyed)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, left.Result)
+	got, err = e.getLobbyMembers(e.keys, keyed, nil)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetLobbyMembersResponse_DENIED, got.Result)
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_DENIED, e.admitLobbyMember(e.keys, keyed, strangerID, keyEnvelopeProto(2)).Result)
+	require.Equal(t, chatpb.DenyLobbyMemberResponse_DENIED, e.denyLobbyMember(e.keys, keyed, strangerID).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_DENIED, e.enterLobby(e.keys, keyed).Result)
+	rejoined, err := e.joinChat(e.keys, keyed)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.JoinChatResponse_OK, rejoined.Result)
+	got, err = e.getLobbyMembers(e.keys, keyed, nil)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetLobbyMembersResponse_OK, got.Result)
+}
+
+// testServer_Lobby_EnterAndLeave pins a user's way into and out of a lobby:
+// the entry's Lobby, in_lobby on the chat for them and no one else, the
+// creator's MemberEntered with the user as a LobbyMember, the no-op repeat,
+// and the withdrawal with its MemberLeft. Nothing of it reaches the chat
+// topic.
+func testServer_Lobby_EnterAndLeave(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.profiles.displayNames[string(e.userID.Value)] = "Creator"
+	userID, userKeys := e.addBoundUser("Waiting")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+
+	before := time.Now()
+	resp := e.enterLobby(userKeys, chatID)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, resp.Result)
+	require.NotNil(t, resp.Lobby)
+	require.False(t, resp.Lobby.EnteredAt.AsTime().Before(before.Add(-time.Second)))
+	md := resp.Lobby.Chat
+	require.Equal(t, chatID.Value, md.ChatId.Value)
+	require.Equal(t, "Sunday Hikers", md.Title)
+	require.True(t, md.IsPrivate)
+	require.True(t, md.InLobby)
+	require.Empty(t, md.Members)
+	require.Nil(t, md.ViewerState)
+	require.Nil(t, md.LastMessage)
+
+	// The chat says so for them, and for no one else.
+	got := e.getChat(userKeys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, got.Result)
+	require.True(t, got.Metadata.InLobby)
+	require.Empty(t, got.Metadata.Members)
+	got = e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, got.Result)
+	require.False(t, got.Metadata.InLobby)
+	_, strangerKeys := e.addBoundUser("Stranger")
+	got = e.getChat(strangerKeys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, got.Result)
+	require.False(t, got.Metadata.InLobby)
+
+	// The creator hears of it, with the user as the lobby shows them.
+	updates := e.waitForLobbyUpdates(e.userID, chatID, 1)
+	entered := updates[0].GetMemberEntered()
+	require.NotNil(t, entered)
+	require.Equal(t, userID.Value, entered.Member.UserProfile.UserId.Value)
+	require.Equal(t, "Waiting", entered.Member.UserProfile.DisplayName)
+	require.True(t, proto.Equal(userKeys.Proto(), entered.Member.PublicKey))
+	require.True(t, entered.Member.EnteredAt.AsTime().Equal(resp.Lobby.EnteredAt.AsTime()))
+	require.Empty(t, e.lobbyUpdatesOnUserTopic(userID, chatID))
+	e.requireNoLobbyUpdatesOnChatTopic(chatID)
+
+	// A repeat is OK with the same entry, and announces nothing.
+	again := e.enterLobby(userKeys, chatID)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, again.Result)
+	require.True(t, again.Lobby.EnteredAt.AsTime().Equal(resp.Lobby.EnteredAt.AsTime()))
+	time.Sleep(100 * time.Millisecond)
+	require.Len(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID), 1)
+
+	// Withdrawing.
+	require.Equal(t, chatpb.LeaveLobbyResponse_OK, e.leaveLobby(userKeys, chatID).Result)
+	got = e.getChat(userKeys, chatID)
+	require.False(t, got.Metadata.InLobby)
+	updates = e.waitForLobbyUpdates(e.userID, chatID, 2)
+	require.Equal(t, userID.Value, updates[1].GetMemberLeft().GetUserId().GetValue())
+	require.Equal(t, chatpb.LeaveLobbyResponse_OK, e.leaveLobby(userKeys, chatID).Result)
+	time.Sleep(100 * time.Millisecond)
+	require.Len(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID), 2)
+	e.requireNoLobbyUpdatesOnChatTopic(chatID)
+	e.requireNoRosterUpdates(userID, chatID)
+}
+
+// testServer_Lobby_Limits pins the server's caps: a full lobby is LOBBY_FULL,
+// a user in too many lobbies TOO_MANY_LOBBIES, and neither refuses a user who
+// is already waiting.
+func testServer_Lobby_Limits(t *testing.T, s chat.Store) {
+	e := newServerEnvWithConfig(t, s, serverConfig{lobbyLimits: &chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1}})
+	_, aKeys := e.addBoundUser("A")
+	_, bKeys := e.addBoundUser("B")
+	first := e.putKeyedPrivateGroup("First")
+	second := e.putKeyedPrivateGroup("Second")
+
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(aKeys, first).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_LOBBY_FULL, e.enterLobby(bKeys, first).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_TOO_MANY_LOBBIES, e.enterLobby(aKeys, second).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(aKeys, first).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(bKeys, second).Result)
+
+	// Nothing was recorded for a refused entry.
+	got := e.getChat(bKeys, first)
+	require.False(t, got.Metadata.InLobby)
+	got = e.getChat(aKeys, second)
+	require.False(t, got.Metadata.InLobby)
+}
+
+// testServer_Lobby_GetLobbyMembers pins the creator's read of the lobby:
+// earliest entered first, paged under a chat-bound token, each member with
+// their profile and public key.
+func testServer_Lobby_GetLobbyMembers(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+	other := e.putKeyedPrivateGroup("Other")
+
+	const n = 3
+	userIDs := make([]*commonpb.UserId, n)
+	userKeys := make([]model.KeyPair, n)
+	for i := range n {
+		userIDs[i], userKeys[i] = e.addBoundUser(fmt.Sprintf("User %d", i))
+		require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(userKeys[i], chatID).Result)
+		time.Sleep(2 * time.Millisecond)
+	}
+	whole := e.waitForLobbyMembers(e.keys, chatID, n)
+	require.False(t, whole.HasMore)
+	require.Nil(t, whole.PagingToken)
+	for i, m := range whole.Members {
+		require.Equal(t, userIDs[i].Value, m.UserProfile.UserId.Value, i)
+		require.Equal(t, fmt.Sprintf("User %d", i), m.UserProfile.DisplayName, i)
+		require.True(t, proto.Equal(userKeys[i].Proto(), m.PublicKey), i)
+		require.NotNil(t, m.EnteredAt)
+		if i > 0 {
+			require.False(t, m.EnteredAt.AsTime().Before(whole.Members[i-1].EnteredAt.AsTime()))
+		}
+	}
+
+	// Pages of two.
+	page, err := e.getLobbyMembers(e.keys, chatID, &commonpb.QueryOptions{PageSize: 2})
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetLobbyMembersResponse_OK, page.Result)
+	require.Len(t, page.Members, 2)
+	require.True(t, page.HasMore)
+	require.NotNil(t, page.PagingToken)
+	require.Equal(t, userIDs[0].Value, page.Members[0].UserProfile.UserId.Value)
+	require.Equal(t, userIDs[1].Value, page.Members[1].UserProfile.UserId.Value)
+	rest, err := e.getLobbyMembers(e.keys, chatID, &commonpb.QueryOptions{PageSize: 2, PagingToken: page.PagingToken})
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetLobbyMembersResponse_OK, rest.Result)
+	require.Len(t, rest.Members, 1)
+	require.False(t, rest.HasMore)
+	require.Nil(t, rest.PagingToken)
+	require.Equal(t, userIDs[2].Value, rest.Members[0].UserProfile.UserId.Value)
+
+	// The token is the chat's: replayed into another lobby it is refused, as
+	// is a malformed one.
+	_, err = e.getLobbyMembers(e.keys, other, &commonpb.QueryOptions{PagingToken: page.PagingToken})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = e.getLobbyMembers(e.keys, chatID, &commonpb.QueryOptions{PagingToken: &commonpb.PagingToken{Value: []byte{1, 2, 3}}})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	// The other lobby is empty, and a waiting user sees no lobby at all.
+	empty, err := e.getLobbyMembers(e.keys, other, nil)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetLobbyMembersResponse_OK, empty.Result)
+	require.Empty(t, empty.Members)
+	denied, err := e.getLobbyMembers(userKeys[0], chatID, nil)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetLobbyMembersResponse_DENIED, denied.Result)
+}
+
+// testServer_Lobby_Admit pins an admission: the waiting user becomes a
+// member holding the envelope the creator wrapped, announced as a join to the
+// members and to them, and as a MemberLeft to the creator; a repeat is a
+// no-op, a user not waiting is NOT_IN_LOBBY, and a member who leaves may wait
+// again.
+func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.profiles.displayNames[string(e.userID.Value)] = "Creator"
+	userID, userKeys := e.addBoundUser("Waiting")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(userKeys, chatID).Result)
+	e.waitForLobbyUpdates(e.userID, chatID, 1)
+
+	// Not waiting.
+	strangerID, _ := e.addBoundUser("Stranger")
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_NOT_IN_LOBBY, e.admitLobbyMember(e.keys, chatID, strangerID, keyEnvelopeProto(2)).Result)
+
+	// Admitted.
+	wrapped := keyEnvelopeProto(2)
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, wrapped).Result)
+	isMember, err := s.IsMember(e.ctx, chatID, userID)
+	require.NoError(t, err)
+	require.True(t, isMember)
+	envelope := e.mustGetKeyEnvelope(userKeys, chatID)
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, envelope.Result)
+	require.True(t, proto.Equal(wrapped, envelope.KeyEnvelope))
+	require.Equal(t, e.userID.Value, envelope.WrappedBy.Value)
+	got := e.getChat(userKeys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, got.Result)
+	require.False(t, got.Metadata.InLobby)
+	require.Len(t, got.Metadata.Members, 1)
+	require.NotNil(t, got.Metadata.ViewerState)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 1}, got.Metadata.RosterSummary))
+
+	// Announced as a join: the members' copy on the chat topic, the admitted
+	// user's with the metadata on their topic; and to the creator, the lobby
+	// shrank.
+	e.waitForRosterUpdates(userID, chatID, 1)
+	onChat, _ := e.rosterUpdatesOnChatTopic(chatID)
+	require.Len(t, onChat, 1)
+	require.Equal(t, userID.Value, onChat[0].GetMemberJoined().GetMember().GetUserId().GetValue())
+	require.Nil(t, onChat[0].GetMemberJoined().GetMetadata())
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 1}, onChat[0].RosterSummary))
+	toUser := e.rosterUpdatesOnUserTopic(userID, chatID)
+	require.Len(t, toUser, 1)
+	joined := toUser[0].GetMemberJoined()
+	require.Equal(t, "Waiting", joined.Member.UserProfile.DisplayName)
+	require.Equal(t, uint64(1), joined.Member.Version)
+	require.NotNil(t, joined.Member.JoinedAt)
+	require.NotNil(t, joined.Metadata)
+	require.Equal(t, "Sunday Hikers", joined.Metadata.Title)
+	require.False(t, joined.Metadata.InLobby)
+	updates := e.waitForLobbyUpdates(e.userID, chatID, 2)
+	require.Equal(t, userID.Value, updates[1].GetMemberLeft().GetUserId().GetValue())
+	e.requireNoLobbyUpdatesOnChatTopic(chatID)
+
+	// A repeat is the no-op the proto promises, their envelope untouched.
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(3)).Result)
+	envelope = e.mustGetKeyEnvelope(userKeys, chatID)
+	require.True(t, proto.Equal(wrapped, envelope.KeyEnvelope))
+	time.Sleep(100 * time.Millisecond)
+	require.Len(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID), 2)
+	onChat, _ = e.rosterUpdatesOnChatTopic(chatID)
+	require.Len(t, onChat, 1)
+
+	// The lobby is empty for the creator, and the member replaces the envelope
+	// with their own as any member may.
+	empty, err := e.getLobbyMembers(e.keys, chatID, nil)
+	require.NoError(t, err)
+	require.Empty(t, empty.Members)
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_OK, e.mustSetKeyEnvelope(userKeys, chatID, keyEnvelopeProto(4)).Result)
+
+	// Leaving discards the envelope, and the way back is the lobby.
+	left, err := e.leaveChat(userKeys, chatID)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, left.Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(userKeys, chatID).Result)
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(5)).Result)
+	envelope = e.mustGetKeyEnvelope(userKeys, chatID)
+	require.True(t, proto.Equal(keyEnvelopeProto(5), envelope.KeyEnvelope))
+}
+
+// testServer_Lobby_Deny pins a denial: the user leaves the lobby and is told
+// nothing, the creator hears a MemberLeft, a repeat is a no-op, and the user
+// may enter again.
+func testServer_Lobby_Deny(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	userID, userKeys := e.addBoundUser("Waiting")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(userKeys, chatID).Result)
+	e.waitForLobbyUpdates(e.userID, chatID, 1)
+
+	require.Equal(t, chatpb.DenyLobbyMemberResponse_OK, e.denyLobbyMember(e.keys, chatID, userID).Result)
+	got := e.getChat(userKeys, chatID)
+	require.False(t, got.Metadata.InLobby)
+	isMember, err := s.IsMember(e.ctx, chatID, userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	updates := e.waitForLobbyUpdates(e.userID, chatID, 2)
+	require.Equal(t, userID.Value, updates[1].GetMemberLeft().GetUserId().GetValue())
+	require.Empty(t, e.lobbyUpdatesOnUserTopic(userID, chatID))
+	e.requireNoRosterUpdates(userID, chatID)
+
+	require.Equal(t, chatpb.DenyLobbyMemberResponse_OK, e.denyLobbyMember(e.keys, chatID, userID).Result)
+	time.Sleep(100 * time.Millisecond)
+	require.Len(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID), 2)
+
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(userKeys, chatID).Result)
+	got = e.getChat(userKeys, chatID)
+	require.True(t, got.Metadata.InLobby)
 }

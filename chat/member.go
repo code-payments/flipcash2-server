@@ -32,11 +32,11 @@ import (
 // Access), and so does a no-op join. Leaving has no rule to satisfy.
 //
 // A private group (see Chat.IsPrivate) is not joined here: its members are
-// admitted by its creator from its lobby, which is not built, so JoinChat
-// refuses everyone as DENIED. Everyone but the creator, that is, who needs no
-// one's approval and rejoins a private group they left. No rule is evaluated
-// for them: a private group's rules admit no one (see RuleEvaluator), and
-// being its creator is what admits them.
+// admitted by its creator from its lobby (see lobby.go), so JoinChat refuses
+// everyone as DENIED. Everyone but the creator, that is, who needs no one's
+// approval and rejoins a private group they left. No rule is evaluated for
+// them: a private group's rules admit no one (see RuleEvaluator), and being
+// its creator is what admits them.
 //
 // Each transition that actually happens is broadcast as a RosterUpdate to the
 // chat's members and to the affected user (see publishRosterUpdate). A join or

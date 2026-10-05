@@ -26,19 +26,20 @@ const (
 	userStateTable    = "chat_user_state_test"
 	activityTable     = "chat_activity_test"
 	keyEnvelopesTable = "chat_key_envelopes_test"
+	lobbiesTable      = "chat_lobbies_test"
 )
 
 func TestChat_DynamoDBStore(t *testing.T) {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable))
+	require.NoError(t, CreateTables(context.Background(), testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, nil)
+	testStore := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, nil)
 	teardown := func() {
 		testStore.(*store).reset()
 	}
 	// The stores newStore builds share testStore's tables, so its teardown
 	// resets theirs too.
 	newStore := func(excludedFromFeed []*commonpb.UserId) chat.Store {
-		return NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, excludedFromFeed)
+		return NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, excludedFromFeed)
 	}
 	tests.RunStoreTests(t, testStore, newStore, teardown)
 }
@@ -50,11 +51,11 @@ func TestChat_DynamoDBStore(t *testing.T) {
 // the other's.
 func TestChat_DynamoDBExclusionOutlivesConfig(t *testing.T) {
 	ctx := context.Background()
-	require.NoError(t, CreateTables(ctx, testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable))
+	require.NoError(t, CreateTables(ctx, testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable))
 
 	team := model.MustGenerateUserID()
-	configured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, []*commonpb.UserId{team})
-	unconfigured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, nil)
+	configured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, []*commonpb.UserId{team})
+	unconfigured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, nil)
 	t.Cleanup(func() { configured.(*store).reset() })
 
 	chatIDValue := make([]byte, chat.DmChatIDSize)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -55,6 +56,11 @@ type memory struct {
 	// then chat ID, mirroring the persistent layout (see chat.Store).
 	keyEnvelopes map[string]map[string]chat.KeyEnvelope
 
+	// lobbies holds each user's lobby entries, keyed by user ID then chat
+	// ID, as when they entered (see chat.LobbyEntry). The counts the
+	// persistent stores keep are computed from it.
+	lobbies map[string]map[string]time.Time
+
 	exclusions chat.FeedExclusions
 }
 
@@ -82,6 +88,7 @@ func NewInMemory(excludedFromFeed []*commonpb.UserId) chat.Store {
 		mutedCounts:      make(map[string]uint64),
 		lastSent:         make(map[string]map[string]time.Time),
 		keyEnvelopes:     make(map[string]map[string]chat.KeyEnvelope),
+		lobbies:          make(map[string]map[string]time.Time),
 	}
 }
 
@@ -97,6 +104,7 @@ func (m *memory) reset() {
 	m.excludedFromFeed = make(map[string]map[string]struct{})
 	m.lastSent = make(map[string]map[string]time.Time)
 	m.keyEnvelopes = make(map[string]map[string]chat.KeyEnvelope)
+	m.lobbies = make(map[string]map[string]time.Time)
 }
 
 // isJoinedLocked reports whether the user's record on the group has them
@@ -842,4 +850,163 @@ func (m *memory) GetKeyEnvelope(_ context.Context, chatID *commonpb.ChatId, user
 		return chat.KeyEnvelope{}, chat.ErrKeyEnvelopeNotFound
 	}
 	return stored.Clone(), nil
+}
+
+func (m *memory) EnterLobby(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, limits chat.LobbyLimits) (chat.LobbyEntry, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.LobbyEntry{}, false, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	userKey, chatKey := string(userID.Value), string(chatID.Value)
+	// Membership first, then an existing entry, then the lobby's cap before
+	// the user's, as the persistent stores judge them.
+	if m.isJoinedLocked(chatKey, userKey) {
+		return chat.LobbyEntry{}, false, chat.ErrAlreadyMember
+	}
+	if enteredAt, ok := m.lobbies[userKey][chatKey]; ok {
+		return chat.LobbyEntry{UserID: cloneUserID(userID), EnteredAt: enteredAt}, false, nil
+	}
+	if m.lobbySizeLocked(chatKey) >= limits.LobbySize {
+		return chat.LobbyEntry{}, false, chat.ErrLobbyFull
+	}
+	if len(m.lobbies[userKey]) >= limits.LobbiesPerUser {
+		return chat.LobbyEntry{}, false, chat.ErrTooManyLobbies
+	}
+
+	byChat := m.lobbies[userKey]
+	if byChat == nil {
+		byChat = make(map[string]time.Time)
+		m.lobbies[userKey] = byChat
+	}
+	enteredAt := time.Now().UTC()
+	byChat[chatKey] = enteredAt
+	return chat.LobbyEntry{UserID: cloneUserID(userID), EnteredAt: enteredAt}, true, nil
+}
+
+func (m *memory) LeaveLobby(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return false, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	return m.leaveLobbyLocked(chatID, userID), nil
+}
+
+func (m *memory) GetLobbyEntries(_ context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.LobbyEntry, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	out := make(map[string]chat.LobbyEntry)
+	byChat := m.lobbies[string(userID.Value)]
+	for _, chatID := range chatIDs {
+		if enteredAt, ok := byChat[string(chatID.Value)]; ok {
+			out[string(chatID.Value)] = chat.LobbyEntry{UserID: cloneUserID(userID), EnteredAt: enteredAt}
+		}
+	}
+	return out, nil
+}
+
+func (m *memory) GetLobbyPage(_ context.Context, chatID *commonpb.ChatId, after *chat.LobbyPosition, limit int) ([]chat.LobbyEntry, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	chatKey := string(chatID.Value)
+	entries := make([]chat.LobbyEntry, 0)
+	for userKey, byChat := range m.lobbies {
+		if enteredAt, ok := byChat[chatKey]; ok {
+			entries = append(entries, chat.LobbyEntry{UserID: &commonpb.UserId{Value: []byte(userKey)}, EnteredAt: enteredAt})
+		}
+	}
+	slices.SortFunc(entries, func(a, b chat.LobbyEntry) int { return a.Position().Compare(b.Position()) })
+	if after != nil {
+		entries = slices.DeleteFunc(entries, func(e chat.LobbyEntry) bool { return e.Position().Compare(*after) <= 0 })
+	}
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries, nil
+}
+
+func (m *memory) AdmitFromLobby(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (bool, chat.RosterSummary, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return false, chat.RosterSummary{}, fmt.Errorf("not a group chat id")
+	}
+	if envelope.WrappedBy == nil {
+		return false, chat.RosterSummary{}, fmt.Errorf("key envelope has no wrapper")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	userKey, chatKey := string(userID.Value), string(chatID.Value)
+	if _, ok := m.chats[chatKey]; !ok {
+		return false, chat.RosterSummary{}, chat.ErrChatNotFound
+	}
+	// A member already is the no-op, judged before the lobby as the
+	// persistent stores judge it (see chat.Store.AdmitFromLobby).
+	if m.isJoinedLocked(chatKey, userKey) {
+		return false, m.rosterSummaryLocked(chatID), nil
+	}
+	if _, ok := m.lobbies[userKey][chatKey]; !ok {
+		return false, chat.RosterSummary{}, chat.ErrNotInLobby
+	}
+
+	byChat := m.keyEnvelopes[userKey]
+	if byChat == nil {
+		byChat = make(map[string]chat.KeyEnvelope)
+		m.keyEnvelopes[userKey] = byChat
+	}
+	byChat[chatKey] = envelope.Clone()
+
+	members := m.groupMembers[chatKey]
+	if members == nil {
+		members = make(map[string]*memberRecord)
+		m.groupMembers[chatKey] = members
+	}
+	m.groupVersions[chatKey]++
+	members[userKey] = &memberRecord{
+		joined:   true,
+		joinedAt: time.Now().UTC(),
+		version:  m.groupVersions[chatKey],
+	}
+	m.leaveLobbyLocked(chatID, userID)
+	return true, m.rosterSummaryLocked(chatID), nil
+}
+
+// lobbySizeLocked counts the users waiting in chatKey's lobby.
+func (m *memory) lobbySizeLocked(chatKey string) int {
+	n := 0
+	for _, byChat := range m.lobbies {
+		if _, ok := byChat[chatKey]; ok {
+			n++
+		}
+	}
+	return n
+}
+
+// leaveLobbyLocked removes userID's entry in chatID's lobby, reporting
+// whether there was one.
+func (m *memory) leaveLobbyLocked(chatID *commonpb.ChatId, userID *commonpb.UserId) bool {
+	byChat := m.lobbies[string(userID.Value)]
+	if _, ok := byChat[string(chatID.Value)]; !ok {
+		return false
+	}
+	delete(byChat, string(chatID.Value))
+	if len(byChat) == 0 {
+		delete(m.lobbies, string(userID.Value))
+	}
+	return true
+}
+
+func cloneUserID(userID *commonpb.UserId) *commonpb.UserId {
+	return &commonpb.UserId{Value: append([]byte(nil), userID.Value...)}
 }

@@ -281,6 +281,29 @@ func (c *Cache) GetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, use
 	return c.db.GetKeyEnvelope(ctx, chatID, userID)
 }
 
+// The lobby methods pass through: a lobby moves with every entry and
+// admission, from any process, and every read of one is already a single
+// query.
+func (c *Cache) EnterLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, limits chat.LobbyLimits) (chat.LobbyEntry, bool, error) {
+	return c.db.EnterLobby(ctx, chatID, userID, limits)
+}
+
+func (c *Cache) LeaveLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
+	return c.db.LeaveLobby(ctx, chatID, userID)
+}
+
+func (c *Cache) GetLobbyEntries(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.LobbyEntry, error) {
+	return c.db.GetLobbyEntries(ctx, userID, chatIDs)
+}
+
+func (c *Cache) GetLobbyPage(ctx context.Context, chatID *commonpb.ChatId, after *chat.LobbyPosition, limit int) ([]chat.LobbyEntry, error) {
+	return c.db.GetLobbyPage(ctx, chatID, after, limit)
+}
+
+func (c *Cache) AdmitFromLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (bool, chat.RosterSummary, error) {
+	return c.db.AdmitFromLobby(ctx, chatID, userID, envelope)
+}
+
 // sendActivityCacheKey keys the activity cache by (group, user). Only group
 // IDs are held, and they are fixed width (chat.GroupChatIDSize), so
 // concatenating the raw bytes is unambiguous.

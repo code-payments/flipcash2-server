@@ -26,8 +26,11 @@ import (
 // user) with two LSIs, one by last_sent_at (lsiByLastSentAt) and one by
 // activity_score (lsiByActivityScore, reserved and empty today), and TTL on
 // expires_at; chat_key_envelopes is keyed by (pk, sk) = (user, chat) with no
-// index. It is idempotent and blocks until all tables are ACTIVE.
-func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable string) error {
+// index; chat_lobbies is keyed by (pk, sk) = (user, chat) — plus one "#meta"
+// aggregates item per chat and per user — with a sparse GSI of a chat's
+// lobby by entry time (see gsiLobbyByChat). It is idempotent and blocks
+// until all tables are ACTIVE.
+func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
 			TableName:   aws.String(chatsTable),
@@ -216,6 +219,38 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
 			},
 		},
+		{
+			TableName:   aws.String(lobbiesTable),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrEnteredAt), AttributeType: types.ScalarAttributeTypeN},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+			},
+			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
+				{
+					// Inverted index of a chat's lobby in entry order, hashed on
+					// the sk (the chat) with no attribute repeating it. Sparse
+					// all the same: an item is indexed only with both keys, and
+					// entered_at exists on entries alone, so the two #meta items
+					// never appear. It pages a lobby earliest first (see
+					// gsiLobbyByChat); the user is recovered from the projected
+					// pk. A GSI, not an LSI, because the table is keyed by user
+					// (see the store's doc): a local index could only reorder one
+					// user's entries, never gather one chat's.
+					IndexName: aws.String(gsiLobbyByChat),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrEnteredAt), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+			},
+		},
 	}
 
 	for _, input := range inputs {
@@ -285,6 +320,9 @@ func (s *store) reset() {
 		panic(err)
 	}
 	if err := clearTable(ctx, s.client, s.keyEnvelopesTable, []string{attrPK, attrSK}); err != nil {
+		panic(err)
+	}
+	if err := clearTable(ctx, s.client, s.lobbiesTable, []string{attrPK, attrSK}); err != nil {
 		panic(err)
 	}
 }

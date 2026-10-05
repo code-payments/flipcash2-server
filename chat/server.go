@@ -190,7 +190,23 @@ type Server struct {
 	// thousands of members.
 	rosterWholeReadCap int
 
+	// lobbyLimits caps a private group's lobby and a user's lobbies (see
+	// lobby.go). DefaultLobbyLimits in production; tests lower them with
+	// WithLobbyLimits to exercise the refusals without thousands of users.
+	lobbyLimits LobbyLimits
+
 	chatpb.UnimplementedChatServer
+}
+
+// ServerOption configures a Server at construction beyond its required
+// dependencies.
+type ServerOption func(*Server)
+
+// WithLobbyLimits overrides DefaultLobbyLimits (see LobbyLimits).
+func WithLobbyLimits(limits LobbyLimits) ServerOption {
+	return func(s *Server) {
+		s.lobbyLimits = limits
+	}
 }
 
 func NewServer(
@@ -214,8 +230,10 @@ func NewServer(
 	teamUserID *commonpb.UserId,
 
 	disableGetRoster bool,
+
+	opts ...ServerOption,
 ) *Server {
-	return &Server{
+	s := &Server{
 		log: log,
 
 		authz: authz,
@@ -240,7 +258,12 @@ func NewServer(
 
 		maxGroupFeedChats:  maxGroupFeedChats,
 		rosterWholeReadCap: rosterWholeReadCap,
+		lobbyLimits:        DefaultLobbyLimits,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // GetChat returns one chat's metadata as the caller may see it.
@@ -274,8 +297,9 @@ func NewServer(
 // is returned to any registered user, with is_private set, so that one who is
 // not a member can see what they would ask to join. It carries no rules, so a
 // non-member's standing is none under every mode and they see the record
-// alone: its messaging state is its members'. A private group whose key has
-// not been stored is returned like any other.
+// alone: its messaging state is its members'. What a non-member does get is
+// in_lobby, whether they are waiting in its lobby (see lobby.go). A private
+// group whose key has not been stored is returned like any other.
 //
 // The group's picture is returned in every case: it is part of the record, as
 // the title is, and the two are what identify a group — a group's picture is
@@ -448,6 +472,12 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 // standing is never a member's and it is never shown a DM, so no per-viewer
 // state is read on its behalf.
 //
+// in_lobby is per-viewer and a non-member's alone: whether the viewer is
+// waiting in a private group's lobby (see lobby.go), read for every private
+// group in the set when the viewer is not a member, one strongly consistent
+// read across the set, and never for a member, who is past waiting, or for a
+// group that is not private, which has no lobby. A nil viewer waits nowhere.
+//
 // viewer_state is per-viewer too, and a member's alone: it is what the chat
 // holds about the viewer (see ViewerState) plus what they may do in it, and
 // a non-member may do nothing and has no standing to see what the record
@@ -478,8 +508,12 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 	uniquePeerIDs := make(map[string]*commonpb.UserId)
 	uniquePictureBlobIDs := make(map[string]*blobpb.BlobId)
 	uniqueDmMemberIDs := make(map[string]*commonpb.UserId)
+	var lobbyChatIDs []*commonpb.ChatId
 	hydratedMembers := make([][]*commonpb.UserId, len(chats))
 	for i, c := range chats {
+		if c.IsPrivate && !standing.IsMember && viewerID != nil {
+			lobbyChatIDs = append(lobbyChatIDs, c.ID)
+		}
 		// The members to hydrate: a DM's participants, or the viewer alone in a
 		// group they are a member of (see above).
 		members := c.Members
@@ -563,6 +597,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		pictureRenditions      map[string][]*blobpb.Rendition
 		viewerStates           map[string]ViewerState
 		staffByUserId          map[string]bool
+		lobbyEntries           map[string]LobbyEntry
 	)
 	chatIDs := make([]*commonpb.ChatId, len(chats))
 	for i, c := range chats {
@@ -619,6 +654,12 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 			return err
 		})
 	}
+	if len(lobbyChatIDs) > 0 {
+		g.Go(func() (err error) {
+			lobbyEntries, err = s.chats.GetLobbyEntries(gctx, viewerID, lobbyChatIDs)
+			return err
+		})
+	}
 	if len(dmMemberIDs) > 0 {
 		g.Go(func() (err error) {
 			staffByUserId, err = s.staffFlags(gctx, dmMemberIDs)
@@ -662,6 +703,9 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		md.LatestEventSequence = latestEventSeqs[key]
 		if peer, ok := dmPeerByChat[key]; ok {
 			md.IsHidden = blockedPeers[string(peer.Value)]
+		}
+		if _, ok := lobbyEntries[key]; ok {
+			md.InLobby = true
 		}
 		if IsDmChatType(c.Type) {
 			md.UseE2Ee = useE2ee(c, staffByUserId, s.teamUserID)

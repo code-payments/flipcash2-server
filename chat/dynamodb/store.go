@@ -150,6 +150,35 @@ import (
 //	          the transaction that records the departure (see
 //	          RemoveGroupMember), so no departed user keeps one. No item
 //	          expires.
+//
+//	chat_lobbies  pk = "user#<id>", sk = "chat#<id>" (one item per (user,
+//	          private group) the user is waiting in the lobby of; see
+//	          chat.LobbyEntry), with entered_at (epoch nanos). gsiLobbyByChat
+//	          on (sk, entered_at) pages a group's lobby earliest first: the
+//	          sk is the chat, so no attribute repeats it, and the index is
+//	          sparse all the same because entered_at, its range key, is on
+//	          entries alone. Keyed
+//	          by user like chat_user_state, so that a user's own entries are
+//	          one strongly consistent query with no index: in_lobby and
+//	          EnterLobby's response today, and the listing of the lobbies a
+//	          user waits in when that RPC comes (decided). The cost is the
+//	          creator's page, which a chat-keyed table with an LSI could have
+//	          served strongly consistent and here comes off a GSI that trails
+//	          writes briefly, as the proto allows; the creator reconciles
+//	          against the LobbyUpdates they receive.
+//
+//	          Two aggregates items count the entries, both sk = "#meta" (see
+//	          skMeta) with lobby_count: pk = "chat#<id>" is the lobby's size,
+//	          pk = "user#<id>" the lobbies the user waits in. Neither carries
+//	          entered_at, so neither is in the index. Every
+//	          write of an entry moves both counts in the same transaction,
+//	          and an entry is made conditionally on both counts being under
+//	          their caps and on the user's group_members row not being
+//	          joined (see EnterLobby), so the caps hold under concurrent
+//	          entries without a read and a member never gains an entry. An
+//	          admission (see AdmitFromLobby) is the membership transition's
+//	          transaction carrying the entry's removal, its counts and the
+//	          key envelope, so the two tables agree in both directions.
 const (
 	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
 	// all of a user's DM types. Superseded by gsiByTypeActivity; retained until
@@ -194,6 +223,12 @@ const (
 	// reserved for a frequency-weighted ordering; nothing writes its key yet.
 	lsiByActivityScore = "by_activity_score"
 
+	// gsiLobbyByChat is the (sk, entered_at) index on chat_lobbies: a group's
+	// lobby in entry order (see GetLobbyPage), hashed on the sk, which is the
+	// chat. It is sparse on entered_at, which only entries carry: the #meta
+	// items must omit it.
+	gsiLobbyByChat = "by_chat"
+
 	// chatKeyPrefix prefixes a chat ID in the chats table pk, the dm_inbox sk
 	// and the chat_user_state sk. The chat ID is recovered from the key, so it
 	// is not stored as its own attribute — except in chat_user_state, where a
@@ -235,6 +270,8 @@ const (
 	attrNonce                = "nonce"          // chat_key_envelopes: the envelope's nonce (B)
 	attrCiphertext           = "ciphertext"     // chat_key_envelopes: the wrapped chat key (B)
 	attrWrappedBy            = "wrapped_by"     // chat_key_envelopes: the raw ID of the user who stored the envelope (B)
+	attrEnteredAt            = "entered_at"     // chat_lobbies: epoch nanos of the entry, keying gsiLobbyByChat
+	attrLobbyCount           = "lobby_count"    // chat_lobbies #meta items: a lobby's size (chat# pk) or a user's lobbies (user# pk)
 
 	// Keys of the min_listener_balance map.
 	attrBalanceCurrency     = "currency"
@@ -301,6 +338,7 @@ type store struct {
 	userStateTable    string
 	activityTable     string
 	keyEnvelopesTable string
+	lobbiesTable      string
 
 	exclusions chat.FeedExclusions
 }
@@ -309,7 +347,7 @@ type store struct {
 // creating every DM with a user in excludedFromFeed excluding them from the
 // feed (see chat.FeedExclusions); nil excludes no one. Use CreateTables to
 // provision the tables.
-func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
+func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
 	return &store{
 		exclusions:        chat.NewFeedExclusions(excludedFromFeed),
 		client:            client,
@@ -319,6 +357,7 @@ func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembe
 		userStateTable:    userStateTable,
 		activityTable:     activityTable,
 		keyEnvelopesTable: keyEnvelopesTable,
+		lobbiesTable:      lobbiesTable,
 	}
 }
 
@@ -482,30 +521,35 @@ func (s *store) addGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 
 	changed := false
 	for _, userID := range userIDs {
-		join := &types.Update{
-			TableName: aws.String(s.groupMembersTable),
-			Key: map[string]types.AttributeValue{
-				attrPK: avS(chatPK(chatID)),
-				attrSK: avS(userPK(userID)),
-			},
-			UpdateExpression: aws.String(fmt.Sprintf(
-				"SET #state = :joined, #user = :user, %s = :now, %s = :version REMOVE %s, %s", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
-			)),
-			ConditionExpression:      aws.String("attribute_not_exists(#state) OR #state <> :joined"),
-			ExpressionAttributeNames: map[string]string{"#state": attrState, "#user": attrUser},
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":joined": avN(memberStateJoined),
-				":user":   avS(userIndexKey(userID)),
-				":now":    avN(uint64(time.Now().UTC().UnixNano())),
-			},
-		}
-		joined, err := s.transitionMembership(ctx, chatID, join, 1, &roster, nil)
+		joined, err := s.transitionMembership(ctx, chatID, s.joinUpdate(chatID, userID), 1, &roster, nil)
 		if err != nil {
 			return changed, roster, err
 		}
 		changed = changed || joined
 	}
 	return changed, roster, nil
+}
+
+// joinUpdate is the membership transition that (re)joins userID to chatID
+// (see addGroupMembers), for transitionMembership to carry.
+func (s *store) joinUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.Update {
+	return &types.Update{
+		TableName: aws.String(s.groupMembersTable),
+		Key: map[string]types.AttributeValue{
+			attrPK: avS(chatPK(chatID)),
+			attrSK: avS(userPK(userID)),
+		},
+		UpdateExpression: aws.String(fmt.Sprintf(
+			"SET #state = :joined, #user = :user, %s = :now, %s = :version REMOVE %s, %s", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
+		)),
+		ConditionExpression:      aws.String("attribute_not_exists(#state) OR #state <> :joined"),
+		ExpressionAttributeNames: map[string]string{"#state": attrState, "#user": attrUser},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":joined": avN(memberStateJoined),
+			":user":   avS(userIndexKey(userID)),
+			":now":    avN(uint64(time.Now().UTC().UnixNano())),
+		},
+	}
 }
 
 func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, discardKeyEnvelope bool) (bool, chat.RosterSummary, error) {
@@ -593,9 +637,12 @@ func (s *store) readRosterSummaryForWrite(ctx context.Context, chatID *commonpb.
 // from it without another read.
 //
 // alongside are further writes the transition carries: they commit iff it
-// does, and are not made when it is a no-op. They must be unconditional, so
-// the only way one can cancel the transaction is by losing to a concurrent
-// write on its own item.
+// does, and are not made when it is a no-op. One may carry a condition of its
+// own: when it fails, the whole transaction cancels, nothing is retried, and
+// the failure is reported as an alongsideConditionFailed naming the item, for
+// the caller to translate (see AdmitFromLobby). An unconditional one can
+// cancel the transaction only by losing to a concurrent write on its own
+// item.
 //
 // Cancellation reasons are positional over the transaction's items: [0] is the
 // membership transition, [1] the summary, and the rest alongside's. A failed
@@ -605,6 +652,10 @@ func (s *store) readRosterSummaryForWrite(ctx context.Context, chatID *commonpb.
 // with no extra read. Losing the write itself to a concurrent transaction on
 // the same item, any of them, surfaces as TransactionConflict and is retried
 // with backoff. Both share the attempt budget (see maxMembershipAttempts).
+// The transition's own no-op is judged first, then the summary, then
+// alongside's conditions: a no-op is a no-op whatever else failed, and a
+// stale summary is retried before an alongside condition is believed, since
+// the retry re-evaluates it.
 func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatId, transition *types.Update, delta int64, roster *chat.RosterSummary, alongside []types.TransactWriteItem) (bool, error) {
 	backoff := membershipBackoffBase
 	for attempt := 0; ; attempt++ {
@@ -672,6 +723,8 @@ func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatI
 				return false, err
 			}
 			*roster = current
+		case slices.Contains(codes[2:], conditionalCheckFailedCode):
+			return false, alongsideConditionFailed{Index: slices.Index(codes[2:], conditionalCheckFailedCode)}
 		case isTransactionConflict(codes):
 			if exhausted {
 				return false, fmt.Errorf("membership transition for chat %x: %w", chatID.Value, err)
@@ -2632,17 +2685,11 @@ func (s *store) SetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, use
 		return chat.KeyEnvelope{}, fmt.Errorf("key envelope has no wrapper")
 	}
 
-	item := keyEnvelopeKey(chatID, userID)
-	item[attrScheme] = avN(uint64(envelope.Scheme))
-	item[attrNonce] = avB(envelope.Nonce)
-	item[attrCiphertext] = avB(envelope.Ciphertext)
-	item[attrWrappedBy] = avB(envelope.WrappedBy.Value)
-
 	// An envelope the user wrapped themself stands: the put is refused when
 	// one is stored, and the refusal returns it.
 	_, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:           aws.String(s.keyEnvelopesTable),
-		Item:                item,
+		Item:                keyEnvelopeItem(chatID, userID, envelope),
 		ConditionExpression: aws.String("attribute_not_exists(#pk) OR #wrappedBy <> :user"),
 		ExpressionAttributeNames: map[string]string{
 			"#pk":        attrPK,
@@ -2687,6 +2734,16 @@ func keyEnvelopeKey(chatID *commonpb.ChatId, userID *commonpb.UserId) map[string
 	}
 }
 
+// keyEnvelopeItem is userID's envelope for chatID as stored, key included.
+func keyEnvelopeItem(chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) map[string]types.AttributeValue {
+	item := keyEnvelopeKey(chatID, userID)
+	item[attrScheme] = avN(uint64(envelope.Scheme))
+	item[attrNonce] = avB(envelope.Nonce)
+	item[attrCiphertext] = avB(envelope.Ciphertext)
+	item[attrWrappedBy] = avB(envelope.WrappedBy.Value)
+	return item
+}
+
 // keyEnvelopeFromItem decodes a chat_key_envelopes item. Every attribute is
 // written with every item, so one missing its wrapper is a corrupt item
 // rather than a default.
@@ -2705,4 +2762,377 @@ func keyEnvelopeFromItem(item map[string]types.AttributeValue) (chat.KeyEnvelope
 		Ciphertext: bytes.Clone(asB(item[attrCiphertext])),
 		WrappedBy:  &commonpb.UserId{Value: bytes.Clone(wrappedBy)},
 	}, nil
+}
+
+// alongsideConditionFailed reports that a conditional write carried alongside
+// a membership transition failed its condition (see transitionMembership).
+// Index is the write's position in alongside.
+type alongsideConditionFailed struct {
+	Index int
+}
+
+func (e alongsideConditionFailed) Error() string {
+	return fmt.Sprintf("write %d alongside the membership transition failed its condition", e.Index)
+}
+
+// EnterLobby is one transaction over the entry, both counts and the user's
+// membership record: the entry is put conditionally on not existing, each
+// count is moved conditionally on being under its cap, and the membership
+// row in group_members is checked to be absent or not joined, so a member, a
+// lobby at its cap, or a user at theirs, cancels the whole write and nothing
+// is recorded. The membership check is what keeps an entry from landing for
+// a user whose admission committed between the caller's gate and this write.
+// The cancellation's per-item reasons tell the cases apart with no read: a
+// joined member is ErrAlreadyMember, judged first; an entry that exists is
+// the no-op, returned from the item the failure hands back, judged before
+// the caps so a repeat never reports a full lobby; a failed lobby count is
+// ErrLobbyFull, judged before the user's; a failed user count is
+// ErrTooManyLobbies. A TransactionConflict — a concurrent write to one of the
+// items, which the counts make likely in a busy lobby — is retried with
+// backoff.
+func (s *store) EnterLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, limits chat.LobbyLimits) (chat.LobbyEntry, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.LobbyEntry{}, false, fmt.Errorf("not a group chat id")
+	}
+
+	entry := chat.LobbyEntry{
+		UserID:    &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
+		EnteredAt: time.Now().UTC(),
+	}
+	item := lobbyKey(chatID, userID)
+	item[attrEnteredAt] = avN(uint64(entry.EnteredAt.UnixNano()))
+	transactItems := []types.TransactWriteItem{
+		{Put: &types.Put{
+			TableName:                           aws.String(s.lobbiesTable),
+			Item:                                item,
+			ConditionExpression:                 aws.String("attribute_not_exists(#pk)"),
+			ExpressionAttributeNames:            map[string]string{"#pk": attrPK},
+			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		}},
+		{Update: s.lobbyCountUpdate(chatPK(chatID), 1, limits.LobbySize)},
+		{Update: s.lobbyCountUpdate(userPK(userID), 1, limits.LobbiesPerUser)},
+		{ConditionCheck: &types.ConditionCheck{
+			TableName: aws.String(s.groupMembersTable),
+			Key: map[string]types.AttributeValue{
+				attrPK: avS(chatPK(chatID)),
+				attrSK: avS(userPK(userID)),
+			},
+			ConditionExpression:       aws.String("attribute_not_exists(#state) OR #state <> :joined"),
+			ExpressionAttributeNames:  map[string]string{"#state": attrState},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":joined": avN(memberStateJoined)},
+		}},
+	}
+
+	backoff := membershipBackoffBase
+	for attempt := 0; ; attempt++ {
+		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
+		if err == nil {
+			return entry, true, nil
+		}
+		reasons, ok := cancellationReasons(err)
+		if !ok || len(reasons) != len(transactItems) {
+			return chat.LobbyEntry{}, false, err
+		}
+		codes := make([]string, len(reasons))
+		for i, reason := range reasons {
+			codes[i] = aws.ToString(reason.Code)
+		}
+		switch {
+		case codes[3] == conditionalCheckFailedCode:
+			return chat.LobbyEntry{}, false, chat.ErrAlreadyMember
+		case codes[0] == conditionalCheckFailedCode:
+			existing, err := lobbyEntryFromItem(reasons[0].Item)
+			return existing, false, err
+		case codes[1] == conditionalCheckFailedCode:
+			return chat.LobbyEntry{}, false, chat.ErrLobbyFull
+		case codes[2] == conditionalCheckFailedCode:
+			return chat.LobbyEntry{}, false, chat.ErrTooManyLobbies
+		case isTransactionConflict(codes):
+			if attempt+1 >= maxMembershipAttempts {
+				return chat.LobbyEntry{}, false, fmt.Errorf("entering lobby of chat %x: %w", chatID.Value, err)
+			}
+			select {
+			case <-ctx.Done():
+				return chat.LobbyEntry{}, false, ctx.Err()
+			case <-time.After(backoff + rand.N(backoff)):
+			}
+			backoff = min(2*backoff, membershipBackoffMax)
+		default:
+			return chat.LobbyEntry{}, false, err
+		}
+	}
+}
+
+// LeaveLobby is the inverse transaction: the entry deleted conditionally on
+// existing, both counts moved down. An entry that does not exist cancels it,
+// which is the no-op; a TransactionConflict is retried with backoff.
+func (s *store) LeaveLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return false, fmt.Errorf("not a group chat id")
+	}
+
+	transactItems := append([]types.TransactWriteItem{{Delete: s.lobbyEntryDelete(chatID, userID)}}, s.lobbyCountDecrements(chatID, userID)...)
+	backoff := membershipBackoffBase
+	for attempt := 0; ; attempt++ {
+		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
+		if err == nil {
+			return true, nil
+		}
+		reasons, ok := cancellationReasons(err)
+		if !ok || len(reasons) != len(transactItems) {
+			return false, err
+		}
+		codes := make([]string, len(reasons))
+		for i, reason := range reasons {
+			codes[i] = aws.ToString(reason.Code)
+		}
+		switch {
+		case codes[0] == conditionalCheckFailedCode:
+			return false, nil
+		case isTransactionConflict(codes):
+			if attempt+1 >= maxMembershipAttempts {
+				return false, fmt.Errorf("leaving lobby of chat %x: %w", chatID.Value, err)
+			}
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(backoff + rand.N(backoff)):
+			}
+			backoff = min(2*backoff, membershipBackoffMax)
+		default:
+			return false, err
+		}
+	}
+}
+
+// GetLobbyEntries reads the user's partition as GetViewerStates does: one
+// strongly consistent point read for a single chat, else one strongly
+// consistent query bounded to the sort-key range the requested chats span,
+// with the rows not asked for dropped in memory.
+func (s *store) GetLobbyEntries(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.LobbyEntry, error) {
+	wanted := make(map[string]struct{}, len(chatIDs))
+	var lo, hi string
+	for _, chatID := range chatIDs {
+		sk := chatSK(chatID)
+		wanted[sk] = struct{}{}
+		if lo == "" || sk < lo {
+			lo = sk
+		}
+		if sk > hi {
+			hi = sk
+		}
+	}
+	out := make(map[string]chat.LobbyEntry, len(wanted))
+	if len(wanted) == 0 {
+		return out, nil
+	}
+
+	if len(wanted) == 1 {
+		res, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName:      aws.String(s.lobbiesTable),
+			Key:            lobbyKey(chatIDs[0], userID),
+			ConsistentRead: aws.Bool(true),
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(res.Item) == 0 {
+			return out, nil
+		}
+		entry, err := lobbyEntryFromItem(res.Item)
+		if err != nil {
+			return nil, err
+		}
+		out[string(chatIDs[0].Value)] = entry
+		return out, nil
+	}
+
+	var startKey map[string]types.AttributeValue
+	for {
+		res, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                aws.String(s.lobbiesTable),
+			KeyConditionExpression:   aws.String("#pk = :pk AND #sk BETWEEN :lo AND :hi"),
+			ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#sk": attrSK},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk": avS(userPK(userID)),
+				":lo": avS(lo),
+				":hi": avS(hi),
+			},
+			ConsistentRead:    aws.Bool(true),
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range res.Items {
+			if _, ok := wanted[asS(item[attrSK])]; !ok {
+				continue
+			}
+			chatID, err := chatIDFromSK(item)
+			if err != nil {
+				return nil, err
+			}
+			entry, err := lobbyEntryFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			out[string(chatID.Value)] = entry
+		}
+		if len(res.LastEvaluatedKey) == 0 {
+			return out, nil
+		}
+		startKey = res.LastEvaluatedKey
+	}
+}
+
+// GetLobbyPage is an ascending range on gsiLobbyByChat, which holds exactly
+// the lobby's entries in entry order, so the page is billed by what it
+// returns. The index projects every attribute, so the user comes with the
+// row's key. A page resumes from an exclusive start key built from the
+// position alone — the table key plus entered_at, which a position and the
+// chat name — so a cursor need not name an entry still in the index
+// (see GetGroupRosterPage for the same shape, and chat.LobbyPosition for the
+// tie order the index may not share). The read is eventually consistent, a
+// GSI's; see the table's doc for why that is the read that pays.
+func (s *store) GetLobbyPage(ctx context.Context, chatID *commonpb.ChatId, after *chat.LobbyPosition, limit int) ([]chat.LobbyEntry, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, fmt.Errorf("not a group chat id")
+	}
+
+	var startKey map[string]types.AttributeValue
+	if after != nil {
+		startKey = lobbyKey(chatID, after.UserID)
+		startKey[attrEnteredAt] = avN(uint64(after.EnteredAt.UnixNano()))
+	}
+
+	entries := make([]chat.LobbyEntry, 0)
+	for {
+		input := &dynamodb.QueryInput{
+			TableName:                 aws.String(s.lobbiesTable),
+			IndexName:                 aws.String(gsiLobbyByChat),
+			KeyConditionExpression:    aws.String("#sk = :chat"),
+			ExpressionAttributeNames:  map[string]string{"#sk": attrSK},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":chat": avS(chatSK(chatID))},
+			ExclusiveStartKey:         startKey,
+		}
+		if limit > 0 {
+			input.Limit = aws.Int32(int32(limit - len(entries)))
+		}
+		out, err := s.client.Query(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			entry, err := lobbyEntryFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, entry)
+			if limit > 0 && len(entries) == limit {
+				return entries, nil
+			}
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			return entries, nil
+		}
+		startKey = out.LastEvaluatedKey
+	}
+}
+
+// AdmitFromLobby is the join transition (see addGroupMembers) carrying the
+// lobby's side of the admission alongside: the entry's conditional delete,
+// its two count decrements and an unconditional put of the key envelope, so
+// the four commit with the membership or not at all. A failed delete
+// condition is the user not waiting, reported as ErrNotInLobby. A join that
+// is a no-op — the user was a member already — writes nothing, the entry
+// included: the caller gates on membership before asking, so an entry left
+// behind this way is a race's residue the user clears by leaving the lobby.
+func (s *store) AdmitFromLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (bool, chat.RosterSummary, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return false, chat.RosterSummary{}, fmt.Errorf("not a group chat id")
+	}
+	if envelope.WrappedBy == nil {
+		return false, chat.RosterSummary{}, fmt.Errorf("key envelope has no wrapper")
+	}
+
+	roster, err := s.readRosterSummaryForWrite(ctx, chatID)
+	if err != nil {
+		return false, chat.RosterSummary{}, err
+	}
+
+	alongside := append([]types.TransactWriteItem{{Delete: s.lobbyEntryDelete(chatID, userID)}}, s.lobbyCountDecrements(chatID, userID)...)
+	alongside = append(alongside, types.TransactWriteItem{Put: &types.Put{
+		TableName: aws.String(s.keyEnvelopesTable),
+		Item:      keyEnvelopeItem(chatID, userID, envelope),
+	}})
+	changed, err := s.transitionMembership(ctx, chatID, s.joinUpdate(chatID, userID), 1, &roster, alongside)
+	var failed alongsideConditionFailed
+	if errors.As(err, &failed) && failed.Index == 0 {
+		return false, roster, chat.ErrNotInLobby
+	}
+	return changed, roster, err
+}
+
+// lobbyKey is the key of userID's entry in chatID's lobby in chat_lobbies.
+func lobbyKey(chatID *commonpb.ChatId, userID *commonpb.UserId) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		attrPK: avS(userPK(userID)),
+		attrSK: avS(chatSK(chatID)),
+	}
+}
+
+// lobbyEntryDelete removes userID's entry in chatID's lobby, conditionally on
+// its existing, so the transaction it rides tells a user who was waiting from
+// one who was not.
+func (s *store) lobbyEntryDelete(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.Delete {
+	return &types.Delete{
+		TableName:                aws.String(s.lobbiesTable),
+		Key:                      lobbyKey(chatID, userID),
+		ConditionExpression:      aws.String("attribute_exists(#pk)"),
+		ExpressionAttributeNames: map[string]string{"#pk": attrPK},
+	}
+}
+
+// lobbyCountDecrements move the lobby's size and the user's lobby count down
+// by one, for the transaction that removes an entry.
+func (s *store) lobbyCountDecrements(chatID *commonpb.ChatId, userID *commonpb.UserId) []types.TransactWriteItem {
+	return []types.TransactWriteItem{
+		{Update: s.lobbyCountUpdate(chatPK(chatID), -1, 0)},
+		{Update: s.lobbyCountUpdate(userPK(userID), -1, 0)},
+	}
+}
+
+// lobbyCountUpdate moves the lobby_count of the #meta item under pk by delta,
+// creating the item on first use. An increment is conditioned on the count
+// being under limit, so the transaction it rides cancels at the cap. The item
+// carries no entered_at, so it stays out of gsiLobbyByChat.
+func (s *store) lobbyCountUpdate(pk string, delta int64, limit int) *types.Update {
+	update := &types.Update{
+		TableName: aws.String(s.lobbiesTable),
+		Key: map[string]types.AttributeValue{
+			attrPK: avS(pk),
+			attrSK: avS(skMeta),
+		},
+		UpdateExpression:          aws.String(fmt.Sprintf("ADD %s :delta", attrLobbyCount)),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":delta": avInt(delta)},
+	}
+	if delta > 0 {
+		update.ConditionExpression = aws.String(fmt.Sprintf("attribute_not_exists(%s) OR %s < :limit", attrLobbyCount, attrLobbyCount))
+		update.ExpressionAttributeValues[":limit"] = avInt(int64(limit))
+	}
+	return update
+}
+
+// lobbyEntryFromItem reads a chat_lobbies entry: the user from its pk, and
+// when they entered.
+func lobbyEntryFromItem(item map[string]types.AttributeValue) (chat.LobbyEntry, error) {
+	userID, err := userIDFromPK(item)
+	if err != nil {
+		return chat.LobbyEntry{}, err
+	}
+	nanos, err := parseN(item[attrEnteredAt])
+	if err != nil {
+		return chat.LobbyEntry{}, fmt.Errorf("reading lobby entry: %w", err)
+	}
+	return chat.LobbyEntry{UserID: userID, EnteredAt: time.Unix(0, int64(nanos)).UTC()}, nil
 }

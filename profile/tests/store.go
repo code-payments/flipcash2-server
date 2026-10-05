@@ -26,10 +26,12 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testPhoneEmailTransfer,
 		testGetPhonesByHashes,
 		testGetPhoneNumbersForPayment,
-		testGetPublicProfiles,
+		testGetLimitedPublicProfilesForRow,
 		testGetUserIdByPhoneNumber,
 		testLinkPhoneNumberForPayment,
 		testProfilePictures,
+		testCoverPictures,
+		testBioStore,
 		testFlipcardColor,
 		testMinDmChatInitFeeStore,
 		testUsername,
@@ -47,7 +49,7 @@ func testStore(t *testing.T, s profile.Store) {
 
 	userID := model.MustGenerateUserID()
 
-	_, err := s.GetProfile(ctx, userID, false)
+	_, err := s.GetFullProfile(ctx, userID, false)
 	require.ErrorIs(t, err, profile.ErrNotFound)
 
 	require.NoError(t, s.UnlinkPhoneNumber(ctx, userID, "+12223334444"))
@@ -57,19 +59,19 @@ func testStore(t *testing.T, s profile.Store) {
 	require.NoError(t, s.LinkPhoneNumber(ctx, userID, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
 	require.NoError(t, s.LinkEmailAddress(ctx, userID, "someone@gmail.com"))
 
-	profile, err := s.GetProfile(ctx, userID, false)
+	profile, err := s.GetFullProfile(ctx, userID, false)
 	require.NoError(t, err)
 	require.Equal(t, "my name", profile.DisplayName)
 
 	require.NoError(t, s.SetDisplayName(ctx, userID, "my other name"))
 
-	profile, err = s.GetProfile(ctx, userID, false)
+	profile, err = s.GetFullProfile(ctx, userID, false)
 	require.NoError(t, err)
 	require.Equal(t, "my other name", profile.DisplayName)
 	require.Nil(t, profile.PhoneNumber)
 	require.Nil(t, profile.EmailAddress)
 
-	profile, err = s.GetProfile(ctx, userID, true)
+	profile, err = s.GetFullProfile(ctx, userID, true)
 	require.NoError(t, err)
 	require.Equal(t, "my other name", profile.DisplayName)
 	require.Equal(t, "+12223334444", profile.PhoneNumber.Value)
@@ -78,7 +80,7 @@ func testStore(t *testing.T, s profile.Store) {
 	require.NoError(t, s.UnlinkPhoneNumber(ctx, userID, "+15556667777"))
 	require.NoError(t, s.UnlinkEmailAddress(ctx, userID, "someone.else@gmail.com"))
 
-	profile, err = s.GetProfile(ctx, userID, true)
+	profile, err = s.GetFullProfile(ctx, userID, true)
 	require.NoError(t, err)
 	require.Equal(t, "my other name", profile.DisplayName)
 	require.Equal(t, "+12223334444", profile.PhoneNumber.Value)
@@ -86,14 +88,14 @@ func testStore(t *testing.T, s profile.Store) {
 
 	require.NoError(t, s.UnlinkPhoneNumber(ctx, userID, "+12223334444"))
 
-	profile, err = s.GetProfile(ctx, userID, true)
+	profile, err = s.GetFullProfile(ctx, userID, true)
 	require.NoError(t, err)
 	require.Nil(t, profile.PhoneNumber)
 	require.NotNil(t, profile.EmailAddress)
 
 	require.NoError(t, s.UnlinkEmailAddress(ctx, userID, "someone@gmail.com"))
 
-	profile, err = s.GetProfile(ctx, userID, true)
+	profile, err = s.GetFullProfile(ctx, userID, true)
 	require.NoError(t, err)
 	require.Nil(t, profile.PhoneNumber)
 	require.Nil(t, profile.EmailAddress)
@@ -116,7 +118,7 @@ func testPhoneEmailTransfer(t *testing.T, s profile.Store) {
 	require.NoError(t, s.LinkPhoneNumber(ctx, userID1, phone, phoneHash))
 	require.NoError(t, s.LinkEmailAddress(ctx, userID1, email))
 
-	p, err := s.GetProfile(ctx, userID1, true)
+	p, err := s.GetFullProfile(ctx, userID1, true)
 	require.NoError(t, err)
 	require.Equal(t, phone, p.PhoneNumber.Value)
 	require.Equal(t, email, p.EmailAddress.Value)
@@ -125,12 +127,12 @@ func testPhoneEmailTransfer(t *testing.T, s profile.Store) {
 	require.NoError(t, s.LinkPhoneNumber(ctx, userID2, phone, phoneHash))
 	require.NoError(t, s.LinkEmailAddress(ctx, userID2, email))
 
-	p, err = s.GetProfile(ctx, userID1, true)
+	p, err = s.GetFullProfile(ctx, userID1, true)
 	require.NoError(t, err)
 	require.Nil(t, p.PhoneNumber)
 	require.Nil(t, p.EmailAddress)
 
-	p, err = s.GetProfile(ctx, userID2, true)
+	p, err = s.GetFullProfile(ctx, userID2, true)
 	require.NoError(t, err)
 	require.Equal(t, phone, p.PhoneNumber.Value)
 	require.Equal(t, email, p.EmailAddress.Value)
@@ -139,7 +141,7 @@ func testPhoneEmailTransfer(t *testing.T, s profile.Store) {
 	require.NoError(t, s.LinkPhoneNumber(ctx, userID2, phone, phoneHash))
 	require.NoError(t, s.LinkEmailAddress(ctx, userID2, email))
 
-	p, err = s.GetProfile(ctx, userID2, true)
+	p, err = s.GetFullProfile(ctx, userID2, true)
 	require.NoError(t, err)
 	require.Equal(t, phone, p.PhoneNumber.Value)
 	require.Equal(t, email, p.EmailAddress.Value)
@@ -184,7 +186,7 @@ func testXProfiles(t *testing.T, s profile.Store) {
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(expected1, actual))
 
-	fullProfile, err := s.GetProfile(ctx, userID1, false)
+	fullProfile, err := s.GetFullProfile(ctx, userID1, false)
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(expected1, fullProfile.SocialProfiles[0].GetX()))
 
@@ -198,7 +200,7 @@ func testXProfiles(t *testing.T, s profile.Store) {
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(expected1, actual))
 
-	fullProfile, err = s.GetProfile(ctx, userID2, false)
+	fullProfile, err = s.GetFullProfile(ctx, userID2, false)
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(expected1, fullProfile.SocialProfiles[0].GetX()))
 
@@ -218,7 +220,7 @@ func testXProfiles(t *testing.T, s profile.Store) {
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(expected3, actual))
 
-	fullProfile, err = s.GetProfile(ctx, userID2, false)
+	fullProfile, err = s.GetFullProfile(ctx, userID2, false)
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(expected3, fullProfile.SocialProfiles[0].GetX()))
 
@@ -229,7 +231,7 @@ func testXProfiles(t *testing.T, s profile.Store) {
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(expected3, actual))
 
-	fullProfile, err = s.GetProfile(ctx, userID2, false)
+	fullProfile, err = s.GetFullProfile(ctx, userID2, false)
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(expected3, fullProfile.SocialProfiles[0].GetX()))
 
@@ -238,7 +240,7 @@ func testXProfiles(t *testing.T, s profile.Store) {
 	_, err = s.GetXProfile(ctx, userID2)
 	require.Equal(t, profile.ErrNotFound, err)
 
-	fullProfile, err = s.GetProfile(ctx, userID2, false)
+	fullProfile, err = s.GetFullProfile(ctx, userID2, false)
 	require.NoError(t, err)
 	require.Empty(t, fullProfile.SocialProfiles)
 }
@@ -370,38 +372,38 @@ func testFlipcardColor(t *testing.T, s profile.Store) {
 	// A user who has picked no colour still reads back a complete customization,
 	// resolved from the default.
 	require.NoError(t, s.SetDisplayName(ctx, user1, "user one"))
-	p, err := s.GetProfile(ctx, user1, false)
+	p, err := s.GetFullProfile(ctx, user1, false)
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(profile.DefaultFlipcardCustomization(), p.FlipcardCustomization))
 
 	// Setting a colour is enough on its own to make the store know a user, the
 	// same way setting any other profile field is.
 	require.NoError(t, s.SetFlipcardColor(ctx, user2, "#19191A"))
-	p, err = s.GetProfile(ctx, user2, false)
+	p, err = s.GetFullProfile(ctx, user2, false)
 	require.NoError(t, err)
 	require.Equal(t, "#19191A", p.FlipcardCustomization.Color.Hex)
 
 	// Colours are per user: user2's choice does not reach user1.
-	p, err = s.GetProfile(ctx, user1, false)
+	p, err = s.GetFullProfile(ctx, user1, false)
 	require.NoError(t, err)
 	require.Equal(t, profile.DefaultFlipcardColorHex, p.FlipcardCustomization.Color.Hex)
 
 	// A second set replaces the first rather than accumulating.
 	require.NoError(t, s.SetFlipcardColor(ctx, user2, "#FFFFFF"))
-	p, err = s.GetProfile(ctx, user2, false)
+	p, err = s.GetFullProfile(ctx, user2, false)
 	require.NoError(t, err)
 	require.Equal(t, "#FFFFFF", p.FlipcardCustomization.Color.Hex)
 
 	// Whatever casing reached the store, reads are canonical.
 	require.NoError(t, s.SetFlipcardColor(ctx, user2, "#abcdef"))
-	p, err = s.GetProfile(ctx, user2, false)
+	p, err = s.GetFullProfile(ctx, user2, false)
 	require.NoError(t, err)
 	require.Equal(t, "#ABCDEF", p.FlipcardCustomization.Color.Hex)
 
 	// The batch read resolves the same way as the single one — it is the path
 	// chat member rows are built from, so a default missed here would leave a
 	// member row failing validation.
-	got, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{user1, user2})
+	got, err := s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{user1, user2})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	require.NoError(t, got[string(user1.Value)].Validate())
@@ -419,7 +421,7 @@ func testMinDmChatInitFeeStore(t *testing.T, s profile.Store) {
 	// A user who has set no fee reads back none: the server default applies,
 	// and is not the store's to resolve.
 	require.NoError(t, s.SetDisplayName(ctx, user1, "user one"))
-	p, err := s.GetProfile(ctx, user1, false)
+	p, err := s.GetFullProfile(ctx, user1, false)
 	require.NoError(t, err)
 	require.Nil(t, p.MinDmChatInitFee)
 
@@ -427,12 +429,12 @@ func testMinDmChatInitFeeStore(t *testing.T, s profile.Store) {
 	// way setting any other profile field is.
 	fee := &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: 5}
 	require.NoError(t, s.SetMinDmChatInitFee(ctx, user2, fee))
-	p, err = s.GetProfile(ctx, user2, false)
+	p, err = s.GetFullProfile(ctx, user2, false)
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(fee, p.MinDmChatInitFee))
 
 	// Fees are per user: user2's choice does not reach user1.
-	p, err = s.GetProfile(ctx, user1, false)
+	p, err = s.GetFullProfile(ctx, user1, false)
 	require.NoError(t, err)
 	require.Nil(t, p.MinDmChatInitFee)
 
@@ -440,23 +442,25 @@ func testMinDmChatInitFeeStore(t *testing.T, s profile.Store) {
 	// accumulating.
 	fee = &commonpb.FiatPaymentAmount{Currency: "eur", NativeAmount: 2.5}
 	require.NoError(t, s.SetMinDmChatInitFee(ctx, user2, fee))
-	p, err = s.GetProfile(ctx, user2, false)
+	p, err = s.GetFullProfile(ctx, user2, false)
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(fee, p.MinDmChatInitFee))
 
 	// The fee is public, so it is present on reads that carry no private fields,
 	// through both the single and the batch path.
-	p, err = s.GetProfile(ctx, user2, true)
+	p, err = s.GetFullProfile(ctx, user2, true)
 	require.NoError(t, err)
 	require.NoError(t, protoutil.ProtoEqualError(fee, p.MinDmChatInitFee))
 
-	got, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{user1, user2})
+	// The fee is not part of a row, so the batch read never carries it, set or
+	// not.
+	got, err := s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{user1, user2})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	require.NoError(t, got[string(user1.Value)].Validate())
 	require.NoError(t, got[string(user2.Value)].Validate())
 	require.Nil(t, got[string(user1.Value)].MinDmChatInitFee)
-	require.NoError(t, protoutil.ProtoEqualError(fee, got[string(user2.Value)].MinDmChatInitFee))
+	require.Nil(t, got[string(user2.Value)].MinDmChatInitFee)
 }
 
 func testUsername(t *testing.T, s profile.Store) {
@@ -468,7 +472,7 @@ func testUsername(t *testing.T, s profile.Store) {
 	// A user who has claimed nothing has no handle, and their profile is still a
 	// complete one.
 	require.NoError(t, s.SetDisplayName(ctx, user1, "user one"))
-	p, err := s.GetProfile(ctx, user1, false)
+	p, err := s.GetFullProfile(ctx, user1, false)
 	require.NoError(t, err)
 	require.Nil(t, p.Username)
 	require.NoError(t, p.Validate())
@@ -486,7 +490,7 @@ func testUsername(t *testing.T, s profile.Store) {
 
 	require.NoError(t, s.SetUsername(ctx, user1, "user_one"))
 
-	p, err = s.GetProfile(ctx, user1, false)
+	p, err = s.GetFullProfile(ctx, user1, false)
 	require.NoError(t, err)
 	require.Equal(t, "user_one", p.Username.Value)
 	require.NoError(t, p.Validate())
@@ -494,7 +498,7 @@ func testUsername(t *testing.T, s profile.Store) {
 	// Claiming a handle is enough on its own to make the store know a user, the
 	// same way setting any other profile field is.
 	require.NoError(t, s.SetUsername(ctx, user2, "user_two"))
-	p, err = s.GetProfile(ctx, user2, false)
+	p, err = s.GetFullProfile(ctx, user2, false)
 	require.NoError(t, err)
 	require.Equal(t, "user_two", p.Username.Value)
 
@@ -508,20 +512,20 @@ func testUsername(t *testing.T, s profile.Store) {
 	// A handle has one holder: a second user cannot take it, and the failed claim
 	// leaves the handle they already held alone.
 	require.ErrorIs(t, s.SetUsername(ctx, user2, "user_one"), profile.ErrUsernameTaken)
-	p, err = s.GetProfile(ctx, user2, false)
+	p, err = s.GetFullProfile(ctx, user2, false)
 	require.NoError(t, err)
 	require.Equal(t, "user_two", p.Username.Value)
 
 	// Re-claiming the handle a user already holds is a no-op, not a conflict.
 	require.NoError(t, s.SetUsername(ctx, user1, "user_one"))
-	p, err = s.GetProfile(ctx, user1, false)
+	p, err = s.GetFullProfile(ctx, user1, false)
 	require.NoError(t, err)
 	require.Equal(t, "user_one", p.Username.Value)
 
 	// Changing a handle replaces the old one rather than accumulating, and frees
 	// it for anyone else to take.
 	require.NoError(t, s.SetUsername(ctx, user1, "renamed"))
-	p, err = s.GetProfile(ctx, user1, false)
+	p, err = s.GetFullProfile(ctx, user1, false)
 	require.NoError(t, err)
 	require.Equal(t, "renamed", p.Username.Value)
 
@@ -538,7 +542,7 @@ func testUsername(t *testing.T, s profile.Store) {
 	noUsername := model.MustGenerateUserID()
 	require.NoError(t, s.SetDisplayName(ctx, noUsername, "no handle"))
 
-	publicProfiles, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{user1, user2, noUsername})
+	publicProfiles, err := s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{user1, user2, noUsername})
 	require.NoError(t, err)
 	require.Len(t, publicProfiles, 3)
 	require.Equal(t, "renamed", publicProfiles[string(user1.Value)].Username.Value)
@@ -558,10 +562,10 @@ func testUsernameAutoAssigned(t *testing.T, s profile.Store) {
 		t.Helper()
 		autoAssigned, err := s.IsUsernameAutoAssigned(ctx, userID)
 		require.NoError(t, err)
-		privateProfile, err := s.GetProfile(ctx, userID, true)
+		privateProfile, err := s.GetFullProfile(ctx, userID, true)
 		require.NoError(t, err)
 		require.Equal(t, autoAssigned, privateProfile.IsUsernameAutoAssigned)
-		publicProfile, err := s.GetProfile(ctx, userID, false)
+		publicProfile, err := s.GetFullProfile(ctx, userID, false)
 		require.NoError(t, err)
 		require.False(t, publicProfile.IsUsernameAutoAssigned)
 		return autoAssigned
@@ -606,7 +610,7 @@ func testUsernameAutoAssigned(t *testing.T, s profile.Store) {
 	// auto-assigned.
 	require.NoError(t, s.SetUsername(ctx, defaulted, "jeff_yanta_2"))
 	require.True(t, autoAssigned(defaulted))
-	p, err := s.GetProfile(ctx, defaulted, false)
+	p, err := s.GetFullProfile(ctx, defaulted, false)
 	require.NoError(t, err)
 	require.Equal(t, "jeff_yanta_2", p.Username.Value)
 
@@ -636,7 +640,7 @@ func testDefaultUsernameStore(t *testing.T, s profile.Store) {
 
 	username := func(userID *commonpb.UserId) string {
 		t.Helper()
-		p, err := s.GetProfile(ctx, userID, false)
+		p, err := s.GetFullProfile(ctx, userID, false)
 		require.NoError(t, err)
 		return p.GetUsername().GetValue()
 	}
@@ -646,7 +650,7 @@ func testDefaultUsernameStore(t *testing.T, s profile.Store) {
 		result, err := s.SetDisplayNameWithDefaultUsername(ctx, userID, displayName, base)
 		require.NoError(t, err)
 		require.False(t, result.NoneAvailable)
-		p, err := s.GetProfile(ctx, userID, false)
+		p, err := s.GetFullProfile(ctx, userID, false)
 		require.NoError(t, err)
 		require.Equal(t, displayName, p.DisplayName)
 		require.Equal(t, result.Username, p.GetUsername().GetValue())
@@ -708,7 +712,7 @@ func testDefaultUsernameStore(t *testing.T, s profile.Store) {
 	result, err = s.SetDisplayNameWithDefaultUsername(ctx, saturated, "Developers X", "developers_x")
 	require.NoError(t, err)
 	require.Equal(t, profile.DefaultUsernameResult{NoneAvailable: true}, result)
-	p, err := s.GetProfile(ctx, saturated, false)
+	p, err := s.GetFullProfile(ctx, saturated, false)
 	require.NoError(t, err)
 	require.Equal(t, "Developers X", p.DisplayName)
 	require.Nil(t, p.Username)
@@ -747,7 +751,7 @@ func testDefaultUsernameStore(t *testing.T, s profile.Store) {
 	require.Len(t, seen, concurrent)
 }
 
-func testGetPublicProfiles(t *testing.T, s profile.Store) {
+func testGetLimitedPublicProfilesForRow(t *testing.T, s profile.Store) {
 	ctx := context.Background()
 
 	user1 := model.MustGenerateUserID()
@@ -755,12 +759,12 @@ func testGetPublicProfiles(t *testing.T, s profile.Store) {
 	unknown := model.MustGenerateUserID()
 
 	// Empty input.
-	got, err := s.GetPublicProfiles(ctx, nil)
+	got, err := s.GetLimitedPublicProfilesForRow(ctx, nil)
 	require.NoError(t, err)
 	require.Empty(t, got)
 
 	// Nobody is known to the store yet.
-	got, err = s.GetPublicProfiles(ctx, []*commonpb.UserId{user1, user2})
+	got, err = s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{user1, user2})
 	require.NoError(t, err)
 	require.Empty(t, got)
 
@@ -768,7 +772,7 @@ func testGetPublicProfiles(t *testing.T, s profile.Store) {
 	require.NoError(t, s.SetDisplayName(ctx, user2, "user two"))
 
 	// Known users are returned keyed by user ID; unknown ones are absent.
-	got, err = s.GetPublicProfiles(ctx, []*commonpb.UserId{user1, user2, unknown})
+	got, err = s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{user1, user2, unknown})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	require.Equal(t, "user one", got[string(user1.Value)].DisplayName)
@@ -789,7 +793,7 @@ func testGetPublicProfiles(t *testing.T, s profile.Store) {
 	require.NoError(t, s.LinkPhoneNumber(ctx, user1, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
 	require.NoError(t, s.LinkEmailAddress(ctx, user1, "someone@gmail.com"))
 
-	got, err = s.GetPublicProfiles(ctx, []*commonpb.UserId{user1})
+	got, err = s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{user1})
 	require.NoError(t, err)
 	require.Nil(t, got[string(user1.Value)].PhoneNumber)
 	require.Nil(t, got[string(user1.Value)].EmailAddress)
@@ -799,7 +803,7 @@ func testGetPublicProfiles(t *testing.T, s profile.Store) {
 	noName := model.MustGenerateUserID()
 	require.NoError(t, s.SetProfilePicture(ctx, noName, blob.MustGenerateID()))
 
-	got, err = s.GetPublicProfiles(ctx, []*commonpb.UserId{noName})
+	got, err = s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{noName})
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Empty(t, got[string(noName.Value)].DisplayName)
@@ -807,9 +811,20 @@ func testGetPublicProfiles(t *testing.T, s profile.Store) {
 
 	// A rename is reflected on the next read.
 	require.NoError(t, s.SetDisplayName(ctx, user1, "user one renamed"))
-	got, err = s.GetPublicProfiles(ctx, []*commonpb.UserId{user1})
+	got, err = s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{user1})
 	require.NoError(t, err)
 	require.Equal(t, "user one renamed", got[string(user1.Value)].DisplayName)
+
+	// The bio, cover picture and DM fee are public, but belong to the profile
+	// view alone: a row profile never carries them, even once set.
+	require.NoError(t, s.SetBio(ctx, user1, "a bio"))
+	require.NoError(t, s.SetCoverPicture(ctx, user1, blob.MustGenerateID()))
+	require.NoError(t, s.SetMinDmChatInitFee(ctx, user1, &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: 5}))
+	got, err = s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{user1})
+	require.NoError(t, err)
+	require.Empty(t, got[string(user1.Value)].Bio)
+	require.Nil(t, got[string(user1.Value)].CoverPicture)
+	require.Nil(t, got[string(user1.Value)].MinDmChatInitFee)
 }
 
 func testGetUserIdByPhoneNumber(t *testing.T, s profile.Store) {
@@ -976,11 +991,11 @@ func testProfilePictures(t *testing.T, s profile.Store) {
 	}
 
 	t.Run("Unset", func(t *testing.T) {
-		profiles, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{userID})
+		profiles, err := s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{userID})
 		require.NoError(t, err)
 		require.Empty(t, profiles)
 
-		profiles, err = s.GetPublicProfiles(ctx, nil)
+		profiles, err = s.GetLimitedPublicProfilesForRow(ctx, nil)
 		require.NoError(t, err)
 		require.Empty(t, profiles)
 	})
@@ -991,11 +1006,11 @@ func testProfilePictures(t *testing.T, s profile.Store) {
 		require.NoError(t, s.SetProfilePicture(ctx, userID, first))
 
 		// A picture alone is enough of a profile to exist, even with no display name.
-		p, err := s.GetProfile(ctx, userID, false)
+		p, err := s.GetFullProfile(ctx, userID, false)
 		require.NoError(t, err)
 		require.Equal(t, first.Value, pictureBlob(p).Value)
 
-		profiles, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{userID, otherUserID})
+		profiles, err := s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{userID, otherUserID})
 		require.NoError(t, err)
 		require.Len(t, profiles, 1)
 		require.Equal(t, first.Value, pictureBlob(profiles[string(userID.Value)]).Value)
@@ -1006,11 +1021,11 @@ func testProfilePictures(t *testing.T, s profile.Store) {
 	t.Run("Replace", func(t *testing.T) {
 		require.NoError(t, s.SetProfilePicture(ctx, userID, second))
 
-		p, err := s.GetProfile(ctx, userID, false)
+		p, err := s.GetFullProfile(ctx, userID, false)
 		require.NoError(t, err)
 		require.Equal(t, second.Value, pictureBlob(p).Value)
 
-		profiles, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{userID})
+		profiles, err := s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{userID})
 		require.NoError(t, err)
 		require.Equal(t, second.Value, pictureBlob(profiles[string(userID.Value)]).Value)
 	})
@@ -1018,7 +1033,7 @@ func testProfilePictures(t *testing.T, s profile.Store) {
 	t.Run("Set the same picture again", func(t *testing.T) {
 		require.NoError(t, s.SetProfilePicture(ctx, userID, second))
 
-		p, err := s.GetProfile(ctx, userID, false)
+		p, err := s.GetFullProfile(ctx, userID, false)
 		require.NoError(t, err)
 		require.Equal(t, second.Value, pictureBlob(p).Value)
 	})
@@ -1027,7 +1042,7 @@ func testProfilePictures(t *testing.T, s profile.Store) {
 		third := blob.MustGenerateID()
 		require.NoError(t, s.SetProfilePicture(ctx, otherUserID, third))
 
-		profiles, err := s.GetPublicProfiles(ctx, []*commonpb.UserId{userID, otherUserID})
+		profiles, err := s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{userID, otherUserID})
 		require.NoError(t, err)
 		require.Len(t, profiles, 2)
 		require.Equal(t, second.Value, pictureBlob(profiles[string(userID.Value)]).Value)
@@ -1047,7 +1062,7 @@ func testJoinTs(t *testing.T, s profile.Store) {
 	// The timestamp is public: it comes back whether or not private fields were
 	// asked for, and it reflects when the user first became known to the store.
 	for _, includePrivateFields := range []bool{false, true} {
-		p, err := s.GetProfile(ctx, userID, includePrivateFields)
+		p, err := s.GetFullProfile(ctx, userID, includePrivateFields)
 		require.NoError(t, err)
 		require.NoError(t, p.Validate())
 		require.NotNil(t, p.JoinTs)
@@ -1056,7 +1071,7 @@ func testJoinTs(t *testing.T, s profile.Store) {
 		require.True(t, joinedAt.Before(after), "join ts %s is after %s", joinedAt, after)
 	}
 
-	p, err := s.GetProfile(ctx, userID, false)
+	p, err := s.GetFullProfile(ctx, userID, false)
 	require.NoError(t, err)
 	joinedAt := p.JoinTs.AsTime()
 
@@ -1065,7 +1080,7 @@ func testJoinTs(t *testing.T, s profile.Store) {
 	require.NoError(t, s.LinkPhoneNumber(ctx, userID, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
 	require.NoError(t, s.LinkEmailAddress(ctx, userID, "someone@gmail.com"))
 
-	p, err = s.GetProfile(ctx, userID, true)
+	p, err = s.GetFullProfile(ctx, userID, true)
 	require.NoError(t, err)
 	require.Equal(t, joinedAt, p.JoinTs.AsTime())
 
@@ -1080,8 +1095,127 @@ func testJoinTs(t *testing.T, s profile.Store) {
 		FollowerCount: 42,
 	}, "accessToken"))
 
-	p, err = s.GetProfile(ctx, userID, false)
+	p, err = s.GetFullProfile(ctx, userID, false)
 	require.NoError(t, err)
 	require.NoError(t, p.Validate())
 	require.Equal(t, joinedAt, p.JoinTs.AsTime())
+}
+
+func testCoverPictures(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	userID := model.MustGenerateUserID()
+	otherUserID := model.MustGenerateUserID()
+
+	coverBlob := func(p *profilepb.UserProfile) *blobpb.BlobId {
+		t.Helper()
+		renditions := p.GetCoverPicture().GetRenditions()
+		require.Len(t, renditions, 1)
+		require.Equal(t, blobpb.Rendition_ORIGINAL, renditions[0].Role)
+		return renditions[0].BlobId
+	}
+
+	first := blob.MustGenerateID()
+
+	t.Run("Set", func(t *testing.T) {
+		require.NoError(t, s.SetCoverPicture(ctx, userID, first))
+
+		// A cover picture alone is enough of a profile to exist.
+		p, err := s.GetFullProfile(ctx, userID, false)
+		require.NoError(t, err)
+		require.Equal(t, first.Value, coverBlob(p).Value)
+
+		// It is its own picture: setting it leaves the profile picture unset.
+		require.Nil(t, p.ProfilePicture)
+	})
+
+	second := blob.MustGenerateID()
+
+	t.Run("Replace", func(t *testing.T) {
+		require.NoError(t, s.SetCoverPicture(ctx, userID, second))
+
+		p, err := s.GetFullProfile(ctx, userID, false)
+		require.NoError(t, err)
+		require.Equal(t, second.Value, coverBlob(p).Value)
+	})
+
+	t.Run("Set the same picture again", func(t *testing.T) {
+		require.NoError(t, s.SetCoverPicture(ctx, userID, second))
+
+		p, err := s.GetFullProfile(ctx, userID, false)
+		require.NoError(t, err)
+		require.Equal(t, second.Value, coverBlob(p).Value)
+	})
+
+	t.Run("Independent of the profile picture", func(t *testing.T) {
+		picture := blob.MustGenerateID()
+		require.NoError(t, s.SetProfilePicture(ctx, userID, picture))
+
+		p, err := s.GetFullProfile(ctx, userID, false)
+		require.NoError(t, err)
+		require.Equal(t, second.Value, coverBlob(p).Value)
+		require.Equal(t, picture.Value, p.GetProfilePicture().GetRenditions()[0].BlobId.Value)
+	})
+
+	t.Run("Pictures are per user", func(t *testing.T) {
+		third := blob.MustGenerateID()
+		require.NoError(t, s.SetCoverPicture(ctx, otherUserID, third))
+
+		p, err := s.GetFullProfile(ctx, userID, false)
+		require.NoError(t, err)
+		require.Equal(t, second.Value, coverBlob(p).Value)
+
+		p, err = s.GetFullProfile(ctx, otherUserID, false)
+		require.NoError(t, err)
+		require.Equal(t, third.Value, coverBlob(p).Value)
+	})
+}
+
+func testBioStore(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	userID := model.MustGenerateUserID()
+
+	bio := func() string {
+		t.Helper()
+		p, err := s.GetFullProfile(ctx, userID, false)
+		require.NoError(t, err)
+		return p.Bio
+	}
+
+	t.Run("Set", func(t *testing.T) {
+		// A bio alone is enough of a profile to exist.
+		require.NoError(t, s.SetBio(ctx, userID, "first bio"))
+		require.Equal(t, "first bio", bio())
+	})
+
+	t.Run("Stored as written", func(t *testing.T) {
+		written := "  two\nlines, with spaces around  "
+		require.NoError(t, s.SetBio(ctx, userID, written))
+		require.Equal(t, written, bio())
+	})
+
+	t.Run("Replace", func(t *testing.T) {
+		require.NoError(t, s.SetBio(ctx, userID, "second bio"))
+		require.Equal(t, "second bio", bio())
+	})
+
+	t.Run("Clear", func(t *testing.T) {
+		require.NoError(t, s.SetBio(ctx, userID, ""))
+		require.Empty(t, bio())
+
+		// A cleared bio reads back exactly as one never set, on both reads.
+		p, err := s.GetFullProfile(ctx, userID, true)
+		require.NoError(t, err)
+		require.Empty(t, p.Bio)
+	})
+
+	t.Run("Public on every read", func(t *testing.T) {
+		require.NoError(t, s.SetBio(ctx, userID, "public bio"))
+		for _, includePrivate := range []bool{false, true} {
+			p, err := s.GetFullProfile(ctx, userID, includePrivate)
+			require.NoError(t, err)
+			require.Equal(t, "public bio", p.Bio)
+		}
+	})
 }

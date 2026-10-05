@@ -87,7 +87,7 @@ func (m *InMemoryStore) ensureProfile(key string) *profilepb.UserProfile {
 	return p
 }
 
-func (m *InMemoryStore) GetProfile(_ context.Context, id *commonpb.UserId, includePrivateProfile bool) (*profilepb.UserProfile, error) {
+func (m *InMemoryStore) GetFullProfile(_ context.Context, id *commonpb.UserId, includePrivateProfile bool) (*profilepb.UserProfile, error) {
 	m.Lock()
 	defer m.Unlock()
 
@@ -138,6 +138,33 @@ func (m *InMemoryStore) SetProfilePicture(_ context.Context, id *commonpb.UserId
 			BlobId: proto.Clone(blobID).(*blobpb.BlobId),
 		}},
 	}
+
+	return nil
+}
+
+func (m *InMemoryStore) SetCoverPicture(_ context.Context, id *commonpb.UserId, blobID *blobpb.BlobId) error {
+	m.Lock()
+	defer m.Unlock()
+
+	p := m.ensureProfile(userIDCacheKey(id))
+
+	// Only the ORIGINAL is stored, as for the profile picture.
+	p.CoverPicture = &blobpb.Media{
+		Renditions: []*blobpb.Rendition{{
+			Role:   blobpb.Rendition_ORIGINAL,
+			BlobId: proto.Clone(blobID).(*blobpb.BlobId),
+		}},
+	}
+
+	return nil
+}
+
+func (m *InMemoryStore) SetBio(_ context.Context, id *commonpb.UserId, bio string) error {
+	m.Lock()
+	defer m.Unlock()
+
+	p := m.ensureProfile(userIDCacheKey(id))
+	p.Bio = bio
 
 	return nil
 }
@@ -300,7 +327,7 @@ func (m *InMemoryStore) GetUserIdByUsername(_ context.Context, username string) 
 	return nil, profile.ErrNotFound
 }
 
-func (m *InMemoryStore) GetPublicProfiles(_ context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
+func (m *InMemoryStore) GetLimitedPublicProfilesForRow(_ context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
 	out := make(map[string]*profilepb.UserProfile)
 	if len(userIDs) == 0 {
 		return out, nil
@@ -324,7 +351,6 @@ func (m *InMemoryStore) GetPublicProfiles(_ context.Context, userIDs []*commonpb
 			Username:              m.username(key),
 			JoinTs:                timestamppb.New(m.createdAtByUser[key]),
 			FlipcardCustomization: m.flipcardCustomization(key),
-			MinDmChatInitFee:      m.minDmChatInitFee(key),
 		}
 		if blobID := profilePictureBlob(p.ProfilePicture); blobID != nil {
 			publicProfile.ProfilePicture = &blobpb.Media{

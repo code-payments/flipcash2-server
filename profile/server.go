@@ -104,7 +104,7 @@ func (s *Server) GetProfile(ctx context.Context, req *profilepb.GetProfileReques
 
 	includePrivateFields := requestingUserID != nil && bytes.Equal(userID.Value, requestingUserID.Value)
 
-	profile, err := s.profiles.GetProfile(ctx, userID, includePrivateFields)
+	profile, err := s.profiles.GetFullProfile(ctx, userID, includePrivateFields)
 	if errors.Is(err, ErrNotFound) {
 		return &profilepb.GetProfileResponse{Result: profilepb.GetProfileResponse_NOT_FOUND}, nil
 	} else if err != nil {
@@ -112,8 +112,8 @@ func (s *Server) GetProfile(ctx context.Context, req *profilepb.GetProfileReques
 		return nil, status.Error(codes.Internal, "failed to get profile")
 	}
 
-	if err := hydratePictures(ctx, s.media, profile.ProfilePicture); err != nil {
-		log.Warn("Failed to hydrate profile picture", zap.Error(err))
+	if err := hydratePictures(ctx, s.media, profile.ProfilePicture, profile.CoverPicture); err != nil {
+		log.Warn("Failed to hydrate profile pictures", zap.Error(err))
 		return nil, status.Error(codes.Internal, "failed to get profile")
 	}
 
@@ -194,7 +194,7 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 	// after the write: they skip the default username path, and the handle read is
 	// the one the response reports.
 	var username *commonpb.Username
-	userProfile, err := s.profiles.GetProfile(ctx, userID, false)
+	userProfile, err := s.profiles.GetFullProfile(ctx, userID, false)
 	switch {
 	case err == nil:
 		username = userProfile.Username
@@ -244,7 +244,7 @@ func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNa
 		// Only then is the handle read again, so the response still reports it. A
 		// failed read fails the call even though the name is set; a retry is safe,
 		// since the name is the same and the handle is not assigned again.
-		userProfile, err := s.profiles.GetProfile(ctx, userID, false)
+		userProfile, err := s.profiles.GetFullProfile(ctx, userID, false)
 		if err != nil {
 			log.Warn("Failed to get profile after setting display name", zap.Error(err))
 			return nil, status.Error(codes.Internal, "failed to get profile")
@@ -328,7 +328,7 @@ func (s *Server) SetUsername(ctx context.Context, req *profilepb.SetUsernameRequ
 	// call, never the claim.
 	var isFirstUsername bool
 	if s.firstUsername != nil {
-		current, err := s.profiles.GetProfile(ctx, userID, false)
+		current, err := s.profiles.GetFullProfile(ctx, userID, false)
 		switch {
 		case err == nil:
 			isFirstUsername = current.Username == nil
@@ -452,7 +452,7 @@ func (s *Server) SetProfilePicture(ctx context.Context, req *profilepb.SetProfil
 	// discoverable — a profile the client could read a blob id from, but not the
 	// blob, would render as a broken image. This also validates the blob, so
 	// nothing is persisted for a blob that cannot back a picture.
-	if err := s.media.SetAsProfilePicture(ctx, userID, req.BlobId); err != nil {
+	if err := s.media.SetAsProfileMedia(ctx, userID, req.BlobId); err != nil {
 		if result, ok := setProfilePictureResultForErr(err); ok {
 			return &profilepb.SetProfilePictureResponse{Result: result}, nil
 		}
@@ -497,6 +497,132 @@ func setProfilePictureResultForErr(err error) (profilepb.SetProfilePictureRespon
 	default:
 		return profilepb.SetProfilePictureResponse_OK, false
 	}
+}
+
+func (s *Server) SetCoverPicture(ctx context.Context, req *profilepb.SetCoverPictureRequest) (*profilepb.SetCoverPictureResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.String("blob_id", blob.IDString(req.BlobId)),
+	)
+
+	isRegistered, err := s.accounts.IsRegistered(ctx, userID)
+	if err != nil {
+		log.Warn("Failed to get registration flag")
+		return nil, status.Errorf(codes.Internal, "failed to get registration flag")
+	} else if !isRegistered {
+		return &profilepb.SetCoverPictureResponse{Result: profilepb.SetCoverPictureResponse_DENIED}, nil
+	}
+
+	// Grant before persisting, exactly as for the profile picture: the cover is
+	// shown from the same public profile surface, so it takes the same grant,
+	// and the grant doubles as the validation that the blob can back a picture.
+	if err := s.media.SetAsProfileMedia(ctx, userID, req.BlobId); err != nil {
+		if result, ok := setCoverPictureResultForErr(err); ok {
+			return &profilepb.SetCoverPictureResponse{Result: result}, nil
+		}
+
+		log.Warn("Failed to set blob as cover picture", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to set cover picture")
+	}
+
+	if err := s.profiles.SetCoverPicture(ctx, userID, req.BlobId); err != nil {
+		log.Warn("Failed to set cover picture", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to set cover picture")
+	}
+
+	picture := &blobpb.Media{
+		Renditions: []*blobpb.Rendition{{
+			Role:   blobpb.Rendition_ORIGINAL,
+			BlobId: req.BlobId,
+		}},
+	}
+	if err := hydratePictures(ctx, s.media, picture); err != nil {
+		log.Warn("Failed to hydrate cover picture", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to set cover picture")
+	}
+
+	return &profilepb.SetCoverPictureResponse{CoverPicture: picture}, nil
+}
+
+// setCoverPictureResultForErr is setProfilePictureResultForErr for the cover
+// picture: the blob can fail in exactly the same ways, and the client acts on
+// the distinction the same way.
+func setCoverPictureResultForErr(err error) (profilepb.SetCoverPictureResponse_Result, bool) {
+	switch {
+	case errors.Is(err, blob.ErrBlobNotFound):
+		return profilepb.SetCoverPictureResponse_BLOB_NOT_FOUND, true
+	case errors.Is(err, blob.ErrBlobNotReady):
+		return profilepb.SetCoverPictureResponse_BLOB_NOT_READY, true
+	case errors.Is(err, blob.ErrBlobRejected):
+		return profilepb.SetCoverPictureResponse_BLOB_REJECTED, true
+	case errors.Is(err, blob.ErrBlobInvalid):
+		return profilepb.SetCoverPictureResponse_INVALID_BLOB, true
+	default:
+		return profilepb.SetCoverPictureResponse_OK, false
+	}
+}
+
+func (s *Server) SetBio(ctx context.Context, req *profilepb.SetBioRequest) (*profilepb.SetBioResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
+
+	isRegistered, err := s.accounts.IsRegistered(ctx, userID)
+	if err != nil {
+		log.Warn("Failed to get registration flag", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to get registration flag")
+	} else if !isRegistered {
+		return &profilepb.SetBioResponse{Result: profilepb.SetBioResponse_DENIED}, nil
+	}
+
+	// Validate before moderating, so a bio the store would never hold is not
+	// sent to a classifier, and so the RPC is correct on its own rather than by
+	// virtue of the request validation that runs in front of it.
+	if err := ValidateBio(req.Bio); err != nil {
+		return &profilepb.SetBioResponse{Result: profilepb.SetBioResponse_INVALID_BIO}, nil
+	}
+
+	// Clearing a bio has nothing to judge. Otherwise moderate before persisting,
+	// so a flagged bio is never briefly visible to anyone reading the profile.
+	// Only the general text classifier runs: there is no bio-specific one, so
+	// unlike a display name nothing is set aside — a meaningless bio is still a
+	// gibberish verdict, and it stands.
+	if req.Bio != "" && s.moderator != nil {
+		result, err := s.moderator.ClassifyText(ctx, req.Bio)
+		if err != nil {
+			// A bio that cannot be classified is never persisted, since allowing it
+			// would leave an unmoderated bio in place. That includes
+			// ErrUnsupportedLanguage, which a display name or a group title lets
+			// through because a second classifier still covers them: a bio has no
+			// second classifier, so for now a language the text classifier cannot
+			// score is refused rather than set unmoderated.
+			log.Warn("Failed to classify bio", zap.Error(err))
+			return nil, status.Error(codes.Internal, "failed to moderate bio")
+		}
+
+		if result.Flagged {
+			log.Info("Bio is flagged", zap.String("bio", req.Bio), zap.Strings("categories", result.FlaggedCategories))
+			return &profilepb.SetBioResponse{
+				Result:          profilepb.SetBioResponse_FAILED_MODERATED,
+				FlaggedCategory: moderation.HighestFlaggedCategory(result),
+			}, nil
+		}
+	}
+
+	if err := s.profiles.SetBio(ctx, userID, req.Bio); err != nil {
+		log.Warn("Failed to set bio", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to set bio")
+	}
+
+	return &profilepb.SetBioResponse{}, nil
 }
 
 func (s *Server) UpdateFlipcard(ctx context.Context, req *profilepb.UpdateFlipcardRequest) (*profilepb.UpdateFlipcardResponse, error) {

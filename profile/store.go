@@ -13,6 +13,7 @@ import (
 var ErrNotFound = errors.New("not found")
 var ErrInvalidDisplayName = errors.New("invalid display name")
 var ErrInvalidUsername = errors.New("invalid username")
+var ErrInvalidBio = errors.New("invalid bio")
 var ErrUsernameTaken = errors.New("username taken")
 var ErrExistingSocialLink = errors.New("existing social link")
 
@@ -39,11 +40,14 @@ type DefaultUsernameResult struct {
 }
 
 type Store interface {
-	// GetProfile returns the user profile for a user, or ErrNotFound when the store
-	// does not know the user. The private fields — phone number, email address and
+	// GetFullProfile returns the whole profile of a user — every public field,
+	// linked social accounts included — or ErrNotFound when the store does not
+	// know the user. The private fields — phone number, email address and
 	// whether the handle is auto-assigned (see IsUsernameAutoAssigned) — are set
-	// only when includePrivateProfile is.
-	GetProfile(ctx context.Context, id *commonpb.UserId, includePrivateProfile bool) (*profilepb.UserProfile, error)
+	// only when includePrivateProfile is. It is the one read that carries the
+	// bio, the cover picture and the social profiles, which are public but
+	// belong to the profile view alone (see GetLimitedPublicProfilesForRow).
+	GetFullProfile(ctx context.Context, id *commonpb.UserId, includePrivateProfile bool) (*profilepb.UserProfile, error)
 
 	// SetDisplayName sets the display name for a user, provided they exist.
 	//
@@ -91,23 +95,40 @@ type Store interface {
 	// form. Returns ErrNotFound when nobody holds it.
 	GetUserIdByUsername(ctx context.Context, username string) (*commonpb.UserId, error)
 
-	// GetPublicProfiles returns, for each of the given users the store knows, the
-	// public part of that user's profile keyed by string(userID.Value): the
-	// fields any viewer may see, carrying no private ones. Unknown users are
-	// absent from the map. It resolves the whole set in a single lookup.
+	// GetLimitedPublicProfilesForRow returns, for each of the given users the
+	// store knows, what a row showing that user needs, keyed by
+	// string(userID.Value): the user ID, display name, username and profile
+	// picture, plus the join timestamp and Flipcard customization the proto
+	// requires of every UserProfile, and nothing else. Unknown users are absent
+	// from the map. It resolves the whole set in a single lookup.
 	//
-	// Display name is empty, and username, profile picture and minimum DM chat
-	// initialization fee nil, for a user who has set none of them, while the join
-	// timestamp and Flipcard customization are always set — so a present entry
-	// means "this user exists", not "this user filled in a profile".
+	// Display name is empty, and username and profile picture nil, for a user
+	// who has set none of them, while the join timestamp and Flipcard
+	// customization are always set — so a present entry means "this user
+	// exists", not "this user filled in a profile".
+	//
+	// Everything else a profile holds — the minimum DM chat initialization fee,
+	// bio, cover picture and linked social accounts — is never carried: it is
+	// public, but belongs to the profile view alone, and this is the projection
+	// every member row, roster page and mention suggestion is built from. It is
+	// read with GetFullProfile.
 	//
 	// The returned picture carries only the blob holding its ORIGINAL rendition;
 	// resolving that blob's metadata is left to the caller.
-	GetPublicProfiles(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error)
+	GetLimitedPublicProfilesForRow(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error)
 
 	// SetProfilePicture sets the user's profile picture to the blob holding its
 	// ORIGINAL rendition, replacing any picture already set.
 	SetProfilePicture(ctx context.Context, id *commonpb.UserId, blobID *blobpb.BlobId) error
+
+	// SetCoverPicture sets the user's cover picture to the blob holding its
+	// ORIGINAL rendition, replacing any cover picture already set.
+	SetCoverPicture(ctx context.Context, id *commonpb.UserId, blobID *blobpb.BlobId) error
+
+	// SetBio sets the user's bio, replacing any bio already set; an empty bio
+	// clears it. bio is stored as given, so callers validate it first (see
+	// ValidateBio).
+	SetBio(ctx context.Context, id *commonpb.UserId, bio string) error
 
 	// SetFlipcardColor sets the colour of the user's Flipcard, provided they
 	// exist, replacing any colour already picked. colorHex is stored as given, so

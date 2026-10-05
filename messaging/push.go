@@ -215,7 +215,7 @@ type messagePush struct {
 // without what the chat type's title needs, earns no push and is not an
 // error.
 func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, chatTitle string) error {
-	senderProfile, err := p.sender.profiles.GetProfile(ctx, p.message.SenderId, true)
+	senderProfile, err := p.sender.profiles.GetFullProfile(ctx, p.message.SenderId, true)
 	if err == profile.ErrNotFound {
 		return nil
 	} else if err != nil {

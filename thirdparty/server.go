@@ -81,7 +81,7 @@ func (s *Server) GetJwt(ctx context.Context, req *thirdpartypb.GetJwtRequest) (*
 			return &thirdpartypb.GetJwtResponse{Result: thirdpartypb.GetJwtResponse_INVALID_API_KEY}, nil
 		}
 
-		userProfile, err := s.profiles.GetProfile(ctx, userID, true)
+		userProfile, err := s.profiles.GetFullProfile(ctx, userID, true)
 		if err == profile.ErrNotFound {
 			return &thirdpartypb.GetJwtResponse{Result: thirdpartypb.GetJwtResponse_PHONE_VERIFICATION_REQUIRED}, nil
 		} else if err != nil {

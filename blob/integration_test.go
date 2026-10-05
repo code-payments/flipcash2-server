@@ -155,7 +155,7 @@ func TestIntegration_EncryptedBlobIsNeverAttachable(t *testing.T) {
 	// only from encrypted content the server never reads, and is readable only
 	// through the grant its reservation made to its own DM.
 	require.ErrorIs(t, integration.ShareIntoChat(ctx, owner, chatID, []*blobpb.BlobId{id}), blob.ErrBlobNotShareable)
-	require.ErrorIs(t, integration.SetAsProfilePicture(ctx, owner, id), blob.ErrBlobInvalid)
+	require.ErrorIs(t, integration.SetAsProfileMedia(ctx, owner, id), blob.ErrBlobInvalid)
 	require.ErrorIs(t, integration.SetAsChatPicture(ctx, owner, chatID, id), blob.ErrBlobInvalid)
 	for _, principal := range []blob.Principal{
 		blob.PrincipalForChat(chatID),

@@ -20,26 +20,27 @@ import (
 )
 
 const (
-	chatsTable        = "chats_test"
-	dmInboxTable      = "dm_inbox_test"
-	groupMembersTable = "group_members_test"
-	userStateTable    = "chat_user_state_test"
-	activityTable     = "chat_activity_test"
-	keyEnvelopesTable = "chat_key_envelopes_test"
-	lobbiesTable      = "chat_lobbies_test"
+	chatsTable          = "chats_test"
+	dmInboxTable        = "dm_inbox_test"
+	groupMembersTable   = "group_members_test"
+	userStateTable      = "chat_user_state_test"
+	activityTable       = "chat_activity_test"
+	keyEnvelopesTable   = "chat_key_envelopes_test"
+	lobbiesTable        = "chat_lobbies_test"
+	featuredGroupsTable = "chat_featured_groups_test"
 )
 
 func TestChat_DynamoDBStore(t *testing.T) {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable))
+	require.NoError(t, CreateTables(context.Background(), testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, nil)
+	testStore := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, nil)
 	teardown := func() {
 		testStore.(*store).reset()
 	}
 	// The stores newStore builds share testStore's tables, so its teardown
 	// resets theirs too.
 	newStore := func(excludedFromFeed []*commonpb.UserId) chat.Store {
-		return NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, excludedFromFeed)
+		return NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, excludedFromFeed)
 	}
 	tests.RunStoreTests(t, testStore, newStore, teardown)
 }
@@ -51,11 +52,11 @@ func TestChat_DynamoDBStore(t *testing.T) {
 // the other's.
 func TestChat_DynamoDBExclusionOutlivesConfig(t *testing.T) {
 	ctx := context.Background()
-	require.NoError(t, CreateTables(ctx, testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable))
+	require.NoError(t, CreateTables(ctx, testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable))
 
 	team := model.MustGenerateUserID()
-	configured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, []*commonpb.UserId{team})
-	unconfigured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, nil)
+	configured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, []*commonpb.UserId{team})
+	unconfigured := NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, nil)
 	t.Cleanup(func() { configured.(*store).reset() })
 
 	chatIDValue := make([]byte, chat.DmChatIDSize)

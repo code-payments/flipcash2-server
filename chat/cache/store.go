@@ -205,6 +205,12 @@ func (c *Cache) GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.
 	return c.db.GetGroupChatsForUserByIDs(ctx, userID, chatIDs)
 }
 
+// GetGroupChatsByID passes through: a group's record changes with every edit
+// and send, and only what is fixed at creation is held here.
+func (c *Cache) GetGroupChatsByID(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]*chat.Chat, error) {
+	return c.db.GetGroupChatsByID(ctx, chatIDs)
+}
+
 func (c *Cache) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, []*commonpb.UserId, error) {
 	return c.db.AdvanceLastMessage(ctx, chatID, messageID, ts)
 }
@@ -310,6 +316,16 @@ func (c *Cache) GetLobbyPage(ctx context.Context, chatID *commonpb.ChatId, after
 
 func (c *Cache) AdmitFromLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (bool, chat.RosterSummary, error) {
 	return c.db.AdmitFromLobby(ctx, chatID, userID, envelope)
+}
+
+// The featured groups methods pass through: a list is read once per profile
+// view, is one query, and changes from any process.
+func (c *Cache) SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (chat.FeaturedGroups, bool, error) {
+	return c.db.SetFeaturedGroups(ctx, userID, chatIDs)
+}
+
+func (c *Cache) GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (chat.FeaturedGroups, error) {
+	return c.db.GetFeaturedGroups(ctx, userID)
 }
 
 // sendActivityCacheKey keys the activity cache by (group, user). Only group

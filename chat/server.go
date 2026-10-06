@@ -63,9 +63,9 @@ type MessagingReader interface {
 }
 
 // ProfileReader is the read slice of the profile domain the Chat service needs
-// to hydrate member profiles. Like MessagingReader it is declared here (consumer
-// side) so the chat package need not import profile; the profile package
-// supplies the concrete adapter.
+// to hydrate member profiles and to find a user by handle. Like
+// MessagingReader it is declared here (consumer side) so the chat package need
+// not import profile; the profile package supplies the concrete adapter.
 type ProfileReader interface {
 	// GetPhoneNumbers returns the linked phone number for each of the given
 	// users that has one, keyed by string(userID.Value). Users without a linked
@@ -92,6 +92,10 @@ type ProfileReader interface {
 	// There is one proto per user, so a caller that fills in per-member fields
 	// must copy before mutating: the same user can be a member of several chats.
 	GetLimitedPublicProfilesForRow(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error)
+
+	// GetUserIDByUsername returns the user currently holding the given
+	// handle, and ok false when nobody holds it.
+	GetUserIDByUsername(ctx context.Context, username string) (userID *commonpb.UserId, ok bool, err error)
 }
 
 // BlocklistReader is the read slice of the blocklist domain the Chat service
@@ -417,13 +421,14 @@ const (
 	fullDetail metadataDetail = iota
 
 	// listDetail is the record as a list view shows it: everything but the
-	// group's description and cover picture, which only its profile view
-	// shows. A feed page is many chats a client renders as rows, so they cost
-	// it bytes and the cover's renditions cost the server a resolve and a
-	// download URL per group, for fields no row renders. The proto allows a
-	// feed to omit them (see chat.v1.Metadata.description and cover_picture),
-	// and tells the client to fetch them with GetChat and never to let a feed
-	// result clear what it holds.
+	// group's cover picture, which only its profile view shows. A feed page
+	// is many chats a client renders as rows, and the cover's renditions cost
+	// the server a resolve and a download URL per group for a field no row
+	// renders. The description stays: a row may show it, and it is short text
+	// read with the record, costing nothing to carry. The proto allows a feed
+	// to omit the cover (see chat.v1.Metadata.cover_picture), and tells the
+	// client to fetch it with GetChat and never to let a feed result clear
+	// what it holds.
 	listDetail
 )
 
@@ -523,9 +528,9 @@ const (
 // to treat as unavailable, rather than failing the whole read.
 //
 // The detail is how much of the record is returned (see metadataDetail): a
-// feed asks for listDetail, and its chats carry no description and no cover
-// picture — the cover's renditions are never resolved, not resolved and
-// dropped — while every other caller asks for fullDetail.
+// feed asks for listDetail, and its chats carry no cover picture — its
+// renditions are never resolved, not resolved and dropped — while every other
+// caller asks for fullDetail.
 func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standing ListenerStanding, reading Reading, detail metadataDetail, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
@@ -758,7 +763,6 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 				}
 			}
 		case listDetail:
-			md.Description = ""
 			md.CoverPicture = nil
 		}
 		assignPointers(md.Members, pointers[key])

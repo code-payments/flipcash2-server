@@ -295,6 +295,17 @@ type Store interface {
 	// chat ID, and an empty map (no error) when chatIDs is empty.
 	GetGroupMemberRecords(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]GroupMember, error)
 
+	// GetGroupMembersByID returns the joined membership record of each of
+	// userIDs in the group chatID, keyed by string(userID.Value): the
+	// transpose of GetGroupMemberRecords, one group and many users. A user
+	// who is not joined — never, or no longer — is absent rather than
+	// reported, a group that does not exist reads as no members, and
+	// duplicate IDs collapse. The read is strongly consistent, so a user who
+	// has just left is never returned (see Server.SampleChatters). It returns
+	// an error if chatID is not a group chat ID, and an empty map (no error)
+	// when userIDs is empty.
+	GetGroupMembersByID(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]GroupMember, error)
+
 	// GetGroupRosterSummary returns a group chat's RosterSummary, maintained
 	// alongside its membership records rather than computed by enumerating
 	// them — so a group's size and version are known without paying for its

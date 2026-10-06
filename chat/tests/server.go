@@ -75,6 +75,10 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetMentionSuggestions,
 		testServer_GetMentionSuggestions_Size,
 		testServer_GetMentionSuggestions_Gates,
+		testServer_SampleChatters,
+		testServer_SampleChatters_Size,
+		testServer_SampleChatters_Window,
+		testServer_SampleChatters_Gates,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
 		testServer_GetDmChatFeed_Paging,
@@ -1053,6 +1057,191 @@ func suggestedUserIDs(suggestions []*chatpb.MentionSuggestion) [][]byte {
 		out[i] = suggestion.UserProfile.UserId.Value
 	}
 	return out
+}
+
+func (e *serverEnv) sampleChatters(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.SampleChattersResponse {
+	req := &chatpb.SampleChattersRequest{ChatId: chatID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.SampleChatters(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// putGroupWithCreator creates a public group with the env's user and others
+// as members, recording creator as the group's creator.
+func (e *serverEnv) putGroupWithCreator(title string, creator *commonpb.UserId, others ...*commonpb.UserId) *commonpb.ChatId {
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      append([]*commonpb.UserId{e.userID, creator}, others...),
+		Title:        title,
+		CreatorID:    creator,
+		LastActivity: at(1),
+	}))
+	return chatID
+}
+
+// sampledUserIDs projects a sample onto its users' IDs, in order.
+func sampledUserIDs(chatters []*chatpb.SampledChatter) [][]byte {
+	out := make([][]byte, len(chatters))
+	for i, chatter := range chatters {
+		out[i] = chatter.UserProfile.UserId.Value
+	}
+	return out
+}
+
+func testServer_SampleChatters(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	creator := model.MustGenerateUserID()  // never sent, at first
+	recent := model.MustGenerateUserID()   // the most recent sender but the caller
+	earlier := model.MustGenerateUserID()  // sent before the others
+	blocked := model.MustGenerateUserID()  // the caller blocked them; still shown
+	departed := model.MustGenerateUserID() // sent, then left
+	quiet := model.MustGenerateUserID()    // a member who never sent
+	groupID := e.putGroupWithCreator("Chatters", creator, recent, earlier, blocked, departed, quiet)
+	e.profiles.displayNames[string(creator.Value)] = "Creator"
+	e.blocklist.block(e.userID, blocked)
+
+	e.recordSend(groupID, earlier, at(10))
+	e.recordSend(groupID, departed, at(25))
+	e.recordSend(groupID, recent, at(30))
+	e.recordSend(groupID, blocked, at(40))
+	e.recordSend(groupID, e.userID, at(50))
+	_, _, err := s.RemoveGroupMember(e.ctx, groupID, departed, false)
+	require.NoError(t, err)
+
+	// The creator first, though they never sent; then the senders who are
+	// still members, most recent first, the caller and a blocked user
+	// included. Someone who left, and a member who never sent, are not.
+	resp := e.sampleChatters(e.keys, groupID)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
+	require.Equal(t, [][]byte{creator.Value, e.userID.Value, blocked.Value, recent.Value, earlier.Value}, sampledUserIDs(resp.Chatters))
+	require.False(t, resp.HasMore)
+	require.True(t, resp.Chatters[0].IsCreator)
+	require.Nil(t, resp.Chatters[0].LastSentAt)
+	require.Equal(t, "Creator", resp.Chatters[0].UserProfile.DisplayName)
+	for i, want := range []time.Time{at(50), at(40), at(30), at(10)} {
+		chatter := resp.Chatters[i+1]
+		require.False(t, chatter.IsCreator)
+		require.True(t, chatter.LastSentAt.AsTime().Equal(want), "chatter %d", i+1)
+	}
+
+	// A creator who sends stays first, at their send.
+	e.recordSend(groupID, creator, at(60))
+	resp = e.sampleChatters(e.keys, groupID)
+	require.Equal(t, [][]byte{creator.Value, e.userID.Value, blocked.Value, recent.Value, earlier.Value}, sampledUserIDs(resp.Chatters))
+	require.True(t, resp.Chatters[0].LastSentAt.AsTime().Equal(at(60)))
+
+	// Someone who rejoins is back at their last send.
+	_, _, err = s.AddGroupMembers(e.ctx, groupID, []*commonpb.UserId{departed})
+	require.NoError(t, err)
+	resp = e.sampleChatters(e.keys, groupID)
+	require.Equal(t, [][]byte{creator.Value, e.userID.Value, blocked.Value, recent.Value, departed.Value, earlier.Value}, sampledUserIDs(resp.Chatters))
+
+	// A creator who has left is not shown, though they have sent.
+	_, _, err = s.RemoveGroupMember(e.ctx, groupID, creator, false)
+	require.NoError(t, err)
+	resp = e.sampleChatters(e.keys, groupID)
+	require.Equal(t, [][]byte{e.userID.Value, blocked.Value, recent.Value, departed.Value, earlier.Value}, sampledUserIDs(resp.Chatters))
+	require.False(t, resp.Chatters[0].IsCreator)
+
+	// A group no one has sent in is its creator alone, and a group with no
+	// recorded creator starts with its senders.
+	quietGroup := e.putGroupWithCreator("Quiet", creator)
+	resp = e.sampleChatters(e.keys, quietGroup)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
+	require.Equal(t, [][]byte{creator.Value}, sampledUserIDs(resp.Chatters))
+	legacy := e.putGroup("Legacy", at(1))
+	resp = e.sampleChatters(e.keys, legacy)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
+	require.Empty(t, resp.Chatters)
+	e.recordSend(legacy, e.userID, at(5))
+	resp = e.sampleChatters(e.keys, legacy)
+	require.Equal(t, [][]byte{e.userID.Value}, sampledUserIDs(resp.Chatters))
+}
+
+func testServer_SampleChatters_Size(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// The creator and 19 senders fill the sample exactly: nothing more.
+	creator := model.MustGenerateUserID()
+	senders := make([]*commonpb.UserId, 25)
+	for i := range senders {
+		senders[i] = model.MustGenerateUserID()
+	}
+	groupID := e.putGroupWithCreator("Busy", creator, senders...)
+	for i := range 19 {
+		e.recordSend(groupID, senders[i], at(int64(i+1)))
+	}
+	resp := e.sampleChatters(e.keys, groupID)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
+	require.Len(t, resp.Chatters, 20)
+	require.False(t, resp.HasMore)
+
+	// More senders, and the sample keeps the creator and the 19 most
+	// recent, and says there are more.
+	for i := 19; i < len(senders); i++ {
+		e.recordSend(groupID, senders[i], at(int64(i+1)))
+	}
+	resp = e.sampleChatters(e.keys, groupID)
+	require.Len(t, resp.Chatters, 20)
+	require.True(t, resp.HasMore)
+	require.Equal(t, creator.Value, resp.Chatters[0].UserProfile.UserId.Value)
+	for i, chatter := range resp.Chatters[1:] {
+		require.Equal(t, senders[len(senders)-1-i].Value, chatter.UserProfile.UserId.Value, "chatter %d", i+1)
+	}
+}
+
+func testServer_SampleChatters_Window(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// A full window of senders, nearly all of whom have left: the members
+	// among them are found past the first check, and since the window was
+	// full, there may be more.
+	creator := model.MustGenerateUserID()
+	stayed := []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID()}
+	groupID := e.putGroupWithCreator("Churn", creator, stayed...)
+	const window = 100
+	for i := range window {
+		sender := model.MustGenerateUserID()
+		switch i {
+		case 40:
+			sender = stayed[0]
+		case 90:
+			sender = stayed[1]
+		}
+		e.recordSend(groupID, sender, at(int64(window-i)))
+	}
+	resp := e.sampleChatters(e.keys, groupID)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
+	require.Equal(t, [][]byte{creator.Value, stayed[0].Value, stayed[1].Value}, sampledUserIDs(resp.Chatters))
+	require.True(t, resp.HasMore)
+}
+
+func testServer_SampleChatters_Gates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	_, strangerKeys := e.addUser()
+
+	// A DM, before anything is read.
+	resp := e.sampleChatters(e.keys, e.putDM(at(1)))
+	require.Equal(t, chatpb.SampleChattersResponse_DENIED, resp.Result)
+
+	// A group that does not exist.
+	resp = e.sampleChatters(e.keys, chat.MustGenerateGroupChatID())
+	require.Equal(t, chatpb.SampleChattersResponse_NOT_FOUND, resp.Result)
+
+	// A private group, even to its creator and members.
+	private := e.putPrivateGroup("Private")
+	resp = e.sampleChatters(e.keys, private)
+	require.Equal(t, chatpb.SampleChattersResponse_DENIED, resp.Result)
+
+	// A public group, to a non-member; then to them once they join.
+	public := e.putGroupWithCreator("Public", model.MustGenerateUserID())
+	resp = e.sampleChatters(strangerKeys, public)
+	require.Equal(t, chatpb.SampleChattersResponse_DENIED, resp.Result)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, e.sampleChatters(e.keys, public).Result)
 }
 
 func testServer_GetMentionSuggestions(t *testing.T, s chat.Store) {

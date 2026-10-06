@@ -61,6 +61,10 @@ func (c *Cache) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 	return c.db.AddGroupMembers(ctx, chatID, userIDs)
 }
 
+func (c *Cache) GetGroupMembersByID(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]chat.GroupMember, error) {
+	return c.db.GetGroupMembersByID(ctx, chatID, userIDs)
+}
+
 func (c *Cache) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, discardKeyEnvelope bool) (bool, chat.RosterSummary, error) {
 	return c.db.RemoveGroupMember(ctx, chatID, userID, discardKeyEnvelope)
 }

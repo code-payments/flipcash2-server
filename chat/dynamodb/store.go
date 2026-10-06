@@ -1228,6 +1228,45 @@ func (s *store) GetGroupMemberRecords(ctx context.Context, userID *commonpb.User
 	return out, nil
 }
 
+// GetGroupMembersByID is one strongly consistent batch read of the users'
+// rows in the group's partition, keeping the joined ones.
+func (s *store) GetGroupMembersByID(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]chat.GroupMember, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, fmt.Errorf("not a group chat id")
+	}
+
+	seen := make(map[string]struct{}, len(userIDs))
+	keys := make([]map[string]types.AttributeValue, 0, len(userIDs))
+	for _, userID := range userIDs {
+		if _, dup := seen[string(userID.Value)]; dup {
+			continue
+		}
+		seen[string(userID.Value)] = struct{}{}
+		keys = append(keys, map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(userPK(userID))})
+	}
+
+	out := make(map[string]chat.GroupMember, len(keys))
+	err := s.batchGet(ctx, s.groupMembersTable, keys, "", nil, true, func(item map[string]types.AttributeValue) error {
+		state, err := parseN(item[attrState])
+		if err != nil {
+			return err
+		}
+		if state != memberStateJoined {
+			return nil
+		}
+		member, err := groupMemberFromItem(item)
+		if err != nil {
+			return err
+		}
+		out[string(member.UserID.Value)] = member
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // groupMemberFromItem decodes a joined membership row: the user from the sort
 // key, the join time, and the version stamp of the transition that wrote it —
 // absent on a row written at the group's creation, which reads as zero (see

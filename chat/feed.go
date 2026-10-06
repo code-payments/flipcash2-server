@@ -24,8 +24,9 @@ import (
 // event stream (see the Chat service proto for the contract).
 //
 // Both feeds are list views, so their chats are hydrated with listDetail: a
-// group's description and cover picture are left out, for GetChat to serve
-// when the client opens the group's profile view.
+// group's cover picture is left out, for GetChat to serve when the client
+// opens the group's profile view. Its description is carried, since a row may
+// show it.
 //
 // The DM feed and the group feed share that contract but not an index. A DM
 // send fans last_activity out to each member's inbox row, so a DM feed page is

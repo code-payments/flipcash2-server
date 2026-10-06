@@ -417,13 +417,14 @@ const (
 	fullDetail metadataDetail = iota
 
 	// listDetail is the record as a list view shows it: everything but the
-	// group's description and cover picture, which only its profile view
-	// shows. A feed page is many chats a client renders as rows, so they cost
-	// it bytes and the cover's renditions cost the server a resolve and a
-	// download URL per group, for fields no row renders. The proto allows a
-	// feed to omit them (see chat.v1.Metadata.description and cover_picture),
-	// and tells the client to fetch them with GetChat and never to let a feed
-	// result clear what it holds.
+	// group's cover picture, which only its profile view shows. A feed page
+	// is many chats a client renders as rows, and the cover's renditions cost
+	// the server a resolve and a download URL per group for a field no row
+	// renders. The description stays: a row may show it, and it is short text
+	// read with the record, costing nothing to carry. The proto allows a feed
+	// to omit the cover (see chat.v1.Metadata.cover_picture), and tells the
+	// client to fetch it with GetChat and never to let a feed result clear
+	// what it holds.
 	listDetail
 )
 
@@ -523,9 +524,9 @@ const (
 // to treat as unavailable, rather than failing the whole read.
 //
 // The detail is how much of the record is returned (see metadataDetail): a
-// feed asks for listDetail, and its chats carry no description and no cover
-// picture — the cover's renditions are never resolved, not resolved and
-// dropped — while every other caller asks for fullDetail.
+// feed asks for listDetail, and its chats carry no cover picture — its
+// renditions are never resolved, not resolved and dropped — while every other
+// caller asks for fullDetail.
 func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standing ListenerStanding, reading Reading, detail metadataDetail, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
@@ -758,7 +759,6 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 				}
 			}
 		case listDetail:
-			md.Description = ""
 			md.CoverPicture = nil
 		}
 		assignPointers(md.Members, pointers[key])

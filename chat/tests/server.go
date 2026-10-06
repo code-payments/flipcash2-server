@@ -5044,9 +5044,9 @@ func testServer_EditChat_AllFields(t *testing.T, s chat.Store) {
 }
 
 // testServer_ChatProfileDetail_Carriers pins where a group's description and
-// cover picture are returned: on every carrier of a group's metadata but the
-// feeds, which are list views and leave both out without resolving the
-// cover.
+// cover picture are returned: the description on every carrier of a group's
+// metadata, and the cover on every one but the feeds, which are list views
+// and leave it out without resolving it.
 func testServer_ChatProfileDetail_Carriers(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
@@ -5058,7 +5058,7 @@ func testServer_ChatProfileDetail_Carriers(t *testing.T, s chat.Store) {
 	}
 
 	// A group the env user is a member of: GetChat carries both, the feed
-	// neither, and the cover was never resolved for the feed.
+	// the description alone, and the cover was never resolved for the feed.
 	profile := &blobpb.BlobId{Value: []byte("group-picture-01")}
 	e.media.setRenditions(profile)
 	member := e.putGroupWithPicture("Member Of", profile, at(1), model.MustGenerateUserID())
@@ -5068,7 +5068,7 @@ func testServer_ChatProfileDetail_Carriers(t *testing.T, s chat.Store) {
 	feed := e.mustGetGroupFeed(&commonpb.QueryOptions{})
 	require.Len(t, feed.Chats, 1)
 	require.Equal(t, "Member Of", feed.Chats[0].Title)
-	require.Empty(t, feed.Chats[0].Description)
+	require.Equal(t, "About us", feed.Chats[0].Description)
 	require.Nil(t, feed.Chats[0].CoverPicture)
 	require.NotNil(t, feed.Chats[0].GetProfilePicture().GetRenditions()[0].Blob)
 	require.False(t, e.media.resolved[string(cover.Value)])

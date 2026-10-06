@@ -1067,6 +1067,14 @@ func (e *serverEnv) sampleChatters(keys model.KeyPair, chatID *commonpb.ChatId) 
 	return resp
 }
 
+// samplePublicChatters asks for a sample with no auth at all (see
+// chat.Server.SampleChatters).
+func (e *serverEnv) samplePublicChatters(chatID *commonpb.ChatId) *chatpb.SampleChattersResponse {
+	resp, err := e.client.SampleChatters(e.ctx, &chatpb.SampleChattersRequest{ChatId: chatID})
+	require.NoError(e.t, err)
+	return resp
+}
+
 // putGroupWithCreator creates a public group with the env's user and others
 // as members, recording creator as the group's creator.
 func (e *serverEnv) putGroupWithCreator(title string, creator *commonpb.UserId, others ...*commonpb.UserId) *commonpb.ChatId {
@@ -1246,11 +1254,32 @@ func testServer_SampleChatters_Gates(t *testing.T, s chat.Store) {
 	resp = e.sampleChatters(e.keys, private)
 	require.Equal(t, chatpb.SampleChattersResponse_DENIED, resp.Result)
 
-	// A public group, to a non-member; then to them once they join.
-	public := e.putGroupWithCreator("Public", model.MustGenerateUserID())
-	resp = e.sampleChatters(strangerKeys, public)
-	require.Equal(t, chatpb.SampleChattersResponse_DENIED, resp.Result)
-	require.Equal(t, chatpb.SampleChattersResponse_OK, e.sampleChatters(e.keys, public).Result)
+	// Without auth: the same answers.
+	require.Equal(t, chatpb.SampleChattersResponse_DENIED, e.samplePublicChatters(e.putDM(at(1))).Result)
+	require.Equal(t, chatpb.SampleChattersResponse_NOT_FOUND, e.samplePublicChatters(chat.MustGenerateGroupChatID()).Result)
+	require.Equal(t, chatpb.SampleChattersResponse_DENIED, e.samplePublicChatters(private).Result)
+
+	// A public group's sample is the same to a member, a non-member and
+	// someone with no auth at all, the member's own place in it included.
+	creator := model.MustGenerateUserID()
+	public := e.putGroupWithCreator("Public", creator)
+	e.recordSend(public, e.userID, at(5))
+	member := e.sampleChatters(e.keys, public)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, member.Result)
+	require.Equal(t, [][]byte{creator.Value, e.userID.Value}, sampledUserIDs(member.Chatters))
+	for _, resp := range []*chatpb.SampleChattersResponse{
+		e.sampleChatters(strangerKeys, public),
+		e.samplePublicChatters(public),
+	} {
+		require.True(t, proto.Equal(member, resp))
+	}
+
+	// Auth, when set, must still be valid.
+	unregistered := model.MustGenerateKeyPair()
+	req := &chatpb.SampleChattersRequest{ChatId: public}
+	require.NoError(t, unregistered.Auth(req, &req.Auth))
+	_, err := e.client.SampleChatters(e.ctx, req)
+	require.Error(t, err)
 }
 
 func testServer_GetMentionSuggestions(t *testing.T, s chat.Store) {

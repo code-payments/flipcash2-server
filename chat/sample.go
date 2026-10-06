@@ -36,8 +36,7 @@ import (
 // later read checks only about as many as are still missing. The read of
 // senders is bounded too; when it fills and too few of the senders are
 // still members, has_more is set,
-// since the server stopped looking before it could tell. The caller passed
-// the membership gate, so their own candidacy needs no check. The check is
+// since the server stopped looking before it could tell. The check is
 // eventually consistent: it decides who is shown, not who may do anything,
 // so a member who left a moment ago appearing, or one who joined a moment
 // ago missing, costs nothing a refetch does not fix, and the read costs half
@@ -55,8 +54,15 @@ import (
 //
 // Only a public group has a sample. A DM is refused before anything is read,
 // and a private group after its record, whoever asks: a private group's
-// members are shown to no one through it. The read is a member's alone, as
-// GetRoster's is.
+// members are shown to no one through it.
+//
+// A public group's sample is public: unlike the roster (see GetRoster), which
+// is a member's alone, it is part of how the group presents itself, as its
+// title and pictures are, so it is returned to anyone who asks, member or
+// not, with or without auth. Auth, when set, is verified as everywhere else,
+// but changes nothing: the sample is the same for every caller, the caller's
+// own place in it included, which is why their membership is checked like
+// anyone's.
 
 const (
 	// sampleChattersSize is the most chatters a sample carries. It is at most
@@ -74,15 +80,14 @@ const (
 )
 
 func (s *Server) SampleChatters(ctx context.Context, req *chatpb.SampleChattersRequest) (*chatpb.SampleChattersResponse, error) {
-	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
-	if err != nil {
-		return nil, err
+	log := s.log.With(zap.String("chat_id", model.ChatIDString(req.ChatId)))
+	if req.Auth != nil {
+		userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+		if err != nil {
+			return nil, err
+		}
+		log = log.With(zap.String("user_id", model.UserIDString(userID)))
 	}
-
-	log := s.log.With(
-		zap.String("user_id", model.UserIDString(userID)),
-		zap.String("chat_id", model.ChatIDString(req.ChatId)),
-	)
 
 	if !IsGroupChatID(req.ChatId) {
 		return &chatpb.SampleChattersResponse{Result: chatpb.SampleChattersResponse_DENIED}, nil
@@ -100,16 +105,7 @@ func (s *Server) SampleChatters(ctx context.Context, req *chatpb.SampleChattersR
 		return &chatpb.SampleChattersResponse{Result: chatpb.SampleChattersResponse_DENIED}, nil
 	}
 
-	isMember, err := s.access.IsMemberWithChat(ctx, c, userID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure determining chat membership")
-		return nil, status.Error(codes.Internal, "")
-	}
-	if !isMember {
-		return &chatpb.SampleChattersResponse{Result: chatpb.SampleChattersResponse_DENIED}, nil
-	}
-
-	chatters, hasMore, err := s.sampleChatters(ctx, c, userID)
+	chatters, hasMore, err := s.sampleChatters(ctx, c)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure sampling chatters")
 		return nil, status.Error(codes.Internal, "")
@@ -128,9 +124,8 @@ type sampleCandidate struct {
 	isCreator  bool
 }
 
-// sampleChatters builds the sample for viewerID, a member of the public group
-// c, as described above.
-func (s *Server) sampleChatters(ctx context.Context, c *Chat, viewerID *commonpb.UserId) ([]*chatpb.SampledChatter, bool, error) {
+// sampleChatters builds the sample of the public group c, as described above.
+func (s *Server) sampleChatters(ctx context.Context, c *Chat) ([]*chatpb.SampledChatter, bool, error) {
 	senders, err := s.chats.GetRecentSenders(ctx, c.ID, sampleChattersSenderWindow)
 	if err != nil {
 		return nil, false, err
@@ -164,11 +159,9 @@ func (s *Server) sampleChatters(ctx context.Context, c *Chat, viewerID *commonpb
 		chunk := candidates[start:end]
 		start = end
 
-		toCheck := make([]*commonpb.UserId, 0, len(chunk))
-		for _, candidate := range chunk {
-			if !isSameUser(candidate.userID, viewerID) {
-				toCheck = append(toCheck, candidate.userID)
-			}
+		toCheck := make([]*commonpb.UserId, len(chunk))
+		for i, candidate := range chunk {
+			toCheck[i] = candidate.userID
 		}
 		joined, err := s.chats.GetGroupMembersByID(ctx, c.ID, toCheck)
 		if err != nil {
@@ -179,7 +172,7 @@ func (s *Server) sampleChatters(ctx context.Context, c *Chat, viewerID *commonpb
 			if len(members) > sampleChattersSize {
 				break
 			}
-			if _, ok := joined[string(candidate.userID.Value)]; ok || isSameUser(candidate.userID, viewerID) {
+			if _, ok := joined[string(candidate.userID.Value)]; ok {
 				members = append(members, candidate)
 			}
 		}

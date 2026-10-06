@@ -33,8 +33,9 @@ import (
 // has_more without being returned. Each chunk is as many candidates as
 // members still to find, plus sampleChattersCheckBuffer, so a group whose
 // recent senders are all still members is answered by one read, and a
-// later read checks only about what is still missing. The read of senders is bounded too; when
-// it fills and too few of the senders are still members, has_more is set,
+// later read checks only about as many as are still missing. The read of
+// senders is bounded too; when it fills and too few of the senders are
+// still members, has_more is set,
 // since the server stopped looking before it could tell. The caller passed
 // the membership gate, so their own candidacy needs no check. The check is
 // eventually consistent: it decides who is shown, not who may do anything,
@@ -45,6 +46,12 @@ import (
 // A member who sent within the last minute may trail their latest message
 // (see ActivityRecordInterval), and one whose activity record has expired
 // (see ActivityRetention) is not a candidate until they send again.
+//
+// The creator is a candidate whether or not they have sent, and is shown at
+// their own last send whenever they have a record, however many others have
+// sent since: one outside the senders read is looked up directly (see
+// Store.GetLastSentAt), only when they are shown and the read of senders
+// filled, since otherwise it holds every record the group has.
 //
 // Only a public group has a sample. A DM is refused before anything is read,
 // and a private group after its record, whoever asks: a private group's
@@ -117,7 +124,7 @@ func (s *Server) SampleChatters(ctx context.Context, req *chatpb.SampleChattersR
 // sampleCandidate is one user who may be in a sample, in sample order.
 type sampleCandidate struct {
 	userID     *commonpb.UserId
-	lastSentAt time.Time // zero for a creator with no recent send
+	lastSentAt time.Time // zero for a creator outside the senders read
 	isCreator  bool
 }
 
@@ -129,8 +136,8 @@ func (s *Server) sampleChatters(ctx context.Context, c *Chat, viewerID *commonpb
 		return nil, false, err
 	}
 
-	// The creator first, at their own send time if they have one, then every
-	// other sender in recency order.
+	// The creator first, at their send time if the senders read holds it
+	// (otherwise looked up below), then every other sender in recency order.
 	candidates := make([]sampleCandidate, 0, len(senders)+1)
 	if c.CreatorID != nil {
 		creator := sampleCandidate{userID: c.CreatorID, isCreator: true}
@@ -178,12 +185,26 @@ func (s *Server) sampleChatters(ctx context.Context, c *Chat, viewerID *commonpb
 		}
 	}
 
-	hasMore := len(members) > sampleChattersSize || len(senders) >= sampleChattersSenderWindow
+	sendersFull := len(senders) >= sampleChattersSenderWindow
+	hasMore := len(members) > sampleChattersSize || sendersFull
 	if len(members) > sampleChattersSize {
 		members = members[:sampleChattersSize]
 	}
 	if len(members) == 0 {
 		return []*chatpb.SampledChatter{}, hasMore, nil
+	}
+
+	// A shown creator outside the senders read may still have a record, once
+	// enough others have sent since; a read that did not fill holds every
+	// record, so there is nothing more to find.
+	if creator := &members[0]; creator.isCreator && creator.lastSentAt.IsZero() && sendersFull {
+		lastSentAt, ok, err := s.chats.GetLastSentAt(ctx, c.ID, creator.userID)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok {
+			creator.lastSentAt = lastSentAt
+		}
 	}
 
 	userIDs := make([]*commonpb.UserId, len(members))

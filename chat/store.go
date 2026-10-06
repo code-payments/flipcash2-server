@@ -486,6 +486,15 @@ type Store interface {
 	// chat ID.
 	GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]RecentSender, error)
 
+	// GetLastSentAt returns userID's activity record in the group chatID:
+	// when their latest recorded send was, and whether they have a record at
+	// all. It is the point read of what GetRecentSenders ranges over, for a
+	// user it may not reach, and strongly consistent like it. A record past
+	// ActivityRetention may be returned. A user with no record, or a group
+	// that does not exist, is ok == false. It returns an error if chatID is
+	// not a group chat ID.
+	GetLastSentAt(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (lastSentAt time.Time, ok bool, err error)
+
 	// SetKeyEnvelope stores envelope as userID's key envelope for the group
 	// chatID, and returns the envelope that stands after the call. An
 	// envelope the user wrapped themself (KeyEnvelope.IsWrappedBy userID) is

@@ -274,6 +274,10 @@ func (c *Cache) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, l
 	return c.db.GetRecentSenders(ctx, chatID, limit)
 }
 
+func (c *Cache) GetLastSentAt(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (time.Time, bool, error) {
+	return c.db.GetLastSentAt(ctx, chatID, userID)
+}
+
 // The key envelope methods pass through: an envelope is read once per chat
 // per install, and one a user wrapped for themself replaces the one they were
 // admitted with, so there is nothing worth holding and something to get wrong.

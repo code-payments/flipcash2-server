@@ -2754,6 +2754,36 @@ func (s *store) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, l
 	}
 }
 
+// GetLastSentAt is one strongly consistent GetItem of the user's activity
+// record, projecting its send time.
+func (s *store) GetLastSentAt(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (time.Time, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return time.Time{}, false, fmt.Errorf("not a group chat id")
+	}
+
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(s.activityTable),
+		Key: map[string]types.AttributeValue{
+			attrPK: avS(chatPK(chatID)),
+			attrSK: avS(userPK(userID)),
+		},
+		ProjectionExpression:     aws.String("#sent"),
+		ExpressionAttributeNames: map[string]string{"#sent": attrLastSentAt},
+		ConsistentRead:           aws.Bool(true),
+	})
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if len(out.Item) == 0 {
+		return time.Time{}, false, nil
+	}
+	sentAtMillis, err := parseInt(out.Item[attrLastSentAt])
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("parsing %s: %w", attrLastSentAt, err)
+	}
+	return time.UnixMilli(sentAtMillis).UTC(), true, nil
+}
+
 func (s *store) SetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (chat.KeyEnvelope, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return chat.KeyEnvelope{}, fmt.Errorf("not a group chat id")

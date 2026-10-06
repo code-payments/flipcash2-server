@@ -846,6 +846,18 @@ func (m *memory) GetRecentSenders(_ context.Context, chatID *commonpb.ChatId, li
 	return senders, nil
 }
 
+func (m *memory) GetLastSentAt(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (time.Time, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return time.Time{}, false, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	last, ok := m.lastSent[string(chatID.Value)][string(userID.Value)]
+	return last, ok, nil
+}
+
 func (m *memory) SetKeyEnvelope(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (chat.KeyEnvelope, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return chat.KeyEnvelope{}, fmt.Errorf("not a group chat id")

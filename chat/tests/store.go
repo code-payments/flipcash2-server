@@ -2608,6 +2608,21 @@ func testStore_Activity_RecentSenders(t *testing.T, s chat.Store) {
 	senders, err = s.GetRecentSenders(ctx, group.ID, 0)
 	require.NoError(t, err)
 	requireRecentSenders(t, senders, a, at(400), b, at(300), c, at(200))
+
+	// A point read finds one user's record, whatever its rank; a user with
+	// no record, or a group that does not exist, has none; groups only.
+	lastSentAt, ok, err := s.GetLastSentAt(ctx, group.ID, c)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, lastSentAt.Equal(at(200)))
+	_, ok, err = s.GetLastSentAt(ctx, group.ID, model.MustGenerateUserID())
+	require.NoError(t, err)
+	require.False(t, ok)
+	_, ok, err = s.GetLastSentAt(ctx, chat.MustGenerateGroupChatID(), a)
+	require.NoError(t, err)
+	require.False(t, ok)
+	_, _, err = s.GetLastSentAt(ctx, generateDmChatID(), a)
+	require.Error(t, err)
 }
 
 func testStore_Activity_Throttle(t *testing.T, s chat.Store) {

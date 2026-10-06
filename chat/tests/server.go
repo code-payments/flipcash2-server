@@ -1218,6 +1218,15 @@ func testServer_SampleChatters_Window(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
 	require.Equal(t, [][]byte{creator.Value, stayed[0].Value, stayed[1].Value}, sampledUserIDs(resp.Chatters))
 	require.True(t, resp.HasMore)
+	require.Nil(t, resp.Chatters[0].LastSentAt)
+
+	// A creator who sent before everyone in the window is still shown at
+	// their send.
+	e.recordSend(groupID, creator, at(0))
+	resp = e.sampleChatters(e.keys, groupID)
+	require.Equal(t, [][]byte{creator.Value, stayed[0].Value, stayed[1].Value}, sampledUserIDs(resp.Chatters))
+	require.True(t, resp.Chatters[0].IsCreator)
+	require.True(t, resp.Chatters[0].LastSentAt.AsTime().Equal(at(0)))
 }
 
 func testServer_SampleChatters_Gates(t *testing.T, s chat.Store) {

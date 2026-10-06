@@ -2,6 +2,7 @@ package profile
 
 import (
 	"context"
+	"errors"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -49,4 +50,14 @@ func (r *chatProfileReader) GetLimitedPublicProfilesForRow(ctx context.Context, 
 		return nil, err
 	}
 	return publicProfiles, nil
+}
+
+func (r *chatProfileReader) GetUserIDByUsername(ctx context.Context, username string) (*commonpb.UserId, bool, error) {
+	userID, err := r.store.GetUserIdByUsername(ctx, username)
+	if errors.Is(err, ErrNotFound) {
+		return nil, false, nil
+	} else if err != nil {
+		return nil, false, err
+	}
+	return userID, true, nil
 }

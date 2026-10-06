@@ -205,6 +205,12 @@ func (c *Cache) GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.
 	return c.db.GetGroupChatsForUserByIDs(ctx, userID, chatIDs)
 }
 
+// GetGroupChatsByID passes through: a group's record changes with every edit
+// and send, and only what is fixed at creation is held here.
+func (c *Cache) GetGroupChatsByID(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]*chat.Chat, error) {
+	return c.db.GetGroupChatsByID(ctx, chatIDs)
+}
+
 func (c *Cache) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, []*commonpb.UserId, error) {
 	return c.db.AdvanceLastMessage(ctx, chatID, messageID, ts)
 }

@@ -152,6 +152,9 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_ChatProfileDetail_Carriers,
 		testServer_EditChat_ModerationFailureIsInternal,
 		testServer_ViewerState_Permissions,
+		testServer_FeaturedGroups_SetAndGet,
+		testServer_FeaturedGroups_Refused,
+		testServer_FeaturedGroups_UnknownUsername,
 	} {
 		tf(t, s)
 		teardown()
@@ -590,6 +593,16 @@ func (f *fakeProfileReader) GetLimitedPublicProfilesForRow(_ context.Context, us
 		}
 	}
 	return out, nil
+}
+
+// GetUserIDByUsername finds the user a test registered the handle for.
+func (f *fakeProfileReader) GetUserIDByUsername(_ context.Context, username string) (*commonpb.UserId, bool, error) {
+	for key, held := range f.usernames {
+		if held == username {
+			return &commonpb.UserId{Value: []byte(key)}, true, nil
+		}
+	}
+	return nil, false, nil
 }
 
 // fakeBlocklistReader is a canned chat.BlocklistReader for server tests: it
@@ -5804,4 +5817,174 @@ func testServer_Lobby_Deny(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(userKeys, chatID).Result)
 	got = e.getChat(userKeys, chatID)
 	require.True(t, got.Metadata.InLobby)
+}
+
+func (e *serverEnv) setFeaturedGroups(keys model.KeyPair, chatIDs ...*commonpb.ChatId) (*chatpb.SetFeaturedGroupsResponse, error) {
+	req := &chatpb.SetFeaturedGroupsRequest{ChatIds: chatIDs}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.SetFeaturedGroups(e.ctx, req)
+}
+
+func (e *serverEnv) mustSetFeaturedGroups(keys model.KeyPair, chatIDs ...*commonpb.ChatId) *chatpb.SetFeaturedGroupsResponse {
+	resp, err := e.setFeaturedGroups(keys, chatIDs...)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// getFeaturedGroups asks for username's featured groups, signed with keys
+// when one is given and with no auth at all otherwise.
+func (e *serverEnv) getFeaturedGroups(username string, keys ...model.KeyPair) *chatpb.GetFeaturedGroupsResponse {
+	req := &chatpb.GetFeaturedGroupsRequest{
+		Identifier: &chatpb.GetFeaturedGroupsRequest_Username{Username: &commonpb.Username{Value: username}},
+	}
+	if len(keys) > 0 {
+		require.NoError(e.t, keys[0].Auth(req, &req.Auth))
+	}
+	resp, err := e.client.GetFeaturedGroups(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// featuredGroupIDs projects featured groups onto their chat IDs, in order.
+func featuredGroupIDs(groups []*chatpb.Metadata) [][]byte {
+	out := make([][]byte, len(groups))
+	for i, md := range groups {
+		out[i] = md.ChatId.Value
+	}
+	return out
+}
+
+func testServer_FeaturedGroups_SetAndGet(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.profiles.usernames[string(e.userID.Value)] = "featurer"
+	_, viewerKeys := e.addUser()
+
+	// Nothing featured yet: OK and empty, for anyone.
+	resp := e.getFeaturedGroups("featurer")
+	require.Equal(t, chatpb.GetFeaturedGroupsResponse_OK, resp.Result)
+	require.Empty(t, resp.FeaturedGroups)
+
+	// A group the caller is in, with a picture, description and cover, and a
+	// group they are not in: featuring needs no membership.
+	picture := &blobpb.BlobId{Value: []byte("group-picture-01")}
+	pictureRenditions := e.media.setRenditions(picture)
+	member := e.putGroupWithPicture("Member Of", picture, at(1))
+	cover := &blobpb.BlobId{Value: []byte("group-cover-0001")}
+	e.describeGroup(member, "About us", cover)
+	other := chat.MustGenerateGroupChatID()
+	require.NoError(t, e.store.PutChat(e.ctx, &chat.Chat{
+		ID:           other,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:        "Not In",
+		LastActivity: at(2),
+	}))
+
+	set := e.mustSetFeaturedGroups(e.keys, other, member)
+	require.Equal(t, chatpb.SetFeaturedGroupsResponse_OK, set.Result)
+	require.Equal(t, [][]byte{other.Value, member.Value}, featuredGroupIDs(set.FeaturedGroups))
+
+	// Each group is its record as a list view shows it, with nothing about
+	// the viewer and no messaging state: the description and the resolved
+	// profile picture, but no cover, which was never resolved.
+	md := set.FeaturedGroups[1]
+	require.Equal(t, "Member Of", md.Title)
+	require.Equal(t, "About us", md.Description)
+	require.Equal(t, chatpb.ChatType_GROUP, md.Type)
+	require.Len(t, md.GetProfilePicture().GetRenditions(), len(pictureRenditions))
+	require.NotNil(t, md.GetProfilePicture().GetRenditions()[0].Blob)
+	require.Nil(t, md.CoverPicture)
+	require.False(t, e.media.resolved[string(cover.Value)])
+	require.EqualValues(t, 1, md.GetRosterSummary().GetMemberCount())
+	require.Empty(t, md.Members)
+	require.Nil(t, md.ViewerState)
+	require.Nil(t, md.LastMessage)
+	require.Zero(t, md.LatestEventSequence)
+	require.False(t, md.IsPrivate)
+	require.False(t, md.InLobby)
+
+	// The list is the same for every caller: no auth, someone else, and the
+	// featurer themself all get what the set returned.
+	for _, got := range []*chatpb.GetFeaturedGroupsResponse{
+		e.getFeaturedGroups("featurer"),
+		e.getFeaturedGroups("featurer", viewerKeys),
+		e.getFeaturedGroups("featurer", e.keys),
+	} {
+		require.Equal(t, chatpb.GetFeaturedGroupsResponse_OK, got.Result)
+		require.Len(t, got.FeaturedGroups, len(set.FeaturedGroups))
+		for i := range set.FeaturedGroups {
+			require.True(t, proto.Equal(set.FeaturedGroups[i], got.FeaturedGroups[i]))
+		}
+	}
+
+	// Setting the same list is OK; a reorder and a removal replace it.
+	set = e.mustSetFeaturedGroups(e.keys, other, member)
+	require.Equal(t, chatpb.SetFeaturedGroupsResponse_OK, set.Result)
+	set = e.mustSetFeaturedGroups(e.keys, member)
+	require.Equal(t, chatpb.SetFeaturedGroupsResponse_OK, set.Result)
+	require.Equal(t, [][]byte{member.Value}, featuredGroupIDs(e.getFeaturedGroups("featurer").FeaturedGroups))
+
+	// An empty list clears them.
+	set = e.mustSetFeaturedGroups(e.keys)
+	require.Equal(t, chatpb.SetFeaturedGroupsResponse_OK, set.Result)
+	require.Empty(t, set.FeaturedGroups)
+	require.Empty(t, e.getFeaturedGroups("featurer").FeaturedGroups)
+}
+
+func testServer_FeaturedGroups_Refused(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.profiles.usernames[string(e.userID.Value)] = "featurer"
+
+	public := e.putGroup("Public", at(1))
+	require.Equal(t, chatpb.SetFeaturedGroupsResponse_OK, e.mustSetFeaturedGroups(e.keys, public).Result)
+	requireUnchanged := func() {
+		t.Helper()
+		require.Equal(t, [][]byte{public.Value}, featuredGroupIDs(e.getFeaturedGroups("featurer").FeaturedGroups))
+	}
+
+	// A group that does not exist: NOT_FOUND, nothing written.
+	missing := chat.MustGenerateGroupChatID()
+	resp := e.mustSetFeaturedGroups(e.keys, public, missing)
+	require.Equal(t, chatpb.SetFeaturedGroupsResponse_NOT_FOUND, resp.Result)
+	require.Empty(t, resp.FeaturedGroups)
+	requireUnchanged()
+
+	// A private group: DENIED, nothing written, member or not.
+	private := e.putKeyedPrivateGroup("Private")
+	resp = e.mustSetFeaturedGroups(e.keys, private, public)
+	require.Equal(t, chatpb.SetFeaturedGroupsResponse_DENIED, resp.Result)
+	require.Empty(t, resp.FeaturedGroups)
+	requireUnchanged()
+
+	// Both: existence is judged first.
+	resp = e.mustSetFeaturedGroups(e.keys, private, missing)
+	require.Equal(t, chatpb.SetFeaturedGroupsResponse_NOT_FOUND, resp.Result)
+	requireUnchanged()
+
+	// A DM's ID, a repeat, or too many groups is an invalid argument.
+	tooMany := make([]*commonpb.ChatId, chat.MaxFeaturedGroups+1)
+	for i := range tooMany {
+		tooMany[i] = e.putGroup("Many", at(1))
+	}
+	for name, chatIDs := range map[string][]*commonpb.ChatId{
+		"dm":       {public, e.putDM(at(1))},
+		"repeated": {public, public},
+		"too many": tooMany,
+	} {
+		_, err := e.setFeaturedGroups(e.keys, chatIDs...)
+		require.Equal(t, codes.InvalidArgument, status.Code(err), name)
+	}
+	requireUnchanged()
+
+	// Setting needs auth.
+	_, err := e.client.SetFeaturedGroups(e.ctx, &chatpb.SetFeaturedGroupsRequest{ChatIds: []*commonpb.ChatId{public}})
+	require.Error(t, err)
+	requireUnchanged()
+}
+
+func testServer_FeaturedGroups_UnknownUsername(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	require.Equal(t, chatpb.GetFeaturedGroupsResponse_NOT_FOUND, e.getFeaturedGroups("nobody").Result)
+	require.Equal(t, chatpb.GetFeaturedGroupsResponse_NOT_FOUND, e.getFeaturedGroups("nobody", e.keys).Result)
 }

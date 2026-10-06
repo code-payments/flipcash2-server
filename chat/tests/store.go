@@ -58,6 +58,7 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_GroupChat_MembershipsForUser,
 		testStore_GroupChat_ChatsForUser,
 		testStore_GroupChat_ChatsForUserByIDs,
+		testStore_GroupChat_ChatsByID,
 		testStore_GroupChat_CreationCap,
 		testStore_GroupChat_DuplicateMembers,
 		testStore_GroupChat_AddMembersErrors,
@@ -1368,6 +1369,51 @@ func testStore_GroupChat_ChatsForUserByIDs(t *testing.T, s chat.Store) {
 
 	// A DM ID is the wrong family: an error, not an omission.
 	_, err = s.GetGroupChatsForUserByIDs(ctx, userA, []*commonpb.ChatId{groupA.ID, dm.ID})
+	require.Error(t, err)
+}
+
+// testStore_GroupChat_ChatsByID pins GetGroupChatsByID: the records of the
+// groups that exist, whoever's they are, with no membership consulted.
+func testStore_GroupChat_ChatsByID(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+
+	groupA := putGroupChat(t, s, "Only A", at(1), userA)
+	groupB := putGroupChat(t, s, "Only B", at(2), userB)
+	dm := putDmChat(t, s, userA, userB, at(3))
+
+	// No IDs is an empty result, not an error.
+	chats, err := s.GetGroupChatsByID(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, chats)
+
+	// Every group that exists, member or not; a group that does not exist is
+	// omitted, and a repeated ID collapses.
+	missing := chat.MustGenerateGroupChatID()
+	chats, err = s.GetGroupChatsByID(ctx, []*commonpb.ChatId{groupB.ID, missing, groupA.ID, groupB.ID})
+	require.NoError(t, err)
+	require.Len(t, chats, 2)
+	require.NotContains(t, chats, string(missing.Value))
+	for _, want := range []*chat.Chat{groupA, groupB} {
+		got, ok := chats[string(want.ID.Value)]
+		require.True(t, ok)
+		require.Equal(t, want.ID.Value, got.ID.Value)
+		require.Equal(t, want.Title, got.Title)
+		require.Equal(t, chatpb.ChatType_GROUP, got.Type)
+		require.Empty(t, got.Members)
+		require.Equal(t, chat.RosterSummary{}, got.RosterSummary)
+	}
+
+	// A departed member changes nothing: the record is read whoever asks.
+	removeGroupMember(t, s, groupA.ID, userA)
+	chats, err = s.GetGroupChatsByID(ctx, []*commonpb.ChatId{groupA.ID})
+	require.NoError(t, err)
+	require.Contains(t, chats, string(groupA.ID.Value))
+
+	// A DM ID is the wrong family: an error, not an omission.
+	_, err = s.GetGroupChatsByID(ctx, []*commonpb.ChatId{groupA.ID, dm.ID})
 	require.Error(t, err)
 }
 

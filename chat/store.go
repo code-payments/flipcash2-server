@@ -388,6 +388,23 @@ type Store interface {
 	// membership, from surfacing a chat they cannot see.
 	GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) ([]*Chat, error)
 
+	// GetGroupChatsByID returns the canonical record of each given group chat
+	// that exists, keyed by string(chatID.Value), whoever is asking: it checks
+	// no membership, so a caller passes only IDs whose records it may show.
+	// IDs of chats that do not exist are absent; duplicate IDs collapse. The
+	// read is eventually consistent, at half the cost of a strong one: a group
+	// created moments ago may be absent, and a record may trail an edit by a
+	// moment, which its readers tolerate (see Server.SetFeaturedGroups and
+	// Server.GetFeaturedGroups). Like GetChatByID it reads only the records: a
+	// group's Members and RosterSummary are empty. It returns an error if any
+	// ID is not a group chat ID, and an empty result (no error) when chatIDs is
+	// empty.
+	//
+	// TODO: revisit the consistency if another reader comes to use it,
+	// especially one that needs a strongly consistent answer, e.g. by having
+	// the caller choose it.
+	GetGroupChatsByID(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]*Chat, error)
+
 	// AdvanceLastMessage records messageID as the chat's most recent message,
 	// moving last_activity forward to ts and last_message_id to messageID, and
 	// reports whether it advanced. The two fields are two views of the same event
@@ -574,13 +591,16 @@ type Store interface {
 	// that moves the version by one, so concurrent replaces each land whole,
 	// in some order, and a reader never sees a mix. An empty list clears the
 	// featured groups. It returns an error unless chatIDs passes
-	// ValidateFeaturedGroups. It does not check that the groups exist: that
-	// is the caller's.
+	// ValidateFeaturedGroups. It does not check that the groups exist or are
+	// public: those need the groups' records, and are the caller's.
 	SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (featured FeaturedGroups, changed bool, err error)
 
 	// GetFeaturedGroups returns userID's featured groups in their order. The
-	// read is strongly consistent: it reflects every write that completed
-	// before it, so a user who just set their featured groups reads them. A
-	// user who has never set any reads as no groups at version zero.
+	// read is eventually consistent, at half the cost of a strong one: it may
+	// trail a replace by a moment, returning the list as it was before, but
+	// never a mix of two lists. Its readers display the list, which a refetch
+	// corrects; SetFeaturedGroups decides against a strongly consistent read
+	// of its own. A user who has never set any reads as no groups at version
+	// zero.
 	GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (FeaturedGroups, error)
 }

@@ -63,9 +63,9 @@ type MessagingReader interface {
 }
 
 // ProfileReader is the read slice of the profile domain the Chat service needs
-// to hydrate member profiles. Like MessagingReader it is declared here (consumer
-// side) so the chat package need not import profile; the profile package
-// supplies the concrete adapter.
+// to hydrate member profiles and to find a user by handle. Like
+// MessagingReader it is declared here (consumer side) so the chat package need
+// not import profile; the profile package supplies the concrete adapter.
 type ProfileReader interface {
 	// GetPhoneNumbers returns the linked phone number for each of the given
 	// users that has one, keyed by string(userID.Value). Users without a linked
@@ -92,6 +92,10 @@ type ProfileReader interface {
 	// There is one proto per user, so a caller that fills in per-member fields
 	// must copy before mutating: the same user can be a member of several chats.
 	GetLimitedPublicProfilesForRow(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error)
+
+	// GetUserIDByUsername returns the user currently holding the given
+	// handle, and ok false when nobody holds it.
+	GetUserIDByUsername(ctx context.Context, username string) (userID *commonpb.UserId, ok bool, err error)
 }
 
 // BlocklistReader is the read slice of the blocklist domain the Chat service

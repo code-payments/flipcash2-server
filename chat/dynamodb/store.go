@@ -186,8 +186,10 @@ import (
 //	          chat.FeaturedGroups), with chat, the group's raw ID (B), and
 //	          version, the list's version as of the write that put the item.
 //	          The position is zero-padded (see featuredSK), so the sk order
-//	          is the list order and the list is one strongly consistent query
-//	          of the partition, in order, with nothing to sort. One
+//	          is the list order and the list is one query of the
+//	          partition, in order, with nothing to sort: eventually
+//	          consistent for a reader, strongly consistent for the replace
+//	          that decides against it (see SetFeaturedGroups). One
 //	          aggregates item heads the partition, sk = "#meta" (see skMeta),
 //	          with the list's version and featured_count.
 //
@@ -1483,6 +1485,42 @@ func (s *store) GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.
 		}
 	}
 	return s.batchGetChats(ctx, wanted)
+}
+
+func (s *store) GetGroupChatsByID(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]*chat.Chat, error) {
+	for _, chatID := range chatIDs {
+		if !chat.IsGroupChatID(chatID) {
+			return nil, fmt.Errorf("not a group chat id")
+		}
+	}
+
+	seen := make(map[string]struct{}, len(chatIDs))
+	var keys []map[string]types.AttributeValue
+	for _, chatID := range chatIDs {
+		if _, dup := seen[string(chatID.Value)]; dup {
+			continue
+		}
+		seen[string(chatID.Value)] = struct{}{}
+		keys = append(keys, map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))})
+	}
+
+	chats := make(map[string]*chat.Chat, len(keys))
+	err := s.batchGet(ctx, s.chatsTable, keys, "", nil, false, func(item map[string]types.AttributeValue) error {
+		chatID, err := chatIDFromPK(item)
+		if err != nil {
+			return err
+		}
+		c, err := chatFromItem(chatID, item)
+		if err != nil {
+			return err
+		}
+		chats[string(chatID.Value)] = c
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return chats, nil
 }
 
 // maxBatchGetKeys is DynamoDB's per-request BatchGetItem key limit.
@@ -3313,10 +3351,12 @@ func (s *store) SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, 
 	for attempt := 0; attempt < maxFeaturedAttempts; attempt++ {
 		// The list is read first, strongly consistent, both to answer the
 		// no-op without a write and for the version the write is compared
-		// against and the positions it must clear. The items are never read
+		// against and the positions it must clear. A stale read would be
+		// wrong here, not just late: it could answer a list it no longer
+		// holds as the no-op and skip the write. The items are never read
 		// for the write's sake beyond that: a replace overwrites every
 		// position it fills.
-		current, err := s.readFeaturedGroups(ctx, userID)
+		current, err := s.readFeaturedGroups(ctx, userID, true)
 		if err != nil {
 			return chat.FeaturedGroups{}, false, err
 		}
@@ -3406,26 +3446,29 @@ func (s *store) SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, 
 	return chat.FeaturedGroups{}, false, fmt.Errorf("replacing featured groups for user %x: attempts exhausted", userID.Value)
 }
 
+// GetFeaturedGroups reads eventually consistent, at half the cost: its
+// readers display the list (see chat.Store).
 func (s *store) GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (chat.FeaturedGroups, error) {
-	return s.readFeaturedGroups(ctx, userID)
+	return s.readFeaturedGroups(ctx, userID, false)
 }
 
-// readFeaturedGroups reads userID's featured groups: one strongly
-// consistent query of their partition, #meta at its head and the positions
-// after it in order. A query is consistent per item, not as a set, so one
-// that runs alongside a replace can return #meta from one side of it and
-// some positions from the other. Every replace stamps every position it fills
+// readFeaturedGroups reads userID's featured groups: one query of their
+// partition, strongly consistent when consistent is set, #meta at its head
+// and the positions after it in order. A query is consistent per item, not
+// as a set, and an eventually consistent one can also take items from
+// replicas at different points, so either can return #meta from one side of
+// a replace and some positions from the other. Every replace stamps every position it fills
 // with its version, so the read is a list exactly when every position carries
 // #meta's version and they number featured_count, contiguous from zero; it
 // is taken again, up to maxFeaturedReads times, when it is not.
-func (s *store) readFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (chat.FeaturedGroups, error) {
+func (s *store) readFeaturedGroups(ctx context.Context, userID *commonpb.UserId, consistent bool) (chat.FeaturedGroups, error) {
 	for attempt := 0; attempt < maxFeaturedReads; attempt++ {
 		var items []map[string]types.AttributeValue
 		paginator := dynamodb.NewQueryPaginator(s.client, &dynamodb.QueryInput{
 			TableName:                 aws.String(s.featuredGroupsTable),
 			KeyConditionExpression:    aws.String(fmt.Sprintf("%s = :pk", attrPK)),
 			ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(userPK(userID))},
-			ConsistentRead:            aws.Bool(true),
+			ConsistentRead:            aws.Bool(consistent),
 		})
 		for paginator.HasMorePages() {
 			out, err := paginator.NextPage(ctx)

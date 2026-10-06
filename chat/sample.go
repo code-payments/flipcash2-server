@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"go.uber.org/zap"
@@ -20,19 +21,23 @@ import (
 )
 
 // A sample of a public group's chatters: a short list of its members to show,
-// the creator first while they are a member, then the members who have sent
-// most recently, most recent first. It is how a group shows who is in it
-// without listing members who only read: everyone in it is a member as of the
-// read, but a member who has not sent recently is not in it.
+// the creator first while they are a member, then the most active members who
+// have sent, by activity score (see NextActivityScore) leaning toward
+// recency (see sampleRank): a member who shows up every day ranks above one
+// who sent once a little more recently, but of two with close scores the
+// more recent sender comes first. It is how a group
+// shows who is in it without listing members who only read: everyone in it
+// is a member as of the read, but a member who has not sent recently is not
+// in it.
 //
-// The candidates are the group's recent senders, read from its activity
-// records (see RecentSender), which name people who have since left as well
-// as members. So each candidate's membership is checked (see
+// The candidates are the group's most active senders, read from its activity
+// records (see Store.GetActiveSenders), which name people who have since left
+// as well as members. So each candidate's membership is checked (see
 // Store.GetGroupMembersByID), in chunks in candidate order, stopping as
 // soon as one more member than the sample holds is found: that one proves
 // has_more without being returned. Each chunk is as many candidates as
 // members still to find, plus sampleChattersCheckBuffer, so a group whose
-// recent senders are all still members is answered by one read, and a
+// most active senders are all still members is answered by one read, and a
 // later read checks only about as many as are still missing. The read of
 // senders is bounded too; when it fills and too few of the senders are
 // still members, has_more is set,
@@ -47,8 +52,8 @@ import (
 // (see ActivityRetention) is not a candidate until they send again.
 //
 // The creator is a candidate whether or not they have sent, and is shown at
-// their own last send whenever they have a record, however many others have
-// sent since: one outside the senders read is looked up directly (see
+// their own last send whenever they have a record, however many others rank
+// above them: one outside the senders read is looked up directly (see
 // Store.GetLastSentAt), only when they are shown and the read of senders
 // filled, since otherwise it holds every record the group has.
 //
@@ -69,7 +74,7 @@ const (
 	// the max_items on SampleChattersResponse.chatters.
 	sampleChattersSize = 20
 
-	// sampleChattersSenderWindow is how many of a group's most recent
+	// sampleChattersSenderWindow is how many of a group's most active
 	// senders are candidates for the sample.
 	sampleChattersSenderWindow = 100
 
@@ -77,7 +82,26 @@ const (
 	// still to find are checked per read, to absorb a few who have left
 	// without another read.
 	sampleChattersCheckBuffer = 5
+
+	// sampleChattersRecencyWeight is how far a sender's rank leans from
+	// their activity score toward their last send (see sampleRank): 0 ranks
+	// by score alone, 1 by recency alone.
+	sampleChattersRecencyWeight = 0.2
 )
+
+// sampleRank is the key a sender is ranked by in a sample, highest first:
+// their activity score less sampleChattersRecencyWeight of its lead over
+// their last send. Comparing two senders, the more recent one ranks first
+// exactly when the gap between their last sends is more than
+// (1 − w) / w times the gap between their scores (4 times at w = 0.2): close
+// scores go to the more recent sender, distant ones to the more active. It
+// only reorders the senders read, which are the most active by score alone,
+// so a sender just outside that read cannot be ranked in by recency; the
+// read is five times the sample, so one that would is far down it.
+func sampleRank(sender RecentSender) time.Time {
+	lead := sender.ActivityScore.Sub(sender.LastSentAt)
+	return sender.ActivityScore.Add(-time.Duration(sampleChattersRecencyWeight * float64(lead)))
+}
 
 func (s *Server) SampleChatters(ctx context.Context, req *chatpb.SampleChattersRequest) (*chatpb.SampleChattersResponse, error) {
 	log := s.log.With(zap.String("chat_id", model.ChatIDString(req.ChatId)))
@@ -126,13 +150,21 @@ type sampleCandidate struct {
 
 // sampleChatters builds the sample of the public group c, as described above.
 func (s *Server) sampleChatters(ctx context.Context, c *Chat) ([]*chatpb.SampledChatter, bool, error) {
-	senders, err := s.chats.GetRecentSenders(ctx, c.ID, sampleChattersSenderWindow)
+	senders, err := s.chats.GetActiveSenders(ctx, c.ID, sampleChattersSenderWindow)
 	if err != nil {
 		return nil, false, err
 	}
+	// By rank, and of two with the same rank, the more recent sender first.
+	sort.SliceStable(senders, func(i, j int) bool {
+		ri, rj := sampleRank(senders[i]), sampleRank(senders[j])
+		if !ri.Equal(rj) {
+			return ri.After(rj)
+		}
+		return senders[i].LastSentAt.After(senders[j].LastSentAt)
+	})
 
 	// The creator first, at their send time if the senders read holds it
-	// (otherwise looked up below), then every other sender in recency order.
+	// (otherwise looked up below), then every other sender in rank order.
 	candidates := make([]sampleCandidate, 0, len(senders)+1)
 	if c.CreatorID != nil {
 		creator := sampleCandidate{userID: c.CreatorID, isCreator: true}

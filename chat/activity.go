@@ -36,7 +36,7 @@ import (
 // ActivityScoreMaxLead bounds it whatever the history; at these values no
 // steady pattern reaches it.
 //
-// Nothing ranks by it yet.
+// A group's chatter sample is ordered by it (see Store.GetActiveSenders).
 const (
 	// ActivityScoreHalfLife is how long a recorded send takes to count half
 	// as much toward an activity score.

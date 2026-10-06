@@ -843,7 +843,8 @@ func (v ViewerState) Clone() ViewerState {
 // Beside recency, each record carries an activity score, a frequency-weighted
 // ordering of the same sends (see NextActivityScore), which is why it is an
 // activity record and not a send time alone. The score is maintained with
-// every recorded send; nothing ranks by it yet.
+// every recorded send, and orders a group's chatter sample (see
+// Store.GetActiveSenders).
 const (
 	// ActivityRecordInterval is the least time between two recorded sends by
 	// one user in one group.
@@ -858,9 +859,11 @@ const (
 	ActivityRetention = 365 * 24 * time.Hour
 )
 
-// RecentSender is one user's activity record in a group, as recency reads
-// it: who, when their latest recorded send was, and the record's activity
-// score (see EffectiveActivityScore), both at millisecond precision.
+// RecentSender is one user's activity record in a group, as the reads of a
+// group's senders return it (see Store.GetRecentSenders and
+// Store.GetActiveSenders): who, when their latest recorded send was, and the
+// record's activity score (see EffectiveActivityScore), both at millisecond
+// precision.
 type RecentSender struct {
 	UserID        *commonpb.UserId
 	LastSentAt    time.Time

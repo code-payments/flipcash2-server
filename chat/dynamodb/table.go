@@ -24,7 +24,7 @@ import (
 // when they end (see gsiByMuted) and an inverted GSI of a chat's records by
 // user (see gsiUserStateByUser); chat_activity is keyed by (pk, sk) = (chat,
 // user) with two LSIs, one by last_sent_at (lsiByLastSentAt) and one by
-// activity_score (lsiByActivityScore, unread today), and TTL on
+// activity_score (lsiByActivityScore), and TTL on
 // expires_at; chat_key_envelopes is keyed by (pk, sk) = (user, chat) with no
 // index; chat_lobbies is keyed by (pk, sk) = (user, chat) — plus one "#meta"
 // aggregates item per chat and per user — with a sparse GSI of a chat's

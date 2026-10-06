@@ -507,6 +507,17 @@ type Store interface {
 	// chat ID.
 	GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]RecentSender, error)
 
+	// GetActiveSenders returns the group's activity records most active
+	// first, by activity score (see NextActivityScore), at most limit of them
+	// (limit <= 0 means unbounded), from an eventually consistent read, as
+	// GetRecentSenders. Ties come back in no particular order. A record
+	// written before scores existed and never since backfilled is not
+	// returned. Records of users who have since left are included, and a
+	// record past ActivityRetention may be. A group with no records, or that
+	// does not exist, is an empty result. It returns an error if chatID is
+	// not a group chat ID.
+	GetActiveSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]RecentSender, error)
+
 	// GetLastSentAt returns userID's activity record in the group chatID:
 	// when their latest recorded send was, and whether they have a record at
 	// all. It is the point read of what GetRecentSenders ranges over, for a

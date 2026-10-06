@@ -15,7 +15,7 @@ require (
 	github.com/aws/smithy-go v1.27.7
 	github.com/buckket/go-blurhash v1.1.0
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/code-payments/flipcash2-protobuf-api v1.27.1-0.20261005230127-66b98eef5e35
+	github.com/code-payments/flipcash2-protobuf-api v1.27.1-0.20261006140335-8b92eb418ab9
 	github.com/code-payments/ocp-protobuf-api v1.16.1-0.20260918154336-e3d25a85b1e1
 	github.com/code-payments/ocp-server v1.24.1-0.20260903184009-272d62754fdc
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2
@@ -126,5 +126,3 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/code-payments/flipcash2-protobuf-api => ../flipcash2-protobuf-api

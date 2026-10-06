@@ -2465,40 +2465,35 @@ func testServer_JoinChat_OK(t *testing.T, s chat.Store) {
 	require.True(t, isMember)
 	require.Equal(t, chatpb.GetChatResponse_OK, e.getChat(e.keys, group.ID).Result)
 
-	// ...and been announced. The chat's topic carries the joiner's hydrated
-	// member entry — profile, no pointers, no metadata — with the joiner
-	// excluded, since their streams are not on the topic yet.
+	// ...and been announced. The chat's topic is told only that the roster
+	// moved, naming no one, with the joiner excluded, since their streams are
+	// not on the topic yet.
 	e.waitForRosterUpdates(e.userID, group.ID, 1)
 	toMembers, excludes := e.rosterUpdatesOnChatTopic(group.ID)
 	require.Len(t, toMembers, 1)
 	require.Len(t, excludes[0], 1)
 	require.Equal(t, e.userID.Value, excludes[0][0].Value)
-	joined := toMembers[0].GetMemberJoined()
-	require.NotNil(t, joined)
-	require.Equal(t, e.userID.Value, joined.Member.UserId.Value)
-	require.Equal(t, "Joiner", joined.Member.UserProfile.DisplayName)
-	require.True(t, joined.Member.UserProfile.JoinTs.AsTime().Equal(at(5)))
-	require.Empty(t, joined.Member.Pointers)
-	require.Nil(t, joined.Metadata)
-	// The announced member is the record the join wrote: the version the
-	// roster moved to, and the join time as stored.
-	require.EqualValues(t, 1, joined.Member.Version)
-	require.NotNil(t, joined.Member.JoinedAt)
-	records, err := s.GetGroupMemberRecords(e.ctx, e.userID, []*commonpb.ChatId{group.ID})
-	require.NoError(t, err)
-	require.True(t, joined.Member.JoinedAt.AsTime().Equal(records[string(group.ID.Value)].JoinedAt))
+	require.NotNil(t, toMembers[0].GetMembershipChanged())
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 3, Version: 1}, toMembers[0].GetRosterSummary()))
 
-	// The joiner's own topic carries the same member plus the full metadata,
-	// so their other devices insert the chat without a refetch.
+	// The joiner's own topic carries their hydrated member entry — profile, no
+	// pointers — plus the full metadata, so their other devices insert the
+	// chat without a refetch.
 	toJoiner := e.rosterUpdatesOnUserTopic(e.userID, group.ID)
 	require.Len(t, toJoiner, 1)
 	joinedSelf := toJoiner[0].GetMemberJoined()
 	require.NotNil(t, joinedSelf)
 	require.Equal(t, e.userID.Value, joinedSelf.Member.UserId.Value)
 	require.Equal(t, "Joiner", joinedSelf.Member.UserProfile.DisplayName)
+	require.True(t, joinedSelf.Member.UserProfile.JoinTs.AsTime().Equal(at(5)))
+	require.Empty(t, joinedSelf.Member.Pointers)
+	// The announced member is the record the join wrote: the version the
+	// roster moved to, and the join time as stored.
 	require.EqualValues(t, 1, joinedSelf.Member.Version)
-	require.True(t, joinedSelf.Member.JoinedAt.AsTime().Equal(joined.Member.JoinedAt.AsTime()))
+	require.NotNil(t, joinedSelf.Member.JoinedAt)
+	records, err := s.GetGroupMemberRecords(e.ctx, e.userID, []*commonpb.ChatId{group.ID})
+	require.NoError(t, err)
+	require.True(t, joinedSelf.Member.JoinedAt.AsTime().Equal(records[string(group.ID.Value)].JoinedAt))
 	require.NotNil(t, joinedSelf.Metadata)
 	require.Equal(t, group.ID.Value, joinedSelf.Metadata.ChatId.Value)
 	require.Equal(t, "Open Group", joinedSelf.Metadata.Title)
@@ -2741,16 +2736,14 @@ func testServer_LeaveChat_OK(t *testing.T, s chat.Store) {
 	require.Equal(t, other.Value, members[0].Value)
 
 	// The departure is announced on the chat's topic with the leaver excluded
-	// — their stream may still be on it — and on the leaver's own topic, so
-	// every device they have open drops the chat.
+	// — their stream may still be on it — naming no one, and on the leaver's
+	// own topic, so every device they have open drops the chat.
 	e.waitForRosterUpdates(e.userID, chatID, 1)
 	toMembers, excludes := e.rosterUpdatesOnChatTopic(chatID)
 	require.Len(t, toMembers, 1)
 	require.Len(t, excludes[0], 1)
 	require.Equal(t, e.userID.Value, excludes[0][0].Value)
-	left := toMembers[0].GetMemberLeft()
-	require.NotNil(t, left)
-	require.Equal(t, e.userID.Value, left.UserId.Value)
+	require.NotNil(t, toMembers[0].GetMembershipChanged())
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 1}, toMembers[0].GetRosterSummary()))
 
 	toLeaver := e.rosterUpdatesOnUserTopic(e.userID, chatID)
@@ -2831,14 +2824,19 @@ func testServer_LeaveChat_ThenRejoin(t *testing.T, s chat.Store) {
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 2}, resp.Chat.GetRosterSummary()))
 	require.Len(t, e.getChat(e.keys, chatID).Metadata.Members, 1)
 
-	// Two transitions, two announcements on each topic, in order.
+	// Two transitions, two announcements on each topic, in order: named on
+	// the user's own, anonymous on the chat's.
 	e.waitForRosterUpdates(e.userID, chatID, 2)
 	toMembers, _ := e.rosterUpdatesOnChatTopic(chatID)
 	require.Len(t, toMembers, 2)
-	require.NotNil(t, toMembers[0].GetMemberLeft())
+	require.NotNil(t, toMembers[0].GetMembershipChanged())
 	require.Equal(t, uint64(1), toMembers[0].GetRosterSummary().GetVersion())
-	require.NotNil(t, toMembers[1].GetMemberJoined())
+	require.NotNil(t, toMembers[1].GetMembershipChanged())
 	require.Equal(t, uint64(2), toMembers[1].GetRosterSummary().GetVersion())
+	toSelf := e.rosterUpdatesOnUserTopic(e.userID, chatID)
+	require.Len(t, toSelf, 2)
+	require.NotNil(t, toSelf[0].GetMemberLeft())
+	require.NotNil(t, toSelf[1].GetMemberJoined())
 }
 
 // fakeModerator is a canned moderation.Client for server tests. Only the two
@@ -5493,14 +5491,13 @@ func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	require.NotNil(t, got.Metadata.ViewerState)
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 1}, got.Metadata.RosterSummary))
 
-	// Announced as a join: the members' copy on the chat topic, the admitted
-	// user's with the metadata on their topic; and to the creator, the lobby
-	// shrank.
+	// Announced as a join: to the members, only that the roster moved; the
+	// admitted user's own copy with the metadata on their topic; and to the
+	// creator, the lobby shrank.
 	e.waitForRosterUpdates(userID, chatID, 1)
 	onChat, _ := e.rosterUpdatesOnChatTopic(chatID)
 	require.Len(t, onChat, 1)
-	require.Equal(t, userID.Value, onChat[0].GetMemberJoined().GetMember().GetUserId().GetValue())
-	require.Nil(t, onChat[0].GetMemberJoined().GetMetadata())
+	require.NotNil(t, onChat[0].GetMembershipChanged())
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 1}, onChat[0].RosterSummary))
 	toUser := e.rosterUpdatesOnUserTopic(userID, chatID)
 	require.Len(t, toUser, 1)

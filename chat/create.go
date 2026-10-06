@@ -270,13 +270,13 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 	if err != nil {
 		return nil, err
 	}
-	s.publishRosterUpdate(chatID, userID, nil, &chatpb.RosterUpdate{
+	s.publishRosterUpdate(chatID, userID, &chatpb.RosterUpdate{
 		Kind: &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{
 			Member:   member,
 			Metadata: md,
 		}},
 		RosterSummary: md.RosterSummary,
-	})
+	}, false)
 
 	return &chatpb.StartChatResponse{
 		Result: chatpb.StartChatResponse_OK,

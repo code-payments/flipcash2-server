@@ -39,9 +39,11 @@ import (
 // its creator is what admits them.
 //
 // Each transition that actually happens is broadcast as a RosterUpdate to the
-// chat's members and to the affected user (see publishRosterUpdate). A join or
-// departure that is a no-op broadcasts nothing: the roster did not move, and a
-// client applying updates by version would drop it anyway.
+// chat's members and to the affected user (see publishRosterUpdate): the user
+// learns what happened to them, and the other members only that the roster
+// moved, with no one named. A join or departure that is a no-op broadcasts
+// nothing: the roster did not move, and a client applying updates by version
+// would drop it anyway.
 
 func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*chatpb.JoinChatResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
@@ -121,21 +123,15 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	md.RosterSummary = rosterSummary
 
 	if changed {
-		// The joiner's own member entry, as hydrate built it, is what the rest of
-		// the chat learns about them — less their pointers, which are never
-		// surfaced to other members (see hydrate), plus the join time and
-		// version of the record this call wrote (see announcedMember), which
-		// hydrate does not read.
+		// The joiner's own devices learn of the join with their member entry,
+		// as hydrate built it, plus the join time and version of the record
+		// this call wrote (see announcedMember), which hydrate does not read,
+		// and the full metadata, so they can insert the chat without a
+		// refetch. The rest of the chat is told only that the roster moved.
 		member, err := s.announcedMember(ctx, log, req.ChatId, userID, md.Members[0].UserProfile, roster)
 		if err != nil {
 			return nil, err
 		}
-		toMembers := &chatpb.RosterUpdate{
-			Kind:          &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{Member: member}},
-			RosterSummary: rosterSummary,
-		}
-		// The joiner's other devices get the full metadata too, so they can
-		// insert the chat without a refetch.
 		toJoiner := &chatpb.RosterUpdate{
 			Kind: &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{
 				Member:   member,
@@ -143,7 +139,7 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 			}},
 			RosterSummary: rosterSummary,
 		}
-		s.publishRosterUpdate(req.ChatId, userID, toMembers, toJoiner)
+		s.publishRosterUpdate(req.ChatId, userID, toJoiner, true)
 	}
 
 	return &chatpb.JoinChatResponse{
@@ -205,7 +201,7 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 			}},
 			RosterSummary: roster.ToProto(),
 		}
-		s.publishRosterUpdate(req.ChatId, userID, update, update)
+		s.publishRosterUpdate(req.ChatId, userID, update, true)
 	}
 
 	// A departure clears the caller's mute (see clearMuteOnLeave). It runs
@@ -216,10 +212,10 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 	return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_OK}, nil
 }
 
-// announcedMember is the member entry a join announces (see
-// RosterUpdate.MemberJoined): the joiner's profile as hydrated, and the join
-// time and version stamp of the record the join just wrote, read back
-// strongly consistent as one point read — the one carrier of a member's
+// announcedMember is the member entry a join announces to the joiner's own
+// devices (see RosterUpdate.MemberJoined): the joiner's profile as hydrated,
+// and the join time and version stamp of the record the join just wrote, read
+// back strongly consistent as one point read — the one carrier of a member's
 // record besides the roster page, and the one the client merges pages
 // against. A record that is not joined after all — a departure from another
 // of the user's devices landing between the join and this read — is announced
@@ -269,26 +265,33 @@ func (s *Server) clearMuteOnLeave(ctx context.Context, log *zap.Logger, chatID *
 }
 
 // publishRosterUpdate broadcasts one roster transition on chatID whose subject
-// is the user who joined or left: toMembers to every other member, and
-// toSubject to the subject's own devices. It is best-effort and non-blocking —
-// the bus hands events to its handlers on their own goroutines — and never
-// fails the RPC whose transition it announces.
+// is the user who joined or left: toSubject to the subject's own devices and,
+// when tellMembers is set, a MembershipChanged carrying the same roster
+// summary to every other member. It is best-effort and non-blocking — the bus
+// hands events to its handlers on their own goroutines — and never fails the
+// RPC whose transition it announces.
+//
+// The other members are never told who joined or left: a membership is not
+// announced to the chat, so the update they get names no one and only keeps
+// their roster summary current (member_count and version), with no gap in
+// the versions they hold. The subject is always told, since their own
+// devices act on it.
 //
 // The two audiences are reached over different topics because a stream's
 // group subscriptions follow its user's membership, and it is the subject's
 // own copy that moves them (see event.Server.followMembership): a joiner's
 // open streams are not on the chat's topic until their MemberJoined arrives
 // on their user topic, and a leaver's come off it when their MemberLeft does.
-// So the chat topic carries toMembers with the subject excluded — which also
-// keeps a leaver whose stream is still on the topic from hearing it twice —
-// and the subject's user topic carries toSubject, reaching every device they
-// have open whatever the topic knows. The two updates may differ in payload
-// (a join carries the chat's metadata to the joiner alone); they carry the
-// same roster summary, so either audience converges on the same version.
+// So the chat topic carries the members' update with the subject excluded —
+// which also keeps a leaver whose stream is still on the topic from hearing
+// it twice — and the subject's user topic carries toSubject, reaching every
+// device they have open whatever the topic knows. Both carry the same roster
+// summary, so either audience converges on the same version.
 //
-// A nil toMembers means there is no one else to tell — a group's creation,
-// where the subject is its only member — and the chat topic is left silent.
-func (s *Server) publishRosterUpdate(chatID *commonpb.ChatId, subject *commonpb.UserId, toMembers, toSubject *chatpb.RosterUpdate) {
+// tellMembers is false when there is no one else to tell — a group's
+// creation, where the subject is its only member — and the chat topic is
+// left silent.
+func (s *Server) publishRosterUpdate(chatID *commonpb.ChatId, subject *commonpb.UserId, toSubject *chatpb.RosterUpdate, tellMembers bool) {
 	newEvent := func(update *chatpb.RosterUpdate) *eventpb.Event {
 		return &eventpb.Event{
 			Id: model.MustGenerateEventID(),
@@ -300,7 +303,11 @@ func (s *Server) publishRosterUpdate(chatID *commonpb.ChatId, subject *commonpb.
 		}
 	}
 
-	if toMembers != nil {
+	if tellMembers {
+		toMembers := &chatpb.RosterUpdate{
+			Kind:          &chatpb.RosterUpdate_MembershipChanged_{MembershipChanged: &chatpb.RosterUpdate_MembershipChanged{}},
+			RosterSummary: toSubject.RosterSummary,
+		}
 		s.chatEventBus.OnEvent(chatID, &eventpb.ChatEvent{
 			ChatId:         chatID,
 			Event:          newEvent(toMembers),

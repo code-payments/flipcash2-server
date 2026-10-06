@@ -118,7 +118,8 @@ import (
 //	          is a blind conditional update of one known item — no read
 //	          first, no duplicate rows — while lsiByLastSentAt orders the
 //	          partition by recency, which is the read: a group's recent
-//	          senders are one strongly consistent query, billed by the page.
+//	          senders are one eventually consistent query, billed by the
+//	          page.
 //
 //	          lsiByActivityScore orders the same partition by activity_score,
 //	          a frequency-weighted ordering that nothing writes yet. It exists
@@ -2698,9 +2699,10 @@ func (s *store) RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID 
 	return true, nil
 }
 
-// GetRecentSenders queries lsiByLastSentAt descending. The index is local,
-// so the read is strongly consistent, and it projects last_sent_at as its own
-// key, so nothing is fetched from the table. Every item in the partition is
+// GetRecentSenders queries lsiByLastSentAt descending, eventually
+// consistent at half the cost of a strong read (the index is local, so a
+// strong one is available if a reader ever needs it). It projects
+// last_sent_at as its own key, so nothing is fetched from the table. Every item in the partition is
 // an activity record carrying last_sent_at, so the index holds them all.
 func (s *store) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]chat.RecentSender, error) {
 	if !chat.IsGroupChatID(chatID) {
@@ -2720,7 +2722,6 @@ func (s *store) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, l
 				":pk": avS(chatPK(chatID)),
 			},
 			ScanIndexForward:  aws.Bool(false),
-			ConsistentRead:    aws.Bool(true),
 			ExclusiveStartKey: startKey,
 		}
 		if limit > 0 {
@@ -2754,7 +2755,7 @@ func (s *store) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, l
 	}
 }
 
-// GetLastSentAt is one strongly consistent GetItem of the user's activity
+// GetLastSentAt is one eventually consistent GetItem of the user's activity
 // record, projecting its send time.
 func (s *store) GetLastSentAt(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (time.Time, bool, error) {
 	if !chat.IsGroupChatID(chatID) {
@@ -2769,7 +2770,6 @@ func (s *store) GetLastSentAt(ctx context.Context, chatID *commonpb.ChatId, user
 		},
 		ProjectionExpression:     aws.String("#sent"),
 		ExpressionAttributeNames: map[string]string{"#sent": attrLastSentAt},
-		ConsistentRead:           aws.Bool(true),
 	})
 	if err != nil {
 		return time.Time{}, false, err

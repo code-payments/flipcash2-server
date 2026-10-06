@@ -477,19 +477,20 @@ type Store interface {
 	RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, sentAt time.Time) (recorded bool, err error)
 
 	// GetRecentSenders returns the group's activity records most recently
-	// sent first, at most limit of them (limit <= 0 means unbounded), from a
-	// strongly consistent read, so a send just recorded is in it. Ties come
-	// back in no particular order. Records of users who have since left are
-	// included (see the activity record), and a record past
-	// ActivityRetention may be. A group with no records, or that does not
-	// exist, is an empty result. It returns an error if chatID is not a group
-	// chat ID.
+	// sent first, at most limit of them (limit <= 0 means unbounded), from an
+	// eventually consistent read, so a send recorded a moment ago may be
+	// missing or at its previous time: its readers rank and show people, which
+	// a refetch corrects. Ties come back in no particular order. Records of
+	// users who have since left are included (see the activity record), and
+	// a record past ActivityRetention may be. A group with no records, or
+	// that does not exist, is an empty result. It returns an error if chatID
+	// is not a group chat ID.
 	GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]RecentSender, error)
 
 	// GetLastSentAt returns userID's activity record in the group chatID:
 	// when their latest recorded send was, and whether they have a record at
 	// all. It is the point read of what GetRecentSenders ranges over, for a
-	// user it may not reach, and strongly consistent like it. A record past
+	// user it may not reach, and eventually consistent like it. A record past
 	// ActivityRetention may be returned. A user with no record, or a group
 	// that does not exist, is ok == false. It returns an error if chatID is
 	// not a group chat ID.

@@ -78,6 +78,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_SampleChatters,
 		testServer_SampleChatters_Size,
 		testServer_SampleChatters_Window,
+		testServer_SampleChatters_Activity,
 		testServer_SampleChatters_Gates,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
@@ -1248,6 +1249,46 @@ func testServer_SampleChatters_Window(t *testing.T, s chat.Store) {
 	require.Equal(t, [][]byte{creator.Value, stayed[0].Value, stayed[1].Value}, sampledUserIDs(resp.Chatters))
 	require.True(t, resp.Chatters[0].IsCreator)
 	require.True(t, resp.Chatters[0].LastSentAt.AsTime().Equal(at(0)))
+}
+
+func testServer_SampleChatters_Activity(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	creator := model.MustGenerateUserID()
+	regular := model.MustGenerateUserID() // sent daily for a week
+	oneOff := model.MustGenerateUserID()  // sent once, a day after the regular
+	nearby := model.MustGenerateUserID()  // sent once, later, at a score just below the regular's
+	groupID := e.putGroupWithCreator("Regulars", creator, regular, oneOff, nearby)
+
+	day := 24 * time.Hour
+	var score, last time.Time
+	for d := range 7 {
+		sentAt := at(0).Add(time.Duration(d) * day)
+		e.recordSend(groupID, regular, sentAt)
+		score, last = chat.NextActivityScore(score, last, sentAt), sentAt
+	}
+	e.recordSend(groupID, oneOff, last.Add(day))
+
+	// Distant scores go to the more active: the regular, about six days
+	// ahead of their last send, above someone who sent once a day after it.
+	// Each is shown at their own last send.
+	resp := e.sampleChatters(e.keys, groupID)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
+	require.Equal(t, [][]byte{creator.Value, regular.Value, oneOff.Value}, sampledUserIDs(resp.Chatters))
+	require.True(t, resp.Chatters[1].LastSentAt.AsTime().Equal(last))
+	require.True(t, resp.Chatters[2].LastSentAt.AsTime().Equal(last.Add(day)))
+
+	// Close scores go to the more recent: a single send at nine tenths of
+	// the regular's lead scores just below them, but its last send is so
+	// much later that it ranks first.
+	lead := score.Sub(last)
+	nearbyAt := last.Add(lead * 9 / 10)
+	e.recordSend(groupID, nearby, nearbyAt)
+	senders, err := s.GetActiveSenders(e.ctx, groupID, 0)
+	require.NoError(t, err)
+	require.Equal(t, regular.Value, senders[0].UserID.Value, "by score alone, the regular leads")
+	resp = e.sampleChatters(e.keys, groupID)
+	require.Equal(t, [][]byte{creator.Value, nearby.Value, regular.Value, oneOff.Value}, sampledUserIDs(resp.Chatters))
 }
 
 func testServer_SampleChatters_Gates(t *testing.T, s chat.Store) {

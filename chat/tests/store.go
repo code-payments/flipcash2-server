@@ -90,6 +90,7 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_Activity_Concurrent,
 		testStore_Activity_Score,
 		testStore_Activity_ScoreConcurrent,
+		testStore_Activity_ActiveSenders,
 		testStore_KeyEnvelope_SetAndGet,
 		testStore_KeyEnvelope_OwnWrapStands,
 		testStore_KeyEnvelope_DiscardedOnLeave,
@@ -2920,6 +2921,54 @@ func testStore_Activity_ScoreConcurrent(t *testing.T, s chat.Store) {
 		require.NoError(t, err)
 		requireRecentSenders(t, senders, user, later)
 	}
+}
+
+func testStore_Activity_ActiveSenders(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	groupID := chat.MustGenerateGroupChatID()
+	regular, oneOff, quiet := model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()
+	day := 24 * time.Hour
+
+	senders, err := s.GetActiveSenders(ctx, groupID, 0)
+	require.NoError(t, err)
+	require.Empty(t, senders)
+
+	// A regular who sent daily for a week, a user who sent once after them,
+	// and one who sent once before.
+	recorded, err := s.RecordSend(ctx, groupID, quiet, at(0))
+	require.NoError(t, err)
+	require.True(t, recorded)
+	for d := range 7 {
+		recorded, err := s.RecordSend(ctx, groupID, regular, at(0).Add(time.Duration(d+1)*day))
+		require.NoError(t, err)
+		require.True(t, recorded)
+	}
+	recorded, err = s.RecordSend(ctx, groupID, oneOff, at(0).Add(8*day))
+	require.NoError(t, err)
+	require.True(t, recorded)
+
+	// By recency the one-off sender leads; by activity the regular does.
+	senders, err = s.GetRecentSenders(ctx, groupID, 0)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, oneOff, at(0).Add(8*day), regular, at(0).Add(7*day), quiet, at(0))
+	senders, err = s.GetActiveSenders(ctx, groupID, 0)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, regular, at(0).Add(7*day), oneOff, at(0).Add(8*day), quiet, at(0))
+	require.True(t, senders[0].ActivityScore.After(senders[1].ActivityScore))
+	require.True(t, senders[1].ActivityScore.Equal(at(0).Add(8*day)))
+
+	// A limit keeps the most active.
+	senders, err = s.GetActiveSenders(ctx, groupID, 2)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, regular, at(0).Add(7*day), oneOff, at(0).Add(8*day))
+
+	// Records belong to their group; groups only.
+	senders, err = s.GetActiveSenders(ctx, chat.MustGenerateGroupChatID(), 0)
+	require.NoError(t, err)
+	require.Empty(t, senders)
+	_, err = s.GetActiveSenders(ctx, generateDmChatID(), 0)
+	require.Error(t, err)
 }
 
 // requireRecentSenders asserts senders is exactly the given (user, last sent)

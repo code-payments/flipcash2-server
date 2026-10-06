@@ -282,6 +282,10 @@ func (c *Cache) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, l
 	return c.db.GetRecentSenders(ctx, chatID, limit)
 }
 
+func (c *Cache) GetActiveSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]chat.RecentSender, error) {
+	return c.db.GetActiveSenders(ctx, chatID, limit)
+}
+
 func (c *Cache) GetLastSentAt(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (time.Time, bool, error) {
 	return c.db.GetLastSentAt(ctx, chatID, userID)
 }

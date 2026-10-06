@@ -124,13 +124,15 @@ import (
 //
 //	          lsiByActivityScore orders the same partition by
 //	          activity_score, a frequency-weighted ordering that every
-//	          recorded send maintains (see RecordSend) and nothing reads yet.
-//	          The score is epoch-ms-denominated, equal to last_sent_at for a
-//	          user with one recorded send and running ahead of it (possibly
-//	          past now) as their sends accumulate, so a row written before
-//	          scores existed, which is missing from the index, can be given
-//	          activity_score = last_sent_at and compare correctly with the
-//	          rest; until it is, it reads and scores as if it had been.
+//	          recorded send maintains (see RecordSend), read by
+//	          GetActiveSenders. The score is epoch-ms-denominated, equal to
+//	          last_sent_at for a user with one recorded send and running
+//	          ahead of it (possibly past now) as their sends accumulate, so a
+//	          row written before scores existed, which is missing from the
+//	          index, was given activity_score = last_sent_at by a one-off
+//	          backfill and compares correctly with the rest; one that
+//	          somehow still lacks it reads and scores as if it had it, but
+//	          GetActiveSenders does not find it.
 //
 //	chat_key_envelopes  pk = "user#<id>", sk = "chat#<id>" (one item per
 //	          (user, private group) the user holds a key envelope for; see
@@ -249,8 +251,9 @@ const (
 	lsiByLastSentAt = "by_last_sent_at"
 
 	// lsiByActivityScore is the (chat, activity_score) LSI on chat_activity:
-	// a group's activity records in activity-score order. Nothing reads it
-	// yet, and a record written before scores existed is missing from it.
+	// a group's activity records in activity-score order (see
+	// GetActiveSenders). It is sparse on activity_score, which records
+	// written before scores existed lacked until backfilled.
 	lsiByActivityScore = "by_activity_score"
 
 	// gsiLobbyByChat is the (sk, entered_at) index on chat_lobbies: a group's
@@ -2845,11 +2848,26 @@ func activityScoreFromItem(item map[string]types.AttributeValue) (time.Time, err
 
 // GetRecentSenders queries lsiByLastSentAt descending, eventually
 // consistent at half the cost of a strong read (the index is local, so a
-// strong one is available if a reader ever needs it). It projects
-// last_sent_at as its own key and activity_score as an included attribute,
-// so nothing is fetched from the table. Every item in the partition is
-// an activity record carrying last_sent_at, so the index holds them all.
+// strong one is available if a reader ever needs it). Every item in the
+// partition is an activity record carrying last_sent_at, so the index holds
+// them all.
 func (s *store) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]chat.RecentSender, error) {
+	return s.querySenders(ctx, chatID, lsiByLastSentAt, limit)
+}
+
+// GetActiveSenders queries lsiByActivityScore descending, eventually
+// consistent like GetRecentSenders. The index is sparse on activity_score, so
+// a record written before scores existed and never backfilled is missing
+// from it.
+func (s *store) GetActiveSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]chat.RecentSender, error) {
+	return s.querySenders(ctx, chatID, lsiByActivityScore, limit)
+}
+
+// querySenders reads a group's activity records from one of the two LSIs on
+// chat_activity, in descending order of its sort key. Each index projects the
+// other's sort key, so a record's send time and score both come from the
+// index and nothing is fetched from the table.
+func (s *store) querySenders(ctx context.Context, chatID *commonpb.ChatId, index string, limit int) ([]chat.RecentSender, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return nil, fmt.Errorf("not a group chat id")
 	}
@@ -2859,7 +2877,7 @@ func (s *store) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, l
 	for {
 		input := &dynamodb.QueryInput{
 			TableName:                aws.String(s.activityTable),
-			IndexName:                aws.String(lsiByLastSentAt),
+			IndexName:                aws.String(index),
 			KeyConditionExpression:   aws.String("#pk = :pk"),
 			ProjectionExpression:     aws.String("#sk, #sent, #score"),
 			ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#sk": attrSK, "#sent": attrLastSentAt, "#score": attrActivityScore},

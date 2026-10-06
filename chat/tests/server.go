@@ -1188,9 +1188,10 @@ func testServer_GetRoster_Gates(t *testing.T, s chat.Store) {
 	resp = e.mustGetRoster(strangerKeys, closed, nil)
 	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
 
-	// A non-member who fails a group's rule is denied — they may preview the
-	// group, but a roster is not a shape. Once they satisfy it, the roster is
-	// theirs to read without joining.
+	// A roster is a member's alone. A non-member is denied whether or not
+	// they satisfy the group's rules: one who fails them may only preview the
+	// group, and one who meets them may read its messages, but neither may
+	// see who is in it until they join.
 	const requirement = 100
 	founder := model.MustGenerateUserID()
 	gated := &chat.Chat{
@@ -1205,9 +1206,18 @@ func testServer_GetRoster_Gates(t *testing.T, s chat.Store) {
 	resp = e.mustGetRoster(e.keys, gated.ID, nil)
 	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
 	e.fundEnvUser(requirement)
+	require.Equal(t, chatpb.GetChatResponse_OK, e.getChat(e.keys, gated.ID).Result)
+	resp = e.mustGetRoster(e.keys, gated.ID, nil)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
+
+	// Joining makes it theirs to read, and leaving takes it away again.
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, gated.ID).Result)
 	resp = e.mustGetRoster(e.keys, gated.ID, nil)
 	require.Equal(t, chatpb.GetRosterResponse_OK, resp.Result)
-	require.Equal(t, [][]byte{founder.Value}, memberUserIDs(resp.Members))
+	require.ElementsMatch(t, [][]byte{founder.Value, e.userID.Value}, memberUserIDs(resp.Members))
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, gated.ID).Result)
+	resp = e.mustGetRoster(e.keys, gated.ID, nil)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
 }
 
 // testServer_GetRoster_Disabled pins the operator's switch: with GetRoster

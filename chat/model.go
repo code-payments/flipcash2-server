@@ -840,10 +840,10 @@ func (v ViewerState) Clone() ViewerState {
 // send; expiry is garbage collection, not semantics, so a reader may still
 // see a record past it.
 //
-// The record is meant to grow a frequency-weighted ordering beside recency
-// (an activity score, see the DynamoDB store's chat_activity table), which is
-// why it is an activity record and not a send time alone; nothing computes or
-// reads one yet.
+// Beside recency, each record carries an activity score, a frequency-weighted
+// ordering of the same sends (see NextActivityScore), which is why it is an
+// activity record and not a send time alone. The score is maintained with
+// every recorded send; nothing ranks by it yet.
 const (
 	// ActivityRecordInterval is the least time between two recorded sends by
 	// one user in one group.
@@ -859,10 +859,12 @@ const (
 )
 
 // RecentSender is one user's activity record in a group, as recency reads
-// it: who, and when their latest recorded send was, at millisecond precision.
+// it: who, when their latest recorded send was, and the record's activity
+// score (see EffectiveActivityScore), both at millisecond precision.
 type RecentSender struct {
-	UserID     *commonpb.UserId
-	LastSentAt time.Time
+	UserID        *commonpb.UserId
+	LastSentAt    time.Time
+	ActivityScore time.Time
 }
 
 // A private group's lobby (see Chat.IsPrivate) is where a user waits to be

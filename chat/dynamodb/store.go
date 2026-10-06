@@ -113,26 +113,24 @@ import (
 //	chat_activity  pk = "chat#<id>", sk = "user#<id>" (one item per (group,
 //	          user) the user has sent in; see chat.RecentSender). A group's
 //	          activity records, independent of membership: last_sent_at
-//	          (epoch ms) and expires_at (DynamoDB TTL, epoch seconds,
-//	          ActivityRetention after it). Keyed by (chat, user) so a send
-//	          is a blind conditional update of one known item — no read
-//	          first, no duplicate rows — while lsiByLastSentAt orders the
-//	          partition by recency, which is the read: a group's recent
-//	          senders are one eventually consistent query, billed by the
-//	          page.
+//	          (epoch ms), activity_score (epoch ms; see
+//	          chat.NextActivityScore) and expires_at (DynamoDB TTL, epoch
+//	          seconds, ActivityRetention after the last send). Keyed by
+//	          (chat, user) so a send is a read and a conditional update of
+//	          one known item, with no duplicate rows, while lsiByLastSentAt
+//	          orders the partition by recency, which is the read: a group's
+//	          recent senders are one eventually consistent query, billed by
+//	          the page.
 //
-//	          lsiByActivityScore orders the same partition by activity_score,
-//	          a frequency-weighted ordering that nothing writes yet. It exists
-//	          now only because an LSI cannot be added to a table later; while
-//	          no item carries activity_score it is empty and costs nothing.
-//	          The score is meant to be epoch-ms-denominated, equal to
-//	          last_sent_at for a user with one recorded send and running ahead
-//	          of it (possibly past now) as their sends accumulate, so rows
-//	          written before it existed can be given activity_score =
-//	          last_sent_at and compare correctly with the rest. The write that
-//	          maintains it will need the item's prior score, so it will read
-//	          first and condition its update on last_sent_at as read, which
-//	          every recorded send moves forward.
+//	          lsiByActivityScore orders the same partition by
+//	          activity_score, a frequency-weighted ordering that every
+//	          recorded send maintains (see RecordSend) and nothing reads yet.
+//	          The score is epoch-ms-denominated, equal to last_sent_at for a
+//	          user with one recorded send and running ahead of it (possibly
+//	          past now) as their sends accumulate, so a row written before
+//	          scores existed, which is missing from the index, can be given
+//	          activity_score = last_sent_at and compare correctly with the
+//	          rest; until it is, it reads and scores as if it had been.
 //
 //	chat_key_envelopes  pk = "user#<id>", sk = "chat#<id>" (one item per
 //	          (user, private group) the user holds a key envelope for; see
@@ -250,8 +248,9 @@ const (
 	// group's activity records in recency order (see GetRecentSenders).
 	lsiByLastSentAt = "by_last_sent_at"
 
-	// lsiByActivityScore is the (chat, activity_score) LSI on chat_activity,
-	// reserved for a frequency-weighted ordering; nothing writes its key yet.
+	// lsiByActivityScore is the (chat, activity_score) LSI on chat_activity:
+	// a group's activity records in activity-score order. Nothing reads it
+	// yet, and a record written before scores existed is missing from it.
 	lsiByActivityScore = "by_activity_score"
 
 	// gsiLobbyByChat is the (sk, entered_at) index on chat_lobbies: a group's
@@ -298,7 +297,7 @@ const (
 	attrMutedUntil           = "muted_until"    // chat_user_state: epoch seconds, present only while a mute is recorded — see muteForeverUntil
 	attrMutedCount           = "muted_count"    // chat_user_state #meta item: records with a mute recorded
 	attrLastSentAt           = "last_sent_at"   // chat_activity: epoch ms of the latest recorded send
-	attrActivityScore        = "activity_score" // chat_activity: reserved, see lsiByActivityScore
+	attrActivityScore        = "activity_score" // chat_activity: epoch ms, see chat.NextActivityScore; absent on records written before scores
 	attrScheme               = "scheme"         // chat_key_envelopes: chatpb.KeyEnvelope_Scheme, by number
 	attrNonce                = "nonce"          // chat_key_envelopes: the envelope's nonce (B)
 	attrCiphertext           = "ciphertext"     // chat_key_envelopes: the wrapped chat key (B)
@@ -2727,11 +2726,29 @@ func viewerStateFromItem(item map[string]types.AttributeValue) (chat.ViewerState
 	return state, nil
 }
 
-// RecordSend is one conditional update of the user's chat_activity item,
-// with no read first: the condition is the throttle, and its failure is the
-// not-recorded answer, so the no-op path costs no second request and never
-// creates an item. last_sent_at is epoch milliseconds, which keeps the
-// throttle's arithmetic and the index's order exact.
+// RecordSend reads the user's chat_activity item and, unless the read already
+// shows the send throttled, writes the next last_sent_at and activity_score
+// in one update conditioned on the last_sent_at it read (or on there being
+// none). The score needs the prior one, which an update expression cannot
+// compute, hence the read; the condition makes the read-compute-write atomic
+// across writers, because every recorded send moves last_sent_at forward by
+// at least ActivityRecordInterval and nothing moves it back, so a value that
+// still matches proves nothing was recorded since the read.
+//
+// A writer that loses checks its send once more against the item the failure
+// returned, with no second read. Usually the winner's send throttles it and
+// it is done; when it is at least ActivityRecordInterval later than the
+// winner's, it is the newest send and is written once more, scored against
+// the winner's. Should that write lose too, another send has landed since,
+// and the send goes unrecorded, as a throttled one does: a record is best
+// effort, and its user's next send repairs it.
+//
+// The read is eventually consistent, at half a strong read's cost: a stale
+// one only shows an older send, so a throttled answer from it is right, and a
+// write from it fails its condition and is checked again against the current
+// item.
+// last_sent_at and activity_score are epoch milliseconds, which keeps the
+// throttle's arithmetic and both indexes' orders exact.
 func (s *store) RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, sentAt time.Time) (bool, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return false, fmt.Errorf("not a group chat id")
@@ -2740,38 +2757,97 @@ func (s *store) RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID 
 	if sentAtMillis <= 0 {
 		return false, fmt.Errorf("send time %v is not after the epoch", sentAt)
 	}
-
-	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(s.activityTable),
-		Key: map[string]types.AttributeValue{
-			attrPK: avS(chatPK(chatID)),
-			attrSK: avS(userPK(userID)),
-		},
-		UpdateExpression:    aws.String("SET #sent = :sent, #expires = :expires"),
-		ConditionExpression: aws.String("attribute_not_exists(#sent) OR #sent <= :stale"),
-		ExpressionAttributeNames: map[string]string{
-			"#sent":    attrLastSentAt,
-			"#expires": attrExpiresAt,
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":sent":    avInt(sentAtMillis),
-			":stale":   avInt(sentAtMillis - chat.ActivityRecordInterval.Milliseconds()),
-			":expires": avInt(sentAt.Add(chat.ActivityRetention).Unix()),
-		},
-	})
-	if isConditionalCheckFailed(err) {
-		return false, nil
+	sentAt = time.UnixMilli(sentAtMillis).UTC()
+	key := map[string]types.AttributeValue{
+		attrPK: avS(chatPK(chatID)),
+		attrSK: avS(userPK(userID)),
 	}
+
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:                aws.String(s.activityTable),
+		Key:                      key,
+		ProjectionExpression:     aws.String("#sent, #score"),
+		ExpressionAttributeNames: map[string]string{"#sent": attrLastSentAt, "#score": attrActivityScore},
+	})
 	if err != nil {
 		return false, err
 	}
-	return true, nil
+	item := out.Item
+
+	for range maxRecordSendAttempts {
+		var prior, lastSentAt time.Time
+		values := map[string]types.AttributeValue{
+			":sent":    avInt(sentAtMillis),
+			":expires": avInt(sentAt.Add(chat.ActivityRetention).Unix()),
+		}
+		condition := "attribute_not_exists(#sent)"
+		if av, ok := item[attrLastSentAt]; ok {
+			lastSentMillis, err := parseInt(av)
+			if err != nil {
+				return false, fmt.Errorf("parsing %s: %w", attrLastSentAt, err)
+			}
+			if lastSentMillis > sentAtMillis-chat.ActivityRecordInterval.Milliseconds() {
+				return false, nil
+			}
+			score, err := activityScoreFromItem(item)
+			if err != nil {
+				return false, err
+			}
+			lastSentAt = time.UnixMilli(lastSentMillis).UTC()
+			prior = chat.EffectiveActivityScore(score, lastSentAt)
+			condition = "#sent = :read"
+			values[":read"] = av
+		}
+		values[":score"] = avInt(chat.NextActivityScore(prior, lastSentAt, sentAt).UnixMilli())
+
+		_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:           aws.String(s.activityTable),
+			Key:                 key,
+			UpdateExpression:    aws.String("SET #sent = :sent, #score = :score, #expires = :expires"),
+			ConditionExpression: aws.String(condition),
+			ExpressionAttributeNames: map[string]string{
+				"#sent":    attrLastSentAt,
+				"#score":   attrActivityScore,
+				"#expires": attrExpiresAt,
+			},
+			ExpressionAttributeValues:           values,
+			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		})
+		if err == nil {
+			return true, nil
+		}
+		var ccf *types.ConditionalCheckFailedException
+		if !errors.As(err, &ccf) {
+			return false, err
+		}
+		item = ccf.Item
+	}
+	return false, nil
+}
+
+// maxRecordSendAttempts bounds RecordSend's writes: the first, and one more
+// after a lost race (see RecordSend).
+const maxRecordSendAttempts = 2
+
+// activityScoreFromItem decodes a chat_activity item's activity_score, the
+// zero time when it has none (a record written before scores existed).
+func activityScoreFromItem(item map[string]types.AttributeValue) (time.Time, error) {
+	av, ok := item[attrActivityScore]
+	if !ok {
+		return time.Time{}, nil
+	}
+	scoreMillis, err := parseInt(av)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parsing %s: %w", attrActivityScore, err)
+	}
+	return time.UnixMilli(scoreMillis).UTC(), nil
 }
 
 // GetRecentSenders queries lsiByLastSentAt descending, eventually
 // consistent at half the cost of a strong read (the index is local, so a
 // strong one is available if a reader ever needs it). It projects
-// last_sent_at as its own key, so nothing is fetched from the table. Every item in the partition is
+// last_sent_at as its own key and activity_score as an included attribute,
+// so nothing is fetched from the table. Every item in the partition is
 // an activity record carrying last_sent_at, so the index holds them all.
 func (s *store) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]chat.RecentSender, error) {
 	if !chat.IsGroupChatID(chatID) {
@@ -2785,8 +2861,8 @@ func (s *store) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, l
 			TableName:                aws.String(s.activityTable),
 			IndexName:                aws.String(lsiByLastSentAt),
 			KeyConditionExpression:   aws.String("#pk = :pk"),
-			ProjectionExpression:     aws.String("#sk, #sent"),
-			ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#sk": attrSK, "#sent": attrLastSentAt},
+			ProjectionExpression:     aws.String("#sk, #sent, #score"),
+			ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#sk": attrSK, "#sent": attrLastSentAt, "#score": attrActivityScore},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
 				":pk": avS(chatPK(chatID)),
 			},
@@ -2809,9 +2885,15 @@ func (s *store) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, l
 			if err != nil {
 				return nil, fmt.Errorf("parsing %s: %w", attrLastSentAt, err)
 			}
+			score, err := activityScoreFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			lastSentAt := time.UnixMilli(sentAtMillis).UTC()
 			senders = append(senders, chat.RecentSender{
-				UserID:     userID,
-				LastSentAt: time.UnixMilli(sentAtMillis).UTC(),
+				UserID:        userID,
+				LastSentAt:    lastSentAt,
+				ActivityScore: chat.EffectiveActivityScore(score, lastSentAt),
 			})
 		}
 		if limit > 0 && len(senders) >= limit {

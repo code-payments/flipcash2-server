@@ -46,11 +46,10 @@ type memory struct {
 	// one.
 	excludedFromFeed map[string]map[string]struct{}
 
-	// lastSent is each group's activity records, keyed by chat ID then user
-	// ID: the latest recorded send, at the persistent store's millisecond
-	// precision (see chat.Store.RecordSend). Records never expire here; the
+	// activity is each group's activity records, keyed by chat ID then user
+	// ID (see chat.Store.RecordSend). Records never expire here; the
 	// contract lets a reader see one past chat.ActivityRetention.
-	lastSent map[string]map[string]time.Time
+	activity map[string]map[string]activityRecord
 
 	// keyEnvelopes holds each user's key envelope per chat, keyed by user ID
 	// then chat ID, mirroring the persistent layout (see chat.Store).
@@ -91,7 +90,7 @@ func NewInMemory(excludedFromFeed []*commonpb.UserId) chat.Store {
 		groupVersions:    make(map[string]uint64),
 		viewerStates:     make(map[string]map[string]*chat.ViewerState),
 		mutedCounts:      make(map[string]uint64),
-		lastSent:         make(map[string]map[string]time.Time),
+		activity:         make(map[string]map[string]activityRecord),
 		keyEnvelopes:     make(map[string]map[string]chat.KeyEnvelope),
 		lobbies:          make(map[string]map[string]time.Time),
 		featured:         make(map[string]chat.FeaturedGroups),
@@ -108,7 +107,7 @@ func (m *memory) reset() {
 	m.viewerStates = make(map[string]map[string]*chat.ViewerState)
 	m.mutedCounts = make(map[string]uint64)
 	m.excludedFromFeed = make(map[string]map[string]struct{})
-	m.lastSent = make(map[string]map[string]time.Time)
+	m.activity = make(map[string]map[string]activityRecord)
 	m.keyEnvelopes = make(map[string]map[string]chat.KeyEnvelope)
 	m.lobbies = make(map[string]map[string]time.Time)
 	m.featured = make(map[string]chat.FeaturedGroups)
@@ -820,6 +819,14 @@ func (m *memory) GetMutedCount(_ context.Context, chatID *commonpb.ChatId) (uint
 	return m.mutedCounts[string(chatID.Value)], nil
 }
 
+// activityRecord is one user's activity record in a group, at the persistent
+// store's millisecond precision. Every record here was written with its score,
+// so score is the record's effective score as it stands.
+type activityRecord struct {
+	lastSentAt time.Time
+	score      time.Time
+}
+
 func (m *memory) RecordSend(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, sentAt time.Time) (bool, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return false, fmt.Errorf("not a group chat id")
@@ -833,13 +840,17 @@ func (m *memory) RecordSend(_ context.Context, chatID *commonpb.ChatId, userID *
 	defer m.Unlock()
 
 	chatKey := string(chatID.Value)
-	if last, ok := m.lastSent[chatKey][string(userID.Value)]; ok && last.After(sentAt.Add(-chat.ActivityRecordInterval)) {
+	prior, ok := m.activity[chatKey][string(userID.Value)]
+	if ok && prior.lastSentAt.After(sentAt.Add(-chat.ActivityRecordInterval)) {
 		return false, nil
 	}
-	if m.lastSent[chatKey] == nil {
-		m.lastSent[chatKey] = make(map[string]time.Time)
+	if m.activity[chatKey] == nil {
+		m.activity[chatKey] = make(map[string]activityRecord)
 	}
-	m.lastSent[chatKey][string(userID.Value)] = sentAt
+	m.activity[chatKey][string(userID.Value)] = activityRecord{
+		lastSentAt: sentAt,
+		score:      chat.NextActivityScore(prior.score, prior.lastSentAt, sentAt),
+	}
 	return true, nil
 }
 
@@ -851,11 +862,12 @@ func (m *memory) GetRecentSenders(_ context.Context, chatID *commonpb.ChatId, li
 	m.Lock()
 	defer m.Unlock()
 
-	senders := make([]chat.RecentSender, 0, len(m.lastSent[string(chatID.Value)]))
-	for user, last := range m.lastSent[string(chatID.Value)] {
+	senders := make([]chat.RecentSender, 0, len(m.activity[string(chatID.Value)]))
+	for user, record := range m.activity[string(chatID.Value)] {
 		senders = append(senders, chat.RecentSender{
-			UserID:     &commonpb.UserId{Value: []byte(user)},
-			LastSentAt: last,
+			UserID:        &commonpb.UserId{Value: []byte(user)},
+			LastSentAt:    record.lastSentAt,
+			ActivityScore: record.score,
 		})
 	}
 	// Ties are in no particular order by contract; break them by user so
@@ -880,8 +892,8 @@ func (m *memory) GetLastSentAt(_ context.Context, chatID *commonpb.ChatId, userI
 	m.Lock()
 	defer m.Unlock()
 
-	last, ok := m.lastSent[string(chatID.Value)][string(userID.Value)]
-	return last, ok, nil
+	record, ok := m.activity[string(chatID.Value)][string(userID.Value)]
+	return record.lastSentAt, ok, nil
 }
 
 func (m *memory) SetKeyEnvelope(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (chat.KeyEnvelope, error) {

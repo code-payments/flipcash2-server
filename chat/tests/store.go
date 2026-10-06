@@ -88,6 +88,8 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_Activity_Precision,
 		testStore_Activity_Scope,
 		testStore_Activity_Concurrent,
+		testStore_Activity_Score,
+		testStore_Activity_ScoreConcurrent,
 		testStore_KeyEnvelope_SetAndGet,
 		testStore_KeyEnvelope_OwnWrapStands,
 		testStore_KeyEnvelope_DiscardedOnLeave,
@@ -2791,6 +2793,133 @@ func testStore_Activity_Concurrent(t *testing.T, s chat.Store) {
 	senders, err := s.GetRecentSenders(ctx, groupID, 0)
 	require.NoError(t, err)
 	requireRecentSenders(t, senders, user, at(70))
+	require.True(t, senders[0].ActivityScore.Equal(at(70)), "scored once")
+}
+
+func testStore_Activity_Score(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+	interval := chat.ActivityRecordInterval
+
+	score := func() time.Time {
+		t.Helper()
+		senders, err := s.GetRecentSenders(ctx, groupID, 0)
+		require.NoError(t, err)
+		require.Len(t, senders, 1)
+		return senders[0].ActivityScore
+	}
+
+	// A first send scores its own time.
+	recorded, err := s.RecordSend(ctx, groupID, user, at(100))
+	require.NoError(t, err)
+	require.True(t, recorded)
+	require.True(t, score().Equal(at(100)))
+
+	// Each recorded send moves the score once, by the formula, against the
+	// send before it.
+	want, last := at(100), at(100)
+	for _, sentAt := range []time.Time{
+		at(100).Add(interval),
+		at(100).Add(3 * interval),
+		at(100).Add(24 * time.Hour),
+	} {
+		recorded, err = s.RecordSend(ctx, groupID, user, sentAt)
+		require.NoError(t, err)
+		require.True(t, recorded)
+		want, last = chat.NextActivityScore(want, last, sentAt), sentAt
+		require.True(t, score().Equal(want), "after send at %v: got %v, want %v", sentAt, score(), want)
+	}
+	require.True(t, want.After(at(100).Add(24*time.Hour)), "the score runs ahead of the last send")
+
+	// A throttled send moves nothing.
+	recorded, err = s.RecordSend(ctx, groupID, user, at(100).Add(24*time.Hour).Add(interval/2))
+	require.NoError(t, err)
+	require.False(t, recorded)
+	require.True(t, score().Equal(want))
+
+	// A frequent sender outranks a one-off sender who sent after them.
+	other := model.MustGenerateUserID()
+	recorded, err = s.RecordSend(ctx, groupID, other, at(100).Add(25*time.Hour))
+	require.NoError(t, err)
+	require.True(t, recorded)
+	senders, err := s.GetRecentSenders(ctx, groupID, 0)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, other, at(100).Add(25*time.Hour), user, at(100).Add(24*time.Hour))
+	require.True(t, senders[1].ActivityScore.After(senders[0].ActivityScore))
+}
+
+func testStore_Activity_ScoreConcurrent(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	groupID := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+
+	// Sends far enough apart that none throttles another in order, recorded
+	// all at once by many writers, as several servers would. Whichever are
+	// recorded must have been recorded in time order, each scored once
+	// against the one before, so the score is exactly theirs: no lost update,
+	// no double count. A store may leave a send that loses its race twice
+	// unrecorded, so which ones are recorded is not fixed.
+	const writers = 4
+	sendTimes := make([]time.Time, writers)
+	for i := range writers {
+		sendTimes[i] = at(1000).Add(time.Duration(i) * time.Hour)
+	}
+	var wg sync.WaitGroup
+	results := make([]bool, writers)
+	errs := make([]error, writers)
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = s.RecordSend(ctx, groupID, user, sendTimes[i])
+		}()
+	}
+	wg.Wait()
+
+	var want, last time.Time
+	for i := range writers {
+		require.NoError(t, errs[i])
+		if results[i] {
+			want = chat.NextActivityScore(want, last, sendTimes[i])
+			last = sendTimes[i]
+		}
+	}
+	require.False(t, last.IsZero())
+	senders, err := s.GetRecentSenders(ctx, groupID, 0)
+	require.NoError(t, err)
+	requireRecentSenders(t, senders, user, last)
+	require.True(t, senders[0].ActivityScore.Equal(want), "got %v, want %v", senders[0].ActivityScore, want)
+
+	// Of two such writers, the later send is always recorded, whichever
+	// writes first: it loses at most once, to the earlier. (Against a store
+	// whose first read may be stale it could lose once to that as well; the
+	// stores under test read current data.)
+	for range 5 {
+		groupID := chat.MustGenerateGroupChatID()
+		earlier, later := at(2000), at(2000).Add(time.Hour)
+		var wg sync.WaitGroup
+		var errEarlier, errLater error
+		var recordedLater bool
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, errEarlier = s.RecordSend(ctx, groupID, user, earlier)
+		}()
+		go func() {
+			defer wg.Done()
+			recordedLater, errLater = s.RecordSend(ctx, groupID, user, later)
+		}()
+		wg.Wait()
+		require.NoError(t, errEarlier)
+		require.NoError(t, errLater)
+		require.True(t, recordedLater)
+		senders, err := s.GetRecentSenders(ctx, groupID, 0)
+		require.NoError(t, err)
+		requireRecentSenders(t, senders, user, later)
+	}
 }
 
 // requireRecentSenders asserts senders is exactly the given (user, last sent)

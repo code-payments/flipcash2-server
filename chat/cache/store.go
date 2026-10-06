@@ -312,6 +312,16 @@ func (c *Cache) AdmitFromLobby(ctx context.Context, chatID *commonpb.ChatId, use
 	return c.db.AdmitFromLobby(ctx, chatID, userID, envelope)
 }
 
+// The featured groups methods pass through: a list is read once per profile
+// view, is one query, and changes from any process.
+func (c *Cache) SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (chat.FeaturedGroups, bool, error) {
+	return c.db.SetFeaturedGroups(ctx, userID, chatIDs)
+}
+
+func (c *Cache) GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (chat.FeaturedGroups, error) {
+	return c.db.GetFeaturedGroups(ctx, userID)
+}
+
 // sendActivityCacheKey keys the activity cache by (group, user). Only group
 // IDs are held, and they are fixed width (chat.GroupChatIDSize), so
 // concatenating the raw bytes is unambiguous.

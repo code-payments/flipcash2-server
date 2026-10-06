@@ -566,4 +566,21 @@ type Store interface {
 	// ErrChatNotFound if the chat does not exist; and an error if chatID is
 	// not a group chat ID or envelope.WrappedBy is nil.
 	AdmitFromLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope KeyEnvelope) (changed bool, roster RosterSummary, err error)
+
+	// SetFeaturedGroups replaces userID's featured groups with chatIDs, in
+	// that order, and returns the list that stands after the call. A list
+	// equal to the stored one is a no-op that writes nothing and returns it
+	// with changed false; otherwise the whole list is replaced in one write
+	// that moves the version by one, so concurrent replaces each land whole,
+	// in some order, and a reader never sees a mix. An empty list clears the
+	// featured groups. It returns an error unless chatIDs passes
+	// ValidateFeaturedGroups. It does not check that the groups exist: that
+	// is the caller's.
+	SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (featured FeaturedGroups, changed bool, err error)
+
+	// GetFeaturedGroups returns userID's featured groups in their order. The
+	// read is strongly consistent: it reflects every write that completed
+	// before it, so a user who just set their featured groups reads them. A
+	// user who has never set any reads as no groups at version zero.
+	GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (FeaturedGroups, error)
 }

@@ -11,9 +11,9 @@ import (
 )
 
 // CreateTables provisions the chats, dm_inbox, group_members,
-// chat_user_state, chat_activity and chat_key_envelopes tables with on-demand
-// billing. The chats table is keyed by
-// pk only; dm_inbox is keyed by (pk, sk) with a GSI ordering each user's DMs
+// chat_user_state, chat_activity, chat_key_envelopes, chat_lobbies and
+// chat_featured_groups tables with on-demand billing. The chats table is keyed
+// by pk only; dm_inbox is keyed by (pk, sk) with a GSI ordering each user's DMs
 // by last_activity; group_members is keyed by (pk, sk) = (chat, user) — plus
 // one "#meta" aggregates item per group — with an inverted GSI for listing a
 // user's group chats, a sparse GSI of a group's joined members by join time
@@ -28,9 +28,10 @@ import (
 // expires_at; chat_key_envelopes is keyed by (pk, sk) = (user, chat) with no
 // index; chat_lobbies is keyed by (pk, sk) = (user, chat) — plus one "#meta"
 // aggregates item per chat and per user — with a sparse GSI of a chat's
-// lobby by entry time (see gsiLobbyByChat). It is idempotent and blocks
-// until all tables are ACTIVE.
-func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable string) error {
+// lobby by entry time (see gsiLobbyByChat); chat_featured_groups is keyed by
+// (pk, sk) = (user, position) — plus one "#meta" item per user — with no
+// index. It is idempotent and blocks until all tables are ACTIVE.
+func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
 			TableName:   aws.String(chatsTable),
@@ -251,6 +252,22 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				},
 			},
 		},
+		{
+			// No index: a user's list is one query of their partition, in
+			// position order (see featuredSK). A (chat, pk) GSI for who
+			// features a group can be added later, since chat is already
+			// on every position and absent from #meta.
+			TableName:   aws.String(featuredGroupsTable),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+			},
+		},
 	}
 
 	for _, input := range inputs {
@@ -323,6 +340,9 @@ func (s *store) reset() {
 		panic(err)
 	}
 	if err := clearTable(ctx, s.client, s.lobbiesTable, []string{attrPK, attrSK}); err != nil {
+		panic(err)
+	}
+	if err := clearTable(ctx, s.client, s.featuredGroupsTable, []string{attrPK, attrSK}); err != nil {
 		panic(err)
 	}
 }

@@ -61,6 +61,11 @@ type memory struct {
 	// persistent stores keep are computed from it.
 	lobbies map[string]map[string]time.Time
 
+	// featured holds each user's featured groups, keyed by user ID, as
+	// last set (see chat.Store.SetFeaturedGroups). Absent reads as none at
+	// version zero.
+	featured map[string]chat.FeaturedGroups
+
 	exclusions chat.FeedExclusions
 }
 
@@ -89,6 +94,7 @@ func NewInMemory(excludedFromFeed []*commonpb.UserId) chat.Store {
 		lastSent:         make(map[string]map[string]time.Time),
 		keyEnvelopes:     make(map[string]map[string]chat.KeyEnvelope),
 		lobbies:          make(map[string]map[string]time.Time),
+		featured:         make(map[string]chat.FeaturedGroups),
 	}
 }
 
@@ -105,6 +111,7 @@ func (m *memory) reset() {
 	m.lastSent = make(map[string]map[string]time.Time)
 	m.keyEnvelopes = make(map[string]map[string]chat.KeyEnvelope)
 	m.lobbies = make(map[string]map[string]time.Time)
+	m.featured = make(map[string]chat.FeaturedGroups)
 }
 
 // isJoinedLocked reports whether the user's record on the group has them
@@ -1046,6 +1053,40 @@ func (m *memory) leaveLobbyLocked(chatID *commonpb.ChatId, userID *commonpb.User
 		delete(m.lobbies, string(userID.Value))
 	}
 	return true
+}
+
+func (m *memory) SetFeaturedGroups(_ context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (chat.FeaturedGroups, bool, error) {
+	if err := chat.ValidateFeaturedGroups(chatIDs); err != nil {
+		return chat.FeaturedGroups{}, false, err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	current := m.featured[string(userID.Value)]
+	if current.Equal(chatIDs) {
+		return cloneFeaturedGroups(current), false, nil
+	}
+	next := cloneFeaturedGroups(chat.FeaturedGroups{ChatIDs: chatIDs, Version: current.Version + 1})
+	m.featured[string(userID.Value)] = next
+	return cloneFeaturedGroups(next), true, nil
+}
+
+func (m *memory) GetFeaturedGroups(_ context.Context, userID *commonpb.UserId) (chat.FeaturedGroups, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	return cloneFeaturedGroups(m.featured[string(userID.Value)]), nil
+}
+
+// cloneFeaturedGroups deep-copies a list, so the stored list and the lists
+// handed to or taken from callers share no memory.
+func cloneFeaturedGroups(f chat.FeaturedGroups) chat.FeaturedGroups {
+	out := chat.FeaturedGroups{Version: f.Version}
+	for _, chatID := range f.ChatIDs {
+		out.ChatIDs = append(out.ChatIDs, &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)})
+	}
+	return out
 }
 
 func cloneUserID(userID *commonpb.UserId) *commonpb.UserId {

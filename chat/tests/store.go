@@ -96,6 +96,10 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_Lobby_Page,
 		testStore_Lobby_Admit,
 		testStore_Lobby_Concurrent,
+		testStore_FeaturedGroups_SetAndGet,
+		testStore_FeaturedGroups_NoOp,
+		testStore_FeaturedGroups_Invalid,
+		testStore_FeaturedGroups_Concurrent,
 	} {
 		tf(t, s)
 		teardown()
@@ -3301,4 +3305,246 @@ func testStore_Lobby_Concurrent(t *testing.T, s chat.Store) {
 	_, changed, err = s.EnterLobby(ctx, groupID, model.MustGenerateUserID(), limits)
 	require.NoError(t, err)
 	require.True(t, changed)
+}
+
+func generateGroupChatIDs(n int) []*commonpb.ChatId {
+	chatIDs := make([]*commonpb.ChatId, n)
+	for i := range chatIDs {
+		chatIDs[i] = chat.MustGenerateGroupChatID()
+	}
+	return chatIDs
+}
+
+func chatIDBytes(chatIDs []*commonpb.ChatId) [][]byte {
+	out := make([][]byte, len(chatIDs))
+	for i, chatID := range chatIDs {
+		out[i] = chatID.Value
+	}
+	return out
+}
+
+func testStore_FeaturedGroups_SetAndGet(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	user := model.MustGenerateUserID()
+	other := model.MustGenerateUserID()
+
+	// Never set: none, at version zero.
+	got, err := s.GetFeaturedGroups(ctx, user)
+	require.NoError(t, err)
+	require.Empty(t, got.ChatIDs)
+	require.Zero(t, got.Version)
+
+	// A full list, in the caller's order.
+	full := generateGroupChatIDs(chat.MaxFeaturedGroups)
+	set, changed, err := s.SetFeaturedGroups(ctx, user, full)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, chatIDBytes(full), chatIDBytes(set.ChatIDs))
+	require.EqualValues(t, 1, set.Version)
+	got, err = s.GetFeaturedGroups(ctx, user)
+	require.NoError(t, err)
+	require.Equal(t, set, got)
+
+	// Shorter: the positions past it go.
+	shorter := []*commonpb.ChatId{full[3], full[0], full[7]}
+	set, changed, err = s.SetFeaturedGroups(ctx, user, shorter)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.EqualValues(t, 2, set.Version)
+	got, err = s.GetFeaturedGroups(ctx, user)
+	require.NoError(t, err)
+	require.Equal(t, chatIDBytes(shorter), chatIDBytes(got.ChatIDs))
+	require.EqualValues(t, 2, got.Version)
+
+	// A reorder alone is a change.
+	reordered := []*commonpb.ChatId{full[0], full[7], full[3]}
+	set, changed, err = s.SetFeaturedGroups(ctx, user, reordered)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.EqualValues(t, 3, set.Version)
+
+	// Longer again, with groups never seen before.
+	longer := append(slices.Clone(reordered), generateGroupChatIDs(4)...)
+	_, changed, err = s.SetFeaturedGroups(ctx, user, longer)
+	require.NoError(t, err)
+	require.True(t, changed)
+	got, err = s.GetFeaturedGroups(ctx, user)
+	require.NoError(t, err)
+	require.Equal(t, chatIDBytes(longer), chatIDBytes(got.ChatIDs))
+	require.EqualValues(t, 4, got.Version)
+
+	// Another user's list is their own.
+	got, err = s.GetFeaturedGroups(ctx, other)
+	require.NoError(t, err)
+	require.Empty(t, got.ChatIDs)
+	require.Zero(t, got.Version)
+
+	// Clearing is a write like any other, and leaves the version.
+	set, changed, err = s.SetFeaturedGroups(ctx, user, nil)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Empty(t, set.ChatIDs)
+	require.EqualValues(t, 5, set.Version)
+	got, err = s.GetFeaturedGroups(ctx, user)
+	require.NoError(t, err)
+	require.Empty(t, got.ChatIDs)
+	require.EqualValues(t, 5, got.Version)
+
+	// Set again after a clear.
+	_, changed, err = s.SetFeaturedGroups(ctx, user, shorter)
+	require.NoError(t, err)
+	require.True(t, changed)
+	got, err = s.GetFeaturedGroups(ctx, user)
+	require.NoError(t, err)
+	require.Equal(t, chatIDBytes(shorter), chatIDBytes(got.ChatIDs))
+	require.EqualValues(t, 6, got.Version)
+
+	// The list returned shares no memory with the stored one.
+	got.ChatIDs[0].Value[0] ^= 0xff
+	again, err := s.GetFeaturedGroups(ctx, user)
+	require.NoError(t, err)
+	require.Equal(t, chatIDBytes(shorter), chatIDBytes(again.ChatIDs))
+}
+
+func testStore_FeaturedGroups_NoOp(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	user := model.MustGenerateUserID()
+
+	// Clearing a list never set writes nothing: still version zero.
+	set, changed, err := s.SetFeaturedGroups(ctx, user, nil)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Zero(t, set.Version)
+
+	list := generateGroupChatIDs(3)
+	_, changed, err = s.SetFeaturedGroups(ctx, user, list)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	// The same list, as fresh values, is the no-op, returning what stands.
+	same := make([]*commonpb.ChatId, len(list))
+	for i, chatID := range list {
+		same[i] = &commonpb.ChatId{Value: slices.Clone(chatID.Value)}
+	}
+	set, changed, err = s.SetFeaturedGroups(ctx, user, same)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, chatIDBytes(list), chatIDBytes(set.ChatIDs))
+	require.EqualValues(t, 1, set.Version)
+
+	got, err := s.GetFeaturedGroups(ctx, user)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, got.Version)
+
+	// So is clearing twice.
+	_, changed, err = s.SetFeaturedGroups(ctx, user, []*commonpb.ChatId{})
+	require.NoError(t, err)
+	require.True(t, changed)
+	set, changed, err = s.SetFeaturedGroups(ctx, user, nil)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.EqualValues(t, 2, set.Version)
+}
+
+func testStore_FeaturedGroups_Invalid(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	user := model.MustGenerateUserID()
+
+	stored := generateGroupChatIDs(2)
+	_, _, err := s.SetFeaturedGroups(ctx, user, stored)
+	require.NoError(t, err)
+
+	group := chat.MustGenerateGroupChatID()
+	for name, chatIDs := range map[string][]*commonpb.ChatId{
+		"too many": generateGroupChatIDs(chat.MaxFeaturedGroups + 1),
+		"dm":       {group, generateDmChatID()},
+		"repeated": {group, chat.MustGenerateGroupChatID(), {Value: slices.Clone(group.Value)}},
+		"nil id":   {group, nil},
+	} {
+		_, _, err := s.SetFeaturedGroups(ctx, user, chatIDs)
+		require.Error(t, err, name)
+	}
+
+	// Nothing refused was written.
+	got, err := s.GetFeaturedGroups(ctx, user)
+	require.NoError(t, err)
+	require.Equal(t, chatIDBytes(stored), chatIDBytes(got.ChatIDs))
+	require.EqualValues(t, 1, got.Version)
+}
+
+// testStore_FeaturedGroups_Concurrent checks that concurrent replaces each land
+// whole: every one succeeds, the list ends as exactly one of them at a version
+// counting them all, and a read alongside them never sees a mix of two.
+func testStore_FeaturedGroups_Concurrent(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	user := model.MustGenerateUserID()
+
+	// Different lengths, so a mix would show as a list of the wrong length as
+	// well as the wrong groups.
+	lengths := []int{1, chat.MaxFeaturedGroups, 3, 7, 2}
+	lists := make([][]*commonpb.ChatId, len(lengths))
+	for i, n := range lengths {
+		lists[i] = generateGroupChatIDs(n)
+	}
+	isWhole := func(chatIDs []*commonpb.ChatId) bool {
+		if len(chatIDs) == 0 {
+			return true
+		}
+		for _, list := range lists {
+			if slices.EqualFunc(list, chatIDs, func(a, b *commonpb.ChatId) bool { return bytes.Equal(a.Value, b.Value) }) {
+				return true
+			}
+		}
+		return false
+	}
+
+	done := make(chan struct{})
+	var readErr error
+	var mixed []*commonpb.ChatId
+	var readers sync.WaitGroup
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			got, err := s.GetFeaturedGroups(ctx, user)
+			if err != nil {
+				readErr = err
+				return
+			}
+			if !isWhole(got.ChatIDs) {
+				mixed = got.ChatIDs
+				return
+			}
+		}
+	}()
+
+	results := make([]error, len(lists))
+	var writers sync.WaitGroup
+	for i, list := range lists {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			_, _, results[i] = s.SetFeaturedGroups(ctx, user, list)
+		}()
+	}
+	writers.Wait()
+	close(done)
+	readers.Wait()
+
+	for _, err := range results {
+		require.NoError(t, err)
+	}
+	require.NoError(t, readErr)
+	require.Nil(t, mixed, "a read saw a mix of two lists")
+
+	got, err := s.GetFeaturedGroups(ctx, user)
+	require.NoError(t, err)
+	require.NotEmpty(t, got.ChatIDs)
+	require.True(t, isWhole(got.ChatIDs))
+	require.EqualValues(t, len(lists), got.Version)
 }

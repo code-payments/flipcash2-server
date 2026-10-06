@@ -24,7 +24,7 @@ import (
 	"github.com/code-payments/flipcash2-server/chat"
 )
 
-// The chat store spans six tables:
+// The chat store spans eight tables:
 //
 //	chats     pk = "chat#<id>" (one item per chat). Canonical metadata: type,
 //	          members (the DM participants; absent for groups), title, creator
@@ -180,6 +180,34 @@ import (
 //	          admission (see AdmitFromLobby) is the membership transition's
 //	          transaction carrying the entry's removal, its counts and the
 //	          key envelope, so the two tables agree in both directions.
+//
+//	chat_featured_groups  pk = "user#<id>", sk = "pos#<nn>" (one item per
+//	          position in the user's featured groups; see
+//	          chat.FeaturedGroups), with chat, the group's raw ID (B), and
+//	          version, the list's version as of the write that put the item.
+//	          The position is zero-padded (see featuredSK), so the sk order
+//	          is the list order and the list is one strongly consistent query
+//	          of the partition, in order, with nothing to sort. One
+//	          aggregates item heads the partition, sk = "#meta" (see skMeta),
+//	          with the list's version and featured_count.
+//
+//	          A replace is one transaction: the #meta item compare-and-set on
+//	          version, a put of every position the new list fills and a
+//	          delete of every position past it that the old list filled, so
+//	          it is at most one item more than the longer of the two lists,
+//	          and needs no read of the items it replaces. The compare-and-set
+//	          is what makes it whole: without it, a short list landing after
+//	          a long one would delete only the positions it knew of and leave
+//	          the rest. Every replace rewrites every position, stamping each
+//	          with the new version, which is what lets a read tell a list
+//	          from a mix of two: a query is consistent per item, not as a
+//	          set, so the read is verified against #meta and taken again when
+//	          it straddles a write (see readFeaturedGroups).
+//
+//	          There is no index. The chat attribute is raw so that a
+//	          (chat, pk) GSI, asking who features a group, can be added
+//	          later and fill from the items as they stand; #meta omits it,
+//	          which keeps it out of such an index.
 const (
 	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
 	// all of a user's DM types. Superseded by gsiByTypeActivity; retained until
@@ -275,6 +303,7 @@ const (
 	attrWrappedBy            = "wrapped_by"     // chat_key_envelopes: the raw ID of the user who stored the envelope (B)
 	attrEnteredAt            = "entered_at"     // chat_lobbies: epoch nanos of the entry, keying gsiLobbyByChat
 	attrLobbyCount           = "lobby_count"    // chat_lobbies #meta items: a lobby's size (chat# pk) or a user's lobbies (user# pk)
+	attrFeaturedCount        = "featured_count" // chat_featured_groups #meta item: how many groups the list holds
 
 	// Keys of the min_listener_balance map.
 	attrBalanceCurrency     = "currency"
@@ -334,14 +363,15 @@ const (
 )
 
 type store struct {
-	client            *dynamodb.Client
-	chatsTable        string
-	dmInboxTable      string
-	groupMembersTable string
-	userStateTable    string
-	activityTable     string
-	keyEnvelopesTable string
-	lobbiesTable      string
+	client              *dynamodb.Client
+	chatsTable          string
+	dmInboxTable        string
+	groupMembersTable   string
+	userStateTable      string
+	activityTable       string
+	keyEnvelopesTable   string
+	lobbiesTable        string
+	featuredGroupsTable string
 
 	exclusions chat.FeedExclusions
 }
@@ -350,17 +380,18 @@ type store struct {
 // creating every DM with a user in excludedFromFeed excluding them from the
 // feed (see chat.FeedExclusions); nil excludes no one. Use CreateTables to
 // provision the tables.
-func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
+func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
 	return &store{
-		exclusions:        chat.NewFeedExclusions(excludedFromFeed),
-		client:            client,
-		chatsTable:        chatsTable,
-		dmInboxTable:      dmInboxTable,
-		groupMembersTable: groupMembersTable,
-		userStateTable:    userStateTable,
-		activityTable:     activityTable,
-		keyEnvelopesTable: keyEnvelopesTable,
-		lobbiesTable:      lobbiesTable,
+		exclusions:          chat.NewFeedExclusions(excludedFromFeed),
+		client:              client,
+		chatsTable:          chatsTable,
+		dmInboxTable:        dmInboxTable,
+		groupMembersTable:   groupMembersTable,
+		userStateTable:      userStateTable,
+		activityTable:       activityTable,
+		keyEnvelopesTable:   keyEnvelopesTable,
+		lobbiesTable:        lobbiesTable,
+		featuredGroupsTable: featuredGroupsTable,
 	}
 }
 
@@ -3242,4 +3273,220 @@ func lobbyEntryFromItem(item map[string]types.AttributeValue) (chat.LobbyEntry, 
 		return chat.LobbyEntry{}, fmt.Errorf("reading lobby entry: %w", err)
 	}
 	return chat.LobbyEntry{UserID: userID, EnteredAt: time.Unix(0, int64(nanos)).UTC()}, nil
+}
+
+// featuredSKPrefix prefixes a position in the chat_featured_groups sk.
+const featuredSKPrefix = "pos#"
+
+// A position is written in two digits, so the list may not outgrow them; and
+// a replace is one transaction of at most chat.MaxFeaturedGroups positions
+// and the #meta item. Asserted rather than assumed, as for group creation:
+// raising the cap past either fails to compile here.
+const (
+	_ uint = 100 - chat.MaxFeaturedGroups
+	_ uint = maxTransactWriteItems - (chat.MaxFeaturedGroups + 1)
+)
+
+// A replace contends only with the same user's other replaces, on the #meta
+// pattern (see maxMembershipAttempts): a lost compare-and-set reads again and
+// retries at once, and a TransactionConflict backs off.
+const maxFeaturedAttempts = maxMembershipAttempts
+
+// maxFeaturedReads bounds how many times a read of a list is taken again
+// when it straddles a replace (see readFeaturedGroups). A replace is one
+// small transaction, so a read that straddles three in a row is a user
+// replacing their list continuously.
+const maxFeaturedReads = 3
+
+// featuredSK is the sk of the given position in a user's featured groups,
+// zero-padded so the sk order is the list order.
+func featuredSK(position int) string {
+	return fmt.Sprintf("%s%02d", featuredSKPrefix, position)
+}
+
+func (s *store) SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (chat.FeaturedGroups, bool, error) {
+	if err := chat.ValidateFeaturedGroups(chatIDs); err != nil {
+		return chat.FeaturedGroups{}, false, err
+	}
+
+	backoff := membershipBackoffBase
+	for attempt := 0; attempt < maxFeaturedAttempts; attempt++ {
+		// The list is read first, strongly consistent, both to answer the
+		// no-op without a write and for the version the write is compared
+		// against and the positions it must clear. The items are never read
+		// for the write's sake beyond that: a replace overwrites every
+		// position it fills.
+		current, err := s.readFeaturedGroups(ctx, userID)
+		if err != nil {
+			return chat.FeaturedGroups{}, false, err
+		}
+		if current.Equal(chatIDs) {
+			return current, false, nil
+		}
+
+		next := current.Version + 1
+		condition := "#version = :version"
+		values := map[string]types.AttributeValue{
+			":next":  avN(next),
+			":count": avN(uint64(len(chatIDs))),
+		}
+		if current.Version == 0 {
+			// Version zero is a list never written, so no #meta item; the
+			// first write must find none, or it lost to another first write.
+			condition = "attribute_not_exists(#version)"
+		} else {
+			values[":version"] = avN(current.Version)
+		}
+
+		transactItems := []types.TransactWriteItem{{Update: &types.Update{
+			TableName: aws.String(s.featuredGroupsTable),
+			Key: map[string]types.AttributeValue{
+				attrPK: avS(userPK(userID)),
+				attrSK: avS(skMeta),
+			},
+			UpdateExpression:          aws.String(fmt.Sprintf("SET #version = :next, %s = :count", attrFeaturedCount)),
+			ConditionExpression:       aws.String(condition),
+			ExpressionAttributeNames:  map[string]string{"#version": attrVersion},
+			ExpressionAttributeValues: values,
+		}}}
+		for position, chatID := range chatIDs {
+			transactItems = append(transactItems, types.TransactWriteItem{Put: &types.Put{
+				TableName: aws.String(s.featuredGroupsTable),
+				Item: map[string]types.AttributeValue{
+					attrPK:      avS(userPK(userID)),
+					attrSK:      avS(featuredSK(position)),
+					attrChat:    avB(chatID.Value),
+					attrVersion: avN(next),
+				},
+			}})
+		}
+		for position := len(chatIDs); position < len(current.ChatIDs); position++ {
+			transactItems = append(transactItems, types.TransactWriteItem{Delete: &types.Delete{
+				TableName: aws.String(s.featuredGroupsTable),
+				Key: map[string]types.AttributeValue{
+					attrPK: avS(userPK(userID)),
+					attrSK: avS(featuredSK(position)),
+				},
+			}})
+		}
+
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
+		if err == nil {
+			featured := chat.FeaturedGroups{Version: next}
+			for _, chatID := range chatIDs {
+				featured.ChatIDs = append(featured.ChatIDs, &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)})
+			}
+			return featured, true, nil
+		}
+		reasons, ok := cancellationReasons(err)
+		if !ok || len(reasons) != len(transactItems) {
+			return chat.FeaturedGroups{}, false, err
+		}
+		codes := make([]string, len(reasons))
+		for i, reason := range reasons {
+			codes[i] = aws.ToString(reason.Code)
+		}
+		switch {
+		case codes[0] == conditionalCheckFailedCode:
+			// Another replace landed since the read: read again, which may
+			// find the list already what this one asks for.
+			continue
+		case isTransactionConflict(codes):
+			select {
+			case <-ctx.Done():
+				return chat.FeaturedGroups{}, false, ctx.Err()
+			case <-time.After(backoff + rand.N(backoff)):
+			}
+			backoff = min(2*backoff, membershipBackoffMax)
+			continue
+		default:
+			return chat.FeaturedGroups{}, false, err
+		}
+	}
+	return chat.FeaturedGroups{}, false, fmt.Errorf("replacing featured groups for user %x: attempts exhausted", userID.Value)
+}
+
+func (s *store) GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (chat.FeaturedGroups, error) {
+	return s.readFeaturedGroups(ctx, userID)
+}
+
+// readFeaturedGroups reads userID's featured groups: one strongly
+// consistent query of their partition, #meta at its head and the positions
+// after it in order. A query is consistent per item, not as a set, so one
+// that runs alongside a replace can return #meta from one side of it and
+// some positions from the other. Every replace stamps every position it fills
+// with its version, so the read is a list exactly when every position carries
+// #meta's version and they number featured_count, contiguous from zero; it
+// is taken again, up to maxFeaturedReads times, when it is not.
+func (s *store) readFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (chat.FeaturedGroups, error) {
+	for attempt := 0; attempt < maxFeaturedReads; attempt++ {
+		var items []map[string]types.AttributeValue
+		paginator := dynamodb.NewQueryPaginator(s.client, &dynamodb.QueryInput{
+			TableName:                 aws.String(s.featuredGroupsTable),
+			KeyConditionExpression:    aws.String(fmt.Sprintf("%s = :pk", attrPK)),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(userPK(userID))},
+			ConsistentRead:            aws.Bool(true),
+		})
+		for paginator.HasMorePages() {
+			out, err := paginator.NextPage(ctx)
+			if err != nil {
+				return chat.FeaturedGroups{}, err
+			}
+			items = append(items, out.Items...)
+		}
+
+		featured, ok, err := featuredGroupsFromItems(items)
+		if err != nil {
+			return chat.FeaturedGroups{}, err
+		}
+		if ok {
+			return featured, nil
+		}
+	}
+	return chat.FeaturedGroups{}, fmt.Errorf("reading featured groups for user %x: every read straddled a replace", userID.Value)
+}
+
+// featuredGroupsFromItems assembles a list from a query of its partition,
+// reporting ok false when the items are not one list (see
+// readFeaturedGroups). No items at all is the list never written.
+func featuredGroupsFromItems(items []map[string]types.AttributeValue) (chat.FeaturedGroups, bool, error) {
+	if len(items) == 0 {
+		return chat.FeaturedGroups{}, true, nil
+	}
+	if asS(items[0][attrSK]) != skMeta {
+		// Positions with no #meta: the query ran alongside the first write.
+		return chat.FeaturedGroups{}, false, nil
+	}
+	version, err := parseN(items[0][attrVersion])
+	if err != nil {
+		return chat.FeaturedGroups{}, false, fmt.Errorf("parsing featured groups version: %w", err)
+	}
+	count, err := parseN(items[0][attrFeaturedCount])
+	if err != nil {
+		return chat.FeaturedGroups{}, false, fmt.Errorf("parsing featured groups count: %w", err)
+	}
+
+	positions := items[1:]
+	if uint64(len(positions)) != count {
+		return chat.FeaturedGroups{}, false, nil
+	}
+	featured := chat.FeaturedGroups{Version: version}
+	for i, item := range positions {
+		if sk := asS(item[attrSK]); sk != featuredSK(i) {
+			return chat.FeaturedGroups{}, false, nil
+		}
+		stamped, err := parseN(item[attrVersion])
+		if err != nil {
+			return chat.FeaturedGroups{}, false, fmt.Errorf("parsing featured group version: %w", err)
+		}
+		if stamped != version {
+			return chat.FeaturedGroups{}, false, nil
+		}
+		chatID := asB(item[attrChat])
+		if len(chatID) == 0 {
+			return chat.FeaturedGroups{}, false, fmt.Errorf("featured group at %s has no chat", asS(item[attrSK]))
+		}
+		featured.ChatIDs = append(featured.ChatIDs, &commonpb.ChatId{Value: chatID})
+	}
+	return featured, true, nil
 }

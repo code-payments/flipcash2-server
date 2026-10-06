@@ -27,7 +27,8 @@ import (
 // is held.
 //
 // One thing is held that is not fixed at creation: a lower bound on each
-// activity record, so a throttled send costs no write (see RecordSend). It can
+// activity record, so a throttled send costs no store request (see
+// RecordSend). It can
 // be out of date but never wrong in the direction that matters, because the
 // record only moves forward.
 type Cache struct {
@@ -239,18 +240,19 @@ func (c *Cache) GetMutedCount(ctx context.Context, chatID *commonpb.ChatId) (uin
 	return c.db.GetMutedCount(ctx, chatID)
 }
 
-// RecordSend answers a throttled send itself, with no write: the backing
-// store is billed for a conditional write whether or not its condition holds,
-// so leaving the throttle to it would cost a write per message. Each send this
+// RecordSend answers a throttled send itself, with no store request: the
+// backing store reads the record to find a send throttled (see
+// chat.Store.RecordSend), so leaving the throttle to it would cost a read per
+// message. Each send this
 // process saw recorded is held for ActivityRecordInterval, keyed by (group,
 // user), and a send the interval has not yet cleared since it is answered
 // false, exactly as the store would answer it: the record only moves forward,
 // so it holds at least what was seen recorded here, whatever other processes
 // have written since. A send this process has not seen within the interval,
 // or one the store refused, goes to the store, so a stale entry can cost a
-// write but never skip one. Each process throttles on its own, so a user's
-// sends spread across several processes cost up to one write per process per
-// interval. A send the store would reject outright (a DM ID, a time before the
+// store request but never skip a record. Each process throttles on its own,
+// so a user's sends spread across several processes cost up to one store
+// request per process per interval, of which the store records one. A send the store would reject outright (a DM ID, a time before the
 // epoch) is never answered here.
 func (c *Cache) RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, sentAt time.Time) (bool, error) {
 	sentAtMillis := sentAt.UnixMilli()

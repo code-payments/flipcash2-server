@@ -300,10 +300,15 @@ type Store interface {
 	// transpose of GetGroupMemberRecords, one group and many users. A user
 	// who is not joined — never, or no longer — is absent rather than
 	// reported, a group that does not exist reads as no members, and
-	// duplicate IDs collapse. The read is strongly consistent, so a user who
-	// has just left is never returned (see Server.SampleChatters). It returns
+	// duplicate IDs collapse. The read is eventually consistent, at half the
+	// cost of a strong one: it may trail a join or departure by a moment, so
+	// a user who has just left can still be returned, which its one reader
+	// tolerates (see Server.SampleChatters). It is not for a gate. It returns
 	// an error if chatID is not a group chat ID, and an empty map (no error)
 	// when userIDs is empty.
+	//
+	// TODO: revisit the consistency if a reader needs a strongly consistent
+	// answer, e.g. by having the caller choose it.
 	GetGroupMembersByID(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]GroupMember, error)
 
 	// GetGroupRosterSummary returns a group chat's RosterSummary, maintained

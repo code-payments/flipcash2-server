@@ -1228,7 +1228,7 @@ func (s *store) GetGroupMemberRecords(ctx context.Context, userID *commonpb.User
 	return out, nil
 }
 
-// GetGroupMembersByID is one strongly consistent batch read of the users'
+// GetGroupMembersByID is one eventually consistent batch read of the users'
 // rows in the group's partition, keeping the joined ones.
 func (s *store) GetGroupMembersByID(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]chat.GroupMember, error) {
 	if !chat.IsGroupChatID(chatID) {
@@ -1246,7 +1246,7 @@ func (s *store) GetGroupMembersByID(ctx context.Context, chatID *commonpb.ChatId
 	}
 
 	out := make(map[string]chat.GroupMember, len(keys))
-	err := s.batchGet(ctx, s.groupMembersTable, keys, "", nil, true, func(item map[string]types.AttributeValue) error {
+	err := s.batchGet(ctx, s.groupMembersTable, keys, "", nil, false, func(item map[string]types.AttributeValue) error {
 		state, err := parseN(item[attrState])
 		if err != nil {
 			return err

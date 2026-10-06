@@ -37,10 +37,10 @@ import (
 // it fills and too few of the senders are still members, has_more is set,
 // since the server stopped looking before it could tell. The caller passed
 // the membership gate, so their own candidacy needs no check. The check is
-// strongly consistent, so someone who has just left is never shown. The
-// sample does not need that, since it decides who is shown and not who may
-// do anything, but the store method serves it alone today and is kept
-// strong until a reader needs otherwise.
+// eventually consistent: it decides who is shown, not who may do anything,
+// so a member who left a moment ago appearing, or one who joined a moment
+// ago missing, costs nothing a refetch does not fix, and the read costs half
+// as much.
 //
 // A member who sent within the last minute may trail their latest message
 // (see ActivityRecordInterval), and one whose activity record has expired

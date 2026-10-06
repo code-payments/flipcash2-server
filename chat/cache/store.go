@@ -61,6 +61,10 @@ func (c *Cache) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 	return c.db.AddGroupMembers(ctx, chatID, userIDs)
 }
 
+func (c *Cache) GetGroupMembersByID(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]chat.GroupMember, error) {
+	return c.db.GetGroupMembersByID(ctx, chatID, userIDs)
+}
+
 func (c *Cache) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, discardKeyEnvelope bool) (bool, chat.RosterSummary, error) {
 	return c.db.RemoveGroupMember(ctx, chatID, userID, discardKeyEnvelope)
 }
@@ -268,6 +272,10 @@ func (c *Cache) RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID 
 
 func (c *Cache) GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]chat.RecentSender, error) {
 	return c.db.GetRecentSenders(ctx, chatID, limit)
+}
+
+func (c *Cache) GetLastSentAt(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (time.Time, bool, error) {
+	return c.db.GetLastSentAt(ctx, chatID, userID)
 }
 
 // The key envelope methods pass through: an envelope is read once per chat

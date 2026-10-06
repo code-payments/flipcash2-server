@@ -592,6 +592,29 @@ func (m *memory) GetGroupMemberRecords(_ context.Context, userID *commonpb.UserI
 	return out, nil
 }
 
+func (m *memory) GetGroupMembersByID(_ context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]chat.GroupMember, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	out := make(map[string]chat.GroupMember)
+	for _, userID := range userIDs {
+		r := m.groupMembers[string(chatID.Value)][string(userID.Value)]
+		if r == nil || !r.joined {
+			continue
+		}
+		out[string(userID.Value)] = chat.GroupMember{
+			UserID:   &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
+			JoinedAt: r.joinedAt,
+			Version:  r.version,
+		}
+	}
+	return out, nil
+}
+
 func (m *memory) GetGroupMembersPage(_ context.Context, chatID *commonpb.ChatId, after *commonpb.UserId, limit int) (chat.MembersPage, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return chat.MembersPage{}, fmt.Errorf("not a group chat id")
@@ -821,6 +844,18 @@ func (m *memory) GetRecentSenders(_ context.Context, chatID *commonpb.ChatId, li
 		senders = senders[:limit]
 	}
 	return senders, nil
+}
+
+func (m *memory) GetLastSentAt(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (time.Time, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return time.Time{}, false, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	last, ok := m.lastSent[string(chatID.Value)][string(userID.Value)]
+	return last, ok, nil
 }
 
 func (m *memory) SetKeyEnvelope(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (chat.KeyEnvelope, error) {

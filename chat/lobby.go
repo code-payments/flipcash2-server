@@ -46,9 +46,10 @@ import (
 // never both waiting and admitted. An entry is likewise refused in the write
 // that would make it for a user who is a member by then (see
 // Store.EnterLobby), so a retried EnterLobby racing the admission cannot
-// leave a member with an entry. It is announced like any join, as a
-// RosterUpdate.MemberJoined to the members and to the admitted user, who
-// learns of it that way and fetches their envelope (see Server.GetKeyEnvelope).
+// leave a member with an entry. It is announced like any join: a
+// RosterUpdate.MemberJoined to the admitted user, who learns of it that way
+// and fetches their envelope (see Server.GetKeyEnvelope), and a
+// MembershipChanged naming no one to the members.
 //
 // The lobby's own changes reach the creator alone, as LobbyUpdates on their
 // user topic (see publishLobbyUpdate): a MemberEntered carrying the waiting
@@ -338,9 +339,10 @@ func (s *Server) AdmitLobbyMember(ctx context.Context, req *chatpb.AdmitLobbyMem
 		return &chatpb.AdmitLobbyMemberResponse{Result: chatpb.AdmitLobbyMemberResponse_OK}, nil
 	}
 
-	// Announced as any join is (see JoinChat): the admitted user's own entry
-	// as hydrated for them, with the metadata to their own devices so they
-	// can insert the chat, and the record the write produced.
+	// Announced as any join is (see JoinChat): to the admitted user's own
+	// devices, their entry as hydrated for them, with the metadata so they
+	// can insert the chat, and the record the write produced; to the
+	// members, only that the roster moved.
 	metadata, err := s.hydrate(ctx, req.UserId, memberListenerStanding, ReadingFull, fullDetail, []*Chat{c})
 	if err != nil {
 		// The admission has landed; only the read back failed. The admitted
@@ -356,10 +358,6 @@ func (s *Server) AdmitLobbyMember(ctx context.Context, req *chatpb.AdmitLobbyMem
 	if err != nil {
 		return nil, err
 	}
-	toMembers := &chatpb.RosterUpdate{
-		Kind:          &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{Member: member}},
-		RosterSummary: rosterSummary,
-	}
 	toJoiner := &chatpb.RosterUpdate{
 		Kind: &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{
 			Member:   member,
@@ -367,7 +365,7 @@ func (s *Server) AdmitLobbyMember(ctx context.Context, req *chatpb.AdmitLobbyMem
 		}},
 		RosterSummary: rosterSummary,
 	}
-	s.publishRosterUpdate(c.ID, req.UserId, toMembers, toJoiner)
+	s.publishRosterUpdate(c.ID, req.UserId, toJoiner, true)
 	s.publishLobbyLeft(c, req.UserId)
 
 	return &chatpb.AdmitLobbyMemberResponse{Result: chatpb.AdmitLobbyMemberResponse_OK}, nil

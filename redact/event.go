@@ -152,7 +152,8 @@ func metadataUpdate(chatID *commonpb.ChatId, md *chatpb.MetadataUpdate) (*chatpb
 
 // rosterUpdate redacts one roster update: a join may carry the chat's
 // metadata for its recipient, whose last_message is a message (see metadata);
-// a departure carries none. A kind this version does not know is an error.
+// a departure, and a membership change naming no one, carry none. A kind this
+// version does not know is an error.
 func rosterUpdate(chatID *commonpb.ChatId, r *chatpb.RosterUpdate) (*chatpb.RosterUpdate, error) {
 	switch kind := r.GetKind().(type) {
 	case *chatpb.RosterUpdate_MemberJoined_:
@@ -166,7 +167,7 @@ func rosterUpdate(chatID *commonpb.ChatId, r *chatpb.RosterUpdate) (*chatpb.Rost
 			joined.Metadata = redacted
 		}
 		return out, nil
-	case *chatpb.RosterUpdate_MemberLeft_:
+	case *chatpb.RosterUpdate_MemberLeft_, *chatpb.RosterUpdate_MembershipChanged_:
 		return proto.Clone(r).(*chatpb.RosterUpdate), nil
 	default:
 		return nil, fmt.Errorf("redact: unsupported roster update %T", kind)

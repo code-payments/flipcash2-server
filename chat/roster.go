@@ -53,10 +53,11 @@ import (
 // never are, since group pointer advances are not broadcast and a page of
 // them would be stale on arrival.
 //
-// The read is a listener's: a member's, or a non-member's whom the group's
-// listener rules admit, evaluated through the shared Access with the usual
-// admission cache. A viewer who may only preview the chat is denied — a
-// roster is not a shape.
+// The read is a member's alone: who else is in a chat is not shown to anyone
+// outside it, so a non-member is denied whatever the group's listener rules
+// say of them, including one they would admit to read its messages.
+// Membership is decided through the shared Access, off the record for a DM
+// and from the store for a group.
 //
 // The whole RPC can be switched off by configuration (see
 // Server.disableGetRoster): every call is then refused with UNAVAILABLE once
@@ -123,12 +124,12 @@ func (s *Server) GetRoster(ctx context.Context, req *chatpb.GetRosterRequest) (*
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	standing, err := s.access.ListenerStandingWithChat(ctx, c, userID, messagingpb.ViewMode_FULL)
+	isMember, err := s.access.IsMemberWithChat(ctx, c, userID)
 	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure determining chat standing")
+		log.With(zap.Error(err)).Warn("Failure determining chat membership")
 		return nil, status.Error(codes.Internal, "")
 	}
-	if !standing.CanListen {
+	if !isMember {
 		return &chatpb.GetRosterResponse{Result: chatpb.GetRosterResponse_DENIED}, nil
 	}
 

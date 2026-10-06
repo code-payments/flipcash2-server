@@ -81,6 +81,10 @@ func chatUpdateFixture() *eventpb.ChatUpdate {
 				Kind:          &chatpb.RosterUpdate_MemberLeft_{MemberLeft: &chatpb.RosterUpdate_MemberLeft{UserId: member}},
 				RosterSummary: &chatpb.RosterSummary{MemberCount: 1, Version: 6},
 			},
+			{
+				Kind:          &chatpb.RosterUpdate_MembershipChanged_{MembershipChanged: &chatpb.RosterUpdate_MembershipChanged{}},
+				RosterSummary: &chatpb.RosterSummary{MemberCount: 2, Version: 7},
+			},
 		}},
 	}
 }
@@ -135,8 +139,8 @@ func TestChatUpdate(t *testing.T) {
 	}
 
 	// A join keeps its member and summary with its metadata's last message
-	// redacted; a departure is as it was.
-	require.Len(t, out.RosterUpdates.RosterUpdates, 2)
+	// redacted; a departure, and a change naming no one, are as they were.
+	require.Len(t, out.RosterUpdates.RosterUpdates, 3)
 	joined := out.RosterUpdates.RosterUpdates[0]
 	assert.True(t, proto.Equal(in.RosterUpdates.RosterUpdates[0].GetMemberJoined().Member, joined.GetMemberJoined().Member))
 	assert.True(t, proto.Equal(in.RosterUpdates.RosterUpdates[0].RosterSummary, joined.RosterSummary))
@@ -144,6 +148,7 @@ func TestChatUpdate(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, proto.Equal(expected, joined.GetMemberJoined().Metadata.LastMessage))
 	assert.True(t, proto.Equal(in.RosterUpdates.RosterUpdates[1], out.RosterUpdates.RosterUpdates[1]))
+	assert.True(t, proto.Equal(in.RosterUpdates.RosterUpdates[2], out.RosterUpdates.RosterUpdates[2]))
 
 	// A redacted update is its own redaction.
 	again, err := ChatUpdate(chatID, out)

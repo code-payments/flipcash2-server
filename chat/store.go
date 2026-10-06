@@ -295,6 +295,22 @@ type Store interface {
 	// chat ID, and an empty map (no error) when chatIDs is empty.
 	GetGroupMemberRecords(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]GroupMember, error)
 
+	// GetGroupMembersByID returns the joined membership record of each of
+	// userIDs in the group chatID, keyed by string(userID.Value): the
+	// transpose of GetGroupMemberRecords, one group and many users. A user
+	// who is not joined — never, or no longer — is absent rather than
+	// reported, a group that does not exist reads as no members, and
+	// duplicate IDs collapse. The read is eventually consistent, at half the
+	// cost of a strong one: it may trail a join or departure by a moment, so
+	// a user who has just left can still be returned, which its one reader
+	// tolerates (see Server.SampleChatters). It is not for a gate. It returns
+	// an error if chatID is not a group chat ID, and an empty map (no error)
+	// when userIDs is empty.
+	//
+	// TODO: revisit the consistency if a reader needs a strongly consistent
+	// answer, e.g. by having the caller choose it.
+	GetGroupMembersByID(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]GroupMember, error)
+
 	// GetGroupRosterSummary returns a group chat's RosterSummary, maintained
 	// alongside its membership records rather than computed by enumerating
 	// them — so a group's size and version are known without paying for its
@@ -461,14 +477,24 @@ type Store interface {
 	RecordSend(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, sentAt time.Time) (recorded bool, err error)
 
 	// GetRecentSenders returns the group's activity records most recently
-	// sent first, at most limit of them (limit <= 0 means unbounded), from a
-	// strongly consistent read, so a send just recorded is in it. Ties come
-	// back in no particular order. Records of users who have since left are
-	// included (see the activity record), and a record past
-	// ActivityRetention may be. A group with no records, or that does not
-	// exist, is an empty result. It returns an error if chatID is not a group
-	// chat ID.
+	// sent first, at most limit of them (limit <= 0 means unbounded), from an
+	// eventually consistent read, so a send recorded a moment ago may be
+	// missing or at its previous time: its readers rank and show people, which
+	// a refetch corrects. Ties come back in no particular order. Records of
+	// users who have since left are included (see the activity record), and
+	// a record past ActivityRetention may be. A group with no records, or
+	// that does not exist, is an empty result. It returns an error if chatID
+	// is not a group chat ID.
 	GetRecentSenders(ctx context.Context, chatID *commonpb.ChatId, limit int) ([]RecentSender, error)
+
+	// GetLastSentAt returns userID's activity record in the group chatID:
+	// when their latest recorded send was, and whether they have a record at
+	// all. It is the point read of what GetRecentSenders ranges over, for a
+	// user it may not reach, and eventually consistent like it. A record past
+	// ActivityRetention may be returned. A user with no record, or a group
+	// that does not exist, is ok == false. It returns an error if chatID is
+	// not a group chat ID.
+	GetLastSentAt(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (lastSentAt time.Time, ok bool, err error)
 
 	// SetKeyEnvelope stores envelope as userID's key envelope for the group
 	// chatID, and returns the envelope that stands after the call. An

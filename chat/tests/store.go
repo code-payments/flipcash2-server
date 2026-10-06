@@ -81,6 +81,7 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_UserState_GetMutedUsers,
 		testStore_UserState_GetMutedUsersPage_Bounds,
 		testStore_UserState_MutedCount,
+		testStore_GroupChat_MembersByID,
 		testStore_Activity_RecentSenders,
 		testStore_Activity_Throttle,
 		testStore_Activity_Precision,
@@ -2521,6 +2522,52 @@ func testStore_UserState_MutedCount(t *testing.T, s chat.Store) {
 	requireMutedCount(t, us, group, 2)
 }
 
+func testStore_GroupChat_MembersByID(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	a, b, departed := model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()
+	stranger := model.MustGenerateUserID()
+	groupID := putGroupChat(t, s, "members", at(0), a, b, departed).ID
+	_, _, err := s.RemoveGroupMember(ctx, groupID, departed, false)
+	require.NoError(t, err)
+	added := model.MustGenerateUserID()
+	_, roster, err := s.AddGroupMembers(ctx, groupID, []*commonpb.UserId{added})
+	require.NoError(t, err)
+
+	// Joined members only, with their records, keyed by user; duplicates
+	// collapse.
+	members, err := s.GetGroupMembersByID(ctx, groupID, []*commonpb.UserId{a, departed, stranger, added, a})
+	require.NoError(t, err)
+	require.Len(t, members, 2)
+	require.Equal(t, a.Value, members[string(a.Value)].UserID.Value)
+	require.Zero(t, members[string(a.Value)].Version)
+	require.Equal(t, added.Value, members[string(added.Value)].UserID.Value)
+	require.Equal(t, roster.Version, members[string(added.Value)].Version)
+	require.False(t, members[string(added.Value)].JoinedAt.IsZero())
+
+	// Nothing asked, nothing returned; a group that does not exist has no
+	// members; groups only.
+	members, err = s.GetGroupMembersByID(ctx, groupID, nil)
+	require.NoError(t, err)
+	require.Empty(t, members)
+	members, err = s.GetGroupMembersByID(ctx, chat.MustGenerateGroupChatID(), []*commonpb.UserId{a})
+	require.NoError(t, err)
+	require.Empty(t, members)
+	_, err = s.GetGroupMembersByID(ctx, generateDmChatID(), []*commonpb.UserId{a})
+	require.Error(t, err)
+
+	// A batch larger than one read is read whole.
+	many := make([]*commonpb.UserId, 0, 120)
+	for range 120 {
+		many = append(many, model.MustGenerateUserID())
+	}
+	_, _, err = s.AddGroupMembers(ctx, groupID, many)
+	require.NoError(t, err)
+	members, err = s.GetGroupMembersByID(ctx, groupID, append(many, b))
+	require.NoError(t, err)
+	require.Len(t, members, 121)
+}
+
 func testStore_Activity_RecentSenders(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
@@ -2561,6 +2608,21 @@ func testStore_Activity_RecentSenders(t *testing.T, s chat.Store) {
 	senders, err = s.GetRecentSenders(ctx, group.ID, 0)
 	require.NoError(t, err)
 	requireRecentSenders(t, senders, a, at(400), b, at(300), c, at(200))
+
+	// A point read finds one user's record, whatever its rank; a user with
+	// no record, or a group that does not exist, has none; groups only.
+	lastSentAt, ok, err := s.GetLastSentAt(ctx, group.ID, c)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, lastSentAt.Equal(at(200)))
+	_, ok, err = s.GetLastSentAt(ctx, group.ID, model.MustGenerateUserID())
+	require.NoError(t, err)
+	require.False(t, ok)
+	_, ok, err = s.GetLastSentAt(ctx, chat.MustGenerateGroupChatID(), a)
+	require.NoError(t, err)
+	require.False(t, ok)
+	_, _, err = s.GetLastSentAt(ctx, generateDmChatID(), a)
+	require.Error(t, err)
 }
 
 func testStore_Activity_Throttle(t *testing.T, s chat.Store) {

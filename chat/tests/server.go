@@ -75,6 +75,10 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetMentionSuggestions,
 		testServer_GetMentionSuggestions_Size,
 		testServer_GetMentionSuggestions_Gates,
+		testServer_SampleChatters,
+		testServer_SampleChatters_Size,
+		testServer_SampleChatters_Window,
+		testServer_SampleChatters_Gates,
 		testServer_GetDmChatFeed_Empty,
 		testServer_GetDmChatFeed_OrderAndContent,
 		testServer_GetDmChatFeed_Paging,
@@ -1055,6 +1059,200 @@ func suggestedUserIDs(suggestions []*chatpb.MentionSuggestion) [][]byte {
 	return out
 }
 
+func (e *serverEnv) sampleChatters(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.SampleChattersResponse {
+	req := &chatpb.SampleChattersRequest{ChatId: chatID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.SampleChatters(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// putGroupWithCreator creates a public group with the env's user and others
+// as members, recording creator as the group's creator.
+func (e *serverEnv) putGroupWithCreator(title string, creator *commonpb.UserId, others ...*commonpb.UserId) *commonpb.ChatId {
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      append([]*commonpb.UserId{e.userID, creator}, others...),
+		Title:        title,
+		CreatorID:    creator,
+		LastActivity: at(1),
+	}))
+	return chatID
+}
+
+// sampledUserIDs projects a sample onto its users' IDs, in order.
+func sampledUserIDs(chatters []*chatpb.SampledChatter) [][]byte {
+	out := make([][]byte, len(chatters))
+	for i, chatter := range chatters {
+		out[i] = chatter.UserProfile.UserId.Value
+	}
+	return out
+}
+
+func testServer_SampleChatters(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	creator := model.MustGenerateUserID()  // never sent, at first
+	recent := model.MustGenerateUserID()   // the most recent sender but the caller
+	earlier := model.MustGenerateUserID()  // sent before the others
+	blocked := model.MustGenerateUserID()  // the caller blocked them; still shown
+	departed := model.MustGenerateUserID() // sent, then left
+	quiet := model.MustGenerateUserID()    // a member who never sent
+	groupID := e.putGroupWithCreator("Chatters", creator, recent, earlier, blocked, departed, quiet)
+	e.profiles.displayNames[string(creator.Value)] = "Creator"
+	e.blocklist.block(e.userID, blocked)
+
+	e.recordSend(groupID, earlier, at(10))
+	e.recordSend(groupID, departed, at(25))
+	e.recordSend(groupID, recent, at(30))
+	e.recordSend(groupID, blocked, at(40))
+	e.recordSend(groupID, e.userID, at(50))
+	_, _, err := s.RemoveGroupMember(e.ctx, groupID, departed, false)
+	require.NoError(t, err)
+
+	// The creator first, though they never sent; then the senders who are
+	// still members, most recent first, the caller and a blocked user
+	// included. Someone who left, and a member who never sent, are not.
+	resp := e.sampleChatters(e.keys, groupID)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
+	require.Equal(t, [][]byte{creator.Value, e.userID.Value, blocked.Value, recent.Value, earlier.Value}, sampledUserIDs(resp.Chatters))
+	require.False(t, resp.HasMore)
+	require.True(t, resp.Chatters[0].IsCreator)
+	require.Nil(t, resp.Chatters[0].LastSentAt)
+	require.Equal(t, "Creator", resp.Chatters[0].UserProfile.DisplayName)
+	for i, want := range []time.Time{at(50), at(40), at(30), at(10)} {
+		chatter := resp.Chatters[i+1]
+		require.False(t, chatter.IsCreator)
+		require.True(t, chatter.LastSentAt.AsTime().Equal(want), "chatter %d", i+1)
+	}
+
+	// A creator who sends stays first, at their send.
+	e.recordSend(groupID, creator, at(60))
+	resp = e.sampleChatters(e.keys, groupID)
+	require.Equal(t, [][]byte{creator.Value, e.userID.Value, blocked.Value, recent.Value, earlier.Value}, sampledUserIDs(resp.Chatters))
+	require.True(t, resp.Chatters[0].LastSentAt.AsTime().Equal(at(60)))
+
+	// Someone who rejoins is back at their last send.
+	_, _, err = s.AddGroupMembers(e.ctx, groupID, []*commonpb.UserId{departed})
+	require.NoError(t, err)
+	resp = e.sampleChatters(e.keys, groupID)
+	require.Equal(t, [][]byte{creator.Value, e.userID.Value, blocked.Value, recent.Value, departed.Value, earlier.Value}, sampledUserIDs(resp.Chatters))
+
+	// A creator who has left is not shown, though they have sent.
+	_, _, err = s.RemoveGroupMember(e.ctx, groupID, creator, false)
+	require.NoError(t, err)
+	resp = e.sampleChatters(e.keys, groupID)
+	require.Equal(t, [][]byte{e.userID.Value, blocked.Value, recent.Value, departed.Value, earlier.Value}, sampledUserIDs(resp.Chatters))
+	require.False(t, resp.Chatters[0].IsCreator)
+
+	// A group no one has sent in is its creator alone, and a group with no
+	// recorded creator starts with its senders.
+	quietGroup := e.putGroupWithCreator("Quiet", creator)
+	resp = e.sampleChatters(e.keys, quietGroup)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
+	require.Equal(t, [][]byte{creator.Value}, sampledUserIDs(resp.Chatters))
+	legacy := e.putGroup("Legacy", at(1))
+	resp = e.sampleChatters(e.keys, legacy)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
+	require.Empty(t, resp.Chatters)
+	e.recordSend(legacy, e.userID, at(5))
+	resp = e.sampleChatters(e.keys, legacy)
+	require.Equal(t, [][]byte{e.userID.Value}, sampledUserIDs(resp.Chatters))
+}
+
+func testServer_SampleChatters_Size(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// The creator and 19 senders fill the sample exactly: nothing more.
+	creator := model.MustGenerateUserID()
+	senders := make([]*commonpb.UserId, 25)
+	for i := range senders {
+		senders[i] = model.MustGenerateUserID()
+	}
+	groupID := e.putGroupWithCreator("Busy", creator, senders...)
+	for i := range 19 {
+		e.recordSend(groupID, senders[i], at(int64(i+1)))
+	}
+	resp := e.sampleChatters(e.keys, groupID)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
+	require.Len(t, resp.Chatters, 20)
+	require.False(t, resp.HasMore)
+
+	// More senders, and the sample keeps the creator and the 19 most
+	// recent, and says there are more.
+	for i := 19; i < len(senders); i++ {
+		e.recordSend(groupID, senders[i], at(int64(i+1)))
+	}
+	resp = e.sampleChatters(e.keys, groupID)
+	require.Len(t, resp.Chatters, 20)
+	require.True(t, resp.HasMore)
+	require.Equal(t, creator.Value, resp.Chatters[0].UserProfile.UserId.Value)
+	for i, chatter := range resp.Chatters[1:] {
+		require.Equal(t, senders[len(senders)-1-i].Value, chatter.UserProfile.UserId.Value, "chatter %d", i+1)
+	}
+}
+
+func testServer_SampleChatters_Window(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// A full window of senders, nearly all of whom have left: the members
+	// among them are found past the first check, and since the window was
+	// full, there may be more.
+	creator := model.MustGenerateUserID()
+	stayed := []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID()}
+	groupID := e.putGroupWithCreator("Churn", creator, stayed...)
+	const window = 100
+	for i := range window {
+		sender := model.MustGenerateUserID()
+		switch i {
+		case 40:
+			sender = stayed[0]
+		case 90:
+			sender = stayed[1]
+		}
+		e.recordSend(groupID, sender, at(int64(window-i)))
+	}
+	resp := e.sampleChatters(e.keys, groupID)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, resp.Result)
+	require.Equal(t, [][]byte{creator.Value, stayed[0].Value, stayed[1].Value}, sampledUserIDs(resp.Chatters))
+	require.True(t, resp.HasMore)
+	require.Nil(t, resp.Chatters[0].LastSentAt)
+
+	// A creator who sent before everyone in the window is still shown at
+	// their send.
+	e.recordSend(groupID, creator, at(0))
+	resp = e.sampleChatters(e.keys, groupID)
+	require.Equal(t, [][]byte{creator.Value, stayed[0].Value, stayed[1].Value}, sampledUserIDs(resp.Chatters))
+	require.True(t, resp.Chatters[0].IsCreator)
+	require.True(t, resp.Chatters[0].LastSentAt.AsTime().Equal(at(0)))
+}
+
+func testServer_SampleChatters_Gates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	_, strangerKeys := e.addUser()
+
+	// A DM, before anything is read.
+	resp := e.sampleChatters(e.keys, e.putDM(at(1)))
+	require.Equal(t, chatpb.SampleChattersResponse_DENIED, resp.Result)
+
+	// A group that does not exist.
+	resp = e.sampleChatters(e.keys, chat.MustGenerateGroupChatID())
+	require.Equal(t, chatpb.SampleChattersResponse_NOT_FOUND, resp.Result)
+
+	// A private group, even to its creator and members.
+	private := e.putPrivateGroup("Private")
+	resp = e.sampleChatters(e.keys, private)
+	require.Equal(t, chatpb.SampleChattersResponse_DENIED, resp.Result)
+
+	// A public group, to a non-member; then to them once they join.
+	public := e.putGroupWithCreator("Public", model.MustGenerateUserID())
+	resp = e.sampleChatters(strangerKeys, public)
+	require.Equal(t, chatpb.SampleChattersResponse_DENIED, resp.Result)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, e.sampleChatters(e.keys, public).Result)
+}
+
 func testServer_GetMentionSuggestions(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
@@ -1188,9 +1386,10 @@ func testServer_GetRoster_Gates(t *testing.T, s chat.Store) {
 	resp = e.mustGetRoster(strangerKeys, closed, nil)
 	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
 
-	// A non-member who fails a group's rule is denied — they may preview the
-	// group, but a roster is not a shape. Once they satisfy it, the roster is
-	// theirs to read without joining.
+	// A roster is a member's alone. A non-member is denied whether or not
+	// they satisfy the group's rules: one who fails them may only preview the
+	// group, and one who meets them may read its messages, but neither may
+	// see who is in it until they join.
 	const requirement = 100
 	founder := model.MustGenerateUserID()
 	gated := &chat.Chat{
@@ -1205,9 +1404,18 @@ func testServer_GetRoster_Gates(t *testing.T, s chat.Store) {
 	resp = e.mustGetRoster(e.keys, gated.ID, nil)
 	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
 	e.fundEnvUser(requirement)
+	require.Equal(t, chatpb.GetChatResponse_OK, e.getChat(e.keys, gated.ID).Result)
+	resp = e.mustGetRoster(e.keys, gated.ID, nil)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
+
+	// Joining makes it theirs to read, and leaving takes it away again.
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, gated.ID).Result)
 	resp = e.mustGetRoster(e.keys, gated.ID, nil)
 	require.Equal(t, chatpb.GetRosterResponse_OK, resp.Result)
-	require.Equal(t, [][]byte{founder.Value}, memberUserIDs(resp.Members))
+	require.ElementsMatch(t, [][]byte{founder.Value, e.userID.Value}, memberUserIDs(resp.Members))
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, gated.ID).Result)
+	resp = e.mustGetRoster(e.keys, gated.ID, nil)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
 }
 
 // testServer_GetRoster_Disabled pins the operator's switch: with GetRoster
@@ -2465,40 +2673,35 @@ func testServer_JoinChat_OK(t *testing.T, s chat.Store) {
 	require.True(t, isMember)
 	require.Equal(t, chatpb.GetChatResponse_OK, e.getChat(e.keys, group.ID).Result)
 
-	// ...and been announced. The chat's topic carries the joiner's hydrated
-	// member entry — profile, no pointers, no metadata — with the joiner
-	// excluded, since their streams are not on the topic yet.
+	// ...and been announced. The chat's topic is told only that the roster
+	// moved, naming no one, with the joiner excluded, since their streams are
+	// not on the topic yet.
 	e.waitForRosterUpdates(e.userID, group.ID, 1)
 	toMembers, excludes := e.rosterUpdatesOnChatTopic(group.ID)
 	require.Len(t, toMembers, 1)
 	require.Len(t, excludes[0], 1)
 	require.Equal(t, e.userID.Value, excludes[0][0].Value)
-	joined := toMembers[0].GetMemberJoined()
-	require.NotNil(t, joined)
-	require.Equal(t, e.userID.Value, joined.Member.UserId.Value)
-	require.Equal(t, "Joiner", joined.Member.UserProfile.DisplayName)
-	require.True(t, joined.Member.UserProfile.JoinTs.AsTime().Equal(at(5)))
-	require.Empty(t, joined.Member.Pointers)
-	require.Nil(t, joined.Metadata)
-	// The announced member is the record the join wrote: the version the
-	// roster moved to, and the join time as stored.
-	require.EqualValues(t, 1, joined.Member.Version)
-	require.NotNil(t, joined.Member.JoinedAt)
-	records, err := s.GetGroupMemberRecords(e.ctx, e.userID, []*commonpb.ChatId{group.ID})
-	require.NoError(t, err)
-	require.True(t, joined.Member.JoinedAt.AsTime().Equal(records[string(group.ID.Value)].JoinedAt))
+	require.NotNil(t, toMembers[0].GetMembershipChanged())
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 3, Version: 1}, toMembers[0].GetRosterSummary()))
 
-	// The joiner's own topic carries the same member plus the full metadata,
-	// so their other devices insert the chat without a refetch.
+	// The joiner's own topic carries their hydrated member entry — profile, no
+	// pointers — plus the full metadata, so their other devices insert the
+	// chat without a refetch.
 	toJoiner := e.rosterUpdatesOnUserTopic(e.userID, group.ID)
 	require.Len(t, toJoiner, 1)
 	joinedSelf := toJoiner[0].GetMemberJoined()
 	require.NotNil(t, joinedSelf)
 	require.Equal(t, e.userID.Value, joinedSelf.Member.UserId.Value)
 	require.Equal(t, "Joiner", joinedSelf.Member.UserProfile.DisplayName)
+	require.True(t, joinedSelf.Member.UserProfile.JoinTs.AsTime().Equal(at(5)))
+	require.Empty(t, joinedSelf.Member.Pointers)
+	// The announced member is the record the join wrote: the version the
+	// roster moved to, and the join time as stored.
 	require.EqualValues(t, 1, joinedSelf.Member.Version)
-	require.True(t, joinedSelf.Member.JoinedAt.AsTime().Equal(joined.Member.JoinedAt.AsTime()))
+	require.NotNil(t, joinedSelf.Member.JoinedAt)
+	records, err := s.GetGroupMemberRecords(e.ctx, e.userID, []*commonpb.ChatId{group.ID})
+	require.NoError(t, err)
+	require.True(t, joinedSelf.Member.JoinedAt.AsTime().Equal(records[string(group.ID.Value)].JoinedAt))
 	require.NotNil(t, joinedSelf.Metadata)
 	require.Equal(t, group.ID.Value, joinedSelf.Metadata.ChatId.Value)
 	require.Equal(t, "Open Group", joinedSelf.Metadata.Title)
@@ -2741,16 +2944,14 @@ func testServer_LeaveChat_OK(t *testing.T, s chat.Store) {
 	require.Equal(t, other.Value, members[0].Value)
 
 	// The departure is announced on the chat's topic with the leaver excluded
-	// — their stream may still be on it — and on the leaver's own topic, so
-	// every device they have open drops the chat.
+	// — their stream may still be on it — naming no one, and on the leaver's
+	// own topic, so every device they have open drops the chat.
 	e.waitForRosterUpdates(e.userID, chatID, 1)
 	toMembers, excludes := e.rosterUpdatesOnChatTopic(chatID)
 	require.Len(t, toMembers, 1)
 	require.Len(t, excludes[0], 1)
 	require.Equal(t, e.userID.Value, excludes[0][0].Value)
-	left := toMembers[0].GetMemberLeft()
-	require.NotNil(t, left)
-	require.Equal(t, e.userID.Value, left.UserId.Value)
+	require.NotNil(t, toMembers[0].GetMembershipChanged())
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 1, Version: 1}, toMembers[0].GetRosterSummary()))
 
 	toLeaver := e.rosterUpdatesOnUserTopic(e.userID, chatID)
@@ -2831,14 +3032,19 @@ func testServer_LeaveChat_ThenRejoin(t *testing.T, s chat.Store) {
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 2}, resp.Chat.GetRosterSummary()))
 	require.Len(t, e.getChat(e.keys, chatID).Metadata.Members, 1)
 
-	// Two transitions, two announcements on each topic, in order.
+	// Two transitions, two announcements on each topic, in order: named on
+	// the user's own, anonymous on the chat's.
 	e.waitForRosterUpdates(e.userID, chatID, 2)
 	toMembers, _ := e.rosterUpdatesOnChatTopic(chatID)
 	require.Len(t, toMembers, 2)
-	require.NotNil(t, toMembers[0].GetMemberLeft())
+	require.NotNil(t, toMembers[0].GetMembershipChanged())
 	require.Equal(t, uint64(1), toMembers[0].GetRosterSummary().GetVersion())
-	require.NotNil(t, toMembers[1].GetMemberJoined())
+	require.NotNil(t, toMembers[1].GetMembershipChanged())
 	require.Equal(t, uint64(2), toMembers[1].GetRosterSummary().GetVersion())
+	toSelf := e.rosterUpdatesOnUserTopic(e.userID, chatID)
+	require.Len(t, toSelf, 2)
+	require.NotNil(t, toSelf[0].GetMemberLeft())
+	require.NotNil(t, toSelf[1].GetMemberJoined())
 }
 
 // fakeModerator is a canned moderation.Client for server tests. Only the two
@@ -5493,14 +5699,13 @@ func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	require.NotNil(t, got.Metadata.ViewerState)
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 1}, got.Metadata.RosterSummary))
 
-	// Announced as a join: the members' copy on the chat topic, the admitted
-	// user's with the metadata on their topic; and to the creator, the lobby
-	// shrank.
+	// Announced as a join: to the members, only that the roster moved; the
+	// admitted user's own copy with the metadata on their topic; and to the
+	// creator, the lobby shrank.
 	e.waitForRosterUpdates(userID, chatID, 1)
 	onChat, _ := e.rosterUpdatesOnChatTopic(chatID)
 	require.Len(t, onChat, 1)
-	require.Equal(t, userID.Value, onChat[0].GetMemberJoined().GetMember().GetUserId().GetValue())
-	require.Nil(t, onChat[0].GetMemberJoined().GetMetadata())
+	require.NotNil(t, onChat[0].GetMembershipChanged())
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 1}, onChat[0].RosterSummary))
 	toUser := e.rosterUpdatesOnUserTopic(userID, chatID)
 	require.Len(t, toUser, 1)

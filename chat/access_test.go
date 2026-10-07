@@ -423,18 +423,27 @@ func TestAccess_GroupNonMember(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok)
 
-	// A group without listener rules admits no non-member, with or without the
-	// record in hand: only a rule can admit one (see Access). Its members are
-	// unaffected. Nothing is valued, since there is no rule to evaluate.
+	// A group without listener rules is open: every non-member reads it, with
+	// or without the record in hand, funded or not (see Access). Nothing is
+	// valued, since there is no rule to evaluate, and nothing is remembered,
+	// since there is nothing to save. Its members are unaffected.
 	open := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP})
 	asked = f.ocpBalance.asked
-	ok, err = a.CanListen(ctx, open.ID, f.funded)
-	require.NoError(t, err)
-	require.False(t, ok)
-	ok, err = a.CanListenWithRules(ctx, open.ID, open.GroupRules(), f.funded)
-	require.NoError(t, err)
-	require.False(t, ok)
+	for _, userID := range []*commonpb.UserId{f.funded, f.unfunded} {
+		ok, err = a.CanListen(ctx, open.ID, userID)
+		require.NoError(t, err)
+		require.True(t, ok)
+		ok, err = a.CanListenWithRules(ctx, open.ID, open.GroupRules(), userID)
+		require.NoError(t, err)
+		require.True(t, ok)
+		_, remembered := a.admitted.Get(admissionKey(open.ID, userID))
+		require.False(t, remembered)
+	}
 	require.Equal(t, asked, f.ocpBalance.asked)
+	// A non-member still does not speak in it.
+	ok, err = a.CanSpeak(ctx, open.ID, f.funded)
+	require.NoError(t, err)
+	require.False(t, ok)
 	f.chats.join(open.ID, f.funded)
 	ok, err = a.CanListen(ctx, open.ID, f.funded)
 	require.NoError(t, err)
@@ -657,9 +666,10 @@ func TestAccess_ViewMode(t *testing.T) {
 	}
 	require.Equal(t, asked, f.ocpBalance.asked)
 
-	// A group without listener rules admits no non-member in any form, a DM no
-	// third party, and a group that does not exist no one — and none of them
-	// are valued.
+	// A group without listener rules is open: every non-member reads it in
+	// full, and under REDACTED, which evaluates nothing, previews it. A DM
+	// admits no third party, and a group that does not exist no one. None of
+	// them are valued.
 	open := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP})
 	peer := model.MustGenerateUserID()
 	dm := MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, f.funded, peer)
@@ -668,7 +678,14 @@ func TestAccess_ViewMode(t *testing.T) {
 	third := model.MustGenerateUserID()
 	f.ocpBalance.set(f.accounts.bind(third), f.usdf, ocp_common.ToCoreMintQuarks(1_000_000))
 	for _, mode := range every {
-		for _, chatID := range []*commonpb.ChatId{open.ID, dm, MustGenerateGroupChatID()} {
+		want := full
+		if mode == messagingpb.ViewMode_REDACTED {
+			want = preview
+		}
+		standing, err := a.ListenerStanding(ctx, open.ID, third, mode)
+		require.NoError(t, err)
+		require.Equal(t, want, standing, mode)
+		for _, chatID := range []*commonpb.ChatId{dm, MustGenerateGroupChatID()} {
 			standing, err := a.ListenerStanding(ctx, chatID, third, mode)
 			require.NoError(t, err)
 			require.Equal(t, ListenerStanding{}, standing, mode)
@@ -832,6 +849,31 @@ func TestAccess_SpeakerAdmission(t *testing.T) {
 	f.chats.storeKey(private.ID, creator)
 	require.True(t, canSpeak(private.ID, creator))
 
+	// Only a verdict that read something is remembered. A group with listener
+	// rules and no speaker rules is (the gated group above), and so is one
+	// with a speaker balance alone; a group with no rules, or whose only rule
+	// is that its creator speaks, is decided off its rules and is not.
+	remembered := func(chatID *commonpb.ChatId, userID *commonpb.UserId) bool {
+		t.Helper()
+		_, ok := a.speakers.Get(admissionKey(chatID, userID))
+		return ok
+	}
+	require.True(t, remembered(f.gated.ID, fresh))
+	speakerGated := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumSpeakerBalance: &MinimumBalance{Currency: "usd", NativeAmount: accessRequirement}})
+	open := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP})
+	creatorOnly := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsCreatorOnlySpeaker: true, CreatorID: f.funded})
+	for _, c := range []*Chat{speakerGated, open, creatorOnly} {
+		f.chats.join(c.ID, f.funded)
+	}
+	asked = f.ocpBalance.asked
+	require.True(t, canSpeak(speakerGated.ID, f.funded))
+	require.True(t, remembered(speakerGated.ID, f.funded))
+	require.True(t, canSpeak(open.ID, f.funded))
+	require.False(t, remembered(open.ID, f.funded))
+	require.True(t, canSpeak(creatorOnly.ID, f.funded))
+	require.False(t, remembered(creatorOnly.ID, f.funded))
+	require.Equal(t, asked+1, f.ocpBalance.asked)
+
 	// With no window, every send is evaluated.
 	a = NewAccess(f.chats, f.rules, WithSpeakerAdmissionTTL(0))
 	asked = f.ocpBalance.asked
@@ -947,27 +989,30 @@ func TestAccess_Governance(t *testing.T) {
 			public: preview,
 		},
 		{
+			// Open: every non-member reads it, funded or not.
 			name:       "public group with no rules",
 			chat:       group(&Chat{}),
 			governance: governancePublicGroup,
 			viewers: []viewer{
 				{"member", richIn, true, member, plaintext},
-				{"non-member", richOut, false, outsider, refused},
+				{"funded non-member", richOut, false, [3]ListenerStanding{full, full, preview}, refused},
+				{"unfunded non-member", poorOut, false, [3]ListenerStanding{full, full, preview}, refused},
 			},
-			public:      none,
+			public:      preview,
 			neverValued: true,
 		},
 		{
-			// Rules, but no listener rule: nothing opens it to a non-member.
+			// No listener rule, so open to read: only speaking is gated.
 			name:       "public group with a speaker balance alone",
 			chat:       group(&Chat{MinimumSpeakerBalance: minimum()}),
 			governance: governancePublicGroup,
 			viewers: []viewer{
 				{"funded member", richIn, true, member, plaintext},
 				{"unfunded member", poorIn, true, member, refused},
-				{"funded non-member", richOut, false, outsider, refused},
+				{"funded non-member", richOut, false, [3]ListenerStanding{full, full, preview}, refused},
+				{"unfunded non-member", poorOut, false, [3]ListenerStanding{full, full, preview}, refused},
 			},
-			public: none,
+			public: preview,
 		},
 		{
 			name:       "creator-only public group",
@@ -976,9 +1021,9 @@ func TestAccess_Governance(t *testing.T) {
 			viewers: []viewer{
 				{"creator", creator, true, member, plaintext},
 				{"member", richIn, true, member, refused},
-				{"non-member", richOut, false, outsider, refused},
+				{"non-member", richOut, false, [3]ListenerStanding{full, full, preview}, refused},
 			},
-			public:      none,
+			public:      preview,
 			neverValued: true,
 		},
 		{

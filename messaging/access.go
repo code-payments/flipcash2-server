@@ -24,12 +24,13 @@ import (
 //     caller's standing and the ViewMode they asked for. A member always
 //     reads in full; a non-member reads a group in full if they satisfy its
 //     listener rules, so a qualifying user can preview a group before joining,
-//     and redacted otherwise if the group carries a listener rule at all, so
-//     any registered user can see a gated group's shape (see present).
+//     and every non-member does when the group carries none, and redacted
+//     otherwise, so any registered user can see a gated group's shape (see
+//     present).
 //   - overlayStanding: the reaction summaries and reactor lists. They carry
 //     no ViewMode, since they return no message, and are answered for anyone
-//     who may read the chat at all — a member, or a non-member of a group
-//     that carries a listener rule, whatever the rules say of them (see
+//     who may read the chat at all — a member, or any non-member of a public
+//     group, whatever its rules say of them (see
 //     chat.ListenerStanding.CanPreview). Reactions are an overlay: who reacted, with
 //     what, on which message is the conversation's movement, which a
 //     redacted view shows, not its words, and the event stream delivers the

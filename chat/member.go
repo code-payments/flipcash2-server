@@ -35,8 +35,11 @@ import (
 // admitted by its creator from its lobby (see lobby.go), so JoinChat refuses
 // everyone as DENIED. Everyone but the creator, that is, who needs no one's
 // approval and rejoins a private group they left. No rule is evaluated for
-// them: a private group's rules admit no one (see RuleEvaluator), and being
-// its creator is what admits them.
+// them: a private group is not governed by rules and has no RuleSet to
+// evaluate (see RuleSet), and being its creator is what admits them.
+//
+// A public group without listener rules is open: the empty set is satisfied
+// by everyone, so anyone may join it, as anyone may read it (see Access).
 //
 // Each transition that actually happens is broadcast as a RosterUpdate to the
 // chat's members and to the affected user (see publishRosterUpdate): the user

@@ -36,7 +36,7 @@ const DefaultSpeakerAdmissionTTL = 30 * time.Second
 //   - CanListen: may the user see the chat — its metadata, its messages, its
 //     pointers and reactions. A member always may. A non-member may read a
 //     public group, and only a public group, if they satisfy its listener
-//     rules right now.
+//     rules right now, which every non-member does when it carries none.
 //   - CanSpeak: may the user produce something other members see — a message,
 //     an edit, a deletion, a typing notification. Members only, and only as
 //     the chat's governance allows.
@@ -70,27 +70,32 @@ const DefaultSpeakerAdmissionTTL = 30 * time.Second
 // membership, which is read on every ask: a member who leaves is refused at
 // once (leaving does not forget the admission, so one who rejoins within the
 // window speaks on it, having passed JoinChat's own rules). Only an admission is remembered, so a member who tops up speaks on
-// their next send, and a hit does not extend the window. DMs and private
-// groups are not remembered: neither values a balance to speak (see
-// dmSpeaker and privateGroupSpeaker).
+// their next send, and a hit does not extend the window. Only a verdict that
+// read something is remembered: a public group with no rules, or whose only
+// rule is that its creator speaks, is decided off the rules alone, as
+// cheaply as a remembered verdict is found, so nothing is kept for it (see
+// RuleSet.speakingReadsState). A group with listener rules and no speaker
+// rules is remembered, since a speak check evaluates its listener rules.
+// DMs and private groups are not remembered: neither values a balance to
+// speak (see dmSpeaker and privateGroupSpeaker).
 //
 // A DM admits its two members and no one else (see governanceDm). A public
-// group without listener rules admits no non-member either: the rules are the only
-// thing that can admit a non-member, and an empty set is not taken as
-// admitting everyone, even though that is what the RuleEvaluator says of it.
-// Every group created through StartChat carries a minimum listener balance
-// (see RulesFromProto), but the store does not require one, and a group
-// written before that rule existed, or by an operator, may carry none; such a
-// group stays its members' alone rather than becoming readable by every
-// registered user. If an open group is ever wanted, it is an explicit rule to
-// add here, not the absence of one.
+// group without listener rules is open: an empty set is satisfied by
+// everyone, as the RuleEvaluator says of it, so every registered non-member
+// reads it in full and anyone may join it (see Server.JoinChat), and its
+// public view is shown (see PublicListenerStanding). Reads and joins agree on
+// this, since gating a read that a join, open to all, would grant protects
+// nothing. Every group created through StartChat carries a minimum listener
+// balance (see RulesFromProto), but the store does not require one, so a
+// group written before that rule existed, or by an operator, may carry none
+// and is open. A group meant to be its members' alone carries a listener
+// rule; one with speaker rules alone (see Chat.MinimumSpeakerBalance) is
+// open to read and join, and gated only to speak.
 //
 // A non-member of a group whose listener rules they do not satisfy is not
 // nothing to the group: they may read it redacted (see ListenerStanding.CanPreview and
 // redact.Message) — that the messages exist and their shape, never what they
-// say — provided the group carries a listener rule at all, on the same basis
-// as above: a rule is what opens a group to non-members, and its absence
-// keeps the group its members' alone in every form. What a read is answered
+// say. Every non-member of a public group may, whatever its rules. What a read is answered
 // with — full, redacted, or nothing — is the viewer's standing combined with
 // what the client asked for (see ListenerStanding.Reading and messagingpb.ViewMode):
 // a client that wants a group blurred asks for REDACTED, and is answered from
@@ -207,9 +212,10 @@ func (a *Access) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *
 // on its roster, whether they may read it in full (see Access.CanListen), and
 // whether they may read it redacted (see Access). A member may always read; a
 // non-member with CanListen is a group's qualifying non-member, admitted by
-// its listener rules; a non-member with CanPreview alone is a non-member of a
-// group that carries a listener rule, who may see that it has messages and
-// their shape. CanListen implies CanPreview: whoever may read in full may
+// its listener rules (every non-member, when the group carries none); a
+// non-member with CanPreview alone is a non-member of a public group whose
+// listener rules they do not satisfy, or who asked under REDACTED, who may
+// see that it has messages and their shape. CanListen implies CanPreview: whoever may read in full may
 // read redacted (see Reading).
 //
 // A standing found under ViewMode REDACTED (see Access.ListenerStanding) never
@@ -286,8 +292,8 @@ func (a *Access) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId
 
 // ListenerStanding is userID's standing in chatID (see ListenerStanding) as needed to answer
 // a read under mode: membership, then for a non-member of a group only, the
-// group's listener rules — whether it has any, and unless mode is REDACTED,
-// whether userID satisfies them. Under REDACTED the rules are not evaluated,
+// group's listener rules — unless mode is REDACTED, whether userID satisfies
+// them, which everyone does when there are none. Under REDACTED the rules are not evaluated,
 // since a placeholder is the answer either way, so a client that wants a group
 // blurred never pays a valuation for it. The standing is zero, not an error,
 // for a chat that does not exist.
@@ -302,7 +308,7 @@ func (a *Access) ListenerStanding(ctx context.Context, chatID *commonpb.ChatId, 
 // Chat.GroupRules), so they are not read a second time. The chat is taken as
 // existing: a caller that has its rules has already told NOT_FOUND from
 // everything else. A public group whose rules carry no listener rule admits
-// no non-member in any form, and a private group none whatever its rules (see
+// every non-member, and a private group none whatever its rules (see
 // Access). On error the standing is zero.
 func (a *Access) ListenerStandingWithRules(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules, userID *commonpb.UserId, mode messagingpb.ViewMode) (ListenerStanding, error) {
 	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(context.Context) (GroupRules, error) {
@@ -327,13 +333,12 @@ func (a *Access) ListenerStandingWithChat(ctx context.Context, c *Chat, userID *
 // PublicListenerStanding is the standing of a viewer who is no one — an
 // unauthenticated read of a chat's public view (see chat.Server.GetChat) —
 // towards the chat whose canonical record the caller holds. They are on no
-// roster and satisfy no rule, so they stand exactly where a registered
-// non-member reading under REDACTED does: a group that carries a listener
-// rule may be previewed, and nothing else admits them in any form. Nothing
-// is read: the rules come off the record.
+// roster and are evaluated against no rule, so they stand exactly where a
+// registered non-member reading under REDACTED does: a public group, with or
+// without listener rules, may be previewed, and nothing else admits them in
+// any form. Nothing is read: the governance comes off the record.
 func (a *Access) PublicListenerStanding(c *Chat) ListenerStanding {
-	gov, rules := governanceOf(c.ID, c.GroupRules())
-	if gov != governancePublicGroup || !rules.hasListenerRules() {
+	if gov, _ := governanceOf(c.ID, c.GroupRules()); gov != governancePublicGroup {
 		return ListenerStanding{}
 	}
 	return ListenerStanding{CanPreview: true}
@@ -374,10 +379,10 @@ func (a *Access) recordMembership(c *Chat, userID *commonpb.UserId) func(context
 //     the rules derived for it (a Never speaker rule in a DM with the team
 //     account, see RuleEvaluator.RulesOf), and speak plaintext or under the
 //     pairwise scheme.
-//   - governancePublicGroup: a public group. A non-member is admitted, in
-//     full or redacted, by its listener rules alone, and only if it carries
-//     one; its members speak plaintext when they satisfy its listener and
-//     speaker rules.
+//   - governancePublicGroup: a public group. A non-member reads it in full
+//     when they satisfy its listener rules (everyone does when it carries
+//     none) and redacted otherwise; its members speak plaintext when they
+//     satisfy its listener and speaker rules.
 //   - governancePrivateGroup: a private group (see Chat.IsPrivate). Its
 //     creator admits its members, so no non-member is admitted in any form,
 //     and whether its members speak is decided by its key; rules are never
@@ -454,15 +459,12 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 }
 
 // publicGroupNonMember is a non-member's standing in a group governed by its rules
-// (see Access): nothing unless the group carries a listener rule, since only a
-// rule opens a group to a non-member; under REDACTED a preview, without the
-// rules being evaluated; otherwise a full read for whoever satisfies the
-// listener rules, remembered for listenerAdmissionTTL, and a preview for
-// whoever does not.
+// (see Access): under REDACTED a preview, without the rules being evaluated;
+// otherwise a full read for whoever satisfies the listener rules — everyone,
+// when the group carries none — and a preview for whoever does not. An
+// admission is remembered for listenerAdmissionTTL only when a listener rule
+// was evaluated for it: an open group's costs nothing to find again.
 func (a *Access) publicGroupNonMember(ctx context.Context, chatID *commonpb.ChatId, rules RuleSet, userID *commonpb.UserId, mode messagingpb.ViewMode) (ListenerStanding, error) {
-	if !rules.hasListenerRules() {
-		return ListenerStanding{}, nil
-	}
 	if mode == messagingpb.ViewMode_REDACTED {
 		return ListenerStanding{CanPreview: true}, nil
 	}
@@ -473,7 +475,7 @@ func (a *Access) publicGroupNonMember(ctx context.Context, chatID *commonpb.Chat
 	if !ok {
 		return ListenerStanding{CanPreview: true}, nil
 	}
-	if a.admitted != nil {
+	if a.admitted != nil && rules.hasListenerRules() {
 		a.admitted.SetWithTTL(admissionKey(chatID, userID), struct{}{}, a.admittedTTL)
 	}
 	return ListenerStanding{CanListen: true, CanPreview: true}, nil
@@ -581,10 +583,13 @@ func (a *Access) dmSpeaker(ctx context.Context, rules RuleSet, userID *commonpb.
 // publicGroupSpeaker is a public group member's standing to speak: they speak when
 // they satisfy its listener and speaker rules, evaluated against their state
 // now or remembered from the last speakerAdmissionTTL (see Access), and the
-// group takes plaintext alone.
+// group takes plaintext alone. The cache is neither consulted nor written for
+// a group whose verdict reads nothing beyond its rules (see
+// RuleSet.speakingReadsState).
 func (a *Access) publicGroupSpeaker(ctx context.Context, chatID *commonpb.ChatId, rules RuleSet, userID *commonpb.UserId) (SpeakerStanding, error) {
 	key := admissionKey(chatID, userID)
-	if a.speakers != nil {
+	remember := a.speakers != nil && rules.speakingReadsState()
+	if remember {
 		if _, ok := a.speakers.Get(key); ok {
 			return SpeakerStanding{CanSpeak: true}, nil
 		}
@@ -593,7 +598,7 @@ func (a *Access) publicGroupSpeaker(ctx context.Context, chatID *commonpb.ChatId
 	if err != nil || !ok {
 		return SpeakerStanding{}, err
 	}
-	if a.speakers != nil {
+	if remember {
 		a.speakers.SetWithTTL(key, struct{}{}, a.speakersTTL)
 	}
 	return SpeakerStanding{CanSpeak: true}, nil

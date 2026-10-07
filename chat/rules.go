@@ -152,10 +152,30 @@ func NewRuleSet(rules *chatpb.Rules, creatorID *commonpb.UserId) RuleSet {
 	return RuleSet{rules: rules, creatorID: creatorID}
 }
 
-// hasListenerRules reports whether the set carries a listener rule, which is
-// what opens a group to non-members at all (see Access).
+// hasListenerRules reports whether the set carries a listener rule. A public
+// group without one is open: every non-member satisfies it (see Access).
 func (r RuleSet) hasListenerRules() bool {
 	return len(r.rules.GetListener()) > 0
+}
+
+// speakingReadsState reports whether evaluating a speak check under the set
+// reads anything beyond the set itself: a listener rule, which a speak check
+// evaluates too, or a speaker rule other than a CreatorRequirement, answered
+// off the creator the set carries, or a Never, answered by no one. A set for
+// which it is false — a public group with no rules, or one whose only rule
+// is that the creator speaks — is decided as cheaply as it is remembered.
+func (r RuleSet) speakingReadsState() bool {
+	if r.hasListenerRules() {
+		return true
+	}
+	for _, rule := range r.rules.GetSpeaker() {
+		switch rule.GetKind().(type) {
+		case *chatpb.SpeakerRules_Creator, *chatpb.SpeakerRules_Never:
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 func isCreator(creatorID, userID *commonpb.UserId) bool {

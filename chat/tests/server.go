@@ -118,6 +118,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_StartChat_TitleModerated,
 		testServer_StartChat_ModerationFailureIsInternal,
 		testServer_StartChat_PrivateGroup,
+		testServer_OpenVersusPrivate_NonMember,
 		testServer_PrivateGroup_Visibility,
 		testServer_PrivateGroup_Membership,
 		testServer_KeyEnvelope_Gates,
@@ -2123,12 +2124,12 @@ func testServer_GetChat_Group_NonMember(t *testing.T, s chat.Store) {
 	require.Equal(t, uint64(9), md.LatestEventSequence)
 	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 1}, md.GetRosterSummary()))
 
-	// A group with no listener rules shows a non-member its record alone,
-	// however funded: only a rule can admit one to the rest (see chat.Access).
+	// A group with no listener rules is open: a non-member, funded or not,
+	// sees it as a qualifying non-member does, record and messaging state, but
+	// is hydrated as no member (see chat.Access).
 	strangerID, strangerKeys := e.addUser()
 	_, err = e.accounts.Bind(e.ctx, strangerID, strangerKeys.Proto())
 	require.NoError(t, err)
-	e.ocpBalance.setBalance(strangerKeys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
 	open := &chat.Chat{
 		ID:            chat.MustGenerateGroupChatID(),
 		Type:          chatpb.ChatType_GROUP,
@@ -2138,15 +2139,17 @@ func testServer_GetChat_Group_NonMember(t *testing.T, s chat.Store) {
 		LastMessageID: &messagingpb.MessageId{Value: 2},
 	}
 	require.NoError(t, s.PutChat(e.ctx, open))
-	e.messaging.lastMessages[string(open.ID.Value)] = textMessage(2, founder, "members only")
+	e.messaging.lastMessages[string(open.ID.Value)] = textMessage(2, founder, "open to all")
 	e.messaging.latestEventSeqs[string(open.ID.Value)] = 2
 	resp = e.getChat(strangerKeys, open.ID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.Equal(t, "Legacy", resp.Metadata.Title)
 	require.Nil(t, resp.Metadata.Rules)
 	require.Empty(t, resp.Metadata.Members)
-	require.Nil(t, resp.Metadata.LastMessage)
-	require.Zero(t, resp.Metadata.LatestEventSequence)
+	require.NotNil(t, resp.Metadata.LastMessage)
+	require.False(t, resp.Metadata.LastMessage.Redacted)
+	require.Equal(t, "open to all", resp.Metadata.LastMessage.Content[0].GetText().GetText())
+	require.Equal(t, uint64(2), resp.Metadata.LatestEventSequence)
 
 	// A DM is unchanged: a non-member is denied outright, funded or not.
 	dm := e.putDM(at(1))
@@ -2257,13 +2260,13 @@ func testServer_GetChat_ViewMode(t *testing.T, s chat.Store) {
 	require.False(t, resp.Metadata.LastMessage.Redacted)
 	require.Equal(t, secret, resp.Metadata.LastMessage.Content[0].GetText().GetText())
 
-	// A group with no listener rules shows a non-member its record alone under
-	// every mode: only a rule can admit one, to a placeholder as to the rest.
-	// Its member gets a placeholder on request like any other.
+	// A group with no listener rules is open: an unfunded non-member reads it
+	// in full under FULL and FULL_OR_REDACTED and redacted under REDACTED,
+	// exactly as a qualifying non-member reads a gated group. Its member gets
+	// a placeholder on request like any other.
 	strangerID, strangerKeys := e.addUser()
 	_, err = e.accounts.Bind(e.ctx, strangerID, strangerKeys.Proto())
 	require.NoError(t, err)
-	e.ocpBalance.setBalance(strangerKeys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
 	open := &chat.Chat{
 		ID:            chat.MustGenerateGroupChatID(),
 		Type:          chatpb.ChatType_GROUP,
@@ -2273,20 +2276,24 @@ func testServer_GetChat_ViewMode(t *testing.T, s chat.Store) {
 		LastMessageID: &messagingpb.MessageId{Value: 2},
 	}
 	require.NoError(t, s.PutChat(e.ctx, open))
-	e.messaging.lastMessages[string(open.ID.Value)] = textMessage(2, e.userID, "members only")
+	e.messaging.lastMessages[string(open.ID.Value)] = textMessage(2, e.userID, "open to all")
 	e.messaging.latestEventSeqs[string(open.ID.Value)] = 2
 	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
 		resp = e.getChatWithMode(strangerKeys, open.ID, mode)
 		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result, mode)
 		require.Equal(t, "Legacy", resp.Metadata.Title)
-		require.Nil(t, resp.Metadata.LastMessage, mode)
-		require.Zero(t, resp.Metadata.LatestEventSequence, mode)
+		require.Empty(t, resp.Metadata.Members, mode)
+		require.NotNil(t, resp.Metadata.LastMessage, mode)
+		require.Equal(t, uint64(2), resp.Metadata.LatestEventSequence, mode)
+		redacted := mode == messagingpb.ViewMode_REDACTED
+		require.Equal(t, redacted, resp.Metadata.LastMessage.Redacted, mode)
+		require.Equal(t, !redacted, resp.Metadata.LastMessage.Content[0].GetText().GetText() == "open to all", mode)
 	}
 	resp = e.getChatWithMode(e.keys, open.ID, messagingpb.ViewMode_REDACTED)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.NotNil(t, resp.Metadata.LastMessage)
 	require.True(t, resp.Metadata.LastMessage.Redacted)
-	require.NotEqual(t, "members only", resp.Metadata.LastMessage.Content[0].GetText().GetText())
+	require.NotEqual(t, "open to all", resp.Metadata.LastMessage.Content[0].GetText().GetText())
 
 	// A DM is unchanged: a non-member is denied outright under every mode, and
 	// a member may ask for a placeholder.
@@ -2360,7 +2367,9 @@ func testServer_GetChat_Unauthenticated(t *testing.T, s chat.Store) {
 		require.Nil(t, resp.Metadata)
 	}
 
-	// A group with no listener rules is its record alone.
+	// A group with no listener rules is open, so its public view is the
+	// preview any public group's is: the record and its messaging state, the
+	// last message redacted.
 	open := &chat.Chat{
 		ID:            chat.MustGenerateGroupChatID(),
 		Type:          chatpb.ChatType_GROUP,
@@ -2370,13 +2379,16 @@ func testServer_GetChat_Unauthenticated(t *testing.T, s chat.Store) {
 		LastMessageID: &messagingpb.MessageId{Value: 2},
 	}
 	require.NoError(t, s.PutChat(e.ctx, open))
-	e.messaging.lastMessages[string(open.ID.Value)] = textMessage(2, founder, "members only")
+	e.messaging.lastMessages[string(open.ID.Value)] = textMessage(2, founder, "open to all")
 	e.messaging.latestEventSeqs[string(open.ID.Value)] = 2
 	resp := e.getPublicChat(open.ID, messagingpb.ViewMode_REDACTED)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.Equal(t, "Legacy", resp.Metadata.Title)
-	require.Nil(t, resp.Metadata.LastMessage)
-	require.Zero(t, resp.Metadata.LatestEventSequence)
+	require.Empty(t, resp.Metadata.Members)
+	require.NotNil(t, resp.Metadata.LastMessage)
+	require.True(t, resp.Metadata.LastMessage.Redacted)
+	require.NotEqual(t, "open to all", resp.Metadata.LastMessage.Content[0].GetText().GetText())
+	require.Equal(t, uint64(2), resp.Metadata.LatestEventSequence)
 
 	// A missing group is NOT_FOUND.
 	resp = e.getPublicChat(chat.MustGenerateGroupChatID(), messagingpb.ViewMode_REDACTED)
@@ -3860,6 +3872,89 @@ func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
 	require.Equal(t, moderationpb.FlaggedCategory_SPAM, resp.FlaggedCategory)
 	require.Nil(t, resp.Chat)
 	require.Len(t, groups(), 1)
+}
+
+// testServer_OpenVersusPrivate_NonMember pins, side by side, what a
+// registered non-member with nothing to their name, and a caller who is no
+// one, get from a public group with no listener rules and from a private
+// group. The open group is open: GetChat carries its messaging state in full
+// (redacted under REDACTED), its public view is shown, its chatter sample is
+// given, and anyone joins it. The private group shows a registered user its
+// record alone under every mode, has no public view and no sample, and is
+// joined by no one but its creator.
+func testServer_OpenVersusPrivate_NonMember(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	every := []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED}
+
+	founder := model.MustGenerateUserID()
+	open := &chat.Chat{
+		ID:            chat.MustGenerateGroupChatID(),
+		Type:          chatpb.ChatType_GROUP,
+		Members:       []*commonpb.UserId{founder},
+		Title:         "Open",
+		LastActivity:  at(1),
+		LastMessageID: &messagingpb.MessageId{Value: 2},
+	}
+	require.NoError(t, s.PutChat(e.ctx, open))
+	private := open.Clone()
+	private.ID = chat.MustGenerateGroupChatID()
+	private.Title = "Private"
+	private.IsPrivate = true
+	private.CreatorID = founder
+	require.NoError(t, s.PutChat(e.ctx, private))
+	for _, c := range []*chat.Chat{open, private} {
+		e.messaging.lastMessages[string(c.ID.Value)] = textMessage(2, founder, "the words")
+		e.messaging.latestEventSeqs[string(c.ID.Value)] = 2
+	}
+
+	_, strangerKeys := e.addUser()
+
+	// GetChat: the open group's messaging state, the private group's record
+	// alone.
+	for _, mode := range every {
+		resp := e.getChatWithMode(strangerKeys, open.ID, mode)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result, mode)
+		require.False(t, resp.Metadata.IsPrivate, mode)
+		require.Empty(t, resp.Metadata.Members, mode)
+		require.NotNil(t, resp.Metadata.LastMessage, mode)
+		require.Equal(t, mode == messagingpb.ViewMode_REDACTED, resp.Metadata.LastMessage.Redacted, mode)
+		require.Equal(t, uint64(2), resp.Metadata.LatestEventSequence, mode)
+
+		resp = e.getChatWithMode(strangerKeys, private.ID, mode)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result, mode)
+		require.True(t, resp.Metadata.IsPrivate, mode)
+		require.Empty(t, resp.Metadata.Members, mode)
+		require.Nil(t, resp.Metadata.LastMessage, mode)
+		require.Zero(t, resp.Metadata.LatestEventSequence, mode)
+	}
+
+	// The public view: shown, redacted, for the open group; DENIED for the
+	// private one.
+	resp := e.getPublicChat(open.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.NotNil(t, resp.Metadata.LastMessage)
+	require.True(t, resp.Metadata.LastMessage.Redacted)
+	require.Equal(t, uint64(2), resp.Metadata.LatestEventSequence)
+	resp = e.getPublicChat(private.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result)
+	require.Nil(t, resp.Metadata)
+
+	// The chatter sample: given for the open group, to a registered user and
+	// to no one; DENIED for the private one either way.
+	require.Equal(t, chatpb.SampleChattersResponse_OK, e.sampleChatters(strangerKeys, open.ID).Result)
+	require.Equal(t, chatpb.SampleChattersResponse_OK, e.samplePublicChatters(open.ID).Result)
+	require.Equal(t, chatpb.SampleChattersResponse_DENIED, e.sampleChatters(strangerKeys, private.ID).Result)
+	require.Equal(t, chatpb.SampleChattersResponse_DENIED, e.samplePublicChatters(private.ID).Result)
+
+	// JoinChat: anyone joins the open group; no one but its creator joins the
+	// private one.
+	require.Equal(t, chatpb.JoinChatResponse_DENIED, e.mustJoinChat(strangerKeys, private.ID).Result)
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(strangerKeys, open.ID).Result)
+	resp = e.getChat(strangerKeys, open.ID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Len(t, resp.Metadata.Members, 1)
+	resp = e.getChat(strangerKeys, private.ID)
+	require.Empty(t, resp.Metadata.Members)
 }
 
 // testServer_PrivateGroup_Visibility pins who sees what of a private group:

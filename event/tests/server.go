@@ -54,6 +54,7 @@ func RunServerTests(t *testing.T, accounts account.Store, teardown func()) {
 		testMembershipFollowsStreams,
 		testMembershipReconciles,
 		testChatPreview,
+		testChatPreviewOpenVersusPrivate,
 		testChatPreviewExpires,
 		testServerShutdown,
 	} {
@@ -1245,6 +1246,68 @@ func testChatPreview(t *testing.T, accounts account.Store) {
 	receiveAll(publish(testEnv.server2, newMessageSentEvent(group, other, 5, "after the changes")), fullStreams, redactedStreams)
 	expectChatStreamError(t, testEnv.client1.openChatPreview(t, staffKeys, group, messagingpb.ViewMode_FULL), eventpb.StreamEventsResponse_StreamError_DENIED)
 	expectChatStreamError(t, testEnv.client1.openChatPreview(t, otherKeys, group, messagingpb.ViewMode_REDACTED), eventpb.StreamEventsResponse_StreamError_DENIED)
+}
+
+// testChatPreviewOpenVersusPrivate pins who may open a preview of a public
+// group with no listener rules and of a private group. The open group is
+// open: any registered non-member previews it, in full under FULL and
+// FULL_OR_REDACTED and redacted under REDACTED. A private group is previewed
+// by no one under any mode, not even a non-member who satisfies a listener
+// rule its record carries.
+func testChatPreviewOpenVersusPrivate(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, true)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	member, _ := registerUser(t, accounts)
+	_, strangerKeys := registerUser(t, accounts)
+	staff, staffKeys := registerUser(t, accounts)
+	testEnv.accounts.setStaff(staff, true)
+
+	open := putGroupChat(t, testEnv.chats, member)
+	private := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{member},
+		Title:        "Private",
+		IsPrivate:    true,
+		CreatorID:    member,
+		LastActivity: time.Now(),
+	}
+	require.NoError(t, testEnv.chats.PutChat(ctx, private))
+	ruledPrivate := private.Clone()
+	ruledPrivate.ID = chat.MustGenerateGroupChatID()
+	ruledPrivate.IsStaffOnly = true
+	require.NoError(t, testEnv.chats.PutChat(ctx, ruledPrivate))
+
+	// A private group is refused to everyone, under every mode, whatever
+	// rules its record carries and whoever would satisfy them.
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		for _, keys := range []model.KeyPair{strangerKeys, staffKeys} {
+			expectChatStreamError(t, testEnv.client1.openChatPreview(t, keys, private.ID, mode), eventpb.StreamEventsResponse_StreamError_DENIED)
+			expectChatStreamError(t, testEnv.client1.openChatPreview(t, keys, ruledPrivate.ID, mode), eventpb.StreamEventsResponse_StreamError_DENIED)
+		}
+	}
+
+	// The open group opens for a non-member with nothing to their name: in
+	// full under FULL and FULL_OR_REDACTED, redacted under REDACTED.
+	full1 := testEnv.client1.openChatPreview(t, strangerKeys, open, messagingpb.ViewMode_FULL)
+	full2 := testEnv.client2.openChatPreview(t, strangerKeys, open, messagingpb.ViewMode_FULL_OR_REDACTED)
+	redacted := testEnv.client1.openChatPreview(t, strangerKeys, open, messagingpb.ViewMode_REDACTED)
+
+	time.Sleep(500 * time.Millisecond)
+
+	sent := newMessageSentEvent(open, member, 1, "open to all")
+	testEnv.server1.chatEventBus.OnEvent(open, &eventpb.ChatEvent{ChatId: open, Event: sent})
+	for _, streamer := range []*cancellableStream{full1, full2} {
+		got := receiveNextEvents(t, streamer)
+		require.Len(t, got, 1)
+		require.NoError(t, protoutil.ProtoEqualError(sent, got[0]))
+	}
+	got := receiveNextEvents(t, redacted)
+	require.Len(t, got, 1)
+	assertRedactedMessageSent(t, open, sent, got[0])
 }
 
 // testChatPreviewExpires pins the window: a preview ends with STREAM_EXPIRED

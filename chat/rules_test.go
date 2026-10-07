@@ -953,3 +953,34 @@ func TestCoversBalance(t *testing.T) {
 		require.Equal(t, tc.want, coversBalance(tc.speaker, tc.listener), tc.name)
 	}
 }
+
+// TestRuleSet_SpeakingReadsState pins which rule sets decide a speak check
+// off the rules alone (see Access.publicGroupSpeaker): only a set with no
+// listener rule and no speaker rule but a creator or Never rule.
+func TestRuleSet_SpeakingReadsState(t *testing.T) {
+	creator := model.MustGenerateUserID()
+	minimum := &MinimumBalance{Currency: "usd", NativeAmount: 1}
+	for _, tc := range []struct {
+		name string
+		set  RuleSet
+		want bool
+	}{
+		{"no rules", (&Chat{Type: chatpb.ChatType_GROUP}).ruleSet(t), false},
+		{"creator only", (&Chat{Type: chatpb.ChatType_GROUP, IsCreatorOnlySpeaker: true, CreatorID: creator}).ruleSet(t), false},
+		{"never", NewRuleSet(teamDmRules(), nil), false},
+		{"staff listener", (&Chat{Type: chatpb.ChatType_GROUP, IsStaffOnly: true}).ruleSet(t), true},
+		{"listener balance", (&Chat{Type: chatpb.ChatType_GROUP, MinimumListenerBalance: minimum}).ruleSet(t), true},
+		{"speaker balance", (&Chat{Type: chatpb.ChatType_GROUP, MinimumSpeakerBalance: minimum}).ruleSet(t), true},
+		{"creator and speaker balance", (&Chat{Type: chatpb.ChatType_GROUP, IsCreatorOnlySpeaker: true, CreatorID: creator, MinimumSpeakerBalance: minimum}).ruleSet(t), true},
+		{"speaker staff", NewRuleSet(&chatpb.Rules{Speaker: []*chatpb.SpeakerRules{{Kind: &chatpb.SpeakerRules_Staff{Staff: &chatpb.StaffRequirement{}}}}}, nil), true},
+	} {
+		require.Equal(t, tc.want, tc.set.speakingReadsState(), tc.name)
+	}
+}
+
+func (c *Chat) ruleSet(t *testing.T) RuleSet {
+	t.Helper()
+	set, ok := c.GroupRules().RuleSet()
+	require.True(t, ok)
+	return set
+}

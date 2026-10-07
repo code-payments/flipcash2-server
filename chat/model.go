@@ -274,7 +274,9 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // record was written with it. It is meant to cover MinimumListenerBalance —
 // the same currency and mints, and at least the amount — so that a speak
 // check values the user's balance once (see RuleEvaluator.CanSpeakWithRules);
-// one that does not is still enforced, at the cost of a second valuation.
+// one that does not is still enforced, at the cost of a second valuation. A
+// group with it and no listener rule is open: anyone reads and joins it, and
+// only speaking is gated (see Access).
 //
 // IsPrivate marks a private group (see chatpb.Metadata.is_private): one whose
 // creator admits each member, and whose messages are end-to-end encrypted

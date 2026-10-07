@@ -737,6 +737,110 @@ func TestStanding_Reading(t *testing.T) {
 	}
 }
 
+// TestAccess_SpeakerAdmission pins the speaker cache (see
+// DefaultSpeakerAdmissionTTL): a member's satisfied rules in a public group
+// are remembered for the window, so their next sends cost no valuation and
+// hold after their balance drops until it closes; a refusal or an error is
+// never remembered; and membership is read on every ask, so a member who
+// leaves is refused at once whatever is remembered.
+func TestAccess_SpeakerAdmission(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	const ttl = 30 * time.Millisecond
+	a := NewAccess(f.chats, f.rules, WithSpeakerAdmissionTTL(ttl))
+	f.chats.join(f.gated.ID, f.funded)
+	f.chats.join(f.gated.ID, f.unfunded)
+
+	canSpeak := func(chatID *commonpb.ChatId, userID *commonpb.UserId) bool {
+		t.Helper()
+		ok, err := a.CanSpeak(ctx, chatID, userID)
+		require.NoError(t, err)
+		return ok
+	}
+
+	// The first send is evaluated and remembered; the next ones are not
+	// evaluated, and stand after the balance drops, until the window closes.
+	// Speaking does not extend it.
+	asked := f.ocpBalance.asked
+	require.True(t, canSpeak(f.gated.ID, f.funded))
+	require.True(t, canSpeak(f.gated.ID, f.funded))
+	require.Equal(t, asked+1, f.ocpBalance.asked)
+	f.setBalance(f.funded, 0)
+	require.True(t, canSpeak(f.gated.ID, f.funded))
+	require.Eventually(t, func() bool { return !canSpeak(f.gated.ID, f.funded) }, time.Second, ttl/10)
+	f.setBalance(f.funded, accessRequirement)
+
+	// A refusal is not remembered: the unfunded member is evaluated on every
+	// send, and speaks the moment they are funded.
+	asked = f.ocpBalance.asked
+	require.False(t, canSpeak(f.gated.ID, f.unfunded))
+	require.False(t, canSpeak(f.gated.ID, f.unfunded))
+	require.Equal(t, asked+2, f.ocpBalance.asked)
+	f.setBalance(f.unfunded, accessRequirement)
+	require.True(t, canSpeak(f.gated.ID, f.unfunded))
+	f.ocpBalance.set(f.accounts.keys[string(f.unfunded.Value)], f.usdf, ocp_common.ToCoreMintQuarks(accessRequirement)-1)
+
+	// Membership is read on every ask: a remembered member who leaves is
+	// refused at once, with nothing evaluated. Leaving does not forget the
+	// admission, so one who rejoins within the window speaks on it.
+	require.True(t, canSpeak(f.gated.ID, f.funded))
+	f.chats.leave(f.gated.ID, f.funded)
+	asked = f.ocpBalance.asked
+	require.False(t, canSpeak(f.gated.ID, f.funded))
+	f.chats.join(f.gated.ID, f.funded)
+	require.True(t, canSpeak(f.gated.ID, f.funded))
+	require.Equal(t, asked, f.ocpBalance.asked)
+
+	// An admission is per group and per user: the same member is evaluated
+	// again in another group, and another member in this one.
+	other := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumListenerBalance: &MinimumBalance{Currency: "usd", NativeAmount: accessRequirement}})
+	f.chats.join(other.ID, f.funded)
+	asked = f.ocpBalance.asked
+	require.True(t, canSpeak(other.ID, f.funded))
+	require.Equal(t, asked+1, f.ocpBalance.asked)
+
+	// A speaker admission is not a listener admission, nor the other way
+	// round: a non-member remembered as a reader has no standing to speak,
+	// and their read is still evaluated by the listener cache's own rules.
+	outsider := model.MustGenerateUserID()
+	f.ocpBalance.set(f.accounts.bind(outsider), f.usdf, ocp_common.ToCoreMintQuarks(accessRequirement))
+	ok, err := a.CanListen(ctx, f.gated.ID, outsider)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, canSpeak(f.gated.ID, outsider))
+
+	// An error is never remembered as either answer.
+	fresh := model.MustGenerateUserID()
+	f.ocpBalance.set(f.accounts.bind(fresh), f.usdf, ocp_common.ToCoreMintQuarks(accessRequirement))
+	f.chats.join(f.gated.ID, fresh)
+	f.ocpBalance.err = errors.New("unavailable")
+	ok, err = a.CanSpeak(ctx, f.gated.ID, fresh)
+	require.Error(t, err)
+	require.False(t, ok)
+	f.ocpBalance.err = nil
+	asked = f.ocpBalance.asked
+	require.True(t, canSpeak(f.gated.ID, fresh))
+	require.Equal(t, asked+1, f.ocpBalance.asked)
+
+	// DMs and private groups value nothing to speak, so nothing is
+	// remembered for them: a private group's members speak the moment its key
+	// lands, as before.
+	creator := model.MustGenerateUserID()
+	private := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: creator})
+	f.chats.join(private.ID, creator)
+	require.False(t, canSpeak(private.ID, creator))
+	f.chats.storeKey(private.ID, creator)
+	require.True(t, canSpeak(private.ID, creator))
+
+	// With no window, every send is evaluated.
+	a = NewAccess(f.chats, f.rules, WithSpeakerAdmissionTTL(0))
+	asked = f.ocpBalance.asked
+	for range 3 {
+		require.True(t, canSpeak(f.gated.ID, f.funded))
+	}
+	require.Equal(t, asked+3, f.ocpBalance.asked)
+}
+
 // TestAccess_Governance is every gate across every kind of chat (see
 // governance): for each, who reads it under each view mode, who speaks in it
 // and what it takes from them, and what an anonymous viewer sees. Each

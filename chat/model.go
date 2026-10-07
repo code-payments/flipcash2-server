@@ -271,7 +271,10 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // MinimumBalanceRequirement speaker rule (see Rules) and enforced on sends
 // like any other rule, on top of the listener rules. Like
 // IsCreatorOnlySpeaker, no RPC sets it, so a group carries it only when its
-// record was written with it.
+// record was written with it. It is meant to cover MinimumListenerBalance —
+// the same currency and mints, and at least the amount — so that a speak
+// check values the user's balance once (see RuleEvaluator.CanSpeakWithRules);
+// one that does not is still enforced, at the cost of a second valuation.
 //
 // IsPrivate marks a private group (see chatpb.Metadata.is_private): one whose
 // creator admits each member, and whose messages are end-to-end encrypted

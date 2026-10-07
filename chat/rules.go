@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -279,7 +280,8 @@ func minimumTransferValue(code currency_lib.Code) float64 {
 // their membership record but is denied on every path that evaluates the
 // rules until they satisfy it again. Not every path does: a member's read is
 // gated on membership alone, so that it never pays for an evaluation; rules
-// are evaluated on sends, and on a non-member's read of a group (see Access).
+// are evaluated on sends, and on a non-member's read of a group, each verdict
+// remembered for a short window when it admits (see Access).
 // The intended design is for membership itself to track the listener rules — a
 // member who stops satisfying one is removed — at which point the membership
 // record is the rules' answer everywhere. Enforcing rules on membership
@@ -367,9 +369,31 @@ func (e *RuleEvaluator) CanSpeak(ctx context.Context, chatID *commonpb.ChatId, u
 
 // CanSpeakWithRules is CanSpeak for a caller that already holds the chat's
 // rule set (see CanListenWithRules). A set with no rules admits everyone.
+//
+// A listener minimum balance that a speaker minimum balance covers (see
+// coversBalance) is not evaluated: whoever meets the speaker's meets it, and
+// whoever does not is refused by the speaker's anyway, so a speak check
+// values the user's balance once rather than twice. The covering speaker rule
+// is evaluated after any cheaper speaker rule, so a non-creator in a
+// creator-only group is refused before any valuation. A listener balance
+// that is not covered is evaluated as a listen check would.
 func (e *RuleEvaluator) CanSpeakWithRules(ctx context.Context, rules RuleSet, userID *commonpb.UserId) (bool, error) {
-	if ok, err := e.CanListenWithRules(ctx, rules, userID); err != nil || !ok {
-		return false, err
+	var speakerBalances []*chatpb.MinimumBalanceRequirement
+	for _, rule := range rules.rules.GetSpeaker() {
+		if b := rule.GetMinimumBalance(); b != nil {
+			speakerBalances = append(speakerBalances, b)
+		}
+	}
+	for _, rule := range rules.rules.GetListener() {
+		if b := rule.GetMinimumBalance(); b != nil && slices.ContainsFunc(speakerBalances, func(s *chatpb.MinimumBalanceRequirement) bool {
+			return coversBalance(s, b)
+		}) {
+			continue
+		}
+		ok, err := e.satisfies(ctx, rules, rule.GetKind(), userID)
+		if err != nil || !ok {
+			return false, err
+		}
 	}
 	for _, rule := range rules.rules.GetSpeaker() {
 		ok, err := e.satisfies(ctx, rules, rule.GetKind(), userID)
@@ -467,6 +491,35 @@ func (e *RuleEvaluator) satisfies(ctx context.Context, rules RuleSet, kind any, 
 	default:
 		return false, fmt.Errorf("unsupported chat rule %T", k)
 	}
+}
+
+// coversBalance reports whether whoever satisfies the speaker requirement
+// satisfies the listener one: the same currency, the same set of mints (in
+// any order; none is any mint, and covers only none), and at least the
+// amount. satisfiesMinimumBalance compares either in a way that keeps the
+// order of the amounts — rounded to the quark for USD, against OCP's
+// valuation with the same slack otherwise — so a balance that clears the
+// larger requirement clears the smaller.
+func coversBalance(speaker, listener *chatpb.MinimumBalanceRequirement) bool {
+	return speaker.GetAmount().GetCurrency() == listener.GetAmount().GetCurrency() &&
+		speaker.GetAmount().GetNativeAmount() >= listener.GetAmount().GetNativeAmount() &&
+		sameMints(speaker.GetMints(), listener.GetMints())
+}
+
+// sameMints reports whether a and b name the same set of mints.
+func sameMints(a, b []*commonpb.PublicKey) bool {
+	inA := make(map[string]struct{}, len(a))
+	for _, mint := range a {
+		inA[string(mint.GetValue())] = struct{}{}
+	}
+	inB := make(map[string]struct{}, len(b))
+	for _, mint := range b {
+		if _, ok := inA[string(mint.GetValue())]; !ok {
+			return false
+		}
+		inB[string(mint.GetValue())] = struct{}{}
+	}
+	return len(inA) == len(inB)
 }
 
 // satisfiesMinimumBalance reports whether userID holds at least the required

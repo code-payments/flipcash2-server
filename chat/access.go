@@ -17,6 +17,13 @@ import (
 // revoked, keeps reading before the rules are asked again.
 const DefaultListenerAdmissionTTL = 30 * time.Second
 
+// DefaultSpeakerAdmissionTTL is how long Access remembers that a member of a
+// public group satisfied its listener and speaker rules (see
+// Access.SpeakerStanding). It bounds how long a member whose balance has
+// since dropped, or whose staff flag was since revoked, keeps speaking before
+// the rules are asked again.
+const DefaultSpeakerAdmissionTTL = 30 * time.Second
+
 // Access answers the questions every chat and messaging RPC asks before acting
 // on behalf of a user, so the chat and messaging services — and any other
 // domain that gates on a chat, such as a blob granted to a chat's audience —
@@ -55,6 +62,17 @@ const DefaultListenerAdmissionTTL = 30 * time.Second
 // duration a reader who no longer satisfies the rules keeps reading. A hit
 // does not extend the window, so a reader who keeps reading is re-evaluated
 // once per window, not never.
+//
+// A member's speech in a public group is remembered the same way, for
+// speakerAdmissionTTL, since every send, edit, deletion and typing
+// notification asks the rules again and a balance rule makes each one a
+// valuation. The cache stands in for the rules' verdict only, never for
+// membership, which is read on every ask: a member who leaves is refused at
+// once (leaving does not forget the admission, so one who rejoins within the
+// window speaks on it, having passed JoinChat's own rules). Only an admission is remembered, so a member who tops up speaks on
+// their next send, and a hit does not extend the window. DMs and private
+// groups are not remembered: neither values a balance to speak (see
+// dmSpeaker and privateGroupSpeaker).
 //
 // A DM admits its two members and no one else (see governanceDm). A public
 // group without listener rules admits no non-member either: the rules are the only
@@ -101,6 +119,12 @@ type Access struct {
 	admitted    *ttlcache.Cache
 	admittedTTL time.Duration
 
+	// speakers remembers, by (group, user), that a member satisfied a public
+	// group's listener and speaker rules. Positive entries only (see above). A
+	// nil cache means speech is not remembered (see WithSpeakerAdmissionTTL).
+	speakers    *ttlcache.Cache
+	speakersTTL time.Duration
+
 	// keyed remembers, by group, that a private group has its key (see
 	// privateGroupSpeaker). Positive entries only, held for the life of the process: a
 	// group that has its key has it for good.
@@ -121,6 +145,17 @@ func WithListenerAdmissionTTL(ttl time.Duration) AccessOption {
 	}
 }
 
+// WithSpeakerAdmissionTTL overrides DefaultSpeakerAdmissionTTL: how long a
+// member's satisfied rules in a public group stand before they are evaluated
+// again for a send. A zero or negative TTL remembers nothing, so every send
+// evaluates the rules — for tests, or for a deployment that would rather pay
+// the valuation than tolerate the window.
+func WithSpeakerAdmissionTTL(ttl time.Duration) AccessOption {
+	return func(a *Access) {
+		a.speakersTTL = ttl
+	}
+}
+
 // NewAccess constructs an Access over the chat store the servers read
 // membership from and the RuleEvaluator they evaluate rules with. The store
 // should be the caching store in production, so a DM's membership and a
@@ -136,6 +171,7 @@ func NewAccess(chats Store, rules *RuleEvaluator, opts ...AccessOption) *Access 
 		chats:       chats,
 		rules:       rules,
 		admittedTTL: DefaultListenerAdmissionTTL,
+		speakersTTL: DefaultSpeakerAdmissionTTL,
 		keyed:       ttlcache.NewCache(),
 	}
 	for _, opt := range opts {
@@ -146,6 +182,10 @@ func NewAccess(chats Store, rules *RuleEvaluator, opts ...AccessOption) *Access 
 		// A hit must not extend the entry, or a reader who keeps reading is
 		// never re-evaluated.
 		a.admitted.SkipTtlExtensionOnHit(true)
+	}
+	if a.speakersTTL > 0 {
+		a.speakers = ttlcache.NewCache()
+		a.speakers.SkipTtlExtensionOnHit(true)
 	}
 	return a
 }
@@ -516,7 +556,7 @@ func (a *Access) SpeakerStanding(ctx context.Context, chatID *commonpb.ChatId, u
 	case governanceDm:
 		return a.dmSpeaker(ctx, ruleSet, userID)
 	case governancePublicGroup:
-		return a.publicGroupSpeaker(ctx, ruleSet, userID)
+		return a.publicGroupSpeaker(ctx, chatID, ruleSet, userID)
 	default:
 		return a.privateGroupSpeaker(ctx, chatID, rules)
 	}
@@ -540,11 +580,21 @@ func (a *Access) dmSpeaker(ctx context.Context, rules RuleSet, userID *commonpb.
 
 // publicGroupSpeaker is a public group member's standing to speak: they speak when
 // they satisfy its listener and speaker rules, evaluated against their state
-// now, and the group takes plaintext alone.
-func (a *Access) publicGroupSpeaker(ctx context.Context, rules RuleSet, userID *commonpb.UserId) (SpeakerStanding, error) {
+// now or remembered from the last speakerAdmissionTTL (see Access), and the
+// group takes plaintext alone.
+func (a *Access) publicGroupSpeaker(ctx context.Context, chatID *commonpb.ChatId, rules RuleSet, userID *commonpb.UserId) (SpeakerStanding, error) {
+	key := admissionKey(chatID, userID)
+	if a.speakers != nil {
+		if _, ok := a.speakers.Get(key); ok {
+			return SpeakerStanding{CanSpeak: true}, nil
+		}
+	}
 	ok, err := a.rules.CanSpeakWithRules(ctx, rules, userID)
 	if err != nil || !ok {
 		return SpeakerStanding{}, err
+	}
+	if a.speakers != nil {
+		a.speakers.SetWithTTL(key, struct{}{}, a.speakersTTL)
 	}
 	return SpeakerStanding{CanSpeak: true}, nil
 }

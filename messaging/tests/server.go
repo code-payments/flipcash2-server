@@ -252,7 +252,10 @@ func newServerEnvWithTeam(t *testing.T, badges badge.Store, blocklists blocklist
 	balances := balance.NewClient(log, env.accounts, env.ocpBalance)
 
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus, teamUserID, senderOpts...)
-	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats, teamUserID))
+	// Speech is never remembered here, so a rule's change is seen on the very
+	// next send; the window production remembers it for is chat.Access's to
+	// test (see chat.DefaultSpeakerAdmissionTTL).
+	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats, teamUserID), chat.WithSpeakerAdmissionTTL(0))
 	server := messaging.NewServer(log, authz, chats, media, messages, access, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
@@ -3332,8 +3335,9 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
 
-	// ...and revoked, the founding staff member is silenced on the next call,
-	// though they still read.
+	// ...and revoked, the founding staff member is silenced on the next call
+	// (in production, once their remembered admission lapses; see
+	// chat.DefaultSpeakerAdmissionTTL), though they still read.
 	e.accounts.setStaff(e.userA, false)
 	deniedToSpeak(e.keysA)
 	canListen(e.keysA)

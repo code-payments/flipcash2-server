@@ -15,6 +15,7 @@ import (
 type Cache struct {
 	db                  account.Store
 	pubkeyToUserCache   *ttlcache.Cache
+	userToPubkeysCache  *ttlcache.Cache
 	registeredUserCache *ttlcache.Cache
 	staffFlagCache      *ttlcache.Cache
 }
@@ -23,6 +24,7 @@ func NewInCache(db account.Store) account.Store {
 	return &Cache{
 		db:                  db,
 		pubkeyToUserCache:   ttlcache.NewCache(),
+		userToPubkeysCache:  ttlcache.NewCache(),
 		registeredUserCache: ttlcache.NewCache(),
 		staffFlagCache:      ttlcache.NewCache(),
 	}
@@ -50,8 +52,54 @@ func (c *Cache) GetUserIds(ctx context.Context, pubKeys []*commonpb.PublicKey) (
 	return c.db.GetUserIds(ctx, pubKeys)
 }
 
+// GetPubKeys caches positive results only: a user's bound key never changes
+// once bound (one per user, never unbound), but a user with none may bind one.
 func (c *Cache) GetPubKeys(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.PublicKey, error) {
-	return c.db.GetPubKeys(ctx, userID)
+	if cached, ok := c.userToPubkeysCache.Get(string(userID.Value)); ok {
+		return clonePubKeys(cached.([]*commonpb.PublicKey)), nil
+	}
+	pubKeys, err := c.db.GetPubKeys(ctx, userID)
+	if err == nil && len(pubKeys) > 0 {
+		c.userToPubkeysCache.Set(string(userID.Value), clonePubKeys(pubKeys))
+	}
+	return pubKeys, err
+}
+
+// GetPubKeysForUsers answers what it can from the cache and reads the rest
+// from the DB in one batch, caching positive results only (see GetPubKeys).
+func (c *Cache) GetPubKeysForUsers(ctx context.Context, userIDs []*commonpb.UserId) (map[string][]*commonpb.PublicKey, error) {
+	res := make(map[string][]*commonpb.PublicKey, len(userIDs))
+	var misses []*commonpb.UserId
+	for _, userID := range userIDs {
+		if cached, ok := c.userToPubkeysCache.Get(string(userID.Value)); ok {
+			res[string(userID.Value)] = clonePubKeys(cached.([]*commonpb.PublicKey))
+			continue
+		}
+		misses = append(misses, userID)
+	}
+	if len(misses) == 0 {
+		return res, nil
+	}
+
+	fetched, err := c.db.GetPubKeysForUsers(ctx, misses)
+	if err != nil {
+		return nil, err
+	}
+	for userKey, pubKeys := range fetched {
+		if len(pubKeys) > 0 {
+			c.userToPubkeysCache.Set(userKey, clonePubKeys(pubKeys))
+		}
+		res[userKey] = pubKeys
+	}
+	return res, nil
+}
+
+func clonePubKeys(pubKeys []*commonpb.PublicKey) []*commonpb.PublicKey {
+	cloned := make([]*commonpb.PublicKey, len(pubKeys))
+	for i, pubKey := range pubKeys {
+		cloned[i] = proto.Clone(pubKey).(*commonpb.PublicKey)
+	}
+	return cloned
 }
 
 func (c *Cache) IsAuthorized(ctx context.Context, userID *commonpb.UserId, pubKey *commonpb.PublicKey) (bool, error) {

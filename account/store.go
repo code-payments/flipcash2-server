@@ -28,6 +28,11 @@ type Store interface {
 	// GetPubKeys returns the set of public keys associated with an account.
 	GetPubKeys(ctx context.Context, userID *commonpb.UserId) ([]*commonpb.PublicKey, error)
 
+	// GetPubKeysForUsers returns the set of public keys associated with each of
+	// a batch of accounts, keyed by string(userID.Value). Users that have no
+	// bound key are omitted from the result.
+	GetPubKeysForUsers(ctx context.Context, userIDs []*commonpb.UserId) (map[string][]*commonpb.PublicKey, error)
+
 	// IsAuthorized returns whether or not a pubKey is authorized to perform actions on behalf of the user.
 	IsAuthorized(ctx context.Context, userID *commonpb.UserId, pubKey *commonpb.PublicKey) (bool, error)
 

@@ -134,6 +134,44 @@ func dbGetPubKeys(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.User
 	return res, nil
 }
 
+func dbGetPubKeysForUsers(ctx context.Context, pool *pgxpool.Pool, userIDs []*commonpb.UserId) (map[string][]*commonpb.PublicKey, error) {
+	type userIdPubKeyRow struct {
+		Key    string `db:"key"`
+		UserId string `db:"userId"`
+	}
+
+	if len(userIDs) == 0 {
+		return make(map[string][]*commonpb.PublicKey), nil
+	}
+
+	encodedUserIDs := make([]string, len(userIDs))
+	for i, userID := range userIDs {
+		encodedUserIDs[i] = pg.Encode(userID.Value)
+	}
+
+	query := `SELECT "key", "userId" FROM ` + publicKeysTableName + ` WHERE "userId" = ANY($1::text[])`
+
+	var rows []userIdPubKeyRow
+	err := pgxscan.Select(ctx, pool, &rows, query, encodedUserIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	res := make(map[string][]*commonpb.PublicKey, len(rows))
+	for _, row := range rows {
+		decodedKey, err := pg.Decode(row.Key)
+		if err != nil {
+			return nil, err
+		}
+		decodedUserID, err := pg.Decode(row.UserId)
+		if err != nil {
+			return nil, err
+		}
+		res[string(decodedUserID)] = append(res[string(decodedUserID)], &commonpb.PublicKey{Value: decodedKey})
+	}
+	return res, nil
+}
+
 func dbIsStaff(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId) (bool, error) {
 	var res bool
 	query := `SELECT "isStaff" FROM ` + usersTableName + ` WHERE "id" = $1`

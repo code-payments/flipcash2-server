@@ -48,6 +48,10 @@ func (s *store) GetPubKeys(ctx context.Context, userID *commonpb.UserId) ([]*com
 	return dbGetPubKeys(ctx, s.pool, userID)
 }
 
+func (s *store) GetPubKeysForUsers(ctx context.Context, userIDs []*commonpb.UserId) (map[string][]*commonpb.PublicKey, error) {
+	return dbGetPubKeysForUsers(ctx, s.pool, userIDs)
+}
+
 func (s *store) IsAuthorized(ctx context.Context, userID *commonpb.UserId, pubKey *commonpb.PublicKey) (bool, error) {
 	linkedUserID, err := dbGetUserId(ctx, s.pool, pubKey)
 	if err == account.ErrNotFound {

@@ -51,7 +51,9 @@ import (
 //     this is a member reading REDACTED, who could decrypt it anyway.
 //   - Widget: the same variant, built field by field like the content that
 //     holds it. A ShareProfileWidget's username becomes redactedUsername, so
-//     the viewer sees a profile was shared but not whose. A variant this
+//     the viewer sees a profile was shared but not whose. A PollWidget is
+//     kept as is: it carries only the poll's ID, and what the poll asks is
+//     the poll service's to show, behind its own gate. A variant this
 //     function does not know is ErrUnsupportedContent.
 //
 // A nil content, or one of a kind this function does not know, is
@@ -167,12 +169,18 @@ func mediaContent(seed []byte, m *messagingpb.MediaContent) *messagingpb.MediaCo
 const redactedUsername = "redacted"
 
 func widgetContent(w *messagingpb.WidgetContent) (*messagingpb.WidgetContent, error) {
-	switch w.GetType().(type) {
+	switch t := w.GetType().(type) {
 	case *messagingpb.WidgetContent_ShareProfile:
 		return &messagingpb.WidgetContent{Type: &messagingpb.WidgetContent_ShareProfile{
 			ShareProfile: &messagingpb.ShareProfileWidget{
 				Username: &commonpb.Username{Value: redactedUsername},
 			},
+		}}, nil
+	case *messagingpb.WidgetContent_Poll:
+		// A poll's ID says nothing of what it asks, and seeing the poll is
+		// gated by the poll service on its own, so it passes through.
+		return &messagingpb.WidgetContent{Type: &messagingpb.WidgetContent_Poll{
+			Poll: proto.Clone(t.Poll).(*messagingpb.PollWidget),
 		}}, nil
 	default:
 		return nil, ErrUnsupportedContent

@@ -328,6 +328,12 @@ func renderGroupChatMessagePushBody(ctx context.Context, ocpData ocp_data.Provid
 		}
 		body = fmt.Sprintf("%s: %s", senderDisplayName, textContent.Text.Text)
 	case *messagingpb.Content_Widget:
+		// A poll is announced, not quoted: its text lives with the poll, and
+		// the payload carries the message for the client to fetch it.
+		if content.Widget.GetPoll() != nil {
+			body = fmt.Sprintf(pollGroupMessagePushBodyFormat, senderDisplayName)
+			break
+		}
 		widgetBody, ok := renderWidgetPushBody(content.Widget)
 		if !ok {
 			return "", false, nil
@@ -400,6 +406,11 @@ const (
 	encryptedGroupMessagePushBodyFormat = "%s sent a message"
 )
 
+// pollGroupMessagePushBodyFormat is the push body for a message sending a poll
+// in a group, with the sender's display name in it ("Alice created a poll").
+// Only a group carries polls, so a DM has no such body.
+const pollGroupMessagePushBodyFormat = "%s created a poll"
+
 // renderDmMessagePushBody renders the push body for a DM message. ok is false
 // for content types that don't produce a push.
 func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, message *messagingpb.Message) (body string, ok bool, err error) {
@@ -457,7 +468,8 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 // renderWidgetPushBody renders the push body for a widget: the plain-text
 // stand-in for what the client renders natively, which the payload carries in
 // full (see maxChatPushBytes). A profile share is the profile's link. ok is
-// false for a variant that doesn't produce a push.
+// false for a variant that doesn't produce a push here, which includes a poll:
+// a group renders its own body for one, and a DM carries none.
 func renderWidgetPushBody(widget *messagingpb.WidgetContent) (body string, ok bool) {
 	switch w := widget.Type.(type) {
 	case *messagingpb.WidgetContent_ShareProfile:

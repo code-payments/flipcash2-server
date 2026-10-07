@@ -13,10 +13,12 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/poll"
 	"github.com/code-payments/flipcash2-server/redact"
 )
 
@@ -184,6 +186,22 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 		}
 	}
 
+	// A poll may be sent only by its creator, in its chat, while it is open,
+	// and its first send makes it live, before the message is persisted and
+	// broadcast, so everyone who sees the message can see the poll (see
+	// poll.PrepareSend). Only a public group reaches this: a private group's
+	// plaintext was refused above, and its polls travel inside encrypted
+	// content.
+	if pollID := sentPollID(req.Content); pollID != nil {
+		switch err := poll.PrepareSend(ctx, s.polls, req.ChatId, userID, pollID, time.Now()); {
+		case errors.Is(err, poll.ErrNotSendable):
+			return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
+		case err != nil:
+			log.With(zap.Error(err)).Warn("Failure preparing poll to send")
+			return nil, status.Error(codes.Internal, "")
+		}
+	}
+
 	// Share any media into the chat — validate the sender owns each blob and it is
 	// a READY original, then grant the chat listen access — before the message is
 	// persisted and broadcast, so the grants are durable before any recipient can
@@ -213,9 +231,10 @@ func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRe
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	// The replacement content is held to the same whitelist as a send.
+	// The replacement content is held to the same whitelist as a send, less a
+	// poll, which is only ever sent: a message is never edited into one.
 	repliedMessageID, ok := clientAllowedContent(req.Content)
-	if !ok {
+	if !ok || sentPollID(req.Content) != nil {
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
 	}
 
@@ -426,10 +445,13 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 // clientAllowedContent reports whether content is a message body a client may
 // author via SendMessage or EditMessage, and extracts the replied-to message ID
 // when it is a reply. The permitted set is a whitelist — currently a text or media
-// message, a reply whose own body is text or media, or encrypted content — so it
-// excludes server-injected content (e.g. cash payment messages, and widgets,
-// which only the server sends; see flipcashteam) and any content type added
-// later until it is explicitly allowed. repliedMessageID is non-nil
+// message, a reply whose own body is text or media, encrypted content, or a
+// poll widget — so it excludes server-injected content (e.g. cash payment
+// messages, and every other widget, which only the server sends; see
+// flipcashteam) and any content type added later until it is explicitly
+// allowed. A poll widget is top-level only, never a reply's body, and is sent,
+// never edited in (see sentPollID); whether its sender may send it is the
+// poll's to say (see poll.PrepareSend). repliedMessageID is non-nil
 // only for a valid reply, signaling the caller to verify the replied-to message
 // exists and is repliable. Whether encrypted content is allowed depends on the
 // chat and so is the caller's to enforce (see encryptionVerdictOf), as is the
@@ -461,9 +483,20 @@ func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *mes
 		return c.Reply.RepliedMessageId, true
 	case *messagingpb.Content_Encrypted:
 		return nil, true
+	case *messagingpb.Content_Widget:
+		return nil, c.Widget.GetPoll() != nil
 	default:
 		return nil, false
 	}
+}
+
+// sentPollID returns the poll a message body sends, or nil when it sends none.
+// A poll is only ever sent as the whole body (see clientAllowedContent).
+func sentPollID(content []*messagingpb.Content) *pollpb.PollId {
+	if len(content) != 1 {
+		return nil
+	}
+	return content[0].GetWidget().GetPoll().GetPollId()
 }
 
 // isEncrypted reports whether content is end-to-end encrypted (see

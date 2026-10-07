@@ -39,10 +39,13 @@ type fakeOcpBalance struct {
 	unknownOwners bool
 
 	lastReq *ocp_balancepb.GetBalancesRequest
+	// calls counts GetBalances calls.
+	calls int
 }
 
 func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBalancesRequest, _ ...grpc.CallOption) (*ocp_balancepb.GetBalancesResponse, error) {
 	f.lastReq = req
+	f.calls++
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -211,4 +214,75 @@ func TestClient_GetTotalFiatValue(t *testing.T) {
 	ocp.err = errors.New("ocp is down")
 	_, err = client.GetTotalFiatValue(ctx, userID, currency_lib.EUR)
 	require.Error(t, err)
+}
+
+func TestClient_GetMintFiatValuesForUsers(t *testing.T) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+	accounts := accountmemory.NewInMemory()
+
+	mint := model.MustGenerateKeyPair().Proto()
+	ocp := &fakeOcpBalance{
+		byMint: map[string]uint64{
+			base58.Encode(mint.Value):                                2 * ocp_common.CoreMintQuarksPerUnit,
+			base58.Encode(model.MustGenerateKeyPair().Proto().Value): 5 * ocp_common.CoreMintQuarksPerUnit,
+		},
+		rates: map[string]float64{"cad": 1.5},
+	}
+	client := NewClient(log, accounts, ocp)
+
+	bound := make([]*commonpb.UserId, 3)
+	for i := range bound {
+		bound[i] = model.MustGenerateUserID()
+		_, err := accounts.Bind(ctx, bound[i], model.MustGenerateKeyPair().Proto())
+		require.NoError(t, err)
+	}
+	unbound := model.MustGenerateUserID()
+
+	// Each bound user's holdings of the mint alone, valued in the currency;
+	// a user with no key is left out.
+	values, err := client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("cad"), mint, append(bound, unbound)...)
+	require.NoError(t, err)
+	require.Len(t, values, len(bound))
+	for _, userID := range bound {
+		require.InDelta(t, 3.0, values[string(userID.Value)], 1e-9)
+	}
+	require.Len(t, ocp.lastReq.Mints, 1)
+	require.Equal(t, mint.Value, ocp.lastReq.Mints[0].Value)
+	require.Equal(t, []string{"cad"}, ocp.lastReq.CurrencyCodes)
+
+	// Owners OCP has no accounts for hold nothing.
+	ocp.unknownOwners = true
+	values, err = client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("cad"), mint, bound...)
+	require.NoError(t, err)
+	require.Empty(t, values)
+	ocp.unknownOwners = false
+
+	// A currency OCP cannot price is unsupported, never a zero.
+	_, err = client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("xyz"), mint, bound...)
+	require.ErrorIs(t, err, ErrUnsupportedCurrency)
+
+	// No users ask OCP nothing.
+	ocp.calls = 0
+	values, err = client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("cad"), mint)
+	require.NoError(t, err)
+	require.Empty(t, values)
+	require.Zero(t, ocp.calls)
+
+	// More owners than one call takes are split across calls.
+	many := make([]*commonpb.UserId, maxOwnersPerGetBalances+1)
+	for i := range many {
+		many[i] = model.MustGenerateUserID()
+		_, err := accounts.Bind(ctx, many[i], model.MustGenerateKeyPair().Proto())
+		require.NoError(t, err)
+	}
+	values, err = client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("cad"), mint, many...)
+	require.NoError(t, err)
+	require.Len(t, values, len(many))
+	require.Equal(t, 2, ocp.calls)
+	require.Len(t, ocp.lastReq.Owners, 1)
+
+	ocp.result = ocp_balancepb.GetBalancesResponse_DENIED
+	_, err = client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("cad"), mint, bound...)
+	require.ErrorIs(t, err, ErrDenied)
 }

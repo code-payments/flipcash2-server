@@ -12,6 +12,7 @@ import (
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 )
 
 const secret = "Meet me at the old bank at 6:30, bring the cash 💰"
@@ -209,6 +210,16 @@ func TestContent_Widget(t *testing.T) {
 	username := out.GetWidget().GetShareProfile().GetUsername()
 	assert.Equal(t, redactedUsername, username.GetValue())
 	assert.NoError(t, out.Validate())
+
+	// A poll widget is kept as is: its ID says nothing of the poll.
+	pollWidget := &messagingpb.Content{Type: &messagingpb.Content_Widget{
+		Widget: &messagingpb.WidgetContent{Type: &messagingpb.WidgetContent_Poll{
+			Poll: &messagingpb.PollWidget{PollId: &pollpb.PollId{Value: bytes.Repeat([]byte{9}, 16)}},
+		}},
+	}}
+	redactedPoll := mustContent(t, chatID, messageID, pollWidget)
+	assert.True(t, proto.Equal(pollWidget, redactedPoll))
+	assert.NotSame(t, pollWidget.GetWidget().GetPoll(), redactedPoll.GetWidget().GetPoll())
 
 	// A widget variant this function does not know is not passed through.
 	for _, in := range []*messagingpb.Content{

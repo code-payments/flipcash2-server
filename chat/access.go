@@ -285,7 +285,7 @@ func (a *Access) CanListen(ctx context.Context, chatID *commonpb.ChatId, userID 
 
 // CanListenWithRules is CanListen for a caller already holding the chat's rules
 // (see ListenerStandingWithRules).
-func (a *Access) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules, userID *commonpb.UserId) (bool, error) {
+func (a *Access) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId, rules ChatRules, userID *commonpb.UserId) (bool, error) {
 	standing, err := a.ListenerStandingWithRules(ctx, chatID, rules, userID, messagingpb.ViewMode_FULL)
 	return standing.CanListen, err
 }
@@ -298,20 +298,20 @@ func (a *Access) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId
 // blurred never pays a valuation for it. The standing is zero, not an error,
 // for a chat that does not exist.
 func (a *Access) ListenerStanding(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (ListenerStanding, error) {
-	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(ctx context.Context) (GroupRules, error) {
+	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(ctx context.Context) (ChatRules, error) {
 		return a.rules.rulesFor(ctx, chatID, userID)
 	})
 }
 
 // ListenerStandingWithRules is ListenerStanding for a caller already holding the chat's rules
 // (read off a canonical record it loaded for its own purposes, see
-// Chat.GroupRules), so they are not read a second time. The chat is taken as
+// Chat.ChatRules), so they are not read a second time. The chat is taken as
 // existing: a caller that has its rules has already told NOT_FOUND from
 // everything else. A public group whose rules carry no listener rule admits
 // every non-member, and a private group none whatever its rules (see
 // Access). On error the standing is zero.
-func (a *Access) ListenerStandingWithRules(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules, userID *commonpb.UserId, mode messagingpb.ViewMode) (ListenerStanding, error) {
-	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(context.Context) (GroupRules, error) {
+func (a *Access) ListenerStandingWithRules(ctx context.Context, chatID *commonpb.ChatId, rules ChatRules, userID *commonpb.UserId, mode messagingpb.ViewMode) (ListenerStanding, error) {
+	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(context.Context) (ChatRules, error) {
 		return rules, nil
 	})
 }
@@ -325,8 +325,8 @@ func (a *Access) ListenerStandingWithRules(ctx context.Context, chatID *commonpb
 // every gate reads it. The chat is taken as existing, as a caller holding
 // its record has established.
 func (a *Access) ListenerStandingWithChat(ctx context.Context, c *Chat, userID *commonpb.UserId, mode messagingpb.ViewMode) (ListenerStanding, error) {
-	return a.standing(ctx, c.ID, userID, mode, a.recordMembership(c, userID), func(context.Context) (GroupRules, error) {
-		return c.GroupRules(), nil
+	return a.standing(ctx, c.ID, userID, mode, a.recordMembership(c, userID), func(context.Context) (ChatRules, error) {
+		return c.ChatRules(), nil
 	})
 }
 
@@ -338,7 +338,7 @@ func (a *Access) ListenerStandingWithChat(ctx context.Context, c *Chat, userID *
 // without listener rules, may be previewed, and nothing else admits them in
 // any form. Nothing is read: the governance comes off the record.
 func (a *Access) PublicListenerStanding(c *Chat) ListenerStanding {
-	if gov, _ := governanceOf(c.ID, c.GroupRules()); gov != governancePublicGroup {
+	if gov, _ := governanceOf(c.ID, c.ChatRules()); gov != governancePublicGroup {
 		return ListenerStanding{}
 	}
 	return ListenerStanding{CanPreview: true}
@@ -399,7 +399,7 @@ const (
 // governed by rules — a DM's derived ones included — the rule set to evaluate.
 // The rule set is zero for a private group, which has none. Privacy is a
 // group's alone (see Chat.IsPrivate), so it is decided first.
-func governanceOf(chatID *commonpb.ChatId, rules GroupRules) (governance, RuleSet) {
+func governanceOf(chatID *commonpb.ChatId, rules ChatRules) (governance, RuleSet) {
 	ruleSet, ruled := rules.RuleSet()
 	switch {
 	case !ruled:
@@ -418,7 +418,7 @@ func governanceOf(chatID *commonpb.ChatId, rules GroupRules) (governance, RuleSe
 // from the store, or off a record the caller holds — and loadRules supplies
 // the chat's rules likewise, called only for a non-member; ErrChatNotFound
 // from it is a plain refusal.
-func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode, membership func(context.Context) (bool, error), loadRules func(context.Context) (GroupRules, error)) (ListenerStanding, error) {
+func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode, membership func(context.Context) (bool, error), loadRules func(context.Context) (ChatRules, error)) (ListenerStanding, error) {
 	isMember, err := membership(ctx)
 	if err != nil {
 		return ListenerStanding{}, err
@@ -626,7 +626,7 @@ func (a *Access) publicGroupSpeaker(ctx context.Context, chatID *commonpb.ChatId
 // members' refused sends costs that one read. A private group with no
 // recorded creator can have no key, since the creator's envelope is the only
 // possible first one.
-func (a *Access) privateGroupSpeaker(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules) (SpeakerStanding, error) {
+func (a *Access) privateGroupSpeaker(ctx context.Context, chatID *commonpb.ChatId, rules ChatRules) (SpeakerStanding, error) {
 	keyed, err := a.hasKey(ctx, chatID, rules)
 	if err != nil || !keyed {
 		return SpeakerStanding{}, err
@@ -640,7 +640,7 @@ func (a *Access) privateGroupSpeaker(ctx context.Context, chatID *commonpb.ChatI
 
 // hasKey reports whether the private group whose rules the caller holds has
 // its chat key (see privateGroupSpeaker). It is false for a public group.
-func (a *Access) hasKey(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules) (bool, error) {
+func (a *Access) hasKey(ctx context.Context, chatID *commonpb.ChatId, rules ChatRules) (bool, error) {
 	if !rules.IsPrivate {
 		return false, nil
 	}

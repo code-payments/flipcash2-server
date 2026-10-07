@@ -200,7 +200,7 @@ func TestAccess_PrivateGroup(t *testing.T) {
 	// It is not governed by rules, so it has no rule set to evaluate, and the
 	// evaluator asked about it alone refuses to answer rather than find it
 	// open to everyone, as an empty rule set would be.
-	_, hasRuleSet := private.GroupRules().RuleSet()
+	_, hasRuleSet := private.ChatRules().RuleSet()
 	require.False(t, hasRuleSet)
 	for _, u := range []*commonpb.UserId{creator, f.funded} {
 		ok, err = f.rules.CanListen(ctx, private.ID, u)
@@ -230,7 +230,7 @@ func TestAccess_PrivateGroup(t *testing.T) {
 		require.Equal(t, ListenerStanding{}, standing, mode)
 	}
 	require.Equal(t, ListenerStanding{}, a.PublicListenerStanding(ruled))
-	_, isRuled := ruled.GroupRules().RuleSet()
+	_, isRuled := ruled.ChatRules().RuleSet()
 	require.False(t, isRuled)
 	ok, err = f.rules.CanListen(ctx, ruled.ID, f.funded)
 	require.ErrorIs(t, err, ErrNotGovernedByRules)
@@ -433,7 +433,7 @@ func TestAccess_GroupNonMember(t *testing.T) {
 		ok, err = a.CanListen(ctx, open.ID, userID)
 		require.NoError(t, err)
 		require.True(t, ok)
-		ok, err = a.CanListenWithRules(ctx, open.ID, open.GroupRules(), userID)
+		ok, err = a.CanListenWithRules(ctx, open.ID, open.ChatRules(), userID)
 		require.NoError(t, err)
 		require.True(t, ok)
 		_, remembered := a.admitted.Get(admissionKey(open.ID, userID))
@@ -496,10 +496,10 @@ func TestAccess_CanListenWithRules(t *testing.T) {
 	// With the rules in hand they are not read from the store, and the
 	// answer — and the remembered admission — is the same as CanListen's.
 	reads := f.chats.reads
-	ok, err := a.CanListenWithRules(ctx, f.gated.ID, f.gated.GroupRules(), f.funded)
+	ok, err := a.CanListenWithRules(ctx, f.gated.ID, f.gated.ChatRules(), f.funded)
 	require.NoError(t, err)
 	require.True(t, ok)
-	ok, err = a.CanListenWithRules(ctx, f.gated.ID, f.gated.GroupRules(), f.unfunded)
+	ok, err = a.CanListenWithRules(ctx, f.gated.ID, f.gated.ChatRules(), f.unfunded)
 	require.NoError(t, err)
 	require.False(t, ok)
 	require.Equal(t, reads, f.chats.reads)
@@ -513,11 +513,11 @@ func TestAccess_CanListenWithRules(t *testing.T) {
 	// A DM record admits only its members, as CanListen does.
 	peer := model.MustGenerateUserID()
 	dm := &Chat{ID: MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, f.funded, peer), Type: chatpb.ChatType_CONTACT_DM, Members: []*commonpb.UserId{f.funded, peer}}
-	ok, err = a.CanListenWithRules(ctx, dm.ID, dm.GroupRules(), f.funded)
+	ok, err = a.CanListenWithRules(ctx, dm.ID, dm.ChatRules(), f.funded)
 	require.NoError(t, err)
 	require.False(t, ok)
 	f.chats.join(dm.ID, f.funded)
-	ok, err = a.CanListenWithRules(ctx, dm.ID, dm.GroupRules(), f.funded)
+	ok, err = a.CanListenWithRules(ctx, dm.ID, dm.ChatRules(), f.funded)
 	require.NoError(t, err)
 	require.True(t, ok)
 }
@@ -590,7 +590,7 @@ func TestAccess_Errors(t *testing.T) {
 	ok, err := a.CanListen(ctx, f.gated.ID, f.funded)
 	require.Error(t, err)
 	require.False(t, ok)
-	ok, err = a.CanListenWithRules(ctx, f.gated.ID, f.gated.GroupRules(), f.funded)
+	ok, err = a.CanListenWithRules(ctx, f.gated.ID, f.gated.ChatRules(), f.funded)
 	require.Error(t, err)
 	require.False(t, ok)
 
@@ -695,12 +695,12 @@ func TestAccess_ViewMode(t *testing.T) {
 
 	// With the rules in hand the answer is the same, without a store read.
 	reads := f.chats.reads
-	standing, err = a.ListenerStandingWithRules(ctx, f.gated.ID, f.gated.GroupRules(), third, messagingpb.ViewMode_REDACTED)
+	standing, err = a.ListenerStandingWithRules(ctx, f.gated.ID, f.gated.ChatRules(), third, messagingpb.ViewMode_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, preview, standing)
 	require.Equal(t, reads, f.chats.reads)
 	require.Equal(t, asked, f.ocpBalance.asked)
-	standing, err = a.ListenerStandingWithRules(ctx, f.gated.ID, f.gated.GroupRules(), third, messagingpb.ViewMode_FULL_OR_REDACTED)
+	standing, err = a.ListenerStandingWithRules(ctx, f.gated.ID, f.gated.ChatRules(), third, messagingpb.ViewMode_FULL_OR_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, full, standing)
 	require.Equal(t, reads, f.chats.reads)
@@ -1078,9 +1078,9 @@ func TestAccess_Governance(t *testing.T) {
 			}
 			asked := f.ocpBalance.asked
 
-			gov, ruleSet := governanceOf(c.ID, c.GroupRules())
+			gov, ruleSet := governanceOf(c.ID, c.ChatRules())
 			require.Equal(t, tc.governance, gov)
-			_, ruled := c.GroupRules().RuleSet()
+			_, ruled := c.ChatRules().RuleSet()
 			require.Equal(t, tc.governance != governancePrivateGroup, ruled)
 			if !ruled {
 				require.Equal(t, RuleSet{}, ruleSet)
@@ -1105,7 +1105,7 @@ func TestAccess_Governance(t *testing.T) {
 						standing, err = a.ListenerStandingWithChat(ctx, c, v.user, mode)
 						require.NoError(t, err)
 						require.Equal(t, want, standing, "off the record, under %v", mode)
-						standing, err = a.ListenerStandingWithRules(ctx, c.ID, c.GroupRules(), v.user, mode)
+						standing, err = a.ListenerStandingWithRules(ctx, c.ID, c.ChatRules(), v.user, mode)
 						require.NoError(t, err)
 						require.Equal(t, want, standing, "with the rules, under %v", mode)
 					}

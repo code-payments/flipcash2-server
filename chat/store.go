@@ -334,12 +334,12 @@ type Store interface {
 	GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]RosterSummary, error)
 
 	// GetGroupRules returns a group chat's participation rules, its recorded
-	// creator and whether it is private (see GroupRules), with a nil Rules
+	// creator and whether it is private (see ChatRules), with a nil Rules
 	// when it has none. It reads only what they are projected from, never the
 	// full canonical record — and all are fixed at creation, so an
 	// implementation is free to cache them indefinitely. It returns ErrChatNotFound if the chat does not exist,
 	// and an error if chatID is not a group chat ID.
-	GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (GroupRules, error)
+	GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (ChatRules, error)
 
 	// IsMember reports whether userID is a member of chatID. It returns false
 	// (no error) when the chat does not exist, or when a group member has been

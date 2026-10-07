@@ -1663,9 +1663,9 @@ func (s *store) GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb
 	return out, nil
 }
 
-func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (chat.GroupRules, error) {
+func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (chat.ChatRules, error) {
 	if !chat.IsGroupChatID(chatID) {
-		return chat.GroupRules{}, fmt.Errorf("not a group chat id")
+		return chat.ChatRules{}, fmt.Errorf("not a group chat id")
 	}
 
 	// Only the attributes the rules are projected from: the type, the
@@ -1687,22 +1687,22 @@ func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (cha
 		},
 	})
 	if err != nil {
-		return chat.GroupRules{}, err
+		return chat.ChatRules{}, err
 	}
 	if len(out.Item) == 0 {
-		return chat.GroupRules{}, chat.ErrChatNotFound
+		return chat.ChatRules{}, chat.ErrChatNotFound
 	}
 	typeVal, err := parseN(out.Item[attrType])
 	if err != nil {
-		return chat.GroupRules{}, err
+		return chat.ChatRules{}, err
 	}
 	listenerBalance, err := minimumBalanceFromItem(out.Item, attrMinListenerBalance)
 	if err != nil {
-		return chat.GroupRules{}, err
+		return chat.ChatRules{}, err
 	}
 	speakerBalance, err := minimumBalanceFromItem(out.Item, attrMinSpeakerBalance)
 	if err != nil {
-		return chat.GroupRules{}, err
+		return chat.ChatRules{}, err
 	}
 	c := &chat.Chat{
 		Type:                   protoChatType(uint64(typeVal)),
@@ -1716,7 +1716,7 @@ func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (cha
 	if creator := asB(out.Item[attrCreator]); len(creator) > 0 {
 		c.CreatorID = &commonpb.UserId{Value: append([]byte(nil), creator...)}
 	}
-	return c.GroupRules(), nil
+	return c.ChatRules(), nil
 }
 
 // rosterSummaryFromItem reads a #meta item. version is absent on an item

@@ -262,26 +262,31 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // IsCreatorOnlySpeaker marks a group in which only its creator may speak. It
 // is stored state, surfaced to clients as a CreatorRequirement speaker rule
 // (see Rules) and enforced on sends like any other rule. No RPC sets it —
-// StartChat refuses speaker rules (see RulesFromProto) — so a group carries
-// it only when its record was written with it. A group that carries it but
-// has no recorded creator admits no one to speak.
+// StartChat refuses every speaker rule but a minimum balance (see
+// RulesFromProto) — so a group carries it only when its record was written
+// with it. A group that carries it but has no recorded creator admits no one
+// to speak.
 //
 // MinimumSpeakerBalance is a balance a member must hold to speak, nil when
 // the group asks for none. It is stored state, surfaced to clients as a
 // MinimumBalanceRequirement speaker rule (see Rules) and enforced on sends
-// like any other rule, on top of the listener rules. Like
-// IsCreatorOnlySpeaker, no RPC sets it, so a group carries it only when its
-// record was written with it. It is meant to cover MinimumListenerBalance —
+// like any other rule, on top of the listener rules. StartChat sets it when
+// a public group asks for it, and only alongside a minimum listener balance
+// in the same currency and mints and smaller by at least a minor unit (see
+// RulesFromProto); like the other rules it is written with the group and
+// never onto one that exists. It is meant to cover MinimumListenerBalance —
 // the same currency and mints, and at least the amount — so that a speak
-// check values the user's balance once (see RuleEvaluator.CanSpeakWithRules);
-// one that does not is still enforced, at the cost of a second valuation. A
-// group with it and no listener rule is open: anyone reads and joins it, and
-// only speaking is gated (see Access).
+// check values the user's balance once (see RuleEvaluator.CanSpeakWithRules),
+// which every group StartChat writes it on does. A record written otherwise
+// may carry one that does not; it is still enforced, at the cost of a second
+// valuation. A group with it and no listener rule, which only such a record
+// can be, is open: anyone reads and joins it, and only speaking is gated (see
+// Access).
 //
 // IsPrivate marks a private group (see chatpb.Metadata.is_private): one whose
 // creator admits each member, and whose messages are end-to-end encrypted
 // with a chat key the server never holds. It is fixed at creation, like the
-// rules, and read with them (see GroupRules). A private group carries no
+// rules, and read with them (see ChatRules). A private group carries no
 // rules: StartChat writes none. No non-member is admitted to it in any form
 // (see Access), no rule admits anyone to it (see RuleEvaluator), and
 // JoinChat refuses everyone but its creator; each is decided on this flag,

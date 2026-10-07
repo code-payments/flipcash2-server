@@ -335,9 +335,9 @@ func (m *memory) GetGroupRosterSummaries(_ context.Context, chatIDs []*commonpb.
 	return out, nil
 }
 
-func (m *memory) GetGroupRules(_ context.Context, chatID *commonpb.ChatId) (chat.GroupRules, error) {
+func (m *memory) GetGroupRules(_ context.Context, chatID *commonpb.ChatId) (chat.ChatRules, error) {
 	if !chat.IsGroupChatID(chatID) {
-		return chat.GroupRules{}, fmt.Errorf("not a group chat id")
+		return chat.ChatRules{}, fmt.Errorf("not a group chat id")
 	}
 
 	m.Lock()
@@ -345,9 +345,9 @@ func (m *memory) GetGroupRules(_ context.Context, chatID *commonpb.ChatId) (chat
 
 	c, ok := m.chats[string(chatID.Value)]
 	if !ok {
-		return chat.GroupRules{}, chat.ErrChatNotFound
+		return chat.ChatRules{}, chat.ErrChatNotFound
 	}
-	return c.Clone().GroupRules(), nil
+	return c.Clone().ChatRules(), nil
 }
 
 // rosterSummaryLocked is a group's summary: the joined count from its records

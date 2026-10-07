@@ -89,7 +89,7 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	// second read through the evaluator: the record is what they are projected
 	// from. A private group has none to evaluate, and its caller is its
 	// creator by now.
-	if ruleSet, ruled := c.GroupRules().RuleSet(); !isMember && ruled {
+	if ruleSet, ruled := c.ChatRules().RuleSet(); !isMember && ruled {
 		canListen, err := s.rules.CanListenWithRules(ctx, ruleSet, userID)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure evaluating chat rules")

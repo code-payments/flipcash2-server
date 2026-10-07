@@ -99,6 +99,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_PrivateGroup_Keyless,
 		testServer_PrivateGroup_Keyed,
 		testServer_BalanceGatedGroup_Rules,
+		testServer_SpeakerBalanceGroup_Rules,
 		testServer_Broadcast_IncludesActor,
 		testServer_SendMessage_PushPerChatType,
 		testServer_SendMessage_GroupChatPush,
@@ -3868,6 +3869,81 @@ func testServer_BalanceGatedGroup_Rules(t *testing.T, badges badge.Store, blockl
 	dmResp, err := e.send(e.keysA, "still a dm", generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, dmResp.Result)
+}
+
+// testServer_SpeakerBalanceGroup_Rules pins that a group's minimum speaker
+// balance, raised above its listener balance as StartChat requires (see
+// chat.RulesFromProto), gates the send paths on top of the listener balance: a
+// member who holds the listener balance alone reads but cannot speak, and
+// speaks once they hold the speaker balance.
+func testServer_SpeakerBalanceGroup_Rules(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	// userA holds the speaker requirement exactly; userB the listener
+	// requirement and a quark short of the speaker one.
+	const (
+		listenerRequirement = 100
+		speakerRequirement  = 200
+	)
+	_, err := e.accounts.Bind(e.ctx, e.userA, e.keysA.Proto())
+	require.NoError(t, err)
+	_, err = e.accounts.Bind(e.ctx, e.userB, e.keysB.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keysA.Proto(), ocp_common.ToCoreMintQuarks(speakerRequirement))
+	e.ocpBalance.setBalance(e.keysB.Proto(), ocp_common.ToCoreMintQuarks(speakerRequirement)-1)
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:                     groupID,
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{e.userA, e.userB},
+		Title:                  "Loud Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: listenerRequirement},
+		MinimumSpeakerBalance:  &chat.MinimumBalance{Currency: "usd", NativeAmount: speakerRequirement},
+		CreatorID:              e.userA,
+		LastActivity:           at(1),
+	}))
+
+	// The member at the speaker requirement speaks.
+	sent, err := e.sendContentToChat(e.keysA, groupID, textContent("loud whales only"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	msgID := sent.Message.MessageId
+
+	// The member under it cannot send or type...
+	sendResp, err := e.sendContentToChat(e.keysB, groupID, textContent("quiet whale"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
+	typingReq := &messagingpb.NotifyIsTypingRequest{ChatId: groupID, State: messagingpb.IsTypingNotification_STARTED_TYPING}
+	require.NoError(t, e.keysB.Auth(typingReq, &typingReq.Auth))
+	typingResp, err := e.client.NotifyIsTyping(e.ctx, typingReq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
+
+	// ...but reads, as a member of the group's audience.
+	getReq := &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: msgID}
+	require.NoError(t, e.keysB.Auth(getReq, &getReq.Auth))
+	getResp, err := e.client.GetMessage(e.ctx, getReq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+
+	// Topped up to the speaker requirement, the member speaks...
+	e.ocpBalance.setBalance(e.keysB.Proto(), ocp_common.ToCoreMintQuarks(speakerRequirement))
+	sendResp, err = e.sendContentToChat(e.keysB, groupID, textContent("loud now"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sendResp.Result)
+
+	// ...and drained below the listener requirement, the creator is silenced
+	// with the rest, still reading.
+	e.ocpBalance.setBalance(e.keysA.Proto(), ocp_common.ToCoreMintQuarks(listenerRequirement)-1)
+	sendResp, err = e.sendContentToChat(e.keysA, groupID, textContent("drained"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
+	getReq = &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: msgID}
+	require.NoError(t, e.keysA.Auth(getReq, &getReq.Auth))
+	getResp, err = e.client.GetMessage(e.ctx, getReq)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
 }
 
 func testServer_Broadcast_IncludesActor(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

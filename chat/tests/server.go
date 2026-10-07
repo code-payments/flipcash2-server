@@ -132,6 +132,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_Lobby_Deny,
 		testServer_StartChat_InvalidRules,
 		testServer_StartChat_RulesNotSatisfied,
+		testServer_StartChat_MinimumSpeakerBalance,
 		testServer_StartChat_WithRules,
 		testServer_StartChat_FiatMinimumBalance,
 		testServer_MuteChat_Lifecycle,
@@ -3463,6 +3464,14 @@ func minimumBalanceRule(currency string, amount float64) *chatpb.ListenerRules {
 	}}}
 }
 
+// speakerBalanceRule builds the speaker rule for a minimum balance in any
+// mint.
+func speakerBalanceRule(currency string, amount float64) *chatpb.SpeakerRules {
+	return &chatpb.SpeakerRules{Kind: &chatpb.SpeakerRules_MinimumBalance{MinimumBalance: &chatpb.MinimumBalanceRequirement{
+		Amount: &commonpb.FiatPaymentAmount{Currency: currency, NativeAmount: amount},
+	}}}
+}
+
 // groupParams builds StartChat parameters for a group with the given title and
 // the default minimum balance rule.
 func groupParams(title string) *chatpb.StartChatRequest_PublicGroupChatParameters {
@@ -4109,10 +4118,47 @@ func testServer_StartChat_InvalidRules(t *testing.T, s chat.Store) {
 		"no rules":   nil,
 		"empty":      {},
 		"staff only": {Listener: []*chatpb.ListenerRules{staff}},
-		// No group carries a speaker rule yet, so none can be asked for.
-		"speaker rule": {
+		// A minimum balance is the only speaker rule a group can ask for.
+		"speaker staff rule": {
 			Listener: []*chatpb.ListenerRules{minimumBalance},
 			Speaker:  []*chatpb.SpeakerRules{{Kind: &chatpb.SpeakerRules_Staff{Staff: &chatpb.StaffRequirement{}}}},
+		},
+		"speaker creator rule": {
+			Listener: []*chatpb.ListenerRules{minimumBalance},
+			Speaker:  []*chatpb.SpeakerRules{{Kind: &chatpb.SpeakerRules_Creator{Creator: &chatpb.CreatorRequirement{}}}},
+		},
+		// A minimum speaker balance must raise the listener balance: the same
+		// currency and mints, and an amount larger by at least a minor unit.
+		"speaker balance in another currency": {
+			Listener: []*chatpb.ListenerRules{minimumBalance},
+			Speaker:  []*chatpb.SpeakerRules{speakerBalanceRule("jpy", 2*startChatMinimumBalance*150)},
+		},
+		"speaker balance in another mint": {
+			Listener: []*chatpb.ListenerRules{minimumBalance},
+			Speaker: []*chatpb.SpeakerRules{{Kind: &chatpb.SpeakerRules_MinimumBalance{MinimumBalance: &chatpb.MinimumBalanceRequirement{
+				Amount: &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: 2 * startChatMinimumBalance},
+				Mints:  []*commonpb.PublicKey{model.MustGenerateKeyPair().Proto()},
+			}}}},
+		},
+		"speaker balance equal to listener": {
+			Listener: []*chatpb.ListenerRules{minimumBalance},
+			Speaker:  []*chatpb.SpeakerRules{speakerBalanceRule("usd", startChatMinimumBalance)},
+		},
+		"speaker balance under a cent above listener": {
+			Listener: []*chatpb.ListenerRules{minimumBalance},
+			Speaker:  []*chatpb.SpeakerRules{speakerBalanceRule("usd", startChatMinimumBalance+0.009)},
+		},
+		"speaker balance below listener": {
+			Listener: []*chatpb.ListenerRules{minimumBalance},
+			Speaker:  []*chatpb.SpeakerRules{speakerBalanceRule("usd", startChatMinimumBalance-1)},
+		},
+		"duplicate speaker balance": {
+			Listener: []*chatpb.ListenerRules{minimumBalance},
+			Speaker:  []*chatpb.SpeakerRules{speakerBalanceRule("usd", 2*startChatMinimumBalance), speakerBalanceRule("usd", 3*startChatMinimumBalance)},
+		},
+		"speaker balance without listener balance": {
+			Listener: []*chatpb.ListenerRules{staff},
+			Speaker:  []*chatpb.SpeakerRules{speakerBalanceRule("usd", startChatMinimumBalance)},
 		},
 		// The record holds one requirement of each kind.
 		"duplicate staff":           {Listener: []*chatpb.ListenerRules{staff, staff, minimumBalance}},
@@ -4169,6 +4215,80 @@ func testServer_StartChat_RulesNotSatisfied(t *testing.T, s chat.Store) {
 	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
 	require.NoError(t, err)
 	require.Empty(t, groups)
+}
+
+// testServer_StartChat_MinimumSpeakerBalance pins that a public group can be
+// created with a minimum speaker balance above its listener balance: the
+// creator must hold the speaker balance, the requirement is stored and shown
+// back as asked, and it gates speaking but not joining.
+func testServer_StartChat_MinimumSpeakerBalance(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	const (
+		listenerRequirement = startChatMinimumBalance
+		speakerRequirement  = 2 * startChatMinimumBalance
+	)
+	usdfMint := model.MustGenerateKeyPair().Proto()
+	params := &chatpb.StartChatRequest_PublicGroupChatParameters{
+		Title: "Loud Whales",
+		Rules: &chatpb.Rules{
+			Listener: []*chatpb.ListenerRules{{Kind: &chatpb.ListenerRules_MinimumBalance{MinimumBalance: &chatpb.MinimumBalanceRequirement{
+				Amount: &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: listenerRequirement},
+				Mints:  []*commonpb.PublicKey{usdfMint},
+			}}}},
+			Speaker: []*chatpb.SpeakerRules{{Kind: &chatpb.SpeakerRules_MinimumBalance{MinimumBalance: &chatpb.MinimumBalanceRequirement{
+				Amount: &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: speakerRequirement},
+				Mints:  []*commonpb.PublicKey{usdfMint},
+			}}}},
+		},
+	}
+
+	// A creator who could read the group but not speak in it cannot start it.
+	e.fundEnvUser(speakerRequirement - 1)
+	resp := e.mustStartGroupChat(e.keys, params)
+	require.Equal(t, chatpb.StartChatResponse_RULES_NOT_SATISFIED, resp.Result)
+	require.Nil(t, resp.Chat)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	require.NoError(t, err)
+	require.Empty(t, groups)
+
+	// Holding the speaker requirement, they get the group, with both rules
+	// stored and shown back as asked.
+	e.fundEnvUser(speakerRequirement)
+	resp = e.mustStartGroupChat(e.keys, params)
+	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(params.Rules, resp.Chat.GetRules()))
+	chatID := resp.Chat.ChatId
+
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.NotNil(t, stored.MinimumSpeakerBalance)
+	require.Equal(t, "usd", stored.MinimumSpeakerBalance.Currency)
+	require.Equal(t, float64(speakerRequirement), stored.MinimumSpeakerBalance.NativeAmount)
+	require.Len(t, stored.MinimumSpeakerBalance.Mints, 1)
+	require.Equal(t, usdfMint.Value, stored.MinimumSpeakerBalance.Mints[0].Value)
+	require.NoError(t, protoutil.ProtoEqualError(params.Rules, stored.Rules()))
+
+	got := e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, got.Result)
+	require.NoError(t, protoutil.ProtoEqualError(params.Rules, got.Metadata.GetRules()))
+
+	// The creator speaks in it.
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_OK, e.getMentionSuggestions(e.keys, chatID).Result)
+
+	// A user holding the listener balance alone joins, but cannot speak.
+	listener, listenerKeys := e.addUser()
+	_, err = e.accounts.Bind(e.ctx, listener, listenerKeys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(listenerKeys.Proto(), ocp_common.ToCoreMintQuarks(listenerRequirement))
+	joined := e.mustJoinChat(listenerKeys, chatID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	require.NoError(t, protoutil.ProtoEqualError(params.Rules, joined.Chat.GetRules()))
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, e.getMentionSuggestions(listenerKeys, chatID).Result)
+
+	// Topped up to the speaker balance, they speak.
+	e.ocpBalance.setBalance(listenerKeys.Proto(), ocp_common.ToCoreMintQuarks(speakerRequirement))
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_OK, e.getMentionSuggestions(listenerKeys, chatID).Result)
 }
 
 func testServer_StartChat_WithRules(t *testing.T, s chat.Store) {

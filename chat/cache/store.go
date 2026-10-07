@@ -155,15 +155,15 @@ func (c *Cache) GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb
 // reaches a process that has read the group only when it restarts. A cached
 // entry is shared by every caller and must be treated as read-only. Errors — including
 // ErrChatNotFound, since the group may be created later — are not cached.
-func (c *Cache) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (chat.GroupRules, error) {
+func (c *Cache) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (chat.ChatRules, error) {
 	key := string(chatID.Value)
 	if cached, ok := c.rulesCache.Get(key); ok {
-		return cached.(chat.GroupRules), nil
+		return cached.(chat.ChatRules), nil
 	}
 
 	rules, err := c.db.GetGroupRules(ctx, chatID)
 	if err != nil {
-		return chat.GroupRules{}, err
+		return chat.ChatRules{}, err
 	}
 	c.rulesCache.Set(key, rules)
 	return rules, nil

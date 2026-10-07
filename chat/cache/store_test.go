@@ -50,11 +50,11 @@ type countingRulesStore struct {
 
 	mu    sync.Mutex
 	calls int
-	rules chat.GroupRules
+	rules chat.ChatRules
 	err   error
 }
 
-func (s *countingRulesStore) GetGroupRules(_ context.Context, _ *commonpb.ChatId) (chat.GroupRules, error) {
+func (s *countingRulesStore) GetGroupRules(_ context.Context, _ *commonpb.ChatId) (chat.ChatRules, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
@@ -212,7 +212,7 @@ func TestCache_GetGroupRules_Cached(t *testing.T) {
 	ctx := context.Background()
 	staffOnly := &chatpb.Rules{Listener: []*chatpb.ListenerRules{{Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}}}}}
 	creator := model.MustGenerateUserID()
-	backing := &countingRulesStore{rules: chat.GroupRules{Rules: staffOnly, CreatorID: creator}}
+	backing := &countingRulesStore{rules: chat.ChatRules{Rules: staffOnly, CreatorID: creator}}
 	c := cache.NewInCache(backing)
 
 	chatID := chat.MustGenerateGroupChatID()
@@ -226,7 +226,7 @@ func TestCache_GetGroupRules_Cached(t *testing.T) {
 
 	// Rules and the creator are fixed at creation, so the cache is what
 	// answers even once the backing store would say otherwise.
-	backing.rules = chat.GroupRules{}
+	backing.rules = chat.ChatRules{}
 	got, err := c.GetGroupRules(ctx, chatID)
 	require.NoError(t, err)
 	require.True(t, proto.Equal(staffOnly, got.Rules))

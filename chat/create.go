@@ -25,8 +25,10 @@ import (
 //
 // The request is checked in the order a client can act on: the rules it asks
 // for must be ones a group can carry — which today means they must include a
-// minimum listener balance, in a currency OCP can value (see RulesFromProto)
-// — and ones the caller satisfies (RULES_NOT_SATISFIED); the title must pass
+// minimum listener balance, in a currency OCP can value, and may add a larger
+// minimum speaker balance in the same currency and mints (see RulesFromProto)
+// — and ones the caller satisfies, speaker rules included
+// (RULES_NOT_SATISFIED); the title must pass
 // moderation (TITLE_MODERATED), and then the description, if any
 // (DESCRIPTION_MODERATED); and the profile picture and cover
 // picture, if any, must each be a READY image the caller owns
@@ -125,10 +127,7 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	var (
-		isStaffOnly            bool
-		minimumListenerBalance *MinimumBalance
-	)
+	var creationRules CreationRules
 	if isPrivate {
 		allowed, err := s.canCreatePrivateGroup(ctx, userID)
 		if err != nil {
@@ -139,7 +138,7 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_DENIED}, nil
 		}
 	} else {
-		isStaffOnly, minimumListenerBalance, err = RulesFromProto(rules)
+		creationRules, err = RulesFromProto(rules)
 		if err != nil {
 			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_INVALID_RULES}, nil
 		}
@@ -222,8 +221,9 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		Type:                   chatpb.ChatType_GROUP,
 		Members:                []*commonpb.UserId{userID},
 		Title:                  title,
-		IsStaffOnly:            isStaffOnly,
-		MinimumListenerBalance: minimumListenerBalance,
+		IsStaffOnly:            creationRules.IsStaffOnly,
+		MinimumListenerBalance: creationRules.MinimumListenerBalance,
+		MinimumSpeakerBalance:  creationRules.MinimumSpeakerBalance,
 		IsPrivate:              isPrivate,
 		CreatorID:              userID,
 		Description:            description,
@@ -299,7 +299,7 @@ func (s *Server) canCreatePrivateGroup(ctx context.Context, userID *commonpb.Use
 // creation, and the creator may even have left, in which case they see it as
 // the non-member they are. Nothing is published; a retry is not news.
 func (s *Server) replayStartChat(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, c *Chat) (*chatpb.StartChatResponse, error) {
-	standing, err := s.access.ListenerStandingWithRules(ctx, c.ID, c.GroupRules(), userID, messagingpb.ViewMode_FULL)
+	standing, err := s.access.ListenerStandingWithRules(ctx, c.ID, c.ChatRules(), userID, messagingpb.ViewMode_FULL)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure determining chat standing")
 		return nil, status.Error(codes.Internal, "")

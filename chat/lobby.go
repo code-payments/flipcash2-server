@@ -117,7 +117,7 @@ func (s *Server) EnterLobby(ctx context.Context, req *chatpb.EnterLobbyRequest) 
 
 	// A keyless group has no lobby (see above). Decided off the record's
 	// rules, as the speaker gate decides it.
-	keyed, err := s.access.hasKey(ctx, c.ID, c.GroupRules())
+	keyed, err := s.access.hasKey(ctx, c.ID, c.ChatRules())
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure checking chat key")
 		return nil, status.Error(codes.Internal, "")
@@ -301,7 +301,7 @@ func (s *Server) AdmitLobbyMember(ctx context.Context, req *chatpb.AdmitLobbyMem
 
 	// Nobody is admitted to a group before its creator holds its key (see
 	// above). The creator is the caller by now, so this is their own envelope.
-	keyed, err := s.access.hasKey(ctx, c.ID, c.GroupRules())
+	keyed, err := s.access.hasKey(ctx, c.ID, c.ChatRules())
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure checking chat key")
 		return nil, status.Error(codes.Internal, "")

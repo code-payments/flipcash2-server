@@ -41,7 +41,7 @@ import (
 // MinimumBalanceRequirement for a group with a minimum speaker balance (see
 // Chat.MinimumSpeakerBalance), or both, again cheapest first. The
 // CreatorRequirement names no user: it is evaluated against the creator the
-// group recorded, which is read with the rules (see GroupRules).
+// group recorded, which is read with the rules (see ChatRules).
 //
 // A DM's record carries none, but a DM with the Flipcash team account carries
 // a Never speaker rule, which only the RuleEvaluator, knowing the team, can
@@ -79,7 +79,7 @@ func (c *Chat) Rules() *chatpb.Rules {
 	return &chatpb.Rules{Listener: listener, Speaker: speaker}
 }
 
-// GroupRules is what a chat's rules are evaluated against: the rules, the
+// ChatRules is what a chat's rules are evaluated against: the rules, the
 // creator a CreatorRequirement names, since the rule itself names no one, and
 // whether the group is private, which decides who speaks in it before any
 // rule does (see Access.CanSpeak). All are fixed at creation and read
@@ -92,7 +92,13 @@ func (c *Chat) Rules() *chatpb.Rules {
 // than looked up per evaluation. It is not part of what a client is shown
 // (Metadata.rules is Rules alone), and a field belongs here only if it is
 // fixed at creation like the rules, since it is cached with them forever.
-type GroupRules struct {
+//
+// Every chat has one, DMs included: a DM's is built rather than read (see
+// RuleEvaluator.rulesFor, Chat.ChatRules), and carries no rules but the
+// Never speaker rule of a DM with the Flipcash team account, no creator and
+// no privacy, which are a group's alone. Only a group's is stored (see
+// Store.GetGroupRules).
+type ChatRules struct {
 	// Rules are the chat's rules, nil when it has none (see Chat.Rules).
 	Rules *chatpb.Rules
 
@@ -107,21 +113,21 @@ type GroupRules struct {
 	IsPrivate bool
 }
 
-// GroupRules returns the chat's rules, creator and privacy as they are
-// evaluated (see GroupRules).
-func (c *Chat) GroupRules() GroupRules {
-	return GroupRules{Rules: c.Rules(), CreatorID: c.CreatorID, IsPrivate: c.IsPrivate}
+// ChatRules returns the chat's rules, creator and privacy as they are
+// evaluated (see ChatRules).
+func (c *Chat) ChatRules() ChatRules {
+	return ChatRules{Rules: c.Rules(), CreatorID: c.CreatorID, IsPrivate: c.IsPrivate}
 }
 
 // isCreator reports whether userID is the recorded creator; false when none
 // is recorded.
-func (r GroupRules) isCreator(userID *commonpb.UserId) bool {
+func (r ChatRules) isCreator(userID *commonpb.UserId) bool {
 	return isCreator(r.CreatorID, userID)
 }
 
 // RuleSet returns the rules the chat is governed by, and false for a private
 // group, which is governed by none (see RuleSet).
-func (r GroupRules) RuleSet() (RuleSet, bool) {
+func (r ChatRules) RuleSet() (RuleSet, bool) {
 	if r.IsPrivate {
 		return RuleSet{}, false
 	}
@@ -132,8 +138,8 @@ func (r GroupRules) RuleSet() (RuleSet, bool) {
 // the RuleEvaluator evaluates. A public group is governed by its stored rules,
 // and a DM by the rules derived for it (see RuleEvaluator.RulesOf). A private
 // group is not governed by rules at all: its creator admits its members and
-// its key decides whether they speak (see Access), so GroupRules.RuleSet
-// returns none for one, and nothing that holds a private group's GroupRules
+// its key decides whether they speak (see Access), so ChatRules.RuleSet
+// returns none for one, and nothing that holds a private group's ChatRules
 // can ask the evaluator about it. Without that, a private group, which
 // carries no rules, would read as an empty rule set, and an empty rule set
 // admits everyone.
@@ -147,7 +153,7 @@ type RuleSet struct {
 
 // NewRuleSet returns the rule set of rules no record holds yet: those a
 // public group is being created with, with the caller as the creator they
-// will record. Every other RuleSet comes from GroupRules.RuleSet.
+// will record. Every other RuleSet comes from ChatRules.RuleSet.
 func NewRuleSet(rules *chatpb.Rules, creatorID *commonpb.UserId) RuleSet {
 	return RuleSet{rules: rules, creatorID: creatorID}
 }
@@ -186,73 +192,143 @@ func isCreator(creatorID, userID *commonpb.UserId) bool {
 // carry (see RulesFromProto for what one can).
 var ErrInvalidRules = errors.New("invalid chat rules")
 
+// CreationRules are the stored fields a new group's rules project onto (see
+// RulesFromProto), which Chat.Rules projects back from.
+type CreationRules struct {
+	IsStaffOnly            bool
+	MinimumListenerBalance *MinimumBalance
+	// MinimumSpeakerBalance is nil when the group asks for none.
+	MinimumSpeakerBalance *MinimumBalance
+}
+
 // RulesFromProto validates a rule set a client asked a new group to carry and
 // projects it onto the stored fields Rules projects back from, so that a group
 // created with rules shows exactly the rules it was asked for.
 //
 // It accepts what a group can be created with today, and nothing more, so
-// that a rule is never accepted and then silently dropped: listener rules
-// only, since no client sets a speaker rule (a creator-only or speaker-gated
-// group is made by writing its record, see Chat.IsCreatorOnlySpeaker and
-// Chat.MinimumSpeakerBalance); each kind at most once, since the record
-// holds one of each; and a minimum balance of at least the currency's minimum
-// transfer value — one unit at its last decimal place, a penny for USD, a yen
-// for JPY, the smallest amount OCP lets anyone hold or move in that currency
-// (see minimumTransferValue). A requirement below it asks for a balance no one
-// can distinguish from nothing, so the rule would admit everyone, or no one,
-// on rounding alone. The currency is any ISO 4217 code: the proto bounds its
-// shape, and whether OCP can value a balance in it is OCP's to say, which it
-// does the first time the rule is evaluated — for a new group, against its
-// creator, before anything is written (see Server.StartChat). The requirement's
-// mints are taken as given: the proto bounds how many, and validation bounds
-// their shape. Anything else is ErrInvalidRules — a rule the server cannot
-// enforce is refused up front rather than stored and failed on every
-// evaluation.
+// that a rule is never accepted and then silently dropped: listener rules of
+// a staff requirement and a minimum balance, and a single speaker rule of a
+// minimum balance (a creator-only group is made by writing its record, see
+// Chat.IsCreatorOnlySpeaker); each kind at most once, since the record holds
+// one of each; and a minimum balance, listener or speaker, of at least the
+// currency's minimum transfer value — one unit at its last decimal place, a
+// penny for USD, a yen for JPY, the smallest amount OCP lets anyone hold or
+// move in that currency (see minimumTransferValue). A requirement below it
+// asks for a balance no one can distinguish from nothing, so the rule would
+// admit everyone, or no one, on rounding alone. The currency is any ISO 4217
+// code: the proto bounds its shape, and whether OCP can value a balance in it
+// is OCP's to say, which it does the first time the rule is evaluated — for a
+// new group, against its creator, before anything is written (see
+// Server.StartChat). The requirement's mints are taken as given: the proto
+// bounds how many, and validation bounds their shape. Anything else is
+// ErrInvalidRules — a rule the server cannot enforce is refused up front
+// rather than stored and failed on every evaluation.
 //
 // It also requires what every group must carry today: a minimum listener
 // balance. A set without one — nil, empty, or staff-only — is ErrInvalidRules,
 // so no group is created that a holder of nothing could join.
-func RulesFromProto(rules *chatpb.Rules) (isStaffOnly bool, minimumListenerBalance *MinimumBalance, err error) {
-	if len(rules.GetSpeaker()) > 0 {
-		return false, nil, fmt.Errorf("%w: speaker rules are not supported", ErrInvalidRules)
-	}
+//
+// A minimum speaker balance is optional, and must raise the listener balance:
+// the same currency, the same mints, and an amount larger by at least the
+// currency's minimum transfer value (see exceedsByMinimumTransferValue). A
+// speaker requirement in another currency or mint asks for a second holding
+// beside the one that admits a listener, and one no larger than the
+// listener's asks for nothing a member does not already hold. One larger by
+// less than a minor unit asks for a difference no one can move, and that a
+// valuation with half a minor unit of slack (see satisfiesMinimumBalance)
+// cannot tell apart, for the same reason a requirement must meet the floor.
+// A pair that passes is one the speaker requirement covers (see
+// coversBalance), so every speak check in a group created this way values
+// the user's balance once.
+func RulesFromProto(rules *chatpb.Rules) (CreationRules, error) {
+	var out CreationRules
 	for _, rule := range rules.GetListener() {
 		switch k := rule.GetKind().(type) {
 		case *chatpb.ListenerRules_Staff:
-			if isStaffOnly {
-				return false, nil, fmt.Errorf("%w: duplicate staff requirement", ErrInvalidRules)
+			if out.IsStaffOnly {
+				return CreationRules{}, fmt.Errorf("%w: duplicate staff requirement", ErrInvalidRules)
 			}
-			isStaffOnly = true
+			out.IsStaffOnly = true
 		case *chatpb.ListenerRules_MinimumBalance:
-			if minimumListenerBalance != nil {
-				return false, nil, fmt.Errorf("%w: duplicate minimum balance requirement", ErrInvalidRules)
+			if out.MinimumListenerBalance != nil {
+				return CreationRules{}, fmt.Errorf("%w: duplicate minimum listener balance requirement", ErrInvalidRules)
 			}
-			req := k.MinimumBalance
-			currency := currency_lib.Code(req.GetAmount().GetCurrency())
-			if currency == "" {
-				return false, nil, fmt.Errorf("%w: minimum balance currency is required", ErrInvalidRules)
+			minimum, err := minimumBalanceFromProto(k.MinimumBalance)
+			if err != nil {
+				return CreationRules{}, err
 			}
-			amount := req.GetAmount().GetNativeAmount()
-			if minimum := minimumTransferValue(currency); math.IsNaN(amount) || math.IsInf(amount, 0) || amount < minimum {
-				return false, nil, fmt.Errorf("%w: minimum balance amount must be at least %s %s", ErrInvalidRules, strconv.FormatFloat(minimum, 'f', -1, 64), strings.ToUpper(string(currency)))
-			}
-			mints := make([]*commonpb.PublicKey, len(req.GetMints()))
-			for i, mint := range req.GetMints() {
-				mints[i] = &commonpb.PublicKey{Value: append([]byte(nil), mint.GetValue()...)}
-			}
-			minimumListenerBalance = &MinimumBalance{
-				Currency:     string(currency),
-				NativeAmount: amount,
-				Mints:        mints,
-			}
+			out.MinimumListenerBalance = minimum
 		default:
-			return false, nil, fmt.Errorf("%w: unsupported listener rule %T", ErrInvalidRules, k)
+			return CreationRules{}, fmt.Errorf("%w: unsupported listener rule %T", ErrInvalidRules, k)
 		}
 	}
-	if minimumListenerBalance == nil {
-		return false, nil, fmt.Errorf("%w: a minimum listener balance is required", ErrInvalidRules)
+	for _, rule := range rules.GetSpeaker() {
+		switch k := rule.GetKind().(type) {
+		case *chatpb.SpeakerRules_MinimumBalance:
+			if out.MinimumSpeakerBalance != nil {
+				return CreationRules{}, fmt.Errorf("%w: duplicate minimum speaker balance requirement", ErrInvalidRules)
+			}
+			minimum, err := minimumBalanceFromProto(k.MinimumBalance)
+			if err != nil {
+				return CreationRules{}, err
+			}
+			out.MinimumSpeakerBalance = minimum
+		default:
+			return CreationRules{}, fmt.Errorf("%w: unsupported speaker rule %T", ErrInvalidRules, k)
+		}
 	}
-	return isStaffOnly, minimumListenerBalance, nil
+	if out.MinimumListenerBalance == nil {
+		return CreationRules{}, fmt.Errorf("%w: a minimum listener balance is required", ErrInvalidRules)
+	}
+	if speaker, listener := out.MinimumSpeakerBalance, out.MinimumListenerBalance; speaker != nil {
+		switch {
+		case speaker.Currency != listener.Currency:
+			return CreationRules{}, fmt.Errorf("%w: minimum speaker balance must be in the listener balance's currency", ErrInvalidRules)
+		case !sameMints(speaker.Mints, listener.Mints):
+			return CreationRules{}, fmt.Errorf("%w: minimum speaker balance must be in the listener balance's mints", ErrInvalidRules)
+		case !exceedsByMinimumTransferValue(speaker.NativeAmount, listener.NativeAmount, currency_lib.Code(speaker.Currency)):
+			minimum := minimumTransferValue(currency_lib.Code(speaker.Currency))
+			return CreationRules{}, fmt.Errorf("%w: minimum speaker balance must exceed the listener balance by at least %s %s", ErrInvalidRules, strconv.FormatFloat(minimum, 'f', -1, 64), strings.ToUpper(speaker.Currency))
+		}
+	}
+	return out, nil
+}
+
+// minimumBalanceFromProto validates one minimum balance requirement a new
+// group asked for, listener or speaker, and copies it into a MinimumBalance
+// (see RulesFromProto for what is valid).
+func minimumBalanceFromProto(req *chatpb.MinimumBalanceRequirement) (*MinimumBalance, error) {
+	currency := currency_lib.Code(req.GetAmount().GetCurrency())
+	if currency == "" {
+		return nil, fmt.Errorf("%w: minimum balance currency is required", ErrInvalidRules)
+	}
+	amount := req.GetAmount().GetNativeAmount()
+	if minimum := minimumTransferValue(currency); math.IsNaN(amount) || math.IsInf(amount, 0) || amount < minimum {
+		return nil, fmt.Errorf("%w: minimum balance amount must be at least %s %s", ErrInvalidRules, strconv.FormatFloat(minimum, 'f', -1, 64), strings.ToUpper(string(currency)))
+	}
+	mints := make([]*commonpb.PublicKey, len(req.GetMints()))
+	for i, mint := range req.GetMints() {
+		mints[i] = &commonpb.PublicKey{Value: append([]byte(nil), mint.GetValue()...)}
+	}
+	return &MinimumBalance{
+		Currency:     string(currency),
+		NativeAmount: amount,
+		Mints:        mints,
+	}, nil
+}
+
+// exceedsByMinimumTransferValue reports whether amount exceeds base by at
+// least the currency's minimum transfer value, the gap RulesFromProto
+// requires between a speaker and a listener balance. Both are finite amounts
+// a client chose as decimals and the proto carries as float64, so neither is
+// exact, nor is their difference: 0.11 - 0.1 is a hair under 0.01. The
+// comparison forgives a few ulps of amount, more than converting two decimals
+// and subtracting them can lose, and far less than any gap a client could
+// mean, so a gap of exactly one minor unit passes at every magnitude and one
+// short of it by anything a client can express does not.
+func exceedsByMinimumTransferValue(amount, base float64, code currency_lib.Code) bool {
+	tolerance := 4 * (math.Nextafter(amount, math.Inf(1)) - amount)
+	return amount-base+tolerance >= minimumTransferValue(code)
 }
 
 // minimumTransferValue is the smallest amount of a currency OCP transfers: one
@@ -291,7 +367,7 @@ func minimumTransferValue(code currency_lib.Code) float64 {
 // StaffRequirement is answered by the account store's staff flag, a
 // MinimumBalanceRequirement by the balance client's valuation of the user's
 // holdings (see satisfiesMinimumBalance), and a CreatorRequirement by the
-// creator read and cached with the rules (see GroupRules), so it costs no
+// creator read and cached with the rules (see ChatRules), so it costs no
 // read of its own.
 //
 // Rules are evaluated against the current state of their subject, not the
@@ -443,12 +519,12 @@ func (e *RuleEvaluator) ruleSetFor(ctx context.Context, chatID *commonpb.ChatId,
 // whether it is one with the team account is decided off the IDs (see
 // inTeamDm). That is exact for a member, which every caller has established
 // first, since a DM's members are userID and one other.
-func (e *RuleEvaluator) rulesFor(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (GroupRules, error) {
+func (e *RuleEvaluator) rulesFor(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (ChatRules, error) {
 	if !IsGroupChatID(chatID) {
 		if e.inTeamDm(chatID, userID) {
-			return GroupRules{Rules: teamDmRules()}, nil
+			return ChatRules{Rules: teamDmRules()}, nil
 		}
-		return GroupRules{}, nil
+		return ChatRules{}, nil
 	}
 	return e.chats.GetGroupRules(ctx, chatID)
 }

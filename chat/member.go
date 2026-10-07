@@ -35,8 +35,11 @@ import (
 // admitted by its creator from its lobby (see lobby.go), so JoinChat refuses
 // everyone as DENIED. Everyone but the creator, that is, who needs no one's
 // approval and rejoins a private group they left. No rule is evaluated for
-// them: a private group's rules admit no one (see RuleEvaluator), and being
-// its creator is what admits them.
+// them: a private group is not governed by rules and has no RuleSet to
+// evaluate (see RuleSet), and being its creator is what admits them.
+//
+// A public group without listener rules is open: the empty set is satisfied
+// by everyone, so anyone may join it, as anyone may read it (see Access).
 //
 // Each transition that actually happens is broadcast as a RosterUpdate to the
 // chat's members and to the affected user (see publishRosterUpdate): the user
@@ -82,12 +85,12 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	// A private group's caller is its creator by now, whom no rule gates.
-	if !isMember && !c.IsPrivate {
-		// The rules come from the canonical record already in hand rather than
-		// a second read through the evaluator: the record is what they are
-		// projected from.
-		canListen, err := s.rules.CanListenWithRules(ctx, c.ID, c.GroupRules(), userID)
+	// The rules come from the canonical record already in hand rather than a
+	// second read through the evaluator: the record is what they are projected
+	// from. A private group has none to evaluate, and its caller is its
+	// creator by now.
+	if ruleSet, ruled := c.GroupRules().RuleSet(); !isMember && ruled {
+		canListen, err := s.rules.CanListenWithRules(ctx, ruleSet, userID)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure evaluating chat rules")
 			return nil, status.Error(codes.Internal, "")

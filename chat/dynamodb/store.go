@@ -282,6 +282,7 @@ const (
 	attrIsStaffOnly          = "is_staff_only"
 	attrMinListenerBalance   = "min_listener_balance" // map: see minimumBalanceAttr
 	attrIsCreatorOnlySpeaker = "is_creator_only_speaker"
+	attrMinSpeakerBalance    = "min_speaker_balance" // map: see minimumBalanceAttr
 	attrIsPrivate            = "is_private"
 	attrCreator              = "creator"
 	attrDescription          = "description"   // group chats item: absent when the group has none
@@ -1674,14 +1675,15 @@ func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (cha
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:            aws.String(s.chatsTable),
 		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
-		ProjectionExpression: aws.String("#type, #staff, #balance, #creatorOnly, #creator, #private"),
+		ProjectionExpression: aws.String("#type, #staff, #balance, #creatorOnly, #speakerBalance, #creator, #private"),
 		ExpressionAttributeNames: map[string]string{
-			"#type":        attrType,
-			"#staff":       attrIsStaffOnly,
-			"#balance":     attrMinListenerBalance,
-			"#creatorOnly": attrIsCreatorOnlySpeaker,
-			"#creator":     attrCreator,
-			"#private":     attrIsPrivate,
+			"#type":           attrType,
+			"#staff":          attrIsStaffOnly,
+			"#balance":        attrMinListenerBalance,
+			"#creatorOnly":    attrIsCreatorOnlySpeaker,
+			"#speakerBalance": attrMinSpeakerBalance,
+			"#creator":        attrCreator,
+			"#private":        attrIsPrivate,
 		},
 	})
 	if err != nil {
@@ -1694,15 +1696,20 @@ func (s *store) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (cha
 	if err != nil {
 		return chat.GroupRules{}, err
 	}
-	balance, err := minimumBalanceFromItem(out.Item)
+	listenerBalance, err := minimumBalanceFromItem(out.Item, attrMinListenerBalance)
+	if err != nil {
+		return chat.GroupRules{}, err
+	}
+	speakerBalance, err := minimumBalanceFromItem(out.Item, attrMinSpeakerBalance)
 	if err != nil {
 		return chat.GroupRules{}, err
 	}
 	c := &chat.Chat{
 		Type:                   protoChatType(uint64(typeVal)),
 		IsStaffOnly:            asBool(out.Item[attrIsStaffOnly]),
-		MinimumListenerBalance: balance,
+		MinimumListenerBalance: listenerBalance,
 		IsCreatorOnlySpeaker:   asBool(out.Item[attrIsCreatorOnlySpeaker]),
+		MinimumSpeakerBalance:  speakerBalance,
 		IsPrivate:              asBool(out.Item[attrIsPrivate]),
 	}
 	// creator is absent for groups written before it was recorded.
@@ -1856,8 +1863,9 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 	}
 	// A group's membership lives in group_members, not on the canonical item —
 	// an inline list could not hold a large group. Title, the staff-only flag,
-	// the minimum listener balance, the creator-only speaker flag, the private
-	// flag, the creator and the picture are group-only;
+	// the minimum listener balance, the creator-only speaker flag, the minimum
+	// speaker balance, the private flag, the creator and the picture are
+	// group-only;
 	// each is written only when set, so an absent attribute (including on every
 	// item written before it existed) reads as its zero value.
 	if c.Type == chatpb.ChatType_GROUP {
@@ -1872,6 +1880,9 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 		}
 		if c.IsCreatorOnlySpeaker {
 			item[attrIsCreatorOnlySpeaker] = avBool(true)
+		}
+		if c.MinimumSpeakerBalance != nil {
+			item[attrMinSpeakerBalance] = minimumBalanceAttr(c.MinimumSpeakerBalance)
 		}
 		if c.IsPrivate {
 			item[attrIsPrivate] = avBool(true)
@@ -1961,8 +1972,13 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 	if err != nil {
 		return nil, err
 	}
-	// min_listener_balance is absent for DMs and for groups without one.
-	balance, err := minimumBalanceFromItem(item)
+	// min_listener_balance and min_speaker_balance are absent for DMs and for
+	// groups without one.
+	listenerBalance, err := minimumBalanceFromItem(item, attrMinListenerBalance)
+	if err != nil {
+		return nil, err
+	}
+	speakerBalance, err := minimumBalanceFromItem(item, attrMinSpeakerBalance)
 	if err != nil {
 		return nil, err
 	}
@@ -1975,8 +1991,9 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 		Title:                  asS(item[attrTitle]),
 		Description:            asS(item[attrDescription]),
 		IsStaffOnly:            asBool(item[attrIsStaffOnly]),
-		MinimumListenerBalance: balance,
+		MinimumListenerBalance: listenerBalance,
 		IsCreatorOnlySpeaker:   asBool(item[attrIsCreatorOnlySpeaker]),
+		MinimumSpeakerBalance:  speakerBalance,
 		IsPrivate:              asBool(item[attrIsPrivate]),
 		LastActivity:           time.Unix(0, nanos).UTC(),
 	}
@@ -2019,8 +2036,8 @@ func membersAttr(members []*commonpb.UserId) types.AttributeValue {
 	return &types.AttributeValueMemberL{Value: values}
 }
 
-// minimumBalanceAttr encodes a group's minimum listener balance as one map
-// attribute, so the requirement is present or absent as a whole: the currency
+// minimumBalanceAttr encodes a group's minimum listener or speaker balance as
+// one map attribute, so the requirement is present or absent as a whole: the currency
 // code, the native amount (a decimal number, written at full float precision),
 // and the mint list — omitted when empty, the encoding of "any mint".
 func minimumBalanceAttr(b *chat.MinimumBalance) types.AttributeValue {
@@ -2038,16 +2055,17 @@ func minimumBalanceAttr(b *chat.MinimumBalance) types.AttributeValue {
 	return &types.AttributeValueMemberM{Value: m}
 }
 
-// minimumBalanceFromItem is the inverse of minimumBalanceAttr: nil, without
-// error, when the item carries no requirement.
-func minimumBalanceFromItem(item map[string]types.AttributeValue) (*chat.MinimumBalance, error) {
-	m, ok := item[attrMinListenerBalance].(*types.AttributeValueMemberM)
+// minimumBalanceFromItem is the inverse of minimumBalanceAttr for the
+// requirement stored under attr: nil, without error, when the item carries
+// none.
+func minimumBalanceFromItem(item map[string]types.AttributeValue, attr string) (*chat.MinimumBalance, error) {
+	m, ok := item[attr].(*types.AttributeValueMemberM)
 	if !ok {
 		return nil, nil
 	}
 	amount, err := parseF(m.Value[attrBalanceNativeAmount])
 	if err != nil {
-		return nil, fmt.Errorf("parsing %s.%s: %w", attrMinListenerBalance, attrBalanceNativeAmount, err)
+		return nil, fmt.Errorf("parsing %s.%s: %w", attr, attrBalanceNativeAmount, err)
 	}
 	b := &chat.MinimumBalance{
 		Currency:     asS(m.Value[attrBalanceCurrency]),

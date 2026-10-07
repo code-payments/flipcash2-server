@@ -95,6 +95,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_ViewMode,
 		testServer_StaffOnlyGroup_Rules,
 		testServer_CreatorOnlyGroup_Rules,
+		testServer_OpenVersusPrivate_NonMember,
 		testServer_PrivateGroup_Keyless,
 		testServer_PrivateGroup_Keyed,
 		testServer_BalanceGatedGroup_Rules,
@@ -252,7 +253,10 @@ func newServerEnvWithTeam(t *testing.T, badges badge.Store, blocklists blocklist
 	balances := balance.NewClient(log, env.accounts, env.ocpBalance)
 
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus, teamUserID, senderOpts...)
-	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats, teamUserID))
+	// Speech is never remembered here, so a rule's change is seen on the very
+	// next send; the window production remembers it for is chat.Access's to
+	// test (see chat.DefaultSpeakerAdmissionTTL).
+	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats, teamUserID), chat.WithSpeakerAdmissionTTL(0))
 	server := messaging.NewServer(log, authz, chats, media, messages, access, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
@@ -2748,9 +2752,8 @@ func testServer_NonMember_Denied(t *testing.T, badges badge.Store, blocklists bl
 // send, no pointer advance, no reaction. One who does not satisfy them is
 // denied the messages but still reads the reaction overlay, which is any
 // reader's (see messaging.Server's overlayStanding), with no self entry; a
-// non-member of a group with no listener rules is denied everything, as any
-// non-member of a DM is (see testServer_NonMember_Denied). See chat.Access
-// for the gates.
+// group with no listener rules is open, so every non-member reads it, and
+// still writes nothing in it. See chat.Access for the gates.
 func testServer_NonMember_Group_Reads(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
@@ -2921,8 +2924,9 @@ func testServer_NonMember_Group_Reads(t *testing.T, badges badge.Store, blocklis
 	readsOverlay(strangerKeys)
 	e.ocpBalance.setErr(nil)
 
-	// A group with no listener rules admits no non-member, however funded:
-	// only a rule can admit one (see chat.Access). Its member still reads.
+	// A group with no listener rules is open: every non-member reads all of
+	// it, funded or not, with no rule evaluated — a balance that cannot be
+	// read does not fail it (see chat.Access). They still write nothing.
 	openID := chat.MustGenerateGroupChatID()
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 		ID:           openID,
@@ -2931,31 +2935,50 @@ func testServer_NonMember_Group_Reads(t *testing.T, badges badge.Store, blocklis
 		Title:        "Legacy",
 		LastActivity: at(1),
 	}))
-	openSent, err := e.sendContentToChat(e.keysA, openID, textContent("members only"), generateClientID())
+	openSent, err := e.sendContentToChat(e.keysA, openID, textContent("open to all"), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, openSent.Result)
-	openGet, err := e.getMessageInChat(strangerKeys, openID, openSent.Message.MessageId)
+	openMsgID := openSent.Message.MessageId
+	openAdd, err := e.addReactionInChat(e.keysA, openID, openMsgID, emoji)
 	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetMessageResponse_DENIED, openGet.Result)
-	openList, err := e.getMessagesByOptionsInChat(strangerKeys, openID, &commonpb.QueryOptions{})
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetMessagesResponse_DENIED, openList.Result)
-	openDelta, err := e.getDeltaInChat(strangerKeys, openID, 0)
-	require.NoError(t, err)
-	require.Len(t, openDelta, 1)
-	require.Equal(t, messagingpb.GetDeltaResponse_DENIED, openDelta[0].Result)
-	openSum, err := e.getReactionSummaryInChat(strangerKeys, openID, openSent.Message.MessageId)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetReactionSummaryResponse_DENIED, openSum.Result)
-	openSums, err := e.getReactionSummariesByIDsInChat(strangerKeys, openID, openSent.Message.MessageId.Value)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetReactionSummariesResponse_DENIED, openSums.Result)
-	openReactors, err := e.getReactorsInChat(strangerKeys, openID, openSent.Message.MessageId, emoji, &commonpb.QueryOptions{})
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetReactorsResponse_DENIED, openReactors.Result)
-	openGet, err = e.getMessageInChat(e.keysA, openID, openSent.Message.MessageId)
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.GetMessageResponse_OK, openGet.Result)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, openAdd.Result)
+	e.ocpBalance.setErr(errors.New("ocp is down"))
+	for _, keys := range []model.KeyPair{strangerKeys, unfundedKeys} {
+		openGet, err := e.getMessageInChat(keys, openID, openMsgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_OK, openGet.Result)
+		require.False(t, openGet.Message.Redacted)
+		require.Equal(t, "open to all", openGet.Message.Content[0].GetText().Text)
+		openList, err := e.getMessagesByOptionsInChat(keys, openID, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_OK, openList.Result)
+		require.Len(t, openList.Messages.GetMessages(), 1)
+		openDelta, err := e.getDeltaInChat(keys, openID, 0)
+		require.NoError(t, err)
+		require.NotEmpty(t, openDelta)
+		require.Equal(t, messagingpb.GetDeltaResponse_OK, openDelta[0].Result)
+		openSum, err := e.getReactionSummaryInChat(keys, openID, openMsgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, openSum.Result)
+		openSums, err := e.getReactionSummariesByIDsInChat(keys, openID, openMsgID.Value)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummariesResponse_OK, openSums.Result)
+		openReactors, err := e.getReactorsInChat(keys, openID, openMsgID, emoji, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactorsResponse_OK, openReactors.Result)
+		require.Len(t, openReactors.Reactors, 1)
+
+		openSend, err := e.sendContentToChat(keys, openID, textContent("intruder"), generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_DENIED, openSend.Result)
+		openReact, err := e.addReactionInChat(keys, openID, openMsgID, emoji)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AddReactionResponse_DENIED, openReact.Result)
+		openAdv, err := e.advancePointerInChat(keys, openID, messagingpb.Pointer_READ, openMsgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AdvancePointerResponse_DENIED, openAdv.Result)
+	}
+	e.ocpBalance.setErr(nil)
 
 	// A balance that cannot be read fails a non-member's read outright, never
 	// waving it through: their admission is the rules' answer, and there is
@@ -3172,9 +3195,10 @@ func testServer_ViewMode(t *testing.T, badges badge.Store, blocklists blocklist.
 	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
 	requireFull(getResp.Message)
 
-	// A group with no listener rules admits no non-member in any form: only a
-	// rule can admit one, to a placeholder as to the rest. Its member may ask
-	// for one.
+	// A group with no listener rules is open: a non-member, funded or not,
+	// reads it in full under FULL and FULL_OR_REDACTED and redacted under
+	// REDACTED, as a qualifying non-member reads a gated group. Its member may
+	// ask for a placeholder too.
 	openID := chat.MustGenerateGroupChatID()
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 		ID:           openID,
@@ -3183,26 +3207,31 @@ func testServer_ViewMode(t *testing.T, badges badge.Store, blocklists blocklist.
 		Title:        "Legacy",
 		LastActivity: at(1),
 	}))
-	openSent, err := e.sendContentToChat(e.keysA, openID, textContent("members only"), generateClientID())
+	openSent, err := e.sendContentToChat(e.keysA, openID, textContent("open to all"), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, openSent.Result)
 	for _, mode := range every {
+		redacted := mode == messagingpb.ViewMode_REDACTED
 		getResp, err := e.getMessageInChatWithMode(strangerKeys, openID, openSent.Message.MessageId, mode)
 		require.NoError(t, err)
-		require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result, mode)
+		require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result, mode)
+		require.Equal(t, redacted, getResp.Message.Redacted, mode)
+		require.Equal(t, !redacted, getResp.Message.Content[0].GetText().GetText() == "open to all", mode)
 		listResp, err := e.getMessagesByOptionsInChatWithMode(strangerKeys, openID, &commonpb.QueryOptions{}, mode)
 		require.NoError(t, err)
-		require.Equal(t, messagingpb.GetMessagesResponse_DENIED, listResp.Result, mode)
+		require.Equal(t, messagingpb.GetMessagesResponse_OK, listResp.Result, mode)
+		require.Len(t, listResp.Messages.GetMessages(), 1, mode)
+		require.Equal(t, redacted, listResp.Messages.GetMessages()[0].Redacted, mode)
 		deltaResps, err := e.getDeltaInChatWithMode(strangerKeys, openID, 0, mode)
 		require.NoError(t, err)
-		require.Len(t, deltaResps, 1)
-		require.Equal(t, messagingpb.GetDeltaResponse_DENIED, deltaResps[0].Result, mode)
+		require.NotEmpty(t, deltaResps)
+		require.Equal(t, messagingpb.GetDeltaResponse_OK, deltaResps[0].Result, mode)
 	}
 	getResp, err = e.getMessageInChatWithMode(e.keysA, openID, openSent.Message.MessageId, messagingpb.ViewMode_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
 	require.True(t, getResp.Message.Redacted)
-	require.NotEqual(t, "members only", getResp.Message.Content[0].GetText().GetText())
+	require.NotEqual(t, "open to all", getResp.Message.Content[0].GetText().GetText())
 
 	// A DM is its members' alone under every mode, and a member may ask for a
 	// placeholder there too.
@@ -3332,8 +3361,9 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
 
-	// ...and revoked, the founding staff member is silenced on the next call,
-	// though they still read.
+	// ...and revoked, the founding staff member is silenced on the next call
+	// (in production, once their remembered admission lapses; see
+	// chat.DefaultSpeakerAdmissionTTL), though they still read.
 	e.accounts.setStaff(e.userA, false)
 	deniedToSpeak(e.keysA)
 	canListen(e.keysA)
@@ -3371,6 +3401,156 @@ func (e *serverEnv) storeChatKey(chats chat.Store, groupID *commonpb.ChatId, use
 		WrappedBy:  userID,
 	})
 	require.NoError(e.t, err)
+}
+
+// testServer_OpenVersusPrivate_NonMember pins, side by side, what a
+// registered non-member with nothing to their name gets from a public group
+// with no listener rules and from a keyed private group, through every
+// message and reaction read under every view mode, and every write. The open
+// group is open: every read answers, in full unless REDACTED is asked for. The
+// private group answers none of them, under any mode, even when its record
+// carries a listener rule the non-member satisfies. Neither takes a write
+// from a non-member.
+func testServer_OpenVersusPrivate_NonMember(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	const emoji = "👍"
+	every := []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED}
+
+	openID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           openID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA},
+		Title:        "Open",
+		LastActivity: at(1),
+	}))
+	openSent, err := e.sendContentToChat(e.keysA, openID, textContent("open to all"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, openSent.Result)
+
+	privateID := e.putPrivateGroup(chats)
+	e.storeChatKey(chats, privateID, e.userA)
+	privateSent, err := e.sendContentToChat(e.keysA, privateID, chatKeyEncryptedContent(1), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, privateSent.Result)
+
+	// A private group whose record carries a staff rule, read by a staff
+	// non-member below: the rule governs nothing in it.
+	ruledID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           ruledID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA},
+		Title:        "Private",
+		IsStaffOnly:  true,
+		IsPrivate:    true,
+		CreatorID:    e.userA,
+		LastActivity: at(1),
+	}))
+	e.storeChatKey(chats, ruledID, e.userA)
+	ruledSent, err := e.sendContentToChat(e.keysA, ruledID, chatKeyEncryptedContent(1), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, ruledSent.Result)
+
+	for _, sent := range []struct {
+		chatID *commonpb.ChatId
+		msgID  *messagingpb.MessageId
+	}{{openID, openSent.Message.MessageId}, {privateID, privateSent.Message.MessageId}, {ruledID, ruledSent.Message.MessageId}} {
+		resp, err := e.addReactionInChat(e.keysA, sent.chatID, sent.msgID, emoji)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AddReactionResponse_OK, resp.Result)
+	}
+
+	strangerID, strangerKeys := e.addUser()
+	staffID, staffKeys := e.addUser()
+	e.accounts.setStaff(staffID, true)
+
+	// The open group: every read answers, for anyone.
+	openMsgID := openSent.Message.MessageId
+	for _, keys := range []model.KeyPair{strangerKeys, staffKeys} {
+		for _, mode := range every {
+			redacted := mode == messagingpb.ViewMode_REDACTED
+			getResp, err := e.getMessageInChatWithMode(keys, openID, openMsgID, mode)
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result, mode)
+			require.Equal(t, redacted, getResp.Message.Redacted, mode)
+			require.Equal(t, !redacted, getResp.Message.Content[0].GetText().GetText() == "open to all", mode)
+			listResp, err := e.getMessagesByOptionsInChatWithMode(keys, openID, &commonpb.QueryOptions{}, mode)
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.GetMessagesResponse_OK, listResp.Result, mode)
+			deltaResps, err := e.getDeltaInChatWithMode(keys, openID, 0, mode)
+			require.NoError(t, err)
+			require.NotEmpty(t, deltaResps)
+			require.Equal(t, messagingpb.GetDeltaResponse_OK, deltaResps[0].Result, mode)
+		}
+		sumResp, err := e.getReactionSummaryInChat(keys, openID, openMsgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, sumResp.Result)
+		sumsResp, err := e.getReactionSummariesByIDsInChat(keys, openID, openMsgID.Value)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummariesResponse_OK, sumsResp.Result)
+		reactorsResp, err := e.getReactorsInChat(keys, openID, openMsgID, emoji, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactorsResponse_OK, reactorsResp.Result)
+	}
+
+	// The private groups: no read answers, for anyone, under any mode.
+	for _, sent := range []struct {
+		chatID *commonpb.ChatId
+		msgID  *messagingpb.MessageId
+	}{{privateID, privateSent.Message.MessageId}, {ruledID, ruledSent.Message.MessageId}} {
+		for _, keys := range []model.KeyPair{strangerKeys, staffKeys} {
+			for _, mode := range every {
+				getResp, err := e.getMessageInChatWithMode(keys, sent.chatID, sent.msgID, mode)
+				require.NoError(t, err)
+				require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result, mode)
+				require.Nil(t, getResp.Message, mode)
+				listResp, err := e.getMessagesByOptionsInChatWithMode(keys, sent.chatID, &commonpb.QueryOptions{}, mode)
+				require.NoError(t, err)
+				require.Equal(t, messagingpb.GetMessagesResponse_DENIED, listResp.Result, mode)
+				deltaResps, err := e.getDeltaInChatWithMode(keys, sent.chatID, 0, mode)
+				require.NoError(t, err)
+				require.Len(t, deltaResps, 1)
+				require.Equal(t, messagingpb.GetDeltaResponse_DENIED, deltaResps[0].Result, mode)
+			}
+			sumResp, err := e.getReactionSummaryInChat(keys, sent.chatID, sent.msgID)
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.GetReactionSummaryResponse_DENIED, sumResp.Result)
+			sumsResp, err := e.getReactionSummariesByIDsInChat(keys, sent.chatID, sent.msgID.Value)
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.GetReactionSummariesResponse_DENIED, sumsResp.Result)
+			reactorsResp, err := e.getReactorsInChat(keys, sent.chatID, sent.msgID, emoji, &commonpb.QueryOptions{})
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.GetReactorsResponse_DENIED, reactorsResp.Result)
+		}
+	}
+
+	// Neither takes a write from a non-member: open to read is not open to
+	// write, which is a member's.
+	for _, sent := range []struct {
+		chatID  *commonpb.ChatId
+		msgID   *messagingpb.MessageId
+		content []*messagingpb.Content
+	}{
+		{openID, openMsgID, textContent("intruder")},
+		{privateID, privateSent.Message.MessageId, chatKeyEncryptedContent(2)},
+	} {
+		sendResp, err := e.sendContentToChat(strangerKeys, sent.chatID, sent.content, generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
+		typingResp, err := e.notifyIsTypingInChat(strangerKeys, sent.chatID, messagingpb.IsTypingNotification_STARTED_TYPING)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
+		advResp, err := e.advancePointerInChat(strangerKeys, sent.chatID, messagingpb.Pointer_READ, sent.msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AdvancePointerResponse_DENIED, advResp.Result)
+		addResp, err := e.addReactionInChat(strangerKeys, sent.chatID, sent.msgID, emoji)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AddReactionResponse_DENIED, addResp.Result)
+		isMember, err := chats.IsMember(e.ctx, sent.chatID, strangerID)
+		require.NoError(t, err)
+		require.False(t, isMember)
+	}
 }
 
 // testServer_PrivateGroup_Keyless pins that nothing is sent in a private

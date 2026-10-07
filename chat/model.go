@@ -240,7 +240,8 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // a group chat: group membership is mutable and lives in its own store records,
 // which no path that reads the canonical record touches. A caller that needs a
 // group's members reads them explicitly via Store.GetMembers. Title,
-// IsStaffOnly, IsCreatorOnlySpeaker, IsPrivate, CreatorID, Description,
+// IsStaffOnly, MinimumListenerBalance, IsCreatorOnlySpeaker,
+// MinimumSpeakerBalance, IsPrivate, CreatorID, Description,
 // ProfilePictureBlobID and CoverPictureBlobID are group-only and zero for DMs.
 //
 // RosterSummary describes the member list without containing it. Like Members,
@@ -264,6 +265,18 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // StartChat refuses speaker rules (see RulesFromProto) — so a group carries
 // it only when its record was written with it. A group that carries it but
 // has no recorded creator admits no one to speak.
+//
+// MinimumSpeakerBalance is a balance a member must hold to speak, nil when
+// the group asks for none. It is stored state, surfaced to clients as a
+// MinimumBalanceRequirement speaker rule (see Rules) and enforced on sends
+// like any other rule, on top of the listener rules. Like
+// IsCreatorOnlySpeaker, no RPC sets it, so a group carries it only when its
+// record was written with it. It is meant to cover MinimumListenerBalance —
+// the same currency and mints, and at least the amount — so that a speak
+// check values the user's balance once (see RuleEvaluator.CanSpeakWithRules);
+// one that does not is still enforced, at the cost of a second valuation. A
+// group with it and no listener rule is open: anyone reads and joins it, and
+// only speaking is gated (see Access).
 //
 // IsPrivate marks a private group (see chatpb.Metadata.is_private): one whose
 // creator admits each member, and whose messages are end-to-end encrypted
@@ -313,6 +326,7 @@ type Chat struct {
 	IsStaffOnly            bool
 	MinimumListenerBalance *MinimumBalance
 	IsCreatorOnlySpeaker   bool
+	MinimumSpeakerBalance  *MinimumBalance
 	IsPrivate              bool
 	CreatorID              *commonpb.UserId
 	Description            string
@@ -451,6 +465,10 @@ func (c *Chat) Clone() *Chat {
 	if c.MinimumListenerBalance != nil {
 		minimumListenerBalance = c.MinimumListenerBalance.Clone()
 	}
+	var minimumSpeakerBalance *MinimumBalance
+	if c.MinimumSpeakerBalance != nil {
+		minimumSpeakerBalance = c.MinimumSpeakerBalance.Clone()
+	}
 	var creatorID *commonpb.UserId
 	if c.CreatorID != nil {
 		creatorID = &commonpb.UserId{Value: append([]byte(nil), c.CreatorID.Value...)}
@@ -475,6 +493,7 @@ func (c *Chat) Clone() *Chat {
 		IsStaffOnly:            c.IsStaffOnly,
 		MinimumListenerBalance: minimumListenerBalance,
 		IsCreatorOnlySpeaker:   c.IsCreatorOnlySpeaker,
+		MinimumSpeakerBalance:  minimumSpeakerBalance,
 		IsPrivate:              c.IsPrivate,
 		CreatorID:              creatorID,
 		Description:            c.Description,

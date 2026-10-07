@@ -370,8 +370,8 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 
 // getPublicChat is GetChat for an unauthenticated caller: the chat's public
 // view, which is what a registered non-member previewing the group gets under
-// REDACTED (see Access.PublicListenerStanding) — the record, and the redacted
-// messaging state when the group carries a listener rule — with none of the
+// REDACTED (see Access.PublicListenerStanding) — the record, and its redacted
+// messaging state, for any public group — with none of the
 // per-viewer fields, since there is no viewer: no hydrated member, no
 // is_hidden, no viewer_state. It is REDACTED or nothing: any other mode is
 // DENIED, as is a DM, before anything is read, so an anonymous caller cannot

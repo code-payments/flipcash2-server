@@ -197,20 +197,17 @@ func TestAccess_PrivateGroup(t *testing.T) {
 	require.False(t, ok)
 	require.Equal(t, ListenerStanding{}, a.PublicListenerStanding(private))
 
-	// The rules admit no one to it either: asked alone, the evaluator refuses
-	// a private group that an empty rule set would open to everyone.
+	// It is not governed by rules, so it has no rule set to evaluate, and the
+	// evaluator asked about it alone refuses to answer rather than find it
+	// open to everyone, as an empty rule set would be.
+	_, hasRuleSet := private.GroupRules().RuleSet()
+	require.False(t, hasRuleSet)
 	for _, u := range []*commonpb.UserId{creator, f.funded} {
 		ok, err = f.rules.CanListen(ctx, private.ID, u)
-		require.NoError(t, err)
-		require.False(t, ok)
-		ok, err = f.rules.CanListenWithRules(ctx, private.ID, private.GroupRules(), u)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, ErrNotGovernedByRules)
 		require.False(t, ok)
 		ok, err = f.rules.CanSpeak(ctx, private.ID, u)
-		require.NoError(t, err)
-		require.False(t, ok)
-		ok, err = f.rules.CanSpeakWithRules(ctx, private.ID, private.GroupRules(), u)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, ErrNotGovernedByRules)
 		require.False(t, ok)
 	}
 
@@ -233,8 +230,10 @@ func TestAccess_PrivateGroup(t *testing.T) {
 		require.Equal(t, ListenerStanding{}, standing, mode)
 	}
 	require.Equal(t, ListenerStanding{}, a.PublicListenerStanding(ruled))
+	_, isRuled := ruled.GroupRules().RuleSet()
+	require.False(t, isRuled)
 	ok, err = f.rules.CanListen(ctx, ruled.ID, f.funded)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrNotGovernedByRules)
 	require.False(t, ok)
 
 	// The creator's envelope is the group's key. Once it is stored every
@@ -735,5 +734,248 @@ func TestStanding_Reading(t *testing.T) {
 		{memberListenerStanding, messagingpb.ViewMode(99), ReadingDenied},
 	} {
 		require.Equal(t, tc.want, tc.standing.Reading(tc.mode), "%+v under %v", tc.standing, tc.mode)
+	}
+}
+
+// TestAccess_Governance is every gate across every kind of chat (see
+// governance): for each, who reads it under each view mode, who speaks in it
+// and what it takes from them, and what an anonymous viewer sees. Each
+// viewer's standing must agree whichever way it is asked — read from the
+// store, off the record, or with the rules in hand — and a chat whose answer
+// never rests on a rule must never value a balance to give it: above all a
+// private group whose record carries rules, which govern nothing in it.
+//
+// Admissions are not remembered, so each mode's answer stands on its own
+// (TestAccess_AdmissionExpires covers the window).
+func TestAccess_Governance(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	team := model.MustGenerateUserID()
+	rules := NewRuleEvaluator(f.accounts, balance.NewClient(zaptest.NewLogger(t), f.accounts, f.ocpBalance), f.chats, team)
+	a := NewAccess(f.chats, rules, WithListenerAdmissionTTL(0))
+
+	// rich users hold exactly the requirement, poor ones a quark less; "in"
+	// users are made members of the chats that list them, "out" users never.
+	bound := func(quarks uint64) *commonpb.UserId {
+		u := model.MustGenerateUserID()
+		f.ocpBalance.set(f.accounts.bind(u), f.usdf, quarks)
+		return u
+	}
+	requirement := ocp_common.ToCoreMintQuarks(accessRequirement)
+	richIn, poorIn := bound(requirement), bound(requirement-1)
+	richOut, poorOut := bound(requirement), bound(requirement-1)
+	creator, peer := bound(requirement), model.MustGenerateUserID()
+	minimum := func() *MinimumBalance { return &MinimumBalance{Currency: "usd", NativeAmount: accessRequirement} }
+
+	modes := []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED}
+	none := ListenerStanding{}
+	preview := ListenerStanding{CanPreview: true}
+	full := ListenerStanding{CanListen: true, CanPreview: true}
+	member := [3]ListenerStanding{memberListenerStanding, memberListenerStanding, memberListenerStanding}
+	outsider := [3]ListenerStanding{none, none, none}
+
+	refused := SpeakerStanding{}
+	plaintext := SpeakerStanding{CanSpeak: true}
+	pairwise := SpeakerStanding{CanSpeak: true, Encryption: EncryptionOptional, Scheme: messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305}
+	chatKey := SpeakerStanding{CanSpeak: true, Encryption: EncryptionRequired, Scheme: messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305}
+
+	type viewer struct {
+		name     string
+		user     *commonpb.UserId
+		member   bool
+		listener [3]ListenerStanding // under modes, in order
+		speaker  SpeakerStanding
+	}
+	dm := func(chatType chatpb.ChatType, u1, u2 *commonpb.UserId) *Chat {
+		return &Chat{ID: MustDeriveDmChatID(chatType, u1, u2), Type: chatType, Members: []*commonpb.UserId{u1, u2}}
+	}
+	group := func(c *Chat) *Chat {
+		c.ID = MustGenerateGroupChatID()
+		c.Type = chatpb.ChatType_GROUP
+		return c
+	}
+
+	for _, tc := range []struct {
+		name       string
+		chat       *Chat
+		keyed      bool
+		governance governance
+		viewers    []viewer
+		public     ListenerStanding
+		// neverValued is a chat whose every answer is given without a rule
+		// being evaluated against a balance.
+		neverValued bool
+	}{
+		{
+			name:       "dm",
+			chat:       dm(chatpb.ChatType_DM, richIn, peer),
+			governance: governanceDm,
+			viewers: []viewer{
+				{"member", richIn, true, member, pairwise},
+				{"peer", peer, true, member, pairwise},
+				{"third party", richOut, false, outsider, refused},
+			},
+			public:      none,
+			neverValued: true,
+		},
+		{
+			name:       "dm with the team",
+			chat:       dm(chatpb.ChatType_DM, poorIn, team),
+			governance: governanceDm,
+			viewers: []viewer{
+				{"member", poorIn, true, member, refused},
+				{"team", team, true, member, refused},
+				{"third party", richOut, false, outsider, refused},
+			},
+			public:      none,
+			neverValued: true,
+		},
+		{
+			name:       "public group with a listener balance",
+			chat:       group(&Chat{MinimumListenerBalance: minimum()}),
+			governance: governancePublicGroup,
+			viewers: []viewer{
+				{"funded member", richIn, true, member, plaintext},
+				{"unfunded member", poorIn, true, member, refused},
+				{"funded non-member", richOut, false, [3]ListenerStanding{full, full, preview}, refused},
+				{"unfunded non-member", poorOut, false, [3]ListenerStanding{preview, preview, preview}, refused},
+			},
+			public: preview,
+		},
+		{
+			name:       "public group with no rules",
+			chat:       group(&Chat{}),
+			governance: governancePublicGroup,
+			viewers: []viewer{
+				{"member", richIn, true, member, plaintext},
+				{"non-member", richOut, false, outsider, refused},
+			},
+			public:      none,
+			neverValued: true,
+		},
+		{
+			// Rules, but no listener rule: nothing opens it to a non-member.
+			name:       "public group with a speaker balance alone",
+			chat:       group(&Chat{MinimumSpeakerBalance: minimum()}),
+			governance: governancePublicGroup,
+			viewers: []viewer{
+				{"funded member", richIn, true, member, plaintext},
+				{"unfunded member", poorIn, true, member, refused},
+				{"funded non-member", richOut, false, outsider, refused},
+			},
+			public: none,
+		},
+		{
+			name:       "creator-only public group",
+			chat:       group(&Chat{IsCreatorOnlySpeaker: true, CreatorID: creator}),
+			governance: governancePublicGroup,
+			viewers: []viewer{
+				{"creator", creator, true, member, plaintext},
+				{"member", richIn, true, member, refused},
+				{"non-member", richOut, false, outsider, refused},
+			},
+			public:      none,
+			neverValued: true,
+		},
+		{
+			name:       "keyless private group",
+			chat:       group(&Chat{IsPrivate: true, CreatorID: creator}),
+			governance: governancePrivateGroup,
+			viewers: []viewer{
+				{"creator", creator, true, member, refused},
+				{"member", poorIn, true, member, refused},
+				{"non-member", richOut, false, outsider, refused},
+			},
+			public:      none,
+			neverValued: true,
+		},
+		{
+			name:       "keyed private group",
+			chat:       group(&Chat{IsPrivate: true, CreatorID: creator}),
+			keyed:      true,
+			governance: governancePrivateGroup,
+			viewers: []viewer{
+				{"creator", creator, true, member, chatKey},
+				{"member", poorIn, true, member, chatKey},
+				{"non-member", richOut, false, outsider, refused},
+			},
+			public:      none,
+			neverValued: true,
+		},
+		{
+			// Its rules govern nothing: the unfunded member speaks, and the
+			// funded non-member they would admit gets nothing.
+			name:       "keyed private group whose record carries rules",
+			chat:       group(&Chat{IsPrivate: true, CreatorID: creator, MinimumListenerBalance: minimum(), MinimumSpeakerBalance: minimum()}),
+			keyed:      true,
+			governance: governancePrivateGroup,
+			viewers: []viewer{
+				{"unfunded member", poorIn, true, member, chatKey},
+				{"funded non-member", richOut, false, outsider, refused},
+			},
+			public:      none,
+			neverValued: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := f.chats.put(tc.chat)
+			for _, v := range tc.viewers {
+				if v.member {
+					f.chats.join(c.ID, v.user)
+				}
+			}
+			if tc.keyed {
+				f.chats.storeKey(c.ID, c.CreatorID)
+			}
+			asked := f.ocpBalance.asked
+
+			gov, ruleSet := governanceOf(c.ID, c.GroupRules())
+			require.Equal(t, tc.governance, gov)
+			_, ruled := c.GroupRules().RuleSet()
+			require.Equal(t, tc.governance != governancePrivateGroup, ruled)
+			if !ruled {
+				require.Equal(t, RuleSet{}, ruleSet)
+			}
+
+			require.Equal(t, tc.public, a.PublicListenerStanding(c))
+
+			for _, v := range tc.viewers {
+				t.Run(v.name, func(t *testing.T) {
+					isMember, err := a.IsMember(ctx, c.ID, v.user)
+					require.NoError(t, err)
+					require.Equal(t, v.member, isMember)
+					isMember, err = a.IsMemberWithChat(ctx, c, v.user)
+					require.NoError(t, err)
+					require.Equal(t, v.member, isMember)
+
+					for i, mode := range modes {
+						want := v.listener[i]
+						standing, err := a.ListenerStanding(ctx, c.ID, v.user, mode)
+						require.NoError(t, err)
+						require.Equal(t, want, standing, "from the store, under %v", mode)
+						standing, err = a.ListenerStandingWithChat(ctx, c, v.user, mode)
+						require.NoError(t, err)
+						require.Equal(t, want, standing, "off the record, under %v", mode)
+						standing, err = a.ListenerStandingWithRules(ctx, c.ID, c.GroupRules(), v.user, mode)
+						require.NoError(t, err)
+						require.Equal(t, want, standing, "with the rules, under %v", mode)
+					}
+					canListen, err := a.CanListen(ctx, c.ID, v.user)
+					require.NoError(t, err)
+					require.Equal(t, v.listener[0].CanListen, canListen)
+
+					speaker, err := a.SpeakerStanding(ctx, c.ID, v.user)
+					require.NoError(t, err)
+					require.Equal(t, v.speaker, speaker)
+					canSpeak, err := a.CanSpeak(ctx, c.ID, v.user)
+					require.NoError(t, err)
+					require.Equal(t, v.speaker.CanSpeak, canSpeak)
+				})
+			}
+
+			if tc.neverValued {
+				require.Equal(t, asked, f.ocpBalance.asked, "a balance was valued")
+			}
+		})
 	}
 }

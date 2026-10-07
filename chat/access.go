@@ -28,17 +28,21 @@ const DefaultListenerAdmissionTTL = 30 * time.Second
 //     user's behalf.
 //   - CanListen: may the user see the chat — its metadata, its messages, its
 //     pointers and reactions. A member always may. A non-member may read a
-//     group, and only a group, if they satisfy its listener rules right now.
+//     public group, and only a public group, if they satisfy its listener
+//     rules right now.
 //   - CanSpeak: may the user produce something other members see — a message,
-//     an edit, a deletion, a typing notification. Members only, and only those
-//     who satisfy the chat's listener and speaker rules.
+//     an edit, a deletion, a typing notification. Members only, and only as
+//     the chat's governance allows.
 //
 // Membership is always checked first: it is the cheaper check (a keyed read,
 // cached for a DM), and it answers for a member without evaluating a rule — a
 // member whose balance has since dipped under the group's requirement is still
 // a member and still reads (see messaging/access.go for why membership stands
-// for the rules on a member's reads). Rules are evaluated only where they
-// decide the answer: for a non-member's read of a group, and for any send.
+// for the rules on a member's reads). Past membership, each gate switches on
+// how the chat is governed (see governance): a DM, a public group governed by
+// its rules, or a private group governed by its creator and key. Rules are
+// evaluated only where they decide the answer: for a non-member's read of a
+// public group, and for a send in a DM or a public group.
 //
 // Evaluating a group's listener rules on behalf of a non-member is what lets
 // someone who satisfies them preview the group before joining. It is also a
@@ -52,9 +56,8 @@ const DefaultListenerAdmissionTTL = 30 * time.Second
 // does not extend the window, so a reader who keeps reading is re-evaluated
 // once per window, not never.
 //
-// A DM admits its two members and no one else; its rules are nil, and nil
-// rules admit everyone, so a DM must never reach the rules fallback. A group
-// without listener rules admits no non-member either: the rules are the only
+// A DM admits its two members and no one else (see governanceDm). A public
+// group without listener rules admits no non-member either: the rules are the only
 // thing that can admit a non-member, and an empty set is not taken as
 // admitting everyone, even though that is what the RuleEvaluator says of it.
 // Every group created through StartChat carries a minimum listener balance
@@ -77,13 +80,12 @@ const DefaultListenerAdmissionTTL = 30 * time.Second
 //
 // A private group (see Chat.IsPrivate) is its members' alone in every form:
 // no non-member listens to it or previews it, whatever mode they ask under,
-// and it has no public view. That is decided on the flag itself, before its
-// rules are looked at. StartChat writes a private group with no rules, which
-// would keep non-members out by the rule above, but a record written with
-// one must not open it. Its record is still shown to any registered user
-// (see Server.GetChat), which is how a user sees what they would ask to join.
-// Its members speak in it on membership and the group's key alone (see
-// SpeakerStanding): the rules are never evaluated for one.
+// and it has no public view. That is decided by its governance
+// (governancePrivateGroup), on the flag itself, and never by its rules: it
+// has no RuleSet, so a record written with rules cannot open it. Its record is still
+// shown to any registered user (see Server.GetChat), which is how a user sees
+// what they would ask to join. Its members speak in it on membership and the
+// group's key alone (see privateGroupSpeaker).
 //
 // A chat that does not exist admits no one: IsMember, CanListen and CanSpeak all
 // report false, not ErrChatNotFound, for a chat ID nothing is stored under. A
@@ -100,7 +102,7 @@ type Access struct {
 	admittedTTL time.Duration
 
 	// keyed remembers, by group, that a private group has its key (see
-	// SpeakerStanding). Positive entries only, held for the life of the process: a
+	// privateGroupSpeaker). Positive entries only, held for the life of the process: a
 	// group that has its key has it for good.
 	keyed *ttlcache.Cache
 }
@@ -251,7 +253,7 @@ func (a *Access) CanListenWithRules(ctx context.Context, chatID *commonpb.ChatId
 // for a chat that does not exist.
 func (a *Access) ListenerStanding(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (ListenerStanding, error) {
 	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(ctx context.Context) (GroupRules, error) {
-		return a.chats.GetGroupRules(ctx, chatID)
+		return a.rules.rulesFor(ctx, chatID, userID)
 	})
 }
 
@@ -259,8 +261,9 @@ func (a *Access) ListenerStanding(ctx context.Context, chatID *commonpb.ChatId, 
 // (read off a canonical record it loaded for its own purposes, see
 // Chat.GroupRules), so they are not read a second time. The chat is taken as
 // existing: a caller that has its rules has already told NOT_FOUND from
-// everything else. A nil rules.Rules is a chat with none, which admits no
-// non-member in any form (see Access). On error the standing is zero.
+// everything else. A public group whose rules carry no listener rule admits
+// no non-member in any form, and a private group none whatever its rules (see
+// Access). On error the standing is zero.
 func (a *Access) ListenerStandingWithRules(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules, userID *commonpb.UserId, mode messagingpb.ViewMode) (ListenerStanding, error) {
 	return a.standing(ctx, chatID, userID, mode, a.storedMembership(chatID, userID), func(context.Context) (GroupRules, error) {
 		return rules, nil
@@ -289,7 +292,8 @@ func (a *Access) ListenerStandingWithChat(ctx context.Context, c *Chat, userID *
 // rule may be previewed, and nothing else admits them in any form. Nothing
 // is read: the rules come off the record.
 func (a *Access) PublicListenerStanding(c *Chat) ListenerStanding {
-	if !IsGroupChatID(c.ID) || c.IsPrivate || len(c.Rules().GetListener()) == 0 {
+	gov, rules := governanceOf(c.ID, c.GroupRules())
+	if gov != governancePublicGroup || !rules.hasListenerRules() {
 		return ListenerStanding{}
 	}
 	return ListenerStanding{CanPreview: true}
@@ -320,12 +324,55 @@ func (a *Access) recordMembership(c *Chat, userID *commonpb.UserId) func(context
 	return func(context.Context) (bool, error) { return c.HasMember(userID), nil }
 }
 
+// governance is how a chat decides who reads and speaks in it beyond its
+// roster. Every gate that looks past membership switches on it, so each kind
+// of chat is answered in one named place rather than by exceptions to the
+// others:
+//
+//   - governanceDm: a DM. Its two members are its audience, fixed by its ID;
+//     no one else is admitted in any form. Its members are evaluated against
+//     the rules derived for it (a Never speaker rule in a DM with the team
+//     account, see RuleEvaluator.RulesOf), and speak plaintext or under the
+//     pairwise scheme.
+//   - governancePublicGroup: a public group. A non-member is admitted, in
+//     full or redacted, by its listener rules alone, and only if it carries
+//     one; its members speak plaintext when they satisfy its listener and
+//     speaker rules.
+//   - governancePrivateGroup: a private group (see Chat.IsPrivate). Its
+//     creator admits its members, so no non-member is admitted in any form,
+//     and whether its members speak is decided by its key; rules are never
+//     evaluated for it, whatever its record carries (see RuleSet).
+type governance uint8
+
+const (
+	governanceDm governance = iota
+	governancePublicGroup
+	governancePrivateGroup
+)
+
+// governanceOf returns how chatID is governed (see governance) and, for a chat
+// governed by rules — a DM's derived ones included — the rule set to evaluate.
+// The rule set is zero for a private group, which has none. Privacy is a
+// group's alone (see Chat.IsPrivate), so it is decided first.
+func governanceOf(chatID *commonpb.ChatId, rules GroupRules) (governance, RuleSet) {
+	ruleSet, ruled := rules.RuleSet()
+	switch {
+	case !ruled:
+		return governancePrivateGroup, RuleSet{}
+	case !IsGroupChatID(chatID):
+		return governanceDm, ruleSet
+	default:
+		return governancePublicGroup, ruleSet
+	}
+}
+
 // standing is the shared shape of ListenerStanding, ListenerStandingWithRules and
-// ListenerStandingWithChat: membership, then for a non-member of a group only, the
-// remembered or freshly evaluated listener rules. membership answers the
-// membership question — from the store, or off a record the caller holds — and
-// loadRules supplies the group's rules likewise, called only when they decide
-// the answer; ErrChatNotFound from it is a plain refusal.
+// ListenerStandingWithChat: membership, which answers for a member of any chat
+// without the rules being read, then for a non-member, what the chat's
+// governance admits them to. membership answers the membership question —
+// from the store, or off a record the caller holds — and loadRules supplies
+// the chat's rules likewise, called only for a non-member; ErrChatNotFound
+// from it is a plain refusal.
 func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode, membership func(context.Context) (bool, error), loadRules func(context.Context) (GroupRules, error)) (ListenerStanding, error) {
 	isMember, err := membership(ctx)
 	if err != nil {
@@ -335,19 +382,12 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 		return memberListenerStanding, nil
 	}
 
-	// Only a group admits a non-member. A DM's rules are nil and would admit
-	// everyone, so the fallback is never reached for one.
-	if !IsGroupChatID(chatID) {
-		return ListenerStanding{}, nil
-	}
-
-	// A redacted read is answered without the rules' verdict, so a remembered
-	// admission is neither consulted nor made for it.
-	evaluate := mode != messagingpb.ViewMode_REDACTED
-
-	key := admissionKey(chatID, userID)
-	if evaluate && a.admitted != nil {
-		if _, ok := a.admitted.Get(key); ok {
+	// A remembered admission answers before the rules are read: only a
+	// non-member of a group governed by its rules is ever remembered (see
+	// publicGroupNonMember). A redacted read is answered without the rules'
+	// verdict, so it neither consults nor makes one.
+	if mode != messagingpb.ViewMode_REDACTED && a.admitted != nil {
+		if _, ok := a.admitted.Get(admissionKey(chatID, userID)); ok {
 			return ListenerStanding{CanListen: true, CanPreview: true}, nil
 		}
 	}
@@ -359,16 +399,34 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 	if err != nil {
 		return ListenerStanding{}, err
 	}
-	// A private group admits no non-member in any form, whatever its rules.
-	// Otherwise, no listener rules, no admission of any kind: only a rule can
-	// admit a non-member (see above).
-	if rules.IsPrivate || len(rules.Rules.GetListener()) == 0 {
+	switch gov, ruleSet := governanceOf(chatID, rules); gov {
+	case governanceDm:
+		// Its two members are its audience; its rules, derived for them, say
+		// nothing of anyone else.
+		return ListenerStanding{}, nil
+	case governancePublicGroup:
+		return a.publicGroupNonMember(ctx, chatID, ruleSet, userID, mode)
+	default:
+		// Its creator admits its audience, so no non-member reads it in any
+		// form, whatever rules its record carries.
 		return ListenerStanding{}, nil
 	}
-	if !evaluate {
+}
+
+// publicGroupNonMember is a non-member's standing in a group governed by its rules
+// (see Access): nothing unless the group carries a listener rule, since only a
+// rule opens a group to a non-member; under REDACTED a preview, without the
+// rules being evaluated; otherwise a full read for whoever satisfies the
+// listener rules, remembered for listenerAdmissionTTL, and a preview for
+// whoever does not.
+func (a *Access) publicGroupNonMember(ctx context.Context, chatID *commonpb.ChatId, rules RuleSet, userID *commonpb.UserId, mode messagingpb.ViewMode) (ListenerStanding, error) {
+	if !rules.hasListenerRules() {
+		return ListenerStanding{}, nil
+	}
+	if mode == messagingpb.ViewMode_REDACTED {
 		return ListenerStanding{CanPreview: true}, nil
 	}
-	ok, err := a.rules.CanListenWithRules(ctx, chatID, rules, userID)
+	ok, err := a.rules.CanListenWithRules(ctx, rules, userID)
 	if err != nil {
 		return ListenerStanding{}, err
 	}
@@ -376,7 +434,7 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 		return ListenerStanding{CanPreview: true}, nil
 	}
 	if a.admitted != nil {
-		a.admitted.SetWithTTL(key, struct{}{}, a.admittedTTL)
+		a.admitted.SetWithTTL(admissionKey(chatID, userID), struct{}{}, a.admittedTTL)
 	}
 	return ListenerStanding{CanListen: true, CanPreview: true}, nil
 }
@@ -435,36 +493,11 @@ func (a *Access) CanSpeak(ctx context.Context, chatID *commonpb.ChatId, userID *
 	return speaker.CanSpeak, err
 }
 
-// SpeakerStanding is userID's standing to speak in chatID (see SpeakerStanding): they are a
-// member, and they satisfy the chat's listener and speaker rules. Membership
-// is checked first, so a chat's rules are never evaluated for a send on
-// behalf of a non-member. It is the zero value, not an error, for a chat that
-// does not exist.
-//
-// A member of a private group (see Chat.IsPrivate) speaks exactly when the
-// group has its key — its creator has stored a key envelope (see KeyEnvelope)
-// — and the rules are never evaluated for one: the RuleEvaluator admits no
-// one to a private group, since no rule is what admitted its members, so the
-// answer is made here on membership and the key alone. A keyless group's
-// members are refused, and it is every gate CanSpeak stands behind at once
-// that refuses them: a send, an edit, a deletion, a typing notification, and
-// mention suggestions. A keyed group's members speak with EncryptionRequired
-// under the chat key's scheme, so messaging admits nothing but encrypted
-// content there (see messaging.Server.SendMessage). Whether a member holds an
-// envelope of their own is not asked: the key is the group's, and a member
-// without one cannot read what they would write, which is their client's to
-// notice.
-//
-// The key is found with the rules read every gate makes, which a store caches
-// with the rules, and then one strongly consistent point read of the
-// creator's envelope. A group found keyed is remembered for the life of the
-// process and never read again: the creator's envelope is never deleted (see
-// Store.RemoveGroupMember), so a group that has its key has it for good. A
-// group found keyless is not remembered, so its first message after the
-// creator stores the key is admitted at once, and until then each of its
-// members' refused sends costs that one read. A private group with no
-// recorded creator can have no key, since the creator's envelope is the only
-// possible first one.
+// SpeakerStanding is userID's standing to speak in chatID (see SpeakerStanding): a
+// non-member never speaks, and a member speaks as the chat's governance
+// decides (see governance). Membership is checked first, so a chat's rules
+// are never evaluated for a send on behalf of a non-member. It is the zero
+// value, not an error, for a chat that does not exist.
 func (a *Access) SpeakerStanding(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (SpeakerStanding, error) {
 	isMember, err := a.chats.IsMember(ctx, chatID, userID)
 	if err != nil || !isMember {
@@ -479,23 +512,24 @@ func (a *Access) SpeakerStanding(ctx context.Context, chatID *commonpb.ChatId, u
 	if err != nil {
 		return SpeakerStanding{}, err
 	}
-	if rules.IsPrivate {
-		keyed, err := a.hasKey(ctx, chatID, rules)
-		if err != nil || !keyed {
-			return SpeakerStanding{}, err
-		}
-		return SpeakerStanding{
-			CanSpeak:   true,
-			Encryption: EncryptionRequired,
-			Scheme:     messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305,
-		}, nil
+	switch gov, ruleSet := governanceOf(chatID, rules); gov {
+	case governanceDm:
+		return a.dmSpeaker(ctx, ruleSet, userID)
+	case governancePublicGroup:
+		return a.publicGroupSpeaker(ctx, ruleSet, userID)
+	default:
+		return a.privateGroupSpeaker(ctx, chatID, rules)
 	}
-	ok, err := a.rules.CanSpeakWithRules(ctx, chatID, rules, userID)
+}
+
+// dmSpeaker is a DM member's standing to speak: they speak when they satisfy
+// the DM's derived rules — always, except in a DM with the team account, whose
+// Never rule no one satisfies — and the DM takes plaintext or content under
+// its pairwise scheme, which either member's client derives on its own.
+func (a *Access) dmSpeaker(ctx context.Context, rules RuleSet, userID *commonpb.UserId) (SpeakerStanding, error) {
+	ok, err := a.rules.CanSpeakWithRules(ctx, rules, userID)
 	if err != nil || !ok {
 		return SpeakerStanding{}, err
-	}
-	if IsGroupChatID(chatID) {
-		return SpeakerStanding{CanSpeak: true}, nil
 	}
 	return SpeakerStanding{
 		CanSpeak:   true,
@@ -504,8 +538,53 @@ func (a *Access) SpeakerStanding(ctx context.Context, chatID *commonpb.ChatId, u
 	}, nil
 }
 
+// publicGroupSpeaker is a public group member's standing to speak: they speak when
+// they satisfy its listener and speaker rules, evaluated against their state
+// now, and the group takes plaintext alone.
+func (a *Access) publicGroupSpeaker(ctx context.Context, rules RuleSet, userID *commonpb.UserId) (SpeakerStanding, error) {
+	ok, err := a.rules.CanSpeakWithRules(ctx, rules, userID)
+	if err != nil || !ok {
+		return SpeakerStanding{}, err
+	}
+	return SpeakerStanding{CanSpeak: true}, nil
+}
+
+// privateGroupSpeaker is a private group member's standing to speak: they speak
+// exactly when the group has its key — its creator has stored a key envelope
+// (see KeyEnvelope) — and no rule is evaluated, since none admitted them. A
+// keyless group's members are refused, and it is every gate CanSpeak stands
+// behind at once that refuses them: a send, an edit, a deletion, a typing
+// notification, and mention suggestions. A keyed group's members speak with
+// EncryptionRequired under the chat key's scheme, so messaging admits nothing
+// but encrypted content there (see messaging.Server.SendMessage). Whether a
+// member holds an envelope of their own is not asked: the key is the group's,
+// and a member without one cannot read what they would write, which is their
+// client's to notice.
+//
+// The key is found with the rules read every gate makes, which a store caches
+// with the rules, and then one strongly consistent point read of the
+// creator's envelope. A group found keyed is remembered for the life of the
+// process and never read again: the creator's envelope is never deleted (see
+// Store.RemoveGroupMember), so a group that has its key has it for good. A
+// group found keyless is not remembered, so its first message after the
+// creator stores the key is admitted at once, and until then each of its
+// members' refused sends costs that one read. A private group with no
+// recorded creator can have no key, since the creator's envelope is the only
+// possible first one.
+func (a *Access) privateGroupSpeaker(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules) (SpeakerStanding, error) {
+	keyed, err := a.hasKey(ctx, chatID, rules)
+	if err != nil || !keyed {
+		return SpeakerStanding{}, err
+	}
+	return SpeakerStanding{
+		CanSpeak:   true,
+		Encryption: EncryptionRequired,
+		Scheme:     messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305,
+	}, nil
+}
+
 // hasKey reports whether the private group whose rules the caller holds has
-// its chat key (see SpeakerStanding). It is false for a public group.
+// its chat key (see privateGroupSpeaker). It is false for a public group.
 func (a *Access) hasKey(ctx context.Context, chatID *commonpb.ChatId, rules GroupRules) (bool, error) {
 	if !rules.IsPrivate {
 		return false, nil

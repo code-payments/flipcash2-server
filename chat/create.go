@@ -156,7 +156,7 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		// INVALID_RULES like any other (see RulesFromProto) rather than failed:
 		// the currency is the client's choice, and no group is written that no one
 		// could ever be admitted to.
-		satisfied, err := s.rules.CanSpeakWithRules(ctx, chatID, GroupRules{Rules: rules, CreatorID: userID}, userID)
+		satisfied, err := s.rules.CanSpeakWithRules(ctx, NewRuleSet(rules, userID), userID)
 		if errors.Is(err, balance.ErrUnsupportedCurrency) {
 			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_INVALID_RULES}, nil
 		}

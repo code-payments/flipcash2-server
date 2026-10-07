@@ -475,7 +475,7 @@ func TestRuleEvaluator(t *testing.T) {
 	staff.staff[string(staffUser.Value)] = true
 	asked := staff.asked
 	for _, u := range []*commonpb.UserId{staffUser, nonStaffUser} {
-		ok, err = e.CanSpeakWithRules(ctx, MustGenerateGroupChatID(), GroupRules{Rules: neverSpeak}, u)
+		ok, err = e.CanSpeakWithRules(ctx, NewRuleSet(neverSpeak, nil), u)
 		require.NoError(t, err)
 		require.False(t, ok)
 	}
@@ -525,11 +525,11 @@ func TestRuleEvaluator(t *testing.T) {
 	// with no read: those of a group not written yet (StartChat's) carry the
 	// caller as its creator.
 	reads = chats.reads
-	creatorOnlyRules := GroupRules{Rules: creatorOnly.Rules(), CreatorID: creator}
-	ok, err = e.CanSpeakWithRules(ctx, MustGenerateGroupChatID(), creatorOnlyRules, creator)
+	creatorOnlyRules := NewRuleSet(creatorOnly.Rules(), creator)
+	ok, err = e.CanSpeakWithRules(ctx, creatorOnlyRules, creator)
 	require.NoError(t, err)
 	require.True(t, ok)
-	ok, err = e.CanSpeakWithRules(ctx, MustGenerateGroupChatID(), creatorOnlyRules, nonStaffUser)
+	ok, err = e.CanSpeakWithRules(ctx, creatorOnlyRules, nonStaffUser)
 	require.NoError(t, err)
 	require.False(t, ok)
 	require.Equal(t, reads, chats.reads)
@@ -819,9 +819,9 @@ func TestRuleEvaluator_MinimumSpeakerBalance(t *testing.T) {
 	ocpBalance.err = nil
 
 	// A private group's speakers are not the rules' to decide, whatever its
-	// record carries (see RuleEvaluator).
+	// record carries (see RuleSet).
 	private := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, MinimumSpeakerBalance: &MinimumBalance{Currency: "usd", NativeAmount: requirement}})
 	ok, err = e.CanSpeak(ctx, private.ID, holder)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrNotGovernedByRules)
 	require.False(t, ok)
 }

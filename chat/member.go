@@ -82,12 +82,12 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	// A private group's caller is its creator by now, whom no rule gates.
-	if !isMember && !c.IsPrivate {
-		// The rules come from the canonical record already in hand rather than
-		// a second read through the evaluator: the record is what they are
-		// projected from.
-		canListen, err := s.rules.CanListenWithRules(ctx, c.ID, c.GroupRules(), userID)
+	// The rules come from the canonical record already in hand rather than a
+	// second read through the evaluator: the record is what they are projected
+	// from. A private group has none to evaluate, and its caller is its
+	// creator by now.
+	if ruleSet, ruled := c.GroupRules().RuleSet(); !isMember && ruled {
+		canListen, err := s.rules.CanListenWithRules(ctx, ruleSet, userID)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure evaluating chat rules")
 			return nil, status.Error(codes.Internal, "")

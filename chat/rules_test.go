@@ -313,11 +313,43 @@ func TestChat_Rules(t *testing.T) {
 	rules.GetListener()[1].GetMinimumBalance().GetMints()[0].Value[0] = 0
 	require.Equal(t, byte(7), both.MinimumListenerBalance.Mints[0].Value[0])
 
+	// A minimum speaker balance is one speaker rule, carrying the requirement
+	// as stored, and adds nothing to the listener rules.
+	speakerGated := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumSpeakerBalance: &MinimumBalance{
+		Currency:     "eur",
+		NativeAmount: 5,
+		Mints:        []*commonpb.PublicKey{usdfMint},
+	}}
+	rules = speakerGated.Rules()
+	require.Empty(t, rules.GetListener())
+	require.Len(t, rules.GetSpeaker(), 1)
+	require.NoError(t, rules.Validate())
+	balance = rules.GetSpeaker()[0].GetMinimumBalance()
+	require.NotNil(t, balance)
+	require.Equal(t, "eur", balance.GetAmount().GetCurrency())
+	require.Equal(t, float64(5), balance.GetAmount().GetNativeAmount())
+	require.Len(t, balance.GetMints(), 1)
+	require.Equal(t, usdfMint.Value, balance.GetMints()[0].GetValue())
+	require.NoError(t, protoutil.ProtoEqualError(rules, speakerGated.ToProto().GetRules()))
+
+	// Beside a creator-only flag and listener requirements, the speaker rules
+	// are listed cheapest first too: the creator before the balance.
+	everything := both.Clone()
+	everything.IsCreatorOnlySpeaker = true
+	everything.MinimumSpeakerBalance = speakerGated.MinimumSpeakerBalance.Clone()
+	rules = everything.Rules()
+	require.Len(t, rules.GetListener(), 2)
+	require.Len(t, rules.GetSpeaker(), 2)
+	require.NotNil(t, rules.GetSpeaker()[0].GetCreator())
+	require.NotNil(t, rules.GetSpeaker()[1].GetMinimumBalance())
+	require.NoError(t, rules.Validate())
+
 	// The requirements are group-only: a DM record that somehow carries them
 	// still has no rules.
 	flaggedDm := dm.Clone()
 	flaggedDm.IsStaffOnly = true
 	flaggedDm.MinimumListenerBalance = gated.MinimumListenerBalance
+	flaggedDm.MinimumSpeakerBalance = speakerGated.MinimumSpeakerBalance
 	require.Nil(t, flaggedDm.Rules())
 }
 
@@ -344,6 +376,27 @@ func TestChat_Clone_MinimumListenerBalance(t *testing.T) {
 	require.Equal(t, float64(10), c.MinimumListenerBalance.NativeAmount)
 	require.Len(t, c.MinimumListenerBalance.Mints, 1)
 	require.Equal(t, byte(1), c.MinimumListenerBalance.Mints[0].Value[0])
+}
+
+func TestChat_Clone_MinimumSpeakerBalance(t *testing.T) {
+	// A group without a requirement clones to one without.
+	plain := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP}
+	require.Nil(t, plain.Clone().MinimumSpeakerBalance)
+
+	// A clone carries an equal, independent copy of the requirement.
+	c := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumSpeakerBalance: &MinimumBalance{
+		Currency:     "eur",
+		NativeAmount: 10,
+		Mints:        []*commonpb.PublicKey{{Value: bytes.Repeat([]byte{1}, 32)}},
+	}}
+	cloned := c.Clone()
+	require.Equal(t, c.MinimumSpeakerBalance, cloned.MinimumSpeakerBalance)
+	require.NotSame(t, c.MinimumSpeakerBalance, cloned.MinimumSpeakerBalance)
+
+	cloned.MinimumSpeakerBalance.NativeAmount = 11
+	cloned.MinimumSpeakerBalance.Mints[0].Value[0] = 2
+	require.Equal(t, float64(10), c.MinimumSpeakerBalance.NativeAmount)
+	require.Equal(t, byte(1), c.MinimumSpeakerBalance.Mints[0].Value[0])
 }
 
 func TestRuleEvaluator(t *testing.T) {
@@ -677,4 +730,98 @@ func TestRuleEvaluator_MinimumBalance(t *testing.T) {
 	ok, err = e.CanListen(ctx, gated.ID, holder)
 	require.NoError(t, err)
 	require.True(t, ok)
+}
+
+func TestRuleEvaluator_MinimumSpeakerBalance(t *testing.T) {
+	ctx := context.Background()
+	accounts := &fakeAccounts{staff: make(map[string]bool), keys: make(map[string]*commonpb.PublicKey)}
+	ocpBalance := &fakeOcpBalance{ledger: make(map[string]map[string]uint64)}
+	chats := &fakeChats{chats: make(map[string]*Chat)}
+	e := NewRuleEvaluator(accounts, balance.NewClient(zaptest.NewLogger(t), accounts, ocpBalance), chats, nil)
+
+	usdf := model.MustGenerateKeyPair().Proto()
+
+	const requirement = 10
+	holder := model.MustGenerateUserID()
+	ocpBalance.set(accounts.bind(holder), usdf, ocp_common.ToCoreMintQuarks(requirement))
+	underfunded := model.MustGenerateUserID()
+	ocpBalance.set(accounts.bind(underfunded), usdf, ocp_common.ToCoreMintQuarks(requirement)-1)
+	unbound := model.MustGenerateUserID()
+
+	// A speaker balance gates speaking alone: everyone listens, and only a
+	// holder of the requirement speaks. Listening asks OCP nothing.
+	gated := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumSpeakerBalance: &MinimumBalance{Currency: "usd", NativeAmount: requirement}})
+	asked := ocpBalance.asked
+	for _, u := range []*commonpb.UserId{holder, underfunded, unbound} {
+		ok, err := e.CanListen(ctx, gated.ID, u)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	require.Equal(t, asked, ocpBalance.asked)
+	ok, err := e.CanSpeak(ctx, gated.ID, holder)
+	require.NoError(t, err)
+	require.True(t, ok)
+	for _, u := range []*commonpb.UserId{underfunded, unbound} {
+		ok, err := e.CanSpeak(ctx, gated.ID, u)
+		require.NoError(t, err)
+		require.False(t, ok)
+	}
+
+	// Beside a creator-only rule, the cheaper creator check runs first: a
+	// non-creator is refused without a valuation, and the creator must still
+	// hold the balance.
+	creatorOnly := chats.put(&Chat{
+		ID:                    MustGenerateGroupChatID(),
+		Type:                  chatpb.ChatType_GROUP,
+		IsCreatorOnlySpeaker:  true,
+		CreatorID:             underfunded,
+		MinimumSpeakerBalance: &MinimumBalance{Currency: "usd", NativeAmount: requirement},
+	})
+	asked = ocpBalance.asked
+	ok, err = e.CanSpeak(ctx, creatorOnly.ID, holder)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Equal(t, asked, ocpBalance.asked)
+	ok, err = e.CanSpeak(ctx, creatorOnly.ID, underfunded)
+	require.NoError(t, err)
+	require.False(t, ok)
+	ocpBalance.set(accounts.keys[string(underfunded.Value)], usdf, ocp_common.ToCoreMintQuarks(requirement))
+	ok, err = e.CanSpeak(ctx, creatorOnly.ID, underfunded)
+	require.NoError(t, err)
+	require.True(t, ok)
+	ocpBalance.set(accounts.keys[string(underfunded.Value)], usdf, ocp_common.ToCoreMintQuarks(requirement)-1)
+
+	// Speaker rules apply on top of listener rules: a listener balance and a
+	// speaker balance are both required to speak, each valued on its own.
+	both := chats.put(&Chat{
+		ID:                     MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		MinimumListenerBalance: &MinimumBalance{Currency: "usd", NativeAmount: requirement / 2},
+		MinimumSpeakerBalance:  &MinimumBalance{Currency: "usd", NativeAmount: requirement},
+	})
+	ok, err = e.CanListen(ctx, both.ID, underfunded)
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, err = e.CanSpeak(ctx, both.ID, underfunded)
+	require.NoError(t, err)
+	require.False(t, ok)
+	asked = ocpBalance.asked
+	ok, err = e.CanSpeak(ctx, both.ID, holder)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, asked+2, ocpBalance.asked)
+
+	// A balance that cannot be read is an error, never a pass.
+	ocpBalance.err = errors.New("unavailable")
+	ok, err = e.CanSpeak(ctx, gated.ID, holder)
+	require.Error(t, err)
+	require.False(t, ok)
+	ocpBalance.err = nil
+
+	// A private group's speakers are not the rules' to decide, whatever its
+	// record carries (see RuleEvaluator).
+	private := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, MinimumSpeakerBalance: &MinimumBalance{Currency: "usd", NativeAmount: requirement}})
+	ok, err = e.CanSpeak(ctx, private.ID, holder)
+	require.NoError(t, err)
+	require.False(t, ok)
 }

@@ -42,6 +42,7 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_GroupChat_PutAndGet,
 		testStore_GroupChat_StaffOnly,
 		testStore_GroupChat_MinimumListenerBalance,
+		testStore_GroupChat_MinimumSpeakerBalance,
 		testStore_GroupChat_Rules,
 		testStore_GroupChat_Creator,
 		testStore_GroupChat_Picture,
@@ -646,6 +647,114 @@ func testStore_GroupChat_MinimumListenerBalance(t *testing.T, s chat.Store) {
 		Members:                []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID()},
 		MinimumListenerBalance: gated.MinimumListenerBalance,
 		LastActivity:           at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, dm))
+	got, err = s.GetChatByID(ctx, dm.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.Rules())
+}
+
+func testStore_GroupChat_MinimumSpeakerBalance(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	// A group has no minimum speaker balance unless it was written with one.
+	plain := putGroupChat(t, s, "Weekend Trip", at(100), model.MustGenerateUserID())
+	got, err := s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.MinimumSpeakerBalance)
+
+	// The requirement round-trips as stored, independent of a listener
+	// requirement beside it.
+	usdfMint := &commonpb.PublicKey{Value: randomBytes(32)}
+	creator := model.MustGenerateUserID()
+	gated := &chat.Chat{
+		ID:      chat.MustGenerateGroupChatID(),
+		Type:    chatpb.ChatType_GROUP,
+		Members: []*commonpb.UserId{creator},
+		Title:   "Speakers",
+		MinimumListenerBalance: &chat.MinimumBalance{
+			Currency:     "usd",
+			NativeAmount: 1,
+		},
+		IsCreatorOnlySpeaker: true,
+		MinimumSpeakerBalance: &chat.MinimumBalance{
+			Currency:     "eur",
+			NativeAmount: 12.34,
+			Mints:        []*commonpb.PublicKey{usdfMint},
+		},
+		CreatorID:    creator,
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, gated))
+
+	got, err = s.GetChatByID(ctx, gated.ID)
+	require.NoError(t, err)
+	require.Equal(t, gated.MinimumSpeakerBalance, got.MinimumSpeakerBalance)
+	require.True(t, proto.Equal(gated.MinimumListenerBalance.ToProto(), got.MinimumListenerBalance.ToProto()))
+	require.True(t, got.IsCreatorOnlySpeaker)
+
+	// The stored record is independent of the one read.
+	got.MinimumSpeakerBalance.Mints[0].Value[0]++
+	again, err := s.GetChatByID(ctx, gated.ID)
+	require.NoError(t, err)
+	require.Equal(t, usdfMint.Value, again.MinimumSpeakerBalance.Mints[0].Value)
+
+	// The rules read projects it as a speaker rule after the creator rule,
+	// with the listener rule untouched, and matches the canonical record.
+	rules, err := s.GetGroupRules(ctx, gated.ID)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(gated.Rules(), rules.Rules))
+	require.Len(t, rules.Rules.GetListener(), 1)
+	require.True(t, proto.Equal(gated.MinimumListenerBalance.ToProto(), rules.Rules.GetListener()[0].GetMinimumBalance()))
+	require.Len(t, rules.Rules.GetSpeaker(), 2)
+	require.NotNil(t, rules.Rules.GetSpeaker()[0].GetCreator())
+	require.True(t, proto.Equal(gated.MinimumSpeakerBalance.ToProto(), rules.Rules.GetSpeaker()[1].GetMinimumBalance()))
+	require.Equal(t, creator.Value, rules.CreatorID.GetValue())
+	require.True(t, proto.Equal(rules.Rules, again.Rules()))
+
+	// A speaker requirement alone is a speaker rule and no listener rule; no
+	// mints reads back as no mints.
+	speakerOnly := &chat.Chat{
+		ID:                    chat.MustGenerateGroupChatID(),
+		Type:                  chatpb.ChatType_GROUP,
+		Members:               []*commonpb.UserId{model.MustGenerateUserID()},
+		MinimumSpeakerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: 0.1 + 0.2},
+		LastActivity:          at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, speakerOnly))
+
+	got, err = s.GetChatByID(ctx, speakerOnly.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.MinimumListenerBalance)
+	require.Equal(t, 0.1+0.2, got.MinimumSpeakerBalance.NativeAmount)
+	require.Empty(t, got.MinimumSpeakerBalance.Mints)
+	rules, err = s.GetGroupRules(ctx, speakerOnly.ID)
+	require.NoError(t, err)
+	require.Empty(t, rules.Rules.GetListener())
+	require.Len(t, rules.Rules.GetSpeaker(), 1)
+	require.NotNil(t, rules.Rules.GetSpeaker()[0].GetMinimumBalance())
+
+	// The requirement is part of the canonical record and survives the updates
+	// that touch it.
+	advanced, _, err := s.AdvanceLastMessage(ctx, gated.ID, &messagingpb.MessageId{Value: 1}, at(200))
+	require.NoError(t, err)
+	require.True(t, advanced)
+	require.NoError(t, s.SetGroupPicture(ctx, gated.ID, &blobpb.BlobId{Value: randomBytes(16)}))
+	title := "Renamed"
+	require.NoError(t, s.EditGroup(ctx, gated.ID, chat.GroupEdit{Title: &title}))
+
+	got, err = s.GetChatByID(ctx, gated.ID)
+	require.NoError(t, err)
+	require.Equal(t, gated.MinimumSpeakerBalance, got.MinimumSpeakerBalance)
+	require.Equal(t, "Renamed", got.Title)
+
+	// A DM never carries one, whatever its record says.
+	dm := &chat.Chat{
+		ID:                    generateDmChatID(),
+		Type:                  chatpb.ChatType_CONTACT_DM,
+		Members:               []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID()},
+		MinimumSpeakerBalance: gated.MinimumSpeakerBalance,
+		LastActivity:          at(100),
 	}
 	require.NoError(t, s.PutChat(ctx, dm))
 	got, err = s.GetChatByID(ctx, dm.ID)

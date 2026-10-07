@@ -35,10 +35,12 @@ import (
 // one a user fails: a staff check is a flag read, a balance check a
 // valuation.
 //
-// The one speaker rule a group can carry is a CreatorRequirement, for a group
-// only its creator may speak in (see Chat.IsCreatorOnlySpeaker). It names no
-// user: it is evaluated against the creator the group recorded, which is read
-// with the rules (see GroupRules).
+// A group's speaker rules are a CreatorRequirement for a group only its
+// creator may speak in (see Chat.IsCreatorOnlySpeaker), a
+// MinimumBalanceRequirement for a group with a minimum speaker balance (see
+// Chat.MinimumSpeakerBalance), or both, again cheapest first. The
+// CreatorRequirement names no user: it is evaluated against the creator the
+// group recorded, which is read with the rules (see GroupRules).
 //
 // A DM's record carries none, but a DM with the Flipcash team account carries
 // a Never speaker rule, which only the RuleEvaluator, knowing the team, can
@@ -63,6 +65,11 @@ func (c *Chat) Rules() *chatpb.Rules {
 	if c.IsCreatorOnlySpeaker {
 		speaker = append(speaker, &chatpb.SpeakerRules{
 			Kind: &chatpb.SpeakerRules_Creator{Creator: &chatpb.CreatorRequirement{}},
+		})
+	}
+	if c.MinimumSpeakerBalance != nil {
+		speaker = append(speaker, &chatpb.SpeakerRules{
+			Kind: &chatpb.SpeakerRules_MinimumBalance{MinimumBalance: c.MinimumSpeakerBalance.ToProto()},
 		})
 	}
 	if len(listener) == 0 && len(speaker) == 0 {
@@ -120,8 +127,9 @@ var ErrInvalidRules = errors.New("invalid chat rules")
 //
 // It accepts what a group can be created with today, and nothing more, so
 // that a rule is never accepted and then silently dropped: listener rules
-// only, since no client sets a speaker rule (a creator-only group is made by
-// writing its record, see Chat.IsCreatorOnlySpeaker); each kind at most once, since the record
+// only, since no client sets a speaker rule (a creator-only or speaker-gated
+// group is made by writing its record, see Chat.IsCreatorOnlySpeaker and
+// Chat.MinimumSpeakerBalance); each kind at most once, since the record
 // holds one of each; and a minimum balance of at least the currency's minimum
 // transfer value — one unit at its last decimal place, a penny for USD, a yen
 // for JPY, the smallest amount OCP lets anyone hold or move in that currency

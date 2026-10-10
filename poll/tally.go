@@ -3,7 +3,6 @@ package poll
 import (
 	"context"
 	"fmt"
-	"math"
 
 	"google.golang.org/protobuf/proto"
 
@@ -20,16 +19,6 @@ const (
 	// for (see pollpb.WithheldResults). Below it, totals would say too much
 	// about how individual members voted.
 	minCountVoters = 3
-
-	// minBalanceVoters is the fewest counted voters holding any of the mint a
-	// BALANCE poll shows totals for. It is higher than minCountVoters, and
-	// counts only voters who add weight, since members' balances can often be
-	// looked up: a total made of one or two balances names whose they are.
-	minBalanceVoters = 5
-
-	// balanceSignificantFigures is how many significant figures each BALANCE
-	// amount is rounded to (see coarsen).
-	balanceSignificantFigures = 2
 
 	// tallyVotesPageSize is how many votes the tally reads at a time.
 	tallyVotesPageSize = 100
@@ -111,16 +100,18 @@ func countResults(p *Poll, votes []Vote) *pollpb.Results {
 // balanceResults are a BALANCE poll's results over its counted votes, given
 // each voter's holdings of the poll's mint valued in its currency (a voter
 // absent from values holds none): each voter adds their full balance to every
-// option they chose, and to the total once. Too few voters holding any of the
-// mint withholds them.
+// option they chose, and to the total once.
 //
-// Every amount is coarsened (see coarsen), so an exact sum cannot be taken
-// apart into the balances that make it, and carries no quarks: OCP reports a
-// voter's holdings of a mint only valued, in the core mint or a currency,
-// never in the mint's own quarks, so there are none to sum.
+// These totals are what the store records, but no reader is shown them: a
+// reader sees only the options' ranking (see ResultsProto). That is why they
+// are exact and never withheld, however few voters hold any of the mint: a
+// ranking reveals no balance.
+//
+// No amount carries quarks: OCP reports a voter's holdings of a mint only
+// valued, in the core mint or a currency, never in the mint's own quarks, so
+// there are none to sum.
 func balanceResults(p *Poll, votes []Vote, values map[string]float64) *pollpb.Results {
 	var (
-		weighted     int
 		total        float64
 		optionTotals = make([]float64, p.Definition.GetOptionCount())
 	)
@@ -129,7 +120,6 @@ func balanceResults(p *Poll, votes []Vote, values map[string]float64) *pollpb.Re
 		if value <= 0 {
 			continue
 		}
-		weighted++
 		total += value
 		for _, option := range vote.Options {
 			if int(option) < len(optionTotals) {
@@ -137,15 +127,12 @@ func balanceResults(p *Poll, votes []Vote, values map[string]float64) *pollpb.Re
 			}
 		}
 	}
-	if weighted < minBalanceVoters {
-		return withheldResults()
-	}
 
 	parameters := p.Definition.GetBalanceParameters()
 	amount := func(value float64) *commonpb.CryptoPaymentAmount {
 		return &commonpb.CryptoPaymentAmount{
 			Currency:     parameters.GetCurrency(),
-			NativeAmount: coarsen(value),
+			NativeAmount: value,
 			Mint:         proto.Clone(parameters.GetMint()).(*commonpb.PublicKey),
 		}
 	}
@@ -158,22 +145,4 @@ func balanceResults(p *Poll, votes []Vote, values map[string]float64) *pollpb.Re
 
 func withheldResults() *pollpb.Results {
 	return &pollpb.Results{Type: &pollpb.Results_Withheld{Withheld: &pollpb.WithheldResults{}}}
-}
-
-// coarsen rounds a non-negative amount to balanceSignificantFigures
-// significant figures, and anything not positive to zero.
-func coarsen(value float64) float64 {
-	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
-		return 0
-	}
-	// Scaling by a whole power of ten either way, never by its fraction, keeps
-	// the result the nearest float to the rounded decimal: 16 / 1e-5 is
-	// 1599999.9999999998, while 16 * 1e5 is 1600000.
-	exponent := balanceSignificantFigures - 1 - int(math.Floor(math.Log10(value)))
-	if exponent >= 0 {
-		scale := math.Pow10(exponent)
-		return math.Round(value*scale) / scale
-	}
-	scale := math.Pow10(-exponent)
-	return math.Round(value/scale) * scale
 }

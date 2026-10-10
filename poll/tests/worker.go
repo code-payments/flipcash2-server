@@ -31,7 +31,7 @@ func RunWorkerTests(t *testing.T, polls poll.Store, teardown func()) {
 		testWorker_CountPoll,
 		testWorker_CountPoll_Withheld,
 		testWorker_BalancePoll,
-		testWorker_BalancePoll_Withheld,
+		testWorker_BalancePoll_FewVoters,
 		testWorker_OnlyDuePolls,
 		testWorker_RetriesFailedTally,
 	} {
@@ -94,7 +94,7 @@ func testWorker_CountPoll_Withheld(t *testing.T, polls poll.Store) {
 
 // testWorker_BalancePoll pins a BALANCE poll's tally: each voter's holdings
 // of the mint, valued in the poll's currency, added to every option they chose
-// and to the total once, coarsened, with no quarks.
+// and to the total once, exactly, with no quarks.
 func testWorker_BalancePoll(t *testing.T, polls poll.Store) {
 	e := newWorkerEnv(t, polls)
 	e.ocpBalance.setRate("cad", 2)
@@ -103,8 +103,8 @@ func testWorker_BalancePoll(t *testing.T, polls poll.Store) {
 	chatID := newGroupChatID()
 	p := e.putDuePoll(chatID, pollpb.Mode_BALANCE, 2, true)
 
-	// Valued in cad at 2: 246.8, 100, 50, 20, 11.22, and nothing.
-	for i, usdf := range []float64{123.4, 50, 25, 10, 5.61} {
+	// Valued in cad at 2: 247, 100, 50, 20, 10.5, and nothing.
+	for i, usdf := range []float64{123.5, 50, 25, 10, 5.25} {
 		e.fund(members[i], usdf)
 	}
 	e.vote(p, members[0], 0)
@@ -117,35 +117,51 @@ func testWorker_BalancePoll(t *testing.T, polls poll.Store) {
 	_, err := e.worker.Process(e.ctx)
 	require.NoError(t, err)
 
-	// Total 428.02 ≈ 430; option 0 358.02 ≈ 360; option 1 170 ≈ 170.
+	// Recorded exactly: only the ranking is ever shown (see
+	// poll.ResultsProto).
 	amount := func(native float64) *commonpb.CryptoPaymentAmount {
 		return &commonpb.CryptoPaymentAmount{Currency: "cad", NativeAmount: native, Mint: e.mint}
 	}
 	e.requireClosed(p, &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
-		Total:          amount(430),
-		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(360), amount(170)},
+		Total:          amount(427.5),
+		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(357.5), amount(170)},
 	}}})
 }
 
-// testWorker_BalancePoll_Withheld pins that a BALANCE poll counts only voters
-// holding some of the mint toward the minimum.
-func testWorker_BalancePoll_Withheld(t *testing.T, polls poll.Store) {
+// testWorker_BalancePoll_FewVoters pins that a BALANCE poll's totals are
+// recorded however few voters hold any of the mint, since no reader is shown
+// them.
+func testWorker_BalancePoll_FewVoters(t *testing.T, polls poll.Store) {
 	e := newWorkerEnv(t, polls)
 	e.ocpBalance.setRate("cad", 1)
 
-	members := e.newUsers(8)
+	members := e.newUsers(3)
 	chatID := newGroupChatID()
 	p := e.putDuePoll(chatID, pollpb.Mode_BALANCE, 2, false)
-	for i, member := range members {
-		if i < 4 {
-			e.fund(member, 10)
-		}
-		e.vote(p, member, uint32(i%2))
-	}
+	e.fund(members[0], 10)
+	e.vote(p, members[0], 0)
+	e.vote(p, members[1], 1)
+	e.vote(p, members[2], 1)
 
 	_, err := e.worker.Process(e.ctx)
 	require.NoError(t, err)
-	e.requireClosed(p, withheld())
+
+	amount := func(native float64) *commonpb.CryptoPaymentAmount {
+		return &commonpb.CryptoPaymentAmount{Currency: "cad", NativeAmount: native, Mint: e.mint}
+	}
+	e.requireClosed(p, &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
+		Total:          amount(10),
+		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(10), amount(0)},
+	}}})
+
+	// Nobody holding any of the mint is recorded too.
+	empty := e.putDuePoll(chatID, pollpb.Mode_BALANCE, 2, false)
+	_, err = e.worker.Process(e.ctx)
+	require.NoError(t, err)
+	e.requireClosed(empty, &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
+		Total:          amount(0),
+		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(0), amount(0)},
+	}}})
 }
 
 // testWorker_OnlyDuePolls pins what the tally takes up: a live poll once

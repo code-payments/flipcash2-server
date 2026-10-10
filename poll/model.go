@@ -155,7 +155,9 @@ func (s Status) ToProto() pollpb.PollState_Status {
 // live when it is first sent in a message (see Store.MarkLive). An unsent poll
 // is discarded once it ends, and no store returns one after that.
 //
-// Results are set once Status is StatusClosed, and never before.
+// Results are set once Status is StatusClosed, and never before. They are the
+// results as recorded, which for a BALANCE poll are totals no reader is shown
+// (see ResultsProto).
 type Poll struct {
 	ID         *pollpb.PollId
 	ChatID     *commonpb.ChatId
@@ -213,7 +215,8 @@ func (p *Poll) ToProto(now time.Time, selfVote []uint32) *pollpb.PollMetadata {
 // it at now (see StatusAt), with selfVote as its self_vote.
 //
 // closed_at is the poll's end, which is when it stopped accepting votes (see
-// IsOpenAt). Results are carried only once the poll is closed.
+// IsOpenAt). Results are carried only once the poll is closed, as a reader is
+// shown them (see ResultsProto).
 func (p *Poll) StateProto(now time.Time, selfVote []uint32) *pollpb.PollState {
 	status := p.StatusAt(now)
 	state := &pollpb.PollState{
@@ -224,9 +227,46 @@ func (p *Poll) StateProto(now time.Time, selfVote []uint32) *pollpb.PollState {
 		state.ClosedAt = timestamppb.New(p.EndsAt())
 	}
 	if status == StatusClosed && p.Results != nil {
-		state.Results = proto.Clone(p.Results).(*pollpb.Results)
+		state.Results = ResultsProto(p.Results)
 	}
 	return state
+}
+
+// ResultsProto projects stored results onto what a reader is shown: a
+// BALANCE poll's totals as their ranking alone (see pollpb.RankedResults), and
+// every other variant as stored.
+//
+// The totals stay stored, so the server keeps what the ranking was made from;
+// no reader is ever sent them.
+func ResultsProto(results *pollpb.Results) *pollpb.Results {
+	balance := results.GetBalance()
+	if balance == nil {
+		return proto.Clone(results).(*pollpb.Results)
+	}
+
+	amounts := make([]float64, len(balance.OptionBalances))
+	for i, option := range balance.OptionBalances {
+		amounts[i] = option.GetNativeAmount()
+	}
+	return &pollpb.Results{Type: &pollpb.Results_Ranked{Ranked: &pollpb.RankedResults{
+		OptionRanks: rank(amounts),
+	}}}
+}
+
+// rank returns each amount's competition rank, in order: 1 for the largest,
+// equal amounts sharing a rank, and the next rank skipping the tied positions
+// (30, 20, 20, 10 rank 1, 2, 2, 4).
+func rank(amounts []float64) []uint32 {
+	ranks := make([]uint32, len(amounts))
+	for i, amount := range amounts {
+		ranks[i] = 1
+		for _, other := range amounts {
+			if other > amount {
+				ranks[i]++
+			}
+		}
+	}
+	return ranks
 }
 
 // Clone returns a deep copy of the poll.

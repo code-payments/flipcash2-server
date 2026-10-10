@@ -52,6 +52,7 @@ func RunServerTests(t *testing.T, chats chat.Store, polls poll.Store, teardown f
 		testServer_Vote,
 		testServer_Vote_MemberOnly,
 		testServer_Vote_Closed,
+		testServer_BalanceResults_Ranked,
 	} {
 		tf(t, chats, polls)
 		teardown()
@@ -512,6 +513,55 @@ func testServer_Vote_Closed(t *testing.T, chats chat.Store, polls poll.Store) {
 	require.Equal(t, pollpb.VoteResponse_POLL_CLOSED, resp.Result)
 	requireStatus(t, resp.State, pollpb.PollState_CLOSED, endsAt, []uint32{1})
 	require.True(t, proto.Equal(results, resp.State.Results))
+}
+
+// testServer_BalanceResults_Ranked pins that a closed BALANCE poll's recorded
+// totals are never shown: every reader gets the options' ranking alone.
+func testServer_BalanceResults_Ranked(t *testing.T, chats chat.Store, polls poll.Store) {
+	e := newServerEnv(t, chats, polls)
+	member := e.addUser()
+	chatID := e.putPublicGroup(nil, member)
+
+	coreMint := &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()}
+	id := e.createLivePollWith(e.creator, chatID, func(d *pollpb.PollDefinition) {
+		d.Mode = pollpb.Mode_BALANCE
+		d.BalanceParameters = &pollpb.BalanceParameters{Mint: coreMint, Currency: "usd"}
+		d.OptionCount = 4
+		d.GetPlaintext().Options = append(d.GetPlaintext().Options, &pollpb.Option{Text: "c"}, &pollpb.Option{Text: "d"})
+	})
+	require.Equal(t, pollpb.VoteResponse_OK, e.vote(member, id, 1).Result)
+
+	amount := func(native float64) *commonpb.CryptoPaymentAmount {
+		return &commonpb.CryptoPaymentAmount{Currency: "usd", NativeAmount: native, Mint: coreMint}
+	}
+	recorded := &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
+		Total:          amount(90),
+		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(20), amount(50), amount(20), amount(0)},
+	}}}
+	stored, err := polls.GetPoll(e.ctx, id)
+	require.NoError(t, err)
+	e.clock.set(stored.EndsAt())
+	_, err = polls.Close(e.ctx, id, recorded)
+	require.NoError(t, err)
+
+	ranked := &pollpb.Results{Type: &pollpb.Results_Ranked{Ranked: &pollpb.RankedResults{
+		OptionRanks: []uint32{2, 1, 2, 4},
+	}}}
+	for _, state := range []*pollpb.PollState{
+		e.getPoll(member, id).Poll.State,
+		e.getPoll(e.creator, id).Poll.State,
+		e.getPolls(member, id).Polls[0].State,
+		e.vote(member, id, 0).State,
+	} {
+		require.Equal(t, pollpb.PollState_CLOSED, state.Status)
+		require.True(t, proto.Equal(ranked, state.Results), "got %v", state.Results)
+		require.NoError(t, state.Results.Validate())
+	}
+
+	// The totals stay recorded.
+	stored, err = polls.GetPoll(e.ctx, id)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(recorded, stored.Results))
 }
 
 type user struct {

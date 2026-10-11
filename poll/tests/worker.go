@@ -128,6 +128,8 @@ func testWorker_BalancePoll(t *testing.T, polls poll.Store) {
 	e.requireClosed(p, &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
 		Total:          amount(427.5, 1722),
 		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(357.5, 1442), amount(170, 680)},
+		// Every voter, the one holding nothing included.
+		TotalVoters: 6,
 	}}})
 }
 
@@ -155,6 +157,7 @@ func testWorker_BalancePoll_FewVoters(t *testing.T, polls poll.Store) {
 	e.requireClosed(p, &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
 		Total:          amount(10, 25),
 		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(10, 25), amount(0, 0)},
+		TotalVoters:    3,
 	}}})
 
 	// Nobody holding any of the mint is recorded too.

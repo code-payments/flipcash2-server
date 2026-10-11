@@ -250,8 +250,8 @@ func (p *Poll) StateProto(now time.Time, selfVote []uint32) *pollpb.PollState {
 }
 
 // ResultsProto projects stored results onto what a reader is shown: a
-// BALANCE poll's totals as their ranking alone (see pollpb.RankedResults), and
-// every other variant as stored.
+// BALANCE poll's totals as their ranking and its voter count alone (see
+// pollpb.RankedResults), and every other variant as stored.
 //
 // The ranking is by quarks, not by value: every holding in a poll is of its
 // one mint, so the quark totals order the options exactly as their value
@@ -273,6 +273,7 @@ func ResultsProto(results *pollpb.Results) *pollpb.Results {
 	}
 	return &pollpb.Results{Type: &pollpb.Results_Ranked{Ranked: &pollpb.RankedResults{
 		OptionRanks: rank(amounts),
+		TotalVoters: balance.TotalVoters,
 	}}}
 }
 

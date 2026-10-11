@@ -101,9 +101,11 @@ func countResults(p *Poll, votes []Vote) *pollpb.Results {
 // each voter's holdings of the poll's mint (a voter absent from holdings holds
 // none): each voter adds their full balance, both its quarks and its value in
 // the poll's currency, to every option they chose, and to the total once.
+// Every voter is counted in TotalVoters, including one who holds none.
 //
 // These totals are what the store records, but no reader is shown them: a
-// reader sees only the options' ranking (see ResultsProto). That is why they
+// reader sees only the options' ranking and the voter count (see
+// ResultsProto). That is why they
 // are exact and never withheld, however few voters hold any of the mint: a
 // ranking reveals no balance.
 //
@@ -140,7 +142,10 @@ func balanceResults(p *Poll, votes []Vote, holdings map[string]balance.MintHoldi
 			Mint:         proto.Clone(parameters.GetMint()).(*commonpb.PublicKey),
 		}
 	}
-	results := &pollpb.BalanceResults{Total: amount(total)}
+	results := &pollpb.BalanceResults{
+		Total:       amount(total),
+		TotalVoters: uint64(len(votes)),
+	}
 	for _, holding := range optionTotals {
 		results.OptionBalances = append(results.OptionBalances, amount(holding))
 	}

@@ -516,7 +516,8 @@ func testServer_Vote_Closed(t *testing.T, chats chat.Store, polls poll.Store) {
 }
 
 // testServer_BalanceResults_Ranked pins that a closed BALANCE poll's recorded
-// totals are never shown: every reader gets the options' ranking alone.
+// totals are never shown: every reader gets the options' ranking and the
+// voter count alone.
 func testServer_BalanceResults_Ranked(t *testing.T, chats chat.Store, polls poll.Store) {
 	e := newServerEnv(t, chats, polls)
 	member := e.addUser()
@@ -539,6 +540,7 @@ func testServer_BalanceResults_Ranked(t *testing.T, chats chat.Store, polls poll
 	recorded := &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
 		Total:          amount(90, 90),
 		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(20, 0.1+0.2), amount(50, 50), amount(20, 0.3), amount(0, 0)},
+		TotalVoters:    7,
 	}}}
 	stored, err := polls.GetPoll(e.ctx, id)
 	require.NoError(t, err)
@@ -548,6 +550,7 @@ func testServer_BalanceResults_Ranked(t *testing.T, chats chat.Store, polls poll
 
 	ranked := &pollpb.Results{Type: &pollpb.Results_Ranked{Ranked: &pollpb.RankedResults{
 		OptionRanks: []uint32{2, 1, 2, 4},
+		TotalVoters: 7,
 	}}}
 	for _, state := range []*pollpb.PollState{
 		e.getPoll(member, id).Poll.State,

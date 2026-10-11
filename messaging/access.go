@@ -21,12 +21,13 @@ import (
 //   - reading: every read that returns messages — GetMessage, GetMessages,
 //     GetDelta. It answers not just whether the caller may read but how the
 //     read is answered, full or redacted (see chat.ListenerStanding.Reading), from the
-//     caller's standing and the ViewMode they asked for. A member always
-//     reads in full; a non-member reads a group in full if they satisfy its
-//     listener rules, so a qualifying user can preview a group before joining,
-//     and every non-member does when the group carries none, and redacted
-//     otherwise, so any registered user can see a gated group's shape (see
-//     present).
+//     caller's standing and the ViewMode they asked for. A member reads a DM
+//     or a private group in full. Anyone, member or not, reads a public
+//     group in full if they satisfy its listener rules, so a qualifying user
+//     can preview a group before joining, and everyone does when the group
+//     carries none, and redacted otherwise, so any registered user can see a
+//     gated group's shape (see present), and a member who no longer
+//     qualifies sees no more than that.
 //   - overlayStanding: the reaction summaries and reactor lists. They carry
 //     no ViewMode, since they return no message, and are answered for anyone
 //     who may read the chat at all — a member, or any non-member of a public
@@ -52,18 +53,23 @@ import (
 //     content; a deletion or typing notification carries nothing to judge
 //     and asks the boolean.
 //
-// A member's read is answered on membership alone, without evaluating a rule,
-// even though a listener rule is what admitted them: reads are the hot path,
-// and a listener rule can be costly to evaluate (a minimum balance is a
-// valuation by the OCP server). The membership record stands for the rules on
-// a member — someone the rules admitted, who remains admitted until removed.
-// The intended design is for membership to track the rules: when a member
-// stops satisfying a listener rule (their balance drops, their staff flag is
-// revoked), whatever detects the transition removes them from the group, so
-// the record is always current. Until that exists, a member who no longer
-// satisfies a listener rule keeps reading, and is denied only on the send
-// paths, where the rules are evaluated. A non-member's read does evaluate the
-// rules, since nothing else can admit them; Access bounds what that costs.
+// A member's read of a public group evaluates its listener rules, as a
+// non-member's does: a listener rule admitted them, and a member who no longer
+// satisfies it (their balance drops, their staff flag is revoked) reads it
+// redacted or not at all until they do again. Reads are the hot path and a
+// listener rule can be costly to evaluate (a minimum balance is a valuation by
+// the OCP server), so Access remembers an admission for a short window, member
+// or not, and a redacted read never evaluates one. This holds only for the
+// reads that ask Access for a standing — these, GetChat, and the group feed,
+// whose page is evaluated with one read of each piece of state its rules
+// need (see chat.Access.MemberListenerStandings): the event stream and
+// pushes deliver to a member on membership alone, since gating them would
+// cost a valuation per recipient on every message. The intended design is for membership to track the rules: when a
+// member stops satisfying a listener rule, whatever detects the transition
+// removes them from the group, so the record is always current and those
+// paths are gated by it. Until that exists, a member who no longer satisfies
+// a listener rule is denied on the reads here and on the send paths, but
+// still receives new messages as they are delivered.
 
 func (s *Server) reading(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (chat.Reading, error) {
 	standing, err := s.access.ListenerStanding(ctx, chatID, userID, mode)

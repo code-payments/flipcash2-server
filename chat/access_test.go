@@ -114,50 +114,74 @@ func TestAccess_GroupMember(t *testing.T) {
 	f := newAccessFixture(t)
 	a := NewAccess(f.chats, f.rules)
 
-	// A member reads on membership alone, whatever their balance: the rules are
-	// not evaluated, so a member whose balance has dipped still reads.
+	// A member's full read evaluates the listener rules, as a non-member's
+	// does: a member whose balance has dipped is still a member, but reads the
+	// group only as an unfunded non-member would, redacted.
 	f.chats.join(f.gated.ID, f.unfunded)
 	ok, err := a.IsMember(ctx, f.gated.ID, f.unfunded)
 	require.NoError(t, err)
 	require.True(t, ok)
 	ok, err = a.CanListen(ctx, f.gated.ID, f.unfunded)
 	require.NoError(t, err)
-	require.True(t, ok)
-	require.Zero(t, f.ocpBalance.asked)
+	require.False(t, ok)
+	require.Equal(t, 1, f.ocpBalance.asked)
+	standing, err := a.ListenerStanding(ctx, f.gated.ID, f.unfunded, messagingpb.ViewMode_FULL_OR_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, ListenerStanding{IsMember: true, CanPreview: true}, standing)
+	require.Equal(t, ReadingRedacted, standing.Reading(messagingpb.ViewMode_FULL_OR_REDACTED))
+	require.Equal(t, ReadingDenied, standing.Reading(messagingpb.ViewMode_FULL))
+	require.Equal(t, 2, f.ocpBalance.asked)
+
+	// A member's redacted read is answered on membership alone, with nothing
+	// valued.
+	standing, err = a.ListenerStanding(ctx, f.gated.ID, f.unfunded, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, ListenerStanding{IsMember: true, CanPreview: true}, standing)
+	require.Equal(t, 2, f.ocpBalance.asked)
 
 	// SpeakerStanding is membership and the rules: the dipped member is refused, a
 	// funded member admitted.
 	ok, err = a.CanSpeak(ctx, f.gated.ID, f.unfunded)
 	require.NoError(t, err)
 	require.False(t, ok)
-	require.Equal(t, 1, f.ocpBalance.asked)
+	require.Equal(t, 3, f.ocpBalance.asked)
 
+	// A funded member reads in full, and the admission is remembered: the
+	// next read values nothing.
 	f.chats.join(f.gated.ID, f.funded)
-	ok, err = a.CanSpeak(ctx, f.gated.ID, f.funded)
-	require.NoError(t, err)
-	require.True(t, ok)
-	require.Equal(t, 2, f.ocpBalance.asked)
-
-	// A member's reads never populate the admission cache, so on leaving they
-	// are judged afresh by the rules: the funded leaver still reads, the
-	// unfunded one does not, and neither speaks.
-	f.chats.leave(f.gated.ID, f.funded)
-	f.chats.leave(f.gated.ID, f.unfunded)
-	asked := f.ocpBalance.asked
 	ok, err = a.CanListen(ctx, f.gated.ID, f.funded)
 	require.NoError(t, err)
 	require.True(t, ok)
+	require.Equal(t, 4, f.ocpBalance.asked)
+	standing, err = a.ListenerStanding(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_FULL)
+	require.NoError(t, err)
+	require.Equal(t, memberListenerStanding, standing)
+	require.Equal(t, 4, f.ocpBalance.asked)
+	ok, err = a.CanSpeak(ctx, f.gated.ID, f.funded)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 5, f.ocpBalance.asked)
+
+	// The admission is the rules' verdict, not membership's, so it outlives
+	// leaving: the funded leaver still reads on it, and the unfunded one,
+	// never admitted, is judged afresh and does not. Neither speaks.
+	f.chats.leave(f.gated.ID, f.funded)
+	f.chats.leave(f.gated.ID, f.unfunded)
+	asked := f.ocpBalance.asked
+	standing, err = a.ListenerStanding(ctx, f.gated.ID, f.funded, messagingpb.ViewMode_FULL)
+	require.NoError(t, err)
+	require.Equal(t, ListenerStanding{CanListen: true, CanPreview: true}, standing)
 	ok, err = a.CanListen(ctx, f.gated.ID, f.unfunded)
 	require.NoError(t, err)
 	require.False(t, ok)
-	require.Equal(t, asked+2, f.ocpBalance.asked)
+	require.Equal(t, asked+1, f.ocpBalance.asked)
 	for _, u := range []*commonpb.UserId{f.funded, f.unfunded} {
 		ok, err = a.CanSpeak(ctx, f.gated.ID, u)
 		require.NoError(t, err)
 		require.False(t, ok)
 	}
 	// A non-member's send is refused on membership, before any rule.
-	require.Equal(t, asked+2, f.ocpBalance.asked)
+	require.Equal(t, asked+1, f.ocpBalance.asked)
 }
 
 // TestAccess_PrivateGroup: a private group is its members' alone in every
@@ -558,17 +582,20 @@ func TestAccess_WithChat(t *testing.T) {
 
 	// A group's record carries no members, so its membership is the store's
 	// — one read per question — and a member is a member whatever the rules
-	// say of them.
+	// say of them, though the rules, read off the record, decide whether they
+	// read in full.
 	f.chats.join(f.gated.ID, f.unfunded)
 	membershipReads = f.chats.membershipReads
+	reads = f.chats.reads
 	ok, err = a.IsMemberWithChat(ctx, f.gated, f.unfunded)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, membershipReads+1, f.chats.membershipReads)
 	standing, err = a.ListenerStandingWithChat(ctx, f.gated, f.unfunded, messagingpb.ViewMode_FULL)
 	require.NoError(t, err)
-	require.Equal(t, memberListenerStanding, standing)
+	require.Equal(t, ListenerStanding{IsMember: true, CanPreview: true}, standing)
 	require.Equal(t, membershipReads+2, f.chats.membershipReads)
+	require.Equal(t, reads, f.chats.reads)
 
 	// A group non-member is judged by the rules off the record, not the
 	// store's copy of them.
@@ -656,14 +683,23 @@ func TestAccess_ViewMode(t *testing.T) {
 	require.Equal(t, preview, standing)
 	require.Equal(t, asked+1, f.ocpBalance.asked)
 
-	// A member is a member under every mode, with nothing evaluated.
+	// A member is a member under every mode, but stands where a non-member
+	// would as to reading: an unfunded member previews, evaluated under the
+	// modes that may answer in full, and under REDACTED with nothing
+	// evaluated.
 	f.chats.join(f.gated.ID, f.unfunded)
-	asked = f.ocpBalance.asked
-	for _, mode := range every {
+	memberPreview := ListenerStanding{IsMember: true, CanPreview: true}
+	for _, mode := range evaluating {
+		asked := f.ocpBalance.asked
 		standing, err := a.ListenerStanding(ctx, f.gated.ID, f.unfunded, mode)
 		require.NoError(t, err)
-		require.Equal(t, memberListenerStanding, standing, mode)
+		require.Equal(t, memberPreview, standing, mode)
+		require.Equal(t, asked+1, f.ocpBalance.asked, mode)
 	}
+	asked = f.ocpBalance.asked
+	standing, err = a.ListenerStanding(ctx, f.gated.ID, f.unfunded, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, memberPreview, standing)
 	require.Equal(t, asked, f.ocpBalance.asked)
 
 	// A group without listener rules is open: every non-member reads it in
@@ -917,7 +953,8 @@ func TestAccess_Governance(t *testing.T) {
 	none := ListenerStanding{}
 	preview := ListenerStanding{CanPreview: true}
 	full := ListenerStanding{CanListen: true, CanPreview: true}
-	member := [3]ListenerStanding{memberListenerStanding, memberListenerStanding, memberListenerStanding}
+	memberPreview := ListenerStanding{IsMember: true, CanPreview: true}
+	member := [3]ListenerStanding{memberListenerStanding, memberListenerStanding, memberPreview}
 	outsider := [3]ListenerStanding{none, none, none}
 
 	refused := SpeakerStanding{}
@@ -982,7 +1019,8 @@ func TestAccess_Governance(t *testing.T) {
 			governance: governancePublicGroup,
 			viewers: []viewer{
 				{"funded member", richIn, true, member, plaintext},
-				{"unfunded member", poorIn, true, member, refused},
+				// Still a member, but read as an unfunded non-member is.
+				{"unfunded member", poorIn, true, [3]ListenerStanding{memberPreview, memberPreview, memberPreview}, refused},
 				{"funded non-member", richOut, false, [3]ListenerStanding{full, full, preview}, refused},
 				{"unfunded non-member", poorOut, false, [3]ListenerStanding{preview, preview, preview}, refused},
 			},
@@ -1127,4 +1165,72 @@ func TestAccess_Governance(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAccess_MemberListenerStandings pins a feed page's standings: nothing is
+// evaluated for a chat a member reads on membership alone, every gated group
+// on the page is evaluated against one balance read however many there are,
+// and each admission is remembered as a single read's is.
+func TestAccess_MemberListenerStandings(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	a := NewAccess(f.chats, f.rules)
+
+	member := memberListenerStanding
+	preview := ListenerStanding{IsMember: true, CanPreview: true}
+
+	peer := model.MustGenerateUserID()
+	dm := &Chat{ID: MustDeriveDmChatID(chatpb.ChatType_DM, f.unfunded, peer), Type: chatpb.ChatType_DM, Members: []*commonpb.UserId{f.unfunded, peer}}
+	open := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP}
+	speakerGated := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumSpeakerBalance: &MinimumBalance{Currency: "usd", NativeAmount: accessRequirement}}
+	private := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: peer, MinimumListenerBalance: &MinimumBalance{Currency: "usd", NativeAmount: accessRequirement}}
+	cheaper := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumListenerBalance: &MinimumBalance{Currency: "usd", NativeAmount: accessRequirement / 2}}
+	staffOnly := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsStaffOnly: true}
+	page := []*Chat{dm, open, speakerGated, private, f.gated, cheaper, staffOnly}
+
+	// Nothing is read for a DM, an open group, one gated only to speak, or a
+	// private group, whatever its record carries. The two balance-gated groups
+	// cost one balance read between them, and the staff-only group one flag
+	// read.
+	standings, err := a.MemberListenerStandings(ctx, f.unfunded, page)
+	require.NoError(t, err)
+	require.Equal(t, []ListenerStanding{member, member, member, member, preview, member, preview}, standings)
+	require.Equal(t, 1, f.ocpBalance.asked)
+	require.Equal(t, 1, f.accounts.asked)
+	require.Zero(t, f.chats.reads)
+	require.Zero(t, f.chats.membershipReads)
+
+	// The admission is remembered: the next page evaluates only what was
+	// refused, so the cheaper group, admitted, costs nothing even after the
+	// balance drains, and the refused ones are asked again.
+	f.setBalance(f.unfunded, 0)
+	standings, err = a.MemberListenerStandings(ctx, f.unfunded, page)
+	require.NoError(t, err)
+	require.Equal(t, []ListenerStanding{member, member, member, member, preview, member, preview}, standings)
+	require.Equal(t, 2, f.ocpBalance.asked)
+	require.Equal(t, 2, f.accounts.asked)
+
+	// Topped up, they are admitted at once, and a single read then finds the
+	// admission the page made.
+	f.setBalance(f.unfunded, accessRequirement)
+	f.accounts.staff[string(f.unfunded.Value)] = true
+	standings, err = a.MemberListenerStandings(ctx, f.unfunded, page)
+	require.NoError(t, err)
+	require.Equal(t, []ListenerStanding{member, member, member, member, member, member, member}, standings)
+	require.Equal(t, 3, f.ocpBalance.asked)
+	f.chats.join(f.gated.ID, f.unfunded)
+	standing, err := a.ListenerStanding(ctx, f.gated.ID, f.unfunded, messagingpb.ViewMode_FULL)
+	require.NoError(t, err)
+	require.Equal(t, member, standing)
+	require.Equal(t, 3, f.ocpBalance.asked)
+
+	// A page with nothing to evaluate reads nothing; one whose evaluation
+	// fails is an error, never a standing.
+	standings, err = a.MemberListenerStandings(ctx, f.funded, []*Chat{dm, open, private})
+	require.NoError(t, err)
+	require.Equal(t, []ListenerStanding{member, member, member}, standings)
+	require.Equal(t, 3, f.ocpBalance.asked)
+	f.ocpBalance.err = errors.New("unavailable")
+	_, err = a.MemberListenerStandings(ctx, f.funded, page)
+	require.Error(t, err)
 }

@@ -65,6 +65,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetChat_Group_Picture,
 		testServer_GetChat_Group_MembershipLifecycle,
 		testServer_GetChat_Group_NonMember,
+		testServer_GetChat_Group_MemberFailsRules,
 		testServer_GetChat_ViewMode,
 		testServer_GetChat_Unauthenticated,
 		testServer_GetRoster_Group,
@@ -90,6 +91,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetGroupChatFeed_Empty,
 		testServer_GetGroupChatFeed_OrderAndContent,
 		testServer_GetGroupChatFeed_Paging,
+		testServer_GetGroupChatFeed_MemberFailsRules,
 		testServer_GetGroupChatFeed_Hydrates,
 		testServer_GetGroupChatFeed_SnapshotPinned,
 		testServer_GetGroupChatFeed_DropsDepartedBetweenPages,
@@ -293,8 +295,11 @@ func (a *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (boo
 
 // fakeOcpBalance is the OCP balance service behind the env's balance client,
 // answering each owner's total from a ledger a test sets in USDF quarks. It
-// ignores the request's mint filter: mint restriction is covered by the rule
-// evaluator's own tests.
+// ignores the request's mint filter, holding the whole balance in whatever
+// mint is asked for, which it reports as that mint's breakdown entry: mint
+// restriction is covered by the rule evaluator's own tests. An unfiltered
+// read reports no breakdown, so a test here must not mix a requirement over
+// a mint with one over every mint in a single page.
 type fakeOcpBalance struct {
 	mu      sync.Mutex
 	byOwner map[string]uint64
@@ -302,6 +307,15 @@ type fakeOcpBalance struct {
 	// requested currency without one is left unvalued, as OCP answers a code
 	// it cannot price.
 	rates map[string]float64
+	// asked counts GetBalances calls.
+	asked int
+}
+
+// calls reports how many times GetBalances has been called.
+func (f *fakeOcpBalance) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.asked
 }
 
 func (f *fakeOcpBalance) setRate(currency string, rate float64) {
@@ -322,6 +336,7 @@ func (f *fakeOcpBalance) setBalance(owner *commonpb.PublicKey, quarks uint64) {
 func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBalancesRequest, _ ...grpc.CallOption) (*ocp_balancepb.GetBalancesResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.asked++
 	resp := &ocp_balancepb.GetBalancesResponse{BalancesByOwner: make(map[string]*ocp_balancepb.OwnerBalance)}
 	for _, owner := range req.Owners {
 		key := base58.Encode(owner.Value)
@@ -329,16 +344,23 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 		if !ok {
 			continue // An owner OCP has no accounts for is left out.
 		}
-		ownerBalance := &ocp_balancepb.OwnerBalance{Owner: owner, CoreMintValue: quarks}
+		var fiatValues map[string]float64
 		for _, code := range req.CurrencyCodes {
 			rate, ok := f.rates[code]
 			if !ok {
 				continue
 			}
-			if ownerBalance.FiatValuesByCurrency == nil {
-				ownerBalance.FiatValuesByCurrency = make(map[string]float64)
+			if fiatValues == nil {
+				fiatValues = make(map[string]float64)
 			}
-			ownerBalance.FiatValuesByCurrency[code] = float64(quarks) / float64(ocp_common.CoreMintQuarksPerUnit) * rate
+			fiatValues[code] = float64(quarks) / float64(ocp_common.CoreMintQuarksPerUnit) * rate
+		}
+		ownerBalance := &ocp_balancepb.OwnerBalance{Owner: owner, CoreMintValue: quarks, FiatValuesByCurrency: fiatValues}
+		if len(req.Mints) > 0 {
+			ownerBalance.BalancesByMint = make(map[string]*ocp_balancepb.MintBalance, len(req.Mints))
+			for _, mint := range req.Mints {
+				ownerBalance.BalancesByMint[base58.Encode(mint.Value)] = &ocp_balancepb.MintBalance{Mint: mint, CoreMintValue: quarks, FiatValuesByCurrency: fiatValues}
+			}
 		}
 		resp.BalancesByOwner[key] = ownerBalance
 	}
@@ -2159,6 +2181,68 @@ func testServer_GetChat_Group_NonMember(t *testing.T, s chat.Store) {
 	require.Nil(t, resp.Metadata)
 }
 
+// testServer_GetChat_Group_MemberFailsRules pins that a member's read of a
+// group evaluates its listener rules (see chat.Access): a member under the
+// requirement is still hydrated as a member — their entry, their pointer,
+// their viewer state — but gets the messaging state as an unqualified
+// non-member would, withheld under FULL and redacted under FULL_OR_REDACTED.
+func testServer_GetChat_Group_MemberFailsRules(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	const requirement = 100
+	founder := model.MustGenerateUserID()
+	group := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{founder, e.userID},
+		Title:                  "Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: requirement},
+		LastActivity:           at(1),
+		LastMessageID:          &messagingpb.MessageId{Value: 7},
+	}
+	require.NoError(t, s.PutChat(e.ctx, group))
+	key := string(group.ID.Value)
+	const secret = "whales only"
+	e.messaging.lastMessages[key] = textMessage(7, founder, secret)
+	e.messaging.latestEventSeqs[key] = 9
+	e.messaging.pointers[key] = []*messagingpb.Pointer{
+		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 3}, Ts: timestamppb.New(at(3))},
+	}
+
+	requireMember := func(md *chatpb.Metadata) {
+		t.Helper()
+		require.Len(t, md.Members, 1)
+		require.Equal(t, e.userID.Value, md.Members[0].UserId.Value)
+		require.NotNil(t, md.ViewerState)
+	}
+
+	// With no owner account the member holds nothing and fails the rules.
+	resp := e.getChat(e.keys, group.ID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	requireMember(resp.Metadata)
+	require.Nil(t, resp.Metadata.LastMessage)
+	require.Zero(t, resp.Metadata.LatestEventSequence)
+
+	resp = e.getChatWithMode(e.keys, group.ID, messagingpb.ViewMode_FULL_OR_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	requireMember(resp.Metadata)
+	require.NotNil(t, resp.Metadata.LastMessage)
+	require.True(t, resp.Metadata.LastMessage.Redacted)
+	require.NotEqual(t, secret, resp.Metadata.LastMessage.Content[0].GetText().GetText())
+	require.Equal(t, uint64(9), resp.Metadata.LatestEventSequence)
+
+	// Funded to the requirement they read in full.
+	_, err := e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(requirement))
+	resp = e.getChat(e.keys, group.ID)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	requireMember(resp.Metadata)
+	require.NotNil(t, resp.Metadata.LastMessage)
+	require.False(t, resp.Metadata.LastMessage.Redacted)
+	require.Equal(t, secret, resp.Metadata.LastMessage.Content[0].GetText().GetText())
+}
+
 // testServer_GetChat_ViewMode pins how the view mode a client asks for decides
 // a group's messaging state (see chat.Server.GetChat): a non-member who fails
 // the rules gets the last message redacted under FULL_OR_REDACTED where FULL
@@ -2629,6 +2713,91 @@ func testServer_GetGroupChatFeed_Hydrates(t *testing.T, s chat.Store) {
 	require.Equal(t, uint64(2), hydrated.Members[0].Pointers[0].Value.Value)
 	require.Len(t, bare.Members, 1)
 	require.Empty(t, bare.Members[0].Pointers)
+}
+
+// testServer_GetGroupChatFeed_MemberFailsRules pins that a feed row is
+// hydrated as the viewer stands in that group (see chat.Access): a member
+// under a group's listener balance gets its record and their own member
+// entry, but none of its messaging state — no last message, no head, no
+// pointers — while every row they qualify for is hydrated in full. Every
+// gated group on the page is decided off one balance read.
+func testServer_GetGroupChatFeed_MemberFailsRules(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	putGated := func(title string, activity time.Time, requirement float64) *commonpb.ChatId {
+		chatID := chat.MustGenerateGroupChatID()
+		require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
+			ID:                     chatID,
+			Type:                   chatpb.ChatType_GROUP,
+			Members:                []*commonpb.UserId{e.userID},
+			Title:                  title,
+			MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: requirement},
+			LastActivity:           activity,
+			LastMessageID:          &messagingpb.MessageId{Value: 1},
+		}))
+		return chatID
+	}
+	whales := putGated("Whales", at(3), 100)
+	minnows := putGated("Minnows", at(2), 50)
+	open := chat.MustGenerateGroupChatID()
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
+		ID:            open,
+		Type:          chatpb.ChatType_GROUP,
+		Members:       []*commonpb.UserId{e.userID},
+		Title:         "Open",
+		LastActivity:  at(1),
+		LastMessageID: &messagingpb.MessageId{Value: 1},
+	}))
+	for _, chatID := range []*commonpb.ChatId{whales, minnows, open} {
+		key := string(chatID.Value)
+		e.messaging.lastMessages[key] = textMessage(1, e.userID, "hi")
+		e.messaging.latestEventSeqs[key] = 1
+		e.messaging.pointers[key] = []*messagingpb.Pointer{
+			{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 1}, Ts: timestamppb.New(at(1))},
+		}
+	}
+
+	// Holding 75, the viewer qualifies for the minnows' group and the open
+	// one, not the whales'.
+	_, err := e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
+	require.NoError(t, err)
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(75))
+	asked := e.ocpBalance.calls()
+	resp := e.mustGetGroupFeed(&commonpb.QueryOptions{})
+	require.Equal(t, asked+1, e.ocpBalance.calls(), "one balance read for the page")
+	require.Len(t, resp.Chats, 3)
+	byChat := make(map[string]*chatpb.Metadata)
+	for _, md := range resp.Chats {
+		byChat[string(md.ChatId.Value)] = md
+	}
+
+	withheld := byChat[string(whales.Value)]
+	require.Equal(t, "Whales", withheld.Title)
+	require.Len(t, withheld.Members, 1)
+	require.Equal(t, e.userID.Value, withheld.Members[0].UserId.Value)
+	require.Empty(t, withheld.Members[0].Pointers)
+	require.NotNil(t, withheld.ViewerState)
+	require.Nil(t, withheld.LastMessage)
+	require.Zero(t, withheld.LatestEventSequence)
+
+	for _, chatID := range []*commonpb.ChatId{minnows, open} {
+		md := byChat[string(chatID.Value)]
+		require.NotNil(t, md.LastMessage)
+		require.False(t, md.LastMessage.Redacted)
+		require.Equal(t, uint64(1), md.LatestEventSequence)
+		require.Len(t, md.Members, 1)
+		require.Len(t, md.Members[0].Pointers, 1)
+	}
+
+	// Topped up, the whales' row is hydrated in full on the next read. The
+	// minnows' admission is remembered, so only the whales' group is valued.
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(100))
+	asked = e.ocpBalance.calls()
+	resp = e.mustGetGroupFeed(&commonpb.QueryOptions{})
+	require.Equal(t, asked+1, e.ocpBalance.calls())
+	for _, md := range resp.Chats {
+		require.NotNil(t, md.LastMessage, md.Title)
+	}
 }
 
 // testServer_GetGroupChatFeed_SnapshotPinned verifies the DM feed's snapshot

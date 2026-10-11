@@ -532,6 +532,23 @@ const (
 // renditions are never resolved, not resolved and dropped — while every other
 // caller asks for fullDetail.
 func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standing ListenerStanding, reading Reading, detail metadataDetail, chats []*Chat) ([]*chatpb.Metadata, error) {
+	standings := make([]ListenerStanding, len(chats))
+	readings := make([]Reading, len(chats))
+	for i := range chats {
+		standings[i], readings[i] = standing, reading
+	}
+	return s.hydrateEach(ctx, viewerID, standings, readings, detail, chats)
+}
+
+// hydrateEach is hydrate for a set whose chats the viewer stands differently
+// towards: standings[i] and readings[i] are the viewer's standing towards
+// chats[i] and what their read of it is answered with, and decide what is
+// hydrated for that chat alone, as hydrate's one standing and reading do for
+// all of its. A feed page passes it, since a member who no longer satisfies a
+// group's listener rules reads that group as no other on the page (see
+// Access.MemberListenerStandings). The reads are still one batch across the
+// set.
+func (s *Server) hydrateEach(ctx context.Context, viewerID *commonpb.UserId, standings []ListenerStanding, readings []Reading, detail metadataDetail, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId
 	var pointerRefs []PointerRef
@@ -543,8 +560,13 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 	uniquePictureBlobIDs := make(map[string]*blobpb.BlobId)
 	uniqueDmMemberIDs := make(map[string]*commonpb.UserId)
 	var lobbyChatIDs []*commonpb.ChatId
+	var memberChatIDs []*commonpb.ChatId
 	hydratedMembers := make([][]*commonpb.UserId, len(chats))
 	for i, c := range chats {
+		standing, reading := standings[i], readings[i]
+		if standing.IsMember {
+			memberChatIDs = append(memberChatIDs, c.ID)
+		}
 		if c.IsPrivate && !standing.IsMember && viewerID != nil {
 			lobbyChatIDs = append(lobbyChatIDs, c.ID)
 		}
@@ -636,10 +658,6 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 		staffByUserId          map[string]bool
 		lobbyEntries           map[string]LobbyEntry
 	)
-	chatIDs := make([]*commonpb.ChatId, len(chats))
-	for i, c := range chats {
-		chatIDs[i] = c.ID
-	}
 	// A read with nothing to ask for is skipped, not made: a viewer's standing
 	// may have withheld a whole class of state from the set.
 	g, gctx := errgroup.WithContext(ctx)
@@ -679,9 +697,9 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 			return err
 		})
 	}
-	if standing.IsMember {
+	if len(memberChatIDs) > 0 {
 		g.Go(func() (err error) {
-			viewerStates, err = s.chats.GetViewerStates(gctx, viewerID, chatIDs)
+			viewerStates, err = s.chats.GetViewerStates(gctx, viewerID, memberChatIDs)
 			return err
 		})
 	}
@@ -711,7 +729,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 	for i, c := range chats {
 		key := string(c.ID.Value)
 		md := c.ToProto()
-		if standing.IsMember {
+		if standings[i].IsMember {
 			md.ViewerState = viewerStates[key].ToProto(c.PermissionsFor(viewerID, true))
 		}
 		if IsGroupChatID(c.ID) {
@@ -730,7 +748,7 @@ func (s *Server) hydrate(ctx context.Context, viewerID *commonpb.UserId, standin
 			md.RosterSummary = rosterSummaries[key].ToProto()
 		}
 		md.LastMessage = lastMessages[key]
-		if reading == ReadingRedacted && md.LastMessage != nil {
+		if readings[i] == ReadingRedacted && md.LastMessage != nil {
 			redacted, err := redact.Message(c.ID, md.LastMessage)
 			if err != nil {
 				return nil, fmt.Errorf("redacting last message of chat %s: %w", base64.StdEncoding.EncodeToString(c.ID.Value), err)

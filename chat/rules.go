@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/sync/errgroup"
+
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 
@@ -374,10 +376,12 @@ func minimumTransferValue(code currency_lib.Code) float64 {
 // state at join time: a member who no longer satisfies a listener rule (a
 // staff member whose flag was revoked, a holder whose balance dropped) keeps
 // their membership record but is denied on every path that evaluates the
-// rules until they satisfy it again. Not every path does: a member's read is
-// gated on membership alone, so that it never pays for an evaluation; rules
-// are evaluated on sends, and on a non-member's read of a group, each verdict
-// remembered for a short window when it admits (see Access).
+// rules until they satisfy it again. Not every path does: rules are evaluated
+// on sends, and on a full read of a group by member and non-member alike,
+// each verdict remembered for a short window when it admits (see Access);
+// a feed page's last messages are evaluated too, the page together (see
+// CanListenEach); a member's writes that are not sends, the event stream and
+// pushes gate on membership alone.
 // The intended design is for membership itself to track the listener rules — a
 // member who stops satisfying one is removed — at which point the membership
 // record is the rules' answer everywhere. Enforcing rules on membership
@@ -640,25 +644,156 @@ func sameMints(a, b []*commonpb.PublicKey) bool {
 // a balance that cannot be read is an error, so the gate is never left
 // unenforced.
 func (e *RuleEvaluator) satisfiesMinimumBalance(ctx context.Context, req *chatpb.MinimumBalanceRequirement, userID *commonpb.UserId) (bool, error) {
+	var currencies []currency_lib.Code
+	if currency := currency_lib.Code(req.GetAmount().GetCurrency()); currency != currency_lib.USD {
+		currencies = []currency_lib.Code{currency}
+	}
+	held, err := e.holdings(ctx, userID, currencies, req.GetMints())
+	if err != nil {
+		return false, err
+	}
+	return meetsMinimumBalance(req, held)
+}
+
+// heldBalance is what a minimum balance is compared against: the user's
+// holdings as one balance read reports them, or none at all for a user with
+// no owner account, who holds nothing in any currency.
+type heldBalance struct {
+	holdings balance.Holdings
+	none     bool
+}
+
+// holdings reads userID's holdings, valued in currencies (none for the USDF
+// figures alone) and filtered to mints (every mint, given none), as one
+// balance read.
+func (e *RuleEvaluator) holdings(ctx context.Context, userID *commonpb.UserId, currencies []currency_lib.Code, mints []*commonpb.PublicKey) (heldBalance, error) {
+	holdings, err := e.balances.GetHoldings(ctx, userID, currencies, mints...)
+	if errors.Is(err, balance.ErrNotFound) {
+		return heldBalance{none: true}, nil
+	}
+	if err != nil {
+		return heldBalance{}, err
+	}
+	return heldBalance{holdings: holdings}, nil
+}
+
+// meetsMinimumBalance compares held against req, over req's mints (see
+// satisfiesMinimumBalance for how each currency is compared). held is a read
+// in req's currency, unless that is USD, and not filtered to exclude any of
+// req's mints; the holdings over them are taken from its per-mint breakdown
+// (see balance.Holdings), so one read answers every requirement it covers.
+func meetsMinimumBalance(req *chatpb.MinimumBalanceRequirement, held heldBalance) (bool, error) {
 	currency := currency_lib.Code(req.GetAmount().GetCurrency())
 	if currency == currency_lib.USD {
 		required := uint64(math.Round(req.GetAmount().GetNativeAmount() * float64(ocp_common.CoreMintQuarksPerUnit)))
+		if held.none {
+			return required == 0, nil
+		}
+		return held.holdings.Usdf(req.GetMints()...) >= required, nil
+	}
 
-		held, err := e.balances.GetTotalUsdfBalance(ctx, userID, req.GetMints()...)
-		if errors.Is(err, balance.ErrNotFound) {
-			held = 0
-		} else if err != nil {
+	var value float64
+	if !held.none {
+		var err error
+		value, err = held.holdings.FiatValue(currency, req.GetMints()...)
+		if err != nil {
 			return false, err
 		}
-		return held >= required, nil
-	}
-
-	held, err := e.balances.GetTotalFiatValue(ctx, userID, currency, req.GetMints()...)
-	if errors.Is(err, balance.ErrNotFound) {
-		held = 0
-	} else if err != nil {
-		return false, err
 	}
 	tolerance := 0.5 * minimumTransferValue(currency)
-	return held >= req.GetAmount().GetNativeAmount()-tolerance, nil
+	return value >= req.GetAmount().GetNativeAmount()-tolerance, nil
+}
+
+// CanListenEach is CanListenWithRules for one user against many rule sets, as
+// a page of chats asks it, answered in the order of sets. Every piece of
+// state the sets' listener rules read is read once for the whole call however
+// many sets ask for it, the two reads concurrent: the staff flag, and the
+// user's holdings as one balance read valued in every currency the minimum
+// balances name, from whose per-mint breakdown each requirement takes the
+// holdings over its own mints (see balance.Holdings). The read is filtered to
+// the mints the requirements name when every one of them names some, and to
+// none otherwise, since a requirement over every mint needs them all. Each
+// set is then decided against that state exactly as CanListenWithRules
+// decides it.
+//
+// A rule kind the evaluator does not know, or a currency OCP cannot value,
+// fails the whole call, never a pass, as it fails CanListenWithRules.
+func (e *RuleEvaluator) CanListenEach(ctx context.Context, sets []RuleSet, userID *commonpb.UserId) ([]bool, error) {
+	var (
+		needStaff, needBalance, everyMint bool
+		currencies                        []currency_lib.Code
+		mints                             []*commonpb.PublicKey
+	)
+	for _, set := range sets {
+		for _, rule := range set.rules.GetListener() {
+			switch k := rule.GetKind().(type) {
+			case *chatpb.ListenerRules_Staff:
+				needStaff = true
+			case *chatpb.ListenerRules_MinimumBalance:
+				needBalance = true
+				if len(k.MinimumBalance.GetMints()) == 0 {
+					everyMint = true
+				}
+				for _, mint := range k.MinimumBalance.GetMints() {
+					if !slices.ContainsFunc(mints, func(m *commonpb.PublicKey) bool { return bytes.Equal(m.GetValue(), mint.GetValue()) }) {
+						mints = append(mints, mint)
+					}
+				}
+				currency := currency_lib.Code(k.MinimumBalance.GetAmount().GetCurrency())
+				if currency != currency_lib.USD && !slices.Contains(currencies, currency) {
+					currencies = append(currencies, currency)
+				}
+			default:
+				return nil, fmt.Errorf("unsupported chat rule %T", k)
+			}
+		}
+	}
+	if everyMint {
+		mints = nil
+	}
+
+	// Each read writes only its own result, and Wait is the barrier before
+	// either is read.
+	var (
+		isStaff bool
+		held    heldBalance
+	)
+	g, gctx := errgroup.WithContext(ctx)
+	if needStaff {
+		g.Go(func() (err error) {
+			isStaff, err = e.accounts.IsStaff(gctx, userID)
+			return err
+		})
+	}
+	if needBalance {
+		g.Go(func() (err error) {
+			held, err = e.holdings(gctx, userID, currencies, mints)
+			return err
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	out := make([]bool, len(sets))
+	for i, set := range sets {
+		ok := true
+		for _, rule := range set.rules.GetListener() {
+			switch k := rule.GetKind().(type) {
+			case *chatpb.ListenerRules_Staff:
+				ok = isStaff
+			case *chatpb.ListenerRules_MinimumBalance:
+				var err error
+				ok, err = meetsMinimumBalance(k.MinimumBalance, held)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if !ok {
+				break
+			}
+		}
+		out[i] = ok
+	}
+	return out, nil
 }

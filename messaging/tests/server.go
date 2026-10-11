@@ -254,10 +254,11 @@ func newServerEnvWithTeam(t *testing.T, badges badge.Store, blocklists blocklist
 	balances := balance.NewClient(log, env.accounts, env.ocpBalance)
 
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocp_data.NewTestDataProvider(), env.pusher, bus, chatBus, teamUserID, senderOpts...)
-	// Speech is never remembered here, so a rule's change is seen on the very
-	// next send; the window production remembers it for is chat.Access's to
-	// test (see chat.DefaultSpeakerAdmissionTTL).
-	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats, teamUserID), chat.WithSpeakerAdmissionTTL(0))
+	// Neither speech nor a read is remembered here, so a rule's change is seen
+	// on the very next send or read; the windows production remembers them
+	// for are chat.Access's to test (see chat.DefaultSpeakerAdmissionTTL and
+	// chat.DefaultListenerAdmissionTTL).
+	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats, teamUserID), chat.WithSpeakerAdmissionTTL(0), chat.WithListenerAdmissionTTL(0))
 	server := messaging.NewServer(log, authz, chats, media, messages, access, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
@@ -3261,7 +3262,8 @@ func testServer_ViewMode(t *testing.T, badges badge.Store, blocklists blocklist.
 // is enforced on the send paths, on top of membership — a member who is not
 // staff cannot speak, exactly as a non-member cannot — and that the rule
 // tracks the flag's current value rather than the state at join time. A
-// member's reads gate on membership alone, so the same member still reads.
+// member's full reads evaluate the rule too, so the same member reads the
+// group only redacted, though still a member.
 func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
@@ -3302,32 +3304,36 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 	}
 	deniedToSpeak(e.keysB)
 
-	// ...but, still a member, reads freely: a member's reads gate on
-	// membership alone, and a member the rule no longer admits is meant to be
-	// removed from the group rather than re-checked on every read (see
-	// messaging.canListen).
-	canListen := func(keys model.KeyPair) {
+	// ...nor read it in full: a member's full read evaluates the listener
+	// rules as a non-member's does, so a member the rule no longer admits
+	// reads the group redacted, as an unqualified non-member would. Still a
+	// member, they keep what is a member's alone: their pointer, and the
+	// reaction overlay any previewer sees.
+	readsRedacted := func(keys model.KeyPair) {
 		t.Helper()
 
-		getReq := &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: msgID}
-		require.NoError(t, keys.Auth(getReq, &getReq.Auth))
-		getResp, err := e.client.GetMessage(e.ctx, getReq)
+		getResp, err := e.getMessageInChat(keys, groupID, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result)
+		getResp, err = e.getMessageInChatWithMode(keys, groupID, msgID, messagingpb.ViewMode_FULL_OR_REDACTED)
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+		require.True(t, getResp.Message.Redacted)
 
-		listReq := &messagingpb.GetMessagesRequest{ChatId: groupID, Query: &messagingpb.GetMessagesRequest_Options{Options: &commonpb.QueryOptions{}}}
-		require.NoError(t, keys.Auth(listReq, &listReq.Auth))
-		listResp, err := e.client.GetMessages(e.ctx, listReq)
+		listResp, err := e.getMessagesByOptionsInChatWithMode(keys, groupID, &commonpb.QueryOptions{}, messagingpb.ViewMode_FULL)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_DENIED, listResp.Result)
+		listResp, err = e.getMessagesByOptionsInChatWithMode(keys, groupID, &commonpb.QueryOptions{}, messagingpb.ViewMode_FULL_OR_REDACTED)
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.GetMessagesResponse_OK, listResp.Result)
+		require.NotEmpty(t, listResp.Messages.GetMessages())
+		for _, m := range listResp.Messages.GetMessages() {
+			require.True(t, m.Redacted)
+		}
 
-		deltaReq := &messagingpb.GetDeltaRequest{ChatId: groupID}
-		require.NoError(t, keys.Auth(deltaReq, &deltaReq.Auth))
-		deltaStream, err := e.client.GetDelta(e.ctx, deltaReq)
+		deltaResp, err := e.getDeltaInChatWithMode(keys, groupID, 0, messagingpb.ViewMode_FULL)
 		require.NoError(t, err)
-		deltaResp, err := deltaStream.Recv()
-		require.NoError(t, err)
-		require.Equal(t, messagingpb.GetDeltaResponse_OK, deltaResp.Result)
+		require.Equal(t, messagingpb.GetDeltaResponse_DENIED, deltaResp[0].Result)
 
 		advResp, err := e.advancePointerInChat(keys, groupID, messagingpb.Pointer_READ, msgID)
 		require.NoError(t, err)
@@ -3341,7 +3347,22 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.GetReactionSummariesResponse_OK, sumsResp.Result)
 	}
-	canListen(e.keysB)
+	readsRedacted(e.keysB)
+
+	// A member the rule admits reads in full.
+	canListen := func(keys model.KeyPair) {
+		t.Helper()
+
+		getResp, err := e.getMessageInChat(keys, groupID, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+		require.False(t, getResp.Message.Redacted)
+
+		deltaResp, err := e.getDeltaInChatWithMode(keys, groupID, 0, messagingpb.ViewMode_FULL)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetDeltaResponse_OK, deltaResp[0].Result)
+	}
+	canListen(e.keysA)
 
 	// Staff status alone is not membership: a staff non-member satisfies the
 	// listener rule and so may read, but may neither speak nor react (see
@@ -3362,12 +3383,16 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
 
-	// ...and revoked, the founding staff member is silenced on the next call
-	// (in production, once their remembered admission lapses; see
-	// chat.DefaultSpeakerAdmissionTTL), though they still read.
+	// ...and reads in full again...
+	canListen(e.keysB)
+
+	// ...and revoked, the founding staff member is silenced and reads
+	// redacted on the next call (in production, once their remembered
+	// admissions lapse; see chat.DefaultSpeakerAdmissionTTL and
+	// chat.DefaultListenerAdmissionTTL).
 	e.accounts.setStaff(e.userA, false)
 	deniedToSpeak(e.keysA)
-	canListen(e.keysA)
+	readsRedacted(e.keysA)
 
 	// A DM in the same env is untouched by any of this: DMs carry no rules.
 	dmResp, err := e.send(e.keysA, "still a dm", generateClientID())
@@ -3714,7 +3739,7 @@ func testServer_PrivateGroup_Keyed(t *testing.T, badges badge.Store, blocklists 
 // testServer_CreatorOnlyGroup_Rules pins that a creator-only group's speaker
 // rule is enforced on the send paths: its creator speaks, and every other
 // member is refused as a non-member is, while still reading and reacting,
-// which gate on membership alone.
+// which a speaker rule does not touch.
 func testServer_CreatorOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
@@ -3749,7 +3774,7 @@ func testServer_CreatorOnlyGroup_Rules(t *testing.T, badges badge.Store, blockli
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
 
-	// ...but reads and reacts, which gate on membership alone.
+	// ...but reads and reacts, which a speaker rule does not touch.
 	getResp, err := e.getMessageInChat(e.keysB, groupID, msgID)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
@@ -3782,8 +3807,10 @@ func testServer_CreatorOnlyGroup_Rules(t *testing.T, badges badge.Store, blockli
 // balance is enforced on the send paths, on top of membership, against the
 // member's balance as the balance service reports it now: a member under the
 // requirement cannot speak, as a non-member cannot, and a balance that cannot
-// be read fails the send rather than waving it through. A member's reads gate
-// on membership alone and never consult the balance.
+// be read fails the send rather than waving it through. A member's full read
+// is gated the same way: under the requirement they read the group redacted,
+// as an unqualified non-member would, and a balance that cannot be read fails
+// the full read but not a redacted one, which never consults it.
 func testServer_BalanceGatedGroup_Rules(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
@@ -3813,8 +3840,8 @@ func testServer_BalanceGatedGroup_Rules(t *testing.T, badges badge.Store, blockl
 	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
 	msgID := sent.Message.MessageId
 
-	// The member under it cannot speak, but still reads: a member's reads gate
-	// on membership alone (see messaging.canListen).
+	// The member under it cannot speak, and reads redacted, though still a
+	// member with a pointer to advance.
 	deniedToSpeak := func(keys model.KeyPair) {
 		t.Helper()
 
@@ -3822,21 +3849,31 @@ func testServer_BalanceGatedGroup_Rules(t *testing.T, badges badge.Store, blockl
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
 	}
-	canListen := func(keys model.KeyPair) {
+	readsRedacted := func(keys model.KeyPair) {
 		t.Helper()
 
-		getReq := &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: msgID}
-		require.NoError(t, keys.Auth(getReq, &getReq.Auth))
-		getResp, err := e.client.GetMessage(e.ctx, getReq)
+		getResp, err := e.getMessageInChat(keys, groupID, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result)
+		getResp, err = e.getMessageInChatWithMode(keys, groupID, msgID, messagingpb.ViewMode_FULL_OR_REDACTED)
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+		require.True(t, getResp.Message.Redacted)
 
 		advResp, err := e.advancePointerInChat(keys, groupID, messagingpb.Pointer_READ, msgID)
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.AdvancePointerResponse_OK, advResp.Result)
 	}
+	canListen := func(keys model.KeyPair) {
+		t.Helper()
+
+		getResp, err := e.getMessageInChat(keys, groupID, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+		require.False(t, getResp.Message.Redacted)
+	}
 	deniedToSpeak(e.keysB)
-	canListen(e.keysB)
+	readsRedacted(e.keysB)
 
 	// A member with no owner account at all holds nothing, and is silenced the
 	// same way — not failed.
@@ -3844,25 +3881,31 @@ func testServer_BalanceGatedGroup_Rules(t *testing.T, badges badge.Store, blockl
 	_, _, err = chats.AddGroupMembers(e.ctx, groupID, []*commonpb.UserId{unfunded})
 	require.NoError(t, err)
 	deniedToSpeak(unfundedKeys)
-	canListen(unfundedKeys)
+	readsRedacted(unfundedKeys)
 
 	// The rule tracks the balance: topped up, the member is admitted...
 	e.ocpBalance.setBalance(e.keysB.Proto(), ocp_common.ToCoreMintQuarks(requirement))
 	resp, err := e.sendContentToChat(e.keysB, groupID, textContent("topped up"), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+	canListen(e.keysB)
 
-	// ...and drained, the founding member is silenced on the next call.
+	// ...and drained, the founding member is silenced and reads redacted on
+	// the next call.
 	e.ocpBalance.setBalance(e.keysA.Proto(), 0)
 	deniedToSpeak(e.keysA)
-	canListen(e.keysA)
+	readsRedacted(e.keysA)
 
-	// A balance that cannot be read fails a send outright, and is never
-	// consulted by a member's read.
+	// A balance that cannot be read fails a send and a member's full read
+	// outright, and is never consulted by a redacted read.
 	e.ocpBalance.setErr(errors.New("ocp is down"))
 	_, err = e.sendContentToChat(e.keysB, groupID, textContent("blind"), generateClientID())
 	require.Equal(t, codes.Internal, status.Code(err))
-	canListen(e.keysB)
+	_, err = e.getMessageInChat(e.keysB, groupID, msgID)
+	require.Equal(t, codes.Internal, status.Code(err))
+	redactedResp, err := e.getMessageInChatWithMode(e.keysB, groupID, msgID, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, redactedResp.Result)
 	e.ocpBalance.setErr(nil)
 
 	// A DM in the same env is untouched by any of this: DMs carry no rules.
@@ -3920,7 +3963,7 @@ func testServer_SpeakerBalanceGroup_Rules(t *testing.T, badges badge.Store, bloc
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typingResp.Result)
 
-	// ...but reads, as a member of the group's audience.
+	// ...but reads in full, holding the listener requirement.
 	getReq := &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: msgID}
 	require.NoError(t, e.keysB.Auth(getReq, &getReq.Auth))
 	getResp, err := e.client.GetMessage(e.ctx, getReq)
@@ -3934,16 +3977,18 @@ func testServer_SpeakerBalanceGroup_Rules(t *testing.T, badges badge.Store, bloc
 	require.Equal(t, messagingpb.SendMessageResponse_OK, sendResp.Result)
 
 	// ...and drained below the listener requirement, the creator is silenced
-	// with the rest, still reading.
+	// with the rest, and reads redacted until they top up.
 	e.ocpBalance.setBalance(e.keysA.Proto(), ocp_common.ToCoreMintQuarks(listenerRequirement)-1)
 	sendResp, err = e.sendContentToChat(e.keysA, groupID, textContent("drained"), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)
-	getReq = &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: msgID}
-	require.NoError(t, e.keysA.Auth(getReq, &getReq.Auth))
-	getResp, err = e.client.GetMessage(e.ctx, getReq)
+	getResp, err = e.getMessageInChat(e.keysA, groupID, msgID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_DENIED, getResp.Result)
+	getResp, err = e.getMessageInChatWithMode(e.keysA, groupID, msgID, messagingpb.ViewMode_FULL_OR_REDACTED)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
+	require.True(t, getResp.Message.Redacted)
 }
 
 func testServer_Broadcast_IncludesActor(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

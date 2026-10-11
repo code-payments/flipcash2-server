@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sync"
 	"testing"
 
 	"github.com/mr-tron/base58"
@@ -32,6 +33,10 @@ import (
 type fakeAccounts struct {
 	account.Store
 
+	// mu guards every field: a page's evaluation reads concurrently (see
+	// RuleEvaluator.CanListenEach).
+	mu sync.Mutex
+
 	staff map[string]bool
 	asked int
 	err   error
@@ -40,6 +45,8 @@ type fakeAccounts struct {
 }
 
 func (f *fakeAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.asked++
 	if f.err != nil {
 		return false, f.err
@@ -48,6 +55,8 @@ func (f *fakeAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (bool
 }
 
 func (f *fakeAccounts) GetPubKeys(_ context.Context, userID *commonpb.UserId) ([]*commonpb.PublicKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	key, ok := f.keys[string(userID.Value)]
 	if !ok {
 		return nil, nil
@@ -66,16 +75,22 @@ func (f *fakeAccounts) bind(userID *commonpb.UserId) *commonpb.PublicKey {
 // fakeOcpBalance is the OCP balance service behind a real balance.Client,
 // answering from a per-owner, per-mint ledger in USDF quarks and honouring the
 // request's mint filter the way OCP does: the owner's total covers only the
-// requested mints. It values the total in each requested currency it has a
-// rate for, and silently not in one it lacks, as OCP answers a code it cannot
-// price. It records how often it was asked.
+// requested mints, and reporting the per-mint breakdown. It values the total
+// and each mint in each requested currency it has a rate for, and silently
+// not in one it lacks, as OCP answers a code it cannot price. It records how
+// often it was asked, and the last request.
 type fakeOcpBalance struct {
+	// mu guards every field, as fakeAccounts.mu does.
+	mu sync.Mutex
+
 	// ledger is owner base58 -> mint base58 -> quarks.
 	ledger map[string]map[string]uint64
 	// rates values a USDF unit in each fiat currency the fake can price.
 	rates map[string]float64
 	asked int
 	err   error
+
+	lastReq *ocp_balancepb.GetBalancesRequest
 }
 
 func (f *fakeOcpBalance) set(owner, mint *commonpb.PublicKey, quarks uint64) {
@@ -87,8 +102,27 @@ func (f *fakeOcpBalance) set(owner, mint *commonpb.PublicKey, quarks uint64) {
 	holdings[base58.Encode(mint.Value)] = quarks
 }
 
+// value values quarks in each currency req asks for that the fake can price.
+func (f *fakeOcpBalance) value(req *ocp_balancepb.GetBalancesRequest, quarks uint64) map[string]float64 {
+	var values map[string]float64
+	for _, code := range req.CurrencyCodes {
+		rate, ok := f.rates[code]
+		if !ok {
+			continue
+		}
+		if values == nil {
+			values = make(map[string]float64)
+		}
+		values[code] = float64(quarks) / float64(ocp_common.CoreMintQuarksPerUnit) * rate
+	}
+	return values
+}
+
 func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBalancesRequest, _ ...grpc.CallOption) (*ocp_balancepb.GetBalancesResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.asked++
+	f.lastReq = req
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -102,22 +136,14 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 		if !ok {
 			continue // An owner OCP has no accounts for is left out.
 		}
-		ownerBalance := &ocp_balancepb.OwnerBalance{Owner: owner}
+		ownerBalance := &ocp_balancepb.OwnerBalance{Owner: owner, BalancesByMint: make(map[string]*ocp_balancepb.MintBalance)}
 		for mint, quarks := range holdings {
 			if len(requested) == 0 || requested[mint] {
 				ownerBalance.CoreMintValue += quarks
+				ownerBalance.BalancesByMint[mint] = &ocp_balancepb.MintBalance{CoreMintValue: quarks, FiatValuesByCurrency: f.value(req, quarks)}
 			}
 		}
-		for _, code := range req.CurrencyCodes {
-			rate, ok := f.rates[code]
-			if !ok {
-				continue
-			}
-			if ownerBalance.FiatValuesByCurrency == nil {
-				ownerBalance.FiatValuesByCurrency = make(map[string]float64)
-			}
-			ownerBalance.FiatValuesByCurrency[code] = float64(ownerBalance.CoreMintValue) / float64(ocp_common.CoreMintQuarksPerUnit) * rate
-		}
+		ownerBalance.FiatValuesByCurrency = f.value(req, ownerBalance.CoreMintValue)
 		resp.BalancesByOwner[base58.Encode(owner.Value)] = ownerBalance
 	}
 	return resp, nil
@@ -1137,4 +1163,113 @@ func (c *Chat) ruleSet(t *testing.T) RuleSet {
 	set, ok := c.ChatRules().RuleSet()
 	require.True(t, ok)
 	return set
+}
+
+// TestRuleEvaluator_CanListenEach pins the page evaluation: every set is
+// decided exactly as CanListenWithRules decides it, while the state the sets
+// read is read once for the call — the staff flag once, and the holdings in
+// one balance read valued in every currency named, filtered to the named
+// mints only when no requirement is over every mint.
+func TestRuleEvaluator_CanListenEach(t *testing.T) {
+	ctx := context.Background()
+	accounts := &fakeAccounts{staff: make(map[string]bool), keys: make(map[string]*commonpb.PublicKey)}
+	ocpBalance := &fakeOcpBalance{ledger: make(map[string]map[string]uint64), rates: map[string]float64{"eur": 0.9}}
+	chats := &fakeChats{chats: make(map[string]*Chat)}
+	e := NewRuleEvaluator(accounts, balance.NewClient(zaptest.NewLogger(t), accounts, ocpBalance), chats, nil)
+
+	usdf := model.MustGenerateKeyPair().Proto()
+	other := model.MustGenerateKeyPair().Proto()
+
+	// holder holds 100 USDF and 10 in another mint: 110 in all, 99 in EUR.
+	holder := model.MustGenerateUserID()
+	holderKey := accounts.bind(holder)
+	ocpBalance.set(holderKey, usdf, ocp_common.ToCoreMintQuarks(100))
+	ocpBalance.set(holderKey, other, ocp_common.ToCoreMintQuarks(10))
+	unbound := model.MustGenerateUserID()
+
+	set := func(c *Chat) RuleSet {
+		c.Type = chatpb.ChatType_GROUP
+		return NewRuleSet(c.Rules(), nil)
+	}
+	minimum := func(currency string, amount float64, mints ...*commonpb.PublicKey) RuleSet {
+		return set(&Chat{MinimumListenerBalance: &MinimumBalance{Currency: currency, NativeAmount: amount, Mints: mints}})
+	}
+	sets := []RuleSet{
+		minimum("usd", 110),             // every mint: met exactly
+		minimum("eur", 90),              // every mint, valued: met
+		minimum("eur", 100),             // every mint, valued: 99 is short
+		minimum("usd", 50, other),       // one mint: 10 is short
+		minimum("usd", 5, other, other), // the same mint set, repeated: met
+		set(&Chat{IsStaffOnly: true}),   // not staff
+		set(&Chat{}),                    // open
+	}
+	check := func(user *commonpb.UserId, want []bool) {
+		t.Helper()
+		staffAsked, ocpAsked := accounts.asked, ocpBalance.asked
+		got, err := e.CanListenEach(ctx, sets, user)
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+		require.Equal(t, staffAsked+1, accounts.asked, "staff flag read once")
+		if _, bound := accounts.keys[string(user.Value)]; bound {
+			require.Equal(t, ocpAsked+1, ocpBalance.asked, "one balance read")
+			require.Equal(t, []string{"eur"}, ocpBalance.lastReq.CurrencyCodes)
+			require.Empty(t, ocpBalance.lastReq.Mints, "a requirement over every mint reads them all")
+		}
+
+		// Each agrees with the single evaluation.
+		for i, s := range sets {
+			ok, err := e.CanListenWithRules(ctx, s, user)
+			require.NoError(t, err)
+			require.Equal(t, ok, got[i], i)
+		}
+	}
+	check(holder, []bool{true, true, false, false, true, false, true})
+	accounts.staff[string(holder.Value)] = true
+	check(holder, []bool{true, true, false, false, true, true, true})
+
+	// A user with no owner account holds nothing, and fails every balance
+	// without error.
+	check(unbound, []bool{false, false, false, false, false, false, true})
+
+	// When every requirement names mints, the read is filtered to them, and
+	// still answers each requirement over its own.
+	third := model.MustGenerateKeyPair().Proto()
+	ocpBalance.set(holderKey, third, ocp_common.ToCoreMintQuarks(7))
+	filtered := []RuleSet{minimum("usd", 10, other), minimum("eur", 90, usdf), minimum("usd", 101, usdf), minimum("usd", 110, usdf, other)}
+	got, err := e.CanListenEach(ctx, filtered, holder)
+	require.NoError(t, err)
+	require.Equal(t, []bool{true, true, false, true}, got)
+	require.Len(t, ocpBalance.lastReq.Mints, 2)
+	require.Equal(t, []string{"eur"}, ocpBalance.lastReq.CurrencyCodes)
+	for i, s := range filtered {
+		ok, err := e.CanListenWithRules(ctx, s, holder)
+		require.NoError(t, err)
+		require.Equal(t, ok, got[i], i)
+	}
+
+	// Nothing to read reads nothing.
+	staffAsked, ocpAsked := accounts.asked, ocpBalance.asked
+	got, err = e.CanListenEach(ctx, []RuleSet{set(&Chat{})}, holder)
+	require.NoError(t, err)
+	require.Equal(t, []bool{true}, got)
+	got, err = e.CanListenEach(ctx, nil, holder)
+	require.NoError(t, err)
+	require.Empty(t, got)
+	require.Equal(t, staffAsked, accounts.asked)
+	require.Equal(t, ocpAsked, ocpBalance.asked)
+
+	// A currency OCP cannot value, and a balance that cannot be read, fail
+	// the whole call rather than pass or refuse.
+	_, err = e.CanListenEach(ctx, append([]RuleSet{minimum("xyz", 1)}, sets...), holder)
+	require.ErrorIs(t, err, balance.ErrUnsupportedCurrency)
+	ocpBalance.err = errors.New("ocp is down")
+	_, err = e.CanListenEach(ctx, sets, holder)
+	require.Error(t, err)
+	ocpBalance.err = nil
+
+	// A rule kind the evaluator does not know fails before anything is read.
+	ocpAsked = ocpBalance.asked
+	_, err = e.CanListenEach(ctx, []RuleSet{NewRuleSet(&chatpb.Rules{Listener: []*chatpb.ListenerRules{{}}}, nil)}, holder)
+	require.Error(t, err)
+	require.Equal(t, ocpAsked, ocpBalance.asked)
 }

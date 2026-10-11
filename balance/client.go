@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/mr-tron/base58"
 	"go.uber.org/zap"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -114,6 +115,115 @@ func (c *Client) GetTotalFiatValue(ctx context.Context, userID *commonpb.UserId,
 		return 0, fmt.Errorf("%w: %q", ErrUnsupportedCurrency, code)
 	}
 	return value, nil
+}
+
+// Holdings is a user's balance as one OCP read reports it (see GetHoldings):
+// the total and the per-mint breakdown, each in USDF quarks and valued in
+// every currency the read asked for. OCP values each mint on its own and
+// totals them, with one exchange rate per currency for the whole read, so
+// the holdings over any set of mints are the sum of those mints' entries,
+// exactly what a read filtered to those mints would have totalled. One read
+// therefore answers for every mint set a caller needs, as long as it was not
+// filtered to exclude any of their mints.
+type Holdings struct {
+	// usdf is the total in USDF quarks.
+	usdf uint64
+
+	// fiatValues is the total valued in each currency asked for that OCP
+	// could price, in major units, keyed by currency code. A currency is
+	// priced for the whole read or not at all, so it decides support for
+	// every mint.
+	fiatValues map[string]float64
+
+	// byMint is the breakdown, keyed by base58 mint address. A mint the user
+	// holds nothing of, or only dust of, is absent.
+	byMint map[string]*ocp_balancepb.MintBalance
+}
+
+// Usdf is the holdings in mints in USDF quarks, as GetTotalUsdfBalance
+// reports them: the total, given no mints, and otherwise the sum of the
+// named mints' entries, each mint counted once.
+func (h Holdings) Usdf(mints ...*commonpb.PublicKey) uint64 {
+	if len(mints) == 0 {
+		return h.usdf
+	}
+	var total uint64
+	for _, mint := range h.mints(mints) {
+		total += mint.GetCoreMintValue()
+	}
+	return total
+}
+
+// FiatValue is the holdings in mints valued in currency, as
+// GetTotalFiatValue reports them, summed like Usdf: ErrUnsupportedCurrency
+// for a currency OCP could not price, or one the read did not ask for, never
+// a zero.
+func (h Holdings) FiatValue(currency currency_lib.Code, mints ...*commonpb.PublicKey) (float64, error) {
+	code := string(currency)
+	total, ok := h.fiatValues[code]
+	if !ok {
+		return 0, fmt.Errorf("%w: %q", ErrUnsupportedCurrency, code)
+	}
+	if len(mints) == 0 {
+		return total, nil
+	}
+	var value float64
+	for _, mint := range h.mints(mints) {
+		value += mint.GetFiatValuesByCurrency()[code]
+	}
+	return value, nil
+}
+
+// mints returns the breakdown entries of the named mints, each once.
+func (h Holdings) mints(mints []*commonpb.PublicKey) []*ocp_balancepb.MintBalance {
+	seen := make(map[string]bool, len(mints))
+	var entries []*ocp_balancepb.MintBalance
+	for _, mint := range mints {
+		key := base58.Encode(mint.GetValue())
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if entry, ok := h.byMint[key]; ok {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+// GetHoldings returns a user's holdings as one OCP read, valued in each of
+// currencies (none for the USDF figures alone) and filtered to mints (every
+// mint, given none), for a caller that would otherwise ask
+// GetTotalUsdfBalance and GetTotalFiatValue more than once: a page of
+// requirements over different mints and currencies is answered by one read
+// in every currency they name, filtered to no mint unless every requirement
+// names some (see Holdings). A user that hasn't opened OCP accounts yet holds
+// nothing, valued at zero in every currency asked for, and ErrNotFound is
+// returned when the user has no public key bound at all.
+func (c *Client) GetHoldings(ctx context.Context, userID *commonpb.UserId, currencies []currency_lib.Code, mints ...*commonpb.PublicKey) (Holdings, error) {
+	codes := make([]string, len(currencies))
+	for i, currency := range currencies {
+		codes[i] = string(currency)
+	}
+	ownerBalance, err := c.getOwnerBalance(ctx, userID, codes, mints)
+	if err != nil {
+		return Holdings{}, err
+	}
+	holdings := Holdings{fiatValues: make(map[string]float64, len(codes))}
+	if ownerBalance == nil {
+		for _, code := range codes {
+			holdings.fiatValues[code] = 0
+		}
+		return holdings, nil
+	}
+	holdings.usdf = ownerBalance.GetCoreMintValue()
+	for _, code := range codes {
+		if value, ok := ownerBalance.FiatValuesByCurrency[code]; ok {
+			holdings.fiatValues[code] = value
+		}
+	}
+	holdings.byMint = ownerBalance.GetBalancesByMint()
+	return holdings, nil
 }
 
 // getOwnerBalance asks OCP for the balance of the user's owner account,

@@ -28,8 +28,8 @@ import (
 // Joining is where a group's listener rules are enforced (see RuleEvaluator):
 // a user who does not satisfy them is refused, and never becomes a member.
 // Membership is checked first, so the rules are never evaluated on behalf of a
-// current member re-joining — a member's reads gate on membership alone (see
-// Access), and so does a no-op join. Leaving has no rule to satisfy.
+// current member re-joining: a no-op join gates on membership alone, as every
+// write that is a member's does (see Access). Leaving has no rule to satisfy.
 //
 // A private group (see Chat.IsPrivate) is not joined here: its members are
 // admitted by its creator from its lobby (see lobby.go), so JoinChat refuses

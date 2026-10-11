@@ -15,6 +15,7 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/model"
 )
@@ -297,7 +298,23 @@ func (s *Server) GetGroupChatFeed(ctx context.Context, req *chatpb.GetGroupChatF
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, listDetail, page)
+	// Every group on the page is one of the caller's, but a member reads a
+	// public group in full only while they satisfy its listener rules (see
+	// Access), so each row is hydrated as the caller stands in it, under
+	// FULL, the read a feed has always answered: a row the caller no longer
+	// qualifies for carries its record and none of its messaging state. The
+	// rules are evaluated together for the page.
+	standings, err := s.access.MemberListenerStandings(ctx, userID, page)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure determining group feed standings")
+		return nil, status.Error(codes.Internal, "")
+	}
+	readings := make([]Reading, len(page))
+	for i, standing := range standings {
+		readings[i] = standing.Reading(messagingpb.ViewMode_FULL)
+	}
+
+	metadata, err := s.hydrateEach(ctx, userID, standings, readings, listDetail, page)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating group feed metadata")
 		return nil, status.Error(codes.Internal, "")

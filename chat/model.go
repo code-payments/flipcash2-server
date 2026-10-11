@@ -254,10 +254,11 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // MinimumListenerBalance a group whose members must hold a balance (nil when
 // the group asks for none). Both are stored state set at creation, surfaced to
 // clients as listener rules (see Rules) and enforced by the messaging service
-// through a RuleEvaluator on sends. Reads, of chat metadata and of messages
-// alike, gate on membership alone, so a member a rule excludes can still see
-// the chat and what it requires of them; enforcing rules on membership changes
-// is the job of whatever path mutates membership.
+// through a RuleEvaluator on sends and on full reads of messages, a member's
+// included (see Access). A member a rule excludes can still see the chat's
+// record and what it requires of them, and its messages redacted; enforcing
+// rules on membership changes is the job of whatever path mutates
+// membership.
 //
 // IsCreatorOnlySpeaker marks a group in which only its creator may speak. It
 // is stored state, surfaced to clients as a CreatorRequirement speaker rule

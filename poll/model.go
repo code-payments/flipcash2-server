@@ -7,9 +7,10 @@
 // A poll in a group that is not private is created unsent: only its creator
 // sees it, and it takes no votes, until it goes live when first sent in a
 // message (see Store.MarkLive), and one that is never sent is discarded when
-// it ends. A private group's poll text is encrypted with the chat key, and its
-// widget is sent inside encrypted content the server never reads, so the
-// server cannot tell when it is sent: it is live from creation.
+// it ends. It is sent at most once: the send that makes it live is the only
+// one (see PrepareSend). A private group's poll text is encrypted with the
+// chat key, and its widget is sent inside encrypted content the server never
+// reads, so the server cannot tell when it is sent: it is live from creation.
 //
 // A poll closes at its PollDefinition.ends_at and at no other time. Votes are
 // refused from then on; TallyDelay later, once every vote accepted before the
@@ -28,6 +29,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 
 	"github.com/code-payments/flipcash2-server/model"
@@ -45,6 +47,16 @@ const (
 	MinDuration = 5 * time.Minute
 	MaxDuration = 30 * 24 * time.Hour
 )
+
+// SendRetryWindow is how long after a poll's creation the send that made it
+// live may be retried (see PrepareSend). A retry is safe only while messaging
+// still holds the send's client message ID, which is what makes it a replay
+// of the original message rather than a second one, so every messaging store
+// must keep a client message ID at least this long after its send. The send
+// comes after the poll's creation, so a client message ID kept that long is
+// kept past the window. It is MaxDuration, so the send can be retried at least
+// until the poll ends.
+const SendRetryWindow = MaxDuration
 
 // TallyDelay is how long after a poll ends the tally takes it up, and
 // VoteWriteTimeout bounds the write of a vote accepted before the end.
@@ -155,18 +167,23 @@ func (s Status) ToProto() pollpb.PollState_Status {
 // live when it is first sent in a message (see Store.MarkLive). An unsent poll
 // is discarded once it ends, and no store returns one after that.
 //
+// ClientMessageID is the client message ID of the send that made the poll
+// live, the one message that carries it (see PrepareSend). A poll created
+// live, or not yet sent, has none.
+//
 // Results are set once Status is StatusClosed, and never before. They are the
 // results as recorded, which for a BALANCE poll are totals no reader is shown
 // (see ResultsProto).
 type Poll struct {
-	ID         *pollpb.PollId
-	ChatID     *commonpb.ChatId
-	CreatorID  *commonpb.UserId
-	Definition *pollpb.PollDefinition
-	CreatedAt  time.Time
-	Live       bool
-	Status     Status
-	Results    *pollpb.Results
+	ID              *pollpb.PollId
+	ChatID          *commonpb.ChatId
+	CreatorID       *commonpb.UserId
+	Definition      *pollpb.PollDefinition
+	CreatedAt       time.Time
+	Live            bool
+	ClientMessageID *messagingpb.ClientMessageId
+	Status          Status
+	Results         *pollpb.Results
 }
 
 // EndsAt is when the poll stops taking votes.
@@ -279,6 +296,9 @@ func (p *Poll) Clone() *Poll {
 		CreatedAt:  p.CreatedAt,
 		Live:       p.Live,
 		Status:     p.Status,
+	}
+	if p.ClientMessageID != nil {
+		clone.ClientMessageID = proto.Clone(p.ClientMessageID).(*messagingpb.ClientMessageId)
 	}
 	if p.Results != nil {
 		clone.Results = proto.Clone(p.Results).(*pollpb.Results)

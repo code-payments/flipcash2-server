@@ -1,6 +1,7 @@
 package dynamodb
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 
 	"github.com/code-payments/flipcash2-server/poll"
@@ -25,7 +27,8 @@ import (
 //	polls       pk = "poll#<poll>", one item per poll: its chat, creator,
 //	            definition (the marshalled PollDefinition, which never changes),
 //	            created_at and ends_at (epoch nanos; ends_at is copied out of the
-//	            definition so conditions and updates can use it), live, status,
+//	            definition so conditions and updates can use it), live, once
+//	            sent the client message ID it went live by (cmid), status,
 //	            and once closed its results (the marshalled Results).
 //
 //	            An unsent poll carries expires_at, its end in epoch seconds, as
@@ -63,17 +66,18 @@ const (
 	pollKeyPrefix = "poll#"
 	userKeyPrefix = "user#"
 
-	attrPK         = "pk"
-	attrSK         = "sk"
-	attrChat       = "chat"       // B
-	attrCreator    = "creator"    // B
-	attrDefinition = "definition" // B, the marshalled PollDefinition
-	attrCreatedAt  = "created_at" // N, Unix nanos
-	attrEndsAt     = "ends_at"    // N, Unix nanos, copied out of the definition
-	attrLive       = "live"       // BOOL
-	attrStatus     = "status"     // N, statusOpen or statusClosed
-	attrResults    = "results"    // B, the marshalled Results; present only once closed
-	attrExpiresAt  = "expires_at" // N, Unix seconds (TTL); present only while unsent
+	attrPK              = "pk"
+	attrSK              = "sk"
+	attrChat            = "chat"       // B
+	attrCreator         = "creator"    // B
+	attrDefinition      = "definition" // B, the marshalled PollDefinition
+	attrCreatedAt       = "created_at" // N, Unix nanos
+	attrEndsAt          = "ends_at"    // N, Unix nanos, copied out of the definition
+	attrLive            = "live"       // BOOL
+	attrClientMessageID = "cmid"       // B, the client message ID it went live by; present only once sent
+	attrStatus          = "status"     // N, statusOpen or statusClosed
+	attrResults         = "results"    // B, the marshalled Results; present only once closed
+	attrExpiresAt       = "expires_at" // N, Unix seconds (TTL); present only while unsent
 
 	attrTallyQueue    = "tally_queue"    // S, tallyQueuePK (GSI hash); present only while queued
 	attrTallyDueAt    = "tally_due_at"   // N, Unix nanos (GSI range); when the poll is next due
@@ -98,6 +102,7 @@ var expressionNames = map[string]string{
 	"#pk":       attrPK,
 	"#endsAt":   attrEndsAt,
 	"#live":     attrLive,
+	"#cmid":     attrClientMessageID,
 	"#status":   attrStatus,
 	"#results":  attrResults,
 	"#expires":  attrExpiresAt,
@@ -221,18 +226,21 @@ func (s *store) GetPolls(ctx context.Context, pollIDs []*pollpb.PollId) (map[str
 	return out, nil
 }
 
-func (s *store) MarkLive(ctx context.Context, pollID *pollpb.PollId, now time.Time) (bool, error) {
+func (s *store) MarkLive(ctx context.Context, pollID *pollpb.PollId, clientMessageID *messagingpb.ClientMessageId, now time.Time) (bool, error) {
 	// The due time is computed from the stored end in the update itself, so
-	// going live is one write with no read before it.
+	// going live is one write with no read before it. The condition admits
+	// only an unsent poll, never a retry by the same send: that would enqueue
+	// the poll again, closed or not.
 	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                aws.String(s.pollsTable),
 		Key:                      pollKey(pollID),
 		ConditionExpression:      aws.String("attribute_exists(#pk) AND #live = :false AND #endsAt > :now"),
-		UpdateExpression:         aws.String("SET #live = :true, #q = :q, #due = #endsAt + :delay, #attempts = :zero REMOVE #expires"),
-		ExpressionAttributeNames: names("#pk", "#live", "#endsAt", "#q", "#due", "#attempts", "#expires"),
+		UpdateExpression:         aws.String("SET #live = :true, #cmid = :cmid, #q = :q, #due = #endsAt + :delay, #attempts = :zero REMOVE #expires"),
+		ExpressionAttributeNames: names("#pk", "#live", "#cmid", "#endsAt", "#q", "#due", "#attempts", "#expires"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":false": avBool(false),
 			":true":  avBool(true),
+			":cmid":  avB(clientMessageID.GetValue()),
 			":now":   avNInt(now.UnixNano()),
 			":q":     avS(tallyQueuePK),
 			":delay": avNInt(int64(poll.TallyDelay)),
@@ -248,11 +256,14 @@ func (s *store) MarkLive(ctx context.Context, pollID *pollpb.PollId, now time.Ti
 		return false, err
 	}
 	// Missing, or unsent and ended (discarded): not found. Otherwise the poll
-	// is live already, which is the no-op.
+	// is live already, which is the no-op if this send made it live.
 	if len(old) == 0 || !asBool(old[attrLive]) {
 		return false, poll.ErrPollNotFound
 	}
-	return false, nil
+	if stored, ok := old[attrClientMessageID]; ok && bytes.Equal(asB(stored), clientMessageID.GetValue()) {
+		return false, nil
+	}
+	return false, poll.ErrPollAlreadyLive
 }
 
 func (s *store) SetVote(ctx context.Context, pollID *pollpb.PollId, userID *commonpb.UserId, options []uint32, votedAt time.Time) error {
@@ -571,6 +582,9 @@ func pollFromItem(item map[string]types.AttributeValue) (*poll.Poll, error) {
 		Definition: definition,
 		CreatedAt:  time.Unix(0, createdAt).UTC(),
 		Live:       asBool(item[attrLive]),
+	}
+	if clientMessageID, ok := item[attrClientMessageID]; ok {
+		p.ClientMessageID = &messagingpb.ClientMessageId{Value: asB(clientMessageID)}
 	}
 	switch status {
 	case statusOpen:

@@ -3387,9 +3387,10 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 }
 
 // testServer_PollWidget pins sending a poll in a public group: only its
-// creator, only in its chat, only while it is open, and the first send makes
-// it live. A poll is never a reply's body or an edit, and its message, which
-// is its creator's, may be deleted without touching the poll.
+// creator, only in its chat, only while it is open, and only once: the send
+// that makes it live is the only one, and only its retries pass again. A poll
+// is never a reply's body or an edit, and its message, which is its
+// creator's, may be deleted without touching the poll.
 func testServer_PollWidget(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
@@ -3434,8 +3435,9 @@ func testServer_PollWidget(t *testing.T, badges badge.Store, blocklists blocklis
 	require.NoError(t, err)
 	require.False(t, stored.Live)
 
-	// The creator's send goes through, and makes the poll live.
-	sent, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(unsent.ID), generateClientID())
+	// The creator's send goes through, and makes the poll live as sent by it.
+	clientMessageID := generateClientID()
+	sent, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(unsent.ID), clientMessageID)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
 	require.True(t, proto.Equal(pollWidgetContent(unsent.ID)[0], sent.Message.Content[0]))
@@ -3443,11 +3445,18 @@ func testServer_PollWidget(t *testing.T, badges badge.Store, blocklists blocklis
 	stored, err = e.polls.GetPoll(e.ctx, unsent.ID)
 	require.NoError(t, err)
 	require.True(t, stored.Live)
+	require.True(t, proto.Equal(clientMessageID, stored.ClientMessageID))
 
-	// They may send it again, to bring it back to the bottom of the chat.
+	// A retry of that send is answered with the original message.
+	retried, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(unsent.ID), clientMessageID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, retried.Result)
+	require.Equal(t, sent.Message.MessageId.Value, retried.Message.MessageId.Value)
+
+	// Any other send of it is refused: a poll is sent once.
 	again, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(unsent.ID), generateClientID())
 	require.NoError(t, err)
-	require.Equal(t, messagingpb.SendMessageResponse_OK, again.Result)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, again.Result)
 
 	// It is a message like any other to read, reply to and react to.
 	read, err := e.getMessageInChat(e.keysB, groupID, sent.Message.MessageId)
@@ -3473,8 +3482,11 @@ func testServer_PollWidget(t *testing.T, badges badge.Store, blocklists blocklis
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.EditMessageResponse_CANNOT_EDIT, editPoll.Result)
 
-	// Its creator may delete its message, which leaves the poll as it was.
-	deleted, err := e.deleteMessageInChat(e.keysA, groupID, again.Message.MessageId, again.Message.EventSequence)
+	// Its creator may delete its message, which leaves the poll as it was, and
+	// does not let it be sent again.
+	read, err = e.getMessageInChat(e.keysA, groupID, sent.Message.MessageId)
+	require.NoError(t, err)
+	deleted, err := e.deleteMessageInChat(e.keysA, groupID, sent.Message.MessageId, read.Message.EventSequence)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.DeleteMessageResponse_OK, deleted.Result)
 
@@ -3482,6 +3494,25 @@ func testServer_PollWidget(t *testing.T, badges badge.Store, blocklists blocklis
 	require.NoError(t, err)
 	require.True(t, stored.Live)
 	require.Equal(t, poll.StatusOpen, stored.Status)
+
+	resent, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(unsent.ID), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, resent.Result)
+
+	// A send that made its poll live but failed before its message was
+	// written is retried after the poll has ended: the retry writes the one
+	// message, and a retry of that is answered with it.
+	lost := e.putPoll(groupID, e.userA, false, time.Now().Add(-time.Second))
+	lostClientMessageID := generateClientID()
+	_, err = e.polls.MarkLive(e.ctx, lost.ID, lostClientMessageID, lost.EndsAt().Add(-time.Minute))
+	require.NoError(t, err)
+	recovered, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(lost.ID), lostClientMessageID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, recovered.Result)
+	replayed, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(lost.ID), lostClientMessageID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, replayed.Result)
+	require.Equal(t, recovered.Message.MessageId.Value, replayed.Message.MessageId.Value)
 
 	// A poll that is no longer open is not sent: one past its end, and one
 	// closed with its results.

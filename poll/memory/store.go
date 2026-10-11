@@ -11,6 +11,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 
 	"github.com/code-payments/flipcash2-server/poll"
@@ -103,7 +104,7 @@ func (m *memory) GetPolls(_ context.Context, pollIDs []*pollpb.PollId) (map[stri
 	return out, nil
 }
 
-func (m *memory) MarkLive(_ context.Context, pollID *pollpb.PollId, now time.Time) (bool, error) {
+func (m *memory) MarkLive(_ context.Context, pollID *pollpb.PollId, clientMessageID *messagingpb.ClientMessageId, now time.Time) (bool, error) {
 	m.Lock()
 	defer m.Unlock()
 
@@ -112,9 +113,13 @@ func (m *memory) MarkLive(_ context.Context, pollID *pollpb.PollId, now time.Tim
 		return false, poll.ErrPollNotFound
 	}
 	if p.Live {
-		return false, nil
+		if p.ClientMessageID != nil && proto.Equal(p.ClientMessageID, clientMessageID) {
+			return false, nil
+		}
+		return false, poll.ErrPollAlreadyLive
 	}
 	p.Live = true
+	p.ClientMessageID = proto.Clone(clientMessageID).(*messagingpb.ClientMessageId)
 	m.queue[string(pollID.Value)] = &queued{dueAt: poll.TallyDueAt(p)}
 	return true, nil
 }

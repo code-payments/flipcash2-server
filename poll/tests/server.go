@@ -93,7 +93,7 @@ func testServer_CreatePoll_PublicGroup(t *testing.T, chats chat.Store, polls pol
 
 	// Sent, it is the chat's. (Sending is messaging's to do; the store is
 	// what it calls.)
-	_, err = polls.MarkLive(e.ctx, created.PollId, e.clock.Now())
+	_, err = polls.MarkLive(e.ctx, created.PollId, newClientMessageID(), e.clock.Now())
 	require.NoError(t, err)
 
 	got = e.getPoll(member, created.PollId)
@@ -750,7 +750,7 @@ func (e *serverEnv) createLivePollWith(u user, chatID *commonpb.ChatId, configur
 	}
 	resp := e.createPoll(u, chatID, definition, newIdempotencyKey())
 	require.Equal(e.t, pollpb.CreatePollResponse_OK, resp.Result)
-	_, err := e.polls.MarkLive(e.ctx, resp.Poll.PollId, e.clock.Now())
+	_, err := e.polls.MarkLive(e.ctx, resp.Poll.PollId, newClientMessageID(), e.clock.Now())
 	require.NoError(e.t, err)
 	return resp.Poll.PollId
 }

@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
@@ -109,7 +112,7 @@ func testStore_UnsentPollDiscardedAtEnd(t *testing.T, s poll.Store) {
 	require.NoError(t, err)
 	require.Empty(t, got)
 
-	_, err = s.MarkLive(ctx, unsent.ID, time.Now())
+	_, err = s.MarkLive(ctx, unsent.ID, newClientMessageID(), time.Now())
 	require.ErrorIs(t, err, poll.ErrPollNotFound)
 
 	// A live poll past its end is not discarded: it is waiting to be counted.
@@ -127,34 +130,90 @@ func testStore_MarkLive(t *testing.T, s poll.Store) {
 	p := newStorePoll(false, time.Now().Add(time.Hour))
 	require.NoError(t, s.CreatePoll(ctx, p))
 
-	changed, err := s.MarkLive(ctx, p.ID, time.Now())
+	got, err := s.GetPoll(ctx, p.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.ClientMessageID)
+
+	clientMessageID := newClientMessageID()
+	changed, err := s.MarkLive(ctx, p.ID, clientMessageID, time.Now())
 	require.NoError(t, err)
 	require.True(t, changed)
 
-	got, err := s.GetPoll(ctx, p.ID)
+	got, err = s.GetPoll(ctx, p.ID)
 	require.NoError(t, err)
 	require.True(t, got.Live)
+	require.True(t, proto.Equal(clientMessageID, got.ClientMessageID))
 
-	// Going live again is the no-op.
-	changed, err = s.MarkLive(ctx, p.ID, time.Now())
+	byID, err := s.GetPolls(ctx, []*pollpb.PollId{p.ID})
+	require.NoError(t, err)
+	require.True(t, proto.Equal(clientMessageID, byID[string(p.ID.Value)].ClientMessageID))
+
+	// Going live again by the same send is the no-op, even once the poll has
+	// ended or closed; by any other send it is refused.
+	changed, err = s.MarkLive(ctx, p.ID, clientMessageID, time.Now())
 	require.NoError(t, err)
 	require.False(t, changed)
 
-	// So is a poll created live.
+	_, err = s.MarkLive(ctx, p.ID, newClientMessageID(), time.Now())
+	require.ErrorIs(t, err, poll.ErrPollAlreadyLive)
+
+	changed, err = s.MarkLive(ctx, p.ID, clientMessageID, p.EndsAt().Add(time.Hour))
+	require.NoError(t, err)
+	require.False(t, changed)
+
+	_, err = s.Close(ctx, p.ID, &pollpb.Results{Type: &pollpb.Results_Withheld{Withheld: &pollpb.WithheldResults{}}})
+	require.NoError(t, err)
+	changed, err = s.MarkLive(ctx, p.ID, clientMessageID, time.Now())
+	require.NoError(t, err)
+	require.False(t, changed)
+
+	// The no-op leaves the closed poll as it was.
+	got, err = s.GetPoll(ctx, p.ID)
+	require.NoError(t, err)
+	require.Equal(t, poll.StatusClosed, got.Status)
+
+	// A poll created live was sent by no send this store saw, so every send
+	// is refused.
 	live := newStorePoll(true, time.Now().Add(time.Hour))
 	require.NoError(t, s.CreatePoll(ctx, live))
-	changed, err = s.MarkLive(ctx, live.ID, time.Now())
-	require.NoError(t, err)
-	require.False(t, changed)
+	_, err = s.MarkLive(ctx, live.ID, newClientMessageID(), time.Now())
+	require.ErrorIs(t, err, poll.ErrPollAlreadyLive)
+
+	// Of sends racing to make a poll live, exactly one does.
+	raced := newStorePoll(false, time.Now().Add(time.Hour))
+	require.NoError(t, s.CreatePoll(ctx, raced))
+	const racers = 8
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		winners int
+	)
+	for range racers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			changed, err := s.MarkLive(ctx, raced.ID, newClientMessageID(), time.Now())
+			if err != nil {
+				assert.ErrorIs(t, err, poll.ErrPollAlreadyLive)
+				return
+			}
+			assert.True(t, changed)
+			mu.Lock()
+			winners++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, 1, winners)
 
 	// An unsent poll cannot go live at or after its end, which is when it is
 	// discarded.
 	ending := newStorePoll(false, time.Now().Add(time.Hour))
 	require.NoError(t, s.CreatePoll(ctx, ending))
-	_, err = s.MarkLive(ctx, ending.ID, ending.EndsAt())
+	_, err = s.MarkLive(ctx, ending.ID, newClientMessageID(), ending.EndsAt())
 	require.ErrorIs(t, err, poll.ErrPollNotFound)
 
-	_, err = s.MarkLive(ctx, newPollID(), time.Now())
+	_, err = s.MarkLive(ctx, newPollID(), newClientMessageID(), time.Now())
 	require.ErrorIs(t, err, poll.ErrPollNotFound)
 }
 
@@ -265,7 +324,7 @@ func testStore_TallyQueue(t *testing.T, s poll.Store) {
 	for _, p := range []*poll.Poll{late, early, unsent, sent} {
 		require.NoError(t, s.CreatePoll(ctx, p))
 	}
-	_, err := s.MarkLive(ctx, sent.ID, now)
+	_, err := s.MarkLive(ctx, sent.ID, newClientMessageID(), now)
 	require.NoError(t, err)
 
 	// A poll comes due TallyDelay after it ends, and not before.
@@ -412,7 +471,7 @@ func testStore_TallyQueueStats(t *testing.T, s poll.Store) {
 	require.True(t, poll.TallyDueAt(sooner).Equal(stats.OldestDueAt))
 
 	// Going live enqueues a poll, and the most overdue sets the age.
-	_, err = s.MarkLive(ctx, unsent.ID, now)
+	_, err = s.MarkLive(ctx, unsent.ID, newClientMessageID(), now)
 	require.NoError(t, err)
 
 	asOf := now.Add(3 * time.Hour)
@@ -509,6 +568,10 @@ func newStorePoll(live bool, endsAt time.Time) *poll.Poll {
 		Live:      live,
 		Status:    poll.StatusOpen,
 	}
+}
+
+func newClientMessageID() *messagingpb.ClientMessageId {
+	return &messagingpb.ClientMessageId{Value: model.MustGenerateUserID().Value}
 }
 
 func newPollID() *pollpb.PollId {

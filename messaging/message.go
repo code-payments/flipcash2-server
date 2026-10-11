@@ -187,13 +187,14 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 	}
 
 	// A poll may be sent only by its creator, in its chat, while it is open,
-	// and its first send makes it live, before the message is persisted and
-	// broadcast, so everyone who sees the message can see the poll (see
-	// poll.PrepareSend). Only a public group reaches this: a private group's
-	// plaintext was refused above, and its polls travel inside encrypted
-	// content.
+	// and only once: the send makes it live, as sent by this client message
+	// ID, before the message is persisted and broadcast, so everyone who sees
+	// the message can see the poll, and only a retry of that send passes again
+	// (see poll.PrepareSend), which the sender then answers with the original
+	// message. Only a public group reaches this: a private group's plaintext
+	// was refused above, and its polls travel inside encrypted content.
 	if pollID := sentPollID(req.Content); pollID != nil {
-		switch err := poll.PrepareSend(ctx, s.polls, req.ChatId, userID, pollID, time.Now()); {
+		switch err := poll.PrepareSend(ctx, s.polls, req.ChatId, userID, pollID, req.ClientMessageId, time.Now()); {
 		case errors.Is(err, poll.ErrNotSendable):
 			return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
 		case err != nil:

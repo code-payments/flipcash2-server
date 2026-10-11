@@ -6,6 +6,7 @@ import (
 	"time"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 )
 
@@ -21,6 +22,10 @@ var (
 	// ErrPollNotLive is returned by Close for a poll that never went live,
 	// which is never tallied.
 	ErrPollNotLive = errors.New("poll is not live")
+
+	// ErrPollAlreadyLive is returned by MarkLive for a poll that is live, but
+	// not by the given send: another send made it live, or it was created live.
+	ErrPollAlreadyLive = errors.New("poll is already live")
 )
 
 // Store persists polls and their votes.
@@ -62,11 +67,14 @@ type Store interface {
 	// as are duplicates beyond the first.
 	GetPolls(ctx context.Context, pollIDs []*pollpb.PollId) (map[string]*Poll, error)
 
-	// MarkLive makes an unsent poll live (see Poll.Live), enqueuing it for the
-	// tally, and reports whether it changed anything: a poll already live is a
-	// no-op. ErrPollNotFound is returned for a poll that does not exist, or
-	// that ended unsent at or before now and so has been discarded.
-	MarkLive(ctx context.Context, pollID *pollpb.PollId, now time.Time) (changed bool, err error)
+	// MarkLive makes an unsent poll live (see Poll.Live) as sent by the
+	// message with clientMessageID, recording it as Poll.ClientMessageID and
+	// enqueuing the poll for the tally, and reports whether it changed
+	// anything: a poll already live by that message is a no-op, and one live
+	// otherwise, by another send or from creation, is ErrPollAlreadyLive, so of
+	// any number of sends racing to make a poll live exactly one does. ErrPollNotFound is returned for a poll that does not
+	// exist, or that ended unsent at or before now and so has been discarded.
+	MarkLive(ctx context.Context, pollID *pollpb.PollId, clientMessageID *messagingpb.ClientMessageId, now time.Time) (changed bool, err error)
 
 	// SetVote replaces userID's vote in a poll with options, as cast at
 	// votedAt, or removes it when options is empty. Nothing is checked against

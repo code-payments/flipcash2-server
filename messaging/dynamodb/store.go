@@ -159,7 +159,10 @@ const (
 	// cmidTTL is how long a cmid idempotency marker is retained before DynamoDB
 	// TTL reaps it. Markers only guard against retried sends, which happen within
 	// seconds, so a month of retention is ample; a (wildly implausible) retry past
-	// this window would persist a duplicate message rather than dedup.
+	// this window would persist a duplicate message rather than dedup. It must be
+	// at least poll.SendRetryWindow: a poll is sent once, and the retries of its
+	// one send that poll.PrepareSend lets through rely on the marker to replay
+	// the message rather than write a second (see TestCmidTTL_CoversPollSendRetries).
 	cmidTTL = 30 * 24 * time.Hour
 
 	// messages table attributes

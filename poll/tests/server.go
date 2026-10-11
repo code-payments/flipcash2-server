@@ -532,7 +532,7 @@ func testServer_BalanceResults_Ranked(t *testing.T, chats chat.Store, polls poll
 	require.Equal(t, pollpb.VoteResponse_OK, e.vote(member, id, 1).Result)
 
 	amount := func(native float64) *commonpb.CryptoPaymentAmount {
-		return &commonpb.CryptoPaymentAmount{Currency: "usd", NativeAmount: native, Mint: coreMint}
+		return &commonpb.CryptoPaymentAmount{Currency: "usd", NativeAmount: native, Quarks: ocp_common.ToCoreMintQuarks(uint64(native)), Mint: coreMint}
 	}
 	recorded := &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
 		Total:          amount(90),
@@ -594,7 +594,7 @@ func newServerEnv(t *testing.T, chats chat.Store, polls poll.Store) *serverEnv {
 
 	authz := auth.NewStaticAuthorizer(log)
 	accounts := accountmemory.NewInMemory()
-	ocpBalance := &fakeOcpBalance{byOwner: make(map[string]uint64)}
+	ocpBalance := &fakeOcpBalance{byOwner: make(map[string]fakeHolding)}
 	balances := balance.NewClient(log, accounts, ocpBalance)
 
 	// Nothing is remembered between asks, so a test's changes to balances and
@@ -951,21 +951,34 @@ func (m *fakeModerator) ClassifyText(_ context.Context, text string) (*moderatio
 }
 
 // fakeOcpBalance is the OCP balance service behind the env's balance client,
-// answering each owner's total from a ledger a test sets in USDF quarks, valued
-// in a fiat currency at the rate a test sets for it (none, and the currency is
-// one OCP cannot price). It ignores the request's mint filter. A test may fail
-// every call with err.
+// answering each owner's total from a ledger a test sets, one holding per
+// owner: its value in USDF quarks, valued in a fiat currency at the rate a test
+// sets for it (none, and the currency is one OCP cannot price), and its amount
+// in the mint's own quarks. It ignores the request's mint filter, and reports
+// the holding as one in each mint requested. A test may fail every call with
+// err.
 type fakeOcpBalance struct {
 	mu      sync.Mutex
-	byOwner map[string]uint64
+	byOwner map[string]fakeHolding
 	rates   map[string]float64
 	err     error
 }
 
-func (f *fakeOcpBalance) setBalance(owner *commonpb.PublicKey, quarks uint64) {
+type fakeHolding struct {
+	quarks        uint64
+	coreMintValue uint64
+}
+
+// setBalance gives owner coreMintValue USDF quarks, held as that many quarks.
+func (f *fakeOcpBalance) setBalance(owner *commonpb.PublicKey, coreMintValue uint64) {
+	f.setHolding(owner, coreMintValue, coreMintValue)
+}
+
+// setHolding gives owner quarks of a mint worth coreMintValue USDF quarks.
+func (f *fakeOcpBalance) setHolding(owner *commonpb.PublicKey, quarks, coreMintValue uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.byOwner[base58.Encode(owner.Value)] = quarks
+	f.byOwner[base58.Encode(owner.Value)] = fakeHolding{quarks: quarks, coreMintValue: coreMintValue}
 }
 
 func (f *fakeOcpBalance) setRate(currency string, rate float64) {
@@ -992,20 +1005,31 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 	resp := &ocp_balancepb.GetBalancesResponse{BalancesByOwner: make(map[string]*ocp_balancepb.OwnerBalance)}
 	for _, owner := range req.Owners {
 		key := base58.Encode(owner.Value)
-		quarks, ok := f.byOwner[key]
+		holding, ok := f.byOwner[key]
 		if !ok {
 			continue
 		}
-		ownerBalance := &ocp_balancepb.OwnerBalance{Owner: owner, CoreMintValue: quarks}
+		fiatValues := make(map[string]float64)
 		for _, code := range req.CurrencyCodes {
-			rate, ok := f.rates[code]
-			if !ok {
-				continue
+			if rate, ok := f.rates[code]; ok {
+				fiatValues[code] = float64(holding.coreMintValue) / float64(ocp_common.CoreMintQuarksPerUnit) * rate
 			}
-			if ownerBalance.FiatValuesByCurrency == nil {
-				ownerBalance.FiatValuesByCurrency = make(map[string]float64)
+		}
+		ownerBalance := &ocp_balancepb.OwnerBalance{
+			Owner:                owner,
+			CoreMintValue:        holding.coreMintValue,
+			FiatValuesByCurrency: fiatValues,
+		}
+		if !req.ExcludePerMintBalances && holding.quarks > 0 {
+			ownerBalance.BalancesByMint = make(map[string]*ocp_balancepb.MintBalance, len(req.Mints))
+			for _, mint := range req.Mints {
+				ownerBalance.BalancesByMint[base58.Encode(mint.Value)] = &ocp_balancepb.MintBalance{
+					Mint:                 mint,
+					CoreMintValue:        holding.coreMintValue,
+					FiatValuesByCurrency: fiatValues,
+					Quarks:               holding.quarks,
+				}
 			}
-			ownerBalance.FiatValuesByCurrency[code] = float64(quarks) / float64(ocp_common.CoreMintQuarksPerUnit) * rate
 		}
 		resp.BalancesByOwner[key] = ownerBalance
 	}

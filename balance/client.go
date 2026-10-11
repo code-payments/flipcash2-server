@@ -82,7 +82,7 @@ func NewClient(
 // A user that hasn't opened OCP accounts yet has a zero balance. ErrNotFound is
 // returned when the user has no public key bound at all.
 func (c *Client) GetTotalUsdfBalance(ctx context.Context, userID *commonpb.UserId, mints ...*commonpb.PublicKey) (uint64, error) {
-	ownerBalance, err := c.getOwnerBalance(ctx, userID, nil, mints)
+	ownerBalance, err := c.getTotalOwnerBalance(ctx, userID, nil, mints)
 	if err != nil {
 		return 0, err
 	}
@@ -102,7 +102,7 @@ func (c *Client) GetTotalUsdfBalance(ctx context.Context, userID *commonpb.UserI
 // the user has no public key bound at all.
 func (c *Client) GetTotalFiatValue(ctx context.Context, userID *commonpb.UserId, currency currency_lib.Code, mints ...*commonpb.PublicKey) (float64, error) {
 	code := string(currency)
-	ownerBalance, err := c.getOwnerBalance(ctx, userID, []string{code}, mints)
+	ownerBalance, err := c.getTotalOwnerBalance(ctx, userID, []string{code}, mints)
 	if err != nil {
 		return 0, err
 	}
@@ -119,26 +119,37 @@ func (c *Client) GetTotalFiatValue(ctx context.Context, userID *commonpb.UserId,
 // maxOwnersPerGetBalances is the most owners one OCP GetBalances call takes.
 const maxOwnersPerGetBalances = 1024
 
-// GetMintFiatValuesForUsers returns what each of the given users holds of mint,
-// valued in currency in that currency's major units, keyed by
-// string(userID.Value): GetTotalFiatValue for many users and one mint, at as
-// few OCP calls as its batch limit allows (maxOwnersPerGetBalances owners
-// each). Calls beyond the first are made one after another, so a large batch
-// is not one instant's balances: holdings that move between users during the
-// read can be seen in both.
+// MintHolding is what one user holds of one mint.
+type MintHolding struct {
+	// Quarks is the amount held, in the mint's own quarks.
+	Quarks uint64
+
+	// FiatValue is the holding valued in the requested currency, in that
+	// currency's major units, as OCP values it at its current exchange rate.
+	FiatValue float64
+}
+
+// GetMintHoldingsForUsers returns what each of the given users holds of mint,
+// in the mint's quarks and valued in currency, keyed by
+// string(userID.Value): GetTotalFiatValue for many users and one mint, plus
+// the quarks behind each value, at as few OCP calls as its batch limit allows
+// (maxOwnersPerGetBalances owners each). Calls beyond the first are made one
+// after another, so a large batch is not one instant's balances: holdings that
+// move between users during the read can be seen in both.
 //
 // A user who holds nothing of mint, or who has not opened OCP accounts yet, is
 // absent, and so is a user with no bound key, or more than one (see
 // ErrAmbiguousOwner, logged here): there is no single owner to read for them,
 // and one such user must not hold up everyone else's balance. A currency OCP
 // cannot price is ErrUnsupportedCurrency, as for GetTotalFiatValue.
-func (c *Client) GetMintFiatValuesForUsers(ctx context.Context, currency currency_lib.Code, mint *commonpb.PublicKey, userIDs ...*commonpb.UserId) (map[string]float64, error) {
+func (c *Client) GetMintHoldingsForUsers(ctx context.Context, currency currency_lib.Code, mint *commonpb.PublicKey, userIDs ...*commonpb.UserId) (map[string]MintHolding, error) {
 	code := string(currency)
 
 	mintAccount, err := ocp_common.NewAccountFromPublicKeyBytes(mint.GetValue())
 	if err != nil {
 		return nil, fmt.Errorf("parsing mint account: %w", err)
 	}
+	mintAddress := mintAccount.PublicKey().ToBase58()
 
 	owners, err := c.getOwners(ctx, userIDs)
 	if err != nil {
@@ -152,7 +163,7 @@ func (c *Client) GetMintFiatValuesForUsers(ctx context.Context, currency currenc
 		ownerIDs = append(ownerIDs, owner.ToProto())
 	}
 
-	values := make(map[string]float64, len(ownerIDs))
+	holdings := make(map[string]MintHolding, len(ownerIDs))
 	for start := 0; start < len(ownerIDs); start += maxOwnersPerGetBalances {
 		resp, err := c.ocpBalance.GetBalances(ctx, &ocp_balancepb.GetBalancesRequest{
 			Owners:        ownerIDs[start:min(start+maxOwnersPerGetBalances, len(ownerIDs))],
@@ -171,8 +182,12 @@ func (c *Client) GetMintFiatValuesForUsers(ctx context.Context, currency currenc
 			return nil, errors.New("unexpected result getting balances: " + resp.Result.String())
 		}
 
-		// Owners OCP doesn't know are left out of the response: they hold
-		// nothing.
+		// Owners OCP doesn't know are left out of the response, and a mint an
+		// owner holds none of is left out of theirs: either way they hold
+		// nothing. The request is filtered to the one mint, so the owner's
+		// fiat total is that mint's value; it is read there because OCP
+		// answers it for every owner it knows, which is what tells a currency
+		// it cannot price from one nobody holds.
 		for address, ownerBalance := range resp.BalancesByOwner {
 			userKey, ok := byOwner[address]
 			if !ok {
@@ -182,18 +197,19 @@ func (c *Client) GetMintFiatValuesForUsers(ctx context.Context, currency currenc
 			if !ok {
 				return nil, fmt.Errorf("%w: %q", ErrUnsupportedCurrency, code)
 			}
-			if value > 0 {
-				values[userKey] = value
+			quarks := ownerBalance.BalancesByMint[mintAddress].GetQuarks()
+			if quarks > 0 {
+				holdings[userKey] = MintHolding{Quarks: quarks, FiatValue: value}
 			}
 		}
 	}
-	return values, nil
+	return holdings, nil
 }
 
 // getOwners returns the owner account of each of the given users that has
 // exactly one bound key, keyed by string(userID.Value), from one batched key
 // lookup. Users with none, or more than one, are left out (see
-// GetMintFiatValuesForUsers).
+// GetMintHoldingsForUsers).
 func (c *Client) getOwners(ctx context.Context, userIDs []*commonpb.UserId) (map[string]*ocp_common.Account, error) {
 	pubKeysByUser, err := c.accounts.GetPubKeysForUsers(ctx, userIDs)
 	if err != nil {
@@ -218,16 +234,17 @@ func (c *Client) getOwners(ctx context.Context, userIDs []*commonpb.UserId) (map
 	return owners, nil
 }
 
-// getOwnerBalance asks OCP for the balance of the user's owner account,
-// filtered to mints and additionally valued in currencyCodes, and returns it
-// as OCP reports it: the totals across the owner's accounts are OCP's, so
-// nothing is summed here. A user has one owner account, the one key bound to
+// getTotalOwnerBalance asks OCP for the total balance of the user's owner
+// account, filtered to mints and additionally valued in currencyCodes, and
+// returns it as OCP reports it: the totals across the owner's accounts are
+// OCP's, so nothing is summed here, and the per-mint breakdown is left out
+// (BalancesByMint is never set). A user has one owner account, the one key bound to
 // them: ErrNotFound is returned when there is none, and ErrAmbiguousOwner
 // when there is more than one, rather than a balance that answers for only
 // some of what the user holds. An owner OCP doesn't know is left out of the
 // response, which is the case until the user opens their accounts: nothing has
 // been opened, so the balance is nil, without error.
-func (c *Client) getOwnerBalance(ctx context.Context, userID *commonpb.UserId, currencyCodes []string, mints []*commonpb.PublicKey) (*ocp_balancepb.OwnerBalance, error) {
+func (c *Client) getTotalOwnerBalance(ctx context.Context, userID *commonpb.UserId, currencyCodes []string, mints []*commonpb.PublicKey) (*ocp_balancepb.OwnerBalance, error) {
 	log := c.log.With(zap.String("user_id", model.UserIDString(userID)))
 
 	pubKeys, err := c.accounts.GetPubKeys(ctx, userID)
@@ -261,9 +278,10 @@ func (c *Client) getOwnerBalance(ctx context.Context, userID *commonpb.UserId, c
 	}
 
 	resp, err := c.ocpBalance.GetBalances(ctx, &ocp_balancepb.GetBalancesRequest{
-		Owners:        []*ocp_commonpb.SolanaAccountId{owner.ToProto()},
-		Mints:         mintProtos,
-		CurrencyCodes: currencyCodes,
+		Owners:                 []*ocp_commonpb.SolanaAccountId{owner.ToProto()},
+		Mints:                  mintProtos,
+		CurrencyCodes:          currencyCodes,
+		ExcludePerMintBalances: true,
 	})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure getting balances from OCP")

@@ -93,8 +93,8 @@ func testWorker_CountPoll_Withheld(t *testing.T, polls poll.Store) {
 }
 
 // testWorker_BalancePoll pins a BALANCE poll's tally: each voter's holdings
-// of the mint, valued in the poll's currency, added to every option they chose
-// and to the total once, exactly, with no quarks.
+// of the mint, in its quarks and valued in the poll's currency, added to every
+// option they chose and to the total once, exactly.
 func testWorker_BalancePoll(t *testing.T, polls poll.Store) {
 	e := newWorkerEnv(t, polls)
 	e.ocpBalance.setRate("cad", 2)
@@ -104,8 +104,11 @@ func testWorker_BalancePoll(t *testing.T, polls poll.Store) {
 	p := e.putDuePoll(chatID, pollpb.Mode_BALANCE, 2, true)
 
 	// Valued in cad at 2: 247, 100, 50, 20, 10.5, and nothing.
-	for i, usdf := range []float64{123.5, 50, 25, 10, 5.25} {
-		e.fund(members[i], usdf)
+	for i, holding := range []struct {
+		quarks uint64
+		usdf   float64
+	}{{1000, 123.5}, {400, 50}, {200, 25}, {80, 10}, {42, 5.25}} {
+		e.fund(members[i], holding.quarks, holding.usdf)
 	}
 	e.vote(p, members[0], 0)
 	e.vote(p, members[1], 0, 1)
@@ -119,12 +122,12 @@ func testWorker_BalancePoll(t *testing.T, polls poll.Store) {
 
 	// Recorded exactly: only the ranking is ever shown (see
 	// poll.ResultsProto).
-	amount := func(native float64) *commonpb.CryptoPaymentAmount {
-		return &commonpb.CryptoPaymentAmount{Currency: "cad", NativeAmount: native, Mint: e.mint}
+	amount := func(native float64, quarks uint64) *commonpb.CryptoPaymentAmount {
+		return &commonpb.CryptoPaymentAmount{Currency: "cad", NativeAmount: native, Quarks: quarks, Mint: e.mint}
 	}
 	e.requireClosed(p, &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
-		Total:          amount(427.5),
-		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(357.5), amount(170)},
+		Total:          amount(427.5, 1722),
+		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(357.5, 1442), amount(170, 680)},
 	}}})
 }
 
@@ -138,7 +141,7 @@ func testWorker_BalancePoll_FewVoters(t *testing.T, polls poll.Store) {
 	members := e.newUsers(3)
 	chatID := newGroupChatID()
 	p := e.putDuePoll(chatID, pollpb.Mode_BALANCE, 2, false)
-	e.fund(members[0], 10)
+	e.fund(members[0], 25, 10)
 	e.vote(p, members[0], 0)
 	e.vote(p, members[1], 1)
 	e.vote(p, members[2], 1)
@@ -146,12 +149,12 @@ func testWorker_BalancePoll_FewVoters(t *testing.T, polls poll.Store) {
 	_, err := e.worker.Process(e.ctx)
 	require.NoError(t, err)
 
-	amount := func(native float64) *commonpb.CryptoPaymentAmount {
-		return &commonpb.CryptoPaymentAmount{Currency: "cad", NativeAmount: native, Mint: e.mint}
+	amount := func(native float64, quarks uint64) *commonpb.CryptoPaymentAmount {
+		return &commonpb.CryptoPaymentAmount{Currency: "cad", NativeAmount: native, Quarks: quarks, Mint: e.mint}
 	}
 	e.requireClosed(p, &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
-		Total:          amount(10),
-		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(10), amount(0)},
+		Total:          amount(10, 25),
+		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(10, 25), amount(0, 0)},
 	}}})
 
 	// Nobody holding any of the mint is recorded too.
@@ -159,8 +162,8 @@ func testWorker_BalancePoll_FewVoters(t *testing.T, polls poll.Store) {
 	_, err = e.worker.Process(e.ctx)
 	require.NoError(t, err)
 	e.requireClosed(empty, &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
-		Total:          amount(0),
-		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(0), amount(0)},
+		Total:          amount(0, 0),
+		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(0, 0), amount(0, 0)},
 	}}})
 }
 
@@ -196,7 +199,7 @@ func testWorker_RetriesFailedTally(t *testing.T, polls poll.Store) {
 	chatID := newGroupChatID()
 	p := e.putDuePoll(chatID, pollpb.Mode_BALANCE, 2, false)
 	for _, member := range members {
-		e.fund(member, 10)
+		e.fund(member, 10, 10)
 		e.vote(p, member, 0)
 	}
 
@@ -246,7 +249,7 @@ type workerEnv struct {
 func newWorkerEnv(t *testing.T, polls poll.Store) *workerEnv {
 	log := zaptest.NewLogger(t)
 	accounts := accountmemory.NewInMemory()
-	ocpBalance := &fakeOcpBalance{byOwner: make(map[string]uint64)}
+	ocpBalance := &fakeOcpBalance{byOwner: make(map[string]fakeHolding)}
 	balances := balance.NewClient(log, accounts, ocpBalance)
 
 	return &workerEnv{
@@ -312,12 +315,13 @@ func (e *workerEnv) vote(p *poll.Poll, userID *commonpb.UserId, options ...uint3
 	require.NoError(e.t, e.polls.SetVote(e.ctx, p.ID, userID, options, p.EndsAt().Add(-time.Minute)))
 }
 
-// fund binds a key for userID and gives them usdf USDF.
-func (e *workerEnv) fund(userID *commonpb.UserId, usdf float64) {
+// fund binds a key for userID and gives them quarks of the env's mint, worth
+// usdf USDF.
+func (e *workerEnv) fund(userID *commonpb.UserId, quarks uint64, usdf float64) {
 	key := model.MustGenerateKeyPair().Proto()
 	_, err := e.accounts.Bind(e.ctx, userID, key)
 	require.NoError(e.t, err)
-	e.ocpBalance.setBalance(key, uint64(usdf*float64(ocp_common.CoreMintQuarksPerUnit)))
+	e.ocpBalance.setHolding(key, quarks, uint64(usdf*float64(ocp_common.CoreMintQuarksPerUnit)))
 }
 
 func (e *workerEnv) requireClosed(p *poll.Poll, want *pollpb.Results) {

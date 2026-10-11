@@ -12,6 +12,7 @@ import (
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	ocp_balancepb "github.com/code-payments/ocp-protobuf-api/generated/go/balance/v1"
+	ocp_commonpb "github.com/code-payments/ocp-protobuf-api/generated/go/common/v1"
 
 	currency_lib "github.com/code-payments/ocp-server/currency"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
@@ -21,10 +22,11 @@ import (
 )
 
 // fakeOcpBalance answers GetBalances from one fixed per-mint ledger for every
-// owner it is asked about, honouring the request's mint filter the way OCP
-// does: the owner's total covers only the requested mints, and its currency
-// codes: the total is also valued in each requested currency it has a rate
-// for, and silently not in one it lacks. It records the last request so a test
+// owner it is asked about, honouring the request the way OCP does: its mint
+// filter (the owner's total covers only the requested mints), its currency
+// codes (the total is also valued in each requested currency it has a rate
+// for, and silently not in one it lacks), and its per-mint breakdown (one
+// entry per held mint unless excluded). It records the last request so a test
 // can see what was asked.
 type fakeOcpBalance struct {
 	result ocp_balancepb.GetBalancesResponse_Result
@@ -32,6 +34,9 @@ type fakeOcpBalance struct {
 
 	// byMint is the ledger, in USDF quarks, keyed by base58 mint address.
 	byMint map[string]uint64
+	// mintQuarks is each mint's holding in its own quarks, keyed like byMint;
+	// a mint absent here holds its USDF value's worth.
+	mintQuarks map[string]uint64
 	// rates values a USDF unit in each fiat currency the fake can price.
 	rates map[string]float64
 	// unknownOwners leaves every requested owner out of the response, which is
@@ -63,24 +68,52 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 	}
 	for _, owner := range req.Owners {
 		ownerBalance := &ocp_balancepb.OwnerBalance{Owner: owner}
-		for mint, quarks := range f.byMint {
-			if len(requested) == 0 || requested[mint] {
-				ownerBalance.CoreMintValue += quarks
-			}
-		}
-		for _, code := range req.CurrencyCodes {
-			rate, ok := f.rates[code]
-			if !ok {
+		for mint, value := range f.byMint {
+			if len(requested) > 0 && !requested[mint] {
 				continue
 			}
-			if ownerBalance.FiatValuesByCurrency == nil {
-				ownerBalance.FiatValuesByCurrency = make(map[string]float64)
+			ownerBalance.CoreMintValue += value
+			if req.ExcludePerMintBalances || value == 0 {
+				continue
 			}
-			ownerBalance.FiatValuesByCurrency[code] = float64(ownerBalance.CoreMintValue) / float64(ocp_common.CoreMintQuarksPerUnit) * rate
+			if ownerBalance.BalancesByMint == nil {
+				ownerBalance.BalancesByMint = make(map[string]*ocp_balancepb.MintBalance)
+			}
+			quarks, ok := f.mintQuarks[mint]
+			if !ok {
+				quarks = value
+			}
+			mintAccount, err := base58.Decode(mint)
+			if err != nil {
+				return nil, err
+			}
+			ownerBalance.BalancesByMint[mint] = &ocp_balancepb.MintBalance{
+				Mint:                 &ocp_commonpb.SolanaAccountId{Value: mintAccount},
+				CoreMintValue:        value,
+				FiatValuesByCurrency: f.fiatValues(req.CurrencyCodes, value),
+				Quarks:               quarks,
+			}
 		}
+		ownerBalance.FiatValuesByCurrency = f.fiatValues(req.CurrencyCodes, ownerBalance.CoreMintValue)
 		resp.BalancesByOwner[base58.Encode(owner.Value)] = ownerBalance
 	}
 	return resp, nil
+}
+
+// fiatValues values coreMintValue in each of codes the fake has a rate for.
+func (f *fakeOcpBalance) fiatValues(codes []string, coreMintValue uint64) map[string]float64 {
+	var values map[string]float64
+	for _, code := range codes {
+		rate, ok := f.rates[code]
+		if !ok {
+			continue
+		}
+		if values == nil {
+			values = make(map[string]float64)
+		}
+		values[code] = float64(coreMintValue) / float64(ocp_common.CoreMintQuarksPerUnit) * rate
+	}
+	return values
 }
 
 func TestClient_GetTotalUsdfBalance(t *testing.T) {
@@ -108,6 +141,7 @@ func TestClient_GetTotalUsdfBalance(t *testing.T) {
 	require.Equal(t, uint64(130), total)
 	require.Empty(t, ocp.lastReq.Mints)
 	require.Len(t, ocp.lastReq.Owners, 1)
+	require.True(t, ocp.lastReq.ExcludePerMintBalances)
 
 	// Filtered, the filter is passed through and OCP's total is trusted.
 	total, err = client.GetTotalUsdfBalance(ctx, userID, usdf)
@@ -176,6 +210,7 @@ func TestClient_GetTotalFiatValue(t *testing.T) {
 	require.InDelta(t, 130*0.9, total, 1e-9)
 	require.Equal(t, []string{"eur"}, ocp.lastReq.CurrencyCodes)
 	require.Empty(t, ocp.lastReq.Mints)
+	require.True(t, ocp.lastReq.ExcludePerMintBalances)
 
 	// Filtered, the filter is passed through and the valuation covers only the
 	// requested mints.
@@ -216,7 +251,7 @@ func TestClient_GetTotalFiatValue(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestClient_GetMintFiatValuesForUsers(t *testing.T) {
+func TestClient_GetMintHoldingsForUsers(t *testing.T) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 	accounts := accountmemory.NewInMemory()
@@ -227,7 +262,8 @@ func TestClient_GetMintFiatValuesForUsers(t *testing.T) {
 			base58.Encode(mint.Value):                                2 * ocp_common.CoreMintQuarksPerUnit,
 			base58.Encode(model.MustGenerateKeyPair().Proto().Value): 5 * ocp_common.CoreMintQuarksPerUnit,
 		},
-		rates: map[string]float64{"cad": 1.5},
+		mintQuarks: map[string]uint64{base58.Encode(mint.Value): 7_000_000_000},
+		rates:      map[string]float64{"cad": 1.5},
 	}
 	client := NewClient(log, accounts, ocp)
 
@@ -239,34 +275,48 @@ func TestClient_GetMintFiatValuesForUsers(t *testing.T) {
 	}
 	unbound := model.MustGenerateUserID()
 
-	// Each bound user's holdings of the mint alone, valued in the currency;
-	// a user with no key is left out.
-	values, err := client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("cad"), mint, append(bound, unbound)...)
+	// Each bound user's holdings of the mint alone, in the mint's own quarks
+	// and valued in the currency; a user with no key is left out.
+	holdings, err := client.GetMintHoldingsForUsers(ctx, currency_lib.Code("cad"), mint, append(bound, unbound)...)
 	require.NoError(t, err)
-	require.Len(t, values, len(bound))
+	require.Len(t, holdings, len(bound))
 	for _, userID := range bound {
-		require.InDelta(t, 3.0, values[string(userID.Value)], 1e-9)
+		holding := holdings[string(userID.Value)]
+		require.Equal(t, uint64(7_000_000_000), holding.Quarks)
+		require.InDelta(t, 3.0, holding.FiatValue, 1e-9)
 	}
 	require.Len(t, ocp.lastReq.Mints, 1)
 	require.Equal(t, mint.Value, ocp.lastReq.Mints[0].Value)
 	require.Equal(t, []string{"cad"}, ocp.lastReq.CurrencyCodes)
+	require.False(t, ocp.lastReq.ExcludePerMintBalances)
 
 	// Owners OCP has no accounts for hold nothing.
 	ocp.unknownOwners = true
-	values, err = client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("cad"), mint, bound...)
+	holdings, err = client.GetMintHoldingsForUsers(ctx, currency_lib.Code("cad"), mint, bound...)
 	require.NoError(t, err)
-	require.Empty(t, values)
+	require.Empty(t, holdings)
 	ocp.unknownOwners = false
 
-	// A currency OCP cannot price is unsupported, never a zero.
-	_, err = client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("xyz"), mint, bound...)
+	// Owners OCP knows who hold none of the mint are left out too.
+	held := ocp.byMint[base58.Encode(mint.Value)]
+	ocp.byMint[base58.Encode(mint.Value)] = 0
+	holdings, err = client.GetMintHoldingsForUsers(ctx, currency_lib.Code("cad"), mint, bound...)
+	require.NoError(t, err)
+	require.Empty(t, holdings)
+
+	// A currency OCP cannot price is unsupported, never a zero, even when
+	// nobody holds the mint.
+	_, err = client.GetMintHoldingsForUsers(ctx, currency_lib.Code("xyz"), mint, bound...)
+	require.ErrorIs(t, err, ErrUnsupportedCurrency)
+	ocp.byMint[base58.Encode(mint.Value)] = held
+	_, err = client.GetMintHoldingsForUsers(ctx, currency_lib.Code("xyz"), mint, bound...)
 	require.ErrorIs(t, err, ErrUnsupportedCurrency)
 
 	// No users ask OCP nothing.
 	ocp.calls = 0
-	values, err = client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("cad"), mint)
+	holdings, err = client.GetMintHoldingsForUsers(ctx, currency_lib.Code("cad"), mint)
 	require.NoError(t, err)
-	require.Empty(t, values)
+	require.Empty(t, holdings)
 	require.Zero(t, ocp.calls)
 
 	// More owners than one call takes are split across calls.
@@ -276,13 +326,13 @@ func TestClient_GetMintFiatValuesForUsers(t *testing.T) {
 		_, err := accounts.Bind(ctx, many[i], model.MustGenerateKeyPair().Proto())
 		require.NoError(t, err)
 	}
-	values, err = client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("cad"), mint, many...)
+	holdings, err = client.GetMintHoldingsForUsers(ctx, currency_lib.Code("cad"), mint, many...)
 	require.NoError(t, err)
-	require.Len(t, values, len(many))
+	require.Len(t, holdings, len(many))
 	require.Equal(t, 2, ocp.calls)
 	require.Len(t, ocp.lastReq.Owners, 1)
 
 	ocp.result = ocp_balancepb.GetBalancesResponse_DENIED
-	_, err = client.GetMintFiatValuesForUsers(ctx, currency_lib.Code("cad"), mint, bound...)
+	_, err = client.GetMintHoldingsForUsers(ctx, currency_lib.Code("cad"), mint, bound...)
 	require.ErrorIs(t, err, ErrDenied)
 }

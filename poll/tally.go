@@ -48,11 +48,11 @@ func tally(ctx context.Context, polls Store, balances *balance.Client, p *Poll) 
 		for i, vote := range votes {
 			voters[i] = vote.UserID
 		}
-		values, err := balances.GetMintFiatValuesForUsers(ctx, currency_lib.Code(parameters.GetCurrency()), parameters.GetMint(), voters...)
+		holdings, err := balances.GetMintHoldingsForUsers(ctx, currency_lib.Code(parameters.GetCurrency()), parameters.GetMint(), voters...)
 		if err != nil {
 			return nil, fmt.Errorf("reading voter balances: %w", err)
 		}
-		return balanceResults(p, votes, values), nil
+		return balanceResults(p, votes, holdings), nil
 	default:
 		return nil, fmt.Errorf("unsupported poll mode %s", p.Definition.GetMode())
 	}
@@ -98,47 +98,51 @@ func countResults(p *Poll, votes []Vote) *pollpb.Results {
 }
 
 // balanceResults are a BALANCE poll's results over its counted votes, given
-// each voter's holdings of the poll's mint valued in its currency (a voter
-// absent from values holds none): each voter adds their full balance to every
-// option they chose, and to the total once.
+// each voter's holdings of the poll's mint (a voter absent from holdings holds
+// none): each voter adds their full balance, both its quarks and its value in
+// the poll's currency, to every option they chose, and to the total once.
 //
 // These totals are what the store records, but no reader is shown them: a
 // reader sees only the options' ranking (see ResultsProto). That is why they
 // are exact and never withheld, however few voters hold any of the mint: a
 // ranking reveals no balance.
 //
-// No amount carries quarks: OCP reports a voter's holdings of a mint only
-// valued, in the core mint or a currency, never in the mint's own quarks, so
-// there are none to sum.
-func balanceResults(p *Poll, votes []Vote, values map[string]float64) *pollpb.Results {
+// The quark sums cannot overflow: each is at most the voters' combined
+// holdings of one mint, which its supply, a uint64, bounds.
+func balanceResults(p *Poll, votes []Vote, holdings map[string]balance.MintHolding) *pollpb.Results {
 	var (
-		total        float64
-		optionTotals = make([]float64, p.Definition.GetOptionCount())
+		total        balance.MintHolding
+		optionTotals = make([]balance.MintHolding, p.Definition.GetOptionCount())
 	)
+	add := func(sum *balance.MintHolding, holding balance.MintHolding) {
+		sum.Quarks += holding.Quarks
+		sum.FiatValue += holding.FiatValue
+	}
 	for _, vote := range votes {
-		value := values[string(vote.UserID.Value)]
-		if value <= 0 {
+		holding, ok := holdings[string(vote.UserID.Value)]
+		if !ok {
 			continue
 		}
-		total += value
+		add(&total, holding)
 		for _, option := range vote.Options {
 			if int(option) < len(optionTotals) {
-				optionTotals[option] += value
+				add(&optionTotals[option], holding)
 			}
 		}
 	}
 
 	parameters := p.Definition.GetBalanceParameters()
-	amount := func(value float64) *commonpb.CryptoPaymentAmount {
+	amount := func(holding balance.MintHolding) *commonpb.CryptoPaymentAmount {
 		return &commonpb.CryptoPaymentAmount{
 			Currency:     parameters.GetCurrency(),
-			NativeAmount: value,
+			NativeAmount: holding.FiatValue,
+			Quarks:       holding.Quarks,
 			Mint:         proto.Clone(parameters.GetMint()).(*commonpb.PublicKey),
 		}
 	}
 	results := &pollpb.BalanceResults{Total: amount(total)}
-	for _, value := range optionTotals {
-		results.OptionBalances = append(results.OptionBalances, amount(value))
+	for _, holding := range optionTotals {
+		results.OptionBalances = append(results.OptionBalances, amount(holding))
 	}
 	return &pollpb.Results{Type: &pollpb.Results_Balance{Balance: results}}
 }

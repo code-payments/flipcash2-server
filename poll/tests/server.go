@@ -531,12 +531,14 @@ func testServer_BalanceResults_Ranked(t *testing.T, chats chat.Store, polls poll
 	})
 	require.Equal(t, pollpb.VoteResponse_OK, e.vote(member, id, 1).Result)
 
-	amount := func(native float64) *commonpb.CryptoPaymentAmount {
-		return &commonpb.CryptoPaymentAmount{Currency: "usd", NativeAmount: native, Quarks: ocp_common.ToCoreMintQuarks(uint64(native)), Mint: coreMint}
+	amount := func(whole uint64, native float64) *commonpb.CryptoPaymentAmount {
+		return &commonpb.CryptoPaymentAmount{Currency: "usd", NativeAmount: native, Quarks: ocp_common.ToCoreMintQuarks(whole), Mint: coreMint}
 	}
+	// The ranking is by quarks, not value: options 0 and 2 hold the same
+	// quarks behind values a float sum left a bit apart, and share a rank.
 	recorded := &pollpb.Results{Type: &pollpb.Results_Balance{Balance: &pollpb.BalanceResults{
-		Total:          amount(90),
-		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(20), amount(50), amount(20), amount(0)},
+		Total:          amount(90, 90),
+		OptionBalances: []*commonpb.CryptoPaymentAmount{amount(20, 0.1+0.2), amount(50, 50), amount(20, 0.3), amount(0, 0)},
 	}}}
 	stored, err := polls.GetPoll(e.ctx, id)
 	require.NoError(t, err)

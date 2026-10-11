@@ -253,6 +253,12 @@ func (p *Poll) StateProto(now time.Time, selfVote []uint32) *pollpb.PollState {
 // BALANCE poll's totals as their ranking alone (see pollpb.RankedResults), and
 // every other variant as stored.
 //
+// The ranking is by quarks, not by value: every holding in a poll is of its
+// one mint, so the quark totals order the options exactly as their value
+// would, without the float error a sum of values carries (equal balances must
+// share a rank) or the rate moving between the batches a large tally is read
+// in (see balance.Client.GetMintHoldingsForUsers).
+//
 // The totals stay stored, so the server keeps what the ranking was made from;
 // no reader is ever sent them.
 func ResultsProto(results *pollpb.Results) *pollpb.Results {
@@ -261,9 +267,9 @@ func ResultsProto(results *pollpb.Results) *pollpb.Results {
 		return proto.Clone(results).(*pollpb.Results)
 	}
 
-	amounts := make([]float64, len(balance.OptionBalances))
+	amounts := make([]uint64, len(balance.OptionBalances))
 	for i, option := range balance.OptionBalances {
-		amounts[i] = option.GetNativeAmount()
+		amounts[i] = option.GetQuarks()
 	}
 	return &pollpb.Results{Type: &pollpb.Results_Ranked{Ranked: &pollpb.RankedResults{
 		OptionRanks: rank(amounts),
@@ -273,7 +279,7 @@ func ResultsProto(results *pollpb.Results) *pollpb.Results {
 // rank returns each amount's competition rank, in order: 1 for the largest,
 // equal amounts sharing a rank, and the next rank skipping the tied positions
 // (30, 20, 20, 10 rank 1, 2, 2, 4).
-func rank(amounts []float64) []uint32 {
+func rank(amounts []uint64) []uint32 {
 	ranks := make([]uint32, len(amounts))
 	for i, amount := range amounts {
 		ranks[i] = 1

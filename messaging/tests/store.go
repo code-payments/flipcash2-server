@@ -16,6 +16,7 @@ import (
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/database"
@@ -2373,6 +2374,15 @@ func widgetContent(username string) []*messagingpb.Content {
 			Type: &messagingpb.WidgetContent_ShareProfile{ShareProfile: &messagingpb.ShareProfileWidget{
 				Username: &commonpb.Username{Value: username},
 			}},
+		}},
+	}}
+}
+
+// pollWidgetContent builds a message sending a poll.
+func pollWidgetContent(pollID *pollpb.PollId) []*messagingpb.Content {
+	return []*messagingpb.Content{{
+		Type: &messagingpb.Content_Widget{Widget: &messagingpb.WidgetContent{
+			Type: &messagingpb.WidgetContent_Poll{Poll: &messagingpb.PollWidget{PollId: pollID}},
 		}},
 	}}
 }

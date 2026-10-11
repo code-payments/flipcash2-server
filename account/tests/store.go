@@ -18,6 +18,7 @@ func RunStoreTests(t *testing.T, s account.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, s account.Store){
 		testStore_keyManagement,
 		testStore_batchGetUserIds,
+		testStore_batchGetPubKeys,
 		testStore_registrationStatus,
 	} {
 		tf(t, s)
@@ -97,6 +98,51 @@ func testStore_batchGetUserIds(t *testing.T, s account.Store) {
 	require.True(t, proto.Equal(user2, res[base58.Encode(key2.Value)]))
 	_, exists := res[base58.Encode(unknownKey.Value)]
 	require.False(t, exists)
+}
+
+func testStore_batchGetPubKeys(t *testing.T, s account.Store) {
+	ctx := context.Background()
+
+	user1 := model.MustGenerateUserID()
+	key1 := model.MustGenerateKeyPair().Proto()
+	_, err := s.Bind(ctx, user1, key1)
+	require.NoError(t, err)
+
+	user2 := model.MustGenerateUserID()
+	key2 := model.MustGenerateKeyPair().Proto()
+	_, err = s.Bind(ctx, user2, key2)
+	require.NoError(t, err)
+
+	unbound := model.MustGenerateUserID()
+
+	// Empty input returns empty map
+	res, err := s.GetPubKeysForUsers(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, res)
+
+	// A single lookup first, so a caching store answers user1 from its cache
+	// and the rest from the batch.
+	_, err = s.GetPubKeys(ctx, user1)
+	require.NoError(t, err)
+
+	// Batch lookup with a mix of bound and unbound users
+	res, err = s.GetPubKeysForUsers(ctx, []*commonpb.UserId{user1, user2, unbound})
+	require.NoError(t, err)
+	require.Len(t, res, 2)
+	require.NoError(t, protoutil.SetEqualError([]*commonpb.PublicKey{key1}, res[string(user1.Value)]))
+	require.NoError(t, protoutil.SetEqualError([]*commonpb.PublicKey{key2}, res[string(user2.Value)]))
+	_, exists := res[string(unbound.Value)]
+	require.False(t, exists)
+
+	// A user found unbound is found once they bind.
+	key3 := model.MustGenerateKeyPair().Proto()
+	_, err = s.Bind(ctx, unbound, key3)
+	require.NoError(t, err)
+
+	res, err = s.GetPubKeysForUsers(ctx, []*commonpb.UserId{user1, user2, unbound})
+	require.NoError(t, err)
+	require.Len(t, res, 3)
+	require.NoError(t, protoutil.SetEqualError([]*commonpb.PublicKey{key3}, res[string(unbound.Value)]))
 }
 
 func testStore_registrationStatus(t *testing.T, s account.Store) {

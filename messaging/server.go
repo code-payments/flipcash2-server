@@ -7,6 +7,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/chat"
+	"github.com/code-payments/flipcash2-server/poll"
 )
 
 type Server struct {
@@ -17,6 +18,7 @@ type Server struct {
 	chats    chat.Store
 	media    Media
 	messages Store
+	polls    poll.Store
 
 	access *chat.Access
 
@@ -33,6 +35,7 @@ func NewServer(
 	chats chat.Store,
 	media Media,
 	messages Store,
+	polls poll.Store,
 
 	access *chat.Access,
 
@@ -46,6 +49,7 @@ func NewServer(
 		chats:    chats,
 		media:    media,
 		messages: messages,
+		polls:    polls,
 
 		access: access,
 

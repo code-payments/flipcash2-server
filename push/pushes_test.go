@@ -13,6 +13,7 @@ import (
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 )
 
@@ -178,6 +179,24 @@ func TestChatMessagePush_Widget(t *testing.T) {
 	require.NotNil(t, group)
 	require.Equal(t, "Flipcash: https://flipcash.com/alice_1", group.body)
 	require.True(t, proto.Equal(message, group.payload.ChatMetadata.GetMessage()))
+
+	// A poll is announced in a group, and carried whole in the payload. Only
+	// a group carries polls, so a DM renders none.
+	pollMessage := testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Widget{
+		Widget: &messagingpb.WidgetContent{Type: &messagingpb.WidgetContent_Poll{
+			Poll: &messagingpb.PollWidget{PollId: &pollpb.PollId{Value: bytes.Repeat([]byte{5}, 16)}},
+		}},
+	}})
+	pollPush, err := BuildGroupChatPush(ctx, nil, groupID, pollMessage, senderID, "Alice", "Group Title")
+	require.NoError(t, err)
+	require.NotNil(t, pollPush)
+	require.Equal(t, "Group Title", pollPush.title)
+	require.Equal(t, "Alice created a poll", pollPush.body)
+	require.True(t, proto.Equal(pollMessage, pollPush.payload.ChatMetadata.GetMessage()))
+
+	dmPoll, err := BuildDmPush(ctx, nil, chatID, pollMessage, senderID, "Alice")
+	require.NoError(t, err)
+	require.Nil(t, dmPoll)
 
 	// A widget variant this server does not know earns no push.
 	unknown := testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Widget{Widget: &messagingpb.WidgetContent{}}})

@@ -18,12 +18,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
@@ -38,6 +40,8 @@ import (
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/messaging"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/poll"
+	poll_memory "github.com/code-payments/flipcash2-server/poll/memory"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/push"
 	"github.com/code-payments/flipcash2-server/testutil"
@@ -60,6 +64,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_EncryptedContent,
 		testServer_EncryptedContent_NotInGroups,
 		testServer_WidgetContent,
+		testServer_PollWidget,
+		testServer_PollWidget_PrivateGroup,
 		testServer_SendMessage_Broadcast,
 		testServer_SendBatch,
 		testServer_SendBatch_SideEffects,
@@ -135,6 +141,9 @@ type serverEnv struct {
 
 	blobStore  blob.Store
 	blobAccess blob.AccessStore
+
+	// polls is the poll store the server checks a poll's send against.
+	polls poll.Store
 }
 
 // fakeOcpBalance is the OCP balance service behind the env's balance client,
@@ -258,7 +267,8 @@ func newServerEnvWithTeam(t *testing.T, badges badge.Store, blocklists blocklist
 	// next send; the window production remembers it for is chat.Access's to
 	// test (see chat.DefaultSpeakerAdmissionTTL).
 	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats, teamUserID), chat.WithSpeakerAdmissionTTL(0))
-	server := messaging.NewServer(log, authz, chats, media, messages, access, sender)
+	env.polls = poll_memory.NewInMemory()
+	server := messaging.NewServer(log, authz, chats, media, messages, env.polls, access, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
 	}))
@@ -1029,10 +1039,11 @@ func testServer_SendMessage_DisallowedContent(t *testing.T, badges badge.Store, 
 	require.Equal(t, messagingpb.SendMessageResponse_DENIED, extraResp.Result)
 }
 
-// testServer_WidgetContent: a widget is server-authored, so no client may send
-// one, directly, as a reply's body or as an edit. Once sent it is a message
-// in the thread like any other: replyable and reactable, but its sender
-// cannot edit or delete it.
+// testServer_WidgetContent: a profile share is server-authored, so no client
+// may send one, directly, as a reply's body or as an edit. Once sent it is a
+// message in the thread like any other: replyable and reactable, but its
+// sender cannot edit or delete it. (A poll is the one widget a client sends;
+// see testServer_PollWidget.)
 func testServer_WidgetContent(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
@@ -3373,6 +3384,185 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 	dmResp, err := e.send(e.keysA, "still a dm", generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, dmResp.Result)
+}
+
+// testServer_PollWidget pins sending a poll in a public group: only its
+// creator, only in its chat, only while it is open, and only once: the send
+// that makes it live is the only one, and only its retries pass again. A poll
+// is never a reply's body or an edit, and its message, which is its
+// creator's, may be deleted without touching the poll.
+func testServer_PollWidget(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		CreatorID:    e.userA,
+		LastActivity: at(1),
+	}))
+
+	unsent := e.putPoll(groupID, e.userA, false, time.Now().Add(time.Hour))
+
+	// Not the creator's to send, not this chat's, not a poll at all.
+	for name, tc := range map[string]struct {
+		keys   model.KeyPair
+		chatID *commonpb.ChatId
+		pollID *pollpb.PollId
+	}{
+		"not the creator": {e.keysB, groupID, unsent.ID},
+		"another chat":    {e.keysA, e.chatID, unsent.ID},
+		"unknown poll":    {e.keysA, groupID, poll.MustDerivePollID(e.userA, &pollpb.IdempotencyKey{Value: model.MustGenerateUserID().Value})},
+	} {
+		resp, err := e.sendContentToChat(tc.keys, tc.chatID, pollWidgetContent(tc.pollID), generateClientID())
+		require.NoError(t, err, name)
+		require.Equal(t, messagingpb.SendMessageResponse_DENIED, resp.Result, name)
+	}
+
+	// Nor a reply's body.
+	original, err := e.sendContentToChat(e.keysA, groupID, textContent("original"), generateClientID())
+	require.NoError(t, err)
+	replyPoll := []*messagingpb.Content{{Type: &messagingpb.Content_Reply{Reply: &messagingpb.ReplyContent{
+		RepliedMessageId: original.Message.MessageId,
+		Content:          pollWidgetContent(unsent.ID),
+	}}}}
+	replyResp, err := e.sendContentToChat(e.keysA, groupID, replyPoll, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, replyResp.Result)
+
+	stored, err := e.polls.GetPoll(e.ctx, unsent.ID)
+	require.NoError(t, err)
+	require.False(t, stored.Live)
+
+	// The creator's send goes through, and makes the poll live as sent by it.
+	clientMessageID := generateClientID()
+	sent, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(unsent.ID), clientMessageID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	require.True(t, proto.Equal(pollWidgetContent(unsent.ID)[0], sent.Message.Content[0]))
+
+	stored, err = e.polls.GetPoll(e.ctx, unsent.ID)
+	require.NoError(t, err)
+	require.True(t, stored.Live)
+	require.True(t, proto.Equal(clientMessageID, stored.ClientMessageID))
+
+	// A retry of that send is answered with the original message.
+	retried, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(unsent.ID), clientMessageID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, retried.Result)
+	require.Equal(t, sent.Message.MessageId.Value, retried.Message.MessageId.Value)
+
+	// Any other send of it is refused: a poll is sent once.
+	again, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(unsent.ID), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, again.Result)
+
+	// It is a message like any other to read, reply to and react to.
+	read, err := e.getMessageInChat(e.keysB, groupID, sent.Message.MessageId)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, read.Result)
+	require.True(t, proto.Equal(sent.Message.Content[0], read.Message.Content[0]))
+
+	reply, err := e.sendContentToChat(e.keysB, groupID, replyContent(sent.Message.MessageId.Value, "voted"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, reply.Result)
+
+	reacted, err := e.addReactionInChat(e.keysB, groupID, sent.Message.MessageId, "👍")
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, reacted.Result)
+
+	// A message is never edited into a poll, and a poll's message is not
+	// edited.
+	editToPoll, err := e.editMessageInChat(e.keysA, groupID, original.Message.MessageId, pollWidgetContent(unsent.ID), original.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_DENIED, editToPoll.Result)
+
+	editPoll, err := e.editMessageInChat(e.keysA, groupID, sent.Message.MessageId, textContent("edited"), sent.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_CANNOT_EDIT, editPoll.Result)
+
+	// Its creator may delete its message, which leaves the poll as it was, and
+	// does not let it be sent again.
+	read, err = e.getMessageInChat(e.keysA, groupID, sent.Message.MessageId)
+	require.NoError(t, err)
+	deleted, err := e.deleteMessageInChat(e.keysA, groupID, sent.Message.MessageId, read.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, deleted.Result)
+
+	stored, err = e.polls.GetPoll(e.ctx, unsent.ID)
+	require.NoError(t, err)
+	require.True(t, stored.Live)
+	require.Equal(t, poll.StatusOpen, stored.Status)
+
+	resent, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(unsent.ID), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, resent.Result)
+
+	// A send that made its poll live but failed before its message was
+	// written is retried after the poll has ended: the retry writes the one
+	// message, and a retry of that is answered with it.
+	lost := e.putPoll(groupID, e.userA, false, time.Now().Add(-time.Second))
+	lostClientMessageID := generateClientID()
+	_, err = e.polls.MarkLive(e.ctx, lost.ID, lostClientMessageID, lost.EndsAt().Add(-time.Minute))
+	require.NoError(t, err)
+	recovered, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(lost.ID), lostClientMessageID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, recovered.Result)
+	replayed, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(lost.ID), lostClientMessageID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, replayed.Result)
+	require.Equal(t, recovered.Message.MessageId.Value, replayed.Message.MessageId.Value)
+
+	// A poll that is no longer open is not sent: one past its end, and one
+	// closed with its results.
+	ended := e.putPoll(groupID, e.userA, true, time.Now().Add(-time.Second))
+	closed := e.putPoll(groupID, e.userA, true, time.Now().Add(time.Hour))
+	_, err = e.polls.Close(e.ctx, closed.ID, &pollpb.Results{Type: &pollpb.Results_Withheld{Withheld: &pollpb.WithheldResults{}}})
+	require.NoError(t, err)
+	for _, p := range []*poll.Poll{ended, closed} {
+		resp, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(p.ID), generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_DENIED, resp.Result)
+	}
+}
+
+// testServer_PollWidget_PrivateGroup pins that a private group takes no
+// plaintext poll widget: its polls are sent inside encrypted content.
+func testServer_PollWidget_PrivateGroup(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	groupID := e.putPrivateGroup(chats, e.userB)
+	e.storeChatKey(chats, groupID, e.userA)
+	p := e.putPoll(groupID, e.userA, true, time.Now().Add(time.Hour))
+
+	resp, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(p.ID), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_ENCRYPTION_REQUIRED, resp.Result)
+}
+
+// putPoll stores a COUNT poll in chatID by creatorID, live or not, ending at
+// endsAt, straight into the poll store, as the poll service would create it.
+func (e *serverEnv) putPoll(chatID *commonpb.ChatId, creatorID *commonpb.UserId, live bool, endsAt time.Time) *poll.Poll {
+	p := &poll.Poll{
+		ID:        poll.MustDerivePollID(creatorID, &pollpb.IdempotencyKey{Value: model.MustGenerateUserID().Value}),
+		ChatID:    chatID,
+		CreatorID: creatorID,
+		Definition: &pollpb.PollDefinition{
+			OptionCount: 2,
+			Mode:        pollpb.Mode_COUNT,
+			EndsAt:      timestamppb.New(endsAt),
+			Text: &pollpb.PollDefinition_Plaintext{Plaintext: &pollpb.PollText{
+				Question: "Which?",
+				Options:  []*pollpb.Option{{Text: "a"}, {Text: "b"}},
+			}},
+		},
+		CreatedAt: time.Now(),
+		Live:      live,
+		Status:    poll.StatusOpen,
+	}
+	require.NoError(e.t, e.polls.CreatePoll(e.ctx, p))
+	return p
 }
 
 // putPrivateGroup persists a private group created by userA, titled

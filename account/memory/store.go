@@ -101,6 +101,19 @@ func (m *memory) GetPubKeys(_ context.Context, userID *commonpb.UserId) ([]*comm
 	return keys, nil
 }
 
+func (m *memory) GetPubKeysForUsers(_ context.Context, userIDs []*commonpb.UserId) (map[string][]*commonpb.PublicKey, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	res := make(map[string][]*commonpb.PublicKey)
+	for _, userID := range userIDs {
+		for _, key := range m.users[string(userID.Value)] {
+			res[string(userID.Value)] = append(res[string(userID.Value)], &commonpb.PublicKey{Value: []byte(key)})
+		}
+	}
+	return res, nil
+}
+
 func (m *memory) IsAuthorized(_ context.Context, userID *commonpb.UserId, pubKey *commonpb.PublicKey) (bool, error) {
 	m.Lock()
 	defer m.Unlock()

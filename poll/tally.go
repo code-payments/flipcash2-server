@@ -15,11 +15,6 @@ import (
 )
 
 const (
-	// minCountVoters is the fewest counted voters a COUNT poll shows totals
-	// for (see pollpb.WithheldResults). Below it, totals would say too much
-	// about how individual members voted.
-	minCountVoters = 3
-
 	// tallyVotesPageSize is how many votes the tally reads at a time.
 	tallyVotesPageSize = 100
 )
@@ -78,11 +73,9 @@ func allVotes(ctx context.Context, polls Store, p *Poll) ([]Vote, error) {
 }
 
 // countResults are a COUNT poll's results over its counted votes: each voter
-// adds one to every option they chose. Too few voters withholds them.
+// adds one to every option they chose. They are never withheld, however few
+// voted (see pollpb.WithheldResults, whose minimum the server chooses).
 func countResults(p *Poll, votes []Vote) *pollpb.Results {
-	if len(votes) < minCountVoters {
-		return withheldResults()
-	}
 	optionVoters := make([]uint64, p.Definition.GetOptionCount())
 	for _, vote := range votes {
 		for _, option := range vote.Options {
@@ -150,8 +143,4 @@ func balanceResults(p *Poll, votes []Vote, holdings map[string]balance.MintHoldi
 		results.OptionBalances = append(results.OptionBalances, amount(holding))
 	}
 	return &pollpb.Results{Type: &pollpb.Results_Balance{Balance: results}}
-}
-
-func withheldResults() *pollpb.Results {
-	return &pollpb.Results{Type: &pollpb.Results_Withheld{Withheld: &pollpb.WithheldResults{}}}
 }

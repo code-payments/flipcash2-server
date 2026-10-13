@@ -306,8 +306,10 @@ func NewServer(
 // not a member can see what they would ask to join. It carries no rules, so a
 // non-member's standing is none under every mode and they see the record
 // alone: its messaging state is its members'. What a non-member does get is
-// in_lobby, whether they are waiting in its lobby (see lobby.go). A private
-// group whose key has not been stored is returned like any other.
+// in_lobby, whether they are waiting in its lobby (see lobby.go). Its public
+// view is that same record, for a caller with no auth at all (see
+// getPublicChat). A private group whose key has not been stored is returned
+// like any other.
 //
 // The group's pictures and description are returned in every case: they are
 // part of the record, as the title is, and are what identify a group — a
@@ -377,9 +379,11 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 // per-viewer fields, since there is no viewer: no hydrated member, no
 // is_hidden, no viewer_state. It is REDACTED or nothing: any other mode is
 // DENIED, as is a DM, before anything is read, so an anonymous caller cannot
-// learn whether a DM exists. A private group has no public view either and is
-// DENIED off its record: its title, description and pictures are for
-// registered users.
+// learn whether a DM exists. A private group's public view is its record
+// alone — title, description, pictures, roster summary, is_private — which is
+// what a registered non-member gets of it too: the public standing admits no
+// one to its messaging state under any mode (see
+// Access.PublicListenerStanding), and there is no viewer to be in its lobby.
 func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) (*chatpb.GetChatResponse, error) {
 	if req.GetViewMode() != messagingpb.ViewMode_REDACTED || !IsGroupChatID(req.ChatId) {
 		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
@@ -394,10 +398,6 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 	case err != nil:
 		log.With(zap.Error(err)).Warn("Failure getting chat")
 		return nil, status.Error(codes.Internal, "")
-	}
-
-	if c.IsPrivate {
-		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
 	}
 
 	standing := s.access.PublicListenerStanding(c)

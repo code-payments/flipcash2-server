@@ -3957,16 +3957,19 @@ func testServer_OpenVersusPrivate_NonMember(t *testing.T, s chat.Store) {
 		require.Zero(t, resp.Metadata.LatestEventSequence, mode)
 	}
 
-	// The public view: shown, redacted, for the open group; DENIED for the
-	// private one.
+	// The public view: shown, redacted, for the open group; the record alone
+	// for the private one.
 	resp := e.getPublicChat(open.ID, messagingpb.ViewMode_REDACTED)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.NotNil(t, resp.Metadata.LastMessage)
 	require.True(t, resp.Metadata.LastMessage.Redacted)
 	require.Equal(t, uint64(2), resp.Metadata.LatestEventSequence)
 	resp = e.getPublicChat(private.ID, messagingpb.ViewMode_REDACTED)
-	require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result)
-	require.Nil(t, resp.Metadata)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.True(t, resp.Metadata.IsPrivate)
+	require.Empty(t, resp.Metadata.Members)
+	require.Nil(t, resp.Metadata.LastMessage)
+	require.Zero(t, resp.Metadata.LatestEventSequence)
 
 	// The chatter sample: given for the open group, to a registered user and
 	// to no one; DENIED for the private one either way.
@@ -3988,7 +3991,8 @@ func testServer_OpenVersusPrivate_NonMember(t *testing.T, s chat.Store) {
 
 // testServer_PrivateGroup_Visibility pins who sees what of a private group:
 // any registered user its record and nothing else under every view mode, its
-// members its messaging state, and an unauthenticated caller nothing at all.
+// members its messaging state, and an unauthenticated caller its record alone
+// as its public view.
 func testServer_PrivateGroup_Visibility(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
@@ -4032,8 +4036,20 @@ func testServer_PrivateGroup_Visibility(t *testing.T, s chat.Store) {
 		require.Nil(t, resp.Metadata.ViewerState, mode)
 	}
 
-	// It has no public view.
-	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+	// Its public view is the record alone, under REDACTED, as for any group;
+	// any other mode is DENIED.
+	resp = e.getPublicChat(private.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.True(t, resp.Metadata.IsPrivate)
+	require.Equal(t, "Sunday Hikers", resp.Metadata.Title)
+	require.Equal(t, e.userID.Value, resp.Metadata.GetCreator().GetValue())
+	require.Nil(t, resp.Metadata.Rules)
+	require.Empty(t, resp.Metadata.Members)
+	require.Nil(t, resp.Metadata.LastMessage)
+	require.Zero(t, resp.Metadata.LatestEventSequence)
+	require.Nil(t, resp.Metadata.ViewerState)
+	require.False(t, resp.Metadata.InLobby)
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED} {
 		resp = e.getPublicChat(private.ID, mode)
 		require.Equal(t, chatpb.GetChatResponse_DENIED, resp.Result, mode)
 		require.Nil(t, resp.Metadata, mode)
@@ -4059,8 +4075,12 @@ func testServer_PrivateGroup_Visibility(t *testing.T, s chat.Store) {
 		require.Empty(t, resp.Metadata.Members, mode)
 		require.Nil(t, resp.Metadata.LastMessage, mode)
 		require.Zero(t, resp.Metadata.LatestEventSequence, mode)
-		require.Equal(t, chatpb.GetChatResponse_DENIED, e.getPublicChat(ruled.ID, mode).Result, mode)
 	}
+	resp = e.getPublicChat(ruled.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.True(t, resp.Metadata.IsPrivate)
+	require.Nil(t, resp.Metadata.LastMessage)
+	require.Zero(t, resp.Metadata.LatestEventSequence)
 	require.Equal(t, chatpb.JoinChatResponse_DENIED, e.mustJoinChat(strangerKeys, ruled.ID).Result)
 
 	// It is in its member's feed, marked private.

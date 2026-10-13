@@ -93,7 +93,15 @@ func widgetFixture() *messagingpb.Content {
 
 func systemFixture() *messagingpb.Content {
 	return &messagingpb.Content{Type: &messagingpb.Content_System{
-		System: &messagingpb.SystemContent{FallbackText: "Alice added Bob to the chat"},
+		System: &messagingpb.SystemContent{
+			FallbackText: "A new member joined the group",
+			Type: &messagingpb.SystemContent_UserJoined_{UserJoined: &messagingpb.SystemContent_UserJoined{
+				UserId: &commonpb.UserId{Value: bytes.Repeat([]byte{2}, 16)},
+				Method: &messagingpb.SystemContent_UserJoined_Admitted_{Admitted: &messagingpb.SystemContent_UserJoined_Admitted{
+					AdmittedBy: &commonpb.UserId{Value: bytes.Repeat([]byte{1}, 16)},
+				}},
+			}},
+		},
 	}}
 }
 

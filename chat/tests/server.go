@@ -130,6 +130,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_Lobby_GetLobbyMembers,
 		testServer_Lobby_Admit,
 		testServer_Lobby_Deny,
+		testServer_PrivateGroup_UserJoinedMessages,
 		testServer_StartChat_InvalidRules,
 		testServer_StartChat_RulesNotSatisfied,
 		testServer_StartChat_MinimumSpeakerBalance,
@@ -177,6 +178,8 @@ type serverEnv struct {
 	blocklist  *fakeBlocklistReader
 	media      *fakeMedia
 	moderator  *fakeModerator
+
+	systemMessages *fakeSystemMessenger
 
 	userObserver *event.TestEventObserver[*commonpb.UserId, *eventpb.Event]
 	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
@@ -227,34 +230,36 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	blocklist := newFakeBlocklistReader()
 	media := newFakeMedia()
 	moderator := &fakeModerator{}
+	systemMessages := &fakeSystemMessenger{}
 	access := chat.NewAccess(s, chat.NewRuleEvaluator(accounts, balances, s, teamUserID))
 	var opts []chat.ServerOption
 	if cfg.lobbyLimits != nil {
 		opts = append(opts, chat.WithLobbyLimits(*cfg.lobbyLimits))
 	}
-	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, access, userBus, chatBus, teamUserID, cfg.disablePublicGroupRoster, opts...)
+	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, systemMessages, access, userBus, chatBus, teamUserID, cfg.disablePublicGroupRoster, opts...)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
 
 	return &serverEnv{
-		t:            t,
-		ctx:          ctx,
-		client:       chatpb.NewChatClient(cc),
-		authz:        authz,
-		store:        s,
-		messaging:    messaging,
-		profiles:     profiles,
-		blocklist:    blocklist,
-		media:        media,
-		moderator:    moderator,
-		accounts:     accounts,
-		ocpBalance:   ocpBalance,
-		userObserver: userObserver,
-		chatObserver: chatObserver,
-		userID:       userID,
-		keys:         keys,
-		teamUserID:   teamUserID,
+		t:              t,
+		ctx:            ctx,
+		client:         chatpb.NewChatClient(cc),
+		authz:          authz,
+		store:          s,
+		messaging:      messaging,
+		profiles:       profiles,
+		blocklist:      blocklist,
+		media:          media,
+		moderator:      moderator,
+		accounts:       accounts,
+		systemMessages: systemMessages,
+		ocpBalance:     ocpBalance,
+		userObserver:   userObserver,
+		chatObserver:   chatObserver,
+		userID:         userID,
+		keys:           keys,
+		teamUserID:     teamUserID,
 	}
 }
 
@@ -641,6 +646,50 @@ func (f *fakeBlocklistReader) GetBlocked(_ context.Context, ownerID *commonpb.Us
 		}
 	}
 	return out, nil
+}
+
+// userJoinedCall is one call to fakeSystemMessenger.SendUserJoined.
+type userJoinedCall struct {
+	chatID        *commonpb.ChatId
+	userID        *commonpb.UserId
+	admittedBy    *commonpb.UserId
+	rosterVersion uint64
+}
+
+// fakeSystemMessenger is a chat.SystemMessenger for server tests: it records
+// every join it is asked to write, and fails each with err when set. The
+// chat server calls it on the request path, so a test reads its calls with no
+// waiting.
+type fakeSystemMessenger struct {
+	mu    sync.Mutex
+	joins []userJoinedCall
+	err   error
+}
+
+func (f *fakeSystemMessenger) SendUserJoined(_ context.Context, chatID *commonpb.ChatId, userID, admittedBy *commonpb.UserId, rosterVersion uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.joins = append(f.joins, userJoinedCall{chatID: chatID, userID: userID, admittedBy: admittedBy, rosterVersion: rosterVersion})
+	return f.err
+}
+
+func (f *fakeSystemMessenger) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+// userJoinedCalls returns the joins recorded for chatID, in order.
+func (f *fakeSystemMessenger) userJoinedCalls(chatID *commonpb.ChatId) []userJoinedCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []userJoinedCall
+	for _, call := range f.joins {
+		if bytes.Equal(call.chatID.Value, chatID.Value) {
+			out = append(out, call)
+		}
+	}
+	return out
 }
 
 // putDM persists a contact DM the env user is a member of, with the given last
@@ -6113,6 +6162,89 @@ func testServer_Lobby_Deny(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(userKeys, chatID).Result)
 	got = e.getChat(userKeys, chatID)
 	require.True(t, got.Metadata.InLobby)
+}
+
+// testServer_PrivateGroup_UserJoinedMessages pins which joins write a
+// UserJoined system message: every real admission, as admitted by the
+// creator, and the creator's own rejoin, as on their own, each at the roster
+// version the join produced; never a creation, a departure, a refusal, a
+// no-op or a public group's join; and a failure to write one never fails the
+// join.
+func testServer_PrivateGroup_UserJoinedMessages(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.accounts.setStaff(e.userID, true)
+
+	requireJoin := func(call userJoinedCall, userID, admittedBy *commonpb.UserId, rosterVersion uint64) {
+		t.Helper()
+		require.Equal(t, userID.Value, call.userID.Value)
+		if admittedBy == nil {
+			require.Nil(t, call.admittedBy)
+		} else {
+			require.Equal(t, admittedBy.Value, call.admittedBy.GetValue())
+		}
+		require.Equal(t, rosterVersion, call.rosterVersion)
+	}
+	rosterVersion := func(chatID *commonpb.ChatId) uint64 {
+		t.Helper()
+		got := e.getChat(e.keys, chatID)
+		require.Equal(t, chatpb.GetChatResponse_OK, got.Result)
+		return got.Metadata.RosterSummary.Version
+	}
+
+	// Creating the group writes none.
+	created := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
+	require.Equal(t, chatpb.StartChatResponse_OK, created.Result)
+	chatID := created.Chat.ChatId
+	require.Empty(t, e.systemMessages.userJoinedCalls(chatID))
+
+	// No one is admitted to a keyless group, nor anyone not waiting.
+	userID, userKeys := e.addBoundUser("Waiting")
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_DENIED, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(2)).Result)
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_OK, e.mustSetKeyEnvelope(e.keys, chatID, keyEnvelopeProto(1)).Result)
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_NOT_IN_LOBBY, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(2)).Result)
+	require.Empty(t, e.systemMessages.userJoinedCalls(chatID))
+
+	// An admission writes one, admitted by the creator.
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(userKeys, chatID).Result)
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(2)).Result)
+	calls := e.systemMessages.userJoinedCalls(chatID)
+	require.Len(t, calls, 1)
+	requireJoin(calls[0], userID, e.userID, rosterVersion(chatID))
+
+	// A repeat is the no-op, and writes nothing.
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(3)).Result)
+	require.Len(t, e.systemMessages.userJoinedCalls(chatID), 1)
+
+	// The creator leaves, which writes none, and rejoins on their own.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	require.Len(t, e.systemMessages.userJoinedCalls(chatID), 1)
+	joined := e.mustJoinChat(e.keys, chatID)
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	calls = e.systemMessages.userJoinedCalls(chatID)
+	require.Len(t, calls, 2)
+	requireJoin(calls[1], e.userID, nil, joined.Chat.RosterSummary.Version)
+
+	// Their join of a group they are in is the no-op.
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, chatID).Result)
+	require.Len(t, e.systemMessages.userJoinedCalls(chatID), 2)
+
+	// A failure to write one never fails the admission.
+	e.systemMessages.setErr(errors.New("unavailable"))
+	otherID, otherKeys := e.addBoundUser("Other")
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(otherKeys, chatID).Result)
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, otherID, keyEnvelopeProto(4)).Result)
+	isMember, err := s.IsMember(e.ctx, chatID, otherID)
+	require.NoError(t, err)
+	require.True(t, isMember)
+	calls = e.systemMessages.userJoinedCalls(chatID)
+	require.Len(t, calls, 3)
+	requireJoin(calls[2], otherID, e.userID, rosterVersion(chatID))
+	e.systemMessages.setErr(nil)
+
+	// A public group's join writes none.
+	groupID := e.putGroup("Open", at(1))
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(userKeys, groupID).Result)
+	require.Empty(t, e.systemMessages.userJoinedCalls(groupID))
 }
 
 func (e *serverEnv) setFeaturedGroups(keys model.KeyPair, chatIDs ...*commonpb.ChatId) (*chatpb.SetFeaturedGroupsResponse, error) {

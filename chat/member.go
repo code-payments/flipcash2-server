@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"errors"
+	"time"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -47,6 +48,14 @@ import (
 // moved, with no one named. A join or departure that is a no-op broadcasts
 // nothing: the roster did not move, and a client applying updates by version
 // would drop it anyway.
+//
+// A join of a private group also writes a UserJoined system message into the
+// group's log (see sendUserJoined), which does name the joiner: everyone
+// there is a member, and members see the roster anyway.
+
+// userJoinedMessageTimeout bounds writing a join's system message (see
+// sendUserJoined).
+const userJoinedMessageTimeout = 5 * time.Second
 
 func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*chatpb.JoinChatResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
@@ -107,6 +116,11 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure adding group member")
 		return nil, status.Error(codes.Internal, "")
+	}
+	if changed {
+		// Only a private group's creator gets this far in one, and they
+		// rejoin on their own.
+		s.sendUserJoined(ctx, log, c, userID, nil, roster)
 	}
 
 	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, fullDetail, []*Chat{c})
@@ -264,6 +278,31 @@ func (s *Server) clearMuteOnLeave(ctx context.Context, log *zap.Logger, chatID *
 	}
 	if changed {
 		s.publishViewerStateChanged(userID, chatID, state, Permissions{})
+	}
+}
+
+// sendUserJoined writes the UserJoined system message for userID's join of c
+// (see SystemMessenger), admitted by admittedBy or on their own when it is
+// nil, at the roster version the join produced. Only a private group gets one
+// today: a public group may be very large and anyone may join it, so its log
+// would fill with joins.
+//
+// It is called once per real join, after the write and before anything else
+// is read, so a failed read-back cannot lose it. It is best effort: the join
+// has landed, so a failure is logged and never fails the RPC, and since a
+// retry of the RPC is the no-op path, a message lost here stays lost.
+func (s *Server) sendUserJoined(ctx context.Context, log *zap.Logger, c *Chat, userID, admittedBy *commonpb.UserId, roster RosterSummary) {
+	if !c.IsPrivate || s.systemMessages == nil {
+		return
+	}
+
+	// The join has landed, so the caller going away must not abort the
+	// message; the timeout bounds the write, and the send detaches its own
+	// side effects.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), userJoinedMessageTimeout)
+	defer cancel()
+	if err := s.systemMessages.SendUserJoined(ctx, c.ID, userID, admittedBy, roster.Version); err != nil {
+		log.With(zap.Error(err)).Warn("Failure sending user joined message")
 	}
 }
 

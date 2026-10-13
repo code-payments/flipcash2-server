@@ -2322,7 +2322,13 @@ func textContent(text string) []*messagingpb.Content {
 func systemContent(text string) []*messagingpb.Content {
 	return []*messagingpb.Content{{
 		Type: &messagingpb.Content_System{
-			System: &messagingpb.SystemContent{FallbackText: text},
+			System: &messagingpb.SystemContent{
+				FallbackText: text,
+				Type: &messagingpb.SystemContent_UserJoined_{UserJoined: &messagingpb.SystemContent_UserJoined{
+					UserId: model.MustGenerateUserID(),
+					Method: &messagingpb.SystemContent_UserJoined_Direct_{Direct: &messagingpb.SystemContent_UserJoined_Direct{}},
+				}},
+			},
 		},
 	}}
 }

@@ -29,7 +29,7 @@ import (
 func RunWorkerTests(t *testing.T, polls poll.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, polls poll.Store){
 		testWorker_CountPoll,
-		testWorker_CountPoll_Withheld,
+		testWorker_CountPoll_FewVoters,
 		testWorker_BalancePoll,
 		testWorker_BalancePoll_FewVoters,
 		testWorker_OnlyDuePolls,
@@ -71,7 +71,9 @@ func testWorker_CountPoll(t *testing.T, polls poll.Store) {
 	require.Zero(t, processed)
 }
 
-func testWorker_CountPoll_Withheld(t *testing.T, polls poll.Store) {
+// testWorker_CountPoll_FewVoters pins that a COUNT poll's totals are shown
+// however few voted, none included: nothing is withheld.
+func testWorker_CountPoll_FewVoters(t *testing.T, polls poll.Store) {
 	e := newWorkerEnv(t, polls)
 
 	members := e.newUsers(2)
@@ -80,16 +82,20 @@ func testWorker_CountPoll_Withheld(t *testing.T, polls poll.Store) {
 	e.vote(p, members[0], 0)
 	e.vote(p, members[1], 1)
 
-	// Two voters' totals would say how each voted.
 	_, err := e.worker.Process(e.ctx)
 	require.NoError(t, err)
-	e.requireClosed(p, withheld())
+	e.requireClosed(p, &pollpb.Results{Type: &pollpb.Results_Count{Count: &pollpb.CountResults{
+		TotalVoters:  2,
+		OptionVoters: []uint64{1, 1},
+	}}})
 
-	// So would none at all.
 	empty := e.putDuePoll(chatID, pollpb.Mode_COUNT, 2, false)
 	_, err = e.worker.Process(e.ctx)
 	require.NoError(t, err)
-	e.requireClosed(empty, withheld())
+	e.requireClosed(empty, &pollpb.Results{Type: &pollpb.Results_Count{Count: &pollpb.CountResults{
+		TotalVoters:  0,
+		OptionVoters: []uint64{0, 0},
+	}}})
 }
 
 // testWorker_BalancePoll pins a BALANCE poll's tally: each voter's holdings
@@ -334,8 +340,4 @@ func (e *workerEnv) requireClosed(p *poll.Poll, want *pollpb.Results) {
 	require.Equal(e.t, poll.StatusClosed, stored.Status)
 	require.True(e.t, proto.Equal(want, stored.Results), "results %v, want %v", stored.Results, want)
 	require.NoError(e.t, stored.Results.Validate())
-}
-
-func withheld() *pollpb.Results {
-	return &pollpb.Results{Type: &pollpb.Results_Withheld{Withheld: &pollpb.WithheldResults{}}}
 }

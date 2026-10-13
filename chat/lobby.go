@@ -49,7 +49,9 @@ import (
 // leave a member with an entry. It is announced like any join: a
 // RosterUpdate.MemberJoined to the admitted user, who learns of it that way
 // and fetches their envelope (see Server.GetKeyEnvelope), and a
-// MembershipChanged naming no one to the members.
+// MembershipChanged naming no one to the members. Like the creator's rejoin,
+// it also writes a UserJoined system message into the group's log, as
+// Admitted by the creator (see sendUserJoined).
 //
 // The lobby's own changes reach the creator alone, as LobbyUpdates on their
 // user topic (see publishLobbyUpdate): a MemberEntered carrying the waiting
@@ -338,6 +340,9 @@ func (s *Server) AdmitLobbyMember(ctx context.Context, req *chatpb.AdmitLobbyMem
 		// write: theirs announced it.
 		return &chatpb.AdmitLobbyMemberResponse{Result: chatpb.AdmitLobbyMemberResponse_OK}, nil
 	}
+
+	// The caller, the creator, let them in.
+	s.sendUserJoined(ctx, log, c, req.UserId, userID, roster)
 
 	// Announced as any join is (see JoinChat): to the admitted user's own
 	// devices, their entry as hydrated for them, with the metadata so they

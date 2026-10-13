@@ -138,6 +138,18 @@ type Media interface {
 	SetAsChatMedia(ctx context.Context, ownerID *commonpb.UserId, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error
 }
 
+// SystemMessenger is the write slice of the messaging domain the Chat service
+// needs to put its own messages in a chat's log. Like MessagingReader it is
+// declared here (consumer side) because messaging imports chat;
+// messaging.Sender satisfies it directly.
+type SystemMessenger interface {
+	// SendUserJoined writes the system message telling a group's members that
+	// userID joined it: admitted by admittedBy, or on their own when it is nil.
+	// rosterVersion is the roster version after the join, which names it: a
+	// repeat of one join writes nothing.
+	SendUserJoined(ctx context.Context, chatID *commonpb.ChatId, userID, admittedBy *commonpb.UserId, rosterVersion uint64) error
+}
+
 // UserEventPublisher is the write slice of the event domain the Chat service
 // needs to notify one user's streams — the user-keyed event bus. Like the
 // readers it is declared here (consumer side) because the event package
@@ -166,6 +178,10 @@ type Server struct {
 	messaging MessagingReader
 	moderator moderation.Client
 	profiles  ProfileReader
+
+	// systemMessages writes the join messages of a private group (see
+	// sendUserJoined). Nil when there is none, which writes nothing.
+	systemMessages SystemMessenger
 
 	// teamUserID is the Flipcash team account (see flipcashteam), whose DMs are
 	// never end-to-end encrypted (see useE2ee). The Never speaker rule they
@@ -229,6 +245,7 @@ func NewServer(
 	messaging MessagingReader,
 	moderator moderation.Client,
 	profiles ProfileReader,
+	systemMessages SystemMessenger,
 
 	access *Access,
 
@@ -253,6 +270,8 @@ func NewServer(
 		messaging: messaging,
 		moderator: moderator,
 		profiles:  profiles,
+
+		systemMessages: systemMessages,
 
 		rules:  access.Rules(),
 		access: access,

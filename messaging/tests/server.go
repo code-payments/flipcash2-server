@@ -71,6 +71,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_SendBatch_SideEffects,
 		testServer_SendBatch_Group,
 		testServer_SendBatch_RecordsGroupSenders,
+		testServer_SendUserJoined,
 		testServer_SendMessage_TeamAccount,
 		testServer_TeamAccount_Refused,
 		testServer_EditMessage,
@@ -1602,6 +1603,79 @@ func testServer_SendBatch_RecordsGroupSenders(t *testing.T, badges badge.Store, 
 	// A DM send records nothing and fails nothing.
 	_, err = e.sender.Send(e.ctx, e.chatID, e.userA, textContent("hi"), generateClientID(), true)
 	require.NoError(t, err)
+}
+
+// testServer_SendUserJoined pins the UserJoined system message: no sender, a
+// fallback naming no one, the method its admitter decides, unread carried
+// forward, the group's last message, broadcast but never pushed; a repeat of
+// one join writes nothing, a later join writes its own, and a DM is refused.
+func testServer_SendUserJoined(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Alice"))
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+	groupEvents := func() []*event.KeyAndEvent[*commonpb.ChatId, *eventpb.ChatEvent] {
+		return e.chatObserver.GetEvents(func(id *commonpb.ChatId) bool { return bytes.Equal(id.Value, groupID.Value) })
+	}
+
+	// One message from Alice first, which userB is pushed and counts toward
+	// unread.
+	_, err := e.sender.Send(e.ctx, groupID, e.userA, textContent("welcome"), generateClientID(), true)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return len(e.pusher.snapshot()) == 1 }, time.Second, 20*time.Millisecond)
+
+	// userB, admitted by Alice.
+	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, e.userA, 1))
+	msg, err := messages.GetMessage(e.ctx, groupID, &messagingpb.MessageId{Value: 2})
+	require.NoError(t, err)
+	require.Nil(t, msg.SenderID)
+	require.Equal(t, uint64(1), msg.UnreadSeq)
+	require.Len(t, msg.Content, 1)
+	system := msg.Content[0].GetSystem()
+	require.NotNil(t, system)
+	require.Equal(t, "A new member joined the group", system.FallbackText)
+	require.Equal(t, e.userB.Value, system.GetUserJoined().GetUserId().GetValue())
+	require.Equal(t, e.userA.Value, system.GetUserJoined().GetAdmitted().GetAdmittedBy().GetValue())
+
+	record, err := chats.GetChatByID(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), record.LastMessageID.GetValue())
+
+	require.Eventually(t, func() bool { return len(groupEvents()) == 2 }, time.Second, 20*time.Millisecond)
+	sent := groupEvents()[1].Event.Event.GetChatUpdate().GetEvents().GetEvents()
+	require.Len(t, sent, 1)
+	require.Len(t, sent[0].Mutations, 1)
+	require.True(t, proto.Equal(msg.ToProto(), sent[0].Mutations[0].GetMessageSent()))
+
+	// A repeat of the same join writes nothing.
+	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, e.userA, 1))
+	_, err = messages.GetMessage(e.ctx, groupID, &messagingpb.MessageId{Value: 3})
+	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
+
+	// A later join, on their own, writes its own.
+	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userA, nil, 2))
+	msg, err = messages.GetMessage(e.ctx, groupID, &messagingpb.MessageId{Value: 3})
+	require.NoError(t, err)
+	require.Nil(t, msg.SenderID)
+	require.Equal(t, uint64(1), msg.UnreadSeq)
+	require.Equal(t, e.userA.Value, msg.Content[0].GetSystem().GetUserJoined().GetUserId().GetValue())
+	require.NotNil(t, msg.Content[0].GetSystem().GetUserJoined().GetDirect())
+
+	// Broadcast once per join, and never pushed.
+	require.Eventually(t, func() bool { return len(groupEvents()) == 3 }, time.Second, 20*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	require.Len(t, groupEvents(), 3)
+	require.Len(t, e.pusher.snapshot(), 1)
+
+	// A DM takes none.
+	require.Error(t, e.sender.SendUserJoined(e.ctx, e.chatID, e.userB, e.userA, 1))
 }
 
 func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

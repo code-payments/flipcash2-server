@@ -179,11 +179,13 @@ type Server struct {
 	userEventBus UserEventPublisher
 	chatEventBus ChatEventPublisher
 
-	// disableGetRoster turns the GetRoster RPC off when set: every call is
-	// refused with UNAVAILABLE before anything is read (see roster.go). It is
-	// an operator's switch on the one read that walks a whole roster, so the
-	// read can be withdrawn without a deploy if it proves too costly.
-	disableGetRoster bool
+	// disablePublicGroupRoster turns GetRoster off for public groups when
+	// set: a call naming one is DENIED before membership is read, members
+	// included (see roster.go). It is an operator's switch on the one read that
+	// walks a whole roster, so the read can be withdrawn from the groups
+	// anyone may join without a deploy if it proves too costly. DMs and
+	// private groups are served whatever it says.
+	disablePublicGroupRoster bool
 
 	// maxGroupFeedChats is the most group chats a user's feed may hold (see
 	// feed.go). It is the package constant of the same name in production;
@@ -235,7 +237,7 @@ func NewServer(
 
 	teamUserID *commonpb.UserId,
 
-	disableGetRoster bool,
+	disablePublicGroupRoster bool,
 
 	opts ...ServerOption,
 ) *Server {
@@ -260,7 +262,7 @@ func NewServer(
 
 		teamUserID: teamUserID,
 
-		disableGetRoster: disableGetRoster,
+		disablePublicGroupRoster: disablePublicGroupRoster,
 
 		maxGroupFeedChats:  maxGroupFeedChats,
 		rosterWholeReadCap: rosterWholeReadCap,

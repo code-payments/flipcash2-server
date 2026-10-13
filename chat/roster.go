@@ -59,11 +59,13 @@ import (
 // Membership is decided through the shared Access, off the record for a DM
 // and from the store for a group.
 //
-// The whole RPC can be switched off by configuration (see
-// Server.disableGetRoster): every call is then refused with UNAVAILABLE once
-// the caller is authorized and before any read, so a client that handles the
-// code as a transient condition falls back to the roster it holds from
-// Metadata and the RosterUpdates it has seen.
+// A public group's roster can be switched off by configuration (see
+// Server.disablePublicGroupRoster): a call naming one is then DENIED once the
+// record is read and before membership is, members included. It is a result,
+// not a transient error: a group member holds no roster to fall back on
+// (Metadata carries only the viewer, and MembershipChanged names no one), so
+// a retry would only be refused again. A private group's roster, like a
+// DM's, is always served to its members, whatever the switch says.
 
 const (
 	// maxGetRosterPageSize bounds a single GetRoster page and is its
@@ -92,10 +94,6 @@ func (s *Server) GetRoster(ctx context.Context, req *chatpb.GetRosterRequest) (*
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if s.disableGetRoster {
-		return nil, status.Error(codes.Unavailable, "roster reads are disabled")
-	}
-
 	limit := maxGetRosterPageSize
 	if pageSize := req.GetQueryOptions().GetPageSize(); pageSize > 0 && int(pageSize) < limit {
 		limit = int(pageSize)
@@ -122,6 +120,10 @@ func (s *Server) GetRoster(ctx context.Context, req *chatpb.GetRosterRequest) (*
 	case err != nil:
 		log.With(zap.Error(err)).Warn("Failure getting chat")
 		return nil, status.Error(codes.Internal, "")
+	}
+
+	if s.disablePublicGroupRoster && IsGroupChatID(c.ID) && !c.IsPrivate {
+		return &chatpb.GetRosterResponse{Result: chatpb.GetRosterResponse_DENIED}, nil
 	}
 
 	isMember, err := s.access.IsMemberWithChat(ctx, c, userID)

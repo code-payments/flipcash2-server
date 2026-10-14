@@ -2359,6 +2359,34 @@ func mediaContent(blobID *blobpb.BlobId) []*messagingpb.Content {
 	}}
 }
 
+// linkPreviewContent builds a text message carrying link, with a preview of it
+// whose image, if imageBlobID is set, references that blob as its ORIGINAL
+// rendition — the shape a client sends.
+func linkPreviewContent(text, link string, imageBlobID *blobpb.BlobId) []*messagingpb.Content {
+	return []*messagingpb.Content{{
+		Type: &messagingpb.Content_Text{
+			Text: &messagingpb.TextContent{
+				Text:         text,
+				LinkPreviews: []*messagingpb.LinkPreview{linkPreview(link, imageBlobID)},
+			},
+		},
+	}}
+}
+
+// linkPreview builds a preview of link, with an image referencing imageBlobID
+// when set.
+func linkPreview(link string, imageBlobID *blobpb.BlobId) *messagingpb.LinkPreview {
+	p := &messagingpb.LinkPreview{
+		Url:         link,
+		Title:       "A page worth a look",
+		Description: "What the page says of itself",
+	}
+	if imageBlobID != nil {
+		p.Image = mediaContent(imageBlobID)[0].GetMedia().Items[0]
+	}
+	return p
+}
+
 // replyMediaContent builds a reply to repliedMessageID whose body is a media
 // message referencing blobID.
 func replyMediaContent(repliedMessageID uint64, blobID *blobpb.BlobId) []*messagingpb.Content {

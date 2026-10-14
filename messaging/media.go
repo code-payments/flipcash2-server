@@ -31,32 +31,43 @@ type Media interface {
 }
 
 // validClientMedia reports whether a media content is one a client may author:
-// at least one item, each carrying exactly one ORIGINAL rendition identified by a
-// blob id and no server-resolved metadata (the server fills Blob on read, never
-// the client). Ownership and readiness of the blobs are checked separately, when
-// they are shared into the chat.
+// at least one item, each one a client may reference (see
+// validClientMediaItem), and a caption, if any, with no link previews (a
+// preview belongs to a text message or a reply's text body; see
+// clientAllowedContent). Ownership and readiness of the blobs are checked
+// separately, when they are shared into the chat.
 func validClientMedia(media *messagingpb.MediaContent) bool {
 	if media == nil || len(media.Items) == 0 {
 		return false
 	}
 	for _, item := range media.Items {
-		if len(item.Renditions) != 1 {
-			return false
-		}
-		r := item.Renditions[0]
-		if r.Role != blobpb.Rendition_ORIGINAL || r.BlobId == nil || r.Blob != nil {
+		if !validClientMediaItem(item) {
 			return false
 		}
 	}
-	return true
+	return len(media.GetCaption().GetLinkPreviews()) == 0
+}
+
+// validClientMediaItem reports whether a media item is one a client may
+// reference, as a media message's item or a link preview's image: exactly one
+// ORIGINAL rendition identified by a blob id and no server-resolved metadata
+// (the server fills Blob on read, never the client).
+func validClientMediaItem(item *blobpb.Media) bool {
+	if len(item.GetRenditions()) != 1 {
+		return false
+	}
+	r := item.Renditions[0]
+	return r.Role == blobpb.Rendition_ORIGINAL && r.BlobId != nil && r.Blob == nil
 }
 
 // shareMessageMedia grants the chat read access to the blobs referenced by
-// content, after verifying the sender owns each and it is a READY original. It
-// reports denied=true when the media is not shareable (the caller returns its
-// DENIED result) and a ready-to-return Internal error on an unexpected failure.
-// Non-media content is a no-op. It runs before the message is persisted and
-// broadcast, so the grants are durable before any recipient can resolve them.
+// content — a media message's items and any link preview's image alike — after
+// verifying the sender owns each and it is a READY original. It reports
+// denied=true when the media is not shareable (the caller returns its DENIED
+// result) and a ready-to-return Internal error on an unexpected failure.
+// Content referencing no blob is a no-op. It runs before the message is
+// persisted and broadcast, so the grants are durable before any recipient can
+// resolve them.
 func (s *Server) shareMessageMedia(ctx context.Context, log *zap.Logger, senderID *commonpb.UserId, chatID *commonpb.ChatId, content []*messagingpb.Content) (denied bool, err error) {
 	blobIDs := mediaBlobIDs(content)
 	if len(blobIDs) == 0 {
@@ -72,26 +83,15 @@ func (s *Server) shareMessageMedia(ctx context.Context, log *zap.Logger, senderI
 	return false, nil
 }
 
-// mediaBlobIDs returns the blob ids a message references — whether the media is
-// the message body or the body of a reply — or nil when there is no media. It
-// assumes the content already passed clientAllowedContent.
+// mediaBlobIDs returns the blob ids a message references (see mediaItemsOf),
+// or nil when it references none. It assumes the content already passed
+// clientAllowedContent.
 func mediaBlobIDs(content []*messagingpb.Content) []*blobpb.BlobId {
 	if len(content) != 1 {
 		return nil
 	}
-	body := content[0]
-	if reply, ok := body.Type.(*messagingpb.Content_Reply); ok {
-		if len(reply.Reply.Content) != 1 {
-			return nil
-		}
-		body = reply.Reply.Content[0]
-	}
-	media, ok := body.Type.(*messagingpb.Content_Media)
-	if !ok {
-		return nil
-	}
 	var ids []*blobpb.BlobId
-	for _, item := range media.Media.Items {
+	for _, item := range mediaItemsOf(content[0]) {
 		for _, r := range item.Renditions {
 			if r.BlobId != nil {
 				ids = append(ids, r.BlobId)
@@ -149,18 +149,13 @@ func hydrateMedia(ctx context.Context, resolver Media, protos []*messagingpb.Mes
 	return nil
 }
 
-// mediaItems returns every media item across the messages — whether the media is a
-// message body or a reply body — so each item's rendition list can be expanded in
-// place.
+// mediaItems returns every media item across the messages (see mediaItemsOf)
+// so each item's rendition list can be expanded in place.
 func mediaItems(protos []*messagingpb.Message) []*blobpb.Media {
 	var out []*blobpb.Media
 	for _, msg := range protos {
 		for _, c := range msg.Content {
-			media := mediaOf(c)
-			if media == nil {
-				continue
-			}
-			out = append(out, media.Items...)
+			out = append(out, mediaItemsOf(c)...)
 		}
 	}
 	return out
@@ -178,14 +173,28 @@ func originalBlobID(item *blobpb.Media) *blobpb.BlobId {
 	return nil
 }
 
-// mediaOf returns the MediaContent a content element carries — directly or as a
-// reply body — or nil if there is none.
-func mediaOf(c *messagingpb.Content) *messagingpb.MediaContent {
+// mediaItemsOf returns every media item a content element carries, in place —
+// a media message's items, the image of each of a text's link previews — looking
+// through a reply to its body; nil if there is none. These are the items whose
+// blobs a send shares into the chat and a read resolves, so the two agree on
+// what a message's media is. Encrypted content carries none the server sees.
+func mediaItemsOf(c *messagingpb.Content) []*blobpb.Media {
 	switch t := c.Type.(type) {
 	case *messagingpb.Content_Media:
-		return t.Media
+		return t.Media.GetItems()
+	case *messagingpb.Content_Text:
+		var out []*blobpb.Media
+		for _, p := range t.Text.GetLinkPreviews() {
+			if p.GetImage() != nil {
+				out = append(out, p.Image)
+			}
+		}
+		return out
 	case *messagingpb.Content_Reply:
-		return mediaOf(t.Reply.Content[0])
+		if len(t.Reply.GetContent()) != 1 {
+			return nil
+		}
+		return mediaItemsOf(t.Reply.Content[0])
 	}
 	return nil
 }

@@ -60,6 +60,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_SendReply,
 		testServer_SendMessage_DisallowedContent,
 		testServer_SendMedia,
+		testServer_LinkPreviews,
 		testServer_ResolvesMediaOnRead,
 		testServer_EncryptedContent,
 		testServer_EncryptedContent_NotInGroups,
@@ -861,6 +862,125 @@ func testServer_SendMedia(t *testing.T, badges badge.Store, blocklists blocklist
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, replyResp.Result)
 	require.True(t, e.chatGrantedRead(replyBlob))
+}
+
+// testServer_LinkPreviews: a text may carry a preview of a link in it, whose
+// image is shared into the chat like a media item and resolved on every read,
+// and is refused when it names a link the text does not carry as a whole, or
+// an image the sender may not share. A caption carries none. An edit is judged
+// against the edited text. A redacted read keeps the preview's shape and
+// drops its link and the image's download URL.
+func testServer_LinkPreviews(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	const link = "https://news.example/story?id=7"
+	const text = "worth a read: " + link + "."
+
+	// A preview with an image the sender uploaded is sent, the image is
+	// granted to the chat, and the send response and a member's read carry
+	// it resolved.
+	imageBlob := e.putReadyBlob(e.userA)
+	sent, err := e.sendContent(e.keysA, linkPreviewContent(text, link, imageBlob), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	require.True(t, e.chatGrantedRead(imageBlob))
+	requireResolved := func(image *blobpb.Media, blobID *blobpb.BlobId) {
+		t.Helper()
+		require.Len(t, image.GetRenditions(), 1)
+		r := image.Renditions[0]
+		require.Equal(t, blobID.Value, r.BlobId.Value)
+		require.NotNil(t, r.Blob)
+		require.Equal(t, "image/png", r.Blob.MimeType)
+		require.NotEmpty(t, r.Blob.GetDownloadUrl().GetUrl())
+	}
+	requirePreview := func(m *messagingpb.Message) {
+		t.Helper()
+		previews := m.Content[0].GetText().GetLinkPreviews()
+		require.Len(t, previews, 1)
+		require.Equal(t, link, previews[0].Url)
+		requireResolved(previews[0].GetImage(), imageBlob)
+	}
+	requirePreview(sent.Message)
+	got, err := e.getMessage(e.keysB, sent.Message.MessageId)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, got.Result)
+	require.Equal(t, text, got.Message.Content[0].GetText().Text)
+	requirePreview(got.Message)
+	listed, err := e.getMessagesByOptions(e.keysB, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_OK, listed.Result)
+	requirePreview(listed.Messages.Messages[0])
+
+	// A preview without an image shares nothing and is sent as is.
+	bare, err := e.sendContent(e.keysA, linkPreviewContent(text, link, nil), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, bare.Result)
+	require.Nil(t, bare.Message.Content[0].GetText().GetLinkPreviews()[0].GetImage())
+
+	// A reply's text body carries one too, and its image is shared.
+	replyBlob := e.putReadyBlob(e.userB)
+	reply := replyContent(sent.Message.MessageId.Value, text)
+	reply[0].GetReply().Content = linkPreviewContent(text, link, replyBlob)
+	replied, err := e.sendContent(e.keysB, reply, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, replied.Result)
+	require.True(t, e.chatGrantedRead(replyBlob))
+	requireResolved(replied.Message.Content[0].GetReply().Content[0].GetText().GetLinkPreviews()[0].GetImage(), replyBlob)
+
+	// Refused: a link the text does not carry, or carries only as part of a
+	// longer link; a caption with a preview; an image the sender does not
+	// own. Nothing is granted on a refusal.
+	for name, content := range map[string][]*messagingpb.Content{
+		"link not in text":      linkPreviewContent("nothing to see", link, nil),
+		"link is a prefix":      linkPreviewContent("see "+link+"&evil=1", link, nil),
+		"link embedded":         linkPreviewContent("see https://evil.example/?u="+link, link, nil),
+		"link behind a bracket": linkPreviewContent("see https://evil.example/("+link+")", link, nil),
+		"link run into a word":  linkPreviewContent("see x"+link, link, nil),
+	} {
+		resp, err := e.sendContent(e.keysA, content, generateClientID())
+		require.NoError(t, err, name)
+		require.Equal(t, messagingpb.SendMessageResponse_DENIED, resp.Result, name)
+	}
+	captioned := mediaContent(e.putReadyBlob(e.userA))
+	captioned[0].GetMedia().Caption = &messagingpb.TextContent{Text: text, LinkPreviews: []*messagingpb.LinkPreview{linkPreview(link, nil)}}
+	captionedResp, err := e.sendContent(e.keysA, captioned, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, captionedResp.Result)
+	othersBlob := e.putReadyBlob(e.userB)
+	stolen, err := e.sendContent(e.keysA, linkPreviewContent(text, link, othersBlob), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, stolen.Result)
+	require.False(t, e.chatGrantedRead(othersBlob))
+
+	// An edit is judged against the edited text: keeping the preview while
+	// editing the link out is refused, and an edit may add a preview, whose
+	// image is shared then.
+	editedOut, err := e.editMessage(e.keysA, bare.Message.MessageId, linkPreviewContent("link removed", link, nil), bare.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_DENIED, editedOut.Result)
+	plain, err := e.send(e.keysA, "no link yet", generateClientID())
+	require.NoError(t, err)
+	editBlob := e.putReadyBlob(e.userA)
+	editedIn, err := e.editMessage(e.keysA, plain.Message.MessageId, linkPreviewContent(text, link, editBlob), plain.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_OK, editedIn.Result)
+	require.True(t, e.chatGrantedRead(editBlob))
+	require.NotEmpty(t, editedIn.Message.Content[0].GetText().GetLinkPreviews()[0].GetImage().GetRenditions()[0].GetBlob().GetDownloadUrl().GetUrl())
+
+	// A redacted read keeps the preview in place and resolved, less what it
+	// says: the link is a placeholder and the image has no download URL.
+	redacted, err := e.getMessageInChatWithMode(e.keysB, e.chatID, sent.Message.MessageId, messagingpb.ViewMode_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, redacted.Result)
+	require.True(t, redacted.Message.Redacted)
+	previews := redacted.Message.Content[0].GetText().GetLinkPreviews()
+	require.Len(t, previews, 1)
+	require.NotEqual(t, link, previews[0].Url)
+	require.NotContains(t, previews[0].Url, "news.example")
+	require.NotEqual(t, "A page worth a look", previews[0].Title)
+	require.NotEmpty(t, previews[0].Title)
+	require.Len(t, previews[0].GetImage().GetRenditions(), 1)
+	require.Equal(t, "image/png", previews[0].Image.Renditions[0].GetBlob().GetMimeType())
+	require.Nil(t, previews[0].Image.Renditions[0].GetBlob().GetDownloadUrl())
 }
 
 func testServer_ResolvesMediaOnRead(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

@@ -25,6 +25,10 @@ type Integration struct {
 	chats    chat.Store
 	profiles profile.Store
 
+	// access gates group payments on the payer's standing to speak and the
+	// recipient's membership (see validateGroupAppMetadata).
+	access *chat.Access
+
 	mintDataProvider *ocp_currency_util.MintDataProvider
 
 	// teamUserID is the Flipcash team account (see flipcashteam), nil when
@@ -33,14 +37,17 @@ type Integration struct {
 	teamUserID *commonpb.UserId
 }
 
-// NewIntegration constructs the intent integration. teamUserID is the Flipcash
-// team account, which the parent resolves once at startup with
-// flipcashteam.GetUserID and passes to the chat store, the chat RuleEvaluator,
-// the chat server and the Sender too; nil names no one.
+// NewIntegration constructs the intent integration. access is the one
+// chat.Access the parent builds and shares with the chat and messaging
+// servers. teamUserID is the Flipcash team account, which the parent resolves
+// once at startup with flipcashteam.GetUserID and passes to the chat store,
+// the chat RuleEvaluator, the chat server and the Sender too; nil names no
+// one.
 func NewIntegration(
 	accounts account.Store,
 	chats chat.Store,
 	profiles profile.Store,
+	access *chat.Access,
 	mintDataProvider *ocp_currency_util.MintDataProvider,
 	teamUserID *commonpb.UserId,
 ) ocp_integration.SubmitIntent {
@@ -48,6 +55,8 @@ func NewIntegration(
 		accounts: accounts,
 		chats:    chats,
 		profiles: profiles,
+
+		access: access,
 
 		mintDataProvider: mintDataProvider,
 
@@ -98,6 +107,8 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 				return ocp_transaction.NewIntentDeniedError("contact send feature is disabled")
 			case *intentpb.ChatMetadata_DmPayment_:
 				return i.validateDmAppMetadata(ctx, intentRecord, &appMetadata)
+			case *intentpb.ChatMetadata_GroupPayment_:
+				return i.validateGroupAppMetadata(ctx, intentRecord, &appMetadata)
 			default:
 				return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
 			}
@@ -115,8 +126,9 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 
 // GetTasksToSchedule returns the guaranteed work derived from a submitted
 // intent. A DM payment of either type (contact DM or DM) schedules the cash
-// message injected into the DM between the sender and recipient; execution is
-// handled by task.Executor.
+// message injected into the DM between the sender and recipient, and a group
+// payment the one injected into the group; execution is handled by
+// task.Executor.
 func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_intent.Record) ([]*ocp_task.Record, error) {
 	if intentRecord.IntentType == ocp_intent.SendPublicPayment {
 		if GetContactDmPayment(intentRecord.AppMetadata) != nil {
@@ -124,6 +136,9 @@ func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_
 		}
 		if GetDmPayment(intentRecord.AppMetadata) != nil {
 			return []*ocp_task.Record{NewSendDmPaymentMessageTask(intentRecord)}, nil
+		}
+		if GetGroupPayment(intentRecord.AppMetadata) != nil {
+			return []*ocp_task.Record{NewSendGroupPaymentMessageTask(intentRecord)}, nil
 		}
 	}
 

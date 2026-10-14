@@ -18,6 +18,7 @@ import (
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
+	"github.com/code-payments/flipcash2-server/account"
 	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
 	badgememory "github.com/code-payments/flipcash2-server/badge/memory"
 	"github.com/code-payments/flipcash2-server/blob"
@@ -35,6 +36,7 @@ import (
 	"github.com/code-payments/flipcash2-server/task"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
+	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
 )
 
 func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
@@ -54,7 +56,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, nil)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
-	integration := intent.NewIntegration(accounts, chats, profiles, nil, nil)
+	integration := intent.NewIntegration(accounts, chats, profiles, nil, nil, nil)
 
 	senderUserID := model.MustGenerateUserID()
 	senderKeys := model.MustGenerateKeyPair()
@@ -134,6 +136,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	assert.EqualValues(t, 10_000, cash.Amount.GetQuarks())
 	assert.Equal(t, "usd", cash.Amount.GetCurrency())
 	assert.EqualValues(t, 1.0, cash.Amount.GetNativeAmount())
+	assert.True(t, proto.Equal(recipientUserID, cash.GetReceiver()))
 	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetVerb())
 
 	// Tasks are delivered at least once, so re-execution must not duplicate
@@ -155,19 +158,19 @@ func TestExecutor_SendDmPaymentMessage(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		location     intentpb.ChatMetadata_DmPayment_Location
-		action       intentpb.ChatMetadata_DmPayment_Action
+		action       intentpb.PaymentAction
 		createdAt    time.Time
 		expectedVerb messagingpb.CashContent_Verb
 	}{
-		{"flipcard", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_DEFAULT, now, messagingpb.CashContent_SENT},
-		{"chat", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_DEFAULT, now, messagingpb.CashContent_SENT},
-		{"flipcard_send", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_SEND, now, messagingpb.CashContent_SENT},
-		{"flipcard_tip", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_TIP, now, messagingpb.CashContent_TIPPED},
-		{"chat_tip", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_TIP, now, messagingpb.CashContent_TIPPED},
-		{"legacy_flipcard", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_DEFAULT, legacy, messagingpb.CashContent_TIPPED},
-		{"legacy_chat", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_DEFAULT, legacy, messagingpb.CashContent_SENT},
-		{"legacy_flipcard_send", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_SEND, legacy, messagingpb.CashContent_SENT},
-		{"legacy_chat_tip", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_TIP, legacy, messagingpb.CashContent_TIPPED},
+		{"flipcard", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.PaymentAction_DEFAULT, now, messagingpb.CashContent_SENT},
+		{"chat", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.PaymentAction_DEFAULT, now, messagingpb.CashContent_SENT},
+		{"flipcard_send", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.PaymentAction_SEND, now, messagingpb.CashContent_SENT},
+		{"flipcard_tip", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.PaymentAction_TIP, now, messagingpb.CashContent_TIPPED},
+		{"chat_tip", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.PaymentAction_TIP, now, messagingpb.CashContent_TIPPED},
+		{"legacy_flipcard", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.PaymentAction_DEFAULT, legacy, messagingpb.CashContent_TIPPED},
+		{"legacy_chat", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.PaymentAction_DEFAULT, legacy, messagingpb.CashContent_SENT},
+		{"legacy_flipcard_send", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.PaymentAction_SEND, legacy, messagingpb.CashContent_SENT},
+		{"legacy_chat_tip", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.PaymentAction_TIP, legacy, messagingpb.CashContent_TIPPED},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testExecutor_SendDmPaymentMessage(t, tc.location, tc.action, tc.createdAt, tc.expectedVerb, false)
@@ -177,14 +180,14 @@ func TestExecutor_SendDmPaymentMessage(t *testing.T) {
 	// A payment to the team account creates the DM with the team excluded
 	// from the feed, by the store's configuration alone.
 	t.Run("to_team", func(t *testing.T) {
-		testExecutor_SendDmPaymentMessage(t, intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_TIP, now, messagingpb.CashContent_TIPPED, true)
+		testExecutor_SendDmPaymentMessage(t, intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.PaymentAction_TIP, now, messagingpb.CashContent_TIPPED, true)
 	})
 }
 
 // testExecutor_SendDmPaymentMessage pays a DM payment through the task.
 // toTeam makes the recipient the team account, which the chat store is built
 // to exclude from the feed as the parent builds it.
-func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetadata_DmPayment_Location, action intentpb.ChatMetadata_DmPayment_Action, createdAt time.Time, expectedVerb messagingpb.CashContent_Verb, toTeam bool) {
+func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetadata_DmPayment_Location, action intentpb.PaymentAction, createdAt time.Time, expectedVerb messagingpb.CashContent_Verb, toTeam bool) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
@@ -216,7 +219,7 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	chats := chatmemory.NewInMemory([]*commonpb.UserId{teamUserID})
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, teamUserID)
 	executor := task.NewExecutor(accounts, chats, sender, ocpData)
-	integration := intent.NewIntegration(accounts, chats, profiles, nil, nil)
+	integration := intent.NewIntegration(accounts, chats, profiles, nil, nil, nil)
 
 	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
 
@@ -297,6 +300,7 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	require.NotNil(t, cash)
 	assert.Equal(t, rawIntentID, cash.IntentId.GetValue())
 	assert.EqualValues(t, 10_000, cash.Amount.GetQuarks())
+	assert.True(t, proto.Equal(recipientUserID, cash.GetReceiver()))
 	assert.Equal(t, expectedVerb, cash.GetVerb())
 
 	// Tasks are delivered at least once, so re-execution must not duplicate
@@ -306,4 +310,192 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	msgs, err = messages.GetMessages(ctx, chatID)
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
+}
+
+// groupPaymentEnv executes group payment tasks against in-memory stores.
+type groupPaymentEnv struct {
+	ctx         context.Context
+	accounts    account.Store
+	chats       chat.Store
+	messages    messaging.Store
+	ocpData     ocp_data.Provider
+	executor    ocp_integration.TaskExecutor
+	integration ocp_integration.SubmitIntent
+}
+
+func newGroupPaymentEnv(t *testing.T) *groupPaymentEnv {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	accounts := accountmemory.NewInMemory()
+	chats := chatmemory.NewInMemory(nil)
+	messages := messagingmemory.NewInMemory()
+	profiles := profilememory.NewInMemory()
+	ocpData := ocp_data.NewTestDataProvider()
+	bus := event.NewBus[*commonpb.UserId, *eventpb.Event]()
+	chatBus := event.NewBus[*commonpb.ChatId, *eventpb.ChatEvent]()
+
+	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
+	sender := messaging.NewSender(log, badgememory.NewInMemory(), chats, messages, profiles, blocklistmemory.NewInMemory(), media, ocpData, push.NewNoOpPusher(), bus, chatBus, nil)
+	access := chat.NewAccess(chats, chat.NewRuleEvaluator(accounts, nil, chats, nil), chat.WithSpeakerAdmissionTTL(0))
+
+	return &groupPaymentEnv{
+		ctx:         ctx,
+		accounts:    accounts,
+		chats:       chats,
+		messages:    messages,
+		ocpData:     ocpData,
+		executor:    task.NewExecutor(accounts, chats, sender, ocpData),
+		integration: intent.NewIntegration(accounts, chats, profiles, access, nil, nil),
+	}
+}
+
+func (e *groupPaymentEnv) bindUser(t *testing.T) (*commonpb.UserId, model.KeyPair) {
+	userID := model.MustGenerateUserID()
+	keys := model.MustGenerateKeyPair()
+	_, err := e.accounts.Bind(e.ctx, userID, keys.Proto())
+	require.NoError(t, err)
+	return userID, keys
+}
+
+// pay validates and saves a payment from one user to another carrying
+// chatMetadata, returning the intent record and its raw ID.
+func (e *groupPaymentEnv) pay(t *testing.T, chatMetadata *intentpb.ChatMetadata, from, to model.KeyPair) (*ocp_intent.Record, []byte) {
+	appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
+		Domain: &intentpb.AppMetadata_Chat{Chat: chatMetadata},
+	})
+	require.NoError(t, err)
+
+	rawIntentID := []byte(model.MustGenerateKeyPair().Public())
+	intentRecord := &ocp_intent.Record{
+		IntentId:              base58.Encode(rawIntentID),
+		IntentType:            ocp_intent.SendPublicPayment,
+		MintAccount:           base58.Encode(model.MustGenerateKeyPair().Public()),
+		InitiatorOwnerAccount: base58.Encode(from.Public()),
+		SendPublicPaymentMetadata: &ocp_intent.SendPublicPaymentMetadata{
+			DestinationOwnerAccount: base58.Encode(to.Public()),
+			DestinationTokenAccount: base58.Encode(model.MustGenerateKeyPair().Public()),
+			Quantity:                25_000,
+			ExchangeCurrency:        "usd",
+			ExchangeRate:            1.0,
+			NativeAmount:            2.5,
+			UsdMarketValue:          2.5,
+		},
+		AppMetadata: appMetadata,
+		State:       ocp_intent.StatePending,
+		CreatedAt:   time.Now(),
+	}
+	require.NoError(t, e.ocpData.SaveIntent(e.ctx, intentRecord))
+	return intentRecord, rawIntentID
+}
+
+func groupPaymentMetadata(chatID *commonpb.ChatId) *intentpb.ChatMetadata {
+	return &intentpb.ChatMetadata{
+		ChatId: chatID,
+		Type: &intentpb.ChatMetadata_GroupPayment_{
+			GroupPayment: &intentpb.ChatMetadata_GroupPayment{Action: intentpb.PaymentAction_SEND},
+		},
+	}
+}
+
+func TestExecutor_SendGroupPaymentMessage(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	payerUserID, payerKeys := e.bindUser(t)
+	recipientUserID, recipientKeys := e.bindUser(t)
+	bystanderUserID, _ := e.bindUser(t)
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Title:        "Group",
+		CreatorID:    bystanderUserID,
+		Members:      []*commonpb.UserId{bystanderUserID, payerUserID, recipientUserID},
+		LastActivity: time.Now(),
+	}))
+
+	// A validated payment schedules the group task, and executing it posts
+	// the cash message into the group as the payer, naming the recipient.
+	intentRecord, rawIntentID := e.pay(t, groupPaymentMetadata(groupID), payerKeys, recipientKeys)
+	require.NoError(t, e.integration.AllowCreation(e.ctx, intentRecord, nil, nil))
+
+	tasks, err := e.integration.GetTasksToSchedule(e.ctx, intentRecord)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, intent.TaskTypeSendGroupPaymentMessage, tasks[0].Type)
+
+	require.NoError(t, e.executor.Execute(e.ctx, tasks[0]))
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Len(t, msgs[0].Content, 1)
+	require.True(t, proto.Equal(payerUserID, msgs[0].SenderID))
+
+	cash := msgs[0].Content[0].GetCash()
+	require.NotNil(t, cash)
+	assert.Equal(t, rawIntentID, cash.IntentId.GetValue())
+	assert.EqualValues(t, 25_000, cash.Amount.GetQuarks())
+	assert.Equal(t, "usd", cash.Amount.GetCurrency())
+	assert.EqualValues(t, 2.5, cash.Amount.GetNativeAmount())
+	assert.True(t, proto.Equal(recipientUserID, cash.GetReceiver()))
+	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetVerb())
+
+	// Tasks are delivered at least once, so re-execution must not duplicate
+	// the message.
+	require.NoError(t, e.executor.Execute(e.ctx, tasks[0]))
+	msgs, err = e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+
+	// Standing is judged at validation: once a payment is made, its message
+	// lands even if both parties have left the group before the task runs.
+	intentRecord, _ = e.pay(t, groupPaymentMetadata(groupID), payerKeys, recipientKeys)
+	require.NoError(t, e.integration.AllowCreation(e.ctx, intentRecord, nil, nil))
+	tasks, err = e.integration.GetTasksToSchedule(e.ctx, intentRecord)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+
+	for _, userID := range []*commonpb.UserId{payerUserID, recipientUserID} {
+		_, _, err := e.chats.RemoveGroupMember(e.ctx, groupID, userID, false)
+		require.NoError(t, err)
+	}
+	require.NoError(t, e.executor.Execute(e.ctx, tasks[0]))
+
+	msgs, err = e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	require.True(t, proto.Equal(payerUserID, msgs[1].SenderID))
+	assert.True(t, proto.Equal(recipientUserID, msgs[1].Content[0].GetCash().GetReceiver()))
+}
+
+// A group payment task only ever sends a group payment into a group: one that
+// references any other payment, or a chat that is not a group, fails rather
+// than sending.
+func TestExecutor_SendGroupPaymentMessage_Mismatched(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	payerUserID, payerKeys := e.bindUser(t)
+	recipientUserID, recipientKeys := e.bindUser(t)
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, payerUserID, recipientUserID)
+
+	dmPayment, _ := e.pay(t, &intentpb.ChatMetadata{
+		ChatId: dmChatID,
+		Type: &intentpb.ChatMetadata_DmPayment_{
+			DmPayment: &intentpb.ChatMetadata_DmPayment{Action: intentpb.PaymentAction_SEND},
+		},
+	}, payerKeys, recipientKeys)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewSendGroupPaymentMessageTask(dmPayment)), "not a group payment")
+
+	groupPaymentToDm, _ := e.pay(t, groupPaymentMetadata(dmChatID), payerKeys, recipientKeys)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewSendGroupPaymentMessageTask(groupPaymentToDm)), "chat id is not a group")
+
+	// And a DM payment task refuses a group payment.
+	groupPayment, _ := e.pay(t, groupPaymentMetadata(chat.MustGenerateGroupChatID()), payerKeys, recipientKeys)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewSendDmPaymentMessageTask(groupPayment)), "not a dm payment")
+
+	msgs, err := e.messages.GetMessages(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.Empty(t, msgs)
 }

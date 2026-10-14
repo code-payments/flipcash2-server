@@ -1,6 +1,7 @@
 package intent_test
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -48,6 +49,7 @@ type integrationEnv struct {
 	accounts    account.Store
 	chats       chat.Store
 	profiles    profile.Store
+	access      *chat.Access
 	integration ocp_integration.SubmitIntent
 
 	// team is the Flipcash team account the integration is built with, and
@@ -84,12 +86,23 @@ func newIntegrationEnv(t *testing.T) *integrationEnv {
 	_, err := accounts.Bind(ctx, team, teamKeys.Proto())
 	require.NoError(t, err)
 
+	// No group in these tests carries a balance rule, so the evaluator never
+	// values a balance. Nothing is remembered between asks, so a test's
+	// membership changes show on the next payment.
+	access := chat.NewAccess(
+		chats,
+		chat.NewRuleEvaluator(accounts, nil, chats, team),
+		chat.WithListenerAdmissionTTL(0),
+		chat.WithSpeakerAdmissionTTL(0),
+	)
+
 	return &integrationEnv{
 		ctx:         ctx,
 		accounts:    accounts,
 		chats:       chats,
 		profiles:    profiles,
-		integration: intent.NewIntegration(accounts, chats, profiles, mintDataProvider, team),
+		access:      access,
+		integration: intent.NewIntegration(accounts, chats, profiles, access, mintDataProvider, team),
 		team:        team,
 		teamKeys:    teamKeys,
 	}
@@ -144,16 +157,41 @@ func dmChatMetadata(chatID *commonpb.ChatId) *intentpb.ChatMetadata {
 }
 
 func dmChatMetadataFrom(chatID *commonpb.ChatId, location intentpb.ChatMetadata_DmPayment_Location) *intentpb.ChatMetadata {
-	return dmChatMetadataWithAction(chatID, location, intentpb.ChatMetadata_DmPayment_DEFAULT)
+	return dmChatMetadataWithAction(chatID, location, intentpb.PaymentAction_DEFAULT)
 }
 
-func dmChatMetadataWithAction(chatID *commonpb.ChatId, location intentpb.ChatMetadata_DmPayment_Location, action intentpb.ChatMetadata_DmPayment_Action) *intentpb.ChatMetadata {
+func dmChatMetadataWithAction(chatID *commonpb.ChatId, location intentpb.ChatMetadata_DmPayment_Location, action intentpb.PaymentAction) *intentpb.ChatMetadata {
 	return &intentpb.ChatMetadata{
 		ChatId: chatID,
 		Type: &intentpb.ChatMetadata_DmPayment_{
 			DmPayment: &intentpb.ChatMetadata_DmPayment{Location: location, Action: action},
 		},
 	}
+}
+
+func groupChatMetadata(chatID *commonpb.ChatId, action intentpb.PaymentAction) *intentpb.ChatMetadata {
+	return &intentpb.ChatMetadata{
+		ChatId: chatID,
+		Type: &intentpb.ChatMetadata_GroupPayment_{
+			GroupPayment: &intentpb.ChatMetadata_GroupPayment{Action: action},
+		},
+	}
+}
+
+// putGroup creates a public group with no rules, created by creator, whose
+// members are creator and members.
+func (e *integrationEnv) putGroup(t *testing.T, creator *commonpb.UserId, members ...*commonpb.UserId) *commonpb.ChatId {
+	return e.putGroupChat(t, &chat.Chat{CreatorID: creator, Members: append([]*commonpb.UserId{creator}, members...)})
+}
+
+// putGroupChat creates a group from c, filling in its ID, type and title.
+func (e *integrationEnv) putGroupChat(t *testing.T, c *chat.Chat) *commonpb.ChatId {
+	c.ID = chat.MustGenerateGroupChatID()
+	c.Type = chatpb.ChatType_GROUP
+	c.Title = "Group"
+	c.LastActivity = time.Now()
+	require.NoError(t, e.chats.PutChat(e.ctx, c))
+	return c.ID
 }
 
 func contactDmChatMetadata(chatID *commonpb.ChatId, sourcePhone, destinationPhone string) *intentpb.ChatMetadata {
@@ -278,14 +316,14 @@ func TestIntegration_AllowCreation_DmPayment(t *testing.T) {
 		for _, tc := range []struct {
 			name     string
 			location intentpb.ChatMetadata_DmPayment_Location
-			action   intentpb.ChatMetadata_DmPayment_Action
+			action   intentpb.PaymentAction
 		}{
-			{"flipcard_default", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_DEFAULT},
-			{"flipcard_send", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_SEND},
-			{"flipcard_tip", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.ChatMetadata_DmPayment_TIP},
-			{"chat_default", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_DEFAULT},
-			{"chat_send", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_SEND},
-			{"chat_tip", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.ChatMetadata_DmPayment_TIP},
+			{"flipcard_default", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.PaymentAction_DEFAULT},
+			{"flipcard_send", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.PaymentAction_SEND},
+			{"flipcard_tip", intentpb.ChatMetadata_DmPayment_FLIPCARD, intentpb.PaymentAction_TIP},
+			{"chat_default", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.PaymentAction_DEFAULT},
+			{"chat_send", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.PaymentAction_SEND},
+			{"chat_tip", intentpb.ChatMetadata_DmPayment_CHAT, intentpb.PaymentAction_TIP},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				e := newIntegrationEnv(t)
@@ -430,13 +468,13 @@ func TestIntegration_AllowCreation_DmPayment_TeamAccount(t *testing.T) {
 		{"to_team", userKeys, e.teamKeys},
 		{"from_team", e.teamKeys, userKeys},
 	}
-	payment := func(from, to model.KeyPair, action intentpb.ChatMetadata_DmPayment_Action) *ocp_intent.Record {
+	payment := func(from, to model.KeyPair, action intentpb.PaymentAction) *ocp_intent.Record {
 		metadata := dmChatMetadataWithAction(chatID, intentpb.ChatMetadata_DmPayment_CHAT, action)
 		return dmPaymentIntentRecord(t, metadata, base58.Encode(from.Public()), base58.Encode(to.Public()))
 	}
 	requireDenied := func(t *testing.T) {
 		for _, p := range parties {
-			for _, action := range []intentpb.ChatMetadata_DmPayment_Action{intentpb.ChatMetadata_DmPayment_TIP, intentpb.ChatMetadata_DmPayment_SEND} {
+			for _, action := range []intentpb.PaymentAction{intentpb.PaymentAction_TIP, intentpb.PaymentAction_SEND} {
 				err := e.integration.AllowCreation(e.ctx, payment(p.from, p.to, action), nil, nil)
 				require.ErrorContains(t, err, "flipcash team", "%s %s", p.name, action)
 			}
@@ -454,8 +492,148 @@ func TestIntegration_AllowCreation_DmPayment_TeamAccount(t *testing.T) {
 
 	// Without a team account configured, the same user is anyone else.
 	t.Run("no_team_configured", func(t *testing.T) {
-		unconfigured := intent.NewIntegration(e.accounts, e.chats, e.profiles, nil, nil)
-		require.NoError(t, unconfigured.AllowCreation(e.ctx, payment(userKeys, e.teamKeys, intentpb.ChatMetadata_DmPayment_SEND), nil, nil))
+		unconfigured := intent.NewIntegration(e.accounts, e.chats, e.profiles, e.access, nil, nil)
+		require.NoError(t, unconfigured.AllowCreation(e.ctx, payment(userKeys, e.teamKeys, intentpb.PaymentAction_SEND), nil, nil))
+	})
+}
+
+func TestIntegration_AllowCreation_GroupPayment(t *testing.T) {
+	e := newIntegrationEnv(t)
+
+	payerUserID, payerKeys := e.bindUser(t)
+	recipientUserID, recipientKeys := e.bindUser(t)
+	outsiderUserID, outsiderKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, payerUserID, recipientUserID)
+
+	payment := func(chatID *commonpb.ChatId, from, to model.KeyPair, action intentpb.PaymentAction) *ocp_intent.Record {
+		return dmPaymentIntentRecord(t, groupChatMetadata(chatID, action), base58.Encode(from.Public()), base58.Encode(to.Public()))
+	}
+	validRecord := func() *ocp_intent.Record {
+		return payment(groupID, payerKeys, recipientKeys, intentpb.PaymentAction_DEFAULT)
+	}
+
+	t.Run("valid", func(t *testing.T) {
+		for _, action := range []intentpb.PaymentAction{intentpb.PaymentAction_DEFAULT, intentpb.PaymentAction_SEND} {
+			require.NoError(t, e.integration.AllowCreation(e.ctx, payment(groupID, payerKeys, recipientKeys, action), nil, nil), action)
+		}
+		// Either member may pay the other: the recipient is not the creator.
+		require.NoError(t, e.integration.AllowCreation(e.ctx, payment(groupID, recipientKeys, payerKeys, intentpb.PaymentAction_SEND), nil, nil))
+	})
+
+	// No floor: a payment is any amount.
+	t.Run("any_amount", func(t *testing.T) {
+		record := validRecord()
+		record.SendPublicPaymentMetadata.NativeAmount = 0.01
+		record.SendPublicPaymentMetadata.UsdMarketValue = 0.01
+		require.NoError(t, e.integration.AllowCreation(e.ctx, record, nil, nil))
+	})
+
+	t.Run("denied_tip", func(t *testing.T) {
+		record := payment(groupID, payerKeys, recipientKeys, intentpb.PaymentAction_TIP)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "action is not supported")
+	})
+
+	t.Run("denied_dm_chat_id", func(t *testing.T) {
+		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, payerUserID, recipientUserID)
+		record := payment(dmChatID, payerKeys, recipientKeys, intentpb.PaymentAction_SEND)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "not a group")
+	})
+
+	t.Run("denied_indirect_payment_flags", func(t *testing.T) {
+		for _, mutate := range []func(*ocp_intent.SendPublicPaymentMetadata){
+			func(m *ocp_intent.SendPublicPaymentMetadata) { m.IsWithdrawal = true },
+			func(m *ocp_intent.SendPublicPaymentMetadata) { m.IsIndirectSend = true },
+			func(m *ocp_intent.SendPublicPaymentMetadata) { m.IsSwapSell = true },
+		} {
+			record := validRecord()
+			mutate(record.SendPublicPaymentMetadata)
+			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "direct payment")
+		}
+	})
+
+	t.Run("denied_recipient_not_flipcash_user", func(t *testing.T) {
+		record := validRecord()
+		record.SendPublicPaymentMetadata.DestinationOwnerAccount = base58.Encode(model.MustGenerateKeyPair().Public())
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "recipient is not a flipcash user")
+	})
+
+	t.Run("denied_self_payment", func(t *testing.T) {
+		record := payment(groupID, payerKeys, payerKeys, intentpb.PaymentAction_SEND)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "payment to yourself")
+	})
+
+	t.Run("denied_group_not_found", func(t *testing.T) {
+		record := payment(chat.MustGenerateGroupChatID(), payerKeys, recipientKeys, intentpb.PaymentAction_SEND)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "sender cannot send")
+	})
+
+	t.Run("denied_payer_not_member", func(t *testing.T) {
+		record := payment(groupID, outsiderKeys, recipientKeys, intentpb.PaymentAction_SEND)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "sender cannot send")
+	})
+
+	t.Run("denied_recipient_not_member", func(t *testing.T) {
+		record := payment(groupID, payerKeys, outsiderKeys, intentpb.PaymentAction_SEND)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "recipient is not a member")
+	})
+
+	// A departed member can neither pay nor be paid, and a rejoin restores
+	// both.
+	t.Run("departed_member", func(t *testing.T) {
+		groupID := e.putGroup(t, payerUserID, recipientUserID, outsiderUserID)
+		_, _, err := e.chats.RemoveGroupMember(e.ctx, groupID, outsiderUserID, false)
+		require.NoError(t, err)
+
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, payment(groupID, outsiderKeys, recipientKeys, intentpb.PaymentAction_SEND), nil, nil), "sender cannot send")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, payment(groupID, payerKeys, outsiderKeys, intentpb.PaymentAction_SEND), nil, nil), "recipient is not a member")
+
+		_, _, err = e.chats.AddGroupMembers(e.ctx, groupID, []*commonpb.UserId{outsiderUserID})
+		require.NoError(t, err)
+		require.NoError(t, e.integration.AllowCreation(e.ctx, payment(groupID, outsiderKeys, recipientKeys, intentpb.PaymentAction_SEND), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, payment(groupID, payerKeys, outsiderKeys, intentpb.PaymentAction_SEND), nil, nil))
+	})
+
+	// In a creator-only group, only the creator may pay, since a payment
+	// speaks; anyone may be paid, since receiving does not.
+	t.Run("creator_only_speaker", func(t *testing.T) {
+		groupID := e.putGroupChat(t, &chat.Chat{
+			CreatorID:            payerUserID,
+			Members:              []*commonpb.UserId{payerUserID, recipientUserID},
+			IsCreatorOnlySpeaker: true,
+		})
+		require.NoError(t, e.integration.AllowCreation(e.ctx, payment(groupID, payerKeys, recipientKeys, intentpb.PaymentAction_SEND), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, payment(groupID, recipientKeys, payerKeys, intentpb.PaymentAction_SEND), nil, nil), "sender cannot send")
+	})
+
+	// A private group takes payments once it has its key, as it takes
+	// messages.
+	t.Run("private_group", func(t *testing.T) {
+		groupID := e.putGroupChat(t, &chat.Chat{
+			CreatorID: payerUserID,
+			Members:   []*commonpb.UserId{payerUserID, recipientUserID},
+			IsPrivate: true,
+		})
+		record := func() *ocp_intent.Record {
+			return payment(groupID, recipientKeys, payerKeys, intentpb.PaymentAction_SEND)
+		}
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record(), nil, nil), "sender cannot send")
+
+		_, err := e.chats.SetKeyEnvelope(e.ctx, groupID, payerUserID, chat.KeyEnvelopeFromProto(&chatpb.KeyEnvelope{
+			Scheme:     chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305,
+			Nonce:      bytes.Repeat([]byte{1}, 24),
+			Ciphertext: bytes.Repeat([]byte{1}, 48),
+		}, payerUserID))
+		require.NoError(t, err)
+		require.NoError(t, e.integration.AllowCreation(e.ctx, record(), nil, nil))
+	})
+
+	// No payment is allowed to or from the Flipcash team account, even as a
+	// member of the group.
+	t.Run("team_account", func(t *testing.T) {
+		groupID := e.putGroup(t, payerUserID, e.team)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, payment(groupID, payerKeys, e.teamKeys, intentpb.PaymentAction_SEND), nil, nil), "flipcash team")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, payment(groupID, e.teamKeys, payerKeys, intentpb.PaymentAction_SEND), nil, nil), "flipcash team")
 	})
 }
 
@@ -553,4 +731,41 @@ func TestIntegration_GetTasksToSchedule_DmPayment(t *testing.T) {
 	require.NotNil(t, tasks[0].ReferenceId)
 	assert.Equal(t, record.IntentId, *tasks[0].ReferenceId)
 	require.NoError(t, tasks[0].Validate())
+}
+
+func TestIntegration_GetTasksToSchedule_GroupPayment(t *testing.T) {
+	e := newIntegrationEnv(t)
+
+	payerUserID, payerKeys := e.bindUser(t)
+	recipientUserID, recipientKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, payerUserID, recipientUserID)
+	record := dmPaymentIntentRecord(t, groupChatMetadata(groupID, intentpb.PaymentAction_SEND), base58.Encode(payerKeys.Public()), base58.Encode(recipientKeys.Public()))
+
+	tasks, err := e.integration.GetTasksToSchedule(e.ctx, record)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, intent.TaskTypeSendGroupPaymentMessage, tasks[0].Type)
+	require.NotNil(t, tasks[0].ReferenceId)
+	assert.Equal(t, record.IntentId, *tasks[0].ReferenceId)
+	require.NoError(t, tasks[0].Validate())
+}
+
+// IsUserChatPayment holds for the chat payments whose parties know each other
+// by user ID, and nothing else.
+func TestIsUserChatPayment(t *testing.T) {
+	marshal := func(chatMetadata *intentpb.ChatMetadata) []byte {
+		appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
+			Domain: &intentpb.AppMetadata_Chat{Chat: chatMetadata},
+		})
+		require.NoError(t, err)
+		return appMetadata
+	}
+	dmChatID := &commonpb.ChatId{Value: make([]byte, 32)}
+
+	assert.True(t, intent.IsUserChatPayment(marshal(dmChatMetadata(dmChatID))))
+	assert.True(t, intent.IsUserChatPayment(marshal(groupChatMetadata(chat.MustGenerateGroupChatID(), intentpb.PaymentAction_SEND))))
+	assert.False(t, intent.IsUserChatPayment(marshal(contactDmChatMetadata(dmChatID, "+12223334444", "+13334445555"))))
+	assert.False(t, intent.IsUserChatPayment(nil))
+	assert.False(t, intent.IsUserChatPayment([]byte{0xff, 0xff}))
 }

@@ -15,6 +15,8 @@ import (
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
+
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 )
 
 func TestTruncatePushBody(t *testing.T) {
@@ -62,7 +64,7 @@ func TestChatMessagePush_MessageOrID(t *testing.T) {
 			return BuildDmPush(ctx, nil, chatID, m, senderID, "Sender Name")
 		},
 		"group": func(m *messagingpb.Message) (*ChatMessagePush, error) {
-			return BuildGroupChatPush(ctx, nil, groupID, m, senderID, "Sender Name", "Group Title")
+			return BuildGroupChatPush(ctx, nil, groupID, m, senderID, "Sender Name", "", "Group Title")
 		},
 	}
 
@@ -146,11 +148,89 @@ func TestChatMessagePush_Encrypted(t *testing.T) {
 	require.Equal(t, "Sent you a message", dm.body)
 	require.True(t, proto.Equal(message, dm.payload.ChatMetadata.GetMessage()))
 
-	group, err := BuildGroupChatPush(ctx, nil, groupID, message, senderID, "Alice", "Sunday Hikers")
+	group, err := BuildGroupChatPush(ctx, nil, groupID, message, senderID, "Alice", "", "Sunday Hikers")
 	require.NoError(t, err)
 	require.Equal(t, "Sunday Hikers", group.title)
 	require.Equal(t, "Alice sent a message", group.body)
 	require.True(t, proto.Equal(message, group.payload.ChatMetadata.GetMessage()))
+}
+
+// TestChatMessagePush_Cash: a DM's cash body is addressed to the recipient. A
+// group's names the sender and the receiver for everyone else, and the
+// receiver's own push is addressed to them; a receiver with no name is left
+// out of the group body rather than costing the push. Every push shares the
+// title and the payload.
+func TestChatMessagePush_Cash(t *testing.T) {
+	ctx := context.Background()
+	dmID := &commonpb.ChatId{Value: bytes.Repeat([]byte{3}, 32)}
+	groupID := &commonpb.ChatId{Value: bytes.Repeat([]byte{4}, 16)}
+	senderID := &commonpb.UserId{Value: bytes.Repeat([]byte{2}, 16)}
+	receiverID := &commonpb.UserId{Value: bytes.Repeat([]byte{5}, 16)}
+
+	// The core mint's name needs no lookup, so no OCP data provider either.
+	cashMessage := func(verb messagingpb.CashContent_Verb, receiver *commonpb.UserId) *messagingpb.Message {
+		return testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Cash{Cash: &messagingpb.CashContent{
+			IntentId: &commonpb.IntentId{Value: bytes.Repeat([]byte{6}, 32)},
+			Amount: &commonpb.CryptoPaymentAmount{
+				Currency:     "usd",
+				NativeAmount: 2.5,
+				Quarks:       2_500_000,
+				Mint:         &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
+			},
+			Receiver: receiver,
+			Verb:     verb,
+		}}})
+	}
+	amount := "$2.50 of " + ocp_common.CoreMintName
+
+	for _, tc := range []struct {
+		verb      messagingpb.CashContent_Verb
+		dmVerb    string
+		groupVerb string
+	}{
+		{messagingpb.CashContent_SENT, "Sent", "sent"},
+		{messagingpb.CashContent_TIPPED, "Tipped", "tipped"},
+	} {
+		message := cashMessage(tc.verb, receiverID)
+
+		dm, err := BuildDmPush(ctx, nil, dmID, message, senderID, "Alice")
+		require.NoError(t, err)
+		require.Equal(t, tc.dmVerb+" you "+amount, dm.body)
+
+		group, err := BuildGroupChatPush(ctx, nil, groupID, message, senderID, "Alice", "Bob", "Sunday Hikers")
+		require.NoError(t, err)
+		require.Equal(t, "Sunday Hikers", group.title)
+		require.Equal(t, "Alice "+tc.groupVerb+" Bob "+amount, group.body)
+
+		receiver, err := BuildGroupChatReceiverPush(ctx, nil, groupID, message, senderID, "Alice", "Sunday Hikers")
+		require.NoError(t, err)
+		require.NotNil(t, receiver)
+		require.Equal(t, "Sunday Hikers", receiver.title)
+		require.Equal(t, "Alice "+tc.groupVerb+" you "+amount, receiver.body)
+		require.True(t, proto.Equal(group.payload, receiver.payload))
+		require.True(t, proto.Equal(group.mutedPayload, receiver.mutedPayload))
+
+		unnamed, err := BuildGroupChatPush(ctx, nil, groupID, message, senderID, "Alice", "", "Sunday Hikers")
+		require.NoError(t, err)
+		require.Equal(t, "Alice "+tc.groupVerb+" "+amount, unnamed.body)
+	}
+
+	// No receiver push for cash naming no receiver, nor for anything else.
+	none, err := BuildGroupChatReceiverPush(ctx, nil, groupID, cashMessage(messagingpb.CashContent_SENT, nil), senderID, "Alice", "Sunday Hikers")
+	require.NoError(t, err)
+	require.Nil(t, none)
+	none, err = BuildGroupChatReceiverPush(ctx, nil, groupID, testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Text{
+		Text: &messagingpb.TextContent{Text: "hello"},
+	}}), senderID, "Alice", "Sunday Hikers")
+	require.NoError(t, err)
+	require.Nil(t, none)
+
+	// A receiver name is ignored for anything but cash.
+	text, err := BuildGroupChatPush(ctx, nil, groupID, testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Text{
+		Text: &messagingpb.TextContent{Text: "hello"},
+	}}), senderID, "Alice", "Bob", "Sunday Hikers")
+	require.NoError(t, err)
+	require.Equal(t, "Alice: hello", text.body)
 }
 
 // TestChatMessagePush_Widget: a widget's body is its plain-text stand-in, a
@@ -174,7 +254,7 @@ func TestChatMessagePush_Widget(t *testing.T) {
 	require.Equal(t, "https://flipcash.com/alice_1", dm.body)
 	require.True(t, proto.Equal(message, dm.payload.ChatMetadata.GetMessage()))
 
-	group, err := BuildGroupChatPush(ctx, nil, groupID, message, senderID, "Flipcash", "Group Title")
+	group, err := BuildGroupChatPush(ctx, nil, groupID, message, senderID, "Flipcash", "", "Group Title")
 	require.NoError(t, err)
 	require.NotNil(t, group)
 	require.Equal(t, "Flipcash: https://flipcash.com/alice_1", group.body)
@@ -187,7 +267,7 @@ func TestChatMessagePush_Widget(t *testing.T) {
 			Poll: &messagingpb.PollWidget{PollId: &pollpb.PollId{Value: bytes.Repeat([]byte{5}, 16)}},
 		}},
 	}})
-	pollPush, err := BuildGroupChatPush(ctx, nil, groupID, pollMessage, senderID, "Alice", "Group Title")
+	pollPush, err := BuildGroupChatPush(ctx, nil, groupID, pollMessage, senderID, "Alice", "", "Group Title")
 	require.NoError(t, err)
 	require.NotNil(t, pollPush)
 	require.Equal(t, "Group Title", pollPush.title)

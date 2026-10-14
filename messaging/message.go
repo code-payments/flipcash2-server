@@ -450,14 +450,17 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 // poll widget — so it excludes server-injected content (e.g. cash payment
 // messages, and every other widget, which only the server sends; see
 // flipcashteam) and any content type added later until it is explicitly
-// allowed. A poll widget is top-level only, never a reply's body, and is sent,
-// never edited in (see sentPollID); whether its sender may send it is the
-// poll's to say (see poll.PrepareSend). repliedMessageID is non-nil
-// only for a valid reply, signaling the caller to verify the replied-to message
-// exists and is repliable. Whether encrypted content is allowed depends on the
-// chat and so is the caller's to enforce (see encryptionVerdictOf), as is the
-// rule that an edit never downgrades an encrypted message to plaintext, which
-// depends on the message being edited.
+// allowed. A text, as a message or a reply's body, may carry link previews,
+// each of which must be well formed and describe a whole link in that text
+// (see validLinkPreviews); a media caption may carry none. A poll widget is
+// top-level only, never a reply's body, and is sent, never edited in (see
+// sentPollID); whether its sender may send it is the poll's to say (see
+// poll.PrepareSend). repliedMessageID is non-nil only for a valid reply,
+// signaling the caller to verify the replied-to message exists and is
+// repliable. Whether encrypted content is allowed depends on the chat and so
+// is the caller's to enforce (see encryptionVerdictOf), as is the rule that an
+// edit never downgrades an encrypted message to plaintext, which depends on
+// the message being edited.
 //
 // Encrypted content is opaque: whatever it wraps — the proto allows text, media,
 // or a reply whose body is either — is the recipient's to check, not the
@@ -471,7 +474,7 @@ func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *mes
 	}
 	switch c := content[0].Type.(type) {
 	case *messagingpb.Content_Text:
-		return nil, true
+		return nil, validLinkPreviews(c.Text)
 	case *messagingpb.Content_Media:
 		return nil, validClientMedia(c.Media)
 	case *messagingpb.Content_Reply:
@@ -548,11 +551,11 @@ func encryptionVerdictOf(speaker chat.SpeakerStanding, content []*messagingpb.Co
 }
 
 // validReplyBody reports whether a reply's body is content a client may author:
-// text or well-formed media.
+// text with well-formed link previews, or well-formed media.
 func validReplyBody(content *messagingpb.Content) bool {
 	switch c := content.Type.(type) {
 	case *messagingpb.Content_Text:
-		return true
+		return validLinkPreviews(c.Text)
 	case *messagingpb.Content_Media:
 		return validClientMedia(c.Media)
 	default:

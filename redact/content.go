@@ -20,7 +20,13 @@ import (
 // original, so every field is an allowlist decision and a field added to the
 // proto later is dropped until one is made for it. Per kind:
 //
-//   - Text: the text becomes Text(seed, text).
+//   - Text: the text becomes Text(seed, text). Its link previews keep their
+//     count and order, so the card is rendered blurred where it was, and
+//     each becomes a placeholder like the content around it: the title and
+//     description are redacted like text, the image like media (below),
+//     and the URL becomes redactedURL, a fixed link that passes the same
+//     validation as any preview's and resolves to nothing, so the viewer
+//     sees that a link was previewed but not which.
 //   - Reply: the replied-to message ID, a per-chat sequence number, is
 //     kept so the client can quote the message it points at — the quoted
 //     message is redacted on its own. The body is redacted like a message.
@@ -126,7 +132,32 @@ func content(seed []byte, c *messagingpb.Content) (*messagingpb.Content, error) 
 }
 
 func textContent(seed []byte, t *messagingpb.TextContent) *messagingpb.TextContent {
-	return &messagingpb.TextContent{Text: Text(seed, t.GetText())}
+	out := &messagingpb.TextContent{Text: Text(seed, t.GetText())}
+	for _, p := range t.GetLinkPreviews() {
+		out.LinkPreviews = append(out.LinkPreviews, linkPreview(seed, p))
+	}
+	return out
+}
+
+// redactedURL stands in for the link a redacted preview describes. It is a
+// valid http URL, so the placeholder passes the same validation as the
+// original, under the reserved "invalid" top-level domain (RFC 2606), so it
+// never resolves; the message's redacted flag is what tells the client not to
+// act on it.
+const redactedURL = "https://redacted.invalid/"
+
+func linkPreview(seed []byte, p *messagingpb.LinkPreview) *messagingpb.LinkPreview {
+	out := &messagingpb.LinkPreview{
+		Url:   redactedURL,
+		Title: Text(seed, p.GetTitle()),
+	}
+	if p.GetDescription() != "" {
+		out.Description = Text(seed, p.GetDescription())
+	}
+	if p.GetImage() != nil {
+		out.Image = mediaItem(p.GetImage())
+	}
+	return out
 }
 
 func replyContent(seed []byte, r *messagingpb.ReplyContent) (*messagingpb.ReplyContent, error) {
@@ -146,20 +177,27 @@ func replyContent(seed []byte, r *messagingpb.ReplyContent) (*messagingpb.ReplyC
 func mediaContent(seed []byte, m *messagingpb.MediaContent) *messagingpb.MediaContent {
 	out := &messagingpb.MediaContent{}
 	for _, item := range m.GetItems() {
-		media := &blobpb.Media{}
-		for _, r := range item.GetRenditions() {
-			redacted := proto.Clone(r).(*blobpb.Rendition)
-			if redacted.Blob != nil {
-				redacted.Blob.DownloadUrl = nil
-			}
-			media.Renditions = append(media.Renditions, redacted)
-		}
-		out.Items = append(out.Items, media)
+		out.Items = append(out.Items, mediaItem(item))
 	}
 	if m.GetCaption() != nil {
 		out.Caption = textContent(seed, m.GetCaption())
 	}
 	return out
+}
+
+// mediaItem is the placeholder for one media item, a message's or a link
+// preview's: every rendition with its blob ID and metadata, less the download
+// URL.
+func mediaItem(item *blobpb.Media) *blobpb.Media {
+	media := &blobpb.Media{}
+	for _, r := range item.GetRenditions() {
+		redacted := proto.Clone(r).(*blobpb.Rendition)
+		if redacted.Blob != nil {
+			redacted.Blob.DownloadUrl = nil
+		}
+		media.Renditions = append(media.Renditions, redacted)
+	}
+	return media
 }
 
 // redactedUsername stands in for the username a redacted widget names. It is

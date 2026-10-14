@@ -31,6 +31,22 @@ func textFixture() *messagingpb.Content {
 	}}
 }
 
+// linkPreviewFixture is a text carrying a preview of a link in it, with an
+// image resolved as a read resolves it.
+func linkPreviewFixture() *messagingpb.Content {
+	return &messagingpb.Content{Type: &messagingpb.Content_Text{
+		Text: &messagingpb.TextContent{
+			Text: "read https://news.example/bank-heist " + secret,
+			LinkPreviews: []*messagingpb.LinkPreview{{
+				Url:         "https://news.example/bank-heist",
+				Title:       "Bank heist foiled",
+				Description: "Police were waiting at the old bank at 6:30",
+				Image:       mediaFixture().GetMedia().GetItems()[0],
+			}},
+		},
+	}}
+}
+
 func mediaFixture() *messagingpb.Content {
 	return &messagingpb.Content{Type: &messagingpb.Content_Media{
 		Media: &messagingpb.MediaContent{
@@ -187,6 +203,53 @@ func TestContent_Media(t *testing.T) {
 	assert.Nil(t, mustContent(t, chatID, messageID, noCaption).GetMedia().GetCaption())
 }
 
+func TestContent_TextLinkPreviews(t *testing.T) {
+	in := linkPreviewFixture()
+	out := mustContent(t, chatID, messageID, in)
+	text := out.GetText()
+	require.NotNil(t, text)
+	assert.Equal(t, Text(contentSeed, in.GetText().GetText()), text.GetText())
+
+	// The preview is kept, as a placeholder: a fixed URL, title and
+	// description redacted like text, the image like media.
+	require.Len(t, text.GetLinkPreviews(), 1)
+	got := text.GetLinkPreviews()[0]
+	want := in.GetText().GetLinkPreviews()[0]
+	assert.Equal(t, redactedURL, got.GetUrl())
+	assert.Equal(t, Text(contentSeed, want.GetTitle()), got.GetTitle())
+	assert.Equal(t, Text(contentSeed, want.GetDescription()), got.GetDescription())
+	require.Len(t, got.GetImage().GetRenditions(), 2)
+	for i, r := range got.GetImage().GetRenditions() {
+		wantRendition := proto.Clone(want.GetImage().GetRenditions()[i]).(*blobpb.Rendition)
+		if wantRendition.Blob != nil {
+			wantRendition.Blob.DownloadUrl = nil
+		}
+		assert.True(t, proto.Equal(wantRendition, r), "rendition %d", i)
+	}
+
+	bs, err := proto.Marshal(out)
+	require.NoError(t, err)
+	for _, leak := range []string{"news.example", "heist", "Police", "cdn.example", "bank"} {
+		assert.NotContains(t, string(bs), leak)
+	}
+
+	// A preview with no description or image stays without them, and a text
+	// with no previews has none.
+	bare := linkPreviewFixture()
+	bare.GetText().GetLinkPreviews()[0].Description = ""
+	bare.GetText().GetLinkPreviews()[0].Image = nil
+	bareOut := mustContent(t, chatID, messageID, bare).GetText().GetLinkPreviews()[0]
+	assert.Empty(t, bareOut.GetDescription())
+	assert.Nil(t, bareOut.GetImage())
+	assert.Empty(t, mustContent(t, chatID, messageID, textFixture()).GetText().GetLinkPreviews())
+
+	// In a reply's body too.
+	reply := mustContent(t, chatID, messageID, replyFixture(linkPreviewFixture())).GetReply()
+	require.Len(t, reply.GetContent(), 1)
+	require.Len(t, reply.GetContent()[0].GetText().GetLinkPreviews(), 1)
+	assert.Equal(t, redactedURL, reply.GetContent()[0].GetText().GetLinkPreviews()[0].GetUrl())
+}
+
 func TestContent_Cash(t *testing.T) {
 	in := cashFixture()
 	out := mustContent(t, chatID, messageID, in)
@@ -297,8 +360,10 @@ func TestContent_LeavesInputAlone(t *testing.T) {
 func fixturesForAllKinds() []*messagingpb.Content {
 	return []*messagingpb.Content{
 		textFixture(),
+		linkPreviewFixture(),
 		replyFixture(textFixture()),
 		replyFixture(mediaFixture()),
+		replyFixture(linkPreviewFixture()),
 		mediaFixture(),
 		cashFixture(),
 		systemFixture(),

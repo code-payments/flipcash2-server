@@ -33,8 +33,8 @@ import (
 //     fetch it (see BlobMetadata.download_url): the client renders the
 //     blurhash and does not ask for a URL. The caption is redacted like
 //     text.
-//   - Cash: kept as is. A payment is public on chain, so a cash card shows
-//     nothing a viewer could not learn there.
+//   - Cash: kept as is, its receiver included. A payment is public on chain,
+//     so a cash card shows nothing a viewer could not learn there.
 //   - Deleted: kept as is. It carries no content, and who deleted a message
 //     is the same kind of fact as who sent one, which is not this
 //     function's to hide.

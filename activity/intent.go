@@ -101,7 +101,7 @@ type unlocalizedNotification struct {
 }
 
 func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, userOwnerAccount *ocp_common.Account, intentRecords []*ocp_intent.Record) ([]*activitypb.Notification, error) {
-	counterpartyUserIDs, err := s.resolveDmCounterparties(ctx, userOwnerAccount, intentRecords)
+	counterpartyUserIDs, err := s.resolveChatCounterparties(ctx, userOwnerAccount, intentRecords)
 	if err != nil {
 		return nil, err
 	}
@@ -192,9 +192,10 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 							Phone: contactPayment.GetDestination(),
 						}
 					} else if recipientUserID, ok := counterpartyUserIDs[intentMetadata.DestinationOwnerAccount]; ok {
-						// A DM payment identifies the recipient by user ID instead, so
-						// the client can render their profile without either party's
-						// phone number, which stays private outside contact DMs.
+						// A DM or group payment identifies the recipient by user ID
+						// instead, so the client can render their profile without
+						// either party's phone number, which stays private outside
+						// contact DMs.
 						directlySentMetadata.DestinationIdentifier = &activitypb.DirectlySentCryptoNotificationMetadata_UserId{
 							UserId: recipientUserID,
 						}
@@ -270,7 +271,7 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 
 		unlocalized = append(unlocalized, unlocalizedNotification{
 			notification:    notification,
-			cashMessageVerb: intent.GetDmPaymentVerb(intentRecord.AppMetadata, intentRecord.CreatedAt),
+			cashMessageVerb: intent.GetChatPaymentVerb(intentRecord.AppMetadata, intentRecord.CreatedAt),
 		})
 	}
 
@@ -289,19 +290,20 @@ func (s *Server) toLocalizedNotifications(ctx context.Context, log *zap.Logger, 
 	return notifications, nil
 }
 
-// resolveDmCounterparties returns the user ID of the other party to each DM
-// payment in intentRecords, keyed by that party's owner account. Unlike a
-// contact DM payment, a DM payment carries no phone number for either side, so the feed
-// identifies the counterparty by user ID — resolved here for the whole page in
-// one lookup rather than once per notification.
+// resolveChatCounterparties returns the user ID of the other party to each DM
+// or group payment in intentRecords, keyed by that party's owner account.
+// Unlike a contact DM payment, neither carries a phone number for either side,
+// so the feed identifies the counterparty by user ID — resolved here for the
+// whole page in one lookup rather than once per notification.
 //
-// Only DM payments are resolved. A payment handed off in person also has an
-// owner account that would resolve, but no identity was exchanged there, so
-// naming the counterparty would disclose one that neither party shared.
-func (s *Server) resolveDmCounterparties(ctx context.Context, userOwnerAccount *ocp_common.Account, intentRecords []*ocp_intent.Record) (map[string]*commonpb.UserId, error) {
+// Only DM and group payments are resolved (see intent.IsUserChatPayment). A
+// payment handed off in person also has an owner account that would resolve,
+// but no identity was exchanged there, so naming the counterparty would
+// disclose one that neither party shared.
+func (s *Server) resolveChatCounterparties(ctx context.Context, userOwnerAccount *ocp_common.Account, intentRecords []*ocp_intent.Record) (map[string]*commonpb.UserId, error) {
 	var pubKeys []*commonpb.PublicKey
 	for _, intentRecord := range intentRecords {
-		if intentRecord.IntentType != ocp_intent.SendPublicPayment || intent.GetDmPayment(intentRecord.AppMetadata) == nil {
+		if intentRecord.IntentType != ocp_intent.SendPublicPayment || !intent.IsUserChatPayment(intentRecord.AppMetadata) {
 			continue
 		}
 

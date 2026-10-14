@@ -69,7 +69,8 @@ func cashFixture() *messagingpb.Content {
 				Quarks:       42_500_000,
 				Mint:         &commonpb.PublicKey{Value: bytes.Repeat([]byte{4}, 32)},
 			},
-			Verb: messagingpb.CashContent_TIPPED,
+			Receiver: &commonpb.UserId{Value: bytes.Repeat([]byte{5}, 16)},
+			Verb:     messagingpb.CashContent_TIPPED,
 		},
 	}}
 }

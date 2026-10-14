@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
@@ -230,11 +231,13 @@ func BuildDmPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonp
 // BuildGroupChatPush renders a new message in a group chat. The notification
 // is titled by the group ("Untitled Group" when it has none), with the sender
 // identified by display name in the body ("Alice: hello"; "Alice sent a
-// message" for encrypted content, see renderGroupChatMessagePushBody). Like a
-// DM, a group push never carries the sender's phone number, which is private
-// outside contact DMs.
-func BuildGroupChatPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName, chatTitle string) (*ChatMessagePush, error) {
-	body, ok, err := renderGroupChatMessagePushBody(ctx, ocpData, message, senderDisplayName)
+// message" for encrypted content, see renderGroupChatMessagePushBody). A cash
+// message also names its receiver, by receiverDisplayName ("Alice sent Bob $5
+// of USDF"), which is ignored for any other content; the receiver is meant to
+// get BuildGroupChatReceiverPush instead. Like a DM, a group push never
+// carries the sender's phone number, which is private outside contact DMs.
+func BuildGroupChatPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName, receiverDisplayName, chatTitle string) (*ChatMessagePush, error) {
+	body, ok, err := renderGroupChatMessagePushBody(ctx, ocpData, message, senderDisplayName, receiverDisplayName)
 	if err != nil {
 		return nil, err
 	}
@@ -242,12 +245,40 @@ func BuildGroupChatPush(ctx context.Context, ocpData ocp_data.Provider, chatId *
 		return nil, nil
 	}
 
-	title := chatTitle
-	if title == "" {
-		title = "Untitled Group"
+	return newChatMessagePush(groupChatPushTitle(chatTitle), body, groupChatPushPayload(chatId, message, senderID))
+}
+
+// BuildGroupChatReceiverPush renders a cash message in a group chat for its
+// receiver alone, addressed to them ("Alice sent you $5 of USDF"), with the
+// title and payload every other member's push has (see BuildGroupChatPush).
+// It is nil for any message that is not cash naming a receiver.
+func BuildGroupChatReceiverPush(ctx context.Context, ocpData ocp_data.Provider, chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId, senderDisplayName, chatTitle string) (*ChatMessagePush, error) {
+	cash := message.Content[0].GetCash()
+	if cash.GetReceiver() == nil {
+		return nil, nil
 	}
 
-	customPayload := &pushpb.Payload{
+	verb, amount, err := renderCashPushPhrase(ctx, ocpData, cash, false)
+	if err != nil {
+		return nil, err
+	}
+	body := truncatePushBody(fmt.Sprintf("%s %s you %s", senderDisplayName, verb, amount))
+
+	return newChatMessagePush(groupChatPushTitle(chatTitle), body, groupChatPushPayload(chatId, message, senderID))
+}
+
+// groupChatPushTitle is a group push's title: the group's, or a fallback for
+// a group with none.
+func groupChatPushTitle(chatTitle string) string {
+	if chatTitle == "" {
+		return "Untitled Group"
+	}
+	return chatTitle
+}
+
+// groupChatPushPayload is a group push's payload, carrying the message.
+func groupChatPushPayload(chatId *commonpb.ChatId, message *messagingpb.Message, senderID *commonpb.UserId) *pushpb.Payload {
+	return &pushpb.Payload{
 		Category: pushpb.Payload_CHAT,
 		GroupKey: base64.StdEncoding.EncodeToString(chatId.Value),
 		Navigation: &pushpb.Navigation{
@@ -261,8 +292,6 @@ func BuildGroupChatPush(ctx context.Context, ocpData ocp_data.Provider, chatId *
 			MessageRef:    &pushpb.ChatMetadata_Message{Message: message},
 		},
 	}
-
-	return newChatMessagePush(title, body, customPayload)
 }
 
 // maxChatPushBytes is the most a chat push may measure (see payloadSize) and
@@ -311,9 +340,10 @@ func newChatMessagePush(title, body string, customPayload *pushpb.Payload) (*Cha
 
 // renderGroupChatMessagePushBody renders the push body for a group chat
 // message. Bodies read in the third person, naming the sender — a group push
-// announces activity in a room titled by the group, not a personal message.
-// ok is false for content types that don't produce a push.
-func renderGroupChatMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, message *messagingpb.Message, senderDisplayName string) (body string, ok bool, err error) {
+// announces activity in a room titled by the group, not a personal message —
+// and for cash, the receiver by receiverDisplayName, left out when it is
+// empty. ok is false for content types that don't produce a push.
+func renderGroupChatMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, message *messagingpb.Message, senderDisplayName, receiverDisplayName string) (body string, ok bool, err error) {
 	switch content := message.Content[0].Type.(type) {
 	case *messagingpb.Content_Text:
 		body = fmt.Sprintf("%s: %s", senderDisplayName, content.Text.Text)
@@ -347,34 +377,50 @@ func renderGroupChatMessagePushBody(ctx context.Context, ocpData ocp_data.Provid
 		// the message ID.
 		body = fmt.Sprintf(encryptedGroupMessagePushBodyFormat, senderDisplayName)
 	case *messagingpb.Content_Cash:
-		currencyName, err := resolveCurrencyName(ctx, ocpData, content.Cash.Amount.Mint)
+		// Cash bodies name the sender and the receiver rather than the DM
+		// renderer's "you", which has no referent when everyone in the group
+		// but the sender receives the same push; the receiver gets their own
+		// (see BuildGroupChatReceiverPush).
+		verb, amount, err := renderCashPushPhrase(ctx, ocpData, content.Cash, false)
 		if err != nil {
 			return "", false, err
 		}
-		// Unknown verbs fall back to sent, matching what clients render. Cash
-		// bodies name the sender rather than the DM renderer's "you", which has
-		// no referent when everyone in the group but the sender receives the
-		// same push.
-		verb := "sent"
-		if content.Cash.GetVerb() == messagingpb.CashContent_TIPPED {
-			verb = "tipped"
+		if receiverDisplayName == "" {
+			body = fmt.Sprintf("%s %s %s", senderDisplayName, verb, amount)
+		} else {
+			body = fmt.Sprintf("%s %s %s %s", senderDisplayName, verb, receiverDisplayName, amount)
 		}
-		body = fmt.Sprintf(
-			"%s %s %s of %s",
-			senderDisplayName,
-			verb,
-			localization.FormatFiat(
-				defaultLocale,
-				ocp_currency.Code(content.Cash.Amount.Currency),
-				content.Cash.Amount.NativeAmount,
-			),
-			currencyName,
-		)
 	default:
 		return "", false, nil
 	}
 
 	return truncatePushBody(body), true, nil
+}
+
+// renderCashPushPhrase renders the parts of a cash push body: the verb
+// ("sent", or "Sent" when capitalized) and the amount with its currency
+// ("$5.00 of USDF"). Unknown verbs fall back to sent, matching what clients
+// render.
+func renderCashPushPhrase(ctx context.Context, ocpData ocp_data.Provider, cash *messagingpb.CashContent, capitalized bool) (verb, amount string, err error) {
+	currencyName, err := resolveCurrencyName(ctx, ocpData, cash.Amount.Mint)
+	if err != nil {
+		return "", "", err
+	}
+
+	verb = "sent"
+	if cash.GetVerb() == messagingpb.CashContent_TIPPED {
+		verb = "tipped"
+	}
+	if capitalized {
+		verb = strings.ToUpper(verb[:1]) + verb[1:]
+	}
+
+	amount = fmt.Sprintf(
+		"%s of %s",
+		localization.FormatFiat(defaultLocale, ocp_currency.Code(cash.Amount.Currency), cash.Amount.NativeAmount),
+		currencyName,
+	)
+	return verb, amount, nil
 }
 
 // maxPushBodyChars is the most characters of rendered text a chat push body
@@ -439,25 +485,11 @@ func renderDmMessagePushBody(ctx context.Context, ocpData ocp_data.Provider, mes
 			return "", false, nil
 		}
 	case *messagingpb.Content_Cash:
-		currencyName, err := resolveCurrencyName(ctx, ocpData, content.Cash.Amount.Mint)
+		verb, amount, err := renderCashPushPhrase(ctx, ocpData, content.Cash, true)
 		if err != nil {
 			return "", false, err
 		}
-		// Unknown verbs fall back to SENT, matching what clients render.
-		verb := "Sent"
-		if content.Cash.GetVerb() == messagingpb.CashContent_TIPPED {
-			verb = "Tipped"
-		}
-		body = fmt.Sprintf(
-			"%s you %s of %s",
-			verb,
-			localization.FormatFiat(
-				defaultLocale,
-				ocp_currency.Code(content.Cash.Amount.Currency),
-				content.Cash.Amount.NativeAmount,
-			),
-			currencyName,
-		)
+		body = fmt.Sprintf("%s you %s", verb, amount)
 	default:
 		return "", false, nil
 	}

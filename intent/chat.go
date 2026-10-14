@@ -41,6 +41,10 @@ const (
 	// TaskTypeSendDmPaymentMessage is the task that injects the cash message
 	// into the sender and recipient's DM after a DM payment.
 	TaskTypeSendDmPaymentMessage uint32 = 2
+
+	// TaskTypeSendGroupPaymentMessage is the task that injects the cash
+	// message into the group after a group payment.
+	TaskTypeSendGroupPaymentMessage uint32 = 3
 )
 
 // NewSendContactDmPaymentMessageTask creates the task that injects the cash
@@ -65,6 +69,19 @@ func NewSendDmPaymentMessageTask(intentRecord *ocp_intent.Record) *ocp_task.Reco
 	return &ocp_task.Record{
 		TaskId:      uuid.NewString(),
 		Type:        TaskTypeSendDmPaymentMessage,
+		ReferenceId: &intentID,
+	}
+}
+
+// NewSendGroupPaymentMessageTask creates the task that injects the cash
+// message into the group after a group payment. Only the intent ID is
+// carried, via the reference ID; the executor reloads the authoritative intent
+// record at execution time.
+func NewSendGroupPaymentMessageTask(intentRecord *ocp_intent.Record) *ocp_task.Record {
+	intentID := intentRecord.IntentId
+	return &ocp_task.Record{
+		TaskId:      uuid.NewString(),
+		Type:        TaskTypeSendGroupPaymentMessage,
 		ReferenceId: &intentID,
 	}
 }
@@ -104,6 +121,24 @@ func GetDmPayment(appMetadata []byte) *intentpb.ChatMetadata_DmPayment {
 	return GetChatMetadata(appMetadata).GetDmPayment()
 }
 
+// GetGroupPayment extracts the group payment from app metadata, if present. It
+// returns nil when there is no app metadata, the metadata fails to decode, or
+// it is not a group payment.
+func GetGroupPayment(appMetadata []byte) *intentpb.ChatMetadata_GroupPayment {
+	return GetChatMetadata(appMetadata).GetGroupPayment()
+}
+
+// IsUserChatPayment reports whether app metadata is a chat payment whose
+// parties know each other by user ID: a DM payment, or a group payment, whose
+// cash message names both in the group. A contact DM payment is not one, since
+// its parties know each other by phone number; nor is a payment carrying no
+// chat metadata, such as one handed off in person, where no identity was
+// exchanged at all.
+func IsUserChatPayment(appMetadata []byte) bool {
+	chatMetadata := GetChatMetadata(appMetadata)
+	return chatMetadata.GetDmPayment() != nil || chatMetadata.GetGroupPayment() != nil
+}
+
 // sendByDefaultCutoff is when an unset DM payment action came to mean SEND.
 // A DM payment created at or after it is a tip only when its action says TIP,
 // whatever its location. One created before it keeps the rule it was made
@@ -114,27 +149,28 @@ func GetDmPayment(appMetadata []byte) *intentpb.ChatMetadata_DmPayment {
 // old payments to agree with the DM.
 var sendByDefaultCutoff = time.Date(2026, time.September, 30, 0, 0, 0, 0, time.UTC)
 
-// GetDmPaymentVerb reports how a DM payment created at createdAt should be
+// GetChatPaymentVerb reports how a chat payment created at createdAt should be
 // rendered. A DM payment is a tip only when its action is TIP; SEND and the
 // unset DEFAULT are plain sends, from either location, except for payments
-// created before sendByDefaultCutoff. Everything else, contact DM payments
-// included, is a plain send.
+// created before sendByDefaultCutoff. Everything else, contact DM and group
+// payments included, is a plain send: a group payment's TIP is denied at
+// validation (see validateGroupAppMetadata).
 //
-// Both the cash message injected into the DM and the sender's activity feed
+// Both the cash message injected into the chat and the sender's activity feed
 // entry render off this, so they cannot disagree about what a payment was.
 // createdAt is the intent's creation time, which OCP sets before validation
 // and copies onto the intent's history records, so every caller passes the
 // same time for the same payment.
-func GetDmPaymentVerb(appMetadata []byte, createdAt time.Time) messagingpb.CashContent_Verb {
+func GetChatPaymentVerb(appMetadata []byte, createdAt time.Time) messagingpb.CashContent_Verb {
 	dmPayment := GetDmPayment(appMetadata)
 	if dmPayment == nil {
 		return messagingpb.CashContent_SENT
 	}
 
 	switch dmPayment.GetAction() {
-	case intentpb.ChatMetadata_DmPayment_SEND:
+	case intentpb.PaymentAction_SEND:
 		return messagingpb.CashContent_SENT
-	case intentpb.ChatMetadata_DmPayment_TIP:
+	case intentpb.PaymentAction_TIP:
 		return messagingpb.CashContent_TIPPED
 	}
 
@@ -144,20 +180,20 @@ func GetDmPaymentVerb(appMetadata []byte, createdAt time.Time) messagingpb.CashC
 	return messagingpb.CashContent_SENT
 }
 
-// resolveDirectDmPaymentParties enforces the checks shared by every DM payment
-// type — the payment must be a direct user-to-user payment between two Flipcash
-// users — and resolves the sender and recipient user IDs. kind names the DM
-// type in denial messages.
-func (i *Integration) resolveDirectDmPaymentParties(ctx context.Context, intentRecord *ocp_intent.Record, kind string) (senderUserID, recipientUserID *commonpb.UserId, err error) {
-	// A DM payment is a direct user-to-user payment. Withdrawals, remote sends,
+// resolveDirectChatPaymentParties enforces the checks shared by every chat
+// payment type — the payment must be a direct user-to-user payment between two
+// Flipcash users — and resolves the sender and recipient user IDs. kind names
+// the payment type in denial messages.
+func (i *Integration) resolveDirectChatPaymentParties(ctx context.Context, intentRecord *ocp_intent.Record, kind string) (senderUserID, recipientUserID *commonpb.UserId, err error) {
+	// A chat payment is a direct user-to-user payment. Withdrawals, remote sends,
 	// and swap sells are routed elsewhere and never carry chat metadata.
 	paymentMetadata := intentRecord.SendPublicPaymentMetadata
 	if paymentMetadata.IsWithdrawal || paymentMetadata.IsIndirectSend || paymentMetadata.IsSwapSell {
 		return nil, nil, ocp_transaction.NewIntentDeniedError(fmt.Sprintf("%s payment must be a direct payment", kind))
 	}
 
-	// DMs are only valid between two Flipcash users, so the payment must resolve
-	// to a registered recipient.
+	// Chat payments are only valid between two Flipcash users, so the payment
+	// must resolve to a registered recipient.
 	if len(paymentMetadata.DestinationOwnerAccount) == 0 {
 		return nil, nil, ocp_transaction.NewIntentDeniedError(fmt.Sprintf("%s payment recipient is not a flipcash user", kind))
 	}
@@ -204,7 +240,7 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 		return ocp_transaction.NewIntentDeniedError("payment is a no-op between the same phone number")
 	}
 
-	senderUserID, recipientUserID, err := i.resolveDirectDmPaymentParties(ctx, intentRecord, "contact dm")
+	senderUserID, recipientUserID, err := i.resolveDirectChatPaymentParties(ctx, intentRecord, "contact dm")
 	if err != nil {
 		return err
 	}
@@ -248,7 +284,7 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 //
 // Any payment, tip or send, initializes the DM, so it may target a chat that
 // doesn't exist yet; whether it is a tip only changes how it is rendered (see
-// GetDmPaymentVerb), never which rules apply. Only the payment that
+// GetChatPaymentVerb), never which rules apply. Only the payment that
 // initializes the chat is held to a floor: the recipient's minimum DM chat
 // initialization fee where they have set one, the per-currency preset minimum
 // otherwise. The fee is what the recipient asks of anyone reaching them for
@@ -264,7 +300,7 @@ func (i *Integration) validateDmAppMetadata(ctx context.Context, intentRecord *o
 		return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
 	}
 
-	senderUserID, recipientUserID, err := i.resolveDirectDmPaymentParties(ctx, intentRecord, "dm")
+	senderUserID, recipientUserID, err := i.resolveDirectChatPaymentParties(ctx, intentRecord, "dm")
 	if err != nil {
 		return err
 	}
@@ -319,6 +355,77 @@ func (i *Integration) validateDmAppMetadata(ctx context.Context, intentRecord *o
 		return validateDefaultMinimumToChat(intentRecord.SendPublicPaymentMetadata)
 	}
 	return i.validateMinDmChatInitFee(ctx, intentRecord.SendPublicPaymentMetadata, fee)
+}
+
+// validateGroupAppMetadata enforces that a SendPublicPayment carrying chat app
+// metadata is a well-formed group payment: a direct payment from one member of
+// a group to another. The task it schedules posts the cash message into the
+// group as the payer, through the messaging Sender, which no rule gates, so
+// every gate a send would face is applied here, before any money moves, rather
+// than by the task, which could only drop the message of a payment already
+// made.
+//
+// The payer must be able to speak in the group (chat.Access.SpeakerStanding:
+// a member who satisfies its rules, so not a non-creator in a creator-only
+// group, nor anyone in a private group without its key), and the recipient
+// must be a member, whatever the rules say of them, since receiving is not
+// speaking. A group that does not exist has no members, so it fails the
+// payer's check. Standing and membership are judged now, not when the task
+// runs: a payer who leaves, or a recipient who does, before the message lands
+// still gets it, since it records a payment that has happened.
+//
+// There is no floor on the amount: the payer can already speak in the group
+// for free, so a payment is no wider a channel than a message. Only a send is
+// supported today, so TIP is denied. No payment either way between a user and
+// the Flipcash team account is allowed, as for DMs.
+func (i *Integration) validateGroupAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
+	chatMetadata := appMetadata.GetChat()
+	groupPayment := chatMetadata.GetGroupPayment()
+	if groupPayment == nil {
+		return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
+	}
+
+	switch groupPayment.GetAction() {
+	case intentpb.PaymentAction_DEFAULT, intentpb.PaymentAction_SEND:
+	default:
+		return ocp_transaction.NewIntentDeniedError("group payment action is not supported")
+	}
+
+	chatID := chatMetadata.GetChatId()
+	if !chat.IsGroupChatID(chatID) {
+		return ocp_transaction.NewIntentValidationError("chat id is not a group")
+	}
+
+	senderUserID, recipientUserID, err := i.resolveDirectChatPaymentParties(ctx, intentRecord, "group")
+	if err != nil {
+		return err
+	}
+
+	if bytes.Equal(senderUserID.Value, recipientUserID.Value) {
+		return ocp_transaction.NewIntentDeniedError("payment to yourself is a no-op")
+	}
+
+	if i.isTeamAccount(senderUserID) || i.isTeamAccount(recipientUserID) {
+		return ocp_transaction.NewIntentDeniedError("group payments with the flipcash team are not allowed")
+	}
+
+	canSpeak, err := i.access.CanSpeak(ctx, chatID, senderUserID)
+	if err != nil {
+		return err
+	}
+	if !canSpeak {
+		return ocp_transaction.NewIntentDeniedError("sender cannot send in the group")
+	}
+
+	isMember, err := i.access.IsMember(ctx, chatID, recipientUserID)
+	if err != nil {
+		return err
+	}
+	if !isMember {
+		return ocp_transaction.NewIntentDeniedError("recipient is not a member of the group")
+	}
+
+	return nil
 }
 
 // isTeamAccount reports whether userID is the Flipcash team account (see

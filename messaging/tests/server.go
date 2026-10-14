@@ -110,6 +110,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_Broadcast_IncludesActor,
 		testServer_SendMessage_PushPerChatType,
 		testServer_SendMessage_GroupChatPush,
+		testServer_SendMessage_GroupPaymentPush,
+		testServer_GroupCashMessage,
 		testServer_SendMessage_SuppressedForBlockedSender,
 		testServer_SendMessage_MutedRecipientsFlagged,
 		testServer_SendMessage_GroupPushPaged,
@@ -4476,6 +4478,183 @@ func testServer_SendMessage_GroupChatPush(t *testing.T, badges badge.Store, bloc
 	untitledPush := e.pusher.snapshot()[1]
 	require.Equal(t, "Untitled Group", untitledPush.title)
 	require.Equal(t, "Sender Name: untitled hello", untitledPush.body)
+}
+
+// testServer_SendMessage_GroupPaymentPush: a group cash message pushes its
+// receiver a push of their own, addressed to them, and every other member but
+// the sender one that names both parties. The receiver's push goes through the
+// same pipeline as any page: a muted receiver gets it flagged and unbadged, a
+// receiver who blocked the sender gets none, and one who has left gets none.
+func testServer_SendMessage_GroupPaymentPush(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Alice"))
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userB, "Bob"))
+
+	userC, _ := e.addUser()
+
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB, userC},
+		Title:        "Trip Planning",
+		LastActivity: at(1),
+	}))
+
+	amount := "$2.50 of " + ocp_common.CoreMintName
+	pay := func() *messagingpb.Message {
+		sent, err := e.sender.Send(e.ctx, chatID, e.userA, []*messagingpb.Content{{Type: &messagingpb.Content_Cash{Cash: &messagingpb.CashContent{
+			IntentId: &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()},
+			Amount: &commonpb.CryptoPaymentAmount{
+				Currency:     "usd",
+				NativeAmount: 2.5,
+				Quarks:       2_500_000,
+				Mint:         &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
+			},
+			Receiver: e.userB,
+		}}}}, generateClientID(), true)
+		require.NoError(t, err)
+		return sent
+	}
+	// pushesFor waits for the payment's pushes, want of them, and returns them
+	// keyed by body.
+	seen := 0
+	pushesFor := func(sent *messagingpb.Message, want int) map[string]capturedPush {
+		require.Eventually(t, func() bool {
+			return len(e.pusher.snapshot()) >= seen+want
+		}, 5*time.Second, 10*time.Millisecond)
+		// Nothing more arrives for the payment.
+		require.Never(t, func() bool {
+			return len(e.pusher.snapshot()) > seen+want
+		}, 200*time.Millisecond, 20*time.Millisecond)
+		pushes := e.pusher.snapshot()[seen:]
+		seen += len(pushes)
+
+		byBody := make(map[string]capturedPush, len(pushes))
+		for _, p := range pushes {
+			require.Equal(t, "Trip Planning", p.title)
+			require.True(t, proto.Equal(sent, p.payload.ChatMetadata.GetMessage()))
+			byBody[p.body] = p
+		}
+		require.Len(t, byBody, len(pushes))
+		return byBody
+	}
+	requireUsers := func(p capturedPush, users ...*commonpb.UserId) {
+		got := make([][]byte, len(p.users))
+		for i, u := range p.users {
+			got[i] = u.Value
+		}
+		want := make([][]byte, len(users))
+		for i, u := range users {
+			want[i] = u.Value
+		}
+		require.ElementsMatch(t, want, got)
+	}
+
+	// The receiver hears it addressed to them, everyone else names both, and
+	// the sender hears nothing.
+	sent := pay()
+	pushes := pushesFor(sent, 2)
+	receiverPush, ok := pushes["Alice sent you "+amount]
+	require.True(t, ok)
+	requireUsers(receiverPush, e.userB)
+	require.True(t, receiverPush.badged)
+	require.False(t, receiverPush.payload.ChatMetadata.GetMuted())
+	groupPush, ok := pushes["Alice sent Bob "+amount]
+	require.True(t, ok)
+	requireUsers(groupPush, userC)
+	require.True(t, groupPush.badged)
+
+	// A receiver who muted the group gets theirs flagged and unbadged, as any
+	// muted member does.
+	_, _, err := chats.SetMute(e.ctx, chatID, e.userB, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	pushes = pushesFor(pay(), 2)
+	receiverPush = pushes["Alice sent you "+amount]
+	requireUsers(receiverPush, e.userB)
+	require.False(t, receiverPush.badged)
+	require.True(t, receiverPush.payload.ChatMetadata.GetMuted())
+	requireUsers(pushes["Alice sent Bob "+amount], userC)
+	_, _, err = chats.ClearMute(e.ctx, chatID, e.userB)
+	require.NoError(t, err)
+
+	// A receiver who blocked the sender gets nothing; everyone else still
+	// hears of the payment.
+	_, err = e.blocklist.Block(e.ctx, e.userB, e.userA, time.Now())
+	require.NoError(t, err)
+	pushes = pushesFor(pay(), 1)
+	requireUsers(pushes["Alice sent Bob "+amount], userC)
+	_, err = e.blocklist.Unblock(e.ctx, e.userB, e.userA)
+	require.NoError(t, err)
+
+	// A receiver who has left the group is not pushed into it.
+	_, _, err = chats.RemoveGroupMember(e.ctx, chatID, e.userB, false)
+	require.NoError(t, err)
+	pushes = pushesFor(pay(), 1)
+	requireUsers(pushes["Alice sent Bob "+amount], userC)
+}
+
+// testServer_GroupCashMessage: a group payment's cash message is a message
+// like a DM's. Only the server writes one, so no client may send cash, naming
+// a receiver or not; once written, its payer cannot delete it, members can
+// reply and react to it, and a non-member previewing the group sees it whole,
+// receiver included, since a payment is public on chain.
+func testServer_GroupCashMessage(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	_, strangerKeys := e.addUser()
+
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		Title:        "Trip Planning",
+		CreatorID:    e.userA,
+		LastActivity: at(1),
+	}))
+
+	cash := func() []*messagingpb.Content {
+		return []*messagingpb.Content{{Type: &messagingpb.Content_Cash{Cash: &messagingpb.CashContent{
+			IntentId: &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()},
+			Amount: &commonpb.CryptoPaymentAmount{
+				Currency:     "usd",
+				NativeAmount: 2.5,
+				Quarks:       2_500_000,
+				Mint:         &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
+			},
+			Receiver: e.userB,
+		}}}}
+	}
+
+	clientResp, err := e.sendContentToChat(e.keysA, chatID, cash(), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, clientResp.Result)
+
+	sent, err := e.sender.Send(e.ctx, chatID, e.userA, cash(), generateClientID(), true)
+	require.NoError(t, err)
+
+	deleted, err := e.deleteMessageInChat(e.keysA, chatID, sent.MessageId, sent.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_CANNOT_DELETE, deleted.Result)
+
+	reply, err := e.sendContentToChat(e.keysB, chatID, []*messagingpb.Content{{Type: &messagingpb.Content_Reply{Reply: &messagingpb.ReplyContent{
+		RepliedMessageId: sent.MessageId,
+		Content:          textContent("thanks!"),
+	}}}}, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, reply.Result)
+
+	reacted, err := e.addReactionInChat(e.keysB, chatID, sent.MessageId, "🙏")
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, reacted.Result)
+
+	preview, err := e.getMessagesByIDsInChatWithMode(strangerKeys, chatID, messagingpb.ViewMode_REDACTED, sent.MessageId.Value)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessagesResponse_OK, preview.Result)
+	require.Len(t, preview.Messages.Messages, 1)
+	previewed := preview.Messages.Messages[0]
+	require.True(t, proto.Equal(sent.Content[0], previewed.Content[0]))
+	require.True(t, proto.Equal(e.userB, previewed.Content[0].GetCash().GetReceiver()))
 }
 
 func testServer_SendMessage_SuppressedForBlockedSender(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

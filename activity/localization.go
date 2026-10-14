@@ -27,7 +27,7 @@ func injectLocalizedTextForHistory(record *history.Record, notification *activit
 		localizedText = "Gave"
 
 		if notification.GetDirectlySentCrypto().GetDestinationIdentifier() != nil {
-			switch intent.GetDmPaymentVerb(record.AppMetadata, record.CreatedAt) {
+			switch intent.GetChatPaymentVerb(record.AppMetadata, record.CreatedAt) {
 			case messagingpb.CashContent_TIPPED:
 				localizedText = "Tipped"
 			default:
@@ -91,8 +91,8 @@ func injectLocalizedTextForHistory(record *history.Record, notification *activit
 // InjectLocalizedText sets the notification's display text. cashMessageVerb
 // applies only to a payment sent to a known recipient, where it distinguishes a
 // tip from a plain send; it is ignored for every other notification type.
-// Callers derive it with intent.GetDmPaymentVerb so the feed and the DM cash
-// message agree.
+// Callers derive it with intent.GetChatPaymentVerb so the feed and the chat
+// cash message agree.
 func InjectLocalizedText(ctx context.Context, ocpData ocp_data.Provider, userOwnerAccount *ocp_common.Account, notification *activitypb.Notification, cashMessageVerb messagingpb.CashContent_Verb) error {
 	var localizedText string
 	switch typed := notification.AdditionalMetadata.(type) {

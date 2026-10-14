@@ -32,7 +32,9 @@ import (
 // Everything that is the same for every recipient (the sender's profile, the
 // rendered push, the choice of mute read) is resolved once per message
 // before the walk. A DM is a walk of exactly one page: its inline pair, sent
-// inline and outside the pool so a large group's walk never delays it. The
+// inline and outside the pool so a large group's walk never delays it. A
+// group's cash message is pushed to its receiver the same way, as a page of
+// one with its own body, before the walk, which then leaves them out. The
 // walk's cursor is a user ID (see chat.Store.GetGroupMembersPage), which is
 // what a durable worker would checkpoint to resume a fan-out without
 // re-sending the pages already out.
@@ -148,9 +150,10 @@ func (s *Sender) pushSentMessages(ctx context.Context, log *zap.Logger, chatID *
 			continue
 		}
 		if isGroup {
+			p.sendReceiver(ctx)
 			p.walkGroup(ctx)
 		} else {
-			p.sendPage(ctx, members)
+			p.sendPage(ctx, p.push, members)
 		}
 	}
 }
@@ -202,6 +205,12 @@ type messagePush struct {
 	// push is the rendered notification, nil when the message earns none.
 	push *push.ChatMessagePush
 
+	// receiver is the member a group cash message paid, and receiverPush the
+	// notification addressed to them, which they get instead of push. Both
+	// are nil for any other message.
+	receiver     *commonpb.UserId
+	receiverPush *push.ChatMessagePush
+
 	// now is when the fan-out began; a mute is active or lapsed against it
 	// for every page, so a timed mute lapsing mid-walk cannot split a page.
 	now time.Time
@@ -211,9 +220,9 @@ type messagePush struct {
 }
 
 // prepare resolves what every page shares: the sender's profile, the
-// rendered push, and how mutes will be read. A sender without a profile, or
-// without what the chat type's title needs, earns no push and is not an
-// error.
+// rendered push, and how mutes will be read; for a group cash message, also
+// the receiver's push. A sender without a profile, or without what the chat
+// type's title needs, earns no push and is not an error.
 func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, chatTitle string) error {
 	senderProfile, err := p.sender.profiles.GetFullProfile(ctx, p.message.SenderId, true)
 	if err == profile.ErrNotFound {
@@ -237,7 +246,10 @@ func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, cha
 		if senderProfile.DisplayName == "" {
 			return nil
 		}
-		p.push, err = push.BuildGroupChatPush(ctx, p.sender.ocpData, p.chatID, p.message, p.message.SenderId, senderProfile.DisplayName, chatTitle)
+		if err := p.prepareReceiver(ctx, senderProfile.DisplayName, chatTitle); err != nil {
+			return err
+		}
+		p.push, err = push.BuildGroupChatPush(ctx, p.sender.ocpData, p.chatID, p.message, p.message.SenderId, senderProfile.DisplayName, p.receiverDisplayName(ctx), chatTitle)
 	default:
 		return nil
 	}
@@ -247,6 +259,39 @@ func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, cha
 
 	p.chooseMutedShape(ctx)
 	return nil
+}
+
+// prepareReceiver builds the receiver's push for a group cash message, which
+// names one, and is a no-op for any other message.
+func (p *messagePush) prepareReceiver(ctx context.Context, senderDisplayName, chatTitle string) error {
+	receiver := p.message.Content[0].GetCash().GetReceiver()
+	if receiver == nil {
+		return nil
+	}
+	receiverPush, err := push.BuildGroupChatReceiverPush(ctx, p.sender.ocpData, p.chatID, p.message, p.message.SenderId, senderDisplayName, chatTitle)
+	if err != nil || receiverPush == nil {
+		return err
+	}
+	p.receiver, p.receiverPush = receiver, receiverPush
+	return nil
+}
+
+// receiverDisplayName is how every other member's push names the receiver of
+// a group cash message: their display name, or nothing when they have none
+// or it cannot be read, which renders the body without them rather than
+// costing the push.
+func (p *messagePush) receiverDisplayName(ctx context.Context) string {
+	if p.receiver == nil {
+		return ""
+	}
+	receiverProfile, err := p.sender.profiles.GetFullProfile(ctx, p.receiver, false)
+	if err != nil {
+		if err != profile.ErrNotFound {
+			p.log.With(zap.Error(err)).Warn("Failure loading receiver profile for message push; leaving them unnamed")
+		}
+		return ""
+	}
+	return receiverProfile.DisplayName
 }
 
 // chooseMutedShape picks how the pages will learn who has muted the chat. A
@@ -308,7 +353,7 @@ func (p *messagePush) walkGroup(ctx context.Context) {
 			go func(users []*commonpb.UserId) {
 				defer wg.Done()
 				defer func() { <-p.sender.pushPageSlots }()
-				p.sendPage(ctx, users)
+				p.sendPage(ctx, p.push, p.withoutReceiver(users))
 			}(page.Users)
 		}
 		if page.Next == nil {
@@ -318,17 +363,55 @@ func (p *messagePush) walkGroup(ctx context.Context) {
 	}
 }
 
-// sendPage runs the per-page pipeline over one page of members, under the
-// page's own deadline. Its failures are the page's alone: the walk continues
-// with the next page whatever happened to this one.
-func (p *messagePush) sendPage(ctx context.Context, members []*commonpb.UserId) {
+// sendReceiver pushes a group cash message's receiver their own notification,
+// as a page of one through the same pipeline as every other page (blocks and
+// mutes apply to them as to anyone), while they are still a member: the walk
+// reaches only members, so the receiver is held to the same, and a receiver
+// who has left since the payment is not pushed into a group they are no
+// longer in. It is a no-op for any other message.
+func (p *messagePush) sendReceiver(ctx context.Context) {
+	if p.receiverPush == nil {
+		return
+	}
 	_ = pushStep(ctx, func(ctx context.Context) error {
-		p.sendPageStep(ctx, members)
+		isMember, err := p.sender.chats.IsMember(ctx, p.chatID, p.receiver)
+		if err != nil {
+			p.log.With(zap.Error(err)).Warn("Failure checking receiver membership for message push; suppressing receiver push")
+			return nil
+		}
+		if isMember {
+			p.sendPageStep(ctx, p.receiverPush, []*commonpb.UserId{p.receiver})
+		}
 		return nil
 	})
 }
 
-func (p *messagePush) sendPageStep(ctx context.Context, members []*commonpb.UserId) {
+// withoutReceiver drops a group cash message's receiver from a page of the
+// walk, since they get their own push (see sendReceiver).
+func (p *messagePush) withoutReceiver(members []*commonpb.UserId) []*commonpb.UserId {
+	if p.receiverPush == nil {
+		return members
+	}
+	out := make([]*commonpb.UserId, 0, len(members))
+	for _, member := range members {
+		if !bytes.Equal(member.Value, p.receiver.Value) {
+			out = append(out, member)
+		}
+	}
+	return out
+}
+
+// sendPage runs the per-page pipeline over one page of members, under the
+// page's own deadline, sending them chatPush. Its failures are the page's
+// alone: the walk continues with the next page whatever happened to this one.
+func (p *messagePush) sendPage(ctx context.Context, chatPush *push.ChatMessagePush, members []*commonpb.UserId) {
+	_ = pushStep(ctx, func(ctx context.Context) error {
+		p.sendPageStep(ctx, chatPush, members)
+		return nil
+	})
+}
+
+func (p *messagePush) sendPageStep(ctx context.Context, chatPush *push.ChatMessagePush, members []*commonpb.UserId) {
 	// Push recipients are every member but the sender, minus anyone who has
 	// blocked the sender — a user who blocks another must stop receiving
 	// pushes for that user's messages. The check is scoped to each
@@ -381,7 +464,7 @@ func (p *messagePush) sendPageStep(ctx context.Context, members []*commonpb.User
 		split = push.ChatRecipients{Unmuted: recipients}
 	}
 
-	if err := p.push.Send(ctx, p.sender.pusher, p.sender.badges, split); err != nil {
+	if err := chatPush.Send(ctx, p.sender.pusher, p.sender.badges, split); err != nil {
 		p.log.With(zap.Error(err)).Warn("Failure sending message push")
 	}
 }

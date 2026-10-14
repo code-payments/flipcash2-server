@@ -23,7 +23,7 @@ func NewWithUsernameAndPassword(username, password, hostname, port, dbname strin
 	// IMPORTANT: Supported by Aurora Serverless clusters
 
 	// Use password based authentication
-	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=prefer",
 		username, password, hostname, port, dbname,
 	)
 

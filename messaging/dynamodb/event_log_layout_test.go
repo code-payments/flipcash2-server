@@ -127,8 +127,8 @@ func TestMessaging_DynamoDBStore_EventLogCorruption(t *testing.T) {
 }
 
 func newLayoutStore(t *testing.T) *store {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable))
-	return NewInDynamoDB(testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable).(*store)
+	require.NoError(t, CreateTables(context.Background(), testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable, boostsTable))
+	return NewInDynamoDB(testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable, boostsTable).(*store)
 }
 
 func randomChatID(t *testing.T) *commonpb.ChatId {

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"sort"
@@ -27,7 +28,7 @@ import (
 	"github.com/code-payments/flipcash2-server/messaging"
 )
 
-// The messaging store spans five tables:
+// The messaging store spans six tables:
 //
 //	messages           pk = "chat#<id>", sk in { "#counter", "msg#<padded seq>",
 //	                   "evt#<padded event_seq>" }, plus one idempotency marker
@@ -97,8 +98,11 @@ import (
 //	message_reactions  pk = "chat#<id>", sk in { "agg#<padded seq>#<emoji hex>",
 //	                   "meta#<padded seq>" }. The aggregates. One agg# row per
 //	                   (message, emoji) holds the reactor count, the emoji's
-//	                   version, and a bounded sample of its most recent reactors.
-//	                   One meta# row per reacted message holds the message's
+//	                   version, its boost total in micro-USD (boost_micros) and
+//	                   how many of its reactors have boosted (booster_count),
+//	                   and a bounded sample of its reactors in list order
+//	                   (messaging.ReactorLess: boosters by total, then the most
+//	                   recent). One meta# row per reacted message holds the message's
 //	                   own reaction state, today the count of emoji currently
 //	                   active on it, for the type cap. Aggregates are keyed by
 //	                   chat so that a page of messages' summaries is one
@@ -110,16 +114,36 @@ import (
 //	                   that the by_version LSI can be queried with a
 //	                   strongly consistent read (a GSI never can), and so that
 //	                   the item-collection size cap an LSI imposes applies per
-//	                   message rather than per chat. A row is deleted, not
+//	                   message rather than per chat. Each row sits in exactly
+//	                   one of two indexes: a plain row carries emoji_version
+//	                   and is in the by_version LSI; a boosted row carries
+//	                   emoji_boost (emoji, total paid, version) instead, with
+//	                   its version moved to reactor_version and its total in
+//	                   boost_micros, and is in the sparse by_boost GSI, which
+//	                   orders one emoji's boosters most money first as a key
+//	                   range (see gsiByBoost). A row is deleted, not
 //	                   tombstoned, when the reaction is removed: no reader
 //	                   follows a reactor row's transitions, so there is nothing
-//	                   for a tombstone to remember (contrast group_members).
+//	                   for a tombstone to remember (contrast group_members). A
+//	                   boosted row is never deleted: the reaction cannot be
+//	                   removed (messaging.ErrReactionBoosted).
+//
+//	message_reaction_boosts  pk = "chat#<id>#<padded seq>", sk = "boost#<intent
+//	                   hex>", user_id, emoji, boost_micros, amount, ts, version,
+//	                   emoji_version. The ledger: one row per boost payment,
+//	                   keyed like the reactor rows and sorted by the intent
+//	                   that paid, so the conditional put of a row in the
+//	                   boost's transaction is its replay guard. The
+//	                   by_emoji_version LSI orders one emoji's boosts on a
+//	                   message in reaction order, for a history read not built
+//	                   yet (see AddBoost).
 //
 //	message_self_reactions  pk = "chat#<id>#<user hex>", sk = "<padded seq>#<emoji
-//	                   hex>", version, reacted_ts. A group's reactions keyed by
-//	                   viewer: one row per current reaction, written and deleted
-//	                   in the reactor row's transaction, carrying the version
-//	                   that added it and when — the viewer's own reactor row,
+//	                   hex>", version, reacted_ts, boost_micros (when boosted).
+//	                   A group's reactions keyed by viewer: one row per current
+//	                   reaction, written and deleted in the reactor row's
+//	                   transaction, carrying the version that added it, when,
+//	                   and the viewer's boost total — the viewer's own reactor row,
 //	                   so the overlay can hand back their full Reactor entry
 //	                   even once the sample has evicted them. A viewer's
 //	                   reactions across a page of messages
@@ -147,7 +171,10 @@ import (
 //	                   reactor row is stamped with the version that added it,
 //	                   which is what the LSI orders by: unique per transition
 //	                   within an emoji, so the order is total, the paging cursor
-//	                   is the bare version, and no wall clock is involved.
+//	                   is the version (with the reactor's boost total before
+//	                   it, see messaging.ReactorCursor), and no wall clock is
+//	                   involved. A boost is the same transaction with the
+//	                   ledger row added (see AddBoost).
 const (
 	skCounter   = "#counter"
 	msgPrefix   = "msg#"
@@ -211,31 +238,75 @@ const (
 	attrEmoji           = "emoji"
 	attrReactorCount    = "reactor_count"
 	attrReactionVersion = "version"
-	attrSample          = "sample" // agg# row map: user hex -> { version: added at, ts: reacted nanos }; a reserved word, so always named through a placeholder
+	attrSample          = "sample" // agg# row map: user hex -> { version: added at, ts: reacted nanos, boost: the user's total in micro-USD (absent when 0) }; a reserved word, so always named through a placeholder
 	attrSampleVersion   = "version"
 	attrSampleTs        = "ts"
-	attrTypeCount       = "type_count" // meta# row: emoji currently active on the message
+	attrSampleBoost     = "boost"
+	attrBoostMicros     = "boost_micros"  // agg# row: the emoji's boost total in micro-USD; reactor and self rows: the user's own, present only when boosted; ledger row: the one payment's value
+	attrBoosterCount    = "booster_count" // agg# row: how many of the emoji's reactors are boosted, moved in the same compare-and-set as the sample (see aggState.boosters)
+	attrTypeCount       = "type_count"    // meta# row: emoji currently active on the message
 
 	// message_reactors table (one row per current reaction, keyed by message).
 	// The member is carried by the sk under the same prefix the chat store uses
 	// for its membership rows.
 	userPrefix = "user#"
 
-	attrReactedTs    = "reacted_ts"    // display timestamp, projected into the LSI
-	attrEmojiVersion = "emoji_version" // "<emoji hex>#<padded version>": the LSI sort key
+	attrReactedTs    = "reacted_ts"      // display timestamp, projected into both indexes
+	attrEmojiVersion = "emoji_version"   // "<emoji hex>#<padded version>": the by_version LSI sort key, carried by PLAIN reactor rows alone
+	attrReactorVer   = "reactor_version" // boosted reactor rows: the version that added the reactor, which emoji_version carried while the row was plain
+	attrEmojiBoost   = "emoji_boost"     // "<emoji hex>#<padded micro-USD total>#<padded version>": the by_boost GSI sort key, carried by BOOSTED reactor rows alone
 
-	// lsiByVersion orders a message's reactor rows by emoji_version (emoji, then
-	// the version that added the reactor). Queried under one emoji's prefix it
-	// yields that emoji's reactors in reaction order, and being local it can be
-	// read strongly consistently. The aggregate rows live in the other table,
-	// so nothing but reactor rows can ever carry emoji_version and leak into it.
+	// A reactor row sits in exactly one of two indexes, decided by which sort
+	// key it carries. A plain row carries emoji_version and is in lsiByVersion,
+	// which orders a message's plain reactors by (emoji, version): queried
+	// under one emoji's prefix it yields that emoji's plain reactors in
+	// reaction order, and being local it is read strongly consistently. A
+	// boosted row carries emoji_boost instead (its boost moves emoji_version to
+	// reactor_version) and is in gsiByBoost, which orders a message's boosted
+	// reactors by (emoji, total, version), so one emoji's boosters are a key
+	// range read most money first — the emoji leads the key rather than being
+	// a filter, since DynamoDB applies Limit before a filter and a page of
+	// one emoji's boosters would otherwise walk the message's other boosters
+	// a Limit at a time. A global index was chosen
+	// because it can be added to the table that exists; the price is that it
+	// is read eventually consistent, which the Store contract allows for the
+	// boosted head of the rare emoji that is read from here at all (see
+	// below): a boost that has just landed may be missing for a moment, and
+	// the booster appears on the next read.
+	// GetReactors reads the head from gsiByBoost only for an emoji with more
+	// boosters than its sample holds: up to MaxStoredSampleReactors of them
+	// the aggregate's sample, read strongly consistently for the version
+	// anyway, is every booster, which its booster count attests (see
+	// aggState.boosters), and serves the head exactly and for free, so the
+	// index's lag reaches only the rare emoji past that size, and a
+	// table without the index serves every message until one gets there
+	// (the rollout order: deploy, add the index and wait for it to be
+	// active, then let boosts be recorded). The tail is lsiByVersion, and no
+	// row can appear in both. The split gives up one
+	// read: every reactor of an emoji by recency, boosted or not, is no longer
+	// one index range but a merge of the emoji's boosters (read whole from
+	// gsiByBoost and re-sorted by version) with the lsiByVersion range, which
+	// costs the booster count per page. Nothing serves that order today, and
+	// boosters are few by nature since boosting costs money, so the layout
+	// favours the order that is served (decided 2026-10-14). The aggregate
+	// rows live in the other table, so nothing but reactor rows ever carries
+	// either key.
 	lsiByVersion = "by_version"
+	gsiByBoost   = "by_boost"
 
 	// message_self_reactions table (one row per current reaction, keyed by
-	// viewer). The version that added the reaction is the row's one attribute
-	// beyond its keys.
+	// viewer). The version that added the reaction, when, and the viewer's
+	// boost total are the row's attributes beyond its keys.
 	attrSelfVersion   = "version"
 	attrSelfReactedTs = "reacted_ts" // the reactor row's reacted_ts, copied
+
+	// message_reaction_boosts table (one row per boost, keyed by message; see messaging/boost.go).
+	boostPrefix         = "boost#"
+	attrBoostUser       = "user_id"       // the booster, raw bytes
+	attrBoostAmount     = "amount"        // the payment as made: a marshalled commonpb.CryptoPaymentAmount
+	attrBoostTs         = "ts"            // epoch nanos
+	attrBoostEmojiVer   = "emoji_version" // "<emoji hex>#<padded version>": the by_emoji_version LSI sort key, chronological within an emoji
+	lsiBoostsByEmojiVer = "by_emoji_version"
 
 	// maxSummaryRefGap bounds how far apart two requested message IDs may be for
 	// GetReactionSummariesByRefs to cover both with one range query. Refs usually
@@ -251,9 +322,10 @@ const (
 	maxPutMessageAttempts = 32
 	maxBatchGetKeys       = 100
 
-	// A reaction transition is a transaction of two to four items — the reactor
+	// A reaction transition is a transaction of two to five items — the reactor
 	// row, the emoji's aggregate, (when an emoji activates or empties) the
-	// message's type-count row, and (in a group) the viewer-keyed copy — and
+	// message's type-count row, (in a group) the viewer-keyed copy, and (for
+	// a boost) the ledger row — and
 	// every transition on an emoji contends on its aggregate, as membership
 	// transitions contend on a group's #meta (see chat/dynamodb). Both failures
 	// that contention produces are absorbed with a bounded number of attempts:
@@ -278,16 +350,22 @@ type store struct {
 	reactionsTable     string
 	reactorsTable      string
 	selfReactionsTable string
+	boostsTable        string
 
 	// beforeReactionWrite, when set, runs between a reaction write's state read
 	// and its transaction. Tests use it to land a concurrent write in that gap;
 	// it is nil in production.
 	beforeReactionWrite func()
+
+	// onReactorQuery, when set, is told the index of every query GetReactors
+	// makes on the reactors table. Tests use it to pin which index a read
+	// touched; it is nil in production.
+	onReactorQuery func(index string)
 }
 
 // NewInDynamoDB returns a messaging.Store backed by the given DynamoDB tables.
 // Use CreateTables to provision them.
-func NewInDynamoDB(client *dynamodb.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable string) messaging.Store {
+func NewInDynamoDB(client *dynamodb.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable, boostsTable string) messaging.Store {
 	return &store{
 		client:             client,
 		messagesTable:      messagesTable,
@@ -295,6 +373,7 @@ func NewInDynamoDB(client *dynamodb.Client, messagesTable, pointersTable, reacti
 		reactionsTable:     reactionsTable,
 		reactorsTable:      reactorsTable,
 		selfReactionsTable: selfReactionsTable,
+		boostsTable:        boostsTable,
 	}
 }
 
@@ -1815,47 +1894,76 @@ func isRetryable(reasons []string) bool {
 }
 
 // sampleEntry is one retained reactor in an aggregate's sample: the version that
-// added them (the ordering key) and when, for display.
+// added them, when (for display), and their boost total in micro-USD (0 for a
+// plain reaction). Boost then version is the sample's order (see
+// messaging.ReactorLess).
 type sampleEntry struct {
 	version uint64
 	ts      time.Time
+	boost   uint64
 }
 
 // aggState is an agg# row as read for a write, or the next state a writer
 // intends to commit. exists distinguishes a retained count-0 row (which keeps
-// its version) from no row at all.
+// its version) from no row at all. boost is the emoji's boost total in
+// micro-USD (messaging.Reaction.BoostUsdMicros); boosterCount how many of
+// its reactors are boosted, a stored fact that boosters compares the sample
+// against rather than a derivation from how the sample is kept.
 type aggState struct {
-	exists  bool
-	count   uint64
-	version uint64
-	sample  map[string]sampleEntry // user hex -> entry, at most MaxStoredSampleReactors
+	exists       bool
+	count        uint64
+	version      uint64
+	boost        uint64
+	boosterCount uint64
+	sample       map[string]sampleEntry // user hex -> entry, at most MaxStoredSampleReactors
 }
 
 // advance is the state after userID reacts: count and version each move by one
-// and the reactor joins the sample. The new reactor carries the highest version
-// the emoji has seen, so it always belongs in a most-recent sample; when the
-// retained set is full the lowest-version entry is evicted to make room.
+// and the reactor joins the sample, evicting the least entry in list order
+// when the retained set is full (see evictLeast). The new reactor carries the
+// highest version the emoji has seen, so it always outranks every plain entry.
 func (a aggState) advance(userID *commonpb.UserId, ts time.Time) aggState {
-	next := aggState{
-		exists:  true,
-		count:   a.count + 1,
-		version: a.version + 1,
-		sample:  make(map[string]sampleEntry, len(a.sample)+1),
-	}
-	for k, v := range a.sample {
-		next.sample[k] = v
-	}
-	if len(next.sample) >= messaging.MaxStoredSampleReactors {
-		var evict string
-		var lowest uint64
-		for k, v := range next.sample {
-			if evict == "" || v.version < lowest || (v.version == lowest && k > evict) {
-				evict, lowest = k, v.version
-			}
-		}
-		delete(next.sample, evict)
-	}
+	next := a.clone()
+	next.count++
+	next.version++
 	next.sample[hex.EncodeToString(userID.Value)] = sampleEntry{version: next.version, ts: ts}
+	next.evictLeast()
+	return next
+}
+
+// boosted is the state after userID's boost of micros lands, taking their
+// total from before to before+micros: the version up by one, the emoji's
+// total up by micros, the count up by one when the boost adds the reaction
+// (existing false), the booster count up by one when before is 0 (their
+// first boost), and the booster in the sample at the new total — their
+// entry's total set to it if
+// they are in it, else inserted at it with their reaction's version and time
+// (the new ones when the boost adds it, the add's otherwise) and the least
+// entry evicted if that overfills the set. The entry carries the total, not
+// the payment: a booster evicted earlier and boosting again comes back at
+// everything they have paid, as the memory store's sample does. Since every
+// boosted entry outranks every plain one, a plain entry is evicted first
+// while there is one; a sample full of bigger boosters evicts the booster,
+// which is the order (see messaging.ReactorLess).
+func (a aggState) boosted(userID *commonpb.UserId, existing bool, version uint64, ts time.Time, before, micros uint64) aggState {
+	userBoost := before + micros
+	next := a.clone()
+	next.version++
+	next.boost += micros
+	if !existing {
+		next.count++
+	}
+	if before == 0 {
+		next.boosterCount++
+	}
+	key := hex.EncodeToString(userID.Value)
+	entry, inSample := next.sample[key]
+	if !inSample {
+		entry = sampleEntry{version: version, ts: ts}
+	}
+	entry.boost = userBoost
+	next.sample[key] = entry
+	next.evictLeast()
 	return next
 }
 
@@ -1863,17 +1971,74 @@ func (a aggState) advance(userID *commonpb.UserId, ts time.Time) aggState {
 // version up by one, and the reactor dropped from the sample if present. The
 // sample is not backfilled — see messaging.MaxStoredSampleReactors.
 func (a aggState) retract(userID *commonpb.UserId) aggState {
-	next := aggState{
-		exists:  true,
-		count:   a.count - 1,
-		version: a.version + 1,
-		sample:  make(map[string]sampleEntry, len(a.sample)),
-	}
+	next := a.clone()
+	next.count--
+	next.version++
+	delete(next.sample, hex.EncodeToString(userID.Value))
+	return next
+}
+
+// clone copies the state with its own sample map, so a next state never
+// mutates the one read.
+func (a aggState) clone() aggState {
+	next := a
+	next.exists = true
+	next.sample = make(map[string]sampleEntry, len(a.sample)+1)
 	for k, v := range a.sample {
 		next.sample[k] = v
 	}
-	delete(next.sample, hex.EncodeToString(userID.Value))
 	return next
+}
+
+// evictLeast restores the sample to MaxStoredSampleReactors after an insert
+// pushed it over, dropping the least entry in list order: the least boosted,
+// then the lowest version (ties, impossible among real reactors, broken by
+// larger key), the order messaging.ReactorLess defines, so the retained set is
+// always the list's head and a booster is never evicted while a plain entry
+// remains. That is what lets the sample hold every booster of an emoji with
+// up to MaxStoredSampleReactors of them; whether it does is not inferred from
+// this order but checked against the row's booster count (see boosters).
+func (a *aggState) evictLeast() {
+	if len(a.sample) <= messaging.MaxStoredSampleReactors {
+		return
+	}
+	var evict string
+	var least sampleEntry
+	first := true
+	for k, v := range a.sample {
+		if first || v.boost < least.boost || (v.boost == least.boost && (v.version < least.version || (v.version == least.version && k > evict))) {
+			evict, least, first = k, v, false
+		}
+	}
+	delete(a.sample, evict)
+}
+
+// boosters is the sample's boosted entries as reactors in list order, and
+// whether they are every booster of the emoji: true when there are as many
+// as the row's booster count says the emoji has, a stored fact moved in the
+// same compare-and-set as the sample, so a booster the sample lacks — one
+// evicted by bigger boosters, or one dropped by some future write that
+// forgets the count — makes the comparison fail and the head come from the
+// index instead. Never true for a sample with none, so a positive total
+// with no booster in the sample is not served as an empty head.
+func (a aggState) boosters() (head []*messaging.Reactor, complete bool) {
+	for userHex, entry := range a.sample {
+		if entry.boost == 0 {
+			continue
+		}
+		uid, err := hex.DecodeString(userHex)
+		if err != nil {
+			continue // sample keys are store-written hex; skip anything malformed
+		}
+		head = append(head, &messaging.Reactor{
+			UserID:         &commonpb.UserId{Value: uid},
+			ReactedTs:      entry.ts,
+			Version:        entry.version,
+			BoostUsdMicros: entry.boost,
+		})
+	}
+	sort.Slice(head, func(i, j int) bool { return messaging.ReactorLess(head[i], head[j]) })
+	return head, len(head) > 0 && uint64(len(head)) == a.boosterCount
 }
 
 // metaState is a meta# row as read for a write.
@@ -1889,10 +2054,12 @@ type reactionState struct {
 	agg     aggState
 	meta    metaState
 	reacted bool
-	// reactedAt is the version that added the caller's reaction, and reactedTs
-	// when, both when reacted.
-	reactedAt uint64
-	reactedTs time.Time
+	// reactedAt is the version that added the caller's reaction, reactedTs
+	// when, and reactedBoost their boost total on it (0 when plain), all when
+	// reacted.
+	reactedAt    uint64
+	reactedTs    time.Time
+	reactedBoost uint64
 }
 
 func (s *store) AddReaction(
@@ -1918,7 +2085,7 @@ func (s *store) AddReaction(
 
 		// Idempotent: the user already reacted with this emoji.
 		if state.reacted {
-			return selfReaction(reactionFromAgg(emoji, state.agg), userID, state.reactedAt, state.reactedTs), false, false, nil
+			return selfReaction(reactionFromAgg(emoji, state.agg), userID, state.reactedAt, state.reactedTs, state.reactedBoost), false, false, nil
 		}
 
 		// Activating a new or emptied emoji must respect the per-message type cap.
@@ -1974,7 +2141,7 @@ func (s *store) AddReaction(
 		}
 		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 		if err == nil {
-			return selfReaction(reactionFromAgg(emoji, next), userID, next.version, ts), true, false, nil
+			return selfReaction(reactionFromAgg(emoji, next), userID, next.version, ts, 0), true, false, nil
 		}
 
 		retry, err := s.absorbReactionFailure(ctx, err, items, metaIdx, &state, attempt, &backoff)
@@ -1991,6 +2158,313 @@ func (s *store) AddReaction(
 		}
 		needRead = retry == retryAfterRead
 	}
+}
+
+// A boost (see messaging/boost.go) touches every table a reaction does and one
+// more. The message_reaction_boosts table keeps the boost itself: one row per payment,
+// keyed by the message (the reactor table's partition key) and the intent ID,
+// so the conditional put of that row is the write's idempotency guard — a
+// replayed task fails it and reads the state back instead of crediting again.
+// The row carries what a history would show (the booster, emoji, amount, USD
+// value, time and the version the boost produced) and a local index orders
+// it by (emoji, version) for the read that is not built yet; nothing reads
+// the table today.
+//
+// The reactor row moves from the by_version LSI to the by_boost GSI (see
+// gsiByBoost): its emoji_version is removed and reactor_version, boost_micros
+// and emoji_boost take its place, so GetReactors finds it in the boosted head
+// and never in the plain tail. The aggregate row's total and
+// sample, the viewer-keyed self row and (when the boost activates the emoji)
+// the meta row's type count move in the same transaction, on the same
+// compare-and-set terms as an add — except that the type cap is not applied,
+// since the money is paid (see the Store contract).
+
+// AddBoost records a boost. See messaging.Store.
+func (s *store) AddBoost(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	userID *commonpb.UserId,
+	emoji string,
+	boost messaging.BoostInput,
+) (*messaging.Reaction, bool, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, false, false, messaging.ErrBoostGroupOnly
+	}
+	if boost.IntentID == nil || len(boost.IntentID.Value) == 0 {
+		return nil, false, false, errors.New("boost has no intent id")
+	}
+	// A boosted row is told from a plain one by its boost attributes, and
+	// every reader judges "boosted" by a positive total, so a boost of
+	// nothing would write a row neither shape reads right: refused before
+	// anything is read (see messaging.ErrBoostEmpty).
+	if boost.UsdMicros == 0 {
+		return nil, false, false, messaging.ErrBoostEmpty
+	}
+	if boost.Amount == nil {
+		return nil, false, false, errors.New("boost has no amount")
+	}
+	seq := messageID.Value
+	backoff := reactionBackoffBase
+	var state reactionState
+	needRead := true
+	for attempt := 0; ; attempt++ {
+		if needRead {
+			st, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
+			if err != nil {
+				return nil, false, false, err
+			}
+			state, needRead = st, false
+		}
+
+		// The reaction's own version and time: the add's when it exists, the
+		// boost's when the boost adds it.
+		version, ts := state.reactedAt, state.reactedTs
+		if !state.reacted {
+			version, ts = state.agg.version+1, boost.Ts
+		}
+		userBoost := state.reactedBoost + boost.UsdMicros
+		next := state.agg.boosted(userID, state.reacted, version, ts, state.reactedBoost, boost.UsdMicros)
+		activating := !state.reacted && (!state.agg.exists || state.agg.count == 0)
+
+		items := []types.TransactWriteItem{
+			// [0] the reactor row: created boosted when absent, else moved to
+			// the boosted index with its total raised. Either way it is
+			// conditioned on exactly the state read — absence, or presence at
+			// the total read — so a concurrent add or boost of the same
+			// reaction makes this write lose and re-read.
+			s.boostedReactorWrite(chatID, seq, userID, emoji, state, version, ts, userBoost),
+			// [1] the aggregate, set to exactly next.
+			s.aggregateWrite(chatID, seq, emoji, state.agg, next),
+		}
+		metaIdx := -1
+		if activating {
+			// The type count, set to exactly one more. There is no cap check:
+			// a boost activates its emoji whatever the count (see the Store
+			// contract), and the compare-and-set alone keeps the count exact
+			// against a concurrent free add.
+			metaIdx = len(items)
+			items = append(items, s.metaWrite(chatID, seq, state.meta, state.meta.types+1))
+		}
+		// The boost record, conditioned on the intent being new: the one
+		// item whose failure means a replay rather than a race.
+		boostIdx := len(items)
+		record, err := s.boostRecordWrite(chatID, seq, userID, emoji, boost, next.version)
+		if err != nil {
+			return nil, false, false, err
+		}
+		items = append(items, record)
+		{
+			// The viewer-keyed copy (see the table comment): every boost is a
+			// group's, refused above otherwise, so there is always one.
+			// Unconditioned: it exists exactly when the reactor row does, and
+			// [0] already decides that.
+			items = append(items, types.TransactWriteItem{Put: &types.Put{
+				TableName: aws.String(s.selfReactionsTable),
+				Item: map[string]types.AttributeValue{
+					attrPK:            avS(viewerPK(chatID, userID)),
+					attrSK:            avS(seqEmojiSK(seq, emoji)),
+					attrSelfVersion:   avN(version),
+					attrSelfReactedTs: avN(uint64(ts.UnixNano())),
+					attrBoostMicros:   avN(userBoost),
+				},
+			}})
+		}
+
+		if s.beforeReactionWrite != nil {
+			s.beforeReactionWrite()
+		}
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+		if err == nil {
+			return selfReaction(reactionFromAgg(emoji, next), userID, version, ts, userBoost), true, !state.reacted, nil
+		}
+
+		// A failed boost-record condition is the replay: the payment is
+		// already credited, and the answer is the state as it stands. Judged
+		// before the race classification, which knows nothing of this item.
+		if reasons, ok := cancellationDetails(err); ok && len(reasons) == len(items) && aws.ToString(reasons[boostIdx].Code) == codeConditionalCheckFailed {
+			st, err := s.readReactionState(ctx, chatID, seq, emoji, userID)
+			if err != nil {
+				return nil, false, false, err
+			}
+			r := reactionFromAgg(emoji, st.agg)
+			if st.reacted {
+				r = selfReaction(r, userID, st.reactedAt, st.reactedTs, st.reactedBoost)
+			}
+			return r, false, false, nil
+		}
+
+		// A boost's reactor write is never a no-op: a failed [0] means the
+		// reaction was added, boosted or removed under us, and the retry
+		// re-decides from a fresh read (absorbReactionFailure asks for one)
+		// and writes again. absorbReactionFailure exempts that path from the
+		// attempt cap, since for an add or remove it ends in a no-op; a boost
+		// keeps writing, so every path is capped here, ahead of the absorb
+		// and its backoff, which a final failure need not wait out.
+		if attempt+1 >= maxReactionAttempts {
+			return nil, false, false, fmt.Errorf("add boost for chat %s: %w", hex.EncodeToString(chatID.Value), err)
+		}
+		retry, err := s.absorbReactionFailure(ctx, err, items, metaIdx, &state, attempt, &backoff)
+		if err != nil {
+			return nil, false, false, fmt.Errorf("add boost for chat %s: %w", hex.EncodeToString(chatID.Value), err)
+		}
+		// A non-activating write carries no meta item, so a lost aggregate
+		// CAS refreshes the aggregate alone; if that shows the emoji emptied
+		// under us, the retry activates it and its meta row must be read
+		// afresh (as in AddReaction).
+		if !activating && state.agg.exists && state.agg.count == 0 {
+			retry = retryAfterRead
+		}
+		needRead = retry == retryAfterRead
+	}
+}
+
+// boostedReactorWrite is the reactor row item of a boost: a conditional put
+// of a new boosted row when the user has no reaction, else an update that
+// raises the total and moves the row from the plain index to the boosted one,
+// conditioned on the total read (absent for a plain row).
+func (s *store) boostedReactorWrite(chatID *commonpb.ChatId, seq uint64, userID *commonpb.UserId, emoji string, state reactionState, version uint64, ts time.Time, userBoost uint64) types.TransactWriteItem {
+	key := map[string]types.AttributeValue{
+		attrPK: avS(reactorPK(chatID, seq)),
+		attrSK: avS(userSK(userID, emoji)),
+	}
+	if !state.reacted {
+		return types.TransactWriteItem{Put: &types.Put{
+			TableName: aws.String(s.reactorsTable),
+			Item: map[string]types.AttributeValue{
+				attrPK:          key[attrPK],
+				attrSK:          key[attrSK],
+				attrReactedTs:   avN(uint64(ts.UnixNano())),
+				attrReactorVer:  avN(version),
+				attrBoostMicros: avN(userBoost),
+				attrEmojiBoost:  avS(emojiBoost(emoji, userBoost, version)),
+			},
+			ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+		}}
+	}
+	update := &types.Update{
+		TableName:        aws.String(s.reactorsTable),
+		Key:              key,
+		UpdateExpression: aws.String("SET #ver = :ver, #boost = :boost, #key = :key REMOVE #plain"),
+		ExpressionAttributeNames: map[string]string{
+			"#ver":   attrReactorVer,
+			"#boost": attrBoostMicros,
+			"#key":   attrEmojiBoost,
+			"#plain": attrEmojiVersion,
+			"#pk":    attrPK,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":ver":   avN(version),
+			":boost": avN(userBoost),
+			":key":   avS(emojiBoost(emoji, userBoost, version)),
+		},
+	}
+	if state.reactedBoost == 0 {
+		update.ConditionExpression = aws.String("attribute_exists(#pk) AND attribute_not_exists(#boost)")
+	} else {
+		update.ConditionExpression = aws.String("attribute_exists(#pk) AND #boost = :expected")
+		update.ExpressionAttributeValues[":expected"] = avN(state.reactedBoost)
+	}
+	return types.TransactWriteItem{Update: update}
+}
+
+// boostRecordWrite is the message_reaction_boosts row of a boost, conditioned on the
+// intent ID being new to the message. The amount is the payment as made,
+// exact, so a failure to encode it fails the boost rather than leaving the
+// record without it (AddBoost has refused a boost with none before reading).
+func (s *store) boostRecordWrite(chatID *commonpb.ChatId, seq uint64, userID *commonpb.UserId, emoji string, boost messaging.BoostInput, version uint64) (types.TransactWriteItem, error) {
+	amount, err := proto.Marshal(boost.Amount)
+	if err != nil {
+		return types.TransactWriteItem{}, fmt.Errorf("encode boost amount: %w", err)
+	}
+	item := map[string]types.AttributeValue{
+		attrPK:              avS(reactorPK(chatID, seq)),
+		attrSK:              avS(boostSK(boost.IntentID)),
+		attrBoostUser:       &types.AttributeValueMemberB{Value: append([]byte(nil), userID.Value...)},
+		attrEmoji:           avS(emoji),
+		attrBoostMicros:     avN(boost.UsdMicros),
+		attrBoostTs:         avN(uint64(boost.Ts.UnixNano())),
+		attrReactionVersion: avN(version),
+		attrBoostEmojiVer:   avS(emojiVersionKey(emoji, version)),
+	}
+	item[attrBoostAmount] = &types.AttributeValueMemberB{Value: amount}
+	return types.TransactWriteItem{Put: &types.Put{
+		TableName:           aws.String(s.boostsTable),
+		Item:                item,
+		ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
+	}}, nil
+}
+
+// sampledHead is the page of a boosted head served from the sample: the
+// boosters in list order, those strictly after the cursor when paged, at
+// most want (0 = every). It is the sample-side twin of queryBoostedReactors.
+func sampledHead(boosters []*messaging.Reactor, cursor messaging.ReactorCursor, paged bool, want int) []*messaging.Reactor {
+	var head []*messaging.Reactor
+	for _, r := range boosters {
+		if paged && !messaging.ReactorAfterCursor(cursor, r) {
+			continue
+		}
+		head = append(head, r)
+		if want > 0 && len(head) == want {
+			break
+		}
+	}
+	return head
+}
+
+// queryBoostedReactors reads up to want (0 = every) boosted reactors of an
+// emoji, most money first, from the by_boost GSI, resuming strictly below the
+// cursor when paged. The emoji leads the index key, so the read is one key
+// range with no filter, billed for the rows it returns. It is read only for
+// an emoji with more boosters than its sample holds; up to
+// MaxStoredSampleReactors of them the sample is the head (see GetReactors). The read is eventually consistent,
+// as a GSI's must be (see gsiByBoost).
+func (s *store) queryBoostedReactors(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, cursor messaging.ReactorCursor, paged bool, want int) ([]*messaging.Reactor, error) {
+	input := &dynamodb.QueryInput{
+		TableName:                aws.String(s.reactorsTable),
+		IndexName:                aws.String(gsiByBoost),
+		ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#key": attrEmojiBoost},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": avS(reactorPK(chatID, seq)),
+		},
+		ScanIndexForward: aws.Bool(false),
+	}
+	if paged {
+		// The cursor resumes strictly below the last key returned, as a key
+		// range (a sort key takes one condition, so "below the cursor" is the
+		// range from the emoji's floor up to the key just under it), like
+		// queryPlainReactors. The key under (micros, version) is (micros,
+		// version-1), or for a version of 0 — none a real reactor has, since
+		// versions start at 1 — the top of (micros-1).
+		hi := ""
+		switch {
+		case cursor.Version > 0:
+			hi = emojiBoost(emoji, cursor.BoostUsdMicros, cursor.Version-1)
+		case cursor.BoostUsdMicros > 0:
+			hi = emojiBoost(emoji, cursor.BoostUsdMicros-1, math.MaxUint64)
+		default:
+			return nil, nil // nothing lies below the first key
+		}
+		input.KeyConditionExpression = aws.String("#pk = :pk AND #key BETWEEN :lo AND :hi")
+		input.ExpressionAttributeValues[":lo"] = avS(emojiBoost(emoji, 0, 0))
+		input.ExpressionAttributeValues[":hi"] = avS(hi)
+	} else {
+		input.KeyConditionExpression = aws.String("#pk = :pk AND begins_with(#key, :prefix)")
+		input.ExpressionAttributeValues[":prefix"] = avS(emojiHex(emoji) + "#")
+	}
+	return s.collectReactors(ctx, input, want)
+}
+
+// emojiBoost is a boosted reactor row's emoji_boost: the emoji, the zero-padded
+// total, then the zero-padded version, so one emoji's boosters sort by what
+// they paid and then by reaction order under a common prefix in the GSI.
+func emojiBoost(emoji string, micros, version uint64) string {
+	return emojiHex(emoji) + "#" + seqPad(micros) + "#" + seqPad(version)
+}
+
+// boostSK is a boost row's sk: the intent ID that paid for it.
+func boostSK(intentID *commonpb.IntentId) string {
+	return boostPrefix + hex.EncodeToString(intentID.Value)
 }
 
 func (s *store) RemoveReaction(
@@ -2027,18 +2501,25 @@ func (s *store) RemoveReaction(
 		if !state.agg.exists || state.agg.count == 0 || !state.meta.exists || state.meta.types == 0 {
 			return nil, false, fmt.Errorf("chat %s message %d emoji %q has a reactor but no active aggregate", hex.EncodeToString(chatID.Value), seq, emoji)
 		}
+		// A boosted reaction is permanent (see the Store contract). The row's
+		// own condition below judges it again at the write, so a boost landing
+		// between this read and the transaction makes the removal lose and
+		// re-read rather than take the boosted row with it.
+		if state.reactedBoost > 0 {
+			return nil, false, messaging.ErrReactionBoosted
+		}
 
 		next := state.agg.retract(userID)
 		items := []types.TransactWriteItem{
-			// [0] delete the reactor row; a concurrent identical remove wins the
-			// condition and this call reports the no-op.
+			// [0] delete the reactor row; a concurrent identical remove, or a
+			// concurrent boost of it, wins the condition and this call re-reads.
 			{Delete: &types.Delete{
 				TableName: aws.String(s.reactorsTable),
 				Key: map[string]types.AttributeValue{
 					attrPK: avS(reactorPK(chatID, seq)),
 					attrSK: avS(userSK(userID, emoji)),
 				},
-				ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
+				ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s) AND attribute_not_exists(%s)", attrPK, attrBoostMicros)),
 			}},
 			// [1] the aggregate, set to exactly next. The row is retained at count
 			// 0 so the version survives the emoji being re-added.
@@ -2062,6 +2543,9 @@ func (s *store) RemoveReaction(
 			}})
 		}
 
+		if s.beforeReactionWrite != nil {
+			s.beforeReactionWrite()
+		}
 		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 		if err == nil {
 			return reactionFromAgg(emoji, next), true, nil
@@ -2083,9 +2567,11 @@ const (
 	// cancellation returned; no read is needed.
 	retryFromState reactionRetry = iota
 	// retryAfterRead re-reads the state first: either the reactor row's own
-	// condition failed, so a concurrent identical write landed and the
-	// idempotent answer is whatever it produced, or the transaction collided
-	// with another and learned nothing about what it left behind.
+	// condition failed, so a concurrent write landed on the row — for an add
+	// or remove an identical one, whose result is the idempotent answer, for
+	// a boost any write of it, which the boost then retries on top of — or
+	// the transaction collided with another and learned nothing about what
+	// it left behind.
 	retryAfterRead
 )
 
@@ -2094,11 +2580,15 @@ const (
 // attempt budget is spent. Cancellation reasons are positional over items: [0]
 // is the reactor row, [1] the aggregate, metaIdx (-1 when the write carries
 // none) the meta row. Any other item is the viewer-keyed copy, which carries no
-// condition and so never fails one.
+// condition and so never fails one, or a boost's ledger row, whose failed
+// condition is the replay and is judged by AddBoost before this is called.
 //
-// A failed [0] condition means a concurrent identical add or remove won, so the
-// caller re-reads and reports the no-op; that is not a retry of the write, so
-// it is taken even when the budget is spent. A failed [1] or meta condition
+// A failed [0] condition means a concurrent write landed on the reactor row.
+// For an add or remove it was an identical one that won, so the caller
+// re-reads and reports the no-op; that is not a retry of the write, so it is
+// taken even when the budget is spent. For a boost it was any write of the
+// row, and the caller re-reads and writes again on top of it, capping the
+// attempts itself (see AddBoost). A failed [1] or meta condition
 // means a concurrent writer moved the aggregate or the type count; the failed
 // item is returned with the cancellation, so the state is refreshed from it and
 // the write retried with no extra read. Losing the write itself to a concurrent
@@ -2174,6 +2664,8 @@ func (s *store) aggregateWrite(chatID *commonpb.ChatId, seq uint64, emoji string
 				attrEmoji:           avS(emoji),
 				attrReactorCount:    avN(next.count),
 				attrReactionVersion: avN(next.version),
+				attrBoostMicros:     avN(next.boost),
+				attrBoosterCount:    avN(next.boosterCount),
 				attrSample:          sampleAttr(next.sample),
 			},
 			ConditionExpression:                 aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
@@ -2181,22 +2673,28 @@ func (s *store) aggregateWrite(chatID *commonpb.ChatId, seq uint64, emoji string
 		}}
 	}
 	// The emoji is fixed by the key and written once by the create above, so the
-	// update sets only what moves. Attribute names go through placeholders:
-	// "sample" is a DynamoDB reserved word, and naming the rest the same way
-	// keeps the expression uniform.
+	// update sets only what moves (the boost total and booster count are set
+	// on every write, so a row from before boosts gains them on its next
+	// transition).
+	// Attribute names go through placeholders: "sample" is a DynamoDB reserved
+	// word, and naming the rest the same way keeps the expression uniform.
 	return types.TransactWriteItem{Update: &types.Update{
 		TableName:           aws.String(s.reactionsTable),
 		Key:                 key,
-		UpdateExpression:    aws.String("SET #count = :count, #version = :version, #sample = :sample"),
+		UpdateExpression:    aws.String("SET #count = :count, #version = :version, #boost = :boost, #boosters = :boosters, #sample = :sample"),
 		ConditionExpression: aws.String("#version = :expected"),
 		ExpressionAttributeNames: map[string]string{
-			"#count":   attrReactorCount,
-			"#version": attrReactionVersion,
-			"#sample":  attrSample,
+			"#count":    attrReactorCount,
+			"#version":  attrReactionVersion,
+			"#boost":    attrBoostMicros,
+			"#boosters": attrBoosterCount,
+			"#sample":   attrSample,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":count":    avN(next.count),
 			":version":  avN(next.version),
+			":boost":    avN(next.boost),
+			":boosters": avN(next.boosterCount),
 			":sample":   sampleAttr(next.sample),
 			":expected": avN(current.version),
 		},
@@ -2238,7 +2736,9 @@ func (s *store) metaWrite(chatID *commonpb.ChatId, seq uint64, current metaState
 // readReactionState fetches, in one strongly consistent batch read spanning both
 // tables, the three items a reaction write decides from: the emoji's aggregate
 // and the message's meta row (message_reactions) and the caller's own reactor row
-// (message_reactors, with the version that added it, for a re-add's result).
+// (message_reactors: the version that added it, for a re-add's result, and its
+// boost total, which a boost conditions its row update on and a removal
+// refuses on).
 // Absent keys are simply omitted from the response, so a missing row leaves its
 // flag false.
 func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, userID *commonpb.UserId) (reactionState, error) {
@@ -2257,7 +2757,7 @@ func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, 
 				{attrPK: avS(reactorPK(chatID, seq)), attrSK: avS(userSK(userID, emoji))},
 			},
 			ConsistentRead:       aws.Bool(true),
-			ProjectionExpression: aws.String(attrSK + ", " + attrEmojiVersion + ", " + attrReactedTs),
+			ProjectionExpression: aws.String(attrSK + ", " + attrEmojiVersion + ", " + attrReactorVer + ", " + attrReactedTs + ", " + attrBoostMicros),
 		},
 	}
 
@@ -2278,15 +2778,11 @@ func (s *store) readReactionState(ctx context.Context, chatID *commonpb.ChatId, 
 			}
 		}
 		for _, item := range resp.Responses[s.reactorsTable] {
-			version, err := versionFromEmojiVersionKey(asS(item[attrEmojiVersion]))
+			r, err := reactorFromItem(item)
 			if err != nil {
 				return reactionState{}, err
 			}
-			nanos, err := parseInt(item[attrReactedTs])
-			if err != nil {
-				return reactionState{}, err
-			}
-			state.reacted, state.reactedAt, state.reactedTs = true, version, time.Unix(0, nanos).UTC()
+			state.reacted, state.reactedAt, state.reactedTs, state.reactedBoost = true, r.Version, r.ReactedTs, r.BoostUsdMicros
 		}
 		req = make(map[string]types.KeysAndAttributes)
 		for table, unprocessed := range resp.UnprocessedKeys {
@@ -2567,11 +3063,13 @@ func (s *store) GetSelfReactions(
 				if err != nil {
 					return nil, err
 				}
+				boost, _ := parseN(item[attrBoostMicros]) // absent on a plain reaction's row
 				present = append(present, messaging.SelfReaction{
-					MessageID: &messagingpb.MessageId{Value: seq},
-					Emoji:     emoji,
-					Version:   version,
-					ReactedTs: time.Unix(0, nanos).UTC(),
+					MessageID:      &messagingpb.MessageId{Value: seq},
+					Emoji:          emoji,
+					Version:        version,
+					ReactedTs:      time.Unix(0, nanos).UTC(),
+					BoostUsdMicros: boost,
 				})
 			}
 			if len(out.LastEvaluatedKey) == 0 {
@@ -2630,10 +3128,82 @@ func (s *store) GetReactors(
 		return nil, agg.version, false, nil
 	}
 
-	// Page the emoji's reactors off the version index, newest first, under a
-	// strongly consistent read. The cursor resumes strictly below the last
-	// version returned, expressed as a key range rather than an ExclusiveStartKey
-	// so the token need carry nothing but the version.
+	// The list is read in two phases: the boosted head, most money first,
+	// then the plain tail, newest first, from the by_version LSI. The cursor
+	// says which phase it is in — a boosted reactor's cursor carries their
+	// total, a plain one's does not — and the head is skipped entirely once
+	// the cursor is in the tail, and when the emoji's total is 0: every
+	// boosted row holds a positive total (AddBoost refuses a boost of
+	// nothing) and moves with the aggregate's in one transaction, so a zero
+	// total read strongly consistently above means no boosted rows.
+	//
+	// The head comes from the aggregate's sample while that holds every
+	// booster, judged against the row's booster count (see boosters): the
+	// sample was read strongly consistently with the version just above, so
+	// the head is exact, costs no second read, and a booster is on the list
+	// the moment their boost commits — which matters, since the BOOSTED
+	// update reaches their own client first and a refetch follows. Only an
+	// emoji with more boosters than the sample holds (past
+	// MaxStoredSampleReactors) reads the head from the by_boost GSI (see
+	// gsiByBoost), which may trail a boost by a moment.
+	// Both sources yield the same order under the same cursor, so a client
+	// paging the head as it crosses that size continues without a gap or
+	// repeat, as far as the index has caught up. Every boosted reactor
+	// precedes every plain one, so the phases concatenate into one list.
+	// Over-fetch one row beyond the page so hasMore is exact: DynamoDB sets
+	// LastEvaluatedKey whenever a query stops at Limit, even on the last
+	// matching row, so the key alone can't tell "exactly a page" from "more
+	// remain".
+	want := 0
+	if q.Limit > 0 {
+		want = q.Limit + 1
+	}
+	cursor, paged := messaging.ReactorFromPageToken(q.PagingToken)
+
+	var reactors []*messaging.Reactor
+	if agg.boost > 0 && (!paged || cursor.BoostUsdMicros > 0) {
+		if head, complete := agg.boosters(); complete {
+			reactors = sampledHead(head, cursor, paged, want)
+		} else {
+			head, err := s.queryBoostedReactors(ctx, chatID, seq, emoji, cursor, paged, want)
+			if err != nil {
+				return nil, 0, false, err
+			}
+			reactors = head
+		}
+		// The head continues into the tail from its top, so the cursor for
+		// the tail's read is none.
+		paged = false
+	}
+	if want == 0 || len(reactors) < want {
+		remaining := 0
+		if want > 0 {
+			remaining = want - len(reactors)
+		}
+		tail, err := s.queryPlainReactors(ctx, chatID, seq, emoji, cursor, paged, remaining)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		reactors = append(reactors, tail...)
+	}
+
+	// Trim the over-fetched row and report hasMore. The dropped row isn't lost:
+	// the caller resumes from the last returned reactor, so it leads the next
+	// page.
+	var hasMore bool
+	if want > 0 && len(reactors) >= want {
+		hasMore = true
+		reactors = reactors[:q.Limit]
+	}
+	return reactors, agg.version, hasMore, nil
+}
+
+// queryPlainReactors reads up to want (0 = every) plain reactors of an emoji
+// in reaction order, newest first, from the by_version LSI under a strongly
+// consistent read, resuming strictly below the cursor's version when paged.
+// The LSI holds plain rows alone (a boosted row carries no emoji_version), so
+// no filter is needed and every row read is returned.
+func (s *store) queryPlainReactors(ctx context.Context, chatID *commonpb.ChatId, seq uint64, emoji string, cursor messaging.ReactorCursor, paged bool, want int) ([]*messaging.Reactor, error) {
 	input := &dynamodb.QueryInput{
 		TableName:                aws.String(s.reactorsTable),
 		IndexName:                aws.String(lsiByVersion),
@@ -2644,50 +3214,53 @@ func (s *store) GetReactors(
 		ScanIndexForward: aws.Bool(false),
 		ConsistentRead:   aws.Bool(true),
 	}
-	if cursor, ok := messaging.ReactorFromPageToken(q.PagingToken); ok {
-		if cursor <= 1 {
-			return nil, agg.version, false, nil // nothing lies below the first version
+	if paged {
+		if cursor.Version <= 1 {
+			return nil, nil // nothing lies below the first version
 		}
+		// The cursor resumes strictly below the last version returned,
+		// expressed as a key range rather than an ExclusiveStartKey so the
+		// token need carry nothing but the cursor.
 		input.KeyConditionExpression = aws.String("#pk = :pk AND #version BETWEEN :lo AND :hi")
 		input.ExpressionAttributeValues[":lo"] = avS(emojiVersionKey(emoji, 0))
-		input.ExpressionAttributeValues[":hi"] = avS(emojiVersionKey(emoji, cursor-1))
+		input.ExpressionAttributeValues[":hi"] = avS(emojiVersionKey(emoji, cursor.Version-1))
 	} else {
 		input.KeyConditionExpression = aws.String("#pk = :pk AND begins_with(#version, :prefix)")
 		input.ExpressionAttributeValues[":prefix"] = avS(emojiHex(emoji) + "#")
 	}
-	// Over-fetch one row beyond the page so hasMore can be determined exactly.
-	// DynamoDB sets LastEvaluatedKey whenever a query stops at Limit — even when it
-	// landed on the last matching row — so the key alone can't distinguish "exactly
-	// a page" from "more remain". Fetching limit+1 does.
-	if q.Limit > 0 {
-		input.Limit = aws.Int32(int32(q.Limit) + 1)
-	}
+	return s.collectReactors(ctx, input, want)
+}
 
-	out, err := s.client.Query(ctx, input)
-	if err != nil {
-		return nil, 0, false, err
-	}
-	reactors := make([]*messaging.Reactor, 0, len(out.Items))
-	for _, item := range out.Items {
-		r, err := reactorFromItem(item)
+// collectReactors runs a reactor query until it has want rows (0 = every row)
+// or the index is exhausted, following LastEvaluatedKey, and decodes them.
+// Limit is applied per request and a request may still stop short of it (at
+// the 1 MB page bound), so one that returns fewer than want is followed by
+// another. Neither reactor query carries a filter: both are key ranges.
+func (s *store) collectReactors(ctx context.Context, input *dynamodb.QueryInput, want int) ([]*messaging.Reactor, error) {
+	var reactors []*messaging.Reactor
+	for {
+		if s.onReactorQuery != nil {
+			s.onReactorQuery(aws.ToString(input.IndexName))
+		}
+		if want > 0 {
+			input.Limit = aws.Int32(int32(want - len(reactors)))
+		}
+		out, err := s.client.Query(ctx, input)
 		if err != nil {
-			return nil, 0, false, err
+			return nil, err
 		}
-		reactors = append(reactors, r)
-	}
-
-	// Trim the over-fetched row and report hasMore. The dropped row isn't lost: the
-	// caller resumes from the last returned reactor, so it leads the next page. When
-	// no limit was set, fall back to LastEvaluatedKey (a real 1 MB page boundary).
-	var hasMore bool
-	if q.Limit > 0 {
-		if hasMore = len(reactors) > q.Limit; hasMore {
-			reactors = reactors[:q.Limit]
+		for _, item := range out.Items {
+			r, err := reactorFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			reactors = append(reactors, r)
 		}
-	} else {
-		hasMore = len(out.LastEvaluatedKey) > 0
+		if len(out.LastEvaluatedKey) == 0 || (want > 0 && len(reactors) >= want) {
+			return reactors, nil
+		}
+		input.ExclusiveStartKey = out.LastEvaluatedKey
 	}
-	return reactors, agg.version, hasMore, nil
 }
 
 // getAggregate reads an emoji's agg# row with a strongly consistent read. The
@@ -2712,7 +3285,9 @@ func (s *store) getAggregate(ctx context.Context, chatID *commonpb.ChatId, seq u
 func aggStateFromItem(item map[string]types.AttributeValue) aggState {
 	count, _ := parseN(item[attrReactorCount])
 	version, _ := parseN(item[attrReactionVersion])
-	return aggState{exists: true, count: count, version: version, sample: parseSampleMap(item[attrSample])}
+	boost, _ := parseN(item[attrBoostMicros])     // absent on a row from before boosts
+	boosters, _ := parseN(item[attrBoosterCount]) // likewise
+	return aggState{exists: true, count: count, version: version, boost: boost, boosterCount: boosters, sample: parseSampleMap(item[attrSample])}
 }
 
 func metaStateFromItem(item map[string]types.AttributeValue) metaState {
@@ -2721,7 +3296,8 @@ func metaStateFromItem(item map[string]types.AttributeValue) metaState {
 }
 
 // reactionFromAgg projects an aggregate onto a Reaction. The surfaced sample is
-// the most-recent MaxSampleReactors of the retained set (see
+// the first MaxSampleReactors of the retained set in list order — the top
+// boosters, then the most recent plain reactors (see
 // messaging.SampleFromReactors). The per-viewer Self is left nil for
 // the server to overlay.
 func reactionFromAgg(emoji string, agg aggState) *messaging.Reaction {
@@ -2732,28 +3308,35 @@ func reactionFromAgg(emoji string, agg aggState) *messaging.Reaction {
 			continue // sample keys are store-written hex; skip anything malformed
 		}
 		reactors = append(reactors, &messaging.Reactor{
-			UserID:    &commonpb.UserId{Value: uid},
-			ReactedTs: entry.ts,
-			Version:   entry.version,
+			UserID:         &commonpb.UserId{Value: uid},
+			ReactedTs:      entry.ts,
+			Version:        entry.version,
+			BoostUsdMicros: entry.boost,
 		})
 	}
 	return &messaging.Reaction{
 		Emoji:          emoji,
 		Count:          agg.count,
 		Version:        agg.version,
+		BoostUsdMicros: agg.boost,
 		SampleReactors: messaging.SampleFromReactors(reactors),
 	}
 }
 
 // sampleAttr encodes a sample as the agg# row's map attribute: user hex -> {
-// version: added at, ts: reacted nanos }.
+// version: added at, ts: reacted nanos, boost: the user's total in micro-USD,
+// written only when positive }.
 func sampleAttr(sample map[string]sampleEntry) types.AttributeValue {
 	m := make(map[string]types.AttributeValue, len(sample))
 	for userHex, entry := range sample {
-		m[userHex] = &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
+		fields := map[string]types.AttributeValue{
 			attrSampleVersion: avN(entry.version),
 			attrSampleTs:      avN(uint64(entry.ts.UnixNano())),
-		}}
+		}
+		if entry.boost > 0 {
+			fields[attrSampleBoost] = avN(entry.boost)
+		}
+		m[userHex] = &types.AttributeValueMemberM{Value: fields}
 	}
 	return &types.AttributeValueMemberM{Value: m}
 }
@@ -2773,27 +3356,36 @@ func parseSampleMap(av types.AttributeValue) map[string]sampleEntry {
 		}
 		version, _ := parseN(entry.Value[attrSampleVersion])
 		nanos, _ := parseInt(entry.Value[attrSampleTs])
-		out[userHex] = sampleEntry{version: version, ts: time.Unix(0, nanos).UTC()}
+		boost, _ := parseN(entry.Value[attrSampleBoost]) // absent on a plain entry
+		out[userHex] = sampleEntry{version: version, ts: time.Unix(0, nanos).UTC(), boost: boost}
 	}
 	return out
 }
 
-// reactorFromItem decodes a reactor row (or its LSI projection): the user from
-// the sort key, the version from emoji_version, and the display timestamp.
+// reactorFromItem decodes a reactor row (or either index's projection): the
+// user from the sort key, the version from emoji_version on a plain row or
+// reactor_version on a boosted one, the display timestamp, and the boost total
+// (absent on a plain row).
 func reactorFromItem(item map[string]types.AttributeValue) (*messaging.Reactor, error) {
 	userID, err := userIDFromUserSK(asS(item[attrSK]))
 	if err != nil {
 		return nil, err
 	}
-	version, err := versionFromEmojiVersionKey(asS(item[attrEmojiVersion]))
-	if err != nil {
+	var version uint64
+	if _, boosted := item[attrReactorVer]; boosted {
+		if version, err = parseN(item[attrReactorVer]); err != nil {
+			return nil, err
+		}
+	} else if version, err = versionFromEmojiVersionKey(asS(item[attrEmojiVersion])); err != nil {
 		return nil, err
 	}
 	nanos, _ := parseInt(item[attrReactedTs])
+	boost, _ := parseN(item[attrBoostMicros])
 	return &messaging.Reactor{
-		UserID:    userID,
-		ReactedTs: time.Unix(0, nanos).UTC(),
-		Version:   version,
+		UserID:         userID,
+		ReactedTs:      time.Unix(0, nanos).UTC(),
+		Version:        version,
+		BoostUsdMicros: boost,
 	}, nil
 }
 
@@ -2850,13 +3442,15 @@ func seqEmojiFromSK(sk string) (uint64, string, error) {
 	return seq, string(emoji), nil
 }
 
-// selfReaction marks an AddReaction result as the reactor's own view: their
-// own entry, at the version that added their reaction and when.
-func selfReaction(r *messaging.Reaction, userID *commonpb.UserId, addedAt uint64, reactedTs time.Time) *messaging.Reaction {
+// selfReaction marks an AddReaction or AddBoost result as the reactor's own
+// view: their own entry, at the version that added their reaction, when, and
+// with their boost total.
+func selfReaction(r *messaging.Reaction, userID *commonpb.UserId, addedAt uint64, reactedTs time.Time, boost uint64) *messaging.Reaction {
 	r.Self = &messaging.Reactor{
-		UserID:    &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
-		ReactedTs: reactedTs,
-		Version:   addedAt,
+		UserID:         &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
+		ReactedTs:      reactedTs,
+		Version:        addedAt,
+		BoostUsdMicros: boost,
 	}
 	return r
 }

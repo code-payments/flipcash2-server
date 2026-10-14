@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"sort"
 	"strconv"
@@ -65,6 +66,9 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_Reactions_TypeCap,
 		testStore_Reactions_TypeCapConcurrent,
 		testStore_Reactions_GetReactors,
+		testStore_Reactions_Boost,
+		testStore_Reactions_BoostOrder,
+		testStore_Reactions_BoostPastTypeCap,
 	} {
 		tf(t, s)
 		teardown()
@@ -2525,4 +2529,386 @@ func generateClientID() *messagingpb.ClientMessageId {
 		panic(err)
 	}
 	return &messagingpb.ClientMessageId{Value: b}
+}
+
+// testStore_Reactions_Boost pins what one boost does to the reaction state:
+// it adds the reaction if absent, grows the emoji's and the booster's totals,
+// surfaces the total on the aggregate, the sample, the self overlay and the
+// reactor list, advances the version by one, credits a payment once however
+// often it is replayed, and pins the reaction against removal.
+func testStore_Reactions_Boost(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateGroupChatID()
+	sender := model.MustGenerateUserID()
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+
+	msg, _, err := s.PutMessage(ctx, chatID, sender, textContent("boost me"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	msgID := msg.ID
+	const emoji = "🔥"
+
+	// A boost in a DM is refused before anything is read: nothing to pay a
+	// creator with, so nothing is recorded, and the DM's reaction state is
+	// untouched.
+	dmID := generateChatID()
+	dm, _, err := s.PutMessage(ctx, dmID, sender, textContent("dm"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	_, _, _, err = s.AddBoost(ctx, dmID, dm.ID, userA, emoji, boostInput(1_000_000, at(2)))
+	require.ErrorIs(t, err, messaging.ErrBoostGroupOnly)
+	dmSummary, err := s.GetReactionSummary(ctx, dmID, dm.ID)
+	require.NoError(t, err)
+	require.Empty(t, dmSummary)
+
+	// A boost worth nothing is refused and records nothing: no reaction, no
+	// payment to replay.
+	empty := boostInput(0, at(2))
+	_, _, _, err = s.AddBoost(ctx, chatID, msgID, userA, emoji, empty)
+	require.ErrorIs(t, err, messaging.ErrBoostEmpty)
+	summary, err := s.GetReactionSummary(ctx, chatID, msgID)
+	require.NoError(t, err)
+	require.Empty(t, summary)
+	empty.UsdMicros = 1
+	_, credited, _, err := s.AddBoost(ctx, chatID, msgID, userA, emoji, empty)
+	require.NoError(t, err)
+	require.True(t, credited, "the refused boost's intent was not spent")
+	_, _, err = s.RemoveReaction(ctx, chatID, msgID, userA, emoji)
+	require.ErrorIs(t, err, messaging.ErrReactionBoosted, "a boost of one micro-dollar is a boost")
+
+	// A boosts an emoji nobody has reacted with: the boost adds the reaction.
+	msg, _, err = s.PutMessage(ctx, chatID, sender, textContent("boost me too"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	msgID = msg.ID
+	first := boostInput(2_500_000, at(2))
+	r, credited, created, err := s.AddBoost(ctx, chatID, msgID, userA, emoji, first)
+	require.NoError(t, err)
+	require.True(t, credited)
+	require.True(t, created)
+	require.Equal(t, uint64(1), r.Count)
+	require.Equal(t, uint64(1), r.Version)
+	require.Equal(t, uint64(2_500_000), r.BoostUsdMicros)
+	require.NotNil(t, r.Self)
+	require.Equal(t, userA.Value, r.Self.UserID.Value)
+	require.Equal(t, uint64(1), r.Self.Version)
+	require.Equal(t, at(2), r.Self.ReactedTs)
+	require.Equal(t, uint64(2_500_000), r.Self.BoostUsdMicros)
+	require.Len(t, r.SampleReactors, 1)
+	require.Equal(t, uint64(2_500_000), r.SampleReactors[0].BoostUsdMicros)
+
+	// The same payment again is a replay: nothing moves, nothing is credited.
+	again, credited, created, err := s.AddBoost(ctx, chatID, msgID, userA, emoji, first)
+	require.NoError(t, err)
+	require.False(t, credited)
+	require.False(t, created)
+	require.Equal(t, uint64(1), again.Version)
+	require.Equal(t, uint64(2_500_000), again.BoostUsdMicros)
+	require.NotNil(t, again.Self)
+	require.Equal(t, uint64(2_500_000), again.Self.BoostUsdMicros)
+
+	// The replay check is the message's, whatever emoji the repeat names: the
+	// same payment under another emoji is the same replay, and that emoji
+	// stays unreacted.
+	other, credited, created, err := s.AddBoost(ctx, chatID, msgID, userA, "👍", first)
+	require.NoError(t, err)
+	require.False(t, credited)
+	require.False(t, created)
+	require.Equal(t, uint64(0), other.Count)
+	require.Nil(t, other.Self, "the user never reacted with that emoji")
+	summary, err = s.GetReactionSummary(ctx, chatID, msgID)
+	require.NoError(t, err)
+	require.Len(t, summary, 1)
+	require.Equal(t, emoji, summary[0].Emoji)
+	require.Equal(t, uint64(2_500_000), summary[0].BoostUsdMicros)
+
+	// B reacts plainly, then boosts: the boost grows the totals but does not
+	// re-add or re-stamp B's reaction.
+	_, created2, _, err := s.AddReaction(ctx, chatID, msgID, userB, emoji, at(3))
+	require.NoError(t, err)
+	require.True(t, created2)
+	r, credited, created, err = s.AddBoost(ctx, chatID, msgID, userB, emoji, boostInput(1_000_000, at(4)))
+	require.NoError(t, err)
+	require.True(t, credited)
+	require.False(t, created)
+	require.Equal(t, uint64(2), r.Count)
+	require.Equal(t, uint64(3), r.Version)
+	require.Equal(t, uint64(3_500_000), r.BoostUsdMicros)
+	require.Equal(t, uint64(2), r.Self.Version, "the add's version, not the boost's")
+	require.Equal(t, at(3), r.Self.ReactedTs, "the add's time, not the boost's")
+	require.Equal(t, uint64(1_000_000), r.Self.BoostUsdMicros)
+
+	// A second boost by A adds to A's total; a second payment is a new record.
+	r, credited, _, err = s.AddBoost(ctx, chatID, msgID, userA, emoji, boostInput(500_000, at(5)))
+	require.NoError(t, err)
+	require.True(t, credited)
+	require.Equal(t, uint64(4), r.Version)
+	require.Equal(t, uint64(4_000_000), r.BoostUsdMicros)
+	require.Equal(t, uint64(3_000_000), r.Self.BoostUsdMicros)
+
+	// Every read agrees on the totals: the summary, the sample on it (A ahead
+	// of B by amount, though B reacted later), the self overlay and the list.
+	summary, err = s.GetReactionSummary(ctx, chatID, msgID)
+	require.NoError(t, err)
+	require.Len(t, summary, 1)
+	require.Equal(t, uint64(4_000_000), summary[0].BoostUsdMicros)
+	require.Len(t, summary[0].SampleReactors, 2)
+	require.Equal(t, userA.Value, summary[0].SampleReactors[0].UserID.Value)
+	require.Equal(t, uint64(3_000_000), summary[0].SampleReactors[0].BoostUsdMicros)
+	require.Equal(t, userB.Value, summary[0].SampleReactors[1].UserID.Value)
+	require.Equal(t, uint64(1_000_000), summary[0].SampleReactors[1].BoostUsdMicros)
+
+	self, err := s.GetSelfReactions(ctx, chatID, userB, []*messagingpb.MessageId{msgID})
+	require.NoError(t, err)
+	require.Len(t, self, 1)
+	require.Equal(t, uint64(1_000_000), self[0].BoostUsdMicros)
+	require.Equal(t, uint64(2), self[0].Version)
+
+	reactors, version, _, err := s.GetReactors(ctx, chatID, msgID, emoji)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), version)
+	require.Len(t, reactors, 2)
+	require.Equal(t, userA.Value, reactors[0].UserID.Value)
+	require.Equal(t, uint64(3_000_000), reactors[0].BoostUsdMicros)
+	require.Equal(t, userB.Value, reactors[1].UserID.Value)
+
+	// A boosted reaction is permanent: the removal is refused and nothing moves.
+	_, _, err = s.RemoveReaction(ctx, chatID, msgID, userB, emoji)
+	require.ErrorIs(t, err, messaging.ErrReactionBoosted)
+	summary, err = s.GetReactionSummary(ctx, chatID, msgID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), summary[0].Count)
+	require.Equal(t, uint64(4), summary[0].Version)
+
+	// Removing a reaction the user does not hold on a boosted emoji is still
+	// the plain no-op.
+	_, removed, err := s.RemoveReaction(ctx, chatID, msgID, sender, emoji)
+	require.NoError(t, err)
+	require.False(t, removed)
+}
+
+// testStore_Reactions_BoostOrder pins list order under boosts: the sample
+// holds the top boosters however many plain reactions follow, GetReactors
+// lists boosters by amount ahead of plain reactors by recency and pages
+// across that boundary, and a summary's emoji carry the totals that order
+// them.
+func testStore_Reactions_BoostOrder(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateGroupChatID()
+	sender := model.MustGenerateUserID()
+
+	msg, _, err := s.PutMessage(ctx, chatID, sender, textContent("order"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	msgID := msg.ID
+	const emoji = "👍"
+
+	// Twenty plain reactors, u0 first. Then the three OLDEST boost, the oldest
+	// the least, then twenty more plain reactors.
+	users := make([]*commonpb.UserId, 40)
+	for i := range users {
+		users[i] = model.MustGenerateUserID()
+	}
+	for i := 0; i < 20; i++ {
+		_, _, _, err := s.AddReaction(ctx, chatID, msgID, users[i], emoji, at(int64(10+i)))
+		require.NoError(t, err)
+	}
+	// u0, u1 and u2 have been evicted from the retained sample by now (it
+	// holds the newest 16); a boost puts them back at its head.
+	for i, micros := range []uint64{1_000_000, 2_000_000, 3_000_000} {
+		_, credited, _, err := s.AddBoost(ctx, chatID, msgID, users[i], emoji, boostInput(micros, at(int64(40+i))))
+		require.NoError(t, err)
+		require.True(t, credited)
+	}
+	for i := 20; i < 40; i++ {
+		_, _, _, err := s.AddReaction(ctx, chatID, msgID, users[i], emoji, at(int64(50+i)))
+		require.NoError(t, err)
+	}
+
+	ids := func(reactors []*messaging.Reactor) [][]byte {
+		out := make([][]byte, len(reactors))
+		for i, r := range reactors {
+			out[i] = r.UserID.Value
+		}
+		return out
+	}
+
+	// The sample opens with the boosters by amount, then the newest plain
+	// reactors: twenty plain adds after the boosts evicted none of them.
+	summary, err := s.GetReactionSummary(ctx, chatID, msgID)
+	require.NoError(t, err)
+	require.Len(t, summary, 1)
+	require.Equal(t, uint64(40), summary[0].Count)
+	require.Equal(t, uint64(6_000_000), summary[0].BoostUsdMicros)
+	sample := summary[0].SampleReactors
+	require.Len(t, sample, messaging.MaxSampleReactors)
+	require.Equal(t, [][]byte{users[2].Value, users[1].Value, users[0].Value}, ids(sample[:3]))
+	for i := 3; i < messaging.MaxSampleReactors; i++ {
+		require.Equal(t, users[39-(i-3)].Value, sample[i].UserID.Value, "plain reactors newest first at %d", i)
+		require.Zero(t, sample[i].BoostUsdMicros)
+	}
+
+	// The full list is the same order all the way down.
+	all, version, hasMore, err := s.GetReactors(ctx, chatID, msgID, emoji)
+	require.NoError(t, err)
+	require.False(t, hasMore)
+	require.Equal(t, uint64(43), version)
+	require.Len(t, all, 40)
+	require.Equal(t, [][]byte{users[2].Value, users[1].Value, users[0].Value}, ids(all[:3]))
+	require.Equal(t, uint64(3), all[0].Version, "a boost keeps the add's version")
+	for i := 3; i < 40; i++ {
+		require.Equal(t, users[39-(i-3)].Value, all[i].UserID.Value, "position %d", i)
+	}
+
+	// Pages of two cross the boundary between boosters and plain reactors
+	// without a gap or a repeat.
+	var walked []*messaging.Reactor
+	var token *commonpb.PagingToken
+	for {
+		var opts []database.QueryOption
+		opts = append(opts, database.WithLimit(2))
+		if token != nil {
+			opts = append(opts, database.WithPagingToken(token))
+		}
+		page, _, more, err := s.GetReactors(ctx, chatID, msgID, emoji, opts...)
+		require.NoError(t, err)
+		walked = append(walked, page...)
+		if !more {
+			break
+		}
+		require.Len(t, page, 2)
+		token = messaging.ReactorPageToken(page[len(page)-1])
+	}
+	require.Equal(t, ids(all), ids(walked))
+
+	// A token from before boosts (the version alone) has no position in this
+	// order and restarts the list; so does anything else malformed.
+	for _, stale := range [][]byte{binary.BigEndian.AppendUint64(nil, all[5].Version), {1, 2, 3}} {
+		restarted, _, _, err := s.GetReactors(ctx, chatID, msgID, emoji, database.WithPagingToken(&commonpb.PagingToken{Value: stale}))
+		require.NoError(t, err)
+		require.Equal(t, ids(all), ids(restarted))
+	}
+
+	// A cursor on the last booster resumes at the first plain reactor; one on
+	// a plain reactor never returns to the boosters.
+	tail, _, _, err := s.GetReactors(ctx, chatID, msgID, emoji, database.WithPagingToken(messaging.ReactorPageToken(all[2])))
+	require.NoError(t, err)
+	require.Equal(t, ids(all[3:]), ids(tail))
+	tail, _, _, err = s.GetReactors(ctx, chatID, msgID, emoji, database.WithPagingToken(messaging.ReactorPageToken(all[5])))
+	require.NoError(t, err)
+	require.Equal(t, ids(all[6:]), ids(tail))
+
+	// Across emoji, a summary carries each total; the wire order is the
+	// projection's (see messaging.ReactionLess), so the store only has to
+	// report them.
+	_, _, _, err = s.AddReaction(ctx, chatID, msgID, users[0], "❤️", at(100))
+	require.NoError(t, err)
+	_, _, _, err = s.AddBoost(ctx, chatID, msgID, users[1], "❤️", boostInput(10_000_000, at(101)))
+	require.NoError(t, err)
+	summary, err = s.GetReactionSummary(ctx, chatID, msgID)
+	require.NoError(t, err)
+	totals := map[string]uint64{}
+	for _, r := range summary {
+		totals[r.Emoji] = r.BoostUsdMicros
+	}
+	require.Equal(t, map[string]uint64{"👍": 6_000_000, "❤️": 10_000_000}, totals)
+
+	// A booster evicted from the sample by bigger boosters who boosts again
+	// comes back at their whole total, not the new payment alone: b0 at $5,
+	// then sixteen at $10 each (b0 is the least, and out), then $6 more from
+	// b0 makes them the top booster at $11, and the sample must lead with
+	// them and have let the least $10 go.
+	msg, _, err = s.PutMessage(ctx, chatID, sender, textContent("return"), at(200), generateClientID(), true)
+	require.NoError(t, err)
+	returnID := msg.ID
+	b0 := model.MustGenerateUserID()
+	_, _, _, err = s.AddBoost(ctx, chatID, returnID, b0, emoji, boostInput(5_000_000, at(201)))
+	require.NoError(t, err)
+	bigger := make([]*commonpb.UserId, messaging.MaxStoredSampleReactors)
+	for i := range bigger {
+		bigger[i] = model.MustGenerateUserID()
+		_, _, _, err = s.AddBoost(ctx, chatID, returnID, bigger[i], emoji, boostInput(10_000_000, at(int64(210+i))))
+		require.NoError(t, err)
+	}
+	summary, err = s.GetReactionSummary(ctx, chatID, returnID)
+	require.NoError(t, err)
+	require.Len(t, summary, 1)
+	require.Len(t, summary[0].SampleReactors, messaging.MaxSampleReactors)
+	for _, r := range summary[0].SampleReactors {
+		require.NotEqual(t, b0.Value, r.UserID.Value, "b0 was the least booster and is out of the sample")
+	}
+	// Out of the sample is not off the list: the full read still has b0, at
+	// the end of the head.
+	all, _, _, err = s.GetReactors(ctx, chatID, returnID, emoji)
+	require.NoError(t, err)
+	require.Len(t, all, 17)
+	require.Equal(t, b0.Value, all[16].UserID.Value, "the least booster is last")
+	require.Equal(t, uint64(5_000_000), all[16].BoostUsdMicros)
+	r, credited, created, err := s.AddBoost(ctx, chatID, returnID, b0, emoji, boostInput(6_000_000, at(300)))
+	require.NoError(t, err)
+	require.True(t, credited)
+	require.False(t, created)
+	require.Equal(t, uint64(11_000_000), r.Self.BoostUsdMicros)
+	require.Equal(t, uint64(1), r.Self.Version, "the add's version, the first boost's")
+	require.Equal(t, b0.Value, r.SampleReactors[0].UserID.Value, "back at the head of the sample")
+	require.Equal(t, uint64(11_000_000), r.SampleReactors[0].BoostUsdMicros, "at their whole total")
+	summary, err = s.GetReactionSummary(ctx, chatID, returnID)
+	require.NoError(t, err)
+	require.Len(t, summary[0].SampleReactors, messaging.MaxSampleReactors)
+	require.Equal(t, b0.Value, summary[0].SampleReactors[0].UserID.Value)
+	require.Equal(t, uint64(11_000_000), summary[0].SampleReactors[0].BoostUsdMicros)
+	require.Equal(t, uint64(10_000_000), summary[0].SampleReactors[1].BoostUsdMicros)
+	require.Equal(t, uint64(5_000_000+16*10_000_000+6_000_000), summary[0].BoostUsdMicros)
+	all, _, _, err = s.GetReactors(ctx, chatID, returnID, emoji)
+	require.NoError(t, err)
+	require.Len(t, all, 17)
+	require.Equal(t, b0.Value, all[0].UserID.Value)
+	require.Equal(t, uint64(11_000_000), all[0].BoostUsdMicros)
+}
+
+// testStore_Reactions_BoostPastTypeCap pins that a boost adds its reaction
+// whatever the message's distinct-emoji count: the money is paid, so the cap
+// AddReaction enforces does not apply.
+func testStore_Reactions_BoostPastTypeCap(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateGroupChatID()
+	sender := model.MustGenerateUserID()
+	user := model.MustGenerateUserID()
+
+	msg, _, err := s.PutMessage(ctx, chatID, sender, textContent("cap"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	msgID := msg.ID
+
+	for i := 0; i < messaging.MaxReactionTypesPerMessage; i++ {
+		_, _, tooMany, err := s.AddReaction(ctx, chatID, msgID, user, fmt.Sprintf("e-%d", i), at(int64(2+i)))
+		require.NoError(t, err)
+		require.False(t, tooMany)
+	}
+	_, _, tooMany, err := s.AddReaction(ctx, chatID, msgID, user, "🚀", at(50))
+	require.NoError(t, err)
+	require.True(t, tooMany)
+
+	r, credited, created, err := s.AddBoost(ctx, chatID, msgID, user, "🚀", boostInput(1_000_000, at(51)))
+	require.NoError(t, err)
+	require.True(t, credited)
+	require.True(t, created)
+	require.Equal(t, uint64(1), r.Count)
+	require.Equal(t, uint64(1_000_000), r.BoostUsdMicros)
+
+	summary, err := s.GetReactionSummary(ctx, chatID, msgID)
+	require.NoError(t, err)
+	require.Len(t, summary, messaging.MaxReactionTypesPerMessage+1)
+}
+
+// boostInput is a fresh payment of usdMicros recorded at ts, with a distinct
+// intent ID each call so two boosts are never replays of each other.
+func boostInput(usdMicros uint64, ts time.Time) messaging.BoostInput {
+	return messaging.BoostInput{
+		IntentID: &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()},
+		Amount: &commonpb.CryptoPaymentAmount{
+			Currency:     "usd",
+			NativeAmount: messaging.UsdFromMicros(usdMicros),
+			Quarks:       usdMicros,
+			Mint:         &commonpb.PublicKey{Value: model.MustGenerateKeyPair().Public()},
+		},
+		UsdMicros: usdMicros,
+		Ts:        ts,
+	}
 }

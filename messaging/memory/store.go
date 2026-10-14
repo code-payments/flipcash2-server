@@ -3,6 +3,7 @@ package memory
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sort"
 	"strconv"
 	"sync"
@@ -37,6 +38,7 @@ type chatState struct {
 	byClient     map[string]uint64                  // client message ID -> seq
 	pointers     map[string]*messagingpb.Pointer    // pointerKey -> pointer
 	reactions    map[uint64]map[string]*reactionAgg // message seq -> emoji -> aggregate
+	boostIntents map[uint64]map[string]struct{}     // message seq -> string(intentID.Value) of every boost recorded on the message, for the replay check (see messaging.Store.AddBoost)
 }
 
 // reactionAgg is a single emoji's aggregate on a message. The entry is retained
@@ -44,30 +46,50 @@ type chatState struct {
 // across an emoji being removed and re-added; an empty aggregate is treated as
 // inactive (absent from summaries, not counted toward the per-message type cap).
 //
-// Each reactor records the version that added them, the ordering key for every
-// reactor list (see messaging.ReactorLess). sample is the bounded subset of
-// reactors retained for the surfaced sample, capped at
-// messaging.MaxStoredSampleReactors (a new reactor evicts the lowest-version
-// entry once full) and never backfilled on removal — it mirrors the DynamoDB
-// store's sample map so both back ends behave identically.
+// Each reactor records the version that added them, when, and their boost
+// total, the keys of every reactor list (see messaging.ReactorLess). sample is
+// the bounded subset of reactors retained for the surfaced sample, capped at
+// messaging.MaxStoredSampleReactors (an insert past the cap evicts the least
+// entry by messaging.ReactorLess, so boosters are pinned ahead of plain
+// reactors) and never backfilled on removal — it mirrors the DynamoDB store's
+// sample map so both back ends behave identically. boostMicros is the emoji's
+// total, the sum of its reactors' (messaging.Reaction.BoostUsdMicros); boosts
+// is every boost recorded on the emoji, in order. The replay check is the
+// message's (chatState.boostIntents), not the emoji's, as in the DynamoDB
+// store, where the boost record is keyed by message and intent.
 type reactionAgg struct {
-	version  uint64
-	reactors map[string]reactorEntry // string(userID.Value) -> entry
-	sample   map[string]reactorEntry // bounded subset of reactors, string(userID.Value) -> entry
+	version     uint64
+	reactors    map[string]reactorEntry // string(userID.Value) -> entry
+	sample      map[string]reactorEntry // bounded subset of reactors, string(userID.Value) -> entry
+	boostMicros uint64
+	boosts      []messaging.Boost
 }
 
-// reactorEntry is one user's reaction: the version that added it and when.
+// reactorEntry is one user's reaction: the version that added it, when, and
+// the user's boost total on the emoji (0 for a plain reaction).
 type reactorEntry struct {
 	version uint64
 	ts      time.Time
+	boost   uint64
+}
+
+// reactor projects an entry onto a messaging.Reactor for userKey.
+func (e reactorEntry) reactor(userKey string) *messaging.Reactor {
+	return &messaging.Reactor{
+		UserID:         &commonpb.UserId{Value: []byte(userKey)},
+		ReactedTs:      e.ts,
+		Version:        e.version,
+		BoostUsdMicros: e.boost,
+	}
 }
 
 func newChatState() *chatState {
 	return &chatState{
-		messages:  make(map[uint64]*messaging.Message),
-		byClient:  make(map[string]uint64),
-		pointers:  make(map[string]*messagingpb.Pointer),
-		reactions: make(map[uint64]map[string]*reactionAgg),
+		messages:     make(map[uint64]*messaging.Message),
+		byClient:     make(map[string]uint64),
+		pointers:     make(map[string]*messagingpb.Pointer),
+		reactions:    make(map[uint64]map[string]*reactionAgg),
+		boostIntents: make(map[uint64]map[string]struct{}),
 	}
 }
 
@@ -587,7 +609,7 @@ func (m *memory) AddReaction(
 	// Idempotent: the user already reacted with this emoji.
 	if agg != nil {
 		if existing, ok := agg.reactors[userKey]; ok {
-			return selfReaction(buildReaction(emoji, agg), userID, existing.version, existing.ts), false, false, nil
+			return selfReaction(buildReaction(emoji, agg), userID, existing), false, false, nil
 		}
 	}
 
@@ -600,32 +622,133 @@ func (m *memory) AddReaction(
 	}
 
 	if agg == nil {
-		agg = &reactionAgg{reactors: make(map[string]reactorEntry), sample: make(map[string]reactorEntry)}
+		agg = newReactionAgg()
 		byEmoji[emoji] = agg
 	}
 	agg.version++
 	entry := reactorEntry{version: agg.version, ts: ts}
 	agg.reactors[userKey] = entry
-	// Maintain the recent sample: insert this reactor and, if that pushes the stored
-	// set over its cap, evict the lowest-version entry. This keeps the sample the
-	// most-recent MaxStoredSampleReactors (reads surface the most-recent
-	// MaxSampleReactors of it); it is not backfilled on removal.
+	// Maintain the sample: insert this reactor and, if that pushes the stored
+	// set over its cap, evict the least entry in list order. This keeps the
+	// sample the list's head (reads surface the first MaxSampleReactors of it);
+	// it is not backfilled on removal.
 	agg.sample[userKey] = entry
 	if len(agg.sample) > messaging.MaxStoredSampleReactors {
-		evictLeastRecentSample(agg.sample)
+		evictLeastSample(agg.sample)
 	}
 
-	return selfReaction(buildReaction(emoji, agg), userID, entry.version, entry.ts), true, false, nil
+	return selfReaction(buildReaction(emoji, agg), userID, entry), true, false, nil
 }
 
-// selfReaction marks an AddReaction result as the reactor's own view: their
-// own entry, at the version that added their reaction and when.
-func selfReaction(r *messaging.Reaction, userID *commonpb.UserId, addedAt uint64, reactedTs time.Time) *messaging.Reaction {
-	r.Self = &messaging.Reactor{
-		UserID:    &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
-		ReactedTs: reactedTs,
-		Version:   addedAt,
+func (m *memory) AddBoost(
+	_ context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	userID *commonpb.UserId,
+	emoji string,
+	boost messaging.BoostInput,
+) (*messaging.Reaction, bool, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, false, false, messaging.ErrBoostGroupOnly
 	}
+	if boost.IntentID == nil || len(boost.IntentID.Value) == 0 {
+		return nil, false, false, errors.New("boost has no intent id")
+	}
+	if boost.UsdMicros == 0 {
+		return nil, false, false, messaging.ErrBoostEmpty
+	}
+	if boost.Amount == nil {
+		return nil, false, false, errors.New("boost has no amount")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	cs := m.chats[string(chatID.Value)]
+	if cs == nil {
+		cs = newChatState()
+		m.chats[string(chatID.Value)] = cs
+	}
+	userKey := string(userID.Value)
+
+	// A replay: the payment is already recorded on the message, under this
+	// emoji or another. Nothing moves, and an emoji the replay names that
+	// has no aggregate gets none (the DynamoDB store writes nothing either).
+	if _, recorded := cs.boostIntents[messageID.Value][string(boost.IntentID.Value)]; recorded {
+		agg := cs.reactions[messageID.Value][emoji]
+		if agg == nil {
+			return &messaging.Reaction{Emoji: emoji}, false, false, nil
+		}
+		r := buildReaction(emoji, agg)
+		if entry, reacted := agg.reactors[userKey]; reacted {
+			r = selfReaction(r, userID, entry)
+		}
+		return r, false, false, nil
+	}
+
+	byEmoji := cs.reactions[messageID.Value]
+	if byEmoji == nil {
+		byEmoji = make(map[string]*reactionAgg)
+		cs.reactions[messageID.Value] = byEmoji
+	}
+	agg := byEmoji[emoji]
+	if agg == nil {
+		agg = newReactionAgg()
+		byEmoji[emoji] = agg
+	}
+	intents := cs.boostIntents[messageID.Value]
+	if intents == nil {
+		intents = make(map[string]struct{})
+		cs.boostIntents[messageID.Value] = intents
+	}
+
+	// The reaction is added if absent, whatever the message's active emoji
+	// count: the money is paid (see the Store contract).
+	agg.version++
+	entry, existed := agg.reactors[userKey]
+	if !existed {
+		entry = reactorEntry{version: agg.version, ts: boost.Ts}
+	}
+	entry.boost += boost.UsdMicros
+	agg.reactors[userKey] = entry
+	agg.boostMicros += boost.UsdMicros
+
+	// The booster belongs in the sample: inserted with their reaction's own
+	// version and time if they were never in it or were evicted, or their
+	// entry's total raised. Only an insert can overfill the set, and then the
+	// least entry goes — a plain reactor while any remains.
+	agg.sample[userKey] = entry
+	if len(agg.sample) > messaging.MaxStoredSampleReactors {
+		evictLeastSample(agg.sample)
+	}
+
+	agg.boosts = append(agg.boosts, messaging.Boost{
+		MessageID: &messagingpb.MessageId{Value: messageID.Value},
+		Emoji:     emoji,
+		UserID:    &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
+		Amount:    proto.Clone(boost.Amount).(*commonpb.CryptoPaymentAmount),
+		UsdMicros: boost.UsdMicros,
+		IntentID:  &commonpb.IntentId{Value: append([]byte(nil), boost.IntentID.Value...)},
+		Ts:        boost.Ts,
+		Version:   agg.version,
+	})
+	intents[string(boost.IntentID.Value)] = struct{}{}
+
+	return selfReaction(buildReaction(emoji, agg), userID, entry), true, !existed, nil
+}
+
+func newReactionAgg() *reactionAgg {
+	return &reactionAgg{
+		reactors: make(map[string]reactorEntry),
+		sample:   make(map[string]reactorEntry),
+	}
+}
+
+// selfReaction marks an AddReaction or AddBoost result as the reactor's own
+// view: their own entry, at the version that added their reaction, when, and
+// with their boost total.
+func selfReaction(r *messaging.Reaction, userID *commonpb.UserId, entry reactorEntry) *messaging.Reaction {
+	r.Self = entry.reactor(string(userID.Value))
 	return r
 }
 
@@ -651,8 +774,13 @@ func (m *memory) RemoveReaction(
 		return nil, false, nil
 	}
 	// Idempotent: the user didn't react. Reflect the current state.
-	if _, ok := agg.reactors[userKey]; !ok {
+	entry, ok := agg.reactors[userKey]
+	if !ok {
 		return buildReaction(emoji, agg), false, nil
+	}
+	// A boosted reaction is permanent (see the Store contract).
+	if entry.boost > 0 {
+		return nil, false, messaging.ErrReactionBoosted
 	}
 
 	delete(agg.reactors, userKey)
@@ -799,10 +927,11 @@ func (m *memory) GetSelfReactions(
 		for emoji, agg := range cs.reactions[id.Value] {
 			if entry, ok := agg.reactors[userKey]; ok {
 				present = append(present, messaging.SelfReaction{
-					MessageID: &messagingpb.MessageId{Value: id.Value},
-					Emoji:     emoji,
-					Version:   entry.version,
-					ReactedTs: entry.ts,
+					MessageID:      &messagingpb.MessageId{Value: id.Value},
+					Emoji:          emoji,
+					Version:        entry.version,
+					ReactedTs:      entry.ts,
+					BoostUsdMicros: entry.boost,
 				})
 			}
 		}
@@ -836,11 +965,11 @@ func (m *memory) GetReactors(
 
 	reactors := reactorsOf(agg)
 
-	// Resume strictly below the cursor version, in most-recent-first order.
+	// Resume strictly after the cursor, in list order.
 	if cursor, ok := messaging.ReactorFromPageToken(q.PagingToken); ok {
 		filtered := reactors[:0]
 		for _, r := range reactors {
-			if r.Version < cursor {
+			if messaging.ReactorAfterCursor(cursor, r) {
 				filtered = append(filtered, r)
 			}
 		}
@@ -859,41 +988,38 @@ func (m *memory) GetReactors(
 }
 
 // buildReaction projects an in-memory aggregate onto a messaging.Reaction. The
-// surfaced sample is the most-recent MaxSampleReactors of the retained sample set
-// (see messaging.SampleFromReactors). The per-viewer Self is left nil
-// for the server to overlay.
+// surfaced sample is the first MaxSampleReactors of the retained sample set in
+// list order (see messaging.SampleFromReactors). The per-viewer Self is left
+// nil for the server to overlay.
 func buildReaction(emoji string, agg *reactionAgg) *messaging.Reaction {
 	sample := make([]*messaging.Reactor, 0, len(agg.sample))
 	for userKey, entry := range agg.sample {
-		sample = append(sample, &messaging.Reactor{
-			UserID:    &commonpb.UserId{Value: []byte(userKey)},
-			ReactedTs: entry.ts,
-			Version:   entry.version,
-		})
+		sample = append(sample, entry.reactor(userKey))
 	}
 	return &messaging.Reaction{
 		Emoji:          emoji,
 		Count:          uint64(len(agg.reactors)),
 		Version:        agg.version,
+		BoostUsdMicros: agg.boostMicros,
 		SampleReactors: messaging.SampleFromReactors(sample),
 	}
 }
 
-// evictLeastRecentSample removes the single least-recent entry from a sample map
-// (lowest version; ties, impossible among real reactors, broken by larger user
-// key), restoring it to MaxStoredSampleReactors after an over-cap insert. The
-// tie-break matches messaging.ReactorLess, whose user-ID order on the raw-byte
-// keys is the same as the lexicographic order used here.
-func evictLeastRecentSample(sample map[string]reactorEntry) {
+// evictLeastSample removes the single least entry in list order from a sample
+// map (see messaging.ReactorLess: the least boosted, then the oldest; a tie,
+// impossible among real reactors, broken by larger user key), restoring it to
+// MaxStoredSampleReactors after an over-cap insert. A boosted entry is never
+// evicted while a plain one remains.
+func evictLeastSample(sample map[string]reactorEntry) {
 	var evictKey string
-	var lowest uint64
-	first := true
+	var least *messaging.Reactor
 	for k, e := range sample {
-		if first || e.version < lowest || (e.version == lowest && k > evictKey) {
-			evictKey, lowest, first = k, e.version, false
+		r := e.reactor(k)
+		if least == nil || messaging.ReactorLess(least, r) {
+			evictKey, least = k, r
 		}
 	}
-	if !first {
+	if least != nil {
 		delete(sample, evictKey)
 	}
 }
@@ -915,16 +1041,12 @@ func summarize(byEmoji map[string]*reactionAgg) []*messaging.Reaction {
 	return out
 }
 
-// reactorsOf returns an aggregate's reactors most-recent-first (see
+// reactorsOf returns an aggregate's reactors in list order (see
 // messaging.ReactorLess), the canonical order for samples and GetReactors paging.
 func reactorsOf(agg *reactionAgg) []*messaging.Reactor {
 	out := make([]*messaging.Reactor, 0, len(agg.reactors))
 	for userKey, entry := range agg.reactors {
-		out = append(out, &messaging.Reactor{
-			UserID:    &commonpb.UserId{Value: []byte(userKey)},
-			ReactedTs: entry.ts,
-			Version:   entry.version,
-		})
+		out = append(out, entry.reactor(userKey))
 	}
 	sort.Slice(out, func(i, j int) bool { return messaging.ReactorLess(out[i], out[j]) })
 	return out

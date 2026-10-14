@@ -50,6 +50,23 @@ var (
 // nothing.
 var ErrSelfReactionsGroupOnly = errors.New("self reactions are read for groups only")
 
+// ErrReactionBoosted is returned by Store.RemoveReaction when the reaction is
+// boosted (see Reactor.BoostUsdMicros): money has been paid on it, so it is
+// permanent, and nothing changes.
+var ErrReactionBoosted = errors.New("reaction is boosted and cannot be removed")
+
+// ErrBoostEmpty is returned by Store.AddBoost for a boost worth nothing
+// (BoostInput.UsdMicros of 0): a reaction is boosted exactly when its total
+// is positive, so a boost of nothing has no state to land in and is refused
+// rather than recorded as a boost that looks plain.
+var ErrBoostEmpty = errors.New("boost is worth nothing")
+
+// ErrBoostGroupOnly is returned by Store.AddBoost for a DM: a boost pays the
+// group's creator (see boost.go), so there is no such thing as a boost in a
+// DM, and the write is refused before anything is read rather than leaving a
+// reaction no one can remove with no one paid for it.
+var ErrBoostGroupOnly = errors.New("boosts are recorded for groups only")
+
 // MessageRef identifies a single message within a chat. It is the unit of a
 // cross-chat batch read (see Store.GetMessagesByRefs) — e.g. one ref per chat to
 // fetch every chat's last message for the feed.
@@ -125,6 +142,23 @@ type SelfReaction struct {
 	Emoji     string
 	Version   uint64
 	ReactedTs time.Time
+	// BoostUsdMicros is the viewer's own total on the emoji
+	// (Reactor.BoostUsdMicros), 0 for a plain reaction.
+	BoostUsdMicros uint64
+}
+
+// BoostInput is the payment a boost records (see Store.AddBoost): what a Boost
+// carries beyond the reaction it sits on. IntentID identifies the payment and
+// is the write's idempotency key; UsdMicros is the payment's market value in
+// millionths of a US dollar (MicrosFromUsd), what the totals grow by; Amount
+// is the payment as made, kept exact on the record, and required; Ts is when
+// the boost is recorded, and becomes the reaction's ReactedTs when the boost
+// adds it.
+type BoostInput struct {
+	IntentID  *commonpb.IntentId
+	Amount    *commonpb.CryptoPaymentAmount
+	UsdMicros uint64
+	Ts        time.Time
 }
 
 // StoredPointerTypes are the only pointer types persisted, for any chat type:
@@ -385,10 +419,58 @@ type Store interface {
 		ts time.Time,
 	) (reaction *Reaction, created bool, tooManyTypes bool, err error)
 
+	// AddBoost records a boost: userID's payment to put money behind emoji on
+	// a message (see boost.go for what a boost is). In one atomic write it
+	// keeps the Boost record (keyed by the payment's intent ID), adds userID's
+	// reaction with emoji if they have none, grows the emoji's and userID's
+	// totals by boost.UsdMicros, places userID in the retained sample
+	// (inserted with their reaction's version and time, or their entry's
+	// total raised; the least entry by ReactorLess evicted when that
+	// overfills it, so the sample always holds the top boosters), and
+	// advances the emoji's version by one. The result is the emoji's
+	// aggregate after the write as the booster's own view: Self is their
+	// entry with their new total.
+	//
+	// It is idempotent on the intent ID, scoped to the message: a boost
+	// already recorded on the message under that intent ID is a replay, with
+	// whatever emoji it names, which returns the current aggregate with
+	// credited false and changes nothing, so the task that records a payment
+	// can be delivered more than once. credited reports whether this call
+	// recorded the boost, so callers can skip the broadcast on a replay;
+	// created whether it added the reaction (false when userID had already
+	// reacted, and on a replay).
+	//
+	// It is for groups only: a DM's ID is ErrBoostGroupOnly, and
+	// boost.UsdMicros must be positive, a boost worth nothing being
+	// ErrBoostEmpty; both are refused before the intent ID is looked at and
+	// record nothing. boost.IntentID and boost.Amount must be set; a boost
+	// without either is an error, and nothing is written.
+	//
+	// A boost adds its reaction whatever the message's distinct-emoji count:
+	// the money has been paid, so the cap that AddReaction enforces is not
+	// applied here (the caller refuses the payment up front instead). It does
+	// not verify the message exists or is reactable, as AddReaction does not;
+	// a boost on a message that has since been deleted still lands.
+	AddBoost(
+		ctx context.Context,
+		chatID *commonpb.ChatId,
+		messageID *messagingpb.MessageId,
+		userID *commonpb.UserId,
+		emoji string,
+		boost BoostInput,
+	) (reaction *Reaction, credited bool, created bool, err error)
+
 	// RemoveReaction removes userID's reaction with emoji from a message. It is
 	// idempotent: removing a reaction that isn't present returns removed false and
 	// changes nothing. removed reports whether this call actually removed the
 	// reaction, so callers can skip the broadcast.
+	//
+	// A boosted reaction (one with a non-zero Reactor.BoostUsdMicros) is
+	// permanent: the call returns ErrReactionBoosted and changes nothing. The
+	// refusal is decided by the write itself, conditioned on the reactor's row
+	// carrying no boost, so a boost that lands between the store's read and
+	// its write still makes the removal lose rather than take the boost's row
+	// with it.
 	//
 	// reaction is the emoji's aggregate after the removal, with Count possibly 0
 	// when the last reactor left (it still carries the advanced Version, which
@@ -448,8 +530,9 @@ type Store interface {
 	) ([]*ReactionSummary, error)
 
 	// GetSelfReactions returns every reaction userID currently holds on the given
-	// messages of a group, each with the version that added it and when — the
-	// per-viewer data behind Reaction.Self and EmojiReaction.self_reactor. It is
+	// messages of a group, each with the version that added it, when, and the
+	// viewer's boost total on it — the per-viewer data behind Reaction.Self and
+	// EmojiReaction.self_reactor. It is
 	// the viewer's half of a summary read: the aggregates are shareable and
 	// leave Self unset, and this answers it for one viewer across a
 	// whole page. The read is addressed by the viewer, not by every (message,
@@ -475,21 +558,42 @@ type Store interface {
 	) ([]SelfReaction, error)
 
 	// GetReactors returns a page of the users who reacted to a message with emoji,
-	// most-recent-first (see ReactorLess), paged via the query options (the paging
-	// token is a ReactorPageToken). It also returns hasMore, whether further pages
+	// in list order (see ReactorLess): most boosted first, then most recent
+	// first, paged via the query options (the paging token is a
+	// ReactorPageToken, which resumes strictly after the reactor it names under
+	// that order, so a page boundary may fall between the last booster and the
+	// first plain reactor). It also returns hasMore, whether further pages
 	// remain. Returns an empty result (no error) when the message has no reactors
-	// for the emoji. The read is strongly consistent: it reflects every add and
-	// remove that completed before it.
+	// for the emoji.
 	//
-	// version is the emoji aggregate's version (Reaction.Version), read BEFORE the
-	// page, so the page reflects at least every transition up to it and possibly
-	// more. That direction is the safe one: a client holding version may apply live
-	// updates for the emoji whose version exceeds it, and any it re-applies are
-	// idempotent (an add of a reactor already listed dedupes, a remove of one
-	// already absent is a no-op), whereas a version newer than the page would make
-	// it drop an update the page is missing. It is 0 when the emoji has no
-	// aggregate. A page cannot read the two atomically, so the order of the reads
-	// is the contract.
+	// With no limit in the options the whole list is returned and hasMore is
+	// false; the RPC always sets one.
+	//
+	// The plain reactors are read strongly consistent: the page reflects every
+	// add and remove that completed before it. So is the boosted head while
+	// the emoji has at most MaxStoredSampleReactors boosters, the common
+	// case, since the retained sample then holds every booster and serves
+	// the head. Past that size the head may be served from an index that
+	// trails a boost by a moment, so a reactor whose boost has just landed
+	// can be missing from a page: the boost moved their row out of the plain
+	// index at once (the strongly consistent read no longer finds it) while
+	// the boosted index has yet to list it; they appear on the next read.
+	// The booster's own client is the likeliest to refetch, since the
+	// BOOSTED update reaches it first, which is why the exact head covers
+	// every emoji but the rare one with many boosters.
+	//
+	// version is the emoji aggregate's version (Reaction.Version), read BEFORE
+	// the page, so the plain tail, and a head served from the sample, reflect
+	// at least every transition up to it and possibly more; a head served
+	// from the index is the exception above, and may lack a boost at or
+	// below it. That direction is the safe one: a client holding version may
+	// apply live updates for the emoji whose version exceeds it, and any it
+	// re-applies are idempotent (an add of a reactor already listed dedupes,
+	// a remove of one already absent is a no-op, a boost re-applied is the
+	// same total), whereas a version newer than the page would make it drop
+	// an update the page is missing. It is 0 when the emoji has no aggregate.
+	// A page cannot read the two atomically, so the order of the reads is
+	// the contract.
 	GetReactors(
 		ctx context.Context,
 		chatID *commonpb.ChatId,
@@ -517,22 +621,49 @@ func IDFromPageToken(token *commonpb.PagingToken) (messageID uint64, ok bool) {
 	return binary.BigEndian.Uint64(token.Value), true
 }
 
+// ReactorCursor is a position in an emoji's reactor list (see ReactorLess):
+// the boost total and version of the last reactor returned. Versions are
+// unique within an emoji, so the pair names one reactor, and the next page
+// resumes strictly after them (see ReactorAfterCursor). A cursor with a boost
+// total is in the boosted head of the list; one without is in the plain tail,
+// which every boosted reactor precedes.
+type ReactorCursor struct {
+	BoostUsdMicros uint64
+	Version        uint64
+}
+
+// ReactorAfterCursor reports whether reactor lies strictly after cursor in
+// list order: less boosted, or as boosted and older. It is how every backend
+// applies a page token, so a page boundary means the same thing everywhere.
+func ReactorAfterCursor(cursor ReactorCursor, reactor *Reactor) bool {
+	if reactor.BoostUsdMicros != cursor.BoostUsdMicros {
+		return reactor.BoostUsdMicros < cursor.BoostUsdMicros
+	}
+	return reactor.Version < cursor.Version
+}
+
 // ReactorPageToken encodes a reactor as the server-issued cursor returned in
-// GetReactorsResponse.paging_token. Reactors are returned most-recent-first, i.e.
-// by descending Reactor.Version, and versions are unique within an emoji, so the
-// token is that version alone; the next page resumes strictly below it. The
-// token is opaque to the client, which echoes it back in options.paging_token.
+// GetReactorsResponse.paging_token: its ReactorCursor, boost total then
+// version, each big-endian. The token is opaque to the client, which echoes it
+// back in options.paging_token.
 func ReactorPageToken(reactor *Reactor) *commonpb.PagingToken {
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, reactor.Version)
+	buf := make([]byte, 16)
+	binary.BigEndian.PutUint64(buf[:8], reactor.BoostUsdMicros)
+	binary.BigEndian.PutUint64(buf[8:], reactor.Version)
 	return &commonpb.PagingToken{Value: buf}
 }
 
-// ReactorFromPageToken decodes the version cursor from a token produced by
-// ReactorPageToken. The ok return is false if the token is nil or malformed.
-func ReactorFromPageToken(token *commonpb.PagingToken) (version uint64, ok bool) {
-	if token == nil || len(token.Value) != 8 {
-		return 0, false
+// ReactorFromPageToken decodes the cursor from a token produced by
+// ReactorPageToken. The ok return is false if the token is nil or malformed,
+// which every store answers with the first page: that covers the 8-byte,
+// version-only token issued before boosts, which has no position in the
+// boost-first order and so restarts the list rather than resuming it.
+func ReactorFromPageToken(token *commonpb.PagingToken) (cursor ReactorCursor, ok bool) {
+	if token == nil || len(token.Value) != 16 {
+		return ReactorCursor{}, false
 	}
-	return binary.BigEndian.Uint64(token.Value), true
+	return ReactorCursor{
+		BoostUsdMicros: binary.BigEndian.Uint64(token.Value[:8]),
+		Version:        binary.BigEndian.Uint64(token.Value[8:]),
+	}, true
 }

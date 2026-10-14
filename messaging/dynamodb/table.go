@@ -11,16 +11,24 @@ import (
 )
 
 // CreateTables provisions the messages, message_pointers, message_reactions,
-// message_reactors and message_self_reactions tables. All use a composite (pk,
-// sk) string key with on-demand billing. The reactors table carries the
-// by_version LSI for strongly-consistent, most-recent-first reactor paging; the
-// other four need no secondary index — event-ordered delta reads page the evt#
-// rows, summary reads page the agg# rows, and a viewer's self overlay pages
-// their own partition, each as a sort-key range. The messages table has TTL
-// enabled on attrExpiresAt so the transient cmid# idempotency markers are
-// auto-reaped. It is idempotent: tables that already exist are left as-is. The
-// call blocks until all tables are ACTIVE.
-func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable string) error {
+// message_reactors, message_self_reactions and message_reaction_boosts tables. All use
+// a composite (pk, sk) string key with on-demand billing. The reactors table
+// carries the by_version LSI for strongly-consistent, most-recent-first paging
+// of plain reactors and the sparse by_boost GSI for the boosted head (see
+// gsiByBoost); the boosts table one LSI for a history read not built yet;
+// the other four need no secondary index — event-ordered delta reads page the
+// evt# rows, summary reads page the agg# rows, and a viewer's self overlay
+// pages their own partition, each as a sort-key range. The messages table has
+// TTL enabled on attrExpiresAt so the transient cmid# idempotency markers are
+// auto-reaped. It is idempotent: tables that already exist are left as-is,
+// which means a reactors table from before by_boost is not given the index
+// here; it is added to the live table out of band, by the infrastructure
+// terraform (a GSI can be added to a live table, an LSI cannot).
+// Nothing reads the index until some emoji has more than
+// MaxStoredSampleReactors boosters (see gsiByBoost), so the order is: deploy, add the index and wait
+// for it to be active, then let boosts be recorded. The call blocks until
+// all tables are ACTIVE.
+func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable, boostsTable string) error {
 	// The messages table is a plain (pk, sk) key-value table: every access — by
 	// message ID (msg#), by event sequence (evt#), the counter, and the idempotency
 	// markers — is served from the chat's partition by sort key, so no GSI is needed.
@@ -102,11 +110,17 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, p
 	}
 
 	// The reactors table is keyed by message, and a local secondary index
-	// re-sorts each message's reactor rows by emoji_version (emoji, then the version that
-	// added the reactor) so one emoji's reactors page most-recent-first under a
-	// strongly consistent read — a GSI could not offer one. An LSI must be
-	// declared with the table, and caps each partition key's item collection at
-	// 10 GB, which is why the key is the message rather than the chat.
+	// re-sorts each message's PLAIN reactor rows by emoji_version (emoji, then
+	// the version that added the reactor) so one emoji's reactors page
+	// most-recent-first under a strongly consistent read — a GSI could not
+	// offer one. An LSI must be declared with the table, and caps each
+	// partition key's item collection at 10 GB, which is why the key is the
+	// message rather than the chat. A global secondary index orders each
+	// message's BOOSTED reactor rows by emoji_boost (emoji, then total paid,
+	// then version, so one emoji's boosters are a key range), sparse by
+	// construction: a row carries emoji_boost, and so sits in this index,
+	// exactly when it is boosted, and then carries no emoji_version (see
+	// gsiByBoost for the split and why a GSI).
 	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
 		TableName:   aws.String(reactorsTable),
 		BillingMode: types.BillingModePayPerRequest,
@@ -114,6 +128,7 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, p
 			{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
 			{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
 			{AttributeName: aws.String(attrEmojiVersion), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String(attrEmojiBoost), AttributeType: types.ScalarAttributeTypeS},
 		},
 		KeySchema: []types.KeySchemaElement{
 			{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
@@ -132,6 +147,19 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, p
 			Projection: &types.Projection{
 				ProjectionType:   types.ProjectionTypeInclude,
 				NonKeyAttributes: []string{attrReactedTs},
+			},
+		}},
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{{
+			IndexName: aws.String(gsiByBoost),
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrEmojiBoost), KeyType: types.KeyTypeRange},
+			},
+			// The keys carry the user (sk) and the emoji, total and version
+			// (emoji_boost); the rest is what a reactor read returns.
+			Projection: &types.Projection{
+				ProjectionType:   types.ProjectionTypeInclude,
+				NonKeyAttributes: []string{attrReactorVer, attrBoostMicros, attrReactedTs},
 			},
 		}},
 	})
@@ -180,6 +208,49 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, messagesTable, p
 		return err
 	}
 
+	// The boosts table keeps every boost, keyed by message with the paying
+	// intent as the sort key (see messaging/boost.go): the conditional put of a row is
+	// the boost write's idempotency guard. Its LSI orders one emoji's boosts
+	// on a message by the version each produced — reaction order, with no
+	// clock — for a history read that is not built yet; being local it will
+	// read strongly consistent and had to be declared now. (A message-wide
+	// order across emoji was left out, decided 2026-10-14: a version is per
+	// emoji, so it would need a time key, and nothing wants that read.)
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String(boostsTable),
+		BillingMode: types.BillingModePayPerRequest,
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String(attrBoostEmojiVer), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+		},
+		LocalSecondaryIndexes: []types.LocalSecondaryIndex{
+			{
+				IndexName: aws.String(lsiBoostsByEmojiVer),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+					{AttributeName: aws.String(attrBoostEmojiVer), KeyType: types.KeyTypeRange},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		},
+	})
+	if err != nil {
+		var inUse *types.ResourceInUseException
+		if !errors.As(err, &inUse) {
+			return err
+		}
+	}
+	if err := dynamodb.NewTableExistsWaiter(client).Wait(ctx, &dynamodb.DescribeTableInput{
+		TableName: aws.String(boostsTable),
+	}, 2*time.Minute); err != nil {
+		return err
+	}
+
 	return ensureTTL(ctx, client, messagesTable, attrExpiresAt)
 }
 
@@ -213,7 +284,7 @@ func ensureTTL(ctx context.Context, client *dynamodb.Client, table, attr string)
 // reset deletes every item from all tables, for tests.
 func (s *store) reset() {
 	ctx := context.Background()
-	for _, table := range []string{s.messagesTable, s.pointersTable, s.reactionsTable, s.reactorsTable, s.selfReactionsTable} {
+	for _, table := range []string{s.messagesTable, s.pointersTable, s.reactionsTable, s.reactorsTable, s.selfReactionsTable, s.boostsTable} {
 		if err := clearTable(ctx, s.client, table); err != nil {
 			panic(err)
 		}

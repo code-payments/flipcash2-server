@@ -95,6 +95,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_Reactions_SummaryOrder,
 		testServer_Reactions_Errors,
 		testServer_Reactions_GroupSelfReaction,
+		testServer_Reactions_RemoveBoosted,
+		testServer_Reactions_Boost,
 		// Typing
 		testServer_NotifyIsTyping,
 		// Cross-cutting
@@ -5104,4 +5106,210 @@ func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.St
 	require.Equal(t, [][]byte{e.userB.Value}, userValues(pushes[3].users))
 	require.False(t, pushes[3].payload.ChatMetadata.Muted)
 	require.True(t, pushes[3].badged)
+}
+
+// testServer_Reactions_RemoveBoosted pins that a boosted reaction is
+// permanent at the RPC: removing it is CANNOT_REMOVE_BOOSTED, nothing moves,
+// and the same user's other, plain reaction is still removable.
+func testServer_Reactions_RemoveBoosted(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	const fire, thumbsUp = "🔥", "👍"
+
+	// A group: boosts are a group's (the store refuses a DM).
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		Title:        "Boosts",
+		LastActivity: at(1),
+	}))
+
+	m, err := e.sendContentToChat(e.keysA, chatID, textContent("boosted"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, m.Result)
+	msgID := m.Message.MessageId
+
+	// B reacts with both; the 🔥 is then boosted, which no RPC does, so it is
+	// recorded through the store as the payment task will.
+	for _, emoji := range []string{fire, thumbsUp} {
+		added, err := e.addReactionInChat(e.keysB, chatID, msgID, emoji)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AddReactionResponse_OK, added.Result)
+	}
+	_, credited, _, err := messages.AddBoost(e.ctx, chatID, msgID, e.userB, fire, boostInput(1_000_000, time.Now()))
+	require.NoError(t, err)
+	require.True(t, credited)
+
+	removed, err := e.removeReactionInChat(e.keysB, chatID, msgID, fire)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.RemoveReactionResponse_CANNOT_REMOVE_BOOSTED, removed.Result)
+	require.Nil(t, removed.Reaction)
+
+	summary, err := e.getReactionSummaryInChat(e.keysB, chatID, msgID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, summary.Result)
+	require.Len(t, summary.Summary.Reactions, 2)
+	require.Equal(t, fire, summary.Summary.Reactions[0].Emoji.Value, "the boosted emoji leads")
+	require.EqualValues(t, 1, summary.Summary.Reactions[0].Count)
+	require.EqualValues(t, 2, summary.Summary.Reactions[0].Version, "the add then the boost; the refused removal moved nothing")
+	require.InDelta(t, 1.0, summary.Summary.Reactions[0].BoostUsd, 1e-9)
+	require.NotNil(t, summary.Summary.Reactions[0].SelfReactor)
+	require.InDelta(t, 1.0, summary.Summary.Reactions[0].SelfReactor.BoostUsd, 1e-9)
+
+	// The plain 👍 goes as ever.
+	removed, err = e.removeReactionInChat(e.keysB, chatID, msgID, thumbsUp)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.RemoveReactionResponse_OK, removed.Result)
+	require.EqualValues(t, 0, removed.Reaction.Count)
+
+	// Someone who never reacted with 🔥 removing it is still the idempotent
+	// no-op, boost or not.
+	removed, err = e.removeReactionInChat(e.keysA, chatID, msgID, fire)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.RemoveReactionResponse_OK, removed.Result)
+	require.EqualValues(t, 1, removed.Reaction.Count)
+}
+
+// testServer_Reactions_Boost pins what a recorded boost looks like from the
+// RPCs and the stream: the summary leads with the boosted emoji and carries
+// the totals, the sample and the reactor list put boosters first, the
+// booster's self overlay carries their own total, every member's stream gets
+// one BOOSTED update with the new totals, and a replay of the payment is
+// silent.
+func testServer_Reactions_Boost(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	const fire, thumbsUp = "🔥", "👍"
+
+	// A group, since boosts are a group's (the intent refuses a DM), and
+	// since a group's self overlay is read off the viewer-keyed row rather
+	// than the sample: the test must go through that path.
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		Title:        "Boosts",
+		LastActivity: at(1),
+	}))
+
+	m, err := e.sendContentToChat(e.keysA, chatID, textContent("boost me"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, m.Result)
+	msgID := m.Message.MessageId
+
+	// Two plain 👍 and a plain 🔥 by A, then B boosts 🔥 without having
+	// reacted, and A boosts it too, for less.
+	for _, keys := range []model.KeyPair{e.keysA, e.keysB} {
+		added, err := e.addReactionInChat(keys, chatID, msgID, thumbsUp)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AddReactionResponse_OK, added.Result)
+		require.Zero(t, added.Reaction.BoostUsd)
+	}
+	added, err := e.addReactionInChat(e.keysA, chatID, msgID, fire)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, added.Result)
+	e.waitForReactionUpdate(e.userB, messagingpb.ReactionUpdate_ADDED, msgID.Value, fire, e.userA)
+
+	payment := boostInput(5_000_000, time.Now())
+	reaction, credited, err := e.sender.RecordBoost(e.ctx, chatID, msgID, e.userB, fire, payment)
+	require.NoError(t, err)
+	require.True(t, credited)
+	require.EqualValues(t, 2, reaction.Count)
+	require.EqualValues(t, 5_000_000, reaction.BoostUsdMicros)
+	_, credited, err = e.sender.RecordBoost(e.ctx, chatID, msgID, e.userA, fire, boostInput(2_000_000, time.Now()))
+	require.NoError(t, err)
+	require.True(t, credited)
+
+	// Both members see each boost once on the stream, with the totals after
+	// it: the emoji's and the actor's.
+	for _, recipient := range []*commonpb.UserId{e.userA, e.userB} {
+		e.waitForReactionUpdate(recipient, messagingpb.ReactionUpdate_BOOSTED, msgID.Value, fire, e.userA)
+		var boosts []*messagingpb.ReactionUpdate
+		for _, u := range e.chatUpdatesFor(recipient) {
+			if u.ReactionUpdates == nil {
+				continue
+			}
+			for _, ru := range u.ReactionUpdates.ReactionUpdates {
+				if ru.Action == messagingpb.ReactionUpdate_BOOSTED {
+					boosts = append(boosts, ru)
+				}
+			}
+		}
+		require.Len(t, boosts, 2)
+		require.Equal(t, e.userB.Value, boosts[0].Actor.Value)
+		require.EqualValues(t, 2, boosts[0].Count, "B's boost added B's reaction")
+		require.InDelta(t, 5.0, boosts[0].BoostUsd, 1e-9)
+		require.InDelta(t, 5.0, boosts[0].ActorBoostUsd, 1e-9)
+		require.Equal(t, e.userA.Value, boosts[1].Actor.Value)
+		require.EqualValues(t, 2, boosts[1].Count, "A had already reacted")
+		require.InDelta(t, 7.0, boosts[1].BoostUsd, 1e-9)
+		require.InDelta(t, 2.0, boosts[1].ActorBoostUsd, 1e-9)
+		require.Greater(t, boosts[1].Version, boosts[0].Version)
+		require.True(t, boosts[1].ReactedTs.AsTime().Before(boosts[0].ReactedTs.AsTime()), "A's reacted_ts is their add's, before B's boost")
+	}
+
+	// The summary leads with 🔥 on money though 👍 has as many reactors, and
+	// carries the totals; the sample lists B (more money) ahead of A.
+	for _, keys := range []model.KeyPair{e.keysA, e.keysB} {
+		summary, err := e.getReactionSummaryInChat(keys, chatID, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, summary.Result)
+		require.Len(t, summary.Summary.Reactions, 2)
+		boosted, plain := summary.Summary.Reactions[0], summary.Summary.Reactions[1]
+		require.Equal(t, fire, boosted.Emoji.Value)
+		require.InDelta(t, 7.0, boosted.BoostUsd, 1e-9)
+		require.Equal(t, thumbsUp, plain.Emoji.Value)
+		require.Zero(t, plain.BoostUsd)
+		require.Len(t, boosted.SampleReactors, 2)
+		require.Equal(t, e.userB.Value, boosted.SampleReactors[0].UserId.Value)
+		require.InDelta(t, 5.0, boosted.SampleReactors[0].BoostUsd, 1e-9)
+		require.Equal(t, e.userA.Value, boosted.SampleReactors[1].UserId.Value)
+		require.InDelta(t, 2.0, boosted.SampleReactors[1].BoostUsd, 1e-9)
+	}
+	// The self overlay is the viewer's own total on the boosted emoji, and
+	// their plain reaction on the other: in a group, both off the
+	// viewer-keyed self row, not the sample.
+	summaryA, err := e.getReactionSummaryInChat(e.keysA, chatID, msgID)
+	require.NoError(t, err)
+	require.NotNil(t, summaryA.Summary.Reactions[0].SelfReactor)
+	require.InDelta(t, 2.0, summaryA.Summary.Reactions[0].SelfReactor.BoostUsd, 1e-9)
+	require.NotNil(t, summaryA.Summary.Reactions[1].SelfReactor)
+	require.Zero(t, summaryA.Summary.Reactions[1].SelfReactor.BoostUsd)
+	summaryB, err := e.getReactionSummaryInChat(e.keysB, chatID, msgID)
+	require.NoError(t, err)
+	require.NotNil(t, summaryB.Summary.Reactions[0].SelfReactor)
+	require.InDelta(t, 5.0, summaryB.Summary.Reactions[0].SelfReactor.BoostUsd, 1e-9)
+
+	// The reactor list is boosters by amount, with their totals.
+	reactors, err := e.getReactorsInChat(e.keysA, chatID, msgID, fire, nil)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetReactorsResponse_OK, reactors.Result)
+	require.Len(t, reactors.Reactors, 2)
+	require.Equal(t, e.userB.Value, reactors.Reactors[0].UserId.Value)
+	require.InDelta(t, 5.0, reactors.Reactors[0].BoostUsd, 1e-9)
+	require.Equal(t, e.userA.Value, reactors.Reactors[1].UserId.Value)
+	require.InDelta(t, 2.0, reactors.Reactors[1].BoostUsd, 1e-9)
+
+	// A replay of B's payment credits nothing and announces nothing.
+	before := len(e.chatUpdatesFor(e.userA))
+	again, credited, err := e.sender.RecordBoost(e.ctx, chatID, msgID, e.userB, fire, payment)
+	require.NoError(t, err)
+	require.False(t, credited)
+	require.EqualValues(t, 7_000_000, again.BoostUsdMicros)
+	time.Sleep(100 * time.Millisecond)
+	require.Len(t, e.chatUpdatesFor(e.userA), before)
+
+	// A value no reaction RPC would accept is refused before the store sees
+	// it, by the same rule (ValidateEmoji: exactly one emoji): nothing
+	// recorded, nothing announced.
+	for _, bad := range []string{"", "\xff", "not an emoji", "🔥🔥", " 🔥"} {
+		_, _, err := e.sender.RecordBoost(e.ctx, chatID, msgID, e.userB, bad, boostInput(1_000_000, time.Now()))
+		require.ErrorIs(t, err, messaging.ErrInvalidEmoji, "%q", bad)
+	}
+	time.Sleep(100 * time.Millisecond)
+	require.Len(t, e.chatUpdatesFor(e.userA), before)
+	summary, err := e.getReactionSummaryInChat(e.keysA, chatID, msgID)
+	require.NoError(t, err)
+	require.Len(t, summary.Summary.Reactions, 2)
 }

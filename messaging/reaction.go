@@ -80,6 +80,7 @@ func (s *Server) AddReaction(ctx context.Context, req *messagingpb.AddReactionRe
 						Count:     reaction.Count,
 						Version:   reaction.Version,
 						ReactedTs: timestamppb.New(now),
+						BoostUsd:  UsdFromMicros(reaction.BoostUsdMicros), // the unchanged total, so the update carries the whole aggregate
 					},
 				},
 			},
@@ -117,7 +118,12 @@ func (s *Server) RemoveReaction(ctx context.Context, req *messagingpb.RemoveReac
 	}
 
 	reaction, removed, err := s.messages.RemoveReaction(ctx, req.ChatId, req.MessageId, userID, req.Emoji.Value)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrReactionBoosted):
+		// A boosted reaction is permanent (see Reactor.BoostUsdMicros): the
+		// store refuses the removal and nothing has changed.
+		return &messagingpb.RemoveReactionResponse{Result: messagingpb.RemoveReactionResponse_CANNOT_REMOVE_BOOSTED}, nil
+	case err != nil:
 		log.With(zap.Error(err)).Warn("Failure removing reaction")
 		return nil, status.Error(codes.Internal, "")
 	}
@@ -134,6 +140,7 @@ func (s *Server) RemoveReaction(ctx context.Context, req *messagingpb.RemoveReac
 						Count:     reaction.Count,
 						Version:   reaction.Version,
 						ReactedTs: timestamppb.Now(),
+						BoostUsd:  UsdFromMicros(reaction.BoostUsdMicros),
 					},
 				},
 			},
@@ -257,10 +264,12 @@ func (s *Server) GetReactors(ctx context.Context, req *messagingpb.GetReactorsRe
 
 	// The response carries at most maxReactorsPerPage reactors, while the request
 	// admits a larger page size, so clamp rather than hand back a page the
-	// client's own validation rejects. The store's read is strongly consistent
-	// for every chat type, so the reader always sees a reaction they just added,
-	// and the aggregate version it reads ahead of the page is what the response
-	// reports the page current to (see GetReactorsResponse.version).
+	// client's own validation rejects. The store reads the plain reactors
+	// strongly consistently for every chat type, so the reader always sees a
+	// reaction they just added; only the boosted head of the list may trail a
+	// boost by a moment (see Store.GetReactors). The aggregate version it
+	// reads ahead of the page is what the response reports the page current
+	// to (see GetReactorsResponse.version).
 	opts := database.FromProtoQueryOptions(req.GetOptions())
 	opts = append(opts, database.WithLimit(min(database.ApplyQueryOptions(opts...).Limit, maxReactorsPerPage)))
 	reactors, version, hasMore, err := s.messages.GetReactors(ctx, req.ChatId, req.MessageId, req.Emoji.Value, opts...)
@@ -296,9 +305,10 @@ func (s *Server) GetReactors(ctx context.Context, req *messagingpb.GetReactorsRe
 // and the sample lists every reactor. Membership in it is an exact answer that
 // costs no store read at all.
 //
-// A group's reactor set is unbounded, so the sample is only its most-recent
-// window: a viewer who reacted early drops out of it once enough others pile on,
-// and scanning it would silently report a reaction of their own as absent. Groups
+// A group's reactor set is unbounded, so the sample is only the head of the
+// list (the top boosters, then the most recent plain reactors): a viewer who
+// reacted early drops out of it once enough others pile on, and scanning it
+// would silently report a reaction of their own as absent. Groups
 // therefore resolve the question against the authoritative per-reactor records,
 // read by viewer across every message in the page — one read whose cost follows
 // the viewer's own reactions, not one probe per aggregate on the page. The split
@@ -342,7 +352,7 @@ func (s *Server) applySelfReactions(ctx context.Context, chatID *commonpb.ChatId
 		for _, reaction := range summary.Reactions {
 			key := selfReactionKey{messageID: summary.MessageID.Value, emoji: reaction.Emoji}
 			if self, ok := reacted[key]; ok {
-				reaction.Self = &Reactor{UserID: userID, ReactedTs: self.ReactedTs, Version: self.Version}
+				reaction.Self = &Reactor{UserID: userID, ReactedTs: self.ReactedTs, Version: self.Version, BoostUsdMicros: self.BoostUsdMicros}
 			}
 		}
 	}

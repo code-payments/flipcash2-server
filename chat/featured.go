@@ -28,7 +28,7 @@ import (
 // record before the write, as it checks that the group exists. IsPrivate is
 // fixed when a group is created, so a group featured as public stays public
 // and a read is not expected to find a private one (it checks all the same;
-// see featuredGroupsMetadata). Whether each group still exists is decided
+// see publicGroupsMetadata). Whether each group still exists is decided
 // when the list is read for display, not stored.
 
 // MaxFeaturedGroups is the most groups a user may feature. A profile shows
@@ -128,7 +128,7 @@ func (s *Server) SetFeaturedGroups(ctx context.Context, req *chatpb.SetFeaturedG
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	featured, err := s.featuredGroupsMetadata(ctx, log, req.ChatIds, records)
+	featured, err := s.hydrator.publicGroupsMetadata(ctx, log, req.ChatIds, records)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating featured groups")
 		return nil, status.Error(codes.Internal, "")
@@ -186,7 +186,7 @@ func (s *Server) GetFeaturedGroups(ctx context.Context, req *chatpb.GetFeaturedG
 		}
 	}
 
-	featured, err := s.featuredGroupsMetadata(ctx, log, list.ChatIDs, records)
+	featured, err := s.hydrator.publicGroupsMetadata(ctx, log, list.ChatIDs, records)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating featured groups")
 		return nil, status.Error(codes.Internal, "")
@@ -195,32 +195,4 @@ func (s *Server) GetFeaturedGroups(ctx context.Context, req *chatpb.GetFeaturedG
 		Result:         chatpb.GetFeaturedGroupsResponse_OK,
 		FeaturedGroups: featured,
 	}, nil
-}
-
-// featuredGroupsMetadata projects a featured list, in its order, from the
-// groups' records: each as a list view shows it, with no viewer (so nothing
-// about anyone's place in the group) and no reading (so no messaging state),
-// which is the same for every caller. A group with no record is left out.
-//
-// A private group is left out too. SetFeaturedGroups refuses one and
-// IsPrivate never changes, so none is expected; the check is what keeps a
-// record that broke that from reaching a caller with no standing to see it,
-// and is logged when it does.
-func (s *Server) featuredGroupsMetadata(ctx context.Context, log *zap.Logger, chatIDs []*commonpb.ChatId, records map[string]*Chat) ([]*chatpb.Metadata, error) {
-	chats := make([]*Chat, 0, len(chatIDs))
-	for _, chatID := range chatIDs {
-		c, ok := records[string(chatID.Value)]
-		if !ok {
-			continue
-		}
-		if c.IsPrivate {
-			log.Warn("Private group in featured groups", zap.String("chat_id", model.ChatIDString(chatID)))
-			continue
-		}
-		chats = append(chats, c)
-	}
-	if len(chats) == 0 {
-		return []*chatpb.Metadata{}, nil
-	}
-	return s.hydrate(ctx, nil, ListenerStanding{}, ReadingDenied, listDetail, chats)
 }

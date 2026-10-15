@@ -65,6 +65,15 @@ type memory struct {
 	// version zero.
 	featured map[string]chat.FeaturedGroups
 
+	// holdings holds each group's holdings snapshot, keyed by chat ID, as
+	// last put (see chat.Store.PutGroupHoldings).
+	holdings map[string]chat.GroupHoldings
+
+	// holdingsQueue holds each queued group's refresh entry, keyed by chat
+	// ID (see chat.HoldingsRefresh), with times at the epoch-ms precision
+	// the persistent store keeps them at.
+	holdingsQueue map[string]chat.HoldingsRefresh
+
 	exclusions chat.FeedExclusions
 }
 
@@ -94,6 +103,8 @@ func NewInMemory(excludedFromFeed []*commonpb.UserId) chat.Store {
 		keyEnvelopes:     make(map[string]map[string]chat.KeyEnvelope),
 		lobbies:          make(map[string]map[string]time.Time),
 		featured:         make(map[string]chat.FeaturedGroups),
+		holdings:         make(map[string]chat.GroupHoldings),
+		holdingsQueue:    make(map[string]chat.HoldingsRefresh),
 	}
 }
 
@@ -111,6 +122,8 @@ func (m *memory) reset() {
 	m.keyEnvelopes = make(map[string]map[string]chat.KeyEnvelope)
 	m.lobbies = make(map[string]map[string]time.Time)
 	m.featured = make(map[string]chat.FeaturedGroups)
+	m.holdings = make(map[string]chat.GroupHoldings)
+	m.holdingsQueue = make(map[string]chat.HoldingsRefresh)
 }
 
 // isJoinedLocked reports whether the user's record on the group has them
@@ -163,6 +176,9 @@ func (m *memory) PutChat(_ context.Context, c *chat.Chat) error {
 		stored.RosterSummary = chat.RosterSummary{}
 		m.chats[key] = stored
 		m.groupMembers[key] = groupMembers
+		if mint, ok := chat.GatedMint(c); ok {
+			m.enqueueHoldingsRefreshLocked(c.ID, mint, time.Now())
+		}
 		return nil
 	}
 
@@ -1147,6 +1163,172 @@ func cloneFeaturedGroups(f chat.FeaturedGroups) chat.FeaturedGroups {
 	for _, chatID := range f.ChatIDs {
 		out.ChatIDs = append(out.ChatIDs, &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)})
 	}
+	return out
+}
+
+func (m *memory) PutGroupHoldings(_ context.Context, h chat.GroupHoldings) (bool, error) {
+	if err := chat.ValidateGroupHoldings(h); err != nil {
+		return false, err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	// as_of is kept, and compared, at the epoch-ms precision the persistent
+	// store holds it at.
+	if recorded := m.recordedHoldingsMintLocked(string(h.ChatID.Value)); recorded != nil && !bytes.Equal(recorded, h.Mint.Value) {
+		return false, chat.ErrHoldingsMintMismatch
+	}
+
+	stored := h.Clone()
+	stored.AsOf = time.UnixMilli(h.AsOf.UnixMilli())
+	if current, ok := m.holdings[string(h.ChatID.Value)]; ok && !stored.AsOf.After(current.AsOf) {
+		return false, nil
+	}
+	m.holdings[string(h.ChatID.Value)] = stored
+	return true, nil
+}
+
+func (m *memory) GetGroupHoldings(_ context.Context, chatIDs []*commonpb.ChatId) (map[string]chat.GroupHoldings, error) {
+	for _, chatID := range chatIDs {
+		if !chat.IsGroupChatID(chatID) {
+			return nil, fmt.Errorf("not a group chat id")
+		}
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	out := make(map[string]chat.GroupHoldings, len(chatIDs))
+	for _, chatID := range chatIDs {
+		if h, ok := m.holdings[string(chatID.Value)]; ok {
+			out[string(chatID.Value)] = h.Clone()
+		}
+	}
+	return out, nil
+}
+
+func (m *memory) GetTopGroupsByHoldings(_ context.Context, mint *commonpb.PublicKey, limit int) ([]chat.GroupHoldings, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	var out []chat.GroupHoldings
+	for _, h := range m.holdings {
+		if h.Listed() && bytes.Equal(h.Mint.Value, mint.GetValue()) {
+			out = append(out, h.Clone())
+		}
+	}
+	slices.SortFunc(out, func(a, b chat.GroupHoldings) int {
+		if chat.HoldingsLess(a, b) {
+			return -1
+		}
+		return 1
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *memory) EnqueueHoldingsRefresh(_ context.Context, chatID *commonpb.ChatId, mint *commonpb.PublicKey, dueAt time.Time) (bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return false, fmt.Errorf("not a group chat id")
+	}
+	if len(mint.GetValue()) != 32 {
+		return false, fmt.Errorf("mint must be 32 bytes")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	if recorded := m.recordedHoldingsMintLocked(string(chatID.Value)); recorded != nil && !bytes.Equal(recorded, mint.Value) {
+		return false, chat.ErrHoldingsMintMismatch
+	}
+	return m.enqueueHoldingsRefreshLocked(chatID, mint, dueAt), nil
+}
+
+// recordedHoldingsMintLocked returns the mint a group's holdings record, off
+// its queue entry or its snapshot, which always agree, or nil when it has
+// neither: the one attribute the persistent store keeps for both (see
+// chat.ErrHoldingsMintMismatch).
+func (m *memory) recordedHoldingsMintLocked(chatKey string) []byte {
+	if r, ok := m.holdingsQueue[chatKey]; ok {
+		return r.Mint.Value
+	}
+	if h, ok := m.holdings[chatKey]; ok {
+		return h.Mint.Value
+	}
+	return nil
+}
+
+// enqueueHoldingsRefreshLocked puts chatID on the refresh queue unless it is
+// there already, reporting whether it did.
+func (m *memory) enqueueHoldingsRefreshLocked(chatID *commonpb.ChatId, mint *commonpb.PublicKey, dueAt time.Time) bool {
+	if _, ok := m.holdingsQueue[string(chatID.Value)]; ok {
+		return false
+	}
+	m.holdingsQueue[string(chatID.Value)] = chat.HoldingsRefresh{
+		ChatID: &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)},
+		Mint:   &commonpb.PublicKey{Value: append([]byte(nil), mint.Value...)},
+		DueAt:  time.UnixMilli(dueAt.UnixMilli()),
+	}
+	return true
+}
+
+func (m *memory) GetDueHoldingsRefreshes(_ context.Context, asOf time.Time, limit int) ([]chat.HoldingsRefresh, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	var out []chat.HoldingsRefresh
+	for _, r := range m.holdingsQueue {
+		if r.DueAt.UnixMilli() <= asOf.UnixMilli() {
+			out = append(out, cloneHoldingsRefresh(r))
+		}
+	}
+	slices.SortFunc(out, func(a, b chat.HoldingsRefresh) int {
+		if c := a.DueAt.Compare(b.DueAt); c != 0 {
+			return c
+		}
+		return bytes.Compare(a.ChatID.Value, b.ChatID.Value)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *memory) ClaimHoldingsRefresh(_ context.Context, chatID *commonpb.ChatId, asOf, until time.Time) (bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	r, ok := m.holdingsQueue[string(chatID.GetValue())]
+	if !ok || r.DueAt.UnixMilli() > asOf.UnixMilli() {
+		return false, nil
+	}
+	r.DueAt = time.UnixMilli(until.UnixMilli())
+	m.holdingsQueue[string(chatID.Value)] = r
+	return true, nil
+}
+
+func (m *memory) RescheduleHoldingsRefresh(_ context.Context, chatID *commonpb.ChatId, dueAt time.Time, attempts uint32) error {
+	m.Lock()
+	defer m.Unlock()
+
+	r, ok := m.holdingsQueue[string(chatID.GetValue())]
+	if !ok {
+		return nil
+	}
+	r.DueAt = time.UnixMilli(dueAt.UnixMilli())
+	r.Attempts = attempts
+	m.holdingsQueue[string(chatID.Value)] = r
+	return nil
+}
+
+// cloneHoldingsRefresh deep-copies a queue entry.
+func cloneHoldingsRefresh(r chat.HoldingsRefresh) chat.HoldingsRefresh {
+	out := r
+	out.ChatID = &commonpb.ChatId{Value: append([]byte(nil), r.ChatID.Value...)}
+	out.Mint = &commonpb.PublicKey{Value: append([]byte(nil), r.Mint.Value...)}
 	return out
 }
 

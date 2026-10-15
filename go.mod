@@ -15,7 +15,7 @@ require (
 	github.com/aws/smithy-go v1.27.7
 	github.com/buckket/go-blurhash v1.1.0
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/code-payments/flipcash2-protobuf-api v1.28.1-0.20261014141745-1897108ae75e
+	github.com/code-payments/flipcash2-protobuf-api v1.28.1-0.20261015185035-16fc577920de
 	github.com/code-payments/ocp-protobuf-api v1.17.1-0.20261011002549-00ea80d00cf1
 	github.com/code-payments/ocp-server v1.27.1-0.20261011002802-c6ca0d2617e2
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2

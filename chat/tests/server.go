@@ -159,6 +159,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_FeaturedGroups_SetAndGet,
 		testServer_FeaturedGroups_Refused,
 		testServer_FeaturedGroups_UnknownUsername,
+		testServer_HoldingsSummary,
 	} {
 		tf(t, s)
 		teardown()
@@ -236,7 +237,8 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	if cfg.lobbyLimits != nil {
 		opts = append(opts, chat.WithLobbyLimits(*cfg.lobbyLimits))
 	}
-	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, systemMessages, access, userBus, chatBus, teamUserID, cfg.disablePublicGroupRoster, opts...)
+	hydrator := chat.NewHydrator(log, accounts, blocklist, s, media, messaging, profiles, access.Rules(), teamUserID)
+	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, systemMessages, access, hydrator, userBus, chatBus, cfg.disablePublicGroupRoster, opts...)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
@@ -6415,4 +6417,79 @@ func testServer_FeaturedGroups_UnknownUsername(t *testing.T, s chat.Store) {
 
 	require.Equal(t, chatpb.GetFeaturedGroupsResponse_NOT_FOUND, e.getFeaturedGroups("nobody").Result)
 	require.Equal(t, chatpb.GetFeaturedGroupsResponse_NOT_FOUND, e.getFeaturedGroups("nobody", e.keys).Result)
+}
+
+// putGatedGroup persists a public group whose members are the env user and
+// the given others, gated on mint by a minimum listener balance.
+func (e *serverEnv) putGatedGroup(title string, mint *commonpb.PublicKey, others ...*commonpb.UserId) *commonpb.ChatId {
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
+		ID:      chatID,
+		Type:    chatpb.ChatType_GROUP,
+		Members: append([]*commonpb.UserId{e.userID}, others...),
+		Title:   title,
+		MinimumListenerBalance: &chat.MinimumBalance{
+			Currency:     "usd",
+			NativeAmount: 1,
+			Mints:        []*commonpb.PublicKey{mint},
+		},
+		CreatorID:    e.userID,
+		LastActivity: at(1),
+	}))
+	return chatID
+}
+
+func testServer_HoldingsSummary(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.profiles.usernames[string(e.userID.Value)] = "holder"
+	mint := model.MustGenerateKeyPair().Proto()
+
+	// A group gated on the mint, with a snapshot of it.
+	gated := e.putGatedGroup("Gated", mint)
+	snapshot := chat.GroupHoldings{ChatID: gated, Mint: mint, Quarks: 12_345, HolderCount: 13, AsOf: at(100)}
+	_, err := e.store.PutGroupHoldings(e.ctx, snapshot)
+	require.NoError(t, err)
+
+	// A gated group with no snapshot yet, and a group gated on nothing with a
+	// snapshot written anyway: neither carries a summary. (A gated group's
+	// snapshot is always of its own mint: the store refuses another.)
+	unrefreshed := e.putGatedGroup("Unrefreshed", mint)
+	ungated := e.putGroup("Ungated", at(1))
+	_, err = e.store.PutGroupHoldings(e.ctx, chat.GroupHoldings{ChatID: ungated, Mint: mint, Quarks: 100, HolderCount: 10, AsOf: at(100)})
+	require.NoError(t, err)
+	// Nor does a gated group whose snapshot is stored but not listed: too
+	// few holders, however much they hold.
+	unlisted := e.putGatedGroup("Unlisted", mint)
+	_, err = e.store.PutGroupHoldings(e.ctx, chat.GroupHoldings{ChatID: unlisted, Mint: mint, Quarks: 9_000_000, HolderCount: chat.MinGroupHoldingsHolders - 1, AsOf: at(100)})
+	require.NoError(t, err)
+
+	requireSummary := func(md *chatpb.Metadata) {
+		t.Helper()
+		require.NotNil(t, md.HoldingsSummary)
+		require.True(t, proto.Equal(snapshot.ToProto(), md.HoldingsSummary))
+	}
+
+	// GetChat carries it, to a member and to anyone else.
+	resp := e.getChat(e.keys, gated)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	requireSummary(resp.Metadata)
+	_, outsiderKeys := e.addUser()
+	resp = e.getChat(outsiderKeys, gated)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	requireSummary(resp.Metadata)
+
+	for _, chatID := range []*commonpb.ChatId{unrefreshed, ungated, unlisted} {
+		resp := e.getChat(e.keys, chatID)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+		require.Nil(t, resp.Metadata.HoldingsSummary)
+	}
+
+	// So does a public list.
+	set := e.mustSetFeaturedGroups(e.keys, gated, ungated)
+	require.Equal(t, chatpb.SetFeaturedGroupsResponse_OK, set.Result)
+	requireSummary(set.FeaturedGroups[0])
+	require.Nil(t, set.FeaturedGroups[1].HoldingsSummary)
+	got := e.getFeaturedGroups("holder")
+	require.Equal(t, chatpb.GetFeaturedGroupsResponse_OK, got.Result)
+	requireSummary(got.FeaturedGroups[0])
 }

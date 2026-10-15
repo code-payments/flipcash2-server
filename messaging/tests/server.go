@@ -4174,14 +4174,14 @@ func testServer_BalanceGatedGroup_Rules(t *testing.T, badges badge.Store, blockl
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// Both members have owner accounts; userA holds the requirement exactly,
-	// userB is one quark short.
+	// userB is a cent short.
 	const requirement = 100
 	_, err := e.accounts.Bind(e.ctx, e.userA, e.keysA.Proto())
 	require.NoError(t, err)
 	_, err = e.accounts.Bind(e.ctx, e.userB, e.keysB.Proto())
 	require.NoError(t, err)
 	e.ocpBalance.setBalance(e.keysA.Proto(), ocp_common.ToCoreMintQuarks(requirement))
-	e.ocpBalance.setBalance(e.keysB.Proto(), ocp_common.ToCoreMintQuarks(requirement)-1)
+	e.ocpBalance.setBalance(e.keysB.Proto(), ocp_common.ToCoreMintQuarks(requirement)-ocp_common.CoreMintQuarksPerUnit/100)
 
 	groupID := chat.MustGenerateGroupChatID()
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
@@ -4266,7 +4266,7 @@ func testServer_SpeakerBalanceGroup_Rules(t *testing.T, badges badge.Store, bloc
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
 	// userA holds the speaker requirement exactly; userB the listener
-	// requirement and a quark short of the speaker one.
+	// requirement and a cent short of the speaker one.
 	const (
 		listenerRequirement = 100
 		speakerRequirement  = 200
@@ -4276,7 +4276,7 @@ func testServer_SpeakerBalanceGroup_Rules(t *testing.T, badges badge.Store, bloc
 	_, err = e.accounts.Bind(e.ctx, e.userB, e.keysB.Proto())
 	require.NoError(t, err)
 	e.ocpBalance.setBalance(e.keysA.Proto(), ocp_common.ToCoreMintQuarks(speakerRequirement))
-	e.ocpBalance.setBalance(e.keysB.Proto(), ocp_common.ToCoreMintQuarks(speakerRequirement)-1)
+	e.ocpBalance.setBalance(e.keysB.Proto(), ocp_common.ToCoreMintQuarks(speakerRequirement)-ocp_common.CoreMintQuarksPerUnit/100)
 
 	groupID := chat.MustGenerateGroupChatID()
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
@@ -4321,7 +4321,7 @@ func testServer_SpeakerBalanceGroup_Rules(t *testing.T, badges badge.Store, bloc
 
 	// ...and drained below the listener requirement, the creator is silenced
 	// with the rest, still reading.
-	e.ocpBalance.setBalance(e.keysA.Proto(), ocp_common.ToCoreMintQuarks(listenerRequirement)-1)
+	e.ocpBalance.setBalance(e.keysA.Proto(), ocp_common.ToCoreMintQuarks(listenerRequirement)-ocp_common.CoreMintQuarksPerUnit/100)
 	sendResp, err = e.sendContentToChat(e.keysA, groupID, textContent("drained"), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_DENIED, sendResp.Result)

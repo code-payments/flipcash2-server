@@ -2978,10 +2978,10 @@ func testServer_JoinChat_MinimumBalanceRule(t *testing.T, s chat.Store) {
 	resp := e.mustJoinChat(e.keys, group.ID)
 	require.Equal(t, chatpb.JoinChatResponse_RULES_NOT_SATISFIED, resp.Result)
 
-	// One quark short is still short.
+	// A cent short is still short.
 	_, err := e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
 	require.NoError(t, err)
-	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(requirement)-1)
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(requirement)-ocp_common.CoreMintQuarksPerUnit/100)
 	resp = e.mustJoinChat(e.keys, group.ID)
 	require.Equal(t, chatpb.JoinChatResponse_RULES_NOT_SATISFIED, resp.Result)
 	e.requireNoRosterUpdates(e.userID, group.ID)
@@ -4287,10 +4287,10 @@ func testServer_StartChat_RulesNotSatisfied(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.StartChatResponse_RULES_NOT_SATISFIED, resp.Result)
 	require.Nil(t, resp.Chat)
 
-	// ...as is one a quark short.
+	// ...as is one a cent short.
 	_, err := e.accounts.Bind(e.ctx, e.userID, e.keys.Proto())
 	require.NoError(t, err)
-	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(startChatMinimumBalance)-1)
+	e.ocpBalance.setBalance(e.keys.Proto(), ocp_common.ToCoreMintQuarks(startChatMinimumBalance)-ocp_common.CoreMintQuarksPerUnit/100)
 	resp = e.mustStartGroupChat(e.keys, groupParams("Whales"))
 	require.Equal(t, chatpb.StartChatResponse_RULES_NOT_SATISFIED, resp.Result)
 

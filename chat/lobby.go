@@ -144,7 +144,7 @@ func (s *Server) EnterLobby(ctx context.Context, req *chatpb.EnterLobbyRequest) 
 	// The chat as a waiting non-member sees it: the record alone (see
 	// hydrate), with in_lobby set off the entry this call holds rather than a
 	// read that would only repeat it.
-	metadata, err := s.hydrate(ctx, userID, ListenerStanding{}, ReadingDenied, fullDetail, []*Chat{c})
+	metadata, err := s.hydrator.hydrate(ctx, userID, ListenerStanding{}, ReadingDenied, fullDetail, []*Chat{c})
 	if err != nil {
 		// The entry has landed; only the read back failed. A retry is the
 		// no-op path and returns the lobby then.
@@ -348,7 +348,7 @@ func (s *Server) AdmitLobbyMember(ctx context.Context, req *chatpb.AdmitLobbyMem
 	// devices, their entry as hydrated for them, with the metadata so they
 	// can insert the chat, and the record the write produced; to the
 	// members, only that the roster moved.
-	metadata, err := s.hydrate(ctx, req.UserId, memberListenerStanding, ReadingFull, fullDetail, []*Chat{c})
+	metadata, err := s.hydrator.hydrate(ctx, req.UserId, memberListenerStanding, ReadingFull, fullDetail, []*Chat{c})
 	if err != nil {
 		// The admission has landed; only the read back failed. The admitted
 		// user is told nothing, and reads the chat on their next open; the

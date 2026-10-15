@@ -336,3 +336,50 @@ func TestClient_GetMintHoldingsForUsers(t *testing.T) {
 	_, err = client.GetMintHoldingsForUsers(ctx, currency_lib.Code("cad"), mint, bound...)
 	require.ErrorIs(t, err, ErrDenied)
 }
+
+func TestClient_GetMintQuarksForUsers(t *testing.T) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+	accounts := accountmemory.NewInMemory()
+
+	mint := model.MustGenerateKeyPair().Proto()
+	ocp := &fakeOcpBalance{
+		byMint: map[string]uint64{
+			base58.Encode(mint.Value):                                2 * ocp_common.CoreMintQuarksPerUnit,
+			base58.Encode(model.MustGenerateKeyPair().Proto().Value): 5 * ocp_common.CoreMintQuarksPerUnit,
+		},
+		mintQuarks: map[string]uint64{base58.Encode(mint.Value): 7_000_000_000},
+	}
+	client := NewClient(log, accounts, ocp)
+
+	bound := make([]*commonpb.UserId, 2)
+	for i := range bound {
+		bound[i] = model.MustGenerateUserID()
+		_, err := accounts.Bind(ctx, bound[i], model.MustGenerateKeyPair().Proto())
+		require.NoError(t, err)
+	}
+	unbound := model.MustGenerateUserID()
+
+	// Each bound user's quarks of the mint alone, with no valuation asked
+	// for, so no rate is needed; a user with no key is left out.
+	quarks, err := client.GetMintQuarksForUsers(ctx, mint, append(bound, unbound)...)
+	require.NoError(t, err)
+	require.Len(t, quarks, len(bound))
+	for _, userID := range bound {
+		require.Equal(t, uint64(7_000_000_000), quarks[string(userID.Value)])
+	}
+	require.Len(t, ocp.lastReq.Mints, 1)
+	require.Equal(t, mint.Value, ocp.lastReq.Mints[0].Value)
+	require.Empty(t, ocp.lastReq.CurrencyCodes)
+	require.False(t, ocp.lastReq.ExcludePerMintBalances)
+
+	// Owners holding none of the mint are left out.
+	ocp.byMint[base58.Encode(mint.Value)] = 0
+	quarks, err = client.GetMintQuarksForUsers(ctx, mint, bound...)
+	require.NoError(t, err)
+	require.Empty(t, quarks)
+
+	ocp.result = ocp_balancepb.GetBalancesResponse_DENIED
+	_, err = client.GetMintQuarksForUsers(ctx, mint, bound...)
+	require.ErrorIs(t, err, ErrDenied)
+}

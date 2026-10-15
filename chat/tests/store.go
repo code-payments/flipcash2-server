@@ -105,6 +105,15 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_FeaturedGroups_NoOp,
 		testStore_FeaturedGroups_Invalid,
 		testStore_FeaturedGroups_Concurrent,
+		testStore_Holdings_PutAndGet,
+		testStore_Holdings_NeverBackwards,
+		testStore_Holdings_Invalid,
+		testStore_Holdings_Unlisted,
+		testStore_Holdings_MintMismatch,
+		testStore_Holdings_TopByMint,
+		testStore_HoldingsQueue_EnqueuedAtCreation,
+		testStore_HoldingsQueue_ClaimAndReschedule,
+		testStore_HoldingsQueue_EntryWithoutSnapshot,
 	} {
 		tf(t, s)
 		teardown()
@@ -3880,4 +3889,465 @@ func testStore_FeaturedGroups_Concurrent(t *testing.T, s chat.Store) {
 	require.NotEmpty(t, got.ChatIDs)
 	require.True(t, isWhole(got.ChatIDs))
 	require.EqualValues(t, len(lists), got.Version)
+}
+
+// holdingsAt returns a snapshot of chatID's holdings of mint, taken at the
+// given offset in seconds from at's epoch.
+func holdingsAt(chatID *commonpb.ChatId, mint *commonpb.PublicKey, quarks, holders uint64, seconds int64) chat.GroupHoldings {
+	return chat.GroupHoldings{ChatID: chatID, Mint: mint, Quarks: quarks, HolderCount: holders, AsOf: at(seconds)}
+}
+
+// requireHoldingsEqual checks that got is want, comparing as_of as an
+// instant.
+func requireHoldingsEqual(t *testing.T, want, got chat.GroupHoldings) {
+	t.Helper()
+	require.Equal(t, want.ChatID.Value, got.ChatID.Value)
+	require.Equal(t, want.Mint.Value, got.Mint.Value)
+	require.Equal(t, want.Quarks, got.Quarks)
+	require.Equal(t, want.HolderCount, got.HolderCount)
+	require.True(t, want.AsOf.Equal(got.AsOf), "as_of %v, want %v", got.AsOf, want.AsOf)
+}
+
+func testStore_Holdings_PutAndGet(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	mint := model.MustGenerateKeyPair().Proto()
+	ids := generateGroupChatIDs(3)
+
+	// Nothing put: nothing read.
+	got, err := s.GetGroupHoldings(ctx, ids)
+	require.NoError(t, err)
+	require.Empty(t, got)
+	got, err = s.GetGroupHoldings(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	first := holdingsAt(ids[0], mint, 1_000, chat.MinGroupHoldingsHolders, 10)
+	changed, err := s.PutGroupHoldings(ctx, first)
+	require.NoError(t, err)
+	require.True(t, changed)
+	second := holdingsAt(ids[1], mint, 300, 12, 10)
+	changed, err = s.PutGroupHoldings(ctx, second)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	// Groups with none are absent, and duplicates collapse.
+	got, err = s.GetGroupHoldings(ctx, []*commonpb.ChatId{ids[0], ids[1], ids[2], ids[0]})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	requireHoldingsEqual(t, first, got[string(ids[0].Value)])
+	requireHoldingsEqual(t, second, got[string(ids[1].Value)])
+
+	// A newer snapshot replaces the stored one.
+	refreshed := holdingsAt(ids[0], mint, 5_000, 15, 20)
+	changed, err = s.PutGroupHoldings(ctx, refreshed)
+	require.NoError(t, err)
+	require.True(t, changed)
+	got, err = s.GetGroupHoldings(ctx, []*commonpb.ChatId{ids[0]})
+	require.NoError(t, err)
+	requireHoldingsEqual(t, refreshed, got[string(ids[0].Value)])
+
+	// A DM ID is refused.
+	_, err = s.GetGroupHoldings(ctx, []*commonpb.ChatId{generateDmChatID()})
+	require.Error(t, err)
+}
+
+func testStore_Holdings_NeverBackwards(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	mint := model.MustGenerateKeyPair().Proto()
+	chatID := chat.MustGenerateGroupChatID()
+
+	current := holdingsAt(chatID, mint, 1_000, 12, 20)
+	changed, err := s.PutGroupHoldings(ctx, current)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	// An older snapshot, and one taken at the same instant, are no-ops.
+	for _, stale := range []chat.GroupHoldings{
+		holdingsAt(chatID, mint, 9_000, 19, 10),
+		holdingsAt(chatID, mint, 9_000, 19, 20),
+	} {
+		changed, err = s.PutGroupHoldings(ctx, stale)
+		require.NoError(t, err)
+		require.False(t, changed)
+	}
+	got, err := s.GetGroupHoldings(ctx, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	requireHoldingsEqual(t, current, got[string(chatID.Value)])
+
+	// Nor does a stale snapshot move the ranking.
+	top, err := s.GetTopGroupsByHoldings(ctx, mint, 0)
+	require.NoError(t, err)
+	require.Len(t, top, 1)
+	requireHoldingsEqual(t, current, top[0])
+}
+
+func testStore_Holdings_Invalid(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	mint := model.MustGenerateKeyPair().Proto()
+	chatID := chat.MustGenerateGroupChatID()
+
+	for name, h := range map[string]chat.GroupHoldings{
+		"dm":                 holdingsAt(generateDmChatID(), mint, 100, 10, 1),
+		"no mint":            holdingsAt(chatID, nil, 100, 10, 1),
+		"short mint":         holdingsAt(chatID, &commonpb.PublicKey{Value: []byte{1}}, 100, 10, 1),
+		"no holders":         holdingsAt(chatID, mint, 100, 0, 1),
+		"holders of nothing": holdingsAt(chatID, mint, 0, 10, 1),
+		"no as_of":           {ChatID: chatID, Mint: mint, Quarks: 100, HolderCount: 10},
+	} {
+		_, err := s.PutGroupHoldings(ctx, h)
+		require.ErrorIs(t, err, chat.ErrInvalidGroupHoldings, name)
+	}
+	got, err := s.GetGroupHoldings(ctx, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+func testStore_Holdings_TopByMint(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	mint := model.MustGenerateKeyPair().Proto()
+	other := model.MustGenerateKeyPair().Proto()
+
+	// Nothing names the mint: an empty ranking.
+	top, err := s.GetTopGroupsByHoldings(ctx, mint, 10)
+	require.NoError(t, err)
+	require.Empty(t, top)
+
+	// Five groups of the mint, two of them tied, and one of another mint
+	// holding more than any.
+	ids := generateGroupChatIDs(5)
+	quarks := []uint64{300, 100, 500, 100, 50}
+	var snapshots []chat.GroupHoldings
+	for i, id := range ids {
+		h := holdingsAt(id, mint, quarks[i], chat.MinGroupHoldingsHolders, 10)
+		_, err := s.PutGroupHoldings(ctx, h)
+		require.NoError(t, err)
+		snapshots = append(snapshots, h)
+	}
+	_, err = s.PutGroupHoldings(ctx, holdingsAt(chat.MustGenerateGroupChatID(), other, 9_000, 10, 10))
+	require.NoError(t, err)
+
+	want := slices.Clone(snapshots)
+	slices.SortFunc(want, func(a, b chat.GroupHoldings) int {
+		if chat.HoldingsLess(a, b) {
+			return -1
+		}
+		return 1
+	})
+	requireRanking := func(want []chat.GroupHoldings, got []chat.GroupHoldings) {
+		t.Helper()
+		require.Len(t, got, len(want))
+		for i := range want {
+			requireHoldingsEqual(t, want[i], got[i])
+		}
+	}
+
+	// The whole ranking, ties to the greater chat ID.
+	top, err = s.GetTopGroupsByHoldings(ctx, mint, 0)
+	require.NoError(t, err)
+	requireRanking(want, top)
+	require.EqualValues(t, 500, top[0].Quarks)
+	require.EqualValues(t, 50, top[4].Quarks)
+	require.Positive(t, bytes.Compare(top[2].ChatID.Value, top[3].ChatID.Value))
+
+	// A limit takes the head.
+	top, err = s.GetTopGroupsByHoldings(ctx, mint, 2)
+	require.NoError(t, err)
+	requireRanking(want[:2], top)
+
+	// A refresh moves a group: the last rises to the top, once.
+	risen := holdingsAt(want[4].ChatID, mint, 1_000, 14, 20)
+	changed, err := s.PutGroupHoldings(ctx, risen)
+	require.NoError(t, err)
+	require.True(t, changed)
+	top, err = s.GetTopGroupsByHoldings(ctx, mint, 0)
+	require.NoError(t, err)
+	requireRanking(append([]chat.GroupHoldings{risen}, want[:4]...), top)
+}
+
+// gatedGroup returns a public group whose minimum listener balance names
+// mint, for the store's queue tests.
+func gatedGroup(mint *commonpb.PublicKey) *chat.Chat {
+	return &chat.Chat{
+		ID:      chat.MustGenerateGroupChatID(),
+		Type:    chatpb.ChatType_GROUP,
+		Members: []*commonpb.UserId{model.MustGenerateUserID()},
+		MinimumListenerBalance: &chat.MinimumBalance{
+			Currency:     "usd",
+			NativeAmount: 1,
+			Mints:        []*commonpb.PublicKey{mint},
+		},
+		LastActivity: at(0),
+	}
+}
+
+// dueChatIDs returns the chat IDs of the refreshes due as of asOf, in queue
+// order.
+func dueChatIDs(t *testing.T, s chat.Store, asOf time.Time) [][]byte {
+	t.Helper()
+	due, err := s.GetDueHoldingsRefreshes(context.Background(), asOf, 0)
+	require.NoError(t, err)
+	out := make([][]byte, len(due))
+	for i, r := range due {
+		out[i] = r.ChatID.Value
+	}
+	return out
+}
+
+func testStore_HoldingsQueue_EnqueuedAtCreation(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	mint := model.MustGenerateKeyPair().Proto()
+
+	before := time.Now()
+	gated := gatedGroup(mint)
+	require.NoError(t, s.PutChat(ctx, gated))
+
+	// Not gated: no requirement, a private group, and a DM.
+	putGroupChat(t, s, "Ungated", at(0), model.MustGenerateUserID())
+	private := gatedGroup(mint)
+	private.IsPrivate = true
+	require.NoError(t, s.PutChat(ctx, private))
+	putDmChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(0))
+
+	// Due at once, with its mint and no failed attempts.
+	due, err := s.GetDueHoldingsRefreshes(ctx, time.Now(), 0)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	require.Equal(t, gated.ID.Value, due[0].ChatID.Value)
+	require.Equal(t, mint.Value, due[0].Mint.Value)
+	require.Zero(t, due[0].Attempts)
+	require.False(t, due[0].DueAt.Before(before.Truncate(time.Millisecond)))
+
+	// A backfill of a group already queued leaves its entry alone.
+	changed, err := s.EnqueueHoldingsRefresh(ctx, gated.ID, mint, at(-1_000_000))
+	require.NoError(t, err)
+	require.False(t, changed)
+	again, err := s.GetDueHoldingsRefreshes(ctx, time.Now(), 0)
+	require.NoError(t, err)
+	require.Len(t, again, 1)
+	require.True(t, due[0].DueAt.Equal(again[0].DueAt))
+}
+
+func testStore_HoldingsQueue_ClaimAndReschedule(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	mint := model.MustGenerateKeyPair().Proto()
+	ids := generateGroupChatIDs(3)
+
+	// A backfill enqueues each group once, due when it says.
+	for i, id := range ids {
+		changed, err := s.EnqueueHoldingsRefresh(ctx, id, mint, at(int64(10*(i+1))))
+		require.NoError(t, err)
+		require.True(t, changed)
+	}
+	_, err := s.EnqueueHoldingsRefresh(ctx, generateDmChatID(), mint, at(0))
+	require.Error(t, err)
+	_, err = s.EnqueueHoldingsRefresh(ctx, chat.MustGenerateGroupChatID(), &commonpb.PublicKey{Value: []byte{1}}, at(0))
+	require.Error(t, err)
+
+	// Due ones only, soonest first, up to a limit.
+	require.Empty(t, dueChatIDs(t, s, at(5)))
+	require.Equal(t, [][]byte{ids[0].Value, ids[1].Value}, dueChatIDs(t, s, at(20)))
+	limited, err := s.GetDueHoldingsRefreshes(ctx, at(100), 2)
+	require.NoError(t, err)
+	require.Len(t, limited, 2)
+
+	// A claim pushes the due time out, once; a group not yet due, or not
+	// queued, cannot be claimed.
+	claimed, err := s.ClaimHoldingsRefresh(ctx, ids[0], at(20), at(1_000))
+	require.NoError(t, err)
+	require.True(t, claimed)
+	claimed, err = s.ClaimHoldingsRefresh(ctx, ids[0], at(20), at(1_000))
+	require.NoError(t, err)
+	require.False(t, claimed)
+	claimed, err = s.ClaimHoldingsRefresh(ctx, ids[2], at(20), at(1_000))
+	require.NoError(t, err)
+	require.False(t, claimed)
+	claimed, err = s.ClaimHoldingsRefresh(ctx, chat.MustGenerateGroupChatID(), at(20), at(1_000))
+	require.NoError(t, err)
+	require.False(t, claimed)
+	require.Equal(t, [][]byte{ids[1].Value}, dueChatIDs(t, s, at(20)))
+
+	// A reschedule sets the due time and the attempts.
+	require.NoError(t, s.RescheduleHoldingsRefresh(ctx, ids[0], at(15), 3))
+	due, err := s.GetDueHoldingsRefreshes(ctx, at(20), 0)
+	require.NoError(t, err)
+	require.Len(t, due, 2)
+	require.Equal(t, ids[0].Value, due[0].ChatID.Value)
+	require.True(t, at(15).Equal(due[0].DueAt))
+	require.EqualValues(t, 3, due[0].Attempts)
+	require.NoError(t, s.RescheduleHoldingsRefresh(ctx, ids[0], at(15), 0))
+	due, err = s.GetDueHoldingsRefreshes(ctx, at(20), 1)
+	require.NoError(t, err)
+	require.Zero(t, due[0].Attempts)
+
+	// Rescheduling a group that is not queued enqueues nothing.
+	unqueued := chat.MustGenerateGroupChatID()
+	require.NoError(t, s.RescheduleHoldingsRefresh(ctx, unqueued, at(0), 0))
+	require.NotContains(t, dueChatIDs(t, s, at(1_000_000)), unqueued.Value)
+}
+
+func testStore_HoldingsQueue_EntryWithoutSnapshot(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	mint := model.MustGenerateKeyPair().Proto()
+	chatID := chat.MustGenerateGroupChatID()
+
+	_, err := s.EnqueueHoldingsRefresh(ctx, chatID, mint, at(0))
+	require.NoError(t, err)
+
+	// Queued but never refreshed: no snapshot, and not ranked.
+	got, err := s.GetGroupHoldings(ctx, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	require.Empty(t, got)
+	top, err := s.GetTopGroupsByHoldings(ctx, mint, 0)
+	require.NoError(t, err)
+	require.Empty(t, top)
+
+	// The first snapshot lands on the entry, which stays queued.
+	h := holdingsAt(chatID, mint, 700, 12, 10)
+	changed, err := s.PutGroupHoldings(ctx, h)
+	require.NoError(t, err)
+	require.True(t, changed)
+	got, err = s.GetGroupHoldings(ctx, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	requireHoldingsEqual(t, h, got[string(chatID.Value)])
+	top, err = s.GetTopGroupsByHoldings(ctx, mint, 0)
+	require.NoError(t, err)
+	require.Len(t, top, 1)
+	require.Equal(t, [][]byte{chatID.Value}, dueChatIDs(t, s, at(1)))
+}
+
+func testStore_Holdings_Unlisted(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	mint := model.MustGenerateKeyPair().Proto()
+	chatID := chat.MustGenerateGroupChatID()
+	listedGroup := chat.MustGenerateGroupChatID()
+
+	requireStored := func(want chat.GroupHoldings) {
+		t.Helper()
+		got, err := s.GetGroupHoldings(ctx, []*commonpb.ChatId{chatID})
+		require.NoError(t, err)
+		requireHoldingsEqual(t, want, got[string(chatID.Value)])
+	}
+	requireRanked := func(want ...*commonpb.ChatId) {
+		t.Helper()
+		top, err := s.GetTopGroupsByHoldings(ctx, mint, 0)
+		require.NoError(t, err)
+		got := make([][]byte, len(top))
+		for i, h := range top {
+			got[i] = h.ChatID.Value
+		}
+		require.Equal(t, chatIDBytes(want), got)
+	}
+
+	// A listed group of the mint beside the one under test, queued.
+	_, err := s.PutGroupHoldings(ctx, holdingsAt(listedGroup, mint, 100, chat.MinGroupHoldingsHolders, 10))
+	require.NoError(t, err)
+	_, err = s.EnqueueHoldingsRefresh(ctx, chatID, mint, at(0))
+	require.NoError(t, err)
+
+	// Below the minimum, however much is held, and nothing held at all: each
+	// is stored, and neither is ranked.
+	for i, unlisted := range []chat.GroupHoldings{
+		holdingsAt(chatID, mint, 9_000_000, chat.MinGroupHoldingsHolders-1, 10),
+		holdingsAt(chatID, mint, 0, 0, 20),
+	} {
+		require.False(t, unlisted.Listed(), i)
+		changed, err := s.PutGroupHoldings(ctx, unlisted)
+		require.NoError(t, err)
+		require.True(t, changed)
+		requireStored(unlisted)
+		requireRanked(listedGroup)
+	}
+
+	// Reaching the minimum ranks it, above the other group.
+	listed := holdingsAt(chatID, mint, 5_000, chat.MinGroupHoldingsHolders, 30)
+	require.True(t, listed.Listed())
+	changed, err := s.PutGroupHoldings(ctx, listed)
+	require.NoError(t, err)
+	require.True(t, changed)
+	requireStored(listed)
+	requireRanked(chatID, listedGroup)
+
+	// Dropping below it again takes it out of the ranking with the snapshot
+	// that records it, which stays stored.
+	dropped := holdingsAt(chatID, mint, 4_000, chat.MinGroupHoldingsHolders-1, 40)
+	changed, err = s.PutGroupHoldings(ctx, dropped)
+	require.NoError(t, err)
+	require.True(t, changed)
+	requireStored(dropped)
+	requireRanked(listedGroup)
+
+	// An older listed snapshot landing late does not rank it again.
+	changed, err = s.PutGroupHoldings(ctx, holdingsAt(chatID, mint, 9_000, 20, 35))
+	require.NoError(t, err)
+	require.False(t, changed)
+	requireStored(dropped)
+	requireRanked(listedGroup)
+
+	// The queue entry is untouched throughout.
+	require.Equal(t, [][]byte{chatID.Value}, dueChatIDs(t, s, at(1)))
+}
+
+func testStore_Holdings_MintMismatch(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	mint := model.MustGenerateKeyPair().Proto()
+	other := model.MustGenerateKeyPair().Proto()
+
+	requireQueuedFor := func(chatID *commonpb.ChatId, want *commonpb.PublicKey) {
+		t.Helper()
+		due, err := s.GetDueHoldingsRefreshes(ctx, at(1_000), 0)
+		require.NoError(t, err)
+		for _, r := range due {
+			if bytes.Equal(r.ChatID.Value, chatID.Value) {
+				require.Equal(t, want.Value, r.Mint.Value)
+				return
+			}
+		}
+		t.Fatalf("group not queued")
+	}
+
+	// A queued group's snapshots are of its queued mint: another is refused,
+	// writes nothing, and leaves the queue totalling the queued one.
+	queued := chat.MustGenerateGroupChatID()
+	_, err := s.EnqueueHoldingsRefresh(ctx, queued, mint, at(0))
+	require.NoError(t, err)
+	_, err = s.PutGroupHoldings(ctx, holdingsAt(queued, other, 500, 10, 10))
+	require.ErrorIs(t, err, chat.ErrHoldingsMintMismatch)
+	got, err := s.GetGroupHoldings(ctx, []*commonpb.ChatId{queued})
+	require.NoError(t, err)
+	require.Empty(t, got)
+	requireQueuedFor(queued, mint)
+
+	// Its own mint lands; then another is refused whether older or newer
+	// than the stored snapshot, which stands.
+	stored := holdingsAt(queued, mint, 500, 10, 10)
+	changed, err := s.PutGroupHoldings(ctx, stored)
+	require.NoError(t, err)
+	require.True(t, changed)
+	for _, seconds := range []int64{5, 20} {
+		_, err = s.PutGroupHoldings(ctx, holdingsAt(queued, other, 900, 12, seconds))
+		require.ErrorIs(t, err, chat.ErrHoldingsMintMismatch)
+	}
+	got, err = s.GetGroupHoldings(ctx, []*commonpb.ChatId{queued})
+	require.NoError(t, err)
+	requireHoldingsEqual(t, stored, got[string(queued.Value)])
+	requireQueuedFor(queued, mint)
+	top, err := s.GetTopGroupsByHoldings(ctx, other, 0)
+	require.NoError(t, err)
+	require.Empty(t, top)
+
+	// The same holds the other way round: a group with a snapshot of one
+	// mint and no queue entry cannot be queued for another, only its own,
+	// once.
+	snapshotted := chat.MustGenerateGroupChatID()
+	_, err = s.PutGroupHoldings(ctx, holdingsAt(snapshotted, mint, 500, 10, 10))
+	require.NoError(t, err)
+	_, err = s.EnqueueHoldingsRefresh(ctx, snapshotted, other, at(0))
+	require.ErrorIs(t, err, chat.ErrHoldingsMintMismatch)
+	changed, err = s.EnqueueHoldingsRefresh(ctx, snapshotted, mint, at(0))
+	require.NoError(t, err)
+	require.True(t, changed)
+	changed, err = s.EnqueueHoldingsRefresh(ctx, snapshotted, mint, at(0))
+	require.NoError(t, err)
+	require.False(t, changed)
+	requireQueuedFor(snapshotted, mint)
 }

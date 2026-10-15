@@ -143,7 +143,36 @@ type MintHolding struct {
 // and one such user must not hold up everyone else's balance. A currency OCP
 // cannot price is ErrUnsupportedCurrency, as for GetTotalFiatValue.
 func (c *Client) GetMintHoldingsForUsers(ctx context.Context, currency currency_lib.Code, mint *commonpb.PublicKey, userIDs ...*commonpb.UserId) (map[string]MintHolding, error) {
-	code := string(currency)
+	return c.getMintHoldings(ctx, string(currency), mint, userIDs)
+}
+
+// GetMintQuarksForUsers returns what each of the given users holds of mint,
+// in the mint's own quarks, keyed by string(userID.Value): the quarks of
+// GetMintHoldingsForUsers with no valuation asked for, so the answer never
+// depends on a rate and no currency can be unsupported. It is for a caller
+// that sums or ranks holdings of one mint, where quarks are exact and a
+// value adds nothing. Who is left out, and how the read is batched, is as for
+// GetMintHoldingsForUsers.
+func (c *Client) GetMintQuarksForUsers(ctx context.Context, mint *commonpb.PublicKey, userIDs ...*commonpb.UserId) (map[string]uint64, error) {
+	holdings, err := c.getMintHoldings(ctx, "", mint, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	quarks := make(map[string]uint64, len(holdings))
+	for userKey, holding := range holdings {
+		quarks[userKey] = holding.Quarks
+	}
+	return quarks, nil
+}
+
+// getMintHoldings is GetMintHoldingsForUsers, valued in code, or not valued
+// at all when code is empty (see GetMintQuarksForUsers), in which case every
+// holding's FiatValue is zero.
+func (c *Client) getMintHoldings(ctx context.Context, code string, mint *commonpb.PublicKey, userIDs []*commonpb.UserId) (map[string]MintHolding, error) {
+	var currencyCodes []string
+	if code != "" {
+		currencyCodes = []string{code}
+	}
 
 	mintAccount, err := ocp_common.NewAccountFromPublicKeyBytes(mint.GetValue())
 	if err != nil {
@@ -168,7 +197,7 @@ func (c *Client) GetMintHoldingsForUsers(ctx context.Context, currency currency_
 		resp, err := c.ocpBalance.GetBalances(ctx, &ocp_balancepb.GetBalancesRequest{
 			Owners:        ownerIDs[start:min(start+maxOwnersPerGetBalances, len(ownerIDs))],
 			Mints:         []*ocp_commonpb.SolanaAccountId{mintAccount.ToProto()},
-			CurrencyCodes: []string{code},
+			CurrencyCodes: currencyCodes,
 		})
 		if err != nil {
 			c.log.With(zap.Error(err)).Warn("Failure getting balances from OCP")
@@ -193,9 +222,13 @@ func (c *Client) GetMintHoldingsForUsers(ctx context.Context, currency currency_
 			if !ok {
 				continue
 			}
-			value, ok := ownerBalance.FiatValuesByCurrency[code]
-			if !ok {
-				return nil, fmt.Errorf("%w: %q", ErrUnsupportedCurrency, code)
+			var value float64
+			if code != "" {
+				var ok bool
+				value, ok = ownerBalance.FiatValuesByCurrency[code]
+				if !ok {
+					return nil, fmt.Errorf("%w: %q", ErrUnsupportedCurrency, code)
+				}
 			}
 			quarks := ownerBalance.BalancesByMint[mintAddress].GetQuarks()
 			if quarks > 0 {

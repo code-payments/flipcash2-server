@@ -334,6 +334,36 @@ func (c *Cache) GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) 
 	return c.db.GetFeaturedGroups(ctx, userID)
 }
 
+// The holdings methods pass through: a snapshot is replaced by a refresh in
+// any process, and its readers are batched already.
+func (c *Cache) PutGroupHoldings(ctx context.Context, h chat.GroupHoldings) (bool, error) {
+	return c.db.PutGroupHoldings(ctx, h)
+}
+
+func (c *Cache) GetGroupHoldings(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]chat.GroupHoldings, error) {
+	return c.db.GetGroupHoldings(ctx, chatIDs)
+}
+
+func (c *Cache) GetTopGroupsByHoldings(ctx context.Context, mint *commonpb.PublicKey, limit int) ([]chat.GroupHoldings, error) {
+	return c.db.GetTopGroupsByHoldings(ctx, mint, limit)
+}
+
+func (c *Cache) EnqueueHoldingsRefresh(ctx context.Context, chatID *commonpb.ChatId, mint *commonpb.PublicKey, dueAt time.Time) (bool, error) {
+	return c.db.EnqueueHoldingsRefresh(ctx, chatID, mint, dueAt)
+}
+
+func (c *Cache) GetDueHoldingsRefreshes(ctx context.Context, asOf time.Time, limit int) ([]chat.HoldingsRefresh, error) {
+	return c.db.GetDueHoldingsRefreshes(ctx, asOf, limit)
+}
+
+func (c *Cache) ClaimHoldingsRefresh(ctx context.Context, chatID *commonpb.ChatId, asOf, until time.Time) (bool, error) {
+	return c.db.ClaimHoldingsRefresh(ctx, chatID, asOf, until)
+}
+
+func (c *Cache) RescheduleHoldingsRefresh(ctx context.Context, chatID *commonpb.ChatId, dueAt time.Time, attempts uint32) error {
+	return c.db.RescheduleHoldingsRefresh(ctx, chatID, dueAt, attempts)
+}
+
 // sendActivityCacheKey keys the activity cache by (group, user). Only group
 // IDs are held, and they are fixed width (chat.GroupChatIDSize), so
 // concatenating the raw bytes is unambiguous.

@@ -11,6 +11,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/chat"
+	"github.com/code-payments/flipcash2-server/messaging"
 	"github.com/code-payments/flipcash2-server/profile"
 	ocp_currency_util "github.com/code-payments/ocp-server/ocp/currency"
 	"github.com/code-payments/ocp-server/ocp/data/intent"
@@ -23,6 +24,7 @@ import (
 type Integration struct {
 	accounts account.Store
 	chats    chat.Store
+	messages messaging.Store
 	profiles profile.Store
 
 	// access gates group payments on the payer's standing to speak and the
@@ -37,7 +39,8 @@ type Integration struct {
 	teamUserID *commonpb.UserId
 }
 
-// NewIntegration constructs the intent integration. access is the one
+// NewIntegration constructs the intent integration. messages is the
+// messaging store, read to validate reaction boosts. access is the one
 // chat.Access the parent builds and shares with the chat and messaging
 // servers. teamUserID is the Flipcash team account, which the parent resolves
 // once at startup with flipcashteam.GetUserID and passes to the chat store,
@@ -46,6 +49,7 @@ type Integration struct {
 func NewIntegration(
 	accounts account.Store,
 	chats chat.Store,
+	messages messaging.Store,
 	profiles profile.Store,
 	access *chat.Access,
 	mintDataProvider *ocp_currency_util.MintDataProvider,
@@ -55,6 +59,8 @@ func NewIntegration(
 		accounts: accounts,
 		chats:    chats,
 		profiles: profiles,
+
+		messages: messages,
 
 		access: access,
 
@@ -109,6 +115,8 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 				return i.validateDmAppMetadata(ctx, intentRecord, &appMetadata)
 			case *intentpb.ChatMetadata_GroupPayment_:
 				return i.validateGroupAppMetadata(ctx, intentRecord, &appMetadata)
+			case *intentpb.ChatMetadata_ReactionBoost_:
+				return i.validateReactionBoostAppMetadata(ctx, intentRecord, &appMetadata)
 			default:
 				return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
 			}
@@ -127,8 +135,8 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 // GetTasksToSchedule returns the guaranteed work derived from a submitted
 // intent. A DM payment of either type (contact DM or DM) schedules the cash
 // message injected into the DM between the sender and recipient, and a group
-// payment the one injected into the group; execution is handled by
-// task.Executor.
+// payment the one injected into the group; a reaction boost schedules the
+// task that records the boost. Execution is handled by task.Executor.
 func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_intent.Record) ([]*ocp_task.Record, error) {
 	if intentRecord.IntentType == ocp_intent.SendPublicPayment {
 		if GetContactDmPayment(intentRecord.AppMetadata) != nil {
@@ -139,6 +147,9 @@ func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_
 		}
 		if GetGroupPayment(intentRecord.AppMetadata) != nil {
 			return []*ocp_task.Record{NewSendGroupPaymentMessageTask(intentRecord)}, nil
+		}
+		if GetReactionBoost(intentRecord.AppMetadata) != nil {
+			return []*ocp_task.Record{NewRecordReactionBoostTask(intentRecord)}, nil
 		}
 	}
 

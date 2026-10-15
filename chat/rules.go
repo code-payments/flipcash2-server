@@ -18,6 +18,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/balance"
+	"github.com/code-payments/flipcash2-server/send"
 )
 
 // Rules projects the chat's stored participation requirements onto a
@@ -213,7 +214,7 @@ type CreationRules struct {
 // one of each; and a minimum balance, listener or speaker, of at least the
 // currency's minimum transfer value — one unit at its last decimal place, a
 // penny for USD, a yen for JPY, the smallest amount OCP lets anyone hold or
-// move in that currency (see minimumTransferValue). A requirement below it
+// move in that currency (see send.MinimumTransferValue). A requirement below it
 // asks for a balance no one can distinguish from nothing, so the rule would
 // admit everyone, or no one, on rounding alone. The currency is any ISO 4217
 // code: the proto bounds its shape, and whether OCP can value a balance in it
@@ -287,7 +288,7 @@ func RulesFromProto(rules *chatpb.Rules) (CreationRules, error) {
 		case !sameMints(speaker.Mints, listener.Mints):
 			return CreationRules{}, fmt.Errorf("%w: minimum speaker balance must be in the listener balance's mints", ErrInvalidRules)
 		case !exceedsByMinimumTransferValue(speaker.NativeAmount, listener.NativeAmount, currency_lib.Code(speaker.Currency)):
-			minimum := minimumTransferValue(currency_lib.Code(speaker.Currency))
+			minimum := send.MinimumTransferValue(currency_lib.Code(speaker.Currency))
 			return CreationRules{}, fmt.Errorf("%w: minimum speaker balance must exceed the listener balance by at least %s %s", ErrInvalidRules, strconv.FormatFloat(minimum, 'f', -1, 64), strings.ToUpper(speaker.Currency))
 		}
 	}
@@ -303,7 +304,7 @@ func minimumBalanceFromProto(req *chatpb.MinimumBalanceRequirement) (*MinimumBal
 		return nil, fmt.Errorf("%w: minimum balance currency is required", ErrInvalidRules)
 	}
 	amount := req.GetAmount().GetNativeAmount()
-	if minimum := minimumTransferValue(currency); math.IsNaN(amount) || math.IsInf(amount, 0) || amount < minimum {
+	if minimum := send.MinimumTransferValue(currency); math.IsNaN(amount) || math.IsInf(amount, 0) || amount < minimum {
 		return nil, fmt.Errorf("%w: minimum balance amount must be at least %s %s", ErrInvalidRules, strconv.FormatFloat(minimum, 'f', -1, 64), strings.ToUpper(string(currency)))
 	}
 	mints := make([]*commonpb.PublicKey, len(req.GetMints()))
@@ -328,17 +329,7 @@ func minimumBalanceFromProto(req *chatpb.MinimumBalanceRequirement) (*MinimumBal
 // short of it by anything a client can express does not.
 func exceedsByMinimumTransferValue(amount, base float64, code currency_lib.Code) bool {
 	tolerance := 4 * (math.Nextafter(amount, math.Inf(1)) - amount)
-	return amount-base+tolerance >= minimumTransferValue(code)
-}
-
-// minimumTransferValue is the smallest amount of a currency OCP transfers: one
-// unit at the currency's last decimal place (currency.GetDecimals), 0.01 for
-// USD and 1 for a currency with no minor unit. It is the floor a minimum
-// balance requirement must meet (see RulesFromProto). OCP's own amount
-// validation is the source of the definition; it is not exported, so the
-// arithmetic is repeated here.
-func minimumTransferValue(code currency_lib.Code) float64 {
-	return math.Pow10(-currency_lib.GetDecimals(code))
+	return amount-base+tolerance >= send.MinimumTransferValue(code)
 }
 
 // RuleEvaluator decides whether a user satisfies a chat's participation rules
@@ -659,6 +650,6 @@ func (e *RuleEvaluator) satisfiesMinimumBalance(ctx context.Context, req *chatpb
 	} else if err != nil {
 		return false, err
 	}
-	tolerance := 0.5 * minimumTransferValue(currency)
+	tolerance := 0.5 * send.MinimumTransferValue(currency)
 	return held >= req.GetAmount().GetNativeAmount()-tolerance, nil
 }

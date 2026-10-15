@@ -215,10 +215,6 @@ func TestRulesFromProto_MinimumTransferValue(t *testing.T) {
 		require.ErrorIs(t, err, ErrInvalidRules, "%v", amount)
 	}
 
-	require.Equal(t, 0.01, minimumTransferValue("usd"))
-	require.Equal(t, 1.0, minimumTransferValue("jpy"))
-	require.Equal(t, 0.001, minimumTransferValue("kwd"))
-
 	// The floor follows the currency: a yen for JPY, a fils for KWD. The
 	// currency itself is stored as asked; whether OCP can value a balance in
 	// it is not validation's question.

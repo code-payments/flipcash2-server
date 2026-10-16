@@ -124,6 +124,7 @@ func toNotification(
 				UserId: userID,
 			}
 		}
+		metadata.BoostedReaction = toBoostedReaction(record.AppMetadata)
 		notification.AdditionalMetadata = &activitypb.Notification_DirectlySentCrypto{DirectlySentCrypto: metadata}
 
 	case history.DirectlyReceived, history.IndirectlyReceived:
@@ -137,6 +138,7 @@ func toNotification(
 				UserId: userID,
 			}
 		}
+		metadata.BoostedReaction = toBoostedReaction(record.AppMetadata)
 		notification.AdditionalMetadata = &activitypb.Notification_ReceivedCrypto{ReceivedCrypto: metadata}
 
 	case history.IndirectlySent:
@@ -192,6 +194,23 @@ func toNotification(
 	}
 
 	return notification, nil
+}
+
+// toBoostedReaction names the reaction a payment boosted, read off the app
+// metadata its intent carried, or nil for a payment that was not a reaction
+// boost. A boost was validated when it was paid, so its metadata names a
+// group, a message and an emoji; it is what the payment was for then, and is
+// not checked against the chat now.
+func toBoostedReaction(appMetadata []byte) *activitypb.BoostedReaction {
+	boost := intent.GetReactionBoost(appMetadata)
+	if boost == nil {
+		return nil
+	}
+	return &activitypb.BoostedReaction{
+		ChatId:    intent.GetChatMetadata(appMetadata).GetChatId(),
+		MessageId: boost.GetMessageId(),
+		Emoji:     boost.GetEmoji(),
+	}
 }
 
 // toSwapMetadata describes the conversion behind a record, or nil for a record

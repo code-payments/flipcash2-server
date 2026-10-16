@@ -61,7 +61,9 @@ func fromNotificationID(id *activitypb.NotificationId) (recordID uint64, ok bool
 //
 // counterpartyUserIDs maps an owner account to the user ID it belongs to, for
 // the records whose counterparty is identified that way. It is resolved for the
-// whole page by resolveHistoryCounterparties rather than per record.
+// whole page by resolveHistoryCounterparties rather than per record, so it is
+// keyed by account and each record still decides for itself whether it may
+// name its counterparty (see chatCounterpartyUserID).
 func toNotifications(
 	records []*history.Record,
 	counterpartyUserIDs map[string]*commonpb.UserId,
@@ -114,7 +116,7 @@ func toNotification(
 			metadata.DestinationIdentifier = &activitypb.DirectlySentCryptoNotificationMetadata_Phone{
 				Phone: contactPayment.GetDestination(),
 			}
-		} else if userID, ok := counterpartyUserIDs[counterpartyOwnerAccount(record)]; ok {
+		} else if userID, ok := chatCounterpartyUserID(record, counterpartyUserIDs); ok {
 			// A DM or group payment identifies the recipient by user ID instead,
 			// so the client can render their profile without either party's
 			// phone number, which stays private outside contact DMs.
@@ -130,7 +132,7 @@ func toNotification(
 			metadata.SourceIdentifier = &activitypb.ReceivedCryptoNotificationMetadata_Phone{
 				Phone: contactPayment.GetSource(),
 			}
-		} else if userID, ok := counterpartyUserIDs[counterpartyOwnerAccount(record)]; ok {
+		} else if userID, ok := chatCounterpartyUserID(record, counterpartyUserIDs); ok {
 			metadata.SourceIdentifier = &activitypb.ReceivedCryptoNotificationMetadata_UserId{
 				UserId: userID,
 			}
@@ -417,6 +419,21 @@ func (s *Server) getBatchNotificationsFromHistory(
 	}
 
 	return toNotifications(records, counterpartyUserIDs)
+}
+
+// chatCounterpartyUserID returns the user ID naming the record's counterparty,
+// for a DM or group payment alone.
+//
+// counterpartyUserIDs is keyed by owner account across the whole page, so a
+// payment handed off in person would find its counterparty there whenever a
+// chat payment with the same person shares the page. Checking the record
+// itself keeps it unnamed whatever else the page holds.
+func chatCounterpartyUserID(record *history.Record, counterpartyUserIDs map[string]*commonpb.UserId) (*commonpb.UserId, bool) {
+	if !intent.IsUserChatPayment(record.AppMetadata) {
+		return nil, false
+	}
+	userID, ok := counterpartyUserIDs[counterpartyOwnerAccount(record)]
+	return userID, ok
 }
 
 // counterpartyOwnerAccount returns the other party's owner account, or empty

@@ -745,18 +745,18 @@ func TestRuleEvaluator_MinimumBalance(t *testing.T) {
 	usdf := model.MustGenerateKeyPair().Proto()
 	other := model.MustGenerateKeyPair().Proto()
 
-	// holder holds exactly the requirement; underfunded is one quark short; unbound
+	// holder holds exactly the requirement; underfunded is a cent short; unbound
 	// has no owner account at all.
 	const requirement = 100
 	holder := model.MustGenerateUserID()
 	ocpBalance.set(accounts.bind(holder), usdf, ocp_common.ToCoreMintQuarks(requirement))
 	underfunded := model.MustGenerateUserID()
-	ocpBalance.set(accounts.bind(underfunded), usdf, ocp_common.ToCoreMintQuarks(requirement)-1)
+	ocpBalance.set(accounts.bind(underfunded), usdf, ocp_common.ToCoreMintQuarks(requirement)-ocp_common.CoreMintQuarksPerUnit/100)
 	unbound := model.MustGenerateUserID()
 
 	// A USD requirement is compared straight against the USDF valuation: a
-	// balance exactly at the requirement satisfies it, one quark under does
-	// not, and a user with no owner account holds nothing.
+	// balance exactly at the requirement satisfies it, a cent under does not,
+	// and a user with no owner account holds nothing.
 	gated := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumListenerBalance: &MinimumBalance{Currency: "usd", NativeAmount: requirement}})
 	for _, u := range []*commonpb.UserId{holder} {
 		ok, err := e.CanListen(ctx, gated.ID, u)
@@ -775,11 +775,29 @@ func TestRuleEvaluator_MinimumBalance(t *testing.T) {
 		require.False(t, ok)
 	}
 
+	// Half a cent of slack is allowed, as for any other currency: half a cent
+	// under the requirement satisfies it, a quark more under does not.
+	halfCent := ocp_common.CoreMintQuarksPerUnit / 200
+	ocpBalance.set(accounts.keys[string(underfunded.Value)], usdf, ocp_common.ToCoreMintQuarks(requirement)-halfCent)
+	ok, err := e.CanListen(ctx, gated.ID, underfunded)
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, err = e.CanSpeak(ctx, gated.ID, underfunded)
+	require.NoError(t, err)
+	require.True(t, ok)
+	ocpBalance.set(accounts.keys[string(underfunded.Value)], usdf, ocp_common.ToCoreMintQuarks(requirement)-halfCent-1)
+	ok, err = e.CanListen(ctx, gated.ID, underfunded)
+	require.NoError(t, err)
+	require.False(t, ok)
+	ok, err = e.CanSpeak(ctx, gated.ID, underfunded)
+	require.NoError(t, err)
+	require.False(t, ok)
+
 	// A fractional requirement is rounded to the quark, so a balance exactly
 	// at the requirement satisfies it despite the float on the way in.
 	cents := chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumListenerBalance: &MinimumBalance{Currency: "usd", NativeAmount: 0.1 + 0.2}})
 	ocpBalance.set(accounts.keys[string(underfunded.Value)], usdf, ocp_common.CoreMintQuarksPerUnit*3/10)
-	ok, err := e.CanListen(ctx, cents.ID, underfunded)
+	ok, err = e.CanListen(ctx, cents.ID, underfunded)
 	require.NoError(t, err)
 	require.True(t, ok)
 
@@ -895,7 +913,7 @@ func TestRuleEvaluator_MinimumSpeakerBalance(t *testing.T) {
 	holder := model.MustGenerateUserID()
 	ocpBalance.set(accounts.bind(holder), usdf, ocp_common.ToCoreMintQuarks(requirement))
 	underfunded := model.MustGenerateUserID()
-	ocpBalance.set(accounts.bind(underfunded), usdf, ocp_common.ToCoreMintQuarks(requirement)-1)
+	ocpBalance.set(accounts.bind(underfunded), usdf, ocp_common.ToCoreMintQuarks(requirement)-ocp_common.CoreMintQuarksPerUnit/100)
 	unbound := model.MustGenerateUserID()
 
 	// A speaker balance gates speaking alone: everyone listens, and only a
@@ -939,7 +957,7 @@ func TestRuleEvaluator_MinimumSpeakerBalance(t *testing.T) {
 	ok, err = e.CanSpeak(ctx, creatorOnly.ID, underfunded)
 	require.NoError(t, err)
 	require.True(t, ok)
-	ocpBalance.set(accounts.keys[string(underfunded.Value)], usdf, ocp_common.ToCoreMintQuarks(requirement)-1)
+	ocpBalance.set(accounts.keys[string(underfunded.Value)], usdf, ocp_common.ToCoreMintQuarks(requirement)-ocp_common.CoreMintQuarksPerUnit/100)
 
 	// Speaker rules apply on top of listener rules, but a speaker balance
 	// that covers the listener one (same currency and mints, at least the

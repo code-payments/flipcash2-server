@@ -584,8 +584,8 @@ func (e *RuleEvaluator) satisfies(ctx context.Context, rules RuleSet, kind any, 
 // satisfies the listener one: the same currency, the same set of mints (in
 // any order; none is any mint, and covers only none), and at least the
 // amount. satisfiesMinimumBalance compares either in a way that keeps the
-// order of the amounts — rounded to the quark for USD, against OCP's
-// valuation with the same slack otherwise — so a balance that clears the
+// order of the amounts — in quarks for USD, against OCP's valuation
+// otherwise, with the same slack either way — so a balance that clears the
 // larger requirement clears the smaller.
 func coversBalance(speaker, listener *chatpb.MinimumBalanceRequirement) bool {
 	return speaker.GetAmount().GetCurrency() == listener.GetAmount().GetCurrency() &&
@@ -612,28 +612,33 @@ func sameMints(a, b []*commonpb.PublicKey) bool {
 // satisfiesMinimumBalance reports whether userID holds at least the required
 // amount, in the required mints, right now.
 //
+// Every currency is compared with half of its smallest transferable unit of
+// slack (half a cent for USD), as intent validation allows on a rate-derived
+// payment, so a balance a fraction of a minor unit under the requirement
+// satisfies it.
+//
 // A USD requirement is answered in quarks: the balance client's core mint
 // total is USDF, a USD stablecoin, so the requirement compares directly
-// against it with no exchange rate in between, the requirement rounded to the
-// nearest quark, so a balance that is exactly the requirement satisfies it
-// whatever the float arithmetic on the way in. The path asks OCP for no
-// valuation, so a USD group is unaffected by what OCP can price.
+// against it with no exchange rate in between, the requirement and the slack
+// each rounded to the nearest quark. The path asks OCP for no valuation, so a
+// USD group is unaffected by what OCP can price.
 //
 // Any other currency is answered by OCP's valuation of the same holdings in
 // that currency (see balance.Client.GetTotalFiatValue). The value is a quoted
 // rate applied to a quark total, so it can land a fraction of a minor unit
-// under a requirement it meets through rounding alone; half of the currency's
-// smallest transferable unit of slack is allowed, as intent validation allows
-// on a rate-derived payment. A currency OCP cannot value is, like an unknown
-// rule kind, an error and never a pass.
+// under a requirement it meets through rounding alone, which the slack
+// absorbs. A currency OCP cannot value is, like an unknown rule kind, an error
+// and never a pass.
 //
 // A user with no owner account holds nothing, and fails as a zero balance would;
 // a balance that cannot be read is an error, so the gate is never left
 // unenforced.
 func (e *RuleEvaluator) satisfiesMinimumBalance(ctx context.Context, req *chatpb.MinimumBalanceRequirement, userID *commonpb.UserId) (bool, error) {
 	currency := currency_lib.Code(req.GetAmount().GetCurrency())
+	tolerance := 0.5 * send.MinimumTransferValue(currency)
 	if currency == currency_lib.USD {
 		required := uint64(math.Round(req.GetAmount().GetNativeAmount() * float64(ocp_common.CoreMintQuarksPerUnit)))
+		slack := uint64(math.Round(tolerance * float64(ocp_common.CoreMintQuarksPerUnit)))
 
 		held, err := e.balances.GetTotalUsdfBalance(ctx, userID, req.GetMints()...)
 		if errors.Is(err, balance.ErrNotFound) {
@@ -641,7 +646,7 @@ func (e *RuleEvaluator) satisfiesMinimumBalance(ctx context.Context, req *chatpb
 		} else if err != nil {
 			return false, err
 		}
-		return held >= required, nil
+		return held+slack >= required, nil
 	}
 
 	held, err := e.balances.GetTotalFiatValue(ctx, userID, currency, req.GetMints()...)
@@ -650,6 +655,5 @@ func (e *RuleEvaluator) satisfiesMinimumBalance(ctx context.Context, req *chatpb
 	} else if err != nil {
 		return false, err
 	}
-	tolerance := 0.5 * send.MinimumTransferValue(currency)
 	return held >= req.GetAmount().GetNativeAmount()-tolerance, nil
 }

@@ -11,8 +11,8 @@ import (
 )
 
 // CreateTables provisions the chats, dm_inbox, group_members,
-// chat_user_state, chat_activity, chat_key_envelopes, chat_lobbies and
-// chat_featured_groups tables with on-demand billing. The chats table is keyed
+// chat_user_state, chat_activity, chat_key_envelopes, chat_lobbies,
+// chat_featured_groups and chat_holdings tables with on-demand billing. The chats table is keyed
 // by pk only; dm_inbox is keyed by (pk, sk) with a GSI ordering each user's DMs
 // by last_activity; group_members is keyed by (pk, sk) = (chat, user) — plus
 // one "#meta" aggregates item per group — with an inverted GSI for listing a
@@ -30,8 +30,11 @@ import (
 // aggregates item per chat and per user — with a sparse GSI of a chat's
 // lobby by entry time (see gsiLobbyByChat); chat_featured_groups is keyed by
 // (pk, sk) = (user, position) — plus one "#meta" item per user — with no
-// index. It is idempotent and blocks until all tables are ACTIVE.
-func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable string) error {
+// index; chat_holdings is keyed by pk = chat with a GSI ranking a mint's
+// groups by holdings (see gsiByMintRank) and a GSI of the refresh queue by
+// due time (see refreshQueueIndex). It is idempotent and blocks until
+// all tables are ACTIVE.
+func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
 			TableName:   aws.String(chatsTable),
@@ -268,6 +271,41 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
 			},
 		},
+		{
+			TableName:   aws.String(holdingsTable),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrMint), AttributeType: types.ScalarAttributeTypeB},
+				{AttributeName: aws.String(attrRank), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrRefreshQueue), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrRefreshDueAt), AttributeType: types.ScalarAttributeTypeN},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+			},
+			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
+				{
+					IndexName: aws.String(gsiByMintRank),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrMint), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrRank), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+				{
+					IndexName: aws.String(refreshQueueIndex),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrRefreshQueue), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrRefreshDueAt), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{
+						ProjectionType:   types.ProjectionTypeInclude,
+						NonKeyAttributes: []string{attrMint, attrRefreshAttempts},
+					},
+				},
+			},
+		},
 	}
 
 	for _, input := range inputs {
@@ -343,6 +381,9 @@ func (s *store) reset() {
 		panic(err)
 	}
 	if err := clearTable(ctx, s.client, s.featuredGroupsTable, []string{attrPK, attrSK}); err != nil {
+		panic(err)
+	}
+	if err := clearTable(ctx, s.client, s.holdingsTable, []string{attrPK}); err != nil {
 		panic(err)
 	}
 }

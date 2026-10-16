@@ -34,8 +34,8 @@ func toNotificationID(recordID uint64) *activitypb.NotificationId {
 
 // fromNotificationID reverses toNotificationID. It reports ok false for
 // anything that is not an ID this package produced, including an ID minted by
-// the intent-derived feed, whose 32 bytes are a base58 decoded intent ID and
-// carry no record to look up.
+// the feed when it was derived from intents, whose 32 bytes are a base58
+// decoded intent ID and carry no record to look up.
 func fromNotificationID(id *activitypb.NotificationId) (recordID uint64, ok bool) {
 	value := id.GetValue()
 	if len(value) != notificationIDSize {
@@ -61,7 +61,9 @@ func fromNotificationID(id *activitypb.NotificationId) (recordID uint64, ok bool
 //
 // counterpartyUserIDs maps an owner account to the user ID it belongs to, for
 // the records whose counterparty is identified that way. It is resolved for the
-// whole page by resolveHistoryCounterparties rather than per record.
+// whole page by resolveHistoryCounterparties rather than per record, so it is
+// keyed by account and each record still decides for itself whether it may
+// name its counterparty (see chatCounterpartyUserID).
 func toNotifications(
 	records []*history.Record,
 	counterpartyUserIDs map[string]*commonpb.UserId,
@@ -81,9 +83,9 @@ func toNotifications(
 }
 
 // toNotification converts a single record, returning nil for one the feed does
-// not surface. Unlike the intent-derived path it reads no other record: a
-// swap's outcome and a gift card's disposition are already the record's state,
-// rather than something to go and look up.
+// not surface. It reads no other record: a swap's outcome and a gift card's
+// disposition are already the record's state, rather than something to go and
+// look up.
 func toNotification(
 	record *history.Record,
 	counterpartyUserIDs map[string]*commonpb.UserId,
@@ -114,7 +116,7 @@ func toNotification(
 			metadata.DestinationIdentifier = &activitypb.DirectlySentCryptoNotificationMetadata_Phone{
 				Phone: contactPayment.GetDestination(),
 			}
-		} else if userID, ok := counterpartyUserIDs[counterpartyOwnerAccount(record)]; ok {
+		} else if userID, ok := chatCounterpartyUserID(record, counterpartyUserIDs); ok {
 			// A DM or group payment identifies the recipient by user ID instead,
 			// so the client can render their profile without either party's
 			// phone number, which stays private outside contact DMs.
@@ -130,7 +132,7 @@ func toNotification(
 			metadata.SourceIdentifier = &activitypb.ReceivedCryptoNotificationMetadata_Phone{
 				Phone: contactPayment.GetSource(),
 			}
-		} else if userID, ok := counterpartyUserIDs[counterpartyOwnerAccount(record)]; ok {
+		} else if userID, ok := chatCounterpartyUserID(record, counterpartyUserIDs); ok {
 			metadata.SourceIdentifier = &activitypb.ReceivedCryptoNotificationMetadata_UserId{
 				UserId: userID,
 			}
@@ -321,9 +323,8 @@ func (s *Server) resolveHistoryCounterparties(ctx context.Context, records []*hi
 }
 
 // getPagedNotificationsFromHistory serves a page of the feed from the
-// transaction history. Where the intent-derived path reads a balance per gift
-// card and joins the swap table per swap, this reads one page and converts it,
-// so the cost of a page does not depend on what is in it.
+// transaction history. It reads one page and converts it, so the cost of a
+// page does not depend on what is in it.
 func (s *Server) getPagedNotificationsFromHistory(
 	ctx context.Context,
 	pubKey *commonpb.PublicKey,
@@ -420,6 +421,21 @@ func (s *Server) getBatchNotificationsFromHistory(
 	return toNotifications(records, counterpartyUserIDs)
 }
 
+// chatCounterpartyUserID returns the user ID naming the record's counterparty,
+// for a DM or group payment alone.
+//
+// counterpartyUserIDs is keyed by owner account across the whole page, so a
+// payment handed off in person would find its counterparty there whenever a
+// chat payment with the same person shares the page. Checking the record
+// itself keeps it unnamed whatever else the page holds.
+func chatCounterpartyUserID(record *history.Record, counterpartyUserIDs map[string]*commonpb.UserId) (*commonpb.UserId, bool) {
+	if !intent.IsUserChatPayment(record.AppMetadata) {
+		return nil, false
+	}
+	userID, ok := counterpartyUserIDs[counterpartyOwnerAccount(record)]
+	return userID, ok
+}
+
 // counterpartyOwnerAccount returns the other party's owner account, or empty
 // when the event had none.
 func counterpartyOwnerAccount(record *history.Record) string {
@@ -435,8 +451,7 @@ func counterpartyOwnerAccount(record *history.Record) string {
 // The response carries no paging token of its own, so a client pages by sending
 // back a notification ID. That names a record rather than a position, and the
 // history is ordered by event time, so the record has to be read to learn the
-// time that goes with it. The intent-derived path pays the same cost, reading
-// the intent a token names to recover its row.
+// time that goes with it.
 //
 // A token naming a record that is not the caller's is refused rather than
 // resolved, so paging cannot be used to confirm that someone else's record

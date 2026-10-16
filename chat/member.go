@@ -123,7 +123,7 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 		s.sendUserJoined(ctx, log, c, userID, nil, roster)
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, fullDetail, []*Chat{c})
+	metadata, err := s.hydrator.hydrate(ctx, userID, memberListenerStanding, ReadingFull, fullDetail, []*Chat{c})
 	if err != nil {
 		// The join has landed; only the read back failed. A retry is the
 		// idempotent path above and returns the metadata then.

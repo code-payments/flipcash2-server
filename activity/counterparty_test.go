@@ -17,7 +17,6 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	"github.com/code-payments/ocp-server/ocp/data/history"
-	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 )
 
 // counterpartyEnv holds a payer and a recipient bound to accounts, and the
@@ -62,6 +61,22 @@ func newCounterpartyEnv(t *testing.T) *counterpartyEnv {
 	return e
 }
 
+func paymentRecord(id uint64, recordType history.Type, owner, counterparty string, appMetadata []byte) *history.Record {
+	return &history.Record{
+		Id:                       id,
+		Type:                     recordType,
+		OwnerAccount:             owner,
+		CounterpartyOwnerAccount: &counterparty,
+		ExchangeCurrency:         "usd",
+		NativeAmount:             2.5,
+		MintAccount:              ocp_common.CoreMintAccount.PublicKey().ToBase58(),
+		Quantity:                 2_500_000,
+		AppMetadata:              appMetadata,
+		State:                    history.StateCompleted,
+		CreatedAt:                time.Now(),
+	}
+}
+
 func chatAppMetadata(t *testing.T, chatMetadata *intentpb.ChatMetadata) []byte {
 	appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
 		Domain: &intentpb.AppMetadata_Chat{Chat: chatMetadata},
@@ -79,21 +94,6 @@ func TestHistoryCounterparties(t *testing.T) {
 
 	payerAccount := base58.Encode(e.payerKeys.Public())
 	recipientAccount := base58.Encode(e.recipientKeys.Public())
-	record := func(id uint64, recordType history.Type, owner, counterparty string, appMetadata []byte) *history.Record {
-		return &history.Record{
-			Id:                       id,
-			Type:                     recordType,
-			OwnerAccount:             owner,
-			CounterpartyOwnerAccount: &counterparty,
-			ExchangeCurrency:         "usd",
-			NativeAmount:             2.5,
-			MintAccount:              ocp_common.CoreMintAccount.PublicKey().ToBase58(),
-			Quantity:                 2_500_000,
-			AppMetadata:              appMetadata,
-			State:                    history.StateCompleted,
-			CreatedAt:                time.Now(),
-		}
-	}
 
 	for _, tc := range []struct {
 		name        string
@@ -107,8 +107,8 @@ func TestHistoryCounterparties(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			records := []*history.Record{
-				record(1, history.DirectlySent, payerAccount, recipientAccount, tc.appMetadata),
-				record(2, history.DirectlyReceived, recipientAccount, payerAccount, tc.appMetadata),
+				paymentRecord(1, history.DirectlySent, payerAccount, recipientAccount, tc.appMetadata),
+				paymentRecord(2, history.DirectlyReceived, recipientAccount, payerAccount, tc.appMetadata),
 			}
 
 			counterparties, err := e.server.resolveHistoryCounterparties(context.Background(), records)
@@ -133,54 +133,46 @@ func TestHistoryCounterparties(t *testing.T) {
 	}
 }
 
-// TestChatCounterparties: the intent-derived feed resolves the other party
-// of a group payment from either side, as it does a DM payment's, and leaves
-// a payment carrying no chat metadata unresolved.
-func TestChatCounterparties(t *testing.T) {
+// TestHistoryCounterparties_MixedPage: a payment handed off in person names no
+// one even when a chat payment with the same person shares its page, whose
+// lookup puts that person's user ID in the page-wide counterparty map.
+func TestHistoryCounterparties_MixedPage(t *testing.T) {
 	e := newCounterpartyEnv(t)
 
 	payerAccount := base58.Encode(e.payerKeys.Public())
 	recipientAccount := base58.Encode(e.recipientKeys.Public())
-	payment := func(appMetadata []byte) *ocp_intent.Record {
-		return &ocp_intent.Record{
-			IntentType:            ocp_intent.SendPublicPayment,
-			InitiatorOwnerAccount: payerAccount,
-			SendPublicPaymentMetadata: &ocp_intent.SendPublicPaymentMetadata{
-				DestinationOwnerAccount: recipientAccount,
-			},
-			AppMetadata: appMetadata,
-		}
-	}
 
 	for _, tc := range []struct {
-		name        string
-		appMetadata []byte
-		named       bool
+		name  string
+		owner string
+		other string
+		types [2]history.Type
 	}{
-		{"group_payment", e.groupPayment, true},
-		{"dm_payment", e.dmPayment, true},
-		{"no_chat_metadata", nil, false},
+		{"payer", payerAccount, recipientAccount, [2]history.Type{history.DirectlySent, history.DirectlySent}},
+		{"recipient", recipientAccount, payerAccount, [2]history.Type{history.DirectlyReceived, history.DirectlyReceived}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			for _, side := range []struct {
-				viewer       model.KeyPair
-				counterparty string
-				userID       *commonpb.UserId
-			}{
-				{e.payerKeys, recipientAccount, e.recipient},
-				{e.recipientKeys, payerAccount, e.payer},
-			} {
-				viewer, err := ocp_common.NewAccountFromPublicKeyBytes(side.viewer.Public())
-				require.NoError(t, err)
+			records := []*history.Record{
+				paymentRecord(1, tc.types[0], tc.owner, tc.other, e.dmPayment),
+				paymentRecord(2, tc.types[1], tc.owner, tc.other, nil),
+			}
 
-				counterparties, err := e.server.resolveChatCounterparties(context.Background(), viewer, []*ocp_intent.Record{payment(tc.appMetadata)})
-				require.NoError(t, err)
-				if tc.named {
-					require.Len(t, counterparties, 1)
-					require.True(t, proto.Equal(side.userID, counterparties[side.counterparty]))
-				} else {
-					require.Empty(t, counterparties)
-				}
+			counterparties, err := e.server.resolveHistoryCounterparties(context.Background(), records)
+			require.NoError(t, err)
+			notifications, err := toNotifications(records, counterparties)
+			require.NoError(t, err)
+			require.Len(t, notifications, 2)
+
+			dm, inPerson := notifications[0], notifications[1]
+			if tc.types[0] == history.DirectlySent {
+				require.True(t, proto.Equal(e.recipient, dm.GetDirectlySentCrypto().GetUserId()))
+				require.Equal(t, "Sent", dm.LocalizedText)
+				require.Nil(t, inPerson.GetDirectlySentCrypto().GetDestinationIdentifier())
+				require.Equal(t, "Gave", inPerson.LocalizedText)
+			} else {
+				require.True(t, proto.Equal(e.payer, dm.GetReceivedCrypto().GetUserId()))
+				require.NotNil(t, inPerson.GetReceivedCrypto())
+				require.Nil(t, inPerson.GetReceivedCrypto().GetSourceIdentifier())
 			}
 		})
 	}

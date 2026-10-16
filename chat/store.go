@@ -140,6 +140,8 @@ type Store interface {
 	// is rejected with ErrTooManyMembers rather than written non-atomically; a
 	// caller wanting a larger group creates it at the cap and grows it with
 	// AddGroupMembers. RosterSummary is derived from Members and ignored.
+	// A group gated on a currency (see GatedMint) is enqueued for a holdings
+	// refresh due at once (see HoldingsRefresh), in the same write.
 	//
 	// A store built with users excluded from the feed (see FeedExclusions)
 	// creates every DM with one of them excluding them from it: their copy of the chat records their membership
@@ -617,4 +619,73 @@ type Store interface {
 	// of its own. A user who has never set any reads as no groups at version
 	// zero.
 	GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (FeaturedGroups, error)
+
+	// PutGroupHoldings records h as its group's holdings snapshot (see
+	// GroupHoldings), replacing the one stored, and reports whether it did.
+	// Every snapshot is stored, listed or not, but only a listed one (see
+	// GroupHoldings.Listed) is ranked: one that is not replaces the stored
+	// snapshot and takes the group out of GetTopGroupsByHoldings. A snapshot
+	// is never replaced by an older one: one taken at or before the stored
+	// snapshot's AsOf is a no-op that writes nothing and returns changed
+	// false, so refreshes that race, or a retried one, leave the latest
+	// standing. It returns an error unless h passes ValidateGroupHoldings.
+	//
+	// A group's holdings are of one mint: its queue entry and every snapshot
+	// share it, and the first of them to be written fixes it. A snapshot of
+	// any other mint is ErrHoldingsMintMismatch, with nothing written, and
+	// is judged before its age: a mismatched snapshot is refused even when it
+	// is also older than the stored one. It does not check that the group
+	// exists or is gated on h.Mint: that needs the group's record, and is the
+	// caller's; the worker writes the mint the queue entry holds, which was
+	// read from the record when the group was created.
+	PutGroupHoldings(ctx context.Context, h GroupHoldings) (changed bool, err error)
+
+	// GetGroupHoldings returns the holdings snapshot of each given group that
+	// has one, listed or not, keyed by string(chatID.Value); groups with none
+	// are absent and duplicate IDs collapse. A caller showing them applies
+	// GroupHoldings.Listed, as hydration does. The read is eventually consistent, at half the
+	// cost of a strong one: a snapshot is a display of derived data that a
+	// moment's lag cannot make wrong. It returns an error if any ID is not a
+	// group chat ID, and an empty result (no error) when chatIDs is empty.
+	GetGroupHoldings(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]GroupHoldings, error)
+
+	// GetTopGroupsByHoldings returns up to limit of the groups whose listed
+	// snapshot (see GroupHoldings.Listed) names mint, in HoldingsLess order: most quarks first, ties to
+	// the greater chat ID. A limit of zero or less means no limit. The read
+	// is eventually consistent, and not a snapshot of the ranking: a group
+	// refreshed while it runs may appear where it stood before or where it
+	// stands after, and the result never names a group twice. A mint no
+	// snapshot names is an empty result.
+	GetTopGroupsByHoldings(ctx context.Context, mint *commonpb.PublicKey, limit int) ([]GroupHoldings, error)
+
+	// EnqueueHoldingsRefresh puts chatID on the holdings refresh queue for
+	// mint, due at dueAt, with no failed attempts, and reports whether it did.
+	// A group already queued is a no-op that leaves its entry as it is, so a
+	// backfill over every gated group, PutChat's enqueue included, can run
+	// any number of times. A group whose holdings already record another
+	// mint is ErrHoldingsMintMismatch, as for PutGroupHoldings, judged before
+	// whether it is queued. It returns an error if chatID is not a group chat
+	// ID or mint is not the shape of a public key. It does not check that the
+	// group exists or is gated on mint: that needs the group's record, and is
+	// the caller's.
+	EnqueueHoldingsRefresh(ctx context.Context, chatID *commonpb.ChatId, mint *commonpb.PublicKey, dueAt time.Time) (changed bool, err error)
+
+	// GetDueHoldingsRefreshes returns up to limit queued groups whose due
+	// time is at or before asOf, soonest first. A limit of zero or less means
+	// no limit. The queue is eventually consistent: a group just claimed or
+	// rescheduled may still be listed, which ClaimHoldingsRefresh settles.
+	GetDueHoldingsRefreshes(ctx context.Context, asOf time.Time, limit int) ([]HoldingsRefresh, error)
+
+	// ClaimHoldingsRefresh pushes a queued group's due time out to until,
+	// provided it is still due as of asOf, and reports whether it did: false
+	// means another worker claimed or rescheduled it first, or it is not
+	// queued. It is what lets every worker list the same due groups and only
+	// one refresh each.
+	ClaimHoldingsRefresh(ctx context.Context, chatID *commonpb.ChatId, asOf, until time.Time) (bool, error)
+
+	// RescheduleHoldingsRefresh sets a queued group's next due time and its
+	// count of failed attempts: zero after a refresh that succeeded, one more
+	// than the claim read after one that failed. A group that is not queued
+	// is a no-op.
+	RescheduleHoldingsRefresh(ctx context.Context, chatID *commonpb.ChatId, dueAt time.Time, attempts uint32) error
 }

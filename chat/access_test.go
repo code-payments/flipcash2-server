@@ -30,7 +30,7 @@ type accessFixture struct {
 	usdf *commonpb.PublicKey
 
 	// gated requires `requirement` USD to listen. funded holds exactly that,
-	// unfunded one quark less.
+	// unfunded a cent less, past the half-cent slack.
 	gated    *Chat
 	funded   *commonpb.UserId
 	unfunded *commonpb.UserId
@@ -50,7 +50,7 @@ func newAccessFixture(t *testing.T) *accessFixture {
 	f.funded = model.MustGenerateUserID()
 	f.ocpBalance.set(f.accounts.bind(f.funded), f.usdf, ocp_common.ToCoreMintQuarks(accessRequirement))
 	f.unfunded = model.MustGenerateUserID()
-	f.ocpBalance.set(f.accounts.bind(f.unfunded), f.usdf, ocp_common.ToCoreMintQuarks(accessRequirement)-1)
+	f.ocpBalance.set(f.accounts.bind(f.unfunded), f.usdf, ocp_common.ToCoreMintQuarks(accessRequirement)-ocp_common.CoreMintQuarksPerUnit/100)
 
 	f.gated = f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, MinimumListenerBalance: &MinimumBalance{Currency: "usd", NativeAmount: accessRequirement}})
 	return f
@@ -795,7 +795,7 @@ func TestAccess_SpeakerAdmission(t *testing.T) {
 	require.Equal(t, asked+2, f.ocpBalance.asked)
 	f.setBalance(f.unfunded, accessRequirement)
 	require.True(t, canSpeak(f.gated.ID, f.unfunded))
-	f.ocpBalance.set(f.accounts.keys[string(f.unfunded.Value)], f.usdf, ocp_common.ToCoreMintQuarks(accessRequirement)-1)
+	f.ocpBalance.set(f.accounts.keys[string(f.unfunded.Value)], f.usdf, ocp_common.ToCoreMintQuarks(accessRequirement)-ocp_common.CoreMintQuarksPerUnit/100)
 
 	// Membership is read on every ask: a remembered member who leaves is
 	// refused at once, with nothing evaluated. Leaving does not forget the
@@ -900,7 +900,7 @@ func TestAccess_Governance(t *testing.T) {
 	rules := NewRuleEvaluator(f.accounts, balance.NewClient(zaptest.NewLogger(t), f.accounts, f.ocpBalance), f.chats, team)
 	a := NewAccess(f.chats, rules, WithListenerAdmissionTTL(0))
 
-	// rich users hold exactly the requirement, poor ones a quark less; "in"
+	// rich users hold exactly the requirement, poor ones a cent less; "in"
 	// users are made members of the chats that list them, "out" users never.
 	bound := func(quarks uint64) *commonpb.UserId {
 		u := model.MustGenerateUserID()
@@ -908,8 +908,8 @@ func TestAccess_Governance(t *testing.T) {
 		return u
 	}
 	requirement := ocp_common.ToCoreMintQuarks(accessRequirement)
-	richIn, poorIn := bound(requirement), bound(requirement-1)
-	richOut, poorOut := bound(requirement), bound(requirement-1)
+	richIn, poorIn := bound(requirement), bound(requirement-ocp_common.CoreMintQuarksPerUnit/100)
+	richOut, poorOut := bound(requirement), bound(requirement-ocp_common.CoreMintQuarksPerUnit/100)
 	creator, peer := bound(requirement), model.MustGenerateUserID()
 	minimum := func() *MinimumBalance { return &MinimumBalance{Currency: "usd", NativeAmount: accessRequirement} }
 

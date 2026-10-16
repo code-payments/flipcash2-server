@@ -24,7 +24,7 @@ import (
 	"github.com/code-payments/flipcash2-server/chat"
 )
 
-// The chat store spans eight tables:
+// The chat store spans nine tables:
 //
 //	chats     pk = "chat#<id>" (one item per chat). Canonical metadata: type,
 //	          members (the DM participants; absent for groups), title, creator
@@ -210,6 +210,43 @@ import (
 //	          (chat, pk) GSI, asking who features a group, can be added
 //	          later and fill from the items as they stand; #meta omits it,
 //	          which keeps it out of such an index.
+//
+//	chat_holdings  pk = "chat#<id>" (one item per group with a holdings
+//	          snapshot or a refresh queue entry; see chat.GroupHoldings), with
+//	          mint (B), quarks, holder_count, as_of (epoch ms) and rank, the
+//	          zero-padded quarks then the chat ID (see holdingsRank).
+//	          gsiByMintRank on (mint, rank) ranks one currency's groups: the
+//	          descending query is chat.HoldingsLess order, total because the
+//	          chat ID breaks ties, so a paged read could resume strictly after
+//	          a (quarks, chat ID) position. A snapshot is written with an
+//	          update of its own attributes, never a put, so attributes a
+//	          refresh keeps on the item beside it survive, and conditioned on
+//	          being newer than the one stored, so a snapshot never moves
+//	          backwards (see PutGroupHoldings). The one mint attribute serves
+//	          the queue entry, the snapshot and gsiByMintRank alike, so every
+//	          write of it is conditioned on it being absent or unchanged (see
+//	          chat.ErrHoldingsMintMismatch): a group's holdings are of the one
+//	          mint it is gated on. Every snapshot is stored, but only a listed
+//	          one (see chat.GroupHoldings.Listed) carries rank, so
+//	          gsiByMintRank holds listed groups alone and a group that drops
+//	          below the minimum leaves it with the write that records it. It is
+//	          derived data, kept apart from the group's canonical item so that
+//	          frequent refreshes neither rewrite the record nor bill for its
+//	          size.
+//
+//	          The same item is the group's entry on the refresh queue (see
+//	          chat.HoldingsRefresh): refresh_queue, the one queue's fixed
+//	          partition (see refreshQueuePK), refresh_due_at (epoch ms) and
+//	          refresh_attempts, beside the mint the refresh reads.
+//	          refreshQueueIndex on (refresh_queue, refresh_due_at) lists the
+//	          due groups soonest first. A gated group's entry is written in
+//	          its creation transaction, before it has any snapshot, so an
+//	          item may be an entry alone: it has no rank, and so is not in
+//	          gsiByMintRank, until its first refresh. Entries are never
+//	          removed. The index is one partition, which every reschedule
+//	          writes: at a refresh per group per interval it is far below a
+//	          partition's throughput until there are many thousands of gated
+//	          groups, and the key can be sharded then.
 const (
 	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
 	// all of a user's DM types. Superseded by gsiByTypeActivity; retained until
@@ -262,6 +299,23 @@ const (
 	// items must omit it.
 	gsiLobbyByChat = "by_chat"
 
+	// gsiByMintRank is the (mint, rank) index on chat_holdings: one
+	// currency's groups in rank order (see GetTopGroupsByHoldings). Every
+	// item carries both keys, and the full item is projected, since a
+	// ranking read wants every attribute and the items are small.
+	gsiByMintRank = "by_mint_rank"
+
+	// refreshQueueIndex is the (refresh_queue, refresh_due_at) index on
+	// chat_holdings: the holdings refresh queue, soonest first (see
+	// GetDueHoldingsRefreshes), named for its queue like the poll tally's and
+	// blob finalization's. It projects the mint and the attempts, which is
+	// all a listing needs.
+	refreshQueueIndex = "refresh_queue"
+
+	// refreshQueuePK is the value of refresh_queue on every queued group:
+	// one queue, one partition of refreshQueueIndex.
+	refreshQueuePK = "queue#refresh"
+
 	// chatKeyPrefix prefixes a chat ID in the chats table pk, the dm_inbox sk
 	// and the chat_user_state sk. The chat ID is recovered from the key, so it
 	// is not stored as its own attribute — except in chat_user_state, where a
@@ -297,18 +351,26 @@ const (
 	attrLastMessageID        = "last_message_id"
 	attrMemberCount          = "member_count" // #meta item: joined member count
 	attrVersion              = "version"
-	attrChat                 = "chat"           // chat_user_state records: the raw chat ID bytes (B), keying gsiByMuted and gsiUserStateByUser
-	attrMutedUntil           = "muted_until"    // chat_user_state: epoch seconds, present only while a mute is recorded — see muteForeverUntil
-	attrMutedCount           = "muted_count"    // chat_user_state #meta item: records with a mute recorded
-	attrLastSentAt           = "last_sent_at"   // chat_activity: epoch ms of the latest recorded send
-	attrActivityScore        = "activity_score" // chat_activity: epoch ms, see chat.NextActivityScore; absent on records written before scores
-	attrScheme               = "scheme"         // chat_key_envelopes: chatpb.KeyEnvelope_Scheme, by number
-	attrNonce                = "nonce"          // chat_key_envelopes: the envelope's nonce (B)
-	attrCiphertext           = "ciphertext"     // chat_key_envelopes: the wrapped chat key (B)
-	attrWrappedBy            = "wrapped_by"     // chat_key_envelopes: the raw ID of the user who stored the envelope (B)
-	attrEnteredAt            = "entered_at"     // chat_lobbies: epoch nanos of the entry, keying gsiLobbyByChat
-	attrLobbyCount           = "lobby_count"    // chat_lobbies #meta items: a lobby's size (chat# pk) or a user's lobbies (user# pk)
-	attrFeaturedCount        = "featured_count" // chat_featured_groups #meta item: how many groups the list holds
+	attrChat                 = "chat"             // chat_user_state records: the raw chat ID bytes (B), keying gsiByMuted and gsiUserStateByUser
+	attrMutedUntil           = "muted_until"      // chat_user_state: epoch seconds, present only while a mute is recorded — see muteForeverUntil
+	attrMutedCount           = "muted_count"      // chat_user_state #meta item: records with a mute recorded
+	attrLastSentAt           = "last_sent_at"     // chat_activity: epoch ms of the latest recorded send
+	attrActivityScore        = "activity_score"   // chat_activity: epoch ms, see chat.NextActivityScore; absent on records written before scores
+	attrScheme               = "scheme"           // chat_key_envelopes: chatpb.KeyEnvelope_Scheme, by number
+	attrNonce                = "nonce"            // chat_key_envelopes: the envelope's nonce (B)
+	attrCiphertext           = "ciphertext"       // chat_key_envelopes: the wrapped chat key (B)
+	attrWrappedBy            = "wrapped_by"       // chat_key_envelopes: the raw ID of the user who stored the envelope (B)
+	attrEnteredAt            = "entered_at"       // chat_lobbies: epoch nanos of the entry, keying gsiLobbyByChat
+	attrLobbyCount           = "lobby_count"      // chat_lobbies #meta items: a lobby's size (chat# pk) or a user's lobbies (user# pk)
+	attrFeaturedCount        = "featured_count"   // chat_featured_groups #meta item: how many groups the list holds
+	attrMint                 = "mint"             // chat_holdings: the raw mint the snapshot is of (B), keying gsiByMintRank
+	attrQuarks               = "quarks"           // chat_holdings: the members' total, in the mint's quarks
+	attrHolderCount          = "holder_count"     // chat_holdings: members holding any of the mint
+	attrAsOf                 = "as_of"            // chat_holdings: epoch ms the snapshot was taken
+	attrRank                 = "rank"             // chat_holdings: see holdingsRank, keying gsiByMintRank
+	attrRefreshQueue         = "refresh_queue"    // chat_holdings: refreshQueuePK on a queued group, keying refreshQueueIndex
+	attrRefreshDueAt         = "refresh_due_at"   // chat_holdings: epoch ms the group's next refresh is due
+	attrRefreshAttempts      = "refresh_attempts" // chat_holdings: refreshes failed in a row since the last that succeeded
 
 	// Keys of the min_listener_balance map.
 	attrBalanceCurrency     = "currency"
@@ -377,6 +439,7 @@ type store struct {
 	keyEnvelopesTable   string
 	lobbiesTable        string
 	featuredGroupsTable string
+	holdingsTable       string
 
 	exclusions chat.FeedExclusions
 }
@@ -385,7 +448,7 @@ type store struct {
 // creating every DM with a user in excludedFromFeed excluding them from the
 // feed (see chat.FeedExclusions); nil excludes no one. Use CreateTables to
 // provision the tables.
-func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
+func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
 	return &store{
 		exclusions:          chat.NewFeedExclusions(excludedFromFeed),
 		client:              client,
@@ -397,6 +460,7 @@ func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembe
 		keyEnvelopesTable:   keyEnvelopesTable,
 		lobbiesTable:        lobbiesTable,
 		featuredGroupsTable: featuredGroupsTable,
+		holdingsTable:       holdingsTable,
 	}
 }
 
@@ -404,12 +468,13 @@ func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembe
 const maxTransactWriteItems = 100
 
 // A group chat is created in one transaction covering the canonical item, the
-// #meta counter, and every membership record, so the domain's cap on the initial
-// member set must leave room for those two items within maxTransactWriteItems.
+// #meta counter, every membership record and, for a group gated on a currency,
+// its holdings refresh entry, so the domain's cap on the initial member set
+// must leave room for those three items within maxTransactWriteItems.
 // Asserted rather than assumed, since the cap lives in the chat package and this
 // is the constraint it exists to respect: raising it past the ceiling fails to
 // compile here, because the difference underflows uint.
-const _ uint = maxTransactWriteItems - (chat.MaxGroupChatCreationMembers + 2)
+const _ uint = maxTransactWriteItems - (chat.MaxGroupChatCreationMembers + 3)
 
 func (s *store) PutChat(ctx context.Context, c *chat.Chat) error {
 	if chat.IsGroupChatID(c.ID) != (c.Type == chatpb.ChatType_GROUP) {
@@ -502,6 +567,18 @@ func (s *store) putGroupChat(ctx context.Context, c *chat.Chat) error {
 			Put: &types.Put{
 				TableName: aws.String(s.groupMembersTable),
 				Item:      s.groupMemberItem(c.ID, member, now),
+			},
+		})
+	}
+	if mint, ok := chat.GatedMint(c); ok {
+		enqueue := s.enqueueHoldingsRefreshUpdate(c.ID, mint, now)
+		transactItems = append(transactItems, types.TransactWriteItem{
+			Update: &types.Update{
+				TableName:                 enqueue.TableName,
+				Key:                       enqueue.Key,
+				UpdateExpression:          enqueue.UpdateExpression,
+				ExpressionAttributeNames:  enqueue.ExpressionAttributeNames,
+				ExpressionAttributeValues: enqueue.ExpressionAttributeValues,
 			},
 		})
 	}
@@ -3650,4 +3727,363 @@ func featuredGroupsFromItems(items []map[string]types.AttributeValue) (chat.Feat
 		featured.ChatIDs = append(featured.ChatIDs, &commonpb.ChatId{Value: chatID})
 	}
 	return featured, true, nil
+}
+
+// holdingsRank is a snapshot's sort key in gsiByMintRank: its quarks,
+// zero-padded to the 20 digits a uint64 can take, then its chat ID in hex,
+// so the string order is (quarks, chat ID) and the descending read is
+// chat.HoldingsLess order.
+func holdingsRank(quarks uint64, chatID *commonpb.ChatId) string {
+	return fmt.Sprintf("%020d#%s", quarks, hex.EncodeToString(chatID.Value))
+}
+
+// PutGroupHoldings is one conditional update of the snapshot's attributes,
+// conditioned on the item recording no mint or the same one, and holding no
+// snapshot (it may be absent, or a queue entry alone) or an older one (see
+// chat.Store), with rank set for a listed snapshot and removed otherwise. A
+// failed condition is told apart off the item it returns: another mint is
+// chat.ErrHoldingsMintMismatch, anything else the no-op. The queue
+// attributes are not touched. as_of is compared in epoch ms, the precision it is
+// stored at, so a snapshot taken within the same millisecond as the stored
+// one is not newer.
+func (s *store) PutGroupHoldings(ctx context.Context, h chat.GroupHoldings) (bool, error) {
+	if err := chat.ValidateGroupHoldings(h); err != nil {
+		return false, err
+	}
+
+	// rank is what puts a snapshot in gsiByMintRank, so only a listed one
+	// carries it, and one that is not removes any its group had.
+	update := "SET #mint = :mint, #quarks = :quarks, #holders = :holders, #as_of = :as_of REMOVE #rank"
+	values := map[string]types.AttributeValue{
+		":mint":    avB(h.Mint.Value),
+		":quarks":  avN(h.Quarks),
+		":holders": avN(h.HolderCount),
+		":as_of":   avInt(h.AsOf.UnixMilli()),
+	}
+	if h.Listed() {
+		update = "SET #mint = :mint, #quarks = :quarks, #holders = :holders, #as_of = :as_of, #rank = :rank"
+		values[":rank"] = avS(holdingsRank(h.Quarks, h.ChatID))
+	}
+
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:        aws.String(s.holdingsTable),
+		Key:              map[string]types.AttributeValue{attrPK: avS(chatPK(h.ChatID))},
+		UpdateExpression: aws.String(update),
+		ConditionExpression: aws.String("(attribute_not_exists(#mint) OR #mint = :mint) AND " +
+			"(attribute_not_exists(#as_of) OR #as_of < :as_of)"),
+		ExpressionAttributeNames: map[string]string{
+			"#mint":    attrMint,
+			"#quarks":  attrQuarks,
+			"#holders": attrHolderCount,
+			"#as_of":   attrAsOf,
+			"#rank":    attrRank,
+		},
+		ExpressionAttributeValues:           values,
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	})
+	var ccf *types.ConditionalCheckFailedException
+	if errors.As(err, &ccf) {
+		// The item names another mint, or holds a snapshot no older: the
+		// first is a caller's error, the second the no-op.
+		if holdingsMintMismatch(ccf.Item, h.Mint) {
+			return false, chat.ErrHoldingsMintMismatch
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// holdingsMintMismatch reports whether a chat_holdings item records a mint
+// other than mint (see chat.ErrHoldingsMintMismatch). An item with none, or
+// no item at all, does not.
+func holdingsMintMismatch(item map[string]types.AttributeValue, mint *commonpb.PublicKey) bool {
+	recorded := asB(item[attrMint])
+	return len(recorded) > 0 && !bytes.Equal(recorded, mint.GetValue())
+}
+
+// GetGroupHoldings reads eventually consistent, at half the cost (see
+// chat.Store).
+func (s *store) GetGroupHoldings(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]chat.GroupHoldings, error) {
+	for _, chatID := range chatIDs {
+		if !chat.IsGroupChatID(chatID) {
+			return nil, fmt.Errorf("not a group chat id")
+		}
+	}
+
+	seen := make(map[string]struct{}, len(chatIDs))
+	var keys []map[string]types.AttributeValue
+	for _, chatID := range chatIDs {
+		if _, dup := seen[string(chatID.Value)]; dup {
+			continue
+		}
+		seen[string(chatID.Value)] = struct{}{}
+		keys = append(keys, map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))})
+	}
+
+	out := make(map[string]chat.GroupHoldings, len(keys))
+	err := s.batchGet(ctx, s.holdingsTable, keys, "", nil, false, func(item map[string]types.AttributeValue) error {
+		if _, ok := item[attrQuarks]; !ok {
+			return nil // A queue entry with no snapshot yet.
+		}
+		h, err := holdingsFromItem(item)
+		if err != nil {
+			return err
+		}
+		out[string(h.ChatID.Value)] = h
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetTopGroupsByHoldings queries gsiByMintRank descending on the mint,
+// following pages until limit groups are read or the index runs out. A group
+// refreshed between two pages can be met on both, so the read keeps the
+// first it meets (see chat.Store).
+func (s *store) GetTopGroupsByHoldings(ctx context.Context, mint *commonpb.PublicKey, limit int) ([]chat.GroupHoldings, error) {
+	var out []chat.GroupHoldings
+	seen := make(map[string]struct{})
+	var startKey map[string]types.AttributeValue
+	for {
+		input := &dynamodb.QueryInput{
+			TableName:                aws.String(s.holdingsTable),
+			IndexName:                aws.String(gsiByMintRank),
+			KeyConditionExpression:   aws.String("#mint = :mint"),
+			ExpressionAttributeNames: map[string]string{"#mint": attrMint},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":mint": avB(mint.GetValue()),
+			},
+			ScanIndexForward:  aws.Bool(false),
+			ExclusiveStartKey: startKey,
+		}
+		if limit > 0 {
+			input.Limit = aws.Int32(int32(limit - len(out)))
+		}
+		resp, err := s.client.Query(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range resp.Items {
+			h, err := holdingsFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			if _, dup := seen[string(h.ChatID.Value)]; dup {
+				continue
+			}
+			seen[string(h.ChatID.Value)] = struct{}{}
+			out = append(out, h)
+		}
+		if len(resp.LastEvaluatedKey) == 0 || (limit > 0 && len(out) >= limit) {
+			return out, nil
+		}
+		startKey = resp.LastEvaluatedKey
+	}
+}
+
+// holdingsFromItem decodes a chat_holdings item.
+func holdingsFromItem(item map[string]types.AttributeValue) (chat.GroupHoldings, error) {
+	chatID, err := chatIDFromPK(item)
+	if err != nil {
+		return chat.GroupHoldings{}, err
+	}
+	quarks, err := parseN(item[attrQuarks])
+	if err != nil {
+		return chat.GroupHoldings{}, fmt.Errorf("parsing quarks: %w", err)
+	}
+	holders, err := parseN(item[attrHolderCount])
+	if err != nil {
+		return chat.GroupHoldings{}, fmt.Errorf("parsing holder_count: %w", err)
+	}
+	asOf, err := parseInt(item[attrAsOf])
+	if err != nil {
+		return chat.GroupHoldings{}, fmt.Errorf("parsing as_of: %w", err)
+	}
+	mint := asB(item[attrMint])
+	if len(mint) == 0 {
+		return chat.GroupHoldings{}, errors.New("holdings item has no mint")
+	}
+	return chat.GroupHoldings{
+		ChatID:      chatID,
+		Mint:        &commonpb.PublicKey{Value: append([]byte(nil), mint...)},
+		Quarks:      quarks,
+		HolderCount: holders,
+		AsOf:        time.UnixMilli(asOf),
+	}, nil
+}
+
+// enqueueHoldingsRefreshUpdate is the unconditional update that puts chatID
+// on the refresh queue, shared by the creation transaction (where the item
+// cannot exist yet) and EnqueueHoldingsRefresh (which conditions it).
+func (s *store) enqueueHoldingsRefreshUpdate(chatID *commonpb.ChatId, mint *commonpb.PublicKey, dueAt time.Time) *dynamodb.UpdateItemInput {
+	return &dynamodb.UpdateItemInput{
+		TableName:        aws.String(s.holdingsTable),
+		Key:              map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
+		UpdateExpression: aws.String("SET #mint = :mint, #q = :q, #due = :due, #attempts = :zero"),
+		ExpressionAttributeNames: map[string]string{
+			"#mint":     attrMint,
+			"#q":        attrRefreshQueue,
+			"#due":      attrRefreshDueAt,
+			"#attempts": attrRefreshAttempts,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":mint": avB(mint.Value),
+			":q":    avS(refreshQueuePK),
+			":due":  avInt(dueAt.UnixMilli()),
+			":zero": avN(0),
+		},
+	}
+}
+
+// EnqueueHoldingsRefresh is the enqueue update conditioned on the group's
+// holdings recording no mint or the same one, and on it not being queued
+// already, told apart as PutGroupHoldings tells its failures (see
+// chat.Store).
+func (s *store) EnqueueHoldingsRefresh(ctx context.Context, chatID *commonpb.ChatId, mint *commonpb.PublicKey, dueAt time.Time) (bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return false, fmt.Errorf("not a group chat id")
+	}
+	if len(mint.GetValue()) != 32 {
+		return false, fmt.Errorf("mint must be 32 bytes")
+	}
+
+	input := s.enqueueHoldingsRefreshUpdate(chatID, mint, dueAt)
+	input.ConditionExpression = aws.String("(attribute_not_exists(#mint) OR #mint = :mint) AND attribute_not_exists(#q)")
+	input.ReturnValuesOnConditionCheckFailure = types.ReturnValuesOnConditionCheckFailureAllOld
+	_, err := s.client.UpdateItem(ctx, input)
+	var ccf *types.ConditionalCheckFailedException
+	if errors.As(err, &ccf) {
+		if holdingsMintMismatch(ccf.Item, mint) {
+			return false, chat.ErrHoldingsMintMismatch
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// GetDueHoldingsRefreshes queries refreshQueueIndex up to asOf; the range key
+// is the due time, so the query is already soonest first.
+func (s *store) GetDueHoldingsRefreshes(ctx context.Context, asOf time.Time, limit int) ([]chat.HoldingsRefresh, error) {
+	var out []chat.HoldingsRefresh
+	var startKey map[string]types.AttributeValue
+	for {
+		input := &dynamodb.QueryInput{
+			TableName:              aws.String(s.holdingsTable),
+			IndexName:              aws.String(refreshQueueIndex),
+			KeyConditionExpression: aws.String("#q = :q AND #due <= :asOf"),
+			ExpressionAttributeNames: map[string]string{
+				"#q":   attrRefreshQueue,
+				"#due": attrRefreshDueAt,
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":q":    avS(refreshQueuePK),
+				":asOf": avInt(asOf.UnixMilli()),
+			},
+			ExclusiveStartKey: startKey,
+		}
+		if limit > 0 {
+			input.Limit = aws.Int32(int32(limit - len(out)))
+		}
+		resp, err := s.client.Query(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range resp.Items {
+			r, err := holdingsRefreshFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, r)
+		}
+		if len(resp.LastEvaluatedKey) == 0 || (limit > 0 && len(out) >= limit) {
+			return out, nil
+		}
+		startKey = resp.LastEvaluatedKey
+	}
+}
+
+// ClaimHoldingsRefresh pushes the due time out, conditioned on the group
+// being queued and still due (see chat.Store).
+func (s *store) ClaimHoldingsRefresh(ctx context.Context, chatID *commonpb.ChatId, asOf, until time.Time) (bool, error) {
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:           aws.String(s.holdingsTable),
+		Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
+		UpdateExpression:    aws.String("SET #due = :until"),
+		ConditionExpression: aws.String("attribute_exists(#q) AND #due <= :asOf"),
+		ExpressionAttributeNames: map[string]string{
+			"#q":   attrRefreshQueue,
+			"#due": attrRefreshDueAt,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":until": avInt(until.UnixMilli()),
+			":asOf":  avInt(asOf.UnixMilli()),
+		},
+	})
+	if isConditionalCheckFailed(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// RescheduleHoldingsRefresh sets the due time and attempts, conditioned on
+// the group being queued, so a group that is not is never enqueued by it (see
+// chat.Store).
+func (s *store) RescheduleHoldingsRefresh(ctx context.Context, chatID *commonpb.ChatId, dueAt time.Time, attempts uint32) error {
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:           aws.String(s.holdingsTable),
+		Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
+		UpdateExpression:    aws.String("SET #due = :due, #attempts = :attempts"),
+		ConditionExpression: aws.String("attribute_exists(#q)"),
+		ExpressionAttributeNames: map[string]string{
+			"#q":        attrRefreshQueue,
+			"#due":      attrRefreshDueAt,
+			"#attempts": attrRefreshAttempts,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":due":      avInt(dueAt.UnixMilli()),
+			":attempts": avN(uint64(attempts)),
+		},
+	})
+	if isConditionalCheckFailed(err) {
+		return nil
+	}
+	return err
+}
+
+// holdingsRefreshFromItem decodes a queue entry as refreshQueueIndex projects
+// it.
+func holdingsRefreshFromItem(item map[string]types.AttributeValue) (chat.HoldingsRefresh, error) {
+	chatID, err := chatIDFromPK(item)
+	if err != nil {
+		return chat.HoldingsRefresh{}, err
+	}
+	dueAt, err := parseInt(item[attrRefreshDueAt])
+	if err != nil {
+		return chat.HoldingsRefresh{}, fmt.Errorf("parsing due_at: %w", err)
+	}
+	attempts, err := parseN(item[attrRefreshAttempts])
+	if err != nil {
+		return chat.HoldingsRefresh{}, fmt.Errorf("parsing attempts: %w", err)
+	}
+	mint := asB(item[attrMint])
+	if len(mint) == 0 {
+		return chat.HoldingsRefresh{}, errors.New("holdings queue entry has no mint")
+	}
+	return chat.HoldingsRefresh{
+		ChatID:   chatID,
+		Mint:     &commonpb.PublicKey{Value: append([]byte(nil), mint...)},
+		DueAt:    time.UnixMilli(dueAt),
+		Attempts: uint32(attempts),
+	}, nil
 }

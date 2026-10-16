@@ -249,7 +249,7 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, memberListenerStanding, ReadingFull, fullDetail, []*Chat{c})
+	metadata, err := s.hydrator.hydrate(ctx, userID, memberListenerStanding, ReadingFull, fullDetail, []*Chat{c})
 	if err != nil {
 		// The group exists; only the read back failed. It will surface on the
 		// creator's next feed read.
@@ -305,7 +305,7 @@ func (s *Server) replayStartChat(ctx context.Context, log *zap.Logger, userID *c
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	metadata, err := s.hydrate(ctx, userID, standing, standing.Reading(messagingpb.ViewMode_FULL), fullDetail, []*Chat{c})
+	metadata, err := s.hydrator.hydrate(ctx, userID, standing, standing.Reading(messagingpb.ViewMode_FULL), fullDetail, []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
 		return nil, status.Error(codes.Internal, "")

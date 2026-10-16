@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"bytes"
+	"math"
 	"sort"
 	"time"
 
@@ -32,18 +33,26 @@ const (
 	MaxReactionTypesPerMessage = 20
 
 	// MaxSampleReactors bounds the sample of reactors surfaced inline on an
-	// EmojiReaction (e.g. for rendering a few avatars). The sample is the most
-	// recent reactors by reaction order (see SampleFromReactors), so a viewer sees
-	// who reacted most recently. The full reactor list is fetched on demand via
-	// GetReactors.
+	// EmojiReaction (e.g. for rendering a few avatars). The sample is the head
+	// of the reactor list in list order (see ReactorLess and
+	// SampleFromReactors): the top boosters by amount, then the most recent
+	// plain reactors, so a viewer sees who put the most behind the emoji and
+	// who reacted most recently. The full reactor list is fetched on demand
+	// via GetReactors.
 	MaxSampleReactors = 8
 
 	// MaxStoredSampleReactors bounds how many reactor entries a store retains for a
-	// reaction's sample. Once the retained set is full, a new reactor evicts the
-	// least-recent entry, keeping it the most-recent reactors. It is twice the
-	// surfaced size so that reactors leaving (the sample is not backfilled on
-	// removal) rarely depletes the retained set below MaxSampleReactors; reads still
-	// surface only the most-recent MaxSampleReactors.
+	// reaction's sample. Once the retained set is full, a new entry evicts the
+	// least by ReactorLess — a plain reactor while there is one, the oldest
+	// first, so a booster is never evicted for a plain reactor and the set
+	// keeps the list's head. A store may lean on that: while an emoji has no
+	// more boosters than this, the retained set holds every one of them, and
+	// the DynamoDB store serves the boosted head of GetReactors from it
+	// rather than from an index (checked against a stored booster count, not
+	// assumed). It is twice the surfaced size so that reactors
+	// leaving (the sample is not backfilled on removal) rarely depletes the
+	// retained set below MaxSampleReactors; reads still surface only the first
+	// MaxSampleReactors in list order.
 	MaxStoredSampleReactors = 2 * MaxSampleReactors
 )
 
@@ -200,18 +209,30 @@ func (m *Message) IsEditable() bool {
 	}
 }
 
-// Reactor is a single user's reaction to a message, with the time they reacted.
+// Reactor is a single user's reaction to a message, with the time they reacted
+// and the money they have put behind it.
 //
 // Version is the emoji aggregate's version at which this reaction was added —
 // the transition that created it (see Reaction.Version). Within one (message,
-// emoji) it is unique, so it is the reactor list's ordering key and paging
-// cursor: "most recent first" means descending Version, which is reaction order
-// by definition and involves no wall clock. ReactedTs is a display value only;
-// a store assigns it from the server clock at the add and never orders by it.
+// emoji) it is unique, so with BoostUsdMicros it makes the reactor list's order
+// total (see ReactorLess): boosted reactors first, by what they paid, then
+// the rest in reaction order, which is descending Version by definition and
+// involves no wall clock. ReactedTs is a display value only; a store assigns
+// it from the server clock at the add and never orders by it.
+//
+// BoostUsdMicros is the total the user has paid to boost this emoji on this
+// message, in millionths of a US dollar, summed from each payment's market
+// value when it was made (see boost.go). It is 0 for a plain reaction and
+// only ever grows: a boosted reaction is permanent (a store refuses to
+// remove it, see Store.RemoveReaction), so the total never has to come
+// down. A boost advances Version like any transition but does not re-stamp
+// the reactor, whose Version stays the add's; it is the total that moves
+// them in the order.
 type Reactor struct {
-	UserID    *commonpb.UserId
-	ReactedTs time.Time
-	Version   uint64
+	UserID         *commonpb.UserId
+	ReactedTs      time.Time
+	Version        uint64
+	BoostUsdMicros uint64
 }
 
 // ToProto projects the reactor onto a messagingpb.Reactor.
@@ -220,21 +241,31 @@ func (r *Reactor) ToProto() *messagingpb.Reactor {
 		UserId:    &commonpb.UserId{Value: append([]byte(nil), r.UserID.Value...)},
 		ReactedTs: timestamppb.New(r.ReactedTs),
 		Version:   r.Version,
+		BoostUsd:  UsdFromMicros(r.BoostUsdMicros),
 	}
 }
 
 // Reaction is the aggregate state of a single emoji on a message: how many users
-// reacted with it, a monotonic version that advances on every change to it, and a
-// bounded sample of reactors (the most recent by reaction order, see
-// SampleFromReactors). Self is per-viewer and set by the read path for the
-// requesting user; the rest of the aggregate is shareable.
+// reacted with it, how much money they have put behind it, a monotonic version
+// that advances on every change to it, and a bounded sample of reactors (the
+// first in list order, see SampleFromReactors). Self is per-viewer and set by
+// the read path for the requesting user; the rest of the aggregate is
+// shareable.
 //
 // Version is state, not a sequence of deltas, in the sense of chat.RosterSummary:
-// every real transition on the emoji — a reactor added or removed — moves it by
-// exactly one, an idempotent no-op leaves it alone, and a client keeps the
-// greater value. It is per emoji, so a client watermarks each (message, emoji)
-// independently. A store keeps it across the emoji emptying and being re-added,
-// so a re-add can never look stale.
+// every real transition on the emoji — a reactor added, removed or boosted —
+// moves it by exactly one, an idempotent no-op leaves it alone, and a client
+// keeps the greater value. It is per emoji, so a client watermarks each
+// (message, emoji) independently. A store keeps it across the emoji emptying
+// and being re-added, so a re-add can never look stale.
+//
+// BoostUsdMicros is the total paid to boost the emoji on the message, in
+// millionths of a US dollar: the sum of every reactor's BoostUsdMicros, kept on
+// the aggregate so a summary read costs no more than it does today (see
+// Store.AddBoost). It only grows, since a boosted reaction cannot be removed,
+// and it is the primary key of the summary's order (see ReactionLess). A store
+// keeps it, like Version, across the emoji emptying — though a boosted emoji
+// never empties, every boosted reactor being pinned.
 //
 // Self is the viewer's own Reactor entry — the version at which their current
 // reaction was added and when — nil when they do not react with the emoji. It
@@ -258,6 +289,7 @@ type Reaction struct {
 	Emoji          string
 	Count          uint64
 	Version        uint64
+	BoostUsdMicros uint64
 	Self           *Reactor
 	SampleReactors []*Reactor
 }
@@ -273,11 +305,57 @@ func (r *Reaction) ToProto() *messagingpb.EmojiReaction {
 		Count:          r.Count,
 		SampleReactors: sample,
 		Version:        r.Version,
+		BoostUsd:       UsdFromMicros(r.BoostUsdMicros),
 	}
 	if r.Self != nil {
 		out.SelfReactor = r.Self.ToProto()
 	}
 	return out
+}
+
+// Boost is one payment made to boost a reaction, as a store records it: the
+// permanent record behind the totals on Reaction and Reactor, which are the
+// sums of these. A store keeps every boost (see Store.AddBoost); nothing reads
+// them back yet, but the record carries what a history would show.
+//
+// Money is kept two ways. Amount is the payment as made, in its mint's quarks
+// and the fiat it was entered in, exact. UsdMicros is its market value in
+// millionths of a US dollar when it was made, the one unit every boost shares
+// whatever its mint, so it is what the totals are summed and ordered on.
+//
+// IntentID identifies the payment and is the record's idempotency key: a
+// store writes a boost once per intent, so the task that records a payment
+// (not built yet; see task.Executor for the cash-message tasks it will sit
+// beside) can be delivered more than once without crediting it twice. Version is the emoji aggregate's version the boost produced (the
+// Reaction.Version after it), unique among the emoji's boosts, so it orders a
+// history the way Reactor.Version orders reactors.
+type Boost struct {
+	MessageID *messagingpb.MessageId
+	Emoji     string
+	UserID    *commonpb.UserId
+	Amount    *commonpb.CryptoPaymentAmount
+	UsdMicros uint64
+	IntentID  *commonpb.IntentId
+	Ts        time.Time
+	Version   uint64
+}
+
+// UsdFromMicros projects a total kept in millionths of a US dollar onto the
+// dollar amount the wire carries (see messagingpb.EmojiReaction.boost_usd).
+// Totals are summed and ordered as integers and only rendered as a float here,
+// so two backends never disagree about an order by a rounding error.
+func UsdFromMicros(micros uint64) float64 {
+	return float64(micros) / 1e6
+}
+
+// MicrosFromUsd is the store's unit for a payment's market value: its dollar
+// value in millionths, rounded to the nearest whole micro. Anything below
+// zero, or not a number, is nothing.
+func MicrosFromUsd(usd float64) uint64 {
+	if usd <= 0 || math.IsNaN(usd) || math.IsInf(usd, 0) {
+		return 0
+	}
+	return uint64(math.Round(usd * 1e6))
 }
 
 // ReactionSummary pairs a message with its non-empty reaction aggregates, the
@@ -289,11 +367,11 @@ type ReactionSummary struct {
 }
 
 // ToProto projects onto a messagingpb.ReactionSummary, with the aggregates in
-// wire order (see ReactionLess): most reacted first, ties by emoji. The stores
-// each return a deterministic order of their own (by emoji), but the order a
-// client sees is decided here, at the one projection every summary read goes
-// through, so it never depends on the backend. The model's slice is left as it
-// was.
+// wire order (see ReactionLess): most money first, then most reacted, ties by
+// emoji. The stores each return a deterministic order of their own (by emoji),
+// but the order a client sees is decided here, at the one projection every
+// summary read goes through, so it never depends on the backend. The model's
+// slice is left as it was.
 func (s *ReactionSummary) ToProto() *messagingpb.ReactionSummary {
 	ordered := make([]*Reaction, len(s.Reactions))
 	copy(ordered, s.Reactions)
@@ -394,11 +472,14 @@ func NewMessageEditedEvent(msg *messagingpb.Message) *messagingpb.Event {
 	}
 }
 
-// SampleFromReactors orders reactors most-recent-first (see ReactorLess) and
-// returns the first MaxSampleReactors — the deterministic, most-recent sample
-// surfaced on a reaction aggregate even when a store retains up to
-// MaxStoredSampleReactors. The ordering matches GetReactors. It mutates the given
-// slice's order; callers pass a slice they own.
+// SampleFromReactors orders reactors in list order (see ReactorLess) and
+// returns the first MaxSampleReactors — the deterministic sample surfaced on a
+// reaction aggregate even when a store retains up to MaxStoredSampleReactors:
+// the top boosters, then the most recent plain reactors. The ordering matches
+// GetReactors, and a store's retained set is evicted by the same order from
+// the bottom (the least-boosted, then oldest, entry goes first), so the sample
+// always holds the list's head. It mutates the given slice's order; callers
+// pass a slice they own.
 func SampleFromReactors(reactors []*Reactor) []*Reactor {
 	sort.Slice(reactors, func(i, j int) bool { return ReactorLess(reactors[i], reactors[j]) })
 	if len(reactors) > MaxSampleReactors {
@@ -407,29 +488,40 @@ func SampleFromReactors(reactors []*Reactor) []*Reactor {
 	return reactors
 }
 
-// ReactorLess orders reactors most-recent-first: descending Version, the order in
-// which they reacted. Versions are unique within an emoji, so the tie-break on
-// ascending user ID only ever decides between reactors of different emoji (or
-// malformed input) and exists to keep the order total. Shared by the stores and
-// the sample so every reactor list agrees.
+// ReactorLess is the order of an emoji's reactors: most boosted first
+// (descending BoostUsdMicros, so every boosted reactor precedes every plain
+// one), then most-recent-first (descending Version, the order in which they
+// reacted). Versions are unique within an emoji, so the tie-break on ascending
+// user ID only ever decides between reactors of different emoji (or malformed
+// input) and exists to keep the order total. Shared by the stores, the sample
+// and the paging cursor so every reactor list agrees. A boost moves its
+// reactor up this order without changing their Version, so a client holding
+// a list re-slots a BOOSTED actor by their new total.
 func ReactorLess(a, b *Reactor) bool {
+	if a.BoostUsdMicros != b.BoostUsdMicros {
+		return a.BoostUsdMicros > b.BoostUsdMicros
+	}
 	if a.Version != b.Version {
 		return a.Version > b.Version
 	}
 	return bytes.Compare(a.UserID.Value, b.UserID.Value) < 0
 }
 
-// ReactionLess is the wire order of a message's emoji aggregates: most reacted
-// first (descending Count), ties broken by the emoji itself (ascending byte
-// order of its UTF-8 encoding, which is code point order). Emoji are unique
-// within a message, so the tie-break makes the order total: two summaries of
-// the same state always list the same sequence, whatever store or read
-// produced them, and no clock or version takes part. Versions are deliberately
-// not a key — they are per emoji, so they say nothing about one emoji against
-// another. Counts move as users react, so a client that wants a row to hold
+// ReactionLess is the wire order of a message's emoji aggregates: most money
+// first (descending BoostUsdMicros), then most reacted (descending Count),
+// ties broken by the emoji itself (ascending byte order of its UTF-8 encoding,
+// which is code point order). Emoji are unique within a message, so the
+// tie-break makes the order total: two summaries of the same state always list
+// the same sequence, whatever store or read produced them, and no clock or
+// version takes part. Versions are deliberately not a key — they are per
+// emoji, so they say nothing about one emoji against another. Counts and
+// totals move as users react and boost, so a client that wants a row to hold
 // still between refreshes must keep its own order; this is the server's
 // contract for a fresh render.
 func ReactionLess(a, b *Reaction) bool {
+	if a.BoostUsdMicros != b.BoostUsdMicros {
+		return a.BoostUsdMicros > b.BoostUsdMicros
+	}
 	if a.Count != b.Count {
 		return a.Count > b.Count
 	}

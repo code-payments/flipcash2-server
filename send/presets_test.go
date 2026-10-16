@@ -55,3 +55,9 @@ func TestAll(t *testing.T) {
 		}
 	}
 }
+
+func TestMinimumTransferValue(t *testing.T) {
+	require.Equal(t, 0.01, MinimumTransferValue("usd"))
+	require.Equal(t, 1.0, MinimumTransferValue("jpy"))
+	require.Equal(t, 0.001, MinimumTransferValue("kwd"))
+}

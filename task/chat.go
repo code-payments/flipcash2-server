@@ -17,6 +17,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/intent"
+	"github.com/code-payments/flipcash2-server/messaging"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_task "github.com/code-payments/ocp-server/ocp/data/task"
@@ -111,6 +112,71 @@ func (e *Executor) sendGroupPaymentMessage(ctx context.Context, record *ocp_task
 	return e.sendCashMessage(ctx, chatID, payment)
 }
 
+// recordReactionBoost records a reaction boost against the payer's reaction
+// once its payment is made (messaging.Sender.RecordBoost), crediting the
+// payment's USD market value to the emoji's total and the payer's, and
+// broadcasting one BOOSTED update. A returned error means the task is retried
+// with backoff.
+//
+// Nothing about the group or the message is checked again: the payer's
+// membership, the message and the emoji's room on it were judged when the
+// payment was validated (see intent.Integration), and the payment has
+// happened since, so the boost lands even if the payer has left or the
+// message has been deleted in between. Who was paid is not read here at all:
+// the payouts were judged at validation, and the boost credits the whole
+// payment.
+//
+// Idempotency under at-least-once delivery comes from the store, which
+// records a boost once per intent ID on the message; a repeat changes nothing
+// and broadcasts nothing. Refusals that a validated payment never produces
+// (an emoji that is not one, a DM, a payment worth nothing) are returned like
+// any failure, so they are retried and surfaced rather than dropping the
+// record of a payment that was made.
+func (e *Executor) recordReactionBoost(ctx context.Context, record *ocp_task.Record) error {
+	_, rawIntentID, intentRecord, err := e.loadIntent(ctx, record)
+	if err != nil {
+		return err
+	}
+
+	boost := intent.GetReactionBoost(intentRecord.AppMetadata)
+	if boost == nil {
+		return errors.New("intent is not a reaction boost")
+	}
+
+	chatID := intent.GetChatMetadata(intentRecord.AppMetadata).GetChatId()
+	if !chat.IsGroupChatID(chatID) {
+		return errors.New("chat id is not a group")
+	}
+
+	payment, err := intent.GetBoostPayment(intentRecord)
+	if err != nil {
+		return err
+	}
+
+	payerUserID, err := e.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: payment.Payer.PublicKey().ToBytes()})
+	if err != nil {
+		return fmt.Errorf("failed to get payer user id: %w", err)
+	}
+
+	if _, _, err := e.sender.RecordBoost(
+		ctx,
+		chatID,
+		boost.GetMessageId(),
+		payerUserID,
+		boost.GetEmoji().GetValue(),
+		messaging.BoostInput{
+			IntentID:  &commonpb.IntentId{Value: rawIntentID},
+			Amount:    payment.Amount,
+			UsdMicros: messaging.MicrosFromUsd(payment.UsdMarketValue),
+			Ts:        time.Now().UTC(),
+		},
+	); err != nil {
+		return fmt.Errorf("failed to record boost: %w", err)
+	}
+
+	return nil
+}
+
 // chatPayment is a validated chat payment, reloaded for the task that injects
 // its cash message.
 type chatPayment struct {
@@ -129,24 +195,9 @@ type chatPayment struct {
 // only what every chat payment shares; which chat the message goes to is the
 // caller's.
 func (e *Executor) loadChatPayment(ctx context.Context, record *ocp_task.Record) (*chatPayment, error) {
-	taskID, err := uuid.Parse(record.TaskId)
+	taskID, rawIntentID, intentRecord, err := e.loadIntent(ctx, record)
 	if err != nil {
-		return nil, fmt.Errorf("task id is not a uuid: %w", err)
-	}
-
-	if record.ReferenceId == nil {
-		return nil, errors.New("task is missing the intent id reference")
-	}
-
-	intentID := *record.ReferenceId
-	rawIntentID, err := base58.Decode(intentID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid intent id: %w", err)
-	}
-
-	intentRecord, err := e.ocpData.GetIntent(ctx, intentID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get intent record: %w", err)
+		return nil, err
 	}
 
 	// The task is only ever scheduled for a validated chat payment, which is
@@ -229,4 +280,30 @@ func (e *Executor) sendCashMessage(ctx context.Context, chatID *commonpb.ChatId,
 	}
 
 	return nil
+}
+
+// loadIntent reloads the authoritative intent record a task references by
+// its reference ID, returning it with the task's UUID and the intent's raw ID.
+func (e *Executor) loadIntent(ctx context.Context, record *ocp_task.Record) (taskID uuid.UUID, rawIntentID []byte, intentRecord *ocp_intent.Record, err error) {
+	taskID, err = uuid.Parse(record.TaskId)
+	if err != nil {
+		return uuid.UUID{}, nil, nil, fmt.Errorf("task id is not a uuid: %w", err)
+	}
+
+	if record.ReferenceId == nil {
+		return uuid.UUID{}, nil, nil, errors.New("task is missing the intent id reference")
+	}
+
+	intentID := *record.ReferenceId
+	rawIntentID, err = base58.Decode(intentID)
+	if err != nil {
+		return uuid.UUID{}, nil, nil, fmt.Errorf("invalid intent id: %w", err)
+	}
+
+	intentRecord, err = e.ocpData.GetIntent(ctx, intentID)
+	if err != nil {
+		return uuid.UUID{}, nil, nil, fmt.Errorf("failed to get intent record: %w", err)
+	}
+
+	return taskID, rawIntentID, intentRecord, nil
 }

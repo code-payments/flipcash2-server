@@ -20,15 +20,18 @@ func injectLocalizedTextForHistory(record *history.Record, notification *activit
 	var localizedText string
 	switch record.Type {
 	case history.DirectlySent:
-		localizedText = "Gave"
-
-		if notification.GetDirectlySentCrypto().GetDestinationIdentifier() != nil {
-			switch intent.GetChatPaymentVerb(record.AppMetadata, record.CreatedAt) {
-			case messagingpb.CashContent_TIPPED:
-				localizedText = "Tipped"
-			default:
-				localizedText = "Sent"
-			}
+		switch {
+		case intent.GetReactionBoost(record.AppMetadata) != nil:
+			// A boost paying one person names them beside it, the boosted
+			// message's sender or the group's creator. One paying both is a
+			// multi payment, whose record is the total and names no one.
+			localizedText = "Boosted"
+		case notification.GetDirectlySentCrypto().GetDestinationIdentifier() == nil:
+			localizedText = "Gave"
+		case intent.GetChatPaymentVerb(record.AppMetadata, record.CreatedAt) == messagingpb.CashContent_TIPPED:
+			localizedText = "Tipped"
+		default:
+			localizedText = "Sent"
 		}
 
 	case history.DirectlyReceived, history.IndirectlyReceived:

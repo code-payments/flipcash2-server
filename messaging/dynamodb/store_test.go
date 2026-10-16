@@ -17,12 +17,13 @@ const (
 	reactionsTable     = "message_reactions_test"
 	reactorsTable      = "message_reactors_test"
 	selfReactionsTable = "message_self_reactions_test"
+	boostsTable        = "message_reaction_boosts_test"
 )
 
 func TestMessaging_DynamoDBStore(t *testing.T) {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable))
+	require.NoError(t, CreateTables(context.Background(), testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable, boostsTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable)
+	testStore := NewInDynamoDB(testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable, boostsTable)
 	teardown := func() {
 		testStore.(*store).reset()
 	}

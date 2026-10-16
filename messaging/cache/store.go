@@ -327,6 +327,17 @@ func (c *Cache) AddReaction(
 	return c.db.AddReaction(ctx, chatID, messageID, userID, emoji, ts)
 }
 
+func (c *Cache) AddBoost(
+	ctx context.Context,
+	chatID *commonpb.ChatId,
+	messageID *messagingpb.MessageId,
+	userID *commonpb.UserId,
+	emoji string,
+	boost messaging.BoostInput,
+) (*messaging.Reaction, bool, bool, error) {
+	return c.db.AddBoost(ctx, chatID, messageID, userID, emoji, boost)
+}
+
 func (c *Cache) RemoveReaction(
 	ctx context.Context,
 	chatID *commonpb.ChatId,

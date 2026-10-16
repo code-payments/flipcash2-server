@@ -941,6 +941,19 @@ func (e *integrationEnv) putMessage(t *testing.T, chatID *commonpb.ChatId, sende
 	return msg
 }
 
+// putEncryptedMessage sends a message encrypted under a private group's chat
+// key into chatID as senderID. The server never reads the ciphertext.
+func (e *integrationEnv) putEncryptedMessage(t *testing.T, chatID *commonpb.ChatId, senderID *commonpb.UserId) *messaging.Message {
+	content := []*messagingpb.Content{{Type: &messagingpb.Content_Encrypted{Encrypted: &messagingpb.EncryptedContent{
+		Scheme:     messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305,
+		Nonce:      make([]byte, 24),
+		Ciphertext: []byte("ciphertext"),
+	}}}}
+	msg, _, err := e.messages.PutMessage(e.ctx, chatID, senderID, content, time.Now(), &messagingpb.ClientMessageId{Value: model.MustGenerateUserID().Value}, true)
+	require.NoError(t, err)
+	return msg
+}
+
 // react adds userID's reaction with emoji on a message.
 func (e *integrationEnv) react(t *testing.T, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, userID *commonpb.UserId, emoji string) {
 	_, _, tooManyTypes, err := e.messages.AddReaction(e.ctx, chatID, messageID, userID, emoji, time.Now())
@@ -948,11 +961,9 @@ func (e *integrationEnv) react(t *testing.T, chatID *commonpb.ChatId, messageID 
 	require.False(t, tooManyTypes)
 }
 
-// A boost is paid today as a SendPublicPayment, which has one destination, so
-// only a boost that pays one person goes through: the creator for a message
-// they sent or one the payer sent, the sender when the creator boosts. One
-// that must pay both is refused until OCP has a payment with two
-// destinations.
+// A boost that pays one person (the creator for their own message, the sender
+// when the creator boosts) is a SendPublicPayment, and one that pays both, 80%
+// to the sender and 20% to the creator, a SendPublicMultiPayment.
 func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 	e := newIntegrationEnv(t)
 
@@ -1233,6 +1244,48 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, removed)
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(groupID, msg.ID, "🔥", payerKeys, creatorKeys), nil, nil), "has not reacted")
+	})
+
+	// A private group takes boosts as a public one does: its messages are
+	// encrypted under the chat key but reactable, and the payer need only be
+	// a member.
+	t.Run("private_group", func(t *testing.T) {
+		privateID := e.putGroupChat(t, &chat.Chat{
+			CreatorID: creatorUserID,
+			Members:   []*commonpb.UserId{creatorUserID, memberUserID, payerUserID},
+			IsPrivate: true,
+		})
+		rules, err := e.chats.GetGroupRules(e.ctx, privateID)
+		require.NoError(t, err)
+		require.True(t, rules.IsPrivate)
+		byCreator := e.putEncryptedMessage(t, privateID, creatorUserID)
+		byMember := e.putEncryptedMessage(t, privateID, memberUserID)
+		for _, msg := range []*messaging.Message{byCreator, byMember} {
+			e.react(t, privateID, msg.ID, payerUserID, "🔥")
+			e.react(t, privateID, msg.ID, creatorUserID, "🔥")
+		}
+
+		// One payee: a single payment.
+		require.NoError(t, e.integration.AllowCreation(e.ctx, boost(privateID, byCreator.ID, "🔥", payerKeys, creatorKeys), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, boost(privateID, byMember.ID, "🔥", creatorKeys, memberKeys), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(privateID, byMember.ID, "🔥", payerKeys, memberKeys), nil, nil), "must be a multi payment")
+
+		// Two payees: a multi payment, 80% to the sender and 20% to the
+		// creator.
+		e.setStaff(payerUserID)
+		defer delete(e.staff, string(payerUserID.Value))
+		split := multiPaymentIntentRecord(base58.Encode(payerKeys.Public()), base58.Encode(memberKeys.Public()), base58.Encode(creatorKeys.Public()))
+		metadata := split.SendPublicMultiPaymentMetadata
+		metadata.Payments[0].Quantity, metadata.Payments[1].Quantity, metadata.Quantity = 8_000, 2_000, 10_000
+		appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
+			Domain: &intentpb.AppMetadata_Chat{Chat: reactionBoostMetadata(privateID, byMember.ID, "🔥")},
+		})
+		require.NoError(t, err)
+		split.AppMetadata = appMetadata
+		require.NoError(t, e.integration.AllowCreation(e.ctx, split, nil, nil))
+
+		// A private group has no non-member standing at all.
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(privateID, byCreator.ID, "🔥", outsiderKeys, creatorKeys), nil, nil), "not a member")
 	})
 
 	// No boost is allowed to or from the Flipcash team account.

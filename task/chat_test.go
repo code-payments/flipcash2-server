@@ -705,6 +705,84 @@ func TestExecutor_RecordReactionBoost_MultiPayment(t *testing.T) {
 	assert.EqualValues(t, 2_500_000, summary[0].SampleReactors[0].BoostUsdMicros)
 }
 
+// A private group's boosts are recorded as a public group's are, on its
+// encrypted messages, whichever payment carries them, each crediting the
+// whole payment.
+func TestExecutor_RecordReactionBoost_PrivateGroup(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	senderUserID, senderKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+	e.accounts.staff[string(payerUserID.Value)] = true
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Title:        "Group",
+		CreatorID:    creatorUserID,
+		Members:      []*commonpb.UserId{creatorUserID, senderUserID, payerUserID},
+		IsPrivate:    true,
+		LastActivity: time.Now(),
+	}))
+	putEncrypted := func(senderID *commonpb.UserId) *messaging.Message {
+		msg, _, err := e.messages.PutMessage(
+			e.ctx,
+			groupID,
+			senderID,
+			[]*messagingpb.Content{{Type: &messagingpb.Content_Encrypted{Encrypted: &messagingpb.EncryptedContent{
+				Scheme:     messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305,
+				Nonce:      make([]byte, 24),
+				Ciphertext: []byte("ciphertext"),
+			}}}},
+			time.Now(),
+			&messagingpb.ClientMessageId{Value: model.MustGenerateUserID().Value},
+			true,
+		)
+		require.NoError(t, err)
+		return msg
+	}
+
+	for _, tc := range []struct {
+		name  string
+		msg   *messaging.Message
+		multi bool
+	}{
+		// $2.50 to the creator for their own message.
+		{name: "single payment", msg: putEncrypted(creatorUserID)},
+		// $2.50: $2.00 to the sender and $0.50 to the creator.
+		{name: "multi payment", msg: putEncrypted(senderUserID), multi: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, _, err := e.messages.AddReaction(e.ctx, groupID, tc.msg.ID, payerUserID, "🔥", time.Now())
+			require.NoError(t, err)
+
+			metadata := reactionBoostMetadata(groupID, tc.msg.ID, "🔥")
+			var intentRecord *ocp_intent.Record
+			if tc.multi {
+				intentRecord = e.multiPay(t, metadata, payerKeys,
+					multiPayment{to: senderKeys, quarks: 20_000},
+					multiPayment{to: creatorKeys, quarks: 5_000},
+				)
+			} else {
+				intentRecord, _ = e.pay(t, metadata, payerKeys, creatorKeys)
+			}
+			require.NoError(t, e.integration.AllowCreation(e.ctx, intentRecord, nil, nil))
+
+			tasks, err := e.integration.GetTasksToSchedule(e.ctx, intentRecord)
+			require.NoError(t, err)
+			require.Len(t, tasks, 1)
+			require.NoError(t, e.executor.Execute(e.ctx, tasks[0]))
+
+			summary, err := e.messages.GetReactionSummary(e.ctx, groupID, tc.msg.ID)
+			require.NoError(t, err)
+			require.Len(t, summary, 1)
+			assert.EqualValues(t, 2_500_000, summary[0].BoostUsdMicros)
+		})
+	}
+}
+
 // A boost task only ever records a reaction boost in a group: one that
 // references any other payment, or a chat that is not a group, fails rather
 // than recording.

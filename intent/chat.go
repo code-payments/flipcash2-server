@@ -153,14 +153,16 @@ func GetReactionBoost(appMetadata []byte) *intentpb.ChatMetadata_ReactionBoost {
 }
 
 // IsUserChatPayment reports whether app metadata is a chat payment whose
-// parties know each other by user ID: a DM payment, or a group payment, whose
-// cash message names both in the group. A contact DM payment is not one, since
-// its parties know each other by phone number; nor is a payment carrying no
-// chat metadata, such as one handed off in person, where no identity was
-// exchanged at all.
+// parties know each other by user ID: a DM payment, a group payment, whose
+// cash message names both in the group, or a reaction boost, whose payer is
+// shown on the reaction to the group and whose payees are the group's creator
+// and the message's sender. A contact DM payment is not one, since its parties
+// know each other by phone number; nor is a payment carrying no chat
+// metadata, such as one handed off in person, where no identity was exchanged
+// at all.
 func IsUserChatPayment(appMetadata []byte) bool {
 	chatMetadata := GetChatMetadata(appMetadata)
-	return chatMetadata.GetDmPayment() != nil || chatMetadata.GetGroupPayment() != nil
+	return chatMetadata.GetDmPayment() != nil || chatMetadata.GetGroupPayment() != nil || chatMetadata.GetReactionBoost() != nil
 }
 
 // sendByDefaultCutoff is when an unset DM payment action came to mean SEND.
@@ -478,30 +480,35 @@ type BoostPayment struct {
 }
 
 // BoostDestination is one destination of a boost's payment: the owner account
-// paid and how much.
+// paid and how much, in quarks and in the payment's currency.
 type BoostDestination struct {
-	Owner  *ocp_common.Account
-	Quarks uint64
+	Owner        *ocp_common.Account
+	Quarks       uint64
+	NativeAmount float64
 }
 
 // GetBoostPayment reads the payment behind a reaction boost off its intent
-// record. Today that is a direct SendPublicPayment, which has one
-// destination, so only a boost that pays one person can be made (see
-// messaging.BoostSplit): a payment that must pay both the message's sender
-// and the group's creator needs a payment with two destinations, which is not
-// read here yet, and is refused by messaging.ValidateBoostPayouts as a payout
-// missing. A payment with several destinations is read here, as one
-// BoostDestination each, when OCP has one.
+// record. A boost that pays one person (see messaging.BoostSplit) is a direct
+// SendPublicPayment, with one destination; a boost that pays both the
+// message's sender and the group's creator is a SendPublicMultiPayment, one
+// BoostDestination per destination. Which of the two a boost must be is
+// judged in validateReactionBoostAppMetadata, not here.
 //
 // It reads nothing but the record and returns ErrNotBoostPayment (wrapped)
-// for an intent that is not a direct payment.
+// for an intent that is neither.
 func GetBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, error) {
 	switch intentRecord.IntentType {
 	case ocp_intent.SendPublicPayment:
+		return getSingleBoostPayment(intentRecord)
+	case ocp_intent.SendPublicMultiPayment:
+		return getMultiBoostPayment(intentRecord)
 	default:
 		return nil, fmt.Errorf("%w: intent type %d", ErrNotBoostPayment, intentRecord.IntentType)
 	}
+}
 
+// getSingleBoostPayment is GetBoostPayment for a SendPublicPayment.
+func getSingleBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, error) {
 	metadata := intentRecord.SendPublicPaymentMetadata
 	if metadata == nil {
 		return nil, fmt.Errorf("%w: missing payment metadata", ErrNotBoostPayment)
@@ -530,7 +537,53 @@ func GetBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, error) {
 
 	return &BoostPayment{
 		Payer:        payer,
-		Destinations: []BoostDestination{{Owner: destinationOwner, Quarks: metadata.Quantity}},
+		Destinations: []BoostDestination{{Owner: destinationOwner, Quarks: metadata.Quantity, NativeAmount: metadata.NativeAmount}},
+		Amount: &commonpb.CryptoPaymentAmount{
+			Currency:     string(metadata.ExchangeCurrency),
+			NativeAmount: metadata.NativeAmount,
+			Quarks:       metadata.Quantity,
+			Mint:         &commonpb.PublicKey{Value: mint.PublicKey().ToBytes()},
+		},
+		UsdMarketValue: metadata.UsdMarketValue,
+	}, nil
+}
+
+// getMultiBoostPayment is GetBoostPayment for a SendPublicMultiPayment. Its
+// totals are the whole payment's, every destination's part together, which
+// OCP sums when it records the intent; the boost credits the whole.
+func getMultiBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, error) {
+	metadata := intentRecord.SendPublicMultiPaymentMetadata
+	if metadata == nil {
+		return nil, fmt.Errorf("%w: missing payment metadata", ErrNotBoostPayment)
+	}
+	if len(metadata.Payments) == 0 {
+		return nil, fmt.Errorf("%w: no destinations", ErrNotBoostPayment)
+	}
+
+	payer, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
+	if err != nil {
+		return nil, fmt.Errorf("invalid initiator owner account: %w", err)
+	}
+	mint, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.MintAccount)
+	if err != nil {
+		return nil, fmt.Errorf("invalid mint account: %w", err)
+	}
+
+	destinations := make([]BoostDestination, len(metadata.Payments))
+	for j, payment := range metadata.Payments {
+		if len(payment.DestinationOwnerAccount) == 0 {
+			return nil, fmt.Errorf("%w: destination has no owner", ErrNotBoostPayment)
+		}
+		owner, err := ocp_common.NewAccountFromPublicKeyString(payment.DestinationOwnerAccount)
+		if err != nil {
+			return nil, fmt.Errorf("invalid destination owner account: %w", err)
+		}
+		destinations[j] = BoostDestination{Owner: owner, Quarks: payment.Quantity, NativeAmount: payment.NativeAmount}
+	}
+
+	return &BoostPayment{
+		Payer:        payer,
+		Destinations: destinations,
 		Amount: &commonpb.CryptoPaymentAmount{
 			Currency:     string(metadata.ExchangeCurrency),
 			NativeAmount: metadata.NativeAmount,
@@ -547,10 +600,13 @@ func GetBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, error) {
 // paid to the message's sender and the group's creator exactly as the boost
 // rule divides it (messaging.ValidateBoostPayouts: 80% to the sender and 20%
 // to the creator, or the whole to one of them when the message is the
-// creator's or the creator boosts). No one boosts their own message. The
-// task it schedules records the boost through the messaging Sender, which
-// gates on nothing, so every gate is applied here, before any money moves;
-// the task could only drop the record of a payment already made.
+// creator's or the creator boosts). No one boosts their own message. A boost
+// that pays one person is a SendPublicPayment and one that pays both a
+// SendPublicMultiPayment, and each intent carries its case alone; a multi
+// payment is also held to its staff gate (validateMultiPayment) before it
+// gets here. The task it schedules records the boost through the messaging
+// Sender, which gates on nothing, so every gate is applied here, before any
+// money moves; the task could only drop the record of a payment already made.
 //
 // The payer must be a member of the group, the same gate as adding a
 // reaction (a reaction is a member's alone; speaking is not required). The
@@ -562,8 +618,8 @@ func GetBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, error) {
 // and no boost needs room under messaging.MaxReactionTypesPerMessage. A payer
 // who removes the reaction after this check still has it back when the boost
 // lands (Store.AddBoost adds a missing reaction, past the cap if it must),
-// since the money has moved by then. The payment must be at least its
-// currency's minimum transfer value (see validateMinimumBoost).
+// since the money has moved by then. Every share of the payment must be at
+// least its currency's minimum transfer value (see validateMinimumBoost).
 // Standing is judged now, not when the task runs: a payer who leaves before
 // the boost lands is still credited, since the payment has happened.
 //
@@ -649,9 +705,21 @@ func (i *Integration) validateReactionBoostAppMetadata(ctx context.Context, inte
 		return ocp_transaction.NewIntentDeniedError("message cannot be reacted to")
 	}
 
-	if _, err := messaging.ValidateBoostPayouts(payerUserID, rules.CreatorID, message.SenderID, payouts); errors.Is(err, messaging.ErrBoostOwnMessage) {
+	split, err := messaging.BoostSplit(payerUserID, rules.CreatorID, message.SenderID, payment.Amount.Quarks)
+	if errors.Is(err, messaging.ErrBoostOwnMessage) {
 		return ocp_transaction.NewIntentDeniedError("payer cannot boost their own message")
 	} else if err != nil {
+		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf("boost payouts are not allowed: %v", err))
+	}
+	// A boost that pays one person is a SendPublicPayment, and one that pays
+	// two a SendPublicMultiPayment, each and only.
+	switch {
+	case intentRecord.IntentType == ocp_intent.SendPublicPayment && len(split) != 1:
+		return ocp_transaction.NewIntentDeniedError("a boost that pays both the message's sender and the group's creator must be a multi payment")
+	case intentRecord.IntentType == ocp_intent.SendPublicMultiPayment && len(split) != 2:
+		return ocp_transaction.NewIntentDeniedError("a boost that pays one person must be a single payment")
+	}
+	if _, err := messaging.ValidateBoostPayouts(payerUserID, rules.CreatorID, message.SenderID, payouts); err != nil {
 		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf("boost payouts are not allowed: %v", err))
 	}
 
@@ -676,13 +744,16 @@ func hasEmoji(reactions []messaging.SelfReaction, emoji string) bool {
 	return false
 }
 
-// validateMinimumBoost enforces the least a reaction boost may pay: the
-// minimum transfer value of the payment's currency (send.MinimumTransferValue,
-// a cent for USD). The amount is a fiat value that can be derived from a
-// quoted rate and land a fraction of a minor unit short, so, as for the preset
-// minimums, half a minor unit of slack is allowed: an amount that rounds to at
-// least one minor unit passes. A payment must also
-// be worth at least a micro-dollar, the unit a boost is recorded in (see
+// validateMinimumBoost enforces the least a reaction boost may pay: every
+// share of it, each destination's part, must be at least the minimum
+// transfer value of the payment's currency (send.MinimumTransferValue, a cent
+// for USD), so a boost paying the sender 80% and the creator 20% is at least
+// five times that (5 cents). A boost paying one person has one share, the
+// whole payment. The amounts are fiat values that can be derived from a
+// quoted rate and land a fraction of a minor unit short, so, as for the
+// preset minimums, half a minor unit of slack is allowed: a share that
+// rounds to at least one minor unit passes. A payment must also be worth at
+// least a micro-dollar, the unit a boost is recorded in (see
 // messaging.MicrosFromUsd): one worth less would credit nothing, which the
 // store refuses (messaging.ErrBoostEmpty) after the money has moved, so it is
 // refused here instead. Only the minor unit of a currency worth very little
@@ -690,12 +761,19 @@ func hasEmoji(reactions []messaging.SelfReaction, emoji string) bool {
 func validateMinimumBoost(payment *BoostPayment) error {
 	currency := currency_lib.Code(payment.Amount.Currency)
 	minimum := send.MinimumTransferValue(currency)
-	if payment.Amount.NativeAmount < minimum-0.5*minimum {
-		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf(
-			"boost amount is below the minimum of %s %s",
-			strconv.FormatFloat(minimum, 'f', -1, 64),
-			strings.ToUpper(string(currency)),
-		))
+	for _, destination := range payment.Destinations {
+		if destination.NativeAmount < minimum-0.5*minimum {
+			what := "boost amount"
+			if len(payment.Destinations) > 1 {
+				what = "boost share"
+			}
+			return ocp_transaction.NewIntentDeniedError(fmt.Sprintf(
+				"%s is below the minimum of %s %s",
+				what,
+				strconv.FormatFloat(minimum, 'f', -1, 64),
+				strings.ToUpper(string(currency)),
+			))
+		}
 	}
 	if messaging.MicrosFromUsd(payment.UsdMarketValue) == 0 {
 		return ocp_transaction.NewIntentDeniedError("boost amount is worth less than a micro-dollar")

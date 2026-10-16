@@ -11,6 +11,7 @@ import (
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
 	"github.com/code-payments/flipcash2-server/chat"
@@ -27,7 +28,7 @@ type counterpartyEnv struct {
 	payer, recipient         *commonpb.UserId
 	payerKeys, recipientKeys model.KeyPair
 
-	dmPayment, groupPayment []byte
+	dmPayment, groupPayment, reactionBoost []byte
 }
 
 func newCounterpartyEnv(t *testing.T) *counterpartyEnv {
@@ -56,6 +57,15 @@ func newCounterpartyEnv(t *testing.T) *counterpartyEnv {
 		ChatId: chat.MustGenerateGroupChatID(),
 		Type: &intentpb.ChatMetadata_GroupPayment_{
 			GroupPayment: &intentpb.ChatMetadata_GroupPayment{Action: intentpb.PaymentAction_SEND},
+		},
+	})
+	e.reactionBoost = chatAppMetadata(t, &intentpb.ChatMetadata{
+		ChatId: chat.MustGenerateGroupChatID(),
+		Type: &intentpb.ChatMetadata_ReactionBoost_{
+			ReactionBoost: &intentpb.ChatMetadata_ReactionBoost{
+				MessageId: &messagingpb.MessageId{Value: 1},
+				Emoji:     &messagingpb.Emoji{Value: "🔥"},
+			},
 		},
 	})
 	return e
@@ -87,8 +97,10 @@ func chatAppMetadata(t *testing.T, chatMetadata *intentpb.ChatMetadata) []byte {
 
 // TestHistoryCounterparties: a group payment names the other party by user
 // ID from both sides, and reads Sent and Received, exactly as a DM payment
-// does. A payment carrying no chat metadata, like one handed off in person,
-// names no one, and the payer's side reads Gave.
+// does. A reaction boost paying one person names the other party the same
+// way, and the payer's side reads Boosted. A payment carrying no chat
+// metadata, like one handed off in person, names no one, and the payer's side
+// reads Gave.
 func TestHistoryCounterparties(t *testing.T) {
 	e := newCounterpartyEnv(t)
 
@@ -103,6 +115,7 @@ func TestHistoryCounterparties(t *testing.T) {
 	}{
 		{"group_payment", e.groupPayment, true, "Sent"},
 		{"dm_payment", e.dmPayment, true, "Sent"},
+		{"reaction_boost", e.reactionBoost, true, "Boosted"},
 		{"no_chat_metadata", nil, false, "Gave"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -176,4 +189,36 @@ func TestHistoryCounterparties_MixedPage(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHistoryCounterparties_MultiPaymentBoost: a reaction boost that pays
+// two people is a multi payment, which records one total for the payer with
+// no counterparty and one record per payee naming the payer. The payer's
+// reads Boosted and names no one; each payee's reads Received and names the
+// payer.
+func TestHistoryCounterparties_MultiPaymentBoost(t *testing.T) {
+	e := newCounterpartyEnv(t)
+
+	payerAccount := base58.Encode(e.payerKeys.Public())
+	recipientAccount := base58.Encode(e.recipientKeys.Public())
+
+	sent := paymentRecord(1, history.DirectlySent, payerAccount, "", e.reactionBoost)
+	sent.CounterpartyOwnerAccount = nil
+	records := []*history.Record{
+		sent,
+		paymentRecord(2, history.DirectlyReceived, recipientAccount, payerAccount, e.reactionBoost),
+	}
+
+	counterparties, err := e.server.resolveHistoryCounterparties(context.Background(), records)
+	require.NoError(t, err)
+	notifications, err := toNotifications(records, counterparties)
+	require.NoError(t, err)
+	require.Len(t, notifications, 2)
+
+	require.Equal(t, "Boosted", notifications[0].LocalizedText)
+	require.NotNil(t, notifications[0].GetDirectlySentCrypto())
+	require.Nil(t, notifications[0].GetDirectlySentCrypto().GetDestinationIdentifier())
+
+	require.Equal(t, "Received", notifications[1].LocalizedText)
+	require.True(t, proto.Equal(e.payer, notifications[1].GetReceivedCrypto().GetUserId()))
 }

@@ -312,10 +312,22 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	require.Len(t, msgs, 1)
 }
 
+// staffAccounts marks the users in staff as staff, which multi payments
+// require while they roll out.
+type staffAccounts struct {
+	account.Store
+
+	staff map[string]bool
+}
+
+func (s *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (bool, error) {
+	return s.staff[string(userID.Value)], nil
+}
+
 // groupPaymentEnv executes group payment tasks against in-memory stores.
 type groupPaymentEnv struct {
 	ctx         context.Context
-	accounts    account.Store
+	accounts    *staffAccounts
 	chats       chat.Store
 	messages    messaging.Store
 	ocpData     ocp_data.Provider
@@ -327,7 +339,7 @@ func newGroupPaymentEnv(t *testing.T) *groupPaymentEnv {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
-	accounts := accountmemory.NewInMemory()
+	accounts := &staffAccounts{Store: accountmemory.NewInMemory(), staff: make(map[string]bool)}
 	chats := chatmemory.NewInMemory(nil)
 	messages := messagingmemory.NewInMemory()
 	profiles := profilememory.NewInMemory()
@@ -387,6 +399,54 @@ func (e *groupPaymentEnv) pay(t *testing.T, chatMetadata *intentpb.ChatMetadata,
 	}
 	require.NoError(t, e.ocpData.SaveIntent(e.ctx, intentRecord))
 	return intentRecord, rawIntentID
+}
+
+// multiPayment is one destination of a multi payment made by multiPay.
+type multiPayment struct {
+	to     model.KeyPair
+	quarks uint64
+}
+
+// multiPay validates and saves a multi payment carrying chatMetadata from one
+// user to several, each paid its quarks at a USD rate of 10_000 quarks to the
+// dollar, returning the intent record.
+func (e *groupPaymentEnv) multiPay(t *testing.T, chatMetadata *intentpb.ChatMetadata, from model.KeyPair, payments ...multiPayment) *ocp_intent.Record {
+	appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
+		Domain: &intentpb.AppMetadata_Chat{Chat: chatMetadata},
+	})
+	require.NoError(t, err)
+
+	metadata := &ocp_intent.SendPublicMultiPaymentMetadata{
+		Source:           base58.Encode(model.MustGenerateKeyPair().Public()),
+		ExchangeCurrency: "usd",
+		ExchangeRate:     1.0,
+	}
+	for _, payment := range payments {
+		usd := float64(payment.quarks) / 10_000
+		metadata.Payments = append(metadata.Payments, &ocp_intent.Payment{
+			DestinationOwnerAccount: base58.Encode(payment.to.Public()),
+			DestinationTokenAccount: base58.Encode(model.MustGenerateKeyPair().Public()),
+			Quantity:                payment.quarks,
+			NativeAmount:            usd,
+			UsdMarketValue:          usd,
+		})
+		metadata.Quantity += payment.quarks
+		metadata.NativeAmount += usd
+		metadata.UsdMarketValue += usd
+	}
+
+	intentRecord := &ocp_intent.Record{
+		IntentId:                       base58.Encode(model.MustGenerateKeyPair().Public()),
+		IntentType:                     ocp_intent.SendPublicMultiPayment,
+		MintAccount:                    base58.Encode(model.MustGenerateKeyPair().Public()),
+		InitiatorOwnerAccount:          base58.Encode(from.Public()),
+		SendPublicMultiPaymentMetadata: metadata,
+		AppMetadata:                    appMetadata,
+		State:                          ocp_intent.StatePending,
+		CreatedAt:                      time.Now(),
+	}
+	require.NoError(t, e.ocpData.SaveIntent(e.ctx, intentRecord))
+	return intentRecord
 }
 
 func groupPaymentMetadata(chatID *commonpb.ChatId) *intentpb.ChatMetadata {
@@ -597,6 +657,52 @@ func TestExecutor_RecordReactionBoost(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, e.executor.Execute(e.ctx, tasks[0]))
 	requireBoost(1, 5_000_000)
+}
+
+// A boost that pays both the message's sender and the group's creator is a
+// multi payment, and the boost credits the whole of it, the creator's cut
+// included.
+func TestExecutor_RecordReactionBoost_MultiPayment(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	senderUserID, senderKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+	e.accounts.staff[string(payerUserID.Value)] = true
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Title:        "Group",
+		CreatorID:    creatorUserID,
+		Members:      []*commonpb.UserId{creatorUserID, senderUserID, payerUserID},
+		LastActivity: time.Now(),
+	}))
+	msg := e.putText(t, groupID, senderUserID)
+	_, _, _, err := e.messages.AddReaction(e.ctx, groupID, msg.ID, payerUserID, "🔥", time.Now())
+	require.NoError(t, err)
+
+	// $2.50: $2.00 to the sender and $0.50 to the creator.
+	intentRecord := e.multiPay(t, reactionBoostMetadata(groupID, msg.ID, "🔥"), payerKeys,
+		multiPayment{to: senderKeys, quarks: 20_000},
+		multiPayment{to: creatorKeys, quarks: 5_000},
+	)
+	require.NoError(t, e.integration.AllowCreation(e.ctx, intentRecord, nil, nil))
+
+	tasks, err := e.integration.GetTasksToSchedule(e.ctx, intentRecord)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, intent.TaskTypeRecordReactionBoost, tasks[0].Type)
+	require.NoError(t, e.executor.Execute(e.ctx, tasks[0]))
+
+	summary, err := e.messages.GetReactionSummary(e.ctx, groupID, msg.ID)
+	require.NoError(t, err)
+	require.Len(t, summary, 1)
+	assert.EqualValues(t, 2_500_000, summary[0].BoostUsdMicros)
+	require.Len(t, summary[0].SampleReactors, 1)
+	assert.True(t, proto.Equal(payerUserID, summary[0].SampleReactors[0].UserID))
+	assert.EqualValues(t, 2_500_000, summary[0].SampleReactors[0].BoostUsdMicros)
 }
 
 // A boost task only ever records a reaction boost in a group: one that

@@ -847,7 +847,8 @@ func TestIntegration_AllowCreation_MultiPayment(t *testing.T) {
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "multi payments are limited to staff")
 	})
 
-	// Only a SendPublicPayment carries Flipcash app metadata, even from staff
+	// A multi payment carries a reaction boost's app metadata alone, even
+	// from staff (see TestIntegration_AllowCreation_ReactionBoost)
 	t.Run("app metadata", func(t *testing.T) {
 		record := multiPaymentIntentRecord(base58.Encode(staffKeys.Public()), recipients...)
 		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, staffUserID, nonStaffUserID)
@@ -856,11 +857,12 @@ func TestIntegration_AllowCreation_MultiPayment(t *testing.T) {
 		})
 		require.NoError(t, err)
 		record.AppMetadata = appMetadata
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "flipcash app metadata only supported for public payment intents")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "multi payments only carry reaction boost metadata")
 	})
 }
 
-// A multi payment carries no app metadata, so it schedules no tasks.
+// A multi payment schedules the boost task when it carries a reaction boost,
+// and nothing otherwise.
 func TestIntegration_GetTasksToSchedule_MultiPayment(t *testing.T) {
 	e := newIntegrationEnv(t)
 
@@ -873,6 +875,18 @@ func TestIntegration_GetTasksToSchedule_MultiPayment(t *testing.T) {
 	tasks, err := e.integration.GetTasksToSchedule(e.ctx, record)
 	require.NoError(t, err)
 	assert.Empty(t, tasks)
+
+	appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
+		Domain: &intentpb.AppMetadata_Chat{Chat: reactionBoostMetadata(chat.MustGenerateGroupChatID(), &messagingpb.MessageId{Value: 1}, "🔥")},
+	})
+	require.NoError(t, err)
+	record.AppMetadata = appMetadata
+	tasks, err = e.integration.GetTasksToSchedule(e.ctx, record)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, intent.TaskTypeRecordReactionBoost, tasks[0].Type)
+	require.NotNil(t, tasks[0].ReferenceId)
+	assert.Equal(t, record.IntentId, *tasks[0].ReferenceId)
 }
 
 // IsUserChatPayment holds for the chat payments whose parties know each other
@@ -889,6 +903,7 @@ func TestIsUserChatPayment(t *testing.T) {
 
 	assert.True(t, intent.IsUserChatPayment(marshal(dmChatMetadata(dmChatID))))
 	assert.True(t, intent.IsUserChatPayment(marshal(groupChatMetadata(chat.MustGenerateGroupChatID(), intentpb.PaymentAction_SEND))))
+	assert.True(t, intent.IsUserChatPayment(marshal(reactionBoostMetadata(chat.MustGenerateGroupChatID(), &messagingpb.MessageId{Value: 1}, "🔥"))))
 	assert.False(t, intent.IsUserChatPayment(marshal(contactDmChatMetadata(dmChatID, "+12223334444", "+13334445555"))))
 	assert.False(t, intent.IsUserChatPayment(nil))
 	assert.False(t, intent.IsUserChatPayment([]byte{0xff, 0xff}))
@@ -965,14 +980,115 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 		}
 	})
 
-	// Paying either one of two required payees leaves the other unpaid, and
-	// paying the wrong person pays a stranger to the boost.
+	// A SendPublicPayment carries a boost that pays one person alone: one
+	// owed to both the sender and the creator is a multi payment, whichever
+	// of them the single payment would pay.
+	t.Run("denied_split_needs_multi_payment", func(t *testing.T) {
+		for name, record := range map[string]*ocp_intent.Record{
+			"paying the sender":  boost(groupID, byMember.ID, "🔥", payerKeys, memberKeys),
+			"paying the creator": boost(groupID, byMember.ID, "🔥", payerKeys, creatorKeys),
+		} {
+			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "must be a multi payment", name)
+		}
+	})
+
+	// A boost that pays both the sender and the creator is a multi payment,
+	// 80% to the sender and 20% to the creator, the creator's share within a
+	// quark of exact.
+	t.Run("multi_payment", func(t *testing.T) {
+		e.setStaff(payerUserID)
+		e.setStaff(creatorUserID)
+		defer delete(e.staff, string(payerUserID.Value))
+		defer delete(e.staff, string(creatorUserID.Value))
+
+		type pay struct {
+			to     model.KeyPair
+			quarks uint64
+		}
+		multiBoost := func(messageID *messagingpb.MessageId, from model.KeyPair, payments ...pay) *ocp_intent.Record {
+			var owners []string
+			for _, payment := range payments {
+				owners = append(owners, base58.Encode(payment.to.Public()))
+			}
+			record := multiPaymentIntentRecord(base58.Encode(from.Public()), owners...)
+			metadata := record.SendPublicMultiPaymentMetadata
+			metadata.Quantity = 0
+			for j, payment := range payments {
+				metadata.Payments[j].Quantity = payment.quarks
+				metadata.Quantity += payment.quarks
+			}
+			appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
+				Domain: &intentpb.AppMetadata_Chat{Chat: reactionBoostMetadata(groupID, messageID, "🔥")},
+			})
+			require.NoError(t, err)
+			record.AppMetadata = appMetadata
+			return record
+		}
+
+		for name, record := range map[string]*ocp_intent.Record{
+			"80/20":                     multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_000}, pay{creatorKeys, 2_000}),
+			"creator first":             multiBoost(byMember.ID, payerKeys, pay{creatorKeys, 2_000}, pay{memberKeys, 8_000}),
+			"creator a quark over":      multiBoost(byMember.ID, payerKeys, pay{memberKeys, 7_999}, pay{creatorKeys, 2_001}),
+			"creator a quark under":     multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_001}, pay{creatorKeys, 1_999}),
+			"uneven total rounded up":   multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_003}, pay{creatorKeys, 2_001}),
+			"uneven total rounded down": multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_004}, pay{creatorKeys, 2_000}),
+		} {
+			require.NoError(t, e.integration.AllowCreation(e.ctx, record, nil, nil), name)
+		}
+
+		for name, tc := range map[string]struct {
+			record *ocp_intent.Record
+			err    string
+		}{
+			"creator two quarks over":           {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 7_998}, pay{creatorKeys, 2_002}), "boost payouts are not allowed"},
+			"even split":                        {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 5_000}, pay{creatorKeys, 5_000}), "boost payouts are not allowed"},
+			"20/80":                             {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 2_000}, pay{creatorKeys, 8_000}), "boost payouts are not allowed"},
+			"a stranger instead of the creator": {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_000}, pay{outsiderKeys, 2_000}), "boost payouts are not allowed"},
+			"the creator's own message":         {multiBoost(byCreator.ID, payerKeys, pay{creatorKeys, 8_000}, pay{memberKeys, 2_000}), "must be a single payment"},
+			"the creator boosting":              {multiBoost(byMember.ID, creatorKeys, pay{memberKeys, 8_000}, pay{payerKeys, 2_000}), "must be a single payment"},
+			"the payer's own message":           {multiBoost(byPayer.ID, payerKeys, pay{payerKeys, 8_000}, pay{creatorKeys, 2_000}), "cannot boost their own message"},
+		} {
+			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tc.record, nil, nil), tc.err, name)
+		}
+
+		// Every share is at least the currency's minimum transfer value,
+		// rounded to its minor unit, so an 80/20 boost is at least 5 cents.
+		for _, tc := range []struct {
+			sender, creator float64
+			expectedErr     string
+		}{
+			{0.04, 0.01, ""},
+			{0.04, 0.005, ""}, // rounds to a cent
+			{0.04, 0.0049, "boost share is below the minimum of 0.01 USD"},
+			{0.0049, 0.04, "boost share is below the minimum of 0.01 USD"},
+		} {
+			record := multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_000}, pay{creatorKeys, 2_000})
+			metadata := record.SendPublicMultiPaymentMetadata
+			metadata.Payments[0].NativeAmount = tc.sender
+			metadata.Payments[1].NativeAmount = tc.creator
+			metadata.NativeAmount = tc.sender + tc.creator
+			metadata.UsdMarketValue = tc.sender + tc.creator
+
+			err := e.integration.AllowCreation(e.ctx, record, nil, nil)
+			if tc.expectedErr == "" {
+				require.NoError(t, err, "%v/%v", tc.sender, tc.creator)
+			} else {
+				require.ErrorContains(t, err, tc.expectedErr, "%v/%v", tc.sender, tc.creator)
+			}
+		}
+
+		// Multi payments are limited to staff while they roll out, a boost's
+		// included.
+		delete(e.staff, string(payerUserID.Value))
+		record := multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_000}, pay{creatorKeys, 2_000})
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "multi payments are limited to staff")
+	})
+
+	// Paying the wrong person pays a stranger to the boost.
 	t.Run("denied_payouts", func(t *testing.T) {
 		for name, record := range map[string]*ocp_intent.Record{
-			"sender alone when both are owed":  boost(groupID, byMember.ID, "🔥", payerKeys, memberKeys),
-			"creator alone when both are owed": boost(groupID, byMember.ID, "🔥", payerKeys, creatorKeys),
-			"a stranger to the boost":          boost(groupID, byCreator.ID, "🔥", payerKeys, memberKeys),
-			"the payer themself":               boost(groupID, byCreator.ID, "🔥", payerKeys, payerKeys),
+			"a stranger to the boost": boost(groupID, byCreator.ID, "🔥", payerKeys, memberKeys),
+			"the payer themself":      boost(groupID, byCreator.ID, "🔥", payerKeys, payerKeys),
 		} {
 			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "boost payouts are not allowed", name)
 		}
@@ -1089,7 +1205,7 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 		require.NoError(t, err)
 
 		require.NoError(t, e.integration.AllowCreation(e.ctx, boost(groupID, msg.ID, "🔥", creatorKeys, memberKeys), nil, nil))
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(groupID, msg.ID, "🔥", payerKeys, creatorKeys), nil, nil), "boost payouts are not allowed")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(groupID, msg.ID, "🔥", payerKeys, creatorKeys), nil, nil), "must be a multi payment")
 	})
 
 	// A boost backs a reaction the payer holds: an emoji they have not

@@ -3,6 +3,7 @@ package intent_test
 import (
 	"bytes"
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -1020,9 +1021,11 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 		defer delete(e.staff, string(payerUserID.Value))
 		defer delete(e.staff, string(creatorUserID.Value))
 
+		// Each payment is a fiat amount, in USD, carried by the quarks worth
+		// it (10_000 to the dollar here), as OCP has checked by validation.
 		type pay struct {
 			to     model.KeyPair
-			quarks uint64
+			amount float64
 		}
 		multiBoost := func(messageID *messagingpb.MessageId, from model.KeyPair, payments ...pay) *ocp_intent.Record {
 			var owners []string
@@ -1031,10 +1034,15 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 			}
 			record := multiPaymentIntentRecord(base58.Encode(from.Public()), owners...)
 			metadata := record.SendPublicMultiPaymentMetadata
-			metadata.Quantity = 0
+			metadata.Quantity, metadata.NativeAmount, metadata.UsdMarketValue = 0, 0, 0
 			for j, payment := range payments {
-				metadata.Payments[j].Quantity = payment.quarks
-				metadata.Quantity += payment.quarks
+				quarks := uint64(math.Round(payment.amount * 10_000))
+				metadata.Payments[j].Quantity = quarks
+				metadata.Payments[j].NativeAmount = payment.amount
+				metadata.Payments[j].UsdMarketValue = payment.amount
+				metadata.Quantity += quarks
+				metadata.NativeAmount += payment.amount
+				metadata.UsdMarketValue += payment.amount
 			}
 			appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
 				Domain: &intentpb.AppMetadata_Chat{Chat: reactionBoostMetadata(groupID, messageID, "🔥")},
@@ -1044,13 +1052,15 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 			return record
 		}
 
+		// The split is judged on each payment's fiat amount, to within half a
+		// cent of its share, so a share rounded to the cent either way passes.
 		for name, record := range map[string]*ocp_intent.Record{
-			"80/20":                     multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_000}, pay{creatorKeys, 2_000}),
-			"creator first":             multiBoost(byMember.ID, payerKeys, pay{creatorKeys, 2_000}, pay{memberKeys, 8_000}),
-			"creator a quark over":      multiBoost(byMember.ID, payerKeys, pay{memberKeys, 7_999}, pay{creatorKeys, 2_001}),
-			"creator a quark under":     multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_001}, pay{creatorKeys, 1_999}),
-			"uneven total rounded up":   multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_003}, pay{creatorKeys, 2_001}),
-			"uneven total rounded down": multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_004}, pay{creatorKeys, 2_000}),
+			"80/20":         multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.80}, pay{creatorKeys, 0.20}),
+			"creator first": multiBoost(byMember.ID, payerKeys, pay{creatorKeys, 0.20}, pay{memberKeys, 0.80}),
+			// A fifth of $0.07 is $0.014, and of $0.08, $0.016.
+			"creator rounded down": multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.06}, pay{creatorKeys, 0.01}),
+			"creator rounded up":   multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.06}, pay{creatorKeys, 0.02}),
+			"the smallest split":   multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.04}, pay{creatorKeys, 0.01}),
 		} {
 			require.NoError(t, e.integration.AllowCreation(e.ctx, record, nil, nil), name)
 		}
@@ -1059,13 +1069,14 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 			record *ocp_intent.Record
 			err    string
 		}{
-			"creator two quarks over":           {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 7_998}, pay{creatorKeys, 2_002}), "boost payouts are not allowed"},
-			"even split":                        {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 5_000}, pay{creatorKeys, 5_000}), "boost payouts are not allowed"},
-			"20/80":                             {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 2_000}, pay{creatorKeys, 8_000}), "boost payouts are not allowed"},
-			"a stranger instead of the creator": {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_000}, pay{outsiderKeys, 2_000}), "boost payouts are not allowed"},
-			"the creator's own message":         {multiBoost(byCreator.ID, payerKeys, pay{creatorKeys, 8_000}, pay{memberKeys, 2_000}), "must be a single payment"},
-			"the creator boosting":              {multiBoost(byMember.ID, creatorKeys, pay{memberKeys, 8_000}, pay{payerKeys, 2_000}), "must be a single payment"},
-			"the payer's own message":           {multiBoost(byPayer.ID, payerKeys, pay{payerKeys, 8_000}, pay{creatorKeys, 2_000}), "cannot boost their own message"},
+			"creator a cent over":               {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.79}, pay{creatorKeys, 0.21}), "boost payouts are not allowed"},
+			"creator a cent under":              {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.81}, pay{creatorKeys, 0.19}), "boost payouts are not allowed"},
+			"even split":                        {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.50}, pay{creatorKeys, 0.50}), "boost payouts are not allowed"},
+			"20/80":                             {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.20}, pay{creatorKeys, 0.80}), "boost payouts are not allowed"},
+			"a stranger instead of the creator": {multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.80}, pay{outsiderKeys, 0.20}), "boost payouts are not allowed"},
+			"the creator's own message":         {multiBoost(byCreator.ID, payerKeys, pay{creatorKeys, 0.80}, pay{memberKeys, 0.20}), "must be a single payment"},
+			"the creator boosting":              {multiBoost(byMember.ID, creatorKeys, pay{memberKeys, 0.80}, pay{payerKeys, 0.20}), "must be a single payment"},
+			"the payer's own message":           {multiBoost(byPayer.ID, payerKeys, pay{payerKeys, 0.80}, pay{creatorKeys, 0.20}), "cannot boost their own message"},
 		} {
 			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tc.record, nil, nil), tc.err, name)
 		}
@@ -1077,17 +1088,11 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 			expectedErr     string
 		}{
 			{0.04, 0.01, ""},
-			{0.04, 0.005, ""}, // rounds to a cent
+			{0.04, 0.005, ""}, // rounds to a cent, and is within half a cent of a fifth of $0.045
 			{0.04, 0.0049, "boost share is below the minimum of 0.01 USD"},
 			{0.0049, 0.04, "boost share is below the minimum of 0.01 USD"},
 		} {
-			record := multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_000}, pay{creatorKeys, 2_000})
-			metadata := record.SendPublicMultiPaymentMetadata
-			metadata.Payments[0].NativeAmount = tc.sender
-			metadata.Payments[1].NativeAmount = tc.creator
-			metadata.NativeAmount = tc.sender + tc.creator
-			metadata.UsdMarketValue = tc.sender + tc.creator
-
+			record := multiBoost(byMember.ID, payerKeys, pay{memberKeys, tc.sender}, pay{creatorKeys, tc.creator})
 			err := e.integration.AllowCreation(e.ctx, record, nil, nil)
 			if tc.expectedErr == "" {
 				require.NoError(t, err, "%v/%v", tc.sender, tc.creator)
@@ -1099,7 +1104,7 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 		// Multi payments are limited to staff while they roll out, a boost's
 		// included.
 		delete(e.staff, string(payerUserID.Value))
-		record := multiBoost(byMember.ID, payerKeys, pay{memberKeys, 8_000}, pay{creatorKeys, 2_000})
+		record := multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.80}, pay{creatorKeys, 0.20})
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "multi payments are limited to staff")
 	})
 
@@ -1277,6 +1282,7 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 		split := multiPaymentIntentRecord(base58.Encode(payerKeys.Public()), base58.Encode(memberKeys.Public()), base58.Encode(creatorKeys.Public()))
 		metadata := split.SendPublicMultiPaymentMetadata
 		metadata.Payments[0].Quantity, metadata.Payments[1].Quantity, metadata.Quantity = 8_000, 2_000, 10_000
+		metadata.Payments[0].NativeAmount, metadata.Payments[1].NativeAmount, metadata.NativeAmount = 0.80, 0.20, 1.00
 		appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
 			Domain: &intentpb.AppMetadata_Chat{Chat: reactionBoostMetadata(privateID, byMember.ID, "🔥")},
 		})

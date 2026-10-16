@@ -488,7 +488,7 @@ type BoostDestination struct {
 }
 
 // GetBoostPayment reads the payment behind a reaction boost off its intent
-// record. A boost that pays one person (see messaging.BoostSplit) is a direct
+// record. A boost that pays one person (see messaging.BoostPayees) is a direct
 // SendPublicPayment, with one destination; a boost that pays both the
 // message's sender and the group's creator is a SendPublicMultiPayment, one
 // BoostDestination per destination. Which of the two a boost must be is
@@ -674,7 +674,9 @@ func (i *Integration) validateReactionBoostAppMetadata(ctx context.Context, inte
 		if i.isTeamAccount(payeeUserID) {
 			return ocp_transaction.NewIntentDeniedError("boosts with the flipcash team are not allowed")
 		}
-		payouts[j] = messaging.BoostPayout{UserID: payeeUserID, Quarks: destination.Quarks}
+		// The payee's fiat amount, which OCP has checked the destination's
+		// quarks are worth, so the split is judged on what each is paid.
+		payouts[j] = messaging.BoostPayout{UserID: payeeUserID, Amount: destination.NativeAmount}
 	}
 
 	// A group that does not exist has no members, so this also refuses one.
@@ -705,7 +707,7 @@ func (i *Integration) validateReactionBoostAppMetadata(ctx context.Context, inte
 		return ocp_transaction.NewIntentDeniedError("message cannot be reacted to")
 	}
 
-	split, err := messaging.BoostSplit(payerUserID, rules.CreatorID, message.SenderID, payment.Amount.Quarks)
+	payees, err := messaging.BoostPayees(payerUserID, rules.CreatorID, message.SenderID)
 	if errors.Is(err, messaging.ErrBoostOwnMessage) {
 		return ocp_transaction.NewIntentDeniedError("payer cannot boost their own message")
 	} else if err != nil {
@@ -714,12 +716,15 @@ func (i *Integration) validateReactionBoostAppMetadata(ctx context.Context, inte
 	// A boost that pays one person is a SendPublicPayment, and one that pays
 	// two a SendPublicMultiPayment, each and only.
 	switch {
-	case intentRecord.IntentType == ocp_intent.SendPublicPayment && len(split) != 1:
+	case intentRecord.IntentType == ocp_intent.SendPublicPayment && len(payees) != 1:
 		return ocp_transaction.NewIntentDeniedError("a boost that pays both the message's sender and the group's creator must be a multi payment")
-	case intentRecord.IntentType == ocp_intent.SendPublicMultiPayment && len(split) != 2:
+	case intentRecord.IntentType == ocp_intent.SendPublicMultiPayment && len(payees) != 2:
 		return ocp_transaction.NewIntentDeniedError("a boost that pays one person must be a single payment")
 	}
-	if _, err := messaging.ValidateBoostPayouts(payerUserID, rules.CreatorID, message.SenderID, payouts); err != nil {
+	// Each share is held to half the currency's smallest unit, the slack OCP
+	// allows between a payment's amount and its quarks.
+	tolerance := 0.5 * send.MinimumTransferValue(currency_lib.Code(payment.Amount.Currency))
+	if _, err := messaging.ValidateBoostPayouts(payerUserID, rules.CreatorID, message.SenderID, payouts, tolerance); err != nil {
 		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf("boost payouts are not allowed: %v", err))
 	}
 

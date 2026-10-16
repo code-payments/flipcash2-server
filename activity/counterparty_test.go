@@ -17,7 +17,6 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	"github.com/code-payments/ocp-server/ocp/data/history"
-	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 )
 
 // counterpartyEnv holds a payer and a recipient bound to accounts, and the
@@ -128,59 +127,6 @@ func TestHistoryCounterparties(t *testing.T) {
 			} else {
 				require.Nil(t, sent.GetDirectlySentCrypto().GetDestinationIdentifier())
 				require.Nil(t, received.GetReceivedCrypto().GetSourceIdentifier())
-			}
-		})
-	}
-}
-
-// TestChatCounterparties: the intent-derived feed resolves the other party
-// of a group payment from either side, as it does a DM payment's, and leaves
-// a payment carrying no chat metadata unresolved.
-func TestChatCounterparties(t *testing.T) {
-	e := newCounterpartyEnv(t)
-
-	payerAccount := base58.Encode(e.payerKeys.Public())
-	recipientAccount := base58.Encode(e.recipientKeys.Public())
-	payment := func(appMetadata []byte) *ocp_intent.Record {
-		return &ocp_intent.Record{
-			IntentType:            ocp_intent.SendPublicPayment,
-			InitiatorOwnerAccount: payerAccount,
-			SendPublicPaymentMetadata: &ocp_intent.SendPublicPaymentMetadata{
-				DestinationOwnerAccount: recipientAccount,
-			},
-			AppMetadata: appMetadata,
-		}
-	}
-
-	for _, tc := range []struct {
-		name        string
-		appMetadata []byte
-		named       bool
-	}{
-		{"group_payment", e.groupPayment, true},
-		{"dm_payment", e.dmPayment, true},
-		{"no_chat_metadata", nil, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, side := range []struct {
-				viewer       model.KeyPair
-				counterparty string
-				userID       *commonpb.UserId
-			}{
-				{e.payerKeys, recipientAccount, e.recipient},
-				{e.recipientKeys, payerAccount, e.payer},
-			} {
-				viewer, err := ocp_common.NewAccountFromPublicKeyBytes(side.viewer.Public())
-				require.NoError(t, err)
-
-				counterparties, err := e.server.resolveChatCounterparties(context.Background(), viewer, []*ocp_intent.Record{payment(tc.appMetadata)})
-				require.NoError(t, err)
-				if tc.named {
-					require.Len(t, counterparties, 1)
-					require.True(t, proto.Equal(side.userID, counterparties[side.counterparty]))
-				} else {
-					require.Empty(t, counterparties)
-				}
 			}
 		})
 	}

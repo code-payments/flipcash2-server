@@ -34,8 +34,8 @@ func toNotificationID(recordID uint64) *activitypb.NotificationId {
 
 // fromNotificationID reverses toNotificationID. It reports ok false for
 // anything that is not an ID this package produced, including an ID minted by
-// the intent-derived feed, whose 32 bytes are a base58 decoded intent ID and
-// carry no record to look up.
+// the feed when it was derived from intents, whose 32 bytes are a base58
+// decoded intent ID and carry no record to look up.
 func fromNotificationID(id *activitypb.NotificationId) (recordID uint64, ok bool) {
 	value := id.GetValue()
 	if len(value) != notificationIDSize {
@@ -81,9 +81,9 @@ func toNotifications(
 }
 
 // toNotification converts a single record, returning nil for one the feed does
-// not surface. Unlike the intent-derived path it reads no other record: a
-// swap's outcome and a gift card's disposition are already the record's state,
-// rather than something to go and look up.
+// not surface. It reads no other record: a swap's outcome and a gift card's
+// disposition are already the record's state, rather than something to go and
+// look up.
 func toNotification(
 	record *history.Record,
 	counterpartyUserIDs map[string]*commonpb.UserId,
@@ -321,9 +321,8 @@ func (s *Server) resolveHistoryCounterparties(ctx context.Context, records []*hi
 }
 
 // getPagedNotificationsFromHistory serves a page of the feed from the
-// transaction history. Where the intent-derived path reads a balance per gift
-// card and joins the swap table per swap, this reads one page and converts it,
-// so the cost of a page does not depend on what is in it.
+// transaction history. It reads one page and converts it, so the cost of a
+// page does not depend on what is in it.
 func (s *Server) getPagedNotificationsFromHistory(
 	ctx context.Context,
 	pubKey *commonpb.PublicKey,
@@ -435,8 +434,7 @@ func counterpartyOwnerAccount(record *history.Record) string {
 // The response carries no paging token of its own, so a client pages by sending
 // back a notification ID. That names a record rather than a position, and the
 // history is ordered by event time, so the record has to be read to learn the
-// time that goes with it. The intent-derived path pays the same cost, reading
-// the intent a token names to recover its row.
+// time that goes with it.
 //
 // A token naming a record that is not the caller's is refused rather than
 // resolved, so paging cannot be used to confirm that someone else's record

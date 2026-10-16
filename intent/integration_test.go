@@ -56,13 +56,31 @@ type integrationEnv struct {
 	// teamKeys the key pair it is bound to.
 	team     *commonpb.UserId
 	teamKeys model.KeyPair
+
+	// staff is the set of staff users, keyed by user ID, that accounts
+	// answers IsStaff from
+	staff map[string]bool
+}
+
+// staffAccounts is an account.Store that answers IsStaff from a set, since
+// the in-memory store has no staff flag. Everything else is the embedded
+// store's.
+type staffAccounts struct {
+	account.Store
+
+	staff map[string]bool
+}
+
+func (s *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (bool, error) {
+	return s.staff[string(userID.Value)], nil
 }
 
 func newIntegrationEnv(t *testing.T) *integrationEnv {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
-	accounts := accountmemory.NewInMemory()
+	staff := make(map[string]bool)
+	accounts := &staffAccounts{Store: accountmemory.NewInMemory(), staff: staff}
 	profiles := profilememory.NewInMemory()
 	chats := chatmemory.NewInMemory(nil)
 
@@ -105,7 +123,13 @@ func newIntegrationEnv(t *testing.T) *integrationEnv {
 		integration: intent.NewIntegration(accounts, chats, profiles, access, mintDataProvider, team),
 		team:        team,
 		teamKeys:    teamKeys,
+		staff:       staff,
 	}
+}
+
+// setStaff flags the user as staff.
+func (e *integrationEnv) setStaff(userID *commonpb.UserId) {
+	e.staff[string(userID.Value)] = true
 }
 
 // bindUser creates a Flipcash user bound to a fresh key pair.
@@ -149,6 +173,37 @@ func dmPaymentIntentRecord(t *testing.T, chatMetadata *intentpb.ChatMetadata, in
 		},
 		AppMetadata: appMetadata,
 		State:       ocp_intent.StatePending,
+	}
+}
+
+// multiPaymentIntentRecord builds a SendPublicMultiPayment intent record
+// paying each destination owner, carrying no app metadata.
+func multiPaymentIntentRecord(initiatorOwner string, destinationOwners ...string) *ocp_intent.Record {
+	metadata := &ocp_intent.SendPublicMultiPaymentMetadata{
+		Source:           base58.Encode(model.MustGenerateKeyPair().Public()),
+		ExchangeCurrency: "usd",
+		ExchangeRate:     1.0,
+	}
+	for _, destinationOwner := range destinationOwners {
+		metadata.Payments = append(metadata.Payments, &ocp_intent.Payment{
+			DestinationOwnerAccount: destinationOwner,
+			DestinationTokenAccount: base58.Encode(model.MustGenerateKeyPair().Public()),
+			Quantity:                10_000,
+			NativeAmount:            1.0,
+			UsdMarketValue:          1.0,
+		})
+		metadata.Quantity += 10_000
+		metadata.NativeAmount += 1.0
+		metadata.UsdMarketValue += 1.0
+	}
+
+	return &ocp_intent.Record{
+		IntentId:                       base58.Encode(model.MustGenerateKeyPair().Public()),
+		IntentType:                     ocp_intent.SendPublicMultiPayment,
+		MintAccount:                    base58.Encode(model.MustGenerateKeyPair().Public()),
+		InitiatorOwnerAccount:          initiatorOwner,
+		SendPublicMultiPaymentMetadata: metadata,
+		State:                          ocp_intent.StatePending,
 	}
 }
 
@@ -749,6 +804,69 @@ func TestIntegration_GetTasksToSchedule_GroupPayment(t *testing.T) {
 	require.NotNil(t, tasks[0].ReferenceId)
 	assert.Equal(t, record.IntentId, *tasks[0].ReferenceId)
 	require.NoError(t, tasks[0].Validate())
+}
+
+// Multi payments are limited to staff while they roll out.
+func TestIntegration_AllowCreation_MultiPayment(t *testing.T) {
+	e := newIntegrationEnv(t)
+
+	staffUserID, staffKeys := e.bindUser(t)
+	e.setStaff(staffUserID)
+	nonStaffUserID, nonStaffKeys := e.bindUser(t)
+	recipient1UserID, recipient1Keys := e.bindUser(t)
+	recipient2UserID, recipient2Keys := e.bindUser(t)
+
+	recipients := []string{base58.Encode(recipient1Keys.Public()), base58.Encode(recipient2Keys.Public())}
+
+	t.Run("staff payer", func(t *testing.T) {
+		record := multiPaymentIntentRecord(base58.Encode(staffKeys.Public()), recipients...)
+		require.NoError(t, e.integration.AllowCreation(e.ctx, record, nil, nil))
+	})
+
+	t.Run("non-staff payer", func(t *testing.T) {
+		record := multiPaymentIntentRecord(base58.Encode(nonStaffKeys.Public()), recipients...)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "multi payments are limited to staff")
+	})
+
+	t.Run("payer is not a flipcash user", func(t *testing.T) {
+		record := multiPaymentIntentRecord(base58.Encode(model.MustGenerateKeyPair().Public()), recipients...)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "payer is not a flipcash user")
+	})
+
+	// Staff recipients don't make a non-staff payer's multi payment allowed
+	t.Run("staff recipients", func(t *testing.T) {
+		e.setStaff(recipient1UserID)
+		e.setStaff(recipient2UserID)
+		record := multiPaymentIntentRecord(base58.Encode(nonStaffKeys.Public()), recipients...)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "multi payments are limited to staff")
+	})
+
+	// Only a SendPublicPayment carries Flipcash app metadata, even from staff
+	t.Run("app metadata", func(t *testing.T) {
+		record := multiPaymentIntentRecord(base58.Encode(staffKeys.Public()), recipients...)
+		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, staffUserID, nonStaffUserID)
+		appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
+			Domain: &intentpb.AppMetadata_Chat{Chat: dmChatMetadata(dmChatID)},
+		})
+		require.NoError(t, err)
+		record.AppMetadata = appMetadata
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "flipcash app metadata only supported for public payment intents")
+	})
+}
+
+// A multi payment carries no app metadata, so it schedules no tasks.
+func TestIntegration_GetTasksToSchedule_MultiPayment(t *testing.T) {
+	e := newIntegrationEnv(t)
+
+	staffUserID, staffKeys := e.bindUser(t)
+	e.setStaff(staffUserID)
+	_, recipient1Keys := e.bindUser(t)
+	_, recipient2Keys := e.bindUser(t)
+
+	record := multiPaymentIntentRecord(base58.Encode(staffKeys.Public()), base58.Encode(recipient1Keys.Public()), base58.Encode(recipient2Keys.Public()))
+	tasks, err := e.integration.GetTasksToSchedule(e.ctx, record)
+	require.NoError(t, err)
+	assert.Empty(t, tasks)
 }
 
 // IsUserChatPayment holds for the chat payments whose parties know each other

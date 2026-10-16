@@ -22,32 +22,40 @@ import (
 // reaction with an emoji on a group message carries the payment's value, the
 // emoji's total grows by it, and the emoji is listed ahead of ones with less
 // money behind it (see ReactionLess and Reactor.BoostUsdMicros). The payment
-// is divided between the group's creator and the message's sender. This file
+// is divided between the message's sender and the group's creator. This file
 // is the rule for that division; the record of one boost is Boost (model.go)
 // and what it does to the reaction state is the Store's (AddBoost).
 //
-// The payer chooses the division. The server enforces only who must be paid
-// and how little either may get:
+// The division is fixed, not the payer's to choose (see BoostSplit):
 //
-//   - The creator is always paid, and the sender is paid too unless they are
-//     the creator (one person, paid once) or the payer (who keeps that part
-//     by not paying it). A payer who is the creator likewise keeps the
-//     creator's part, so the sender takes the whole payment. See
-//     BoostPayees.
-//   - When two people are paid, neither gets less than
-//     MinimumBoostShareBps of the whole: a 90/10 split either way is the
-//     least uneven division allowed, 95/5 is refused. When one person is
-//     paid, they get the whole payment.
-//   - A payment that would pay no one, because the payer is both the creator
-//     and the sender, cannot boost at all (ErrBoostNoPayee).
+//   - No one boosts their own message (ErrBoostOwnMessage), the creator
+//     included.
+//   - A boost of another member's message by anyone but the creator pays the
+//     sender and the creator: the creator CreatorBoostShareBps (20%) of the
+//     whole, the sender the rest (80%).
+//   - A boost of the creator's own message pays the creator the whole
+//     payment: they are both payees, and are paid once.
+//   - A boost by the creator pays the sender the whole payment: the
+//     creator's part would be paid to themself, so it is not taken out.
 //
-// The shares are checked on quarks, the unit the payment is made in, and the
-// minimum is rounded up: a share is large enough when it is at least a tenth
-// of the total, rounded up to a whole quark.
+// So a boost is one payment to one person, the whole amount, unless it pays
+// two, and only then is anything divided. Either way the reaction is credited
+// with the whole payment. The shares are on quarks, the unit the payment is
+// made in. BoostSplit gives the creator CreatorBoostShareBps of the total
+// rounded down to a whole quark and the sender the remainder, but a payment
+// need not round the same way: its creator share passes when it is within
+// BoostShareToleranceQuarks of the exact 20%, and since the sender takes the
+// rest of the same total, theirs is then as close to the exact 80%.
 
-// MinimumBoostShareBps is the least share of a boost either payee may be
-// given when two are paid, in basis points of the whole payment.
-const MinimumBoostShareBps uint64 = 1000
+// CreatorBoostShareBps is the group creator's share of a boost that pays
+// both the message's sender and the creator, in basis points of the whole
+// payment. The sender is paid the rest.
+const CreatorBoostShareBps uint64 = 2000
+
+// BoostShareToleranceQuarks is how far a payment's creator share may be from
+// the exact CreatorBoostShareBps of its total, in quarks, either way, so a
+// client that rounds the share differently is not refused.
+const BoostShareToleranceQuarks uint64 = 1
 
 var (
 	// ErrBoostNoPayer is returned when no payer is named: the division is
@@ -55,25 +63,33 @@ var (
 	ErrBoostNoPayer = errors.New("boost requires a payer")
 
 	// ErrBoostNoCreator is returned when the group has no recorded creator:
-	// the creator is always paid, so a group with none cannot take a boost.
+	// the creator is paid on every boost they do not make, so a group with
+	// none cannot take a boost.
 	ErrBoostNoCreator = errors.New("boost requires the group's creator")
 
+	// ErrBoostOwnMessage is returned when the payer sent the message: no one
+	// boosts their own message.
+	ErrBoostOwnMessage = errors.New("boost of one's own message")
+
 	// ErrBoostNoPayee is returned when the payment would pay no one but the
-	// payer: they are both the creator and the sender.
+	// payer: the creator boosting a message with no sender. A message with
+	// no sender cannot be reacted to, so no validated boost reaches it.
 	ErrBoostNoPayee = errors.New("boost would pay no one but the payer")
 
 	// ErrBoostPayoutMismatch is returned when the payouts do not name exactly
-	// the people the boost must pay (see BoostPayees): one is missing, one
+	// the people the boost must pay (see BoostSplit): one is missing, one
 	// is a stranger to the boost, or one is named twice.
 	ErrBoostPayoutMismatch = errors.New("boost payouts do not match the payees")
 
-	// ErrBoostPayoutEmpty is returned when a payout carries nothing: every
-	// payee is paid something.
+	// ErrBoostPayoutEmpty is returned when a payout carries nothing, or the
+	// boost is too small for a split to give every payee something (under 5
+	// quarks): every payee is paid something.
 	ErrBoostPayoutEmpty = errors.New("boost payout is empty")
 
-	// ErrBoostShareBelowMinimum is returned when two people are paid and
-	// one's share is under MinimumBoostShareBps of the whole.
-	ErrBoostShareBelowMinimum = errors.New("boost share is below the minimum")
+	// ErrBoostShareMismatch is returned when two people are paid and the
+	// creator's share is more than BoostShareToleranceQuarks from the exact
+	// split.
+	ErrBoostShareMismatch = errors.New("boost shares do not match the split")
 
 	// ErrBoostTotalOverflow is returned when the payouts sum past what a
 	// payment can carry.
@@ -86,61 +102,57 @@ type BoostPayout struct {
 	Quarks uint64
 }
 
-// BoostPayees is who a boost by payer must pay, given the group's creator
-// and the message's sender: the creator, then the sender, each left out when
-// they are the payer, and the sender also when they are the creator. sender
-// is nil for a message with none, which then pays the creator alone. It
-// returns ErrBoostNoPayer when payer is nil (a nil payer would match no one
-// and pay everyone), ErrBoostNoCreator when creator is nil, and
-// ErrBoostNoPayee when no one is left to pay. payer and the returned payees
-// are the caller's own values, not copies.
-func BoostPayees(payer, creator, sender *commonpb.UserId) ([]*commonpb.UserId, error) {
+// BoostSplit is what a boost of total quarks by payer must pay, given the
+// group's creator and the message's sender, by the rule above: the sender
+// then the creator when both are paid, or the one payee and the whole total.
+// sender is nil for a message with none, which then pays the creator alone.
+// It returns ErrBoostNoPayer when payer is nil (a nil payer would match no
+// one and pay everyone), ErrBoostNoCreator when creator is nil,
+// ErrBoostOwnMessage when payer is the sender, ErrBoostNoPayee when no one is
+// left to pay, and ErrBoostPayoutEmpty when the total is too small for a
+// split to pay both. The user IDs returned are the caller's own values, not
+// copies.
+func BoostSplit(payer, creator, sender *commonpb.UserId, total uint64) ([]BoostPayout, error) {
 	if payer == nil {
 		return nil, ErrBoostNoPayer
 	}
 	if creator == nil {
 		return nil, ErrBoostNoCreator
 	}
-	var payees []*commonpb.UserId
-	if !sameUser(creator, payer) {
-		payees = append(payees, creator)
+	if sameUser(sender, payer) {
+		return nil, ErrBoostOwnMessage
 	}
-	if sender != nil && !sameUser(sender, payer) && !sameUser(sender, creator) {
-		payees = append(payees, sender)
+
+	switch {
+	case sender == nil || sameUser(sender, creator):
+		if sameUser(creator, payer) {
+			return nil, ErrBoostNoPayee
+		}
+		return []BoostPayout{{UserID: creator, Quarks: total}}, nil
+	case sameUser(creator, payer):
+		return []BoostPayout{{UserID: sender, Quarks: total}}, nil
 	}
-	if len(payees) == 0 {
-		return nil, ErrBoostNoPayee
+
+	creatorShare := CreatorBoostShare(total)
+	if creatorShare == 0 {
+		return nil, fmt.Errorf("%w: %d quarks cannot be split", ErrBoostPayoutEmpty, total)
 	}
-	return payees, nil
+	return []BoostPayout{
+		{UserID: sender, Quarks: total - creatorShare},
+		{UserID: creator, Quarks: creatorShare},
+	}, nil
 }
 
 // ValidateBoostPayouts checks a boost's payouts against the rule above for a
 // boost by payer on a message sent by sender in a group created by creator,
 // and returns the payment's total, the sum of the payouts. The payouts must
-// name exactly BoostPayees (in any order), each paid something, and when
-// there are two, each at least MinimumBoostShare of the total. Every
-// failure wraps one of the ErrBoost* sentinels.
+// name exactly the people BoostSplit of that total pays, in any order, each
+// paid something, and when two are paid, the creator's share must be within
+// BoostShareToleranceQuarks of the exact CreatorBoostShareBps of the total
+// (the sender's is the rest, so it needs no check of its own). Every failure
+// wraps one of the ErrBoost* sentinels.
 func ValidateBoostPayouts(payer, creator, sender *commonpb.UserId, payouts []BoostPayout) (total uint64, err error) {
-	payees, err := BoostPayees(payer, creator, sender)
-	if err != nil {
-		return 0, err
-	}
-
-	if len(payouts) != len(payees) {
-		return 0, fmt.Errorf("%w: %d payouts for %d payees", ErrBoostPayoutMismatch, len(payouts), len(payees))
-	}
-	matched := make([]bool, len(payees))
 	for _, payout := range payouts {
-		found := false
-		for i, payee := range payees {
-			if !matched[i] && sameUser(payout.UserID, payee) {
-				matched[i], found = true, true
-				break
-			}
-		}
-		if !found {
-			return 0, fmt.Errorf("%w: payout to someone the boost does not pay, or paid twice", ErrBoostPayoutMismatch)
-		}
 		if payout.Quarks == 0 {
 			return 0, ErrBoostPayoutEmpty
 		}
@@ -150,11 +162,36 @@ func ValidateBoostPayouts(payer, creator, sender *commonpb.UserId, payouts []Boo
 		}
 	}
 
-	if len(payouts) == 2 {
-		minimum := MinimumBoostShare(total)
+	split, err := BoostSplit(payer, creator, sender, total)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(payouts) != len(split) {
+		return 0, fmt.Errorf("%w: %d payouts for %d payees", ErrBoostPayoutMismatch, len(payouts), len(split))
+	}
+	// Who is paid is judged before how much, so a payout to the wrong person
+	// is always a mismatch, never a share that looks wrong.
+	matched := make([]bool, len(split))
+	for _, payout := range payouts {
+		found := false
+		for i, share := range split {
+			if !matched[i] && sameUser(payout.UserID, share.UserID) {
+				matched[i], found = true, true
+				break
+			}
+		}
+		if !found {
+			return 0, fmt.Errorf("%w: payout to someone the boost does not pay, or paid twice", ErrBoostPayoutMismatch)
+		}
+	}
+
+	// One payee is paid the total by construction. Of two, the creator's
+	// share is checked, and the sender's is the rest of the same total.
+	if len(split) == 2 {
 		for _, payout := range payouts {
-			if payout.Quarks < minimum {
-				return 0, fmt.Errorf("%w: %d of %d quarks, at least %d required", ErrBoostShareBelowMinimum, payout.Quarks, total, minimum)
+			if sameUser(payout.UserID, creator) && !nearCreatorBoostShare(payout.Quarks, total) {
+				return 0, fmt.Errorf("%w: creator paid %d of %d quarks, %d required (within %d)", ErrBoostShareMismatch, payout.Quarks, total, CreatorBoostShare(total), BoostShareToleranceQuarks)
 			}
 		}
 	}
@@ -162,19 +199,32 @@ func ValidateBoostPayouts(payer, creator, sender *commonpb.UserId, payouts []Boo
 	return total, nil
 }
 
-// MinimumBoostShare is the least either payee may be given of a boost of
-// total quarks when two are paid: MinimumBoostShareBps of the total, rounded
-// up to a whole quark, so a share is never under the minimum by a fraction
-// the payment cannot express.
-func MinimumBoostShare(total uint64) uint64 {
+// CreatorBoostShare is the group creator's share of a boost of total quarks
+// that pays both the sender and the creator: CreatorBoostShareBps of the
+// total, rounded down to a whole quark. The sender is paid the rest.
+func CreatorBoostShare(total uint64) uint64 {
 	// total * bps can exceed 64 bits; the high word is under 10000 since bps
 	// is, so the division cannot overflow.
-	hi, lo := bits.Mul64(total, MinimumBoostShareBps)
-	quotient, remainder := bits.Div64(hi, lo, 10000)
-	if remainder != 0 {
-		quotient++
-	}
+	hi, lo := bits.Mul64(total, CreatorBoostShareBps)
+	quotient, _ := bits.Div64(hi, lo, 10000)
 	return quotient
+}
+
+// nearCreatorBoostShare reports whether quarks is within
+// BoostShareToleranceQuarks of the exact CreatorBoostShareBps of total, a
+// fraction of a quark that CreatorBoostShare rounds down. It compares
+// quarks*10000 with total*bps in 128 bits, so nothing is rounded or
+// overflows.
+func nearCreatorBoostShare(quarks, total uint64) bool {
+	aHi, aLo := bits.Mul64(quarks, 10000)
+	bHi, bLo := bits.Mul64(total, CreatorBoostShareBps)
+	if aHi < bHi || (aHi == bHi && aLo < bLo) {
+		aHi, aLo, bHi, bLo = bHi, bLo, aHi, aLo
+	}
+	diffLo, borrow := bits.Sub64(aLo, bLo, 0)
+	diffHi, _ := bits.Sub64(aHi, bHi, borrow)
+	limitHi, limitLo := bits.Mul64(BoostShareToleranceQuarks, 10000)
+	return diffHi < limitHi || (diffHi == limitHi && diffLo <= limitLo)
 }
 
 // sameUser reports whether two user IDs name the same user; nil names no one

@@ -9,45 +9,50 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 )
 
-func TestMinimumBoostShare(t *testing.T) {
+func TestCreatorBoostShare(t *testing.T) {
 	for _, tc := range []struct {
 		total, want uint64
 	}{
 		{0, 0},
-		{1, 1},  // a tenth of one quark rounds up to one
-		{9, 1},  // 0.9 rounds up
-		{10, 1}, // exact
-		{11, 2}, // 1.1 rounds up
-		{1_000_000, 100_000},
-		{1_000_001, 100_001},
-		{^uint64(0), 1844674407370955162}, // no overflow at the top of the range
+		{4, 0}, // a fifth of four quarks rounds down to nothing
+		{5, 1},
+		{9, 1}, // 1.8 rounds down
+		{10, 2},
+		{1_000_000, 200_000},
+		{1_000_004, 200_000},
+		{^uint64(0), 3689348814741910323}, // no overflow at the top of the range
 	} {
-		require.Equal(t, tc.want, MinimumBoostShare(tc.total), "total %d", tc.total)
+		require.Equal(t, tc.want, CreatorBoostShare(tc.total), "total %d", tc.total)
 	}
 }
 
-func TestBoostPayees(t *testing.T) {
+func TestBoostSplit(t *testing.T) {
 	payer, creator, sender := userID(1), userID(2), userID(3)
 
 	for _, tc := range []struct {
 		name                   string
 		payer, creator, sender *commonpb.UserId
-		want                   []*commonpb.UserId
+		total                  uint64
+		want                   []BoostPayout
 		err                    error
 	}{
-		{name: "third party pays both", payer: payer, creator: creator, sender: sender, want: []*commonpb.UserId{creator, sender}},
-		{name: "payer is the sender", payer: payer, creator: creator, sender: payer, want: []*commonpb.UserId{creator}},
-		{name: "payer is the creator", payer: payer, creator: payer, sender: sender, want: []*commonpb.UserId{sender}},
-		{name: "sender is the creator", payer: payer, creator: creator, sender: creator, want: []*commonpb.UserId{creator}},
-		{name: "message has no sender", payer: payer, creator: creator, sender: nil, want: []*commonpb.UserId{creator}},
-		{name: "payer is creator and sender", payer: payer, creator: payer, sender: payer, err: ErrBoostNoPayee},
-		{name: "payer is creator of a message with no sender", payer: payer, creator: payer, sender: nil, err: ErrBoostNoPayee},
-		{name: "no creator", payer: payer, creator: nil, sender: sender, err: ErrBoostNoCreator},
-		{name: "no payer", payer: nil, creator: creator, sender: sender, err: ErrBoostNoPayer},
-		{name: "no payer is judged before no creator", payer: nil, creator: nil, sender: sender, err: ErrBoostNoPayer},
+		{name: "third party pays both", payer: payer, creator: creator, sender: sender, total: 1000, want: []BoostPayout{{sender, 800}, {creator, 200}}},
+		{name: "sender takes the rounding", payer: payer, creator: creator, sender: sender, total: 1004, want: []BoostPayout{{sender, 804}, {creator, 200}}},
+		{name: "smallest split", payer: payer, creator: creator, sender: sender, total: 5, want: []BoostPayout{{sender, 4}, {creator, 1}}},
+		{name: "too small to split", payer: payer, creator: creator, sender: sender, total: 4, err: ErrBoostPayoutEmpty},
+		{name: "sender is the creator, paid the whole", payer: payer, creator: creator, sender: creator, total: 1000, want: []BoostPayout{{creator, 1000}}},
+		{name: "payer is the creator, sender paid the whole", payer: payer, creator: payer, sender: sender, total: 1000, want: []BoostPayout{{sender, 1000}}},
+		{name: "one payee is not split", payer: payer, creator: payer, sender: sender, total: 1, want: []BoostPayout{{sender, 1}}},
+		{name: "message has no sender", payer: payer, creator: creator, sender: nil, total: 1000, want: []BoostPayout{{creator, 1000}}},
+		{name: "payer is the sender", payer: payer, creator: creator, sender: payer, total: 1000, err: ErrBoostOwnMessage},
+		{name: "creator boosting their own message", payer: payer, creator: payer, sender: payer, total: 1000, err: ErrBoostOwnMessage},
+		{name: "creator boosting a message with no sender", payer: payer, creator: payer, sender: nil, total: 1000, err: ErrBoostNoPayee},
+		{name: "no creator", payer: payer, creator: nil, sender: sender, total: 1000, err: ErrBoostNoCreator},
+		{name: "no payer", payer: nil, creator: creator, sender: sender, total: 1000, err: ErrBoostNoPayer},
+		{name: "no payer is judged before no creator", payer: nil, creator: nil, sender: sender, total: 1000, err: ErrBoostNoPayer},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := BoostPayees(tc.payer, tc.creator, tc.sender)
+			got, err := BoostSplit(tc.payer, tc.creator, tc.sender, tc.total)
 			if tc.err != nil {
 				require.ErrorIs(t, err, tc.err)
 				require.Nil(t, got)
@@ -56,7 +61,8 @@ func TestBoostPayees(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, got, len(tc.want))
 			for i := range tc.want {
-				require.True(t, sameUser(tc.want[i], got[i]), "payee %d", i)
+				require.True(t, sameUser(tc.want[i].UserID, got[i].UserID), "payee %d", i)
+				require.Equal(t, tc.want[i].Quarks, got[i].Quarks, "payee %d", i)
 			}
 		})
 	}
@@ -74,36 +80,64 @@ func TestValidateBoostPayouts(t *testing.T) {
 		err             error
 	}{
 		{
-			name: "90/10 to sender and creator", creator: creator, sender: sender,
-			payouts: []BoostPayout{{sender, 900}, {creator, 100}}, total: 1000,
+			name: "80/20 to sender and creator", creator: creator, sender: sender,
+			payouts: []BoostPayout{{sender, 800}, {creator, 200}}, total: 1000,
 		},
 		{
-			name: "10/90 the other way", creator: creator, sender: sender,
-			payouts: []BoostPayout{{sender, 100}, {creator, 900}}, total: 1000,
+			name: "order does not matter", creator: creator, sender: sender,
+			payouts: []BoostPayout{{creator, 200}, {sender, 800}}, total: 1000,
+		},
+		{
+			name: "sender takes the rounding", creator: creator, sender: sender,
+			// A fifth of 1004 is 200.8, rounded down to 200 for the creator.
+			payouts: []BoostPayout{{sender, 804}, {creator, 200}}, total: 1004,
+		},
+		{
+			name: "creator rounded up", creator: creator, sender: sender,
+			// 200.8 is within a quark of 201 too.
+			payouts: []BoostPayout{{sender, 803}, {creator, 201}}, total: 1004,
+		},
+		{
+			name: "creator rounded down past a quark", creator: creator, sender: sender,
+			// 199 is 1.8 quarks under 200.8.
+			payouts: []BoostPayout{{sender, 805}, {creator, 199}}, err: ErrBoostShareMismatch,
+		},
+		{
+			name: "creator rounded up past a quark", creator: creator, sender: sender,
+			// 202 is 1.2 quarks over 200.8.
+			payouts: []BoostPayout{{sender, 802}, {creator, 202}}, err: ErrBoostShareMismatch,
+		},
+		{
+			name: "creator a quark under an exact share", creator: creator, sender: sender,
+			payouts: []BoostPayout{{sender, 801}, {creator, 199}}, total: 1000,
+		},
+		{
+			name: "creator a quark over an exact share", creator: creator, sender: sender,
+			payouts: []BoostPayout{{sender, 799}, {creator, 201}}, total: 1000,
+		},
+		{
+			name: "creator two quarks under an exact share", creator: creator, sender: sender,
+			payouts: []BoostPayout{{sender, 802}, {creator, 198}}, err: ErrBoostShareMismatch,
+		},
+		{
+			name: "creator two quarks over an exact share", creator: creator, sender: sender,
+			payouts: []BoostPayout{{sender, 798}, {creator, 202}}, err: ErrBoostShareMismatch,
+		},
+		{
+			name: "tolerance at the top of the range", creator: creator, sender: sender,
+			// A fifth of 2^64-1 is exactly 3689348814741910323.
+			payouts: []BoostPayout{{sender, ^uint64(0) - 3689348814741910324}, {creator, 3689348814741910324}}, total: ^uint64(0),
+		},
+		{
+			name: "20/80 the other way", creator: creator, sender: sender,
+			payouts: []BoostPayout{{sender, 200}, {creator, 800}}, err: ErrBoostShareMismatch,
 		},
 		{
 			name: "even split", creator: creator, sender: sender,
-			payouts: []BoostPayout{{creator, 500}, {sender, 500}}, total: 1000,
+			payouts: []BoostPayout{{creator, 500}, {sender, 500}}, err: ErrBoostShareMismatch,
 		},
 		{
-			name: "creator under the minimum", creator: creator, sender: sender,
-			payouts: []BoostPayout{{sender, 950}, {creator, 50}}, err: ErrBoostShareBelowMinimum,
-		},
-		{
-			name: "sender under the minimum", creator: creator, sender: sender,
-			payouts: []BoostPayout{{sender, 50}, {creator, 950}}, err: ErrBoostShareBelowMinimum,
-		},
-		{
-			name: "minimum rounds up", creator: creator, sender: sender,
-			// A tenth of 1001 is 100.1, so 100 is short and 101 is enough.
-			payouts: []BoostPayout{{sender, 901}, {creator, 100}}, err: ErrBoostShareBelowMinimum,
-		},
-		{
-			name: "minimum met after rounding up", creator: creator, sender: sender,
-			payouts: []BoostPayout{{sender, 900}, {creator, 101}}, total: 1001,
-		},
-		{
-			name: "payer is the sender, creator takes all", creator: creator, sender: payer,
+			name: "sender is the creator, paid once", creator: creator, sender: creator,
 			payouts: []BoostPayout{{creator, 1000}}, total: 1000,
 		},
 		{
@@ -111,16 +145,24 @@ func TestValidateBoostPayouts(t *testing.T) {
 			payouts: []BoostPayout{{sender, 1000}}, total: 1000,
 		},
 		{
-			name: "sender is the creator, paid once", creator: creator, sender: creator,
-			payouts: []BoostPayout{{creator, 1000}}, total: 1000,
+			name: "payer is the creator, creator's part not kept", creator: payer, sender: sender,
+			payouts: []BoostPayout{{sender, 800}}, total: 800,
 		},
 		{
-			name: "one payee is not held to a share", creator: creator, sender: payer,
+			name: "one payee is not held to a share", creator: creator, sender: creator,
 			payouts: []BoostPayout{{creator, 1}}, total: 1,
 		},
 		{
-			name: "one payee paid twice is not a split", creator: creator, sender: payer,
-			payouts: []BoostPayout{{creator, 900}, {creator, 100}}, err: ErrBoostPayoutMismatch,
+			name: "payer is the sender", creator: creator, sender: payer,
+			payouts: []BoostPayout{{creator, 1000}}, err: ErrBoostOwnMessage,
+		},
+		{
+			name: "creator boosting their own message", creator: payer, sender: payer,
+			payouts: []BoostPayout{{stranger, 1000}}, err: ErrBoostOwnMessage,
+		},
+		{
+			name: "one payee paid twice is not a split", creator: creator, sender: creator,
+			payouts: []BoostPayout{{creator, 800}, {creator, 200}}, err: ErrBoostPayoutMismatch,
 		},
 		{
 			name: "sender missing", creator: creator, sender: sender,
@@ -132,15 +174,15 @@ func TestValidateBoostPayouts(t *testing.T) {
 		},
 		{
 			name: "stranger paid", creator: creator, sender: sender,
-			payouts: []BoostPayout{{sender, 900}, {stranger, 100}}, err: ErrBoostPayoutMismatch,
+			payouts: []BoostPayout{{sender, 800}, {stranger, 200}}, err: ErrBoostPayoutMismatch,
 		},
 		{
 			name: "payer paid", creator: creator, sender: sender,
-			payouts: []BoostPayout{{creator, 900}, {payer, 100}}, err: ErrBoostPayoutMismatch,
+			payouts: []BoostPayout{{sender, 800}, {payer, 200}}, err: ErrBoostPayoutMismatch,
 		},
 		{
 			name: "creator named twice", creator: creator, sender: sender,
-			payouts: []BoostPayout{{creator, 900}, {creator, 100}}, err: ErrBoostPayoutMismatch,
+			payouts: []BoostPayout{{creator, 800}, {creator, 200}}, err: ErrBoostPayoutMismatch,
 		},
 		{
 			name: "three payouts", creator: creator, sender: sender,
@@ -148,18 +190,18 @@ func TestValidateBoostPayouts(t *testing.T) {
 		},
 		{
 			name: "no payouts", creator: creator, sender: sender,
-			payouts: nil, err: ErrBoostPayoutMismatch,
+			payouts: nil, err: ErrBoostPayoutEmpty,
 		},
 		{
 			name: "empty payout", creator: creator, sender: sender,
 			payouts: []BoostPayout{{sender, 1000}, {creator, 0}}, err: ErrBoostPayoutEmpty,
 		},
 		{
-			name: "one quark cannot be split", creator: creator, sender: sender,
-			payouts: []BoostPayout{{sender, 1}, {creator, 0}}, err: ErrBoostPayoutEmpty,
+			name: "too small to split", creator: creator, sender: sender,
+			payouts: []BoostPayout{{sender, 3}, {creator, 1}}, err: ErrBoostPayoutEmpty,
 		},
 		{
-			name: "no one to pay", creator: payer, sender: payer,
+			name: "no one to pay", creator: payer, sender: nil,
 			payouts: []BoostPayout{{creator, 1000}}, err: ErrBoostNoPayee,
 		},
 		{
@@ -168,7 +210,7 @@ func TestValidateBoostPayouts(t *testing.T) {
 		},
 		{
 			name: "no payer", payer: true, creator: creator, sender: sender,
-			payouts: []BoostPayout{{sender, 900}, {creator, 100}}, err: ErrBoostNoPayer,
+			payouts: []BoostPayout{{sender, 800}, {creator, 200}}, err: ErrBoostNoPayer,
 		},
 		{
 			name: "overflow", creator: creator, sender: sender,

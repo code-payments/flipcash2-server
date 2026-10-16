@@ -487,9 +487,9 @@ type BoostDestination struct {
 // GetBoostPayment reads the payment behind a reaction boost off its intent
 // record. Today that is a direct SendPublicPayment, which has one
 // destination, so only a boost that pays one person can be made (see
-// messaging.BoostPayees): a payment that must pay both the group's creator and
-// the message's sender needs a payment with two destinations, which OCP does
-// not offer yet, and is refused by messaging.ValidateBoostPayouts as a payout
+// messaging.BoostSplit): a payment that must pay both the message's sender
+// and the group's creator needs a payment with two destinations, which is not
+// read here yet, and is refused by messaging.ValidateBoostPayouts as a payout
 // missing. A payment with several destinations is read here, as one
 // BoostDestination each, when OCP has one.
 //
@@ -544,11 +544,13 @@ func GetBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, error) {
 // validateReactionBoostAppMetadata enforces that a payment carrying chat app
 // metadata is a well-formed reaction boost: a payment by a member of a group
 // to put money behind their reaction with an emoji on one of its messages,
-// divided between the group's creator and the message's sender as the boost
-// rule allows (messaging.ValidateBoostPayouts). The task it schedules records
-// the boost through the messaging Sender, which gates on nothing, so every
-// gate is applied here, before any money moves; the task could only drop the
-// record of a payment already made.
+// paid to the message's sender and the group's creator exactly as the boost
+// rule divides it (messaging.ValidateBoostPayouts: 80% to the sender and 20%
+// to the creator, or the whole to one of them when the message is the
+// creator's or the creator boosts). No one boosts their own message. The
+// task it schedules records the boost through the messaging Sender, which
+// gates on nothing, so every gate is applied here, before any money moves;
+// the task could only drop the record of a payment already made.
 //
 // The payer must be a member of the group, the same gate as adding a
 // reaction (a reaction is a member's alone; speaking is not required). The
@@ -647,7 +649,9 @@ func (i *Integration) validateReactionBoostAppMetadata(ctx context.Context, inte
 		return ocp_transaction.NewIntentDeniedError("message cannot be reacted to")
 	}
 
-	if _, err := messaging.ValidateBoostPayouts(payerUserID, rules.CreatorID, message.SenderID, payouts); err != nil {
+	if _, err := messaging.ValidateBoostPayouts(payerUserID, rules.CreatorID, message.SenderID, payouts); errors.Is(err, messaging.ErrBoostOwnMessage) {
+		return ocp_transaction.NewIntentDeniedError("payer cannot boost their own message")
+	} else if err != nil {
 		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf("boost payouts are not allowed: %v", err))
 	}
 

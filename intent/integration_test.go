@@ -959,7 +959,6 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 	t.Run("valid_one_payee", func(t *testing.T) {
 		for name, record := range map[string]*ocp_intent.Record{
 			"creator's message pays the creator": boost(groupID, byCreator.ID, "🔥", payerKeys, creatorKeys),
-			"own message pays the creator":       boost(groupID, byPayer.ID, "🔥", payerKeys, creatorKeys),
 			"creator boosting pays the sender":   boost(groupID, byMember.ID, "🔥", creatorKeys, memberKeys),
 		} {
 			require.NoError(t, e.integration.AllowCreation(e.ctx, record, nil, nil), name)
@@ -973,10 +972,21 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 			"sender alone when both are owed":  boost(groupID, byMember.ID, "🔥", payerKeys, memberKeys),
 			"creator alone when both are owed": boost(groupID, byMember.ID, "🔥", payerKeys, creatorKeys),
 			"a stranger to the boost":          boost(groupID, byCreator.ID, "🔥", payerKeys, memberKeys),
-			"the creator's own message":        boost(groupID, byCreator.ID, "🔥", creatorKeys, memberKeys),
 			"the payer themself":               boost(groupID, byCreator.ID, "🔥", payerKeys, payerKeys),
 		} {
 			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "boost payouts are not allowed", name)
+		}
+	})
+
+	// No one boosts their own message, the creator included, whoever the
+	// payment pays.
+	t.Run("denied_own_message", func(t *testing.T) {
+		for name, record := range map[string]*ocp_intent.Record{
+			"member paying the creator":  boost(groupID, byPayer.ID, "🔥", payerKeys, creatorKeys),
+			"creator paying a member":    boost(groupID, byCreator.ID, "🔥", creatorKeys, memberKeys),
+			"creator paying no one else": boost(groupID, byCreator.ID, "🔥", creatorKeys, creatorKeys),
+		} {
+			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "cannot boost their own message", name)
 		}
 	})
 

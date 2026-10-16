@@ -2,6 +2,7 @@ package intent
 
 import (
 	"context"
+	"errors"
 
 	"google.golang.org/protobuf/proto"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/profile"
+	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_currency_util "github.com/code-payments/ocp-server/ocp/currency"
 	"github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
@@ -119,6 +121,11 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 	case ocp_intent.ReceivePaymentsPublicly:
 		return nil
 
+	case ocp_intent.SendPublicMultiPayment:
+		// App metadata was refused above, since only a SendPublicPayment
+		// carries it
+		return i.validateMultiPayment(ctx, intentRecord)
+
 	default:
 		return ocp_transaction.NewIntentDeniedError("flipcash does not support the intent type")
 	}
@@ -146,5 +153,32 @@ func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_
 }
 
 func (i *Integration) OnSuccess(ctx context.Context, intentRecord *ocp_intent.Record) error {
+	return nil
+}
+
+// validateMultiPayment allows a multi payment only from a staff user. It is a
+// transitional gate while multi payments roll out, so opening them to
+// everyone is removing this check.
+func (i *Integration) validateMultiPayment(ctx context.Context, intentRecord *ocp_intent.Record) error {
+	payer, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
+	if err != nil {
+		return err
+	}
+
+	payerUserID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: payer.PublicKey().ToBytes()})
+	if errors.Is(err, account.ErrNotFound) {
+		return ocp_transaction.NewIntentDeniedError("payer is not a flipcash user")
+	} else if err != nil {
+		return err
+	}
+
+	isStaff, err := i.accounts.IsStaff(ctx, payerUserID)
+	if err != nil {
+		return err
+	}
+	if !isStaff {
+		return ocp_transaction.NewIntentDeniedError("multi payments are limited to staff")
+	}
+
 	return nil
 }

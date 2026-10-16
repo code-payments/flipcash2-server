@@ -812,7 +812,9 @@ func TestIntegration_GetTasksToSchedule_GroupPayment(t *testing.T) {
 	require.NoError(t, tasks[0].Validate())
 }
 
-// Multi payments are limited to staff while they roll out.
+// A multi payment is made for a reaction boost alone, and is limited to staff
+// while multi payments roll out. A staff boost that passes is covered by
+// TestIntegration_AllowCreation_ReactionBoost.
 func TestIntegration_AllowCreation_MultiPayment(t *testing.T) {
 	e := newIntegrationEnv(t)
 
@@ -824,40 +826,46 @@ func TestIntegration_AllowCreation_MultiPayment(t *testing.T) {
 
 	recipients := []string{base58.Encode(recipient1Keys.Public()), base58.Encode(recipient2Keys.Public())}
 
-	t.Run("staff payer", func(t *testing.T) {
-		record := multiPaymentIntentRecord(base58.Encode(staffKeys.Public()), recipients...)
-		require.NoError(t, e.integration.AllowCreation(e.ctx, record, nil, nil))
+	withChatMetadata := func(record *ocp_intent.Record, chatMetadata *intentpb.ChatMetadata) *ocp_intent.Record {
+		appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
+			Domain: &intentpb.AppMetadata_Chat{Chat: chatMetadata},
+		})
+		require.NoError(t, err)
+		record.AppMetadata = appMetadata
+		return record
+	}
+	boost := func(payer model.KeyPair) *ocp_intent.Record {
+		record := multiPaymentIntentRecord(base58.Encode(payer.Public()), recipients...)
+		return withChatMetadata(record, reactionBoostMetadata(chat.MustGenerateGroupChatID(), &messagingpb.MessageId{Value: 1}, "🔥"))
+	}
+
+	// Whoever pays, staff included.
+	t.Run("no app metadata", func(t *testing.T) {
+		for _, payer := range []model.KeyPair{staffKeys, nonStaffKeys} {
+			record := multiPaymentIntentRecord(base58.Encode(payer.Public()), recipients...)
+			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "only supported for reaction boosts")
+		}
+	})
+
+	t.Run("other app metadata", func(t *testing.T) {
+		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, staffUserID, nonStaffUserID)
+		record := withChatMetadata(multiPaymentIntentRecord(base58.Encode(staffKeys.Public()), recipients...), dmChatMetadata(dmChatID))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "only supported for reaction boosts")
 	})
 
 	t.Run("non-staff payer", func(t *testing.T) {
-		record := multiPaymentIntentRecord(base58.Encode(nonStaffKeys.Public()), recipients...)
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "multi payments are limited to staff")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(nonStaffKeys), nil, nil), "multi payments are limited to staff")
 	})
 
 	t.Run("payer is not a flipcash user", func(t *testing.T) {
-		record := multiPaymentIntentRecord(base58.Encode(model.MustGenerateKeyPair().Public()), recipients...)
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "payer is not a flipcash user")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(model.MustGenerateKeyPair()), nil, nil), "payer is not a flipcash user")
 	})
 
 	// Staff recipients don't make a non-staff payer's multi payment allowed
 	t.Run("staff recipients", func(t *testing.T) {
 		e.setStaff(recipient1UserID)
 		e.setStaff(recipient2UserID)
-		record := multiPaymentIntentRecord(base58.Encode(nonStaffKeys.Public()), recipients...)
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "multi payments are limited to staff")
-	})
-
-	// A multi payment carries a reaction boost's app metadata alone, even
-	// from staff (see TestIntegration_AllowCreation_ReactionBoost)
-	t.Run("app metadata", func(t *testing.T) {
-		record := multiPaymentIntentRecord(base58.Encode(staffKeys.Public()), recipients...)
-		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, staffUserID, nonStaffUserID)
-		appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
-			Domain: &intentpb.AppMetadata_Chat{Chat: dmChatMetadata(dmChatID)},
-		})
-		require.NoError(t, err)
-		record.AppMetadata = appMetadata
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "multi payments only carry reaction boost metadata")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(nonStaffKeys), nil, nil), "multi payments are limited to staff")
 	})
 }
 

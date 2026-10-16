@@ -132,17 +132,15 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 		return nil
 
 	case ocp_intent.SendPublicMultiPayment:
+		// A multi payment is made for one thing alone: a reaction boost that
+		// pays both the message's sender and the group's creator. One without
+		// a boost's app metadata, including one with none, is refused before
+		// anything is read.
+		if appMetadata.GetChat().GetReactionBoost() == nil {
+			return ocp_transaction.NewIntentDeniedError("multi payments are only supported for reaction boosts")
+		}
 		if err := i.validateMultiPayment(ctx, intentRecord); err != nil {
 			return err
-		}
-		if !hasAppMetadata {
-			return nil
-		}
-
-		// The one chat payment made as a multi payment is a reaction boost
-		// that pays both the message's sender and the group's creator.
-		if appMetadata.GetChat().GetReactionBoost() == nil {
-			return ocp_transaction.NewIntentDeniedError("multi payments only carry reaction boost metadata")
 		}
 		return i.validateReactionBoostAppMetadata(ctx, intentRecord, &appMetadata)
 

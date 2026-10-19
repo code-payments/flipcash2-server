@@ -150,7 +150,7 @@ func (s *Sender) pushSentMessages(ctx context.Context, log *zap.Logger, chatID *
 			continue
 		}
 		if isGroup {
-			p.sendReceiver(ctx)
+			p.sendReceivers(ctx)
 			p.walkGroup(ctx)
 		} else {
 			p.sendPage(ctx, p.push, members)
@@ -205,11 +205,12 @@ type messagePush struct {
 	// push is the rendered notification, nil when the message earns none.
 	push *push.ChatMessagePush
 
-	// receiver is the member a group cash message paid, and receiverPush the
-	// notification addressed to them, which they get instead of push. Both
-	// are nil for any other message.
-	receiver     *commonpb.UserId
-	receiverPush *push.ChatMessagePush
+	// receivers are the notifications addressed to the members a group cash
+	// message paid, each with the receivers it goes to, which they get
+	// instead of push; receiverSet is all of those receivers. Both are empty
+	// for any other message.
+	receivers   []push.ReceiverPush
+	receiverSet map[string]struct{}
 
 	// now is when the fan-out began; a mute is active or lapsed against it
 	// for every page, so a timed mute lapsing mid-walk cannot split a page.
@@ -221,7 +222,7 @@ type messagePush struct {
 
 // prepare resolves what every page shares: the sender's profile, the
 // rendered push, and how mutes will be read; for a group cash message, also
-// the receiver's push. A sender without a profile, or without what the chat
+// its receivers' pushes. A sender without a profile, or without what the chat
 // type's title needs, earns no push and is not an error.
 func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, chatTitle string) error {
 	senderProfile, err := p.sender.profiles.GetFullProfile(ctx, p.message.SenderId, true)
@@ -246,7 +247,7 @@ func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, cha
 		if senderProfile.DisplayName == "" {
 			return nil
 		}
-		if err := p.prepareReceiver(ctx, senderProfile.DisplayName, chatTitle); err != nil {
+		if err := p.prepareReceivers(ctx, senderProfile.DisplayName, chatTitle); err != nil {
 			return err
 		}
 		p.push, err = push.BuildGroupChatPush(ctx, p.sender.ocpData, p.chatID, p.message, p.message.SenderId, senderProfile.DisplayName, p.receiverDisplayName(ctx), chatTitle)
@@ -261,30 +262,34 @@ func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, cha
 	return nil
 }
 
-// prepareReceiver builds the receiver's push for a group cash message, which
-// names one, and is a no-op for any other message.
-func (p *messagePush) prepareReceiver(ctx context.Context, senderDisplayName, chatTitle string) error {
-	receiver := p.message.Content[0].GetCash().GetReceiver()
-	if receiver == nil {
-		return nil
-	}
-	receiverPush, err := push.BuildGroupChatReceiverPush(ctx, p.sender.ocpData, p.chatID, p.message, p.message.SenderId, senderDisplayName, chatTitle)
-	if err != nil || receiverPush == nil {
+// prepareReceivers builds the receivers' pushes for a group cash message,
+// which names one receiver or several, and is a no-op for any other message.
+func (p *messagePush) prepareReceivers(ctx context.Context, senderDisplayName, chatTitle string) error {
+	receivers, err := push.BuildGroupChatReceiverPushes(ctx, p.sender.ocpData, p.chatID, p.message, p.message.SenderId, senderDisplayName, chatTitle)
+	if err != nil {
 		return err
 	}
-	p.receiver, p.receiverPush = receiver, receiverPush
+	p.receivers = receivers
+	p.receiverSet = make(map[string]struct{})
+	for _, receiverPush := range receivers {
+		for _, receiver := range receiverPush.Receivers {
+			p.receiverSet[string(receiver.Value)] = struct{}{}
+		}
+	}
 	return nil
 }
 
 // receiverDisplayName is how every other member's push names the receiver of
-// a group cash message: their display name, or nothing when they have none
-// or it cannot be read, which renders the body without them rather than
-// costing the push.
+// a group cash message paying one member: their display name, or nothing when
+// they have none or it cannot be read, which renders the body without them
+// rather than costing the push. A message paying several names none of them,
+// so nothing is read for it.
 func (p *messagePush) receiverDisplayName(ctx context.Context) string {
-	if p.receiver == nil {
+	receiver := p.message.Content[0].GetCash().GetSingleReceiver()
+	if receiver == nil || len(p.receivers) == 0 {
 		return ""
 	}
-	receiverProfile, err := p.sender.profiles.GetFullProfile(ctx, p.receiver, false)
+	receiverProfile, err := p.sender.profiles.GetFullProfile(ctx, receiver, false)
 	if err != nil {
 		if err != profile.ErrNotFound {
 			p.log.With(zap.Error(err)).Warn("Failure loading receiver profile for message push; leaving them unnamed")
@@ -353,7 +358,7 @@ func (p *messagePush) walkGroup(ctx context.Context) {
 			go func(users []*commonpb.UserId) {
 				defer wg.Done()
 				defer func() { <-p.sender.pushPageSlots }()
-				p.sendPage(ctx, p.push, p.withoutReceiver(users))
+				p.sendPage(ctx, p.push, p.withoutReceivers(users))
 			}(page.Users)
 		}
 		if page.Next == nil {
@@ -363,38 +368,45 @@ func (p *messagePush) walkGroup(ctx context.Context) {
 	}
 }
 
-// sendReceiver pushes a group cash message's receiver their own notification,
-// as a page of one through the same pipeline as every other page (blocks and
-// mutes apply to them as to anyone), while they are still a member: the walk
-// reaches only members, so the receiver is held to the same, and a receiver
-// who has left since the payment is not pushed into a group they are no
-// longer in. It is a no-op for any other message.
-func (p *messagePush) sendReceiver(ctx context.Context) {
-	if p.receiverPush == nil {
-		return
-	}
-	_ = pushStep(ctx, func(ctx context.Context) error {
-		isMember, err := p.sender.chats.IsMember(ctx, p.chatID, p.receiver)
-		if err != nil {
-			p.log.With(zap.Error(err)).Warn("Failure checking receiver membership for message push; suppressing receiver push")
+// sendReceivers pushes a group cash message's receivers their own
+// notifications, each push as a page of its receivers through the same
+// pipeline as every other page (blocks and mutes apply to them as to anyone),
+// to those still members: the walk reaches only members, so receivers are
+// held to the same, and a receiver who has left since the payment is not
+// pushed into a group they are no longer in. Membership is read one receiver
+// at a time, strongly consistent, at most intent.MaxGroupPaymentReceivers (10)
+// of them. It is a no-op for any other message.
+func (p *messagePush) sendReceivers(ctx context.Context) {
+	for _, receiverPush := range p.receivers {
+		_ = pushStep(ctx, func(ctx context.Context) error {
+			members := make([]*commonpb.UserId, 0, len(receiverPush.Receivers))
+			for _, receiver := range receiverPush.Receivers {
+				isMember, err := p.sender.chats.IsMember(ctx, p.chatID, receiver)
+				if err != nil {
+					p.log.With(zap.Error(err), zap.String("receiver", model.UserIDString(receiver))).Warn("Failure checking receiver membership for message push; suppressing receiver push")
+					continue
+				}
+				if isMember {
+					members = append(members, receiver)
+				}
+			}
+			if len(members) > 0 {
+				p.sendPageStep(ctx, receiverPush.Push, members)
+			}
 			return nil
-		}
-		if isMember {
-			p.sendPageStep(ctx, p.receiverPush, []*commonpb.UserId{p.receiver})
-		}
-		return nil
-	})
+		})
+	}
 }
 
-// withoutReceiver drops a group cash message's receiver from a page of the
-// walk, since they get their own push (see sendReceiver).
-func (p *messagePush) withoutReceiver(members []*commonpb.UserId) []*commonpb.UserId {
-	if p.receiverPush == nil {
+// withoutReceivers drops a group cash message's receivers from a page of the
+// walk, since they get their own pushes (see sendReceivers).
+func (p *messagePush) withoutReceivers(members []*commonpb.UserId) []*commonpb.UserId {
+	if len(p.receiverSet) == 0 {
 		return members
 	}
 	out := make([]*commonpb.UserId, 0, len(members))
 	for _, member := range members {
-		if !bytes.Equal(member.Value, p.receiver.Value) {
+		if _, ok := p.receiverSet[string(member.Value)]; !ok {
 			out = append(out, member)
 		}
 	}

@@ -26,6 +26,12 @@ func injectLocalizedTextForHistory(record *history.Record, notification *activit
 			// message's sender or the group's creator. One paying both is a
 			// multi payment, whose record is the total and names no one.
 			localizedText = "Boosted"
+		case intent.GetGroupPayment(record.AppMetadata) != nil:
+			// A group payment is always a send. One paying a single member
+			// names them beside it; one paying several is a multi payment,
+			// whose record is the total and names no one, so it must not
+			// read Gave, which is a payment handed off in person.
+			localizedText = "Sent"
 		case notification.GetDirectlySentCrypto().GetDestinationIdentifier() == nil:
 			localizedText = "Gave"
 		case intent.GetChatPaymentVerb(record.AppMetadata, record.CreatedAt) == messagingpb.CashContent_TIPPED:

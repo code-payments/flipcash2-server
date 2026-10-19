@@ -154,12 +154,12 @@ func GetReactionBoost(appMetadata []byte) *intentpb.ChatMetadata_ReactionBoost {
 
 // IsUserChatPayment reports whether app metadata is a chat payment whose
 // parties know each other by user ID: a DM payment, a group payment, whose
-// cash message names both in the group, or a reaction boost, whose payer is
-// shown on the reaction to the group and whose payees are the group's creator
-// and the message's sender. A contact DM payment is not one, since its parties
-// know each other by phone number; nor is a payment carrying no chat
-// metadata, such as one handed off in person, where no identity was exchanged
-// at all.
+// cash message names the payer and every recipient in the group, or a
+// reaction boost, whose payer is shown on the reaction to the group and whose
+// payees are the group's creator and the message's sender. A contact DM
+// payment is not one, since its parties know each other by phone number; nor
+// is a payment carrying no chat metadata, such as one handed off in person,
+// where no identity was exchanged at all.
 func IsUserChatPayment(appMetadata []byte) bool {
 	chatMetadata := GetChatMetadata(appMetadata)
 	return chatMetadata.GetDmPayment() != nil || chatMetadata.GetGroupPayment() != nil || chatMetadata.GetReactionBoost() != nil
@@ -383,22 +383,33 @@ func (i *Integration) validateDmAppMetadata(ctx context.Context, intentRecord *o
 	return i.validateMinDmChatInitFee(ctx, intentRecord.SendPublicPaymentMetadata, fee)
 }
 
-// validateGroupAppMetadata enforces that a SendPublicPayment carrying chat app
-// metadata is a well-formed group payment: a direct payment from one member of
-// a group to another. The task it schedules posts the cash message into the
-// group as the payer, through the messaging Sender, which no rule gates, so
-// every gate a send would face is applied here, before any money moves, rather
-// than by the task, which could only drop the message of a payment already
-// made.
+// MaxGroupPaymentReceivers is the most members one group payment may pay: the
+// most receivers a cash message can list (messagingpb.CashContent_Payments).
+// OCP caps a multi payment's destinations at the same number today; the check
+// is Flipcash's own, so a payment that passed validation can always be posted.
+const MaxGroupPaymentReceivers = 10
+
+// validateGroupAppMetadata enforces that a payment carrying chat app metadata
+// is a well-formed group payment: a direct payment from one member of a group
+// to one or more others. A payment to one member is a SendPublicPayment and a
+// payment to several at once (2 to MaxGroupPaymentReceivers) a
+// SendPublicMultiPayment, which has passed its staff gate
+// (validateMultiPayment) before it gets here. The task it schedules posts one
+// cash message into the group as the payer, through the messaging Sender,
+// which no rule gates, so every gate a send would face is applied here,
+// before any money moves, rather than by the task, which could only drop the
+// message of a payment already made.
 //
 // The payer must be able to speak in the group (chat.Access.SpeakerStanding:
 // a member who satisfies its rules, so not a non-creator in a creator-only
-// group, nor anyone in a private group without its key), and the recipient
+// group, nor anyone in a private group without its key), and every recipient
 // must be a member, whatever the rules say of them, since receiving is not
 // speaking. A group that does not exist has no members, so it fails the
-// payer's check. Standing and membership are judged now, not when the task
-// runs: a payer who leaves, or a recipient who does, before the message lands
-// still gets it, since it records a payment that has happened.
+// payer's check. No recipient may be the payer or appear twice, so the cash
+// message names distinct members other than its sender. Standing and
+// membership are judged now, not when the task runs: a payer who leaves, or a
+// recipient who does, before the message lands still gets it, since it
+// records a payment that has happened.
 //
 // There is no floor on the amount: the payer can already speak in the group
 // for free, so a payment is no wider a channel than a message. Only a send is
@@ -422,17 +433,56 @@ func (i *Integration) validateGroupAppMetadata(ctx context.Context, intentRecord
 		return ocp_transaction.NewIntentValidationError("chat id is not a group")
 	}
 
-	senderUserID, recipientUserID, err := i.resolveDirectChatPaymentParties(ctx, intentRecord, "group")
+	payment, err := GetDirectPayment(intentRecord)
+	if errors.Is(err, ErrNotDirectPayment) {
+		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf("group payment must be a direct payment: %v", err))
+	} else if err != nil {
+		return err
+	}
+	if len(payment.Destinations) > MaxGroupPaymentReceivers {
+		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf("group payment pays more than %d members", MaxGroupPaymentReceivers))
+	}
+
+	senderUserID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: payment.Payer.PublicKey().ToBytes()})
+	if errors.Is(err, account.ErrNotFound) {
+		return ocp_transaction.NewIntentDeniedError("sender is not a flipcash user")
+	} else if err != nil {
+		return err
+	}
+
+	pubKeys := make([]*commonpb.PublicKey, len(payment.Destinations))
+	for j, destination := range payment.Destinations {
+		pubKeys[j] = &commonpb.PublicKey{Value: destination.Owner.PublicKey().ToBytes()}
+	}
+	userIDsByKey, err := i.accounts.GetUserIds(ctx, pubKeys)
 	if err != nil {
 		return err
 	}
 
-	if bytes.Equal(senderUserID.Value, recipientUserID.Value) {
-		return ocp_transaction.NewIntentDeniedError("payment to yourself is a no-op")
+	recipientUserIDs := make([]*commonpb.UserId, len(payment.Destinations))
+	seen := make(map[string]struct{}, len(payment.Destinations))
+	for j, destination := range payment.Destinations {
+		recipientUserID, ok := userIDsByKey[destination.Owner.PublicKey().ToBase58()]
+		if !ok {
+			return ocp_transaction.NewIntentDeniedError("recipient is not a flipcash user")
+		}
+		if bytes.Equal(senderUserID.Value, recipientUserID.Value) {
+			return ocp_transaction.NewIntentDeniedError("payment to yourself is a no-op")
+		}
+		if _, ok := seen[string(recipientUserID.Value)]; ok {
+			return ocp_transaction.NewIntentDeniedError("group payment pays a recipient more than once")
+		}
+		seen[string(recipientUserID.Value)] = struct{}{}
+		recipientUserIDs[j] = recipientUserID
 	}
 
-	if i.isTeamAccount(senderUserID) || i.isTeamAccount(recipientUserID) {
+	if i.isTeamAccount(senderUserID) {
 		return ocp_transaction.NewIntentDeniedError("group payments with the flipcash team are not allowed")
+	}
+	for _, recipientUserID := range recipientUserIDs {
+		if i.isTeamAccount(recipientUserID) {
+			return ocp_transaction.NewIntentDeniedError("group payments with the flipcash team are not allowed")
+		}
 	}
 
 	canSpeak, err := i.access.CanSpeak(ctx, chatID, senderUserID)
@@ -443,83 +493,85 @@ func (i *Integration) validateGroupAppMetadata(ctx context.Context, intentRecord
 		return ocp_transaction.NewIntentDeniedError("sender cannot send in the group")
 	}
 
-	isMember, err := i.access.IsMember(ctx, chatID, recipientUserID)
-	if err != nil {
-		return err
-	}
-	if !isMember {
-		return ocp_transaction.NewIntentDeniedError("recipient is not a member of the group")
+	for _, recipientUserID := range recipientUserIDs {
+		isMember, err := i.access.IsMember(ctx, chatID, recipientUserID)
+		if err != nil {
+			return err
+		}
+		if !isMember {
+			return ocp_transaction.NewIntentDeniedError("recipient is not a member of the group")
+		}
 	}
 
 	return nil
 }
 
-// ErrNotBoostPayment is returned by GetBoostPayment for an intent that cannot
-// carry a boost's payment.
-var ErrNotBoostPayment = errors.New("intent is not a boost payment")
+// ErrNotDirectPayment is returned by GetDirectPayment for an intent that is not
+// a direct payment.
+var ErrNotDirectPayment = errors.New("intent is not a direct payment")
 
-// BoostPayment is the payment behind a reaction boost, read off its intent
-// record by GetBoostPayment: who paid, who it pays, and the whole payment.
-// It is what boost validation and the boost task read instead of the intent's
-// own metadata, so that the one place that knows which intents carry a boost,
-// and how each names its destinations, is GetBoostPayment.
-type BoostPayment struct {
+// DirectPayment is a direct payment from one user to one or more others, read
+// off its intent record by GetDirectPayment: who paid, who it pays, and the
+// whole payment. It is what group payment and boost validation, and the tasks
+// they schedule, read instead of the intent's own metadata, so that the one
+// place that knows which intents are direct payments, and how each names its
+// destinations, is GetDirectPayment.
+type DirectPayment struct {
 	// Payer is the owner account that made the payment.
 	Payer *ocp_common.Account
 
 	// Destinations are the payment's destinations, one per payee, in the
 	// payment's own order.
-	Destinations []BoostDestination
+	Destinations []DirectDestination
 
 	// Amount is the whole payment, every destination's part together.
 	Amount *commonpb.CryptoPaymentAmount
 
-	// UsdMarketValue is the whole payment's value in USD, what the boost
-	// grows the reaction's totals by.
+	// UsdMarketValue is the whole payment's value in USD (for a boost, what
+	// it grows the reaction's totals by).
 	UsdMarketValue float64
 }
 
-// BoostDestination is one destination of a boost's payment: the owner account
+// DirectDestination is one destination of a direct payment: the owner account
 // paid and how much, in quarks and in the payment's currency.
-type BoostDestination struct {
+type DirectDestination struct {
 	Owner        *ocp_common.Account
 	Quarks       uint64
 	NativeAmount float64
 }
 
-// GetBoostPayment reads the payment behind a reaction boost off its intent
-// record. A boost that pays one person (see messaging.BoostPayees) is a direct
-// SendPublicPayment, with one destination; a boost that pays both the
-// message's sender and the group's creator is a SendPublicMultiPayment, one
-// BoostDestination per destination. Which of the two a boost must be is
-// judged in validateReactionBoostAppMetadata, not here.
+// GetDirectPayment reads a direct payment off its intent record. A payment to
+// one person is a SendPublicPayment, with one destination; a payment to
+// several at once is a SendPublicMultiPayment, one DirectDestination per
+// destination. Which of the two a payment must be is judged by its validator
+// (validateGroupAppMetadata, validateReactionBoostAppMetadata), not here.
 //
-// It reads nothing but the record and returns ErrNotBoostPayment (wrapped)
-// for an intent that is neither.
-func GetBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, error) {
+// It reads nothing but the record and returns ErrNotDirectPayment (wrapped)
+// for an intent that is neither, or a SendPublicPayment that is not direct.
+func GetDirectPayment(intentRecord *ocp_intent.Record) (*DirectPayment, error) {
 	switch intentRecord.IntentType {
 	case ocp_intent.SendPublicPayment:
-		return getSingleBoostPayment(intentRecord)
+		return getSingleDirectPayment(intentRecord)
 	case ocp_intent.SendPublicMultiPayment:
-		return getMultiBoostPayment(intentRecord)
+		return getMultiDirectPayment(intentRecord)
 	default:
-		return nil, fmt.Errorf("%w: intent type %d", ErrNotBoostPayment, intentRecord.IntentType)
+		return nil, fmt.Errorf("%w: intent type %d", ErrNotDirectPayment, intentRecord.IntentType)
 	}
 }
 
-// getSingleBoostPayment is GetBoostPayment for a SendPublicPayment.
-func getSingleBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, error) {
+// getSingleDirectPayment is GetDirectPayment for a SendPublicPayment.
+func getSingleDirectPayment(intentRecord *ocp_intent.Record) (*DirectPayment, error) {
 	metadata := intentRecord.SendPublicPaymentMetadata
 	if metadata == nil {
-		return nil, fmt.Errorf("%w: missing payment metadata", ErrNotBoostPayment)
+		return nil, fmt.Errorf("%w: missing payment metadata", ErrNotDirectPayment)
 	}
-	// A boost pays its payees directly. Withdrawals, remote sends and swap
-	// sells are routed elsewhere.
+	// Withdrawals, remote sends and swap sells are routed elsewhere, never
+	// directly to a user.
 	if metadata.IsWithdrawal || metadata.IsIndirectSend || metadata.IsSwapSell {
-		return nil, fmt.Errorf("%w: not a direct payment", ErrNotBoostPayment)
+		return nil, fmt.Errorf("%w: not a direct payment", ErrNotDirectPayment)
 	}
 	if len(metadata.DestinationOwnerAccount) == 0 {
-		return nil, fmt.Errorf("%w: destination has no owner", ErrNotBoostPayment)
+		return nil, fmt.Errorf("%w: destination has no owner", ErrNotDirectPayment)
 	}
 
 	payer, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
@@ -535,9 +587,9 @@ func getSingleBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, erro
 		return nil, fmt.Errorf("invalid mint account: %w", err)
 	}
 
-	return &BoostPayment{
+	return &DirectPayment{
 		Payer:        payer,
-		Destinations: []BoostDestination{{Owner: destinationOwner, Quarks: metadata.Quantity, NativeAmount: metadata.NativeAmount}},
+		Destinations: []DirectDestination{{Owner: destinationOwner, Quarks: metadata.Quantity, NativeAmount: metadata.NativeAmount}},
 		Amount: &commonpb.CryptoPaymentAmount{
 			Currency:     string(metadata.ExchangeCurrency),
 			NativeAmount: metadata.NativeAmount,
@@ -548,16 +600,17 @@ func getSingleBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, erro
 	}, nil
 }
 
-// getMultiBoostPayment is GetBoostPayment for a SendPublicMultiPayment. Its
+// getMultiDirectPayment is GetDirectPayment for a SendPublicMultiPayment. Its
 // totals are the whole payment's, every destination's part together, which
-// OCP sums when it records the intent; the boost credits the whole.
-func getMultiBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, error) {
+// OCP sums when it records the intent. A multi payment has no indirect form,
+// so it is always direct.
+func getMultiDirectPayment(intentRecord *ocp_intent.Record) (*DirectPayment, error) {
 	metadata := intentRecord.SendPublicMultiPaymentMetadata
 	if metadata == nil {
-		return nil, fmt.Errorf("%w: missing payment metadata", ErrNotBoostPayment)
+		return nil, fmt.Errorf("%w: missing payment metadata", ErrNotDirectPayment)
 	}
 	if len(metadata.Payments) == 0 {
-		return nil, fmt.Errorf("%w: no destinations", ErrNotBoostPayment)
+		return nil, fmt.Errorf("%w: no destinations", ErrNotDirectPayment)
 	}
 
 	payer, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
@@ -569,19 +622,19 @@ func getMultiBoostPayment(intentRecord *ocp_intent.Record) (*BoostPayment, error
 		return nil, fmt.Errorf("invalid mint account: %w", err)
 	}
 
-	destinations := make([]BoostDestination, len(metadata.Payments))
+	destinations := make([]DirectDestination, len(metadata.Payments))
 	for j, payment := range metadata.Payments {
 		if len(payment.DestinationOwnerAccount) == 0 {
-			return nil, fmt.Errorf("%w: destination has no owner", ErrNotBoostPayment)
+			return nil, fmt.Errorf("%w: destination has no owner", ErrNotDirectPayment)
 		}
 		owner, err := ocp_common.NewAccountFromPublicKeyString(payment.DestinationOwnerAccount)
 		if err != nil {
 			return nil, fmt.Errorf("invalid destination owner account: %w", err)
 		}
-		destinations[j] = BoostDestination{Owner: owner, Quarks: payment.Quantity, NativeAmount: payment.NativeAmount}
+		destinations[j] = DirectDestination{Owner: owner, Quarks: payment.Quantity, NativeAmount: payment.NativeAmount}
 	}
 
-	return &BoostPayment{
+	return &DirectPayment{
 		Payer:        payer,
 		Destinations: destinations,
 		Amount: &commonpb.CryptoPaymentAmount{
@@ -642,8 +695,8 @@ func (i *Integration) validateReactionBoostAppMetadata(ctx context.Context, inte
 		return ocp_transaction.NewIntentDeniedError("boost emoji is not a single emoji")
 	}
 
-	payment, err := GetBoostPayment(intentRecord)
-	if errors.Is(err, ErrNotBoostPayment) {
+	payment, err := GetDirectPayment(intentRecord)
+	if errors.Is(err, ErrNotDirectPayment) {
 		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf("boost must be a direct payment: %v", err))
 	} else if err != nil {
 		return err
@@ -763,7 +816,7 @@ func hasEmoji(reactions []messaging.SelfReaction, emoji string) bool {
 // store refuses (messaging.ErrBoostEmpty) after the money has moved, so it is
 // refused here instead. Only the minor unit of a currency worth very little
 // can fall below that.
-func validateMinimumBoost(payment *BoostPayment) error {
+func validateMinimumBoost(payment *DirectPayment) error {
 	currency := currency_lib.Code(payment.Amount.Currency)
 	minimum := send.MinimumTransferValue(currency)
 	for _, destination := range payment.Destinations {

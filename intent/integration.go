@@ -76,7 +76,7 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 	hasAppMetadata := len(intentRecord.AppMetadata) > 0
 
 	// A SendPublicPayment carries any chat payment; a SendPublicMultiPayment
-	// carries a reaction boost alone (see below).
+	// carries a reaction boost or a group payment alone (see below).
 	if hasAppMetadata && intentRecord.IntentType != intent.SendPublicPayment && intentRecord.IntentType != intent.SendPublicMultiPayment {
 		return ocp_transaction.NewIntentDeniedError("flipcash app metadata only supported for public payment intents")
 	}
@@ -132,17 +132,24 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 		return nil
 
 	case ocp_intent.SendPublicMultiPayment:
-		// A multi payment is made for one thing alone: a reaction boost that
-		// pays both the message's sender and the group's creator. One without
-		// a boost's app metadata, including one with none, is refused before
-		// anything is read.
-		if appMetadata.GetChat().GetReactionBoost() == nil {
-			return ocp_transaction.NewIntentDeniedError("multi payments are only supported for reaction boosts")
+		// A multi payment is made for one of two things: a reaction boost
+		// that pays both the message's sender and the group's creator, or a
+		// group payment to several members at once. One carrying any other
+		// app metadata, or none, is refused before anything is read.
+		switch appMetadata.GetChat().GetType().(type) {
+		case *intentpb.ChatMetadata_ReactionBoost_:
+			if err := i.validateMultiPayment(ctx, intentRecord); err != nil {
+				return err
+			}
+			return i.validateReactionBoostAppMetadata(ctx, intentRecord, &appMetadata)
+		case *intentpb.ChatMetadata_GroupPayment_:
+			if err := i.validateMultiPayment(ctx, intentRecord); err != nil {
+				return err
+			}
+			return i.validateGroupAppMetadata(ctx, intentRecord, &appMetadata)
+		default:
+			return ocp_transaction.NewIntentDeniedError("multi payments are only supported for reaction boosts and group payments")
 		}
-		if err := i.validateMultiPayment(ctx, intentRecord); err != nil {
-			return err
-		}
-		return i.validateReactionBoostAppMetadata(ctx, intentRecord, &appMetadata)
 
 	default:
 		return ocp_transaction.NewIntentDeniedError("flipcash does not support the intent type")
@@ -152,12 +159,17 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 // GetTasksToSchedule returns the guaranteed work derived from a submitted
 // intent. A DM payment of either type (contact DM or DM) schedules the cash
 // message injected into the DM between the sender and recipient, and a group
-// payment the one injected into the group; a reaction boost, made as either
-// payment intent, schedules the task that records the boost. Execution is
-// handled by task.Executor.
+// payment, made as either payment intent, the one injected into the group; a
+// reaction boost, made as either payment intent, schedules the task that
+// records the boost. Execution is handled by task.Executor.
 func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_intent.Record) ([]*ocp_task.Record, error) {
-	if intentRecord.IntentType == ocp_intent.SendPublicMultiPayment && GetReactionBoost(intentRecord.AppMetadata) != nil {
-		return []*ocp_task.Record{NewRecordReactionBoostTask(intentRecord)}, nil
+	if intentRecord.IntentType == ocp_intent.SendPublicMultiPayment {
+		if GetReactionBoost(intentRecord.AppMetadata) != nil {
+			return []*ocp_task.Record{NewRecordReactionBoostTask(intentRecord)}, nil
+		}
+		if GetGroupPayment(intentRecord.AppMetadata) != nil {
+			return []*ocp_task.Record{NewSendGroupPaymentMessageTask(intentRecord)}, nil
+		}
 	}
 
 	if intentRecord.IntentType == ocp_intent.SendPublicPayment {
@@ -184,8 +196,9 @@ func (i *Integration) OnSuccess(ctx context.Context, intentRecord *ocp_intent.Re
 
 // validateMultiPayment allows a multi payment only from a staff user. It is a
 // transitional gate while multi payments roll out, so opening them to
-// everyone is removing this check. It gates every multi payment, a reaction
-// boost's included, so only staff can make a boost that pays two people.
+// everyone is removing this check. It gates every multi payment, so only
+// staff can make a boost that pays two people or a group payment to several
+// members at once.
 func (i *Integration) validateMultiPayment(ctx context.Context, intentRecord *ocp_intent.Record) error {
 	payer, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
 	if err != nil {

@@ -79,14 +79,14 @@ func cashFixture() *messagingpb.Content {
 	return &messagingpb.Content{Type: &messagingpb.Content_Cash{
 		Cash: &messagingpb.CashContent{
 			IntentId: &commonpb.IntentId{Value: bytes.Repeat([]byte{3}, 32)},
-			Amount: &commonpb.CryptoPaymentAmount{
+			TotalAmount: &commonpb.CryptoPaymentAmount{
 				Currency:     "usd",
 				NativeAmount: 42.5,
 				Quarks:       42_500_000,
 				Mint:         &commonpb.PublicKey{Value: bytes.Repeat([]byte{4}, 32)},
 			},
-			Receiver: &commonpb.UserId{Value: bytes.Repeat([]byte{5}, 16)},
-			Verb:     messagingpb.CashContent_TIPPED,
+			Recipient: &messagingpb.CashContent_SingleReceiver{SingleReceiver: &commonpb.UserId{Value: bytes.Repeat([]byte{5}, 16)}},
+			Verb:      messagingpb.CashContent_TIPPED,
 		},
 	}}
 }

@@ -18,7 +18,6 @@ import (
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/intent"
 	"github.com/code-payments/flipcash2-server/messaging"
-	ocp_common "github.com/code-payments/ocp-server/ocp/common"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_task "github.com/code-payments/ocp-server/ocp/data/task"
 )
@@ -45,6 +44,13 @@ func (e *Executor) sendDmPaymentMessageOfType(ctx context.Context, record *ocp_t
 		return err
 	}
 
+	// A DM payment pays the other member of the DM alone, so it is never a
+	// multi payment.
+	if len(payment.recipients) != 1 {
+		return fmt.Errorf("dm payment has %d recipients", len(payment.recipients))
+	}
+	recipientUserID := payment.recipients[0].userID
+
 	// The metadata must match the DM the payment is being injected into.
 	switch chatType {
 	case chatpb.ChatType_CONTACT_DM:
@@ -62,7 +68,7 @@ func (e *Executor) sendDmPaymentMessageOfType(ctx context.Context, record *ocp_t
 	// The message must land in the canonical DM of this type between the two
 	// users, which is the chat the client referenced in the validated app
 	// metadata.
-	chatID := chat.MustDeriveDmChatID(chatType, payment.senderUserID, payment.recipientUserID)
+	chatID := chat.MustDeriveDmChatID(chatType, payment.senderUserID, recipientUserID)
 	if !bytes.Equal(payment.chatMetadata.GetChatId().GetValue(), chatID.Value) {
 		return errors.New("chat id does not match the dm between sender and recipient")
 	}
@@ -75,7 +81,7 @@ func (e *Executor) sendDmPaymentMessageOfType(ctx context.Context, record *ocp_t
 	err = e.chats.PutChat(ctx, &chat.Chat{
 		ID:           chatID,
 		Type:         chatType,
-		Members:      []*commonpb.UserId{payment.senderUserID, payment.recipientUserID},
+		Members:      []*commonpb.UserId{payment.senderUserID, recipientUserID},
 		LastActivity: time.Now().UTC(),
 	})
 	if err != nil && !errors.Is(err, chat.ErrChatExists) {
@@ -85,14 +91,14 @@ func (e *Executor) sendDmPaymentMessageOfType(ctx context.Context, record *ocp_t
 	return e.sendCashMessage(ctx, chatID, payment)
 }
 
-// sendGroupPaymentMessage injects the cash message for a group payment into
-// the group it was made in. A returned error means the task is retried with
-// backoff.
+// sendGroupPaymentMessage injects the cash message for a group payment, to
+// one member or to several at once, into the group it was made in. A returned
+// error means the task is retried with backoff.
 //
 // Nothing about the group is checked again: the payer's standing to speak and
-// the recipient's membership were judged when the payment was validated (see
+// each recipient's membership were judged when the payment was validated (see
 // intent.Integration), and the payment has happened since, so its message
-// lands even if either has left the group in between. A group is never
+// lands even if any of them has left the group in between. A group is never
 // created here; the payment was made in one that exists.
 func (e *Executor) sendGroupPaymentMessage(ctx context.Context, record *ocp_task.Record) error {
 	payment, err := e.loadChatPayment(ctx, record)
@@ -148,7 +154,7 @@ func (e *Executor) recordReactionBoost(ctx context.Context, record *ocp_task.Rec
 		return errors.New("chat id is not a group")
 	}
 
-	payment, err := intent.GetBoostPayment(intentRecord)
+	payment, err := intent.GetDirectPayment(intentRecord)
 	if err != nil {
 		return err
 	}
@@ -185,15 +191,29 @@ type chatPayment struct {
 	intentRecord *ocp_intent.Record
 	chatMetadata *intentpb.ChatMetadata
 
-	senderUserID    *commonpb.UserId
-	recipientUserID *commonpb.UserId
-	mint            *ocp_common.Account
+	senderUserID *commonpb.UserId
+
+	// recipients are who the payment paid, one per destination, in the
+	// payment's own order: one for a SendPublicPayment, several for a
+	// SendPublicMultiPayment.
+	recipients []chatPaymentRecipient
+
+	// amount is the whole payment, every recipient's part together.
+	amount *commonpb.CryptoPaymentAmount
+}
+
+// chatPaymentRecipient is one recipient of a chat payment and their part of
+// it, in the payment's currency and mint.
+type chatPaymentRecipient struct {
+	userID       *commonpb.UserId
+	nativeAmount float64
+	quarks       uint64
 }
 
 // loadChatPayment reloads the authoritative intent record a payment message
-// task references, and resolves the payment's sender and recipient. It checks
-// only what every chat payment shares; which chat the message goes to is the
-// caller's.
+// task references, and resolves the payment's sender and recipients. It checks
+// only what every chat payment shares; which chat the message goes to, and how
+// many recipients it may name, is the caller's.
 func (e *Executor) loadChatPayment(ctx context.Context, record *ocp_task.Record) (*chatPayment, error) {
 	taskID, rawIntentID, intentRecord, err := e.loadIntent(ctx, record)
 	if err != nil {
@@ -201,71 +221,87 @@ func (e *Executor) loadChatPayment(ctx context.Context, record *ocp_task.Record)
 	}
 
 	// The task is only ever scheduled for a validated chat payment, which is
-	// always a direct SendPublicPayment between two Flipcash users carrying the
-	// matching chat payment app metadata (enforced in
-	// intent.Integration.AllowCreation).
-	metadata := intentRecord.SendPublicPaymentMetadata
-	if intentRecord.IntentType != ocp_intent.SendPublicPayment || metadata == nil {
-		return nil, errors.New("intent is not a send public payment")
+	// always a direct payment between Flipcash users carrying the matching
+	// chat payment app metadata (enforced in intent.Integration.AllowCreation):
+	// a SendPublicPayment to one of them, or a SendPublicMultiPayment to
+	// several in a group.
+	payment, err := intent.GetDirectPayment(intentRecord)
+	if err != nil {
+		return nil, err
 	}
 
-	senderOwner, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
-	if err != nil {
-		return nil, fmt.Errorf("invalid initiator owner account: %w", err)
-	}
-	recipientOwner, err := ocp_common.NewAccountFromPublicKeyString(metadata.DestinationOwnerAccount)
-	if err != nil {
-		return nil, fmt.Errorf("invalid destination owner account: %w", err)
-	}
-	mint, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.MintAccount)
-	if err != nil {
-		return nil, fmt.Errorf("invalid mint account: %w", err)
-	}
-
-	senderUserID, err := e.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: senderOwner.PublicKey().ToBytes()})
+	senderUserID, err := e.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: payment.Payer.PublicKey().ToBytes()})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sender user id: %w", err)
 	}
-	recipientUserID, err := e.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: recipientOwner.PublicKey().ToBytes()})
+
+	pubKeys := make([]*commonpb.PublicKey, len(payment.Destinations))
+	for j, destination := range payment.Destinations {
+		pubKeys[j] = &commonpb.PublicKey{Value: destination.Owner.PublicKey().ToBytes()}
+	}
+	userIDsByKey, err := e.accounts.GetUserIds(ctx, pubKeys)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get recipient user id: %w", err)
+		return nil, fmt.Errorf("failed to get recipient user ids: %w", err)
+	}
+
+	recipients := make([]chatPaymentRecipient, len(payment.Destinations))
+	for j, destination := range payment.Destinations {
+		userID, ok := userIDsByKey[destination.Owner.PublicKey().ToBase58()]
+		if !ok {
+			return nil, fmt.Errorf("recipient %s is not a flipcash user", destination.Owner.PublicKey().ToBase58())
+		}
+		recipients[j] = chatPaymentRecipient{
+			userID:       userID,
+			nativeAmount: destination.NativeAmount,
+			quarks:       destination.Quarks,
+		}
 	}
 
 	return &chatPayment{
-		taskID:          taskID,
-		rawIntentID:     rawIntentID,
-		intentRecord:    intentRecord,
-		chatMetadata:    intent.GetChatMetadata(intentRecord.AppMetadata),
-		senderUserID:    senderUserID,
-		recipientUserID: recipientUserID,
-		mint:            mint,
+		taskID:       taskID,
+		rawIntentID:  rawIntentID,
+		intentRecord: intentRecord,
+		chatMetadata: intent.GetChatMetadata(intentRecord.AppMetadata),
+		senderUserID: senderUserID,
+		recipients:   recipients,
+		amount:       payment.Amount,
 	}, nil
 }
 
 // sendCashMessage sends the payment's cash message into chatID as the
-// payer, naming the recipient as its receiver.
+// payer: carrying the whole payment as its total, and naming its recipient as
+// its single receiver, or, for a payment to several, listing each recipient
+// with their part, in the payment's order, as its multi receiver.
 //
 // Idempotency under at-least-once delivery comes from the messaging layer:
 // sends dedupe on (chatID, clientMessageID), and the client message ID is the
 // task's UUID, which is stable across retries.
 func (e *Executor) sendCashMessage(ctx context.Context, chatID *commonpb.ChatId, payment *chatPayment) error {
-	metadata := payment.intentRecord.SendPublicPaymentMetadata
+	cash := &messagingpb.CashContent{
+		IntentId:    &commonpb.IntentId{Value: payment.rawIntentID},
+		TotalAmount: payment.amount,
+		// The verb is how the client renders the payment.
+		Verb: intent.GetChatPaymentVerb(payment.intentRecord.AppMetadata, payment.intentRecord.CreatedAt),
+	}
+	switch len(payment.recipients) {
+	case 0:
+		return errors.New("payment has no recipients")
+	case 1:
+		cash.Recipient = &messagingpb.CashContent_SingleReceiver{SingleReceiver: payment.recipients[0].userID}
+	default:
+		items := make([]*messagingpb.CashContent_Payment, len(payment.recipients))
+		for j, recipient := range payment.recipients {
+			items[j] = &messagingpb.CashContent_Payment{
+				Receiver:     recipient.userID,
+				NativeAmount: recipient.nativeAmount,
+				Quarks:       recipient.quarks,
+			}
+		}
+		cash.Recipient = &messagingpb.CashContent_MultiReceiver{MultiReceiver: &messagingpb.CashContent_Payments{Items: items}}
+	}
 
 	content := []*messagingpb.Content{{
-		Type: &messagingpb.Content_Cash{
-			Cash: &messagingpb.CashContent{
-				IntentId: &commonpb.IntentId{Value: payment.rawIntentID},
-				Amount: &commonpb.CryptoPaymentAmount{
-					Currency:     string(metadata.ExchangeCurrency),
-					NativeAmount: metadata.NativeAmount,
-					Quarks:       metadata.Quantity,
-					Mint:         &commonpb.PublicKey{Value: payment.mint.PublicKey().ToBytes()},
-				},
-				Receiver: payment.recipientUserID,
-				// The verb is how the client renders the payment.
-				Verb: intent.GetChatPaymentVerb(payment.intentRecord.AppMetadata, payment.intentRecord.CreatedAt),
-			},
-		},
+		Type: &messagingpb.Content_Cash{Cash: cash},
 	}}
 
 	if _, err := e.sender.Send(

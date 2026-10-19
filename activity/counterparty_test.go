@@ -238,6 +238,40 @@ func TestHistoryCounterparties_MultiPaymentBoost(t *testing.T) {
 	e.requireBoostedReaction(t, notifications[1].GetReceivedCrypto().GetBoostedReaction())
 }
 
+// TestHistoryCounterparties_GroupMultiPayment: a group payment to several
+// members is a multi payment, which records one total for the payer with no
+// counterparty and one record per recipient naming the payer. The payer's
+// reads Sent, not Gave, and names no one; each recipient's reads Received and
+// names the payer.
+func TestHistoryCounterparties_GroupMultiPayment(t *testing.T) {
+	e := newCounterpartyEnv(t)
+
+	payerAccount := base58.Encode(e.payerKeys.Public())
+	recipientAccount := base58.Encode(e.recipientKeys.Public())
+
+	sent := paymentRecord(1, history.DirectlySent, payerAccount, "", e.groupPayment)
+	sent.CounterpartyOwnerAccount = nil
+	records := []*history.Record{
+		sent,
+		paymentRecord(2, history.DirectlyReceived, recipientAccount, payerAccount, e.groupPayment),
+	}
+
+	counterparties, err := e.server.resolveHistoryCounterparties(context.Background(), records)
+	require.NoError(t, err)
+	notifications, err := toNotifications(records, counterparties)
+	require.NoError(t, err)
+	require.Len(t, notifications, 2)
+
+	require.Equal(t, "Sent", notifications[0].LocalizedText)
+	require.NotNil(t, notifications[0].GetDirectlySentCrypto())
+	require.Nil(t, notifications[0].GetDirectlySentCrypto().GetDestinationIdentifier())
+	require.Nil(t, notifications[0].GetDirectlySentCrypto().GetBoostedReaction())
+
+	require.Equal(t, "Received", notifications[1].LocalizedText)
+	require.True(t, proto.Equal(e.payer, notifications[1].GetReceivedCrypto().GetUserId()))
+	require.Nil(t, notifications[1].GetReceivedCrypto().GetBoostedReaction())
+}
+
 // requireBoostedReaction checks that a notification names the reaction
 // e.reactionBoost boosted, and that it is valid as the proto defines it.
 func (e *counterpartyEnv) requireBoostedReaction(t *testing.T, boosted *activitypb.BoostedReaction) {

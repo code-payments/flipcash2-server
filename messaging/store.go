@@ -281,10 +281,7 @@ type Store interface {
 
 	// GetMessage returns a single message by ID, or ErrMessageNotFound. The read
 	// is strongly consistent: it reflects every send, edit and delete that
-	// completed before it. EditMessage's callers judge the edit against it — an
-	// encrypted message may not be downgraded to plaintext — and a lagging read
-	// could miss an upgrade to encrypted that the caller's expected
-	// event_sequence already names.
+	// completed before it.
 	GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*Message, error)
 
 	// MessageExists reports whether a message exists in the chat. It is a

@@ -278,16 +278,6 @@ func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRe
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_CANNOT_EDIT}, nil
 	}
 
-	// An encrypted message stays encrypted: an edit may replace it only with
-	// other encrypted content, never downgrade it to plaintext. Plaintext may be
-	// upgraded. The rule is judged on the read above, which is strongly
-	// consistent, and the write is conditioned on the caller's expected
-	// event_sequence, so an upgrade that lands after the read makes this edit a
-	// CONFLICT rather than slipping a downgrade past the check.
-	if isEncrypted(msg.Content) && !isEncrypted(req.Content) {
-		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_CANNOT_EDIT}, nil
-	}
-
 	// When the new content is a reply, the replied-to message must exist in this
 	// chat and be repliable — the same rule a send is held to.
 	if repliedMessageID != nil {
@@ -458,9 +448,9 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 // poll.PrepareSend). repliedMessageID is non-nil only for a valid reply,
 // signaling the caller to verify the replied-to message exists and is
 // repliable. Whether encrypted content is allowed depends on the chat and so
-// is the caller's to enforce (see encryptionVerdictOf), as is the rule that an
-// edit never downgrades an encrypted message to plaintext, which depends on
-// the message being edited.
+// is the caller's to enforce (see encryptionVerdictOf), which also keeps an
+// encrypted message from being edited down to plaintext: the only chats that
+// take encrypted content take nothing else.
 //
 // Encrypted content is opaque: whatever it wraps — the proto allows text, media,
 // or a reply whose body is either — is the recipient's to check, not the
@@ -528,10 +518,8 @@ const (
 //
 //   - EncryptionNone (a public group) takes plaintext alone: any encrypted
 //     content is ENCRYPTION_NOT_ALLOWED.
-//   - EncryptionOptional (a DM) takes plaintext, and encrypted content under
-//     the standing's Scheme. Any other scheme is ENCRYPTION_NOT_ALLOWED.
-//   - EncryptionRequired (a private group with its key) takes encrypted
-//     content under the standing's Scheme and nothing else: plaintext is
+//   - EncryptionRequired (a DM, or a private group with its key) takes
+//     encrypted content under the standing's Scheme and nothing else: plaintext is
 //     ENCRYPTION_REQUIRED, including a reply, which is encrypted whole, and
 //     any other scheme is ENCRYPTION_NOT_ALLOWED.
 //

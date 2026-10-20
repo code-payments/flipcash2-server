@@ -285,9 +285,8 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 }
 
 // canCreatePrivateGroup reports whether userID may create a private group:
-// today, only a staff user. It is a transitional gate, like use_e2ee's (see
-// useE2ee): private groups were built in steps behind it, and clients have
-// not shipped them. Opening creation to everyone is removing this check.
+// today, only a staff user. It is a transitional gate: private groups were
+// built in steps behind it, and clients have not shipped them. Opening creation to everyone is removing this check.
 func (s *Server) canCreatePrivateGroup(ctx context.Context, userID *commonpb.UserId) (bool, error) {
 	return s.accounts.IsStaff(ctx, userID)
 }

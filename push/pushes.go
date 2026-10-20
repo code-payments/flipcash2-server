@@ -250,6 +250,53 @@ func BuildGroupChatPush(ctx context.Context, ocpData ocp_data.Provider, chatId *
 	return newChatMessagePush(groupChatPushTitle(chatTitle), body, groupChatPushPayload(chatId, message, senderID))
 }
 
+// SendLobbyEnteredPush tells a private group's creator that a user is waiting
+// in its lobby to be let in ("Alice requested to join", titled by the group).
+// The requester is named by display name, or as "Someone" when they have
+// none. It is a chat push that is not for a message: it navigates to the
+// group and carries its type, but no message and no sender (see
+// pushpb.ChatMetadata), and it moves no badge, like every push that is not a
+// message's.
+func SendLobbyEnteredPush(ctx context.Context, pusher Pusher, creator *commonpb.UserId, chatId *commonpb.ChatId, chatTitle, requesterDisplayName string) error {
+	if requesterDisplayName == "" {
+		requesterDisplayName = "Someone"
+	}
+	body := truncatePushBody(fmt.Sprintf(lobbyEnteredPushBodyFormat, requesterDisplayName))
+	return pusher.SendPushes(ctx, groupChatPushTitle(chatTitle), body, lobbyPushPayload(chatId), creator)
+}
+
+// SendLobbyAdmittedPush tells a user that a private group's creator let them
+// in from its lobby, titled by the group. Like SendLobbyEnteredPush it is a
+// chat push that is not for a message, and moves no badge.
+func SendLobbyAdmittedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, chatId *commonpb.ChatId, chatTitle string) error {
+	return pusher.SendPushes(ctx, groupChatPushTitle(chatTitle), lobbyAdmittedPushBody, lobbyPushPayload(chatId), user)
+}
+
+// lobbyEnteredPushBodyFormat is the creator's push body for a user entering
+// the lobby, with the user's display name in it; lobbyAdmittedPushBody is the
+// admitted user's.
+const (
+	lobbyEnteredPushBodyFormat = "%s requested to join"
+	lobbyAdmittedPushBody      = "Your request to join was approved"
+)
+
+// lobbyPushPayload is a lobby push's payload: grouped and navigating with the
+// group's chat pushes, carrying no message.
+func lobbyPushPayload(chatId *commonpb.ChatId) *pushpb.Payload {
+	return &pushpb.Payload{
+		Category: pushpb.Payload_CHAT,
+		GroupKey: base64.StdEncoding.EncodeToString(chatId.Value),
+		Navigation: &pushpb.Navigation{
+			Type: &pushpb.Navigation_ChatId{
+				ChatId: chatId,
+			},
+		},
+		ChatMetadata: &pushpb.ChatMetadata{
+			Type: chatpb.ChatType_GROUP,
+		},
+	}
+}
+
 // ReceiverPush is a group cash message's notification for some of its
 // receivers, and who they are: every receiver whose own push reads the same,
 // so they can be sent it together.

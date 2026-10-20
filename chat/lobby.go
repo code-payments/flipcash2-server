@@ -21,6 +21,7 @@ import (
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/push"
 )
 
 // The lobby: how a user is admitted to a private group (see Chat.IsPrivate and
@@ -62,6 +63,15 @@ import (
 // are best-effort, outside the event log, so a creator reconciles by reading
 // the lobby. A waiting user is told nothing of a denial; they read in_lobby
 // off GetChat (see hydrate) to learn they are no longer waiting.
+//
+// Two of those changes are also pushed (see sendLobbyPush): a new entry to
+// the creator, whether or not they are a member, as for the LobbyUpdate, and
+// an admission to the admitted user. A withdrawal or a denial is pushed to no
+// one. Neither push is a message's, so neither is held back by a mute: a
+// creator who muted the group still hears that someone is waiting, which no
+// message in it would tell them. They are best effort: a lost push stays
+// lost, since a retry is the no-op path, and the lobby and the chat are there
+// to read.
 //
 // Caps (see LobbyLimits) are the store's to enforce in the write that would
 // exceed them, so they hold under concurrent entries; the server only names
@@ -155,15 +165,24 @@ func (s *Server) EnterLobby(ctx context.Context, req *chatpb.EnterLobbyRequest) 
 	md.InLobby = true
 
 	if changed {
+		// The push names the user off the profile the update carries, and
+		// goes out without a name when that read fails.
+		var displayName string
 		members, err := s.hydrateLobbyMembers(ctx, []LobbyEntry{entry})
 		if err != nil {
 			// The entry has landed and the response stands; the creator
 			// reconciles by reading the lobby, as for any missed update.
 			log.With(zap.Error(err)).Warn("Failure hydrating lobby member for update")
 		} else {
+			displayName = members[0].UserProfile.GetDisplayName()
 			s.publishLobbyUpdate(c, &chatpb.LobbyUpdate{Kind: &chatpb.LobbyUpdate_MemberEntered_{
 				MemberEntered: &chatpb.LobbyUpdate_MemberEntered{Member: members[0]},
 			}})
+		}
+		if c.CreatorID != nil {
+			s.sendLobbyPush(ctx, log, func(ctx context.Context) error {
+				return push.SendLobbyEnteredPush(ctx, s.pusher, c.CreatorID, c.ID, c.Title, displayName)
+			})
 		}
 	}
 
@@ -343,6 +362,9 @@ func (s *Server) AdmitLobbyMember(ctx context.Context, req *chatpb.AdmitLobbyMem
 
 	// The caller, the creator, let them in.
 	s.sendUserJoined(ctx, log, c, req.UserId, userID, roster)
+	s.sendLobbyPush(ctx, log, func(ctx context.Context) error {
+		return push.SendLobbyAdmittedPush(ctx, s.pusher, req.UserId, c.ID, c.Title)
+	})
 
 	// Announced as any join is (see JoinChat): to the admitted user's own
 	// devices, their entry as hydrated for them, with the metadata so they
@@ -518,6 +540,26 @@ func (s *Server) hydrateLobbyMembers(ctx context.Context, entries []LobbyEntry) 
 		})
 	}
 	return out, nil
+}
+
+// lobbyPushTimeout bounds sending one lobby push (see sendLobbyPush).
+const lobbyPushTimeout = 10 * time.Second
+
+// sendLobbyPush sends one of the lobby's pushes (see above) on its own
+// goroutine, detached from the request, whose change has landed by then, and
+// bounded by lobbyPushTimeout. It is best effort: a failure is logged, and
+// never fails the RPC. A server with no pusher sends nothing.
+func (s *Server) sendLobbyPush(ctx context.Context, log *zap.Logger, send func(ctx context.Context) error) {
+	if s.pusher == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lobbyPushTimeout)
+	go func() {
+		defer cancel()
+		if err := send(ctx); err != nil {
+			log.With(zap.Error(err)).Warn("Failure sending lobby push")
+		}
+	}()
 }
 
 // publishLobbyLeft announces that userID is no longer in c's lobby, whichever

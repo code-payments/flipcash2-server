@@ -3,6 +3,7 @@ package tests
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
+	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 	ocp_balancepb "github.com/code-payments/ocp-protobuf-api/generated/go/balance/v1"
 
 	ocp_common "github.com/code-payments/ocp-server/ocp/common"
@@ -43,6 +45,7 @@ import (
 	"github.com/code-payments/flipcash2-server/moderation"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/protoutil"
+	"github.com/code-payments/flipcash2-server/push"
 	"github.com/code-payments/flipcash2-server/testutil"
 )
 
@@ -181,6 +184,7 @@ type serverEnv struct {
 	moderator  *fakeModerator
 
 	systemMessages *fakeSystemMessenger
+	pusher         *fakePusher
 
 	userObserver *event.TestEventObserver[*commonpb.UserId, *eventpb.Event]
 	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
@@ -232,13 +236,14 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	media := newFakeMedia()
 	moderator := &fakeModerator{}
 	systemMessages := &fakeSystemMessenger{}
+	pusher := &fakePusher{}
 	access := chat.NewAccess(s, chat.NewRuleEvaluator(accounts, balances, s, teamUserID))
 	var opts []chat.ServerOption
 	if cfg.lobbyLimits != nil {
 		opts = append(opts, chat.WithLobbyLimits(*cfg.lobbyLimits))
 	}
 	hydrator := chat.NewHydrator(log, accounts, blocklist, s, media, messaging, profiles, access.Rules(), teamUserID)
-	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, systemMessages, access, hydrator, userBus, chatBus, cfg.disablePublicGroupRoster, opts...)
+	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, systemMessages, pusher, access, hydrator, userBus, chatBus, cfg.disablePublicGroupRoster, opts...)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
 	}))
@@ -256,6 +261,7 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 		moderator:      moderator,
 		accounts:       accounts,
 		systemMessages: systemMessages,
+		pusher:         pusher,
 		ocpBalance:     ocpBalance,
 		userObserver:   userObserver,
 		chatObserver:   chatObserver,
@@ -662,6 +668,75 @@ type userJoinedCall struct {
 // every join it is asked to write, and fails each with err when set. The
 // chat server calls it on the request path, so a test reads its calls with no
 // waiting.
+// fakePusher records every push the server sends, for tests to assert on
+// what would reach a device.
+type fakePusher struct {
+	mu     sync.Mutex
+	pushes []fakePush
+}
+
+type fakePush struct {
+	title, body string
+	payload     *pushpb.Payload
+	users       []*commonpb.UserId
+	badged      bool
+}
+
+func (p *fakePusher) SendPushes(_ context.Context, title, body string, customPayload *pushpb.Payload, users ...*commonpb.UserId) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pushes = append(p.pushes, fakePush{title: title, body: body, payload: customPayload, users: users})
+	return nil
+}
+
+func (p *fakePusher) SendPushesWithBadges(_ context.Context, title, body string, customPayload *pushpb.Payload, _ push.BadgeResolver, users ...*commonpb.UserId) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pushes = append(p.pushes, fakePush{title: title, body: body, payload: customPayload, users: users, badged: true})
+	return nil
+}
+
+// pushesTo returns the pushes sent to userID, in order.
+func (p *fakePusher) pushesTo(userID *commonpb.UserId) []fakePush {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []fakePush
+	for _, sent := range p.pushes {
+		for _, u := range sent.users {
+			if bytes.Equal(u.Value, userID.Value) {
+				out = append(out, sent)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// waitForPushes waits for n pushes to userID, sent off the request path, and
+// returns every push sent to them.
+func (e *serverEnv) waitForPushes(userID *commonpb.UserId, n int) []fakePush {
+	require.Eventually(e.t, func() bool {
+		return len(e.pusher.pushesTo(userID)) >= n
+	}, time.Second, 5*time.Millisecond)
+	return e.pusher.pushesTo(userID)
+}
+
+// requireLobbyPush asserts that a push is a lobby push for chatID: a group
+// chat push titled title and reading body, navigating to the chat and
+// carrying no message, sent to one user with no badge.
+func requireLobbyPush(t *testing.T, got fakePush, chatID *commonpb.ChatId, title, body string) {
+	require.Equal(t, title, got.title)
+	require.Equal(t, body, got.body)
+	require.False(t, got.badged)
+	require.Len(t, got.users, 1)
+	require.Equal(t, pushpb.Payload_CHAT, got.payload.Category)
+	require.Equal(t, base64.StdEncoding.EncodeToString(chatID.Value), got.payload.GroupKey)
+	require.Equal(t, chatID.Value, got.payload.Navigation.GetChatId().GetValue())
+	require.Equal(t, chatpb.ChatType_GROUP, got.payload.ChatMetadata.GetType())
+	require.Nil(t, got.payload.ChatMetadata.GetMessageRef())
+	require.Nil(t, got.payload.ChatMetadata.GetSendingUserId())
+}
+
 type fakeSystemMessenger struct {
 	mu    sync.Mutex
 	joins []userJoinedCall
@@ -5947,12 +6022,18 @@ func testServer_Lobby_EnterAndLeave(t *testing.T, s chat.Store) {
 	require.Empty(t, e.lobbyUpdatesOnUserTopic(userID, chatID))
 	e.requireNoLobbyUpdatesOnChatTopic(chatID)
 
+	// And is pushed, naming the user.
+	pushes := e.waitForPushes(e.userID, 1)
+	require.Len(t, pushes, 1)
+	requireLobbyPush(t, pushes[0], chatID, "Sunday Hikers", "Waiting requested to join")
+
 	// A repeat is OK with the same entry, and announces nothing.
 	again := e.enterLobby(userKeys, chatID)
 	require.Equal(t, chatpb.EnterLobbyResponse_OK, again.Result)
 	require.True(t, again.Lobby.EnteredAt.AsTime().Equal(resp.Lobby.EnteredAt.AsTime()))
 	time.Sleep(100 * time.Millisecond)
 	require.Len(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID), 1)
+	require.Len(t, e.pusher.pushesTo(e.userID), 1)
 
 	// Withdrawing.
 	require.Equal(t, chatpb.LeaveLobbyResponse_OK, e.leaveLobby(userKeys, chatID).Result)
@@ -5965,6 +6046,16 @@ func testServer_Lobby_EnterAndLeave(t *testing.T, s chat.Store) {
 	require.Len(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID), 2)
 	e.requireNoLobbyUpdatesOnChatTopic(chatID)
 	e.requireNoRosterUpdates(userID, chatID)
+
+	// A withdrawal is pushed to no one, and the waiting user is never pushed.
+	require.Len(t, e.pusher.pushesTo(e.userID), 1)
+	require.Empty(t, e.pusher.pushesTo(userID))
+
+	// A user with no display name is pushed as someone.
+	_, namelessKeys := e.addBoundUser("")
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(namelessKeys, chatID).Result)
+	pushes = e.waitForPushes(e.userID, 2)
+	requireLobbyPush(t, pushes[1], chatID, "Sunday Hikers", "Someone requested to join")
 }
 
 // testServer_Lobby_Limits pins the server's caps: a full lobby is LOBBY_FULL,
@@ -6109,12 +6200,19 @@ func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	require.Equal(t, userID.Value, updates[1].GetMemberLeft().GetUserId().GetValue())
 	e.requireNoLobbyUpdatesOnChatTopic(chatID)
 
+	// And pushed to the admitted user; the creator was pushed only the entry.
+	pushes := e.waitForPushes(userID, 1)
+	require.Len(t, pushes, 1)
+	requireLobbyPush(t, pushes[0], chatID, "Sunday Hikers", "Your request to join was approved")
+	require.Len(t, e.pusher.pushesTo(e.userID), 1)
+
 	// A repeat is the no-op the proto promises, their envelope untouched.
 	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(3)).Result)
 	envelope = e.mustGetKeyEnvelope(userKeys, chatID)
 	require.True(t, proto.Equal(wrapped, envelope.KeyEnvelope))
 	time.Sleep(100 * time.Millisecond)
 	require.Len(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID), 2)
+	require.Len(t, e.pusher.pushesTo(userID), 1)
 	onChat, _ = e.rosterUpdatesOnChatTopic(chatID)
 	require.Len(t, onChat, 1)
 
@@ -6133,6 +6231,10 @@ func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(5)).Result)
 	envelope = e.mustGetKeyEnvelope(userKeys, chatID)
 	require.True(t, proto.Equal(keyEnvelopeProto(5), envelope.KeyEnvelope))
+
+	// Each wait and each admission is pushed again.
+	e.waitForPushes(e.userID, 2)
+	e.waitForPushes(userID, 2)
 }
 
 // testServer_Lobby_Deny pins a denial: the user leaves the lobby and is told
@@ -6160,6 +6262,10 @@ func testServer_Lobby_Deny(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.DenyLobbyMemberResponse_OK, e.denyLobbyMember(e.keys, chatID, userID).Result)
 	time.Sleep(100 * time.Millisecond)
 	require.Len(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID), 2)
+
+	// A denial is pushed to no one.
+	require.Empty(t, e.pusher.pushesTo(userID))
+	require.Len(t, e.pusher.pushesTo(e.userID), 1)
 
 	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(userKeys, chatID).Result)
 	got = e.getChat(userKeys, chatID)

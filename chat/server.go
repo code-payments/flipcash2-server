@@ -20,6 +20,7 @@ import (
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/moderation"
+	"github.com/code-payments/flipcash2-server/push"
 )
 
 // MessageRef identifies a chat's message to hydrate. The feed builds one ref per
@@ -178,6 +179,10 @@ type Server struct {
 	// sendUserJoined). Nil when there is none, which writes nothing.
 	systemMessages SystemMessenger
 
+	// pusher sends the lobby's pushes (see sendLobbyPush). Nil when there is
+	// none, which sends nothing.
+	pusher push.Pusher
+
 	rules  *RuleEvaluator
 	access *Access
 
@@ -239,6 +244,7 @@ func NewServer(
 	moderator moderation.Client,
 	profiles ProfileReader,
 	systemMessages SystemMessenger,
+	pusher push.Pusher,
 
 	access *Access,
 	hydrator *Hydrator,
@@ -264,6 +270,7 @@ func NewServer(
 		profiles:  profiles,
 
 		systemMessages: systemMessages,
+		pusher:         pusher,
 
 		rules:    access.Rules(),
 		access:   access,

@@ -306,10 +306,11 @@ func toSwapState(record *history.Record) activitypb.SwapState {
 }
 
 // resolveHistoryCounterparties returns the user ID of the other party to each
-// DM or group payment in records, keyed by that party's owner account,
-// resolved for the whole page in one lookup rather than once per record.
+// DM, group or requested payment, or reaction boost, in records, keyed by
+// that party's owner account, resolved for the whole page in one lookup rather
+// than once per record.
 //
-// Only DM and group payments are resolved (see intent.IsUserChatPayment). A
+// Only those chat payments are resolved (see intent.IsUserChatPayment). A
 // payment handed off in person also has a counterparty whose owner account
 // would resolve, but no identity was exchanged there, so naming them would
 // disclose one that neither party shared.

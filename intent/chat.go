@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/mr-tron/base58"
 	"google.golang.org/protobuf/proto"
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
@@ -20,6 +22,7 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/messaging"
+	"github.com/code-payments/flipcash2-server/paymentrequest"
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/send"
 	currency_lib "github.com/code-payments/ocp-server/currency"
@@ -50,6 +53,11 @@ const (
 	// against the payer's reaction once its payment is made (see
 	// messaging.Sender.RecordBoost).
 	TaskTypeRecordReactionBoost uint32 = 4
+
+	// TaskTypeRecordRequestedPayment is the task that marks a payment
+	// request's share paid by a requested payment and injects its cash
+	// message into the group.
+	TaskTypeRecordRequestedPayment uint32 = 5
 )
 
 // NewSendContactDmPaymentMessageTask creates the task that injects the cash
@@ -103,6 +111,19 @@ func NewRecordReactionBoostTask(intentRecord *ocp_intent.Record) *ocp_task.Recor
 	}
 }
 
+// NewRecordRequestedPaymentTask creates the task that marks a payment
+// request's share paid after a requested payment, and injects its cash
+// message into the group. Only the intent ID is carried, via the reference ID;
+// the executor reloads the authoritative intent record at execution time.
+func NewRecordRequestedPaymentTask(intentRecord *ocp_intent.Record) *ocp_task.Record {
+	intentID := intentRecord.IntentId
+	return &ocp_task.Record{
+		TaskId:      uuid.NewString(),
+		Type:        TaskTypeRecordRequestedPayment,
+		ReferenceId: &intentID,
+	}
+}
+
 // GetChatMetadata extracts the chat metadata from an intent's additional app
 // metadata, if present. It returns nil when there is no app metadata, the
 // metadata fails to decode, or it is not chat metadata.
@@ -152,17 +173,30 @@ func GetReactionBoost(appMetadata []byte) *intentpb.ChatMetadata_ReactionBoost {
 	return GetChatMetadata(appMetadata).GetReactionBoost()
 }
 
+// GetRequestedPayment extracts the requested payment, a payment of the payer's
+// share of a payment request, from app metadata, if present. It returns nil
+// when there is no app metadata, the metadata fails to decode, or it is not a
+// requested payment.
+func GetRequestedPayment(appMetadata []byte) *intentpb.ChatMetadata_RequestedPayment {
+	return GetChatMetadata(appMetadata).GetRequestedPayment()
+}
+
 // IsUserChatPayment reports whether app metadata is a chat payment whose
 // parties know each other by user ID: a DM payment, a group payment, whose
-// cash message names the payer and every recipient in the group, or a
-// reaction boost, whose payer is shown on the reaction to the group and whose
-// payees are the group's creator and the message's sender. A contact DM
+// cash message names the payer and every recipient in the group, a reaction
+// boost, whose payer is shown on the reaction to the group and whose payees
+// are the group's creator and the message's sender, or a requested payment,
+// whose cash message names the payer and the request's creator in the group.
+// A contact DM
 // payment is not one, since its parties know each other by phone number; nor
 // is a payment carrying no chat metadata, such as one handed off in person,
 // where no identity was exchanged at all.
 func IsUserChatPayment(appMetadata []byte) bool {
 	chatMetadata := GetChatMetadata(appMetadata)
-	return chatMetadata.GetDmPayment() != nil || chatMetadata.GetGroupPayment() != nil || chatMetadata.GetReactionBoost() != nil
+	return chatMetadata.GetDmPayment() != nil ||
+		chatMetadata.GetGroupPayment() != nil ||
+		chatMetadata.GetReactionBoost() != nil ||
+		chatMetadata.GetRequestedPayment() != nil
 }
 
 // sendByDefaultCutoff is when an unset DM payment action came to mean SEND.
@@ -178,9 +212,10 @@ var sendByDefaultCutoff = time.Date(2026, time.September, 30, 0, 0, 0, 0, time.U
 // GetChatPaymentVerb reports how a chat payment created at createdAt should be
 // rendered. A DM payment is a tip only when its action is TIP; SEND and the
 // unset DEFAULT are plain sends, from either location, except for payments
-// created before sendByDefaultCutoff. Everything else, contact DM and group
-// payments included, is a plain send: a group payment's TIP is denied at
-// validation (see validateGroupAppMetadata).
+// created before sendByDefaultCutoff. Everything else, contact DM, group and
+// requested payments included, is a plain send: a group payment's TIP is
+// denied at validation (see validateGroupAppMetadata), and a requested payment
+// carries no action.
 //
 // Both the cash message injected into the chat and the sender's activity feed
 // entry render off this, so they cannot disagree about what a payment was.
@@ -506,16 +541,152 @@ func (i *Integration) validateGroupAppMetadata(ctx context.Context, intentRecord
 	return nil
 }
 
+// validateRequestedPaymentAppMetadata enforces that a SendPublicPayment
+// carrying chat app metadata is a well-formed requested payment: a payment by
+// a debtor of a payment request of their own unpaid share, exactly, to the
+// request's creator. The task it schedules marks the share paid and posts one
+// cash message into the group as the payer, through the messaging Sender,
+// which no rule gates, so every gate is applied here, before any money moves,
+// rather than by the task, which could only drop the record of a payment
+// already made. A multi payment never carries one (see AllowCreation): a
+// share is paid to one person.
+//
+// The checks, in order:
+//   - the chat ID is a group's (a validation error otherwise);
+//   - the payment is a direct payment to a single destination;
+//   - the payer is a Flipcash user;
+//   - the request exists and was made in that group;
+//   - the request is open as of now (paymentrequest.PaymentRequest.IsOpenAt:
+//     not completed, closed, or past its ends_at);
+//   - the payer holds a share of the request, and it is unpaid (the creator's
+//     own share is paid from creation, so the creator never passes);
+//   - the intent's ID is the one the request holds for the payer's share
+//     (paymentrequest.PaymentRequest.PaymentIntentIDs). OCP stores an intent
+//     ID at most once, in the transaction that moves the money, so this is
+//     what makes a share payable at most once: two payments of it, however
+//     close together, cannot both commit, which the unpaid check alone,
+//     read before either commits and before either's task marks the share,
+//     cannot promise;
+//   - the destination's owner is the request's creator;
+//   - neither the payer nor the creator is the Flipcash team account;
+//   - the payment is in the request's currency, read as a boost's is, off the
+//     payment's exchange currency (any mint may pay); and
+//   - the payment's native amount (its one destination's, as a boost's
+//     payouts are read) is the share's native_amount to within half the
+//     currency's minor unit (send.MinimumTransferValue), the slack OCP allows
+//     between a payment's amount and its quarks, with a few ulps of float
+//     error forgiven. A share is paid all at once, so a partial payment or an
+//     overpayment is refused.
+//
+// Membership is not checked beyond the share: a share names a member of the
+// group as of the request's creation, and the contract does not require the
+// payer or the creator to be one now, so a debtor who has since left may still
+// pay what they owe and a creator who has left is still paid. Nor is there a
+// floor beyond the share itself (a share is at least the currency's minimum
+// transfer value when the request is created), nor a block check, as for
+// group payments. The payment is always shown as SENT (see
+// GetChatPaymentVerb).
+//
+// Standing is judged now, not when the task runs: a request closed or expired
+// between this check and the task still has the share recorded (see
+// paymentrequest.Store.PayShare), since the money has moved by then.
+func (i *Integration) validateRequestedPaymentAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
+	chatMetadata := appMetadata.GetChat()
+	requested := chatMetadata.GetRequestedPayment()
+	if requested == nil {
+		return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
+	}
+
+	chatID := chatMetadata.GetChatId()
+	if !chat.IsGroupChatID(chatID) {
+		return ocp_transaction.NewIntentValidationError("chat id is not a group")
+	}
+
+	payment, err := GetDirectPayment(intentRecord)
+	if errors.Is(err, ErrNotDirectPayment) {
+		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf("requested payment must be a direct payment: %v", err))
+	} else if err != nil {
+		return err
+	}
+	if len(payment.Destinations) != 1 {
+		return ocp_transaction.NewIntentDeniedError("requested payment must be a single payment")
+	}
+	destination := payment.Destinations[0]
+
+	payerUserID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: payment.Payer.PublicKey().ToBytes()})
+	if errors.Is(err, account.ErrNotFound) {
+		return ocp_transaction.NewIntentDeniedError("payer is not a flipcash user")
+	} else if err != nil {
+		return err
+	}
+
+	request, err := i.requests.Get(ctx, requested.GetPaymentRequestId())
+	if errors.Is(err, paymentrequest.ErrNotFound) {
+		return ocp_transaction.NewIntentDeniedError("payment request not found")
+	} else if err != nil {
+		return err
+	}
+	if !bytes.Equal(request.ChatID.GetValue(), chatID.GetValue()) {
+		return ocp_transaction.NewIntentDeniedError("payment request was not made in the chat")
+	}
+	if !request.IsOpenAt(time.Now()) {
+		return ocp_transaction.NewIntentDeniedError("payment request is not open")
+	}
+
+	share := request.Share(payerUserID)
+	if share == nil {
+		return ocp_transaction.NewIntentDeniedError("payer has no share")
+	}
+	if share.GetPaid() != nil {
+		return ocp_transaction.NewIntentDeniedError("share is already paid")
+	}
+	if intentRecord.IntentId != base58.Encode(request.PaymentIntentID(payerUserID)) {
+		return ocp_transaction.NewIntentDeniedError("payment must use the share's payment intent id")
+	}
+
+	payeeUserID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: destination.Owner.PublicKey().ToBytes()})
+	switch {
+	case errors.Is(err, account.ErrNotFound):
+		return ocp_transaction.NewIntentDeniedError("payment must be to the request's creator")
+	case err != nil:
+		return err
+	case !bytes.Equal(payeeUserID.Value, request.Creator.GetValue()):
+		return ocp_transaction.NewIntentDeniedError("payment must be to the request's creator")
+	}
+
+	if i.isTeamAccount(payerUserID) || i.isTeamAccount(request.Creator) {
+		return ocp_transaction.NewIntentDeniedError("requested payments with the flipcash team are not allowed")
+	}
+
+	currency := currency_lib.Code(payment.Amount.Currency)
+	if string(currency) != request.Split.GetCurrency() {
+		return ocp_transaction.NewIntentDeniedError("payment must be in the request's currency")
+	}
+
+	expected := share.GetNativeAmount()
+	slack := 0.5*send.MinimumTransferValue(currency) + 4*(math.Nextafter(expected, math.Inf(1))-expected)
+	if math.IsNaN(destination.NativeAmount) || math.Abs(destination.NativeAmount-expected) > slack {
+		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf(
+			"payment must pay the share exactly: paid %s, share is %s %s",
+			strconv.FormatFloat(destination.NativeAmount, 'f', -1, 64),
+			strconv.FormatFloat(expected, 'f', -1, 64),
+			strings.ToUpper(string(currency)),
+		))
+	}
+
+	return nil
+}
+
 // ErrNotDirectPayment is returned by GetDirectPayment for an intent that is not
 // a direct payment.
 var ErrNotDirectPayment = errors.New("intent is not a direct payment")
 
 // DirectPayment is a direct payment from one user to one or more others, read
 // off its intent record by GetDirectPayment: who paid, who it pays, and the
-// whole payment. It is what group payment and boost validation, and the tasks
-// they schedule, read instead of the intent's own metadata, so that the one
-// place that knows which intents are direct payments, and how each names its
-// destinations, is GetDirectPayment.
+// whole payment. It is what group payment, boost and requested payment
+// validation, and the tasks they schedule, read instead of the intent's own
+// metadata, so that the one place that knows which intents are direct
+// payments, and how each names its destinations, is GetDirectPayment.
 type DirectPayment struct {
 	// Payer is the owner account that made the payment.
 	Payer *ocp_common.Account
@@ -544,7 +715,8 @@ type DirectDestination struct {
 // one person is a SendPublicPayment, with one destination; a payment to
 // several at once is a SendPublicMultiPayment, one DirectDestination per
 // destination. Which of the two a payment must be is judged by its validator
-// (validateGroupAppMetadata, validateReactionBoostAppMetadata), not here.
+// (validateGroupAppMetadata, validateReactionBoostAppMetadata,
+// validateRequestedPaymentAppMetadata), not here.
 //
 // It reads nothing but the record and returns ErrNotDirectPayment (wrapped)
 // for an intent that is neither, or a SendPublicPayment that is not direct.

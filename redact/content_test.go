@@ -12,6 +12,7 @@ import (
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
 	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 )
 
@@ -292,6 +293,17 @@ func TestContent_Widget(t *testing.T) {
 	redactedPoll := mustContent(t, chatID, messageID, pollWidget)
 	assert.True(t, proto.Equal(pollWidget, redactedPoll))
 	assert.NotSame(t, pollWidget.GetWidget().GetPoll(), redactedPoll.GetWidget().GetPoll())
+
+	// So is a payment request widget: its ID says nothing of the request.
+	requestWidget := &messagingpb.Content{Type: &messagingpb.Content_Widget{
+		Widget: &messagingpb.WidgetContent{Type: &messagingpb.WidgetContent_PaymentRequest{
+			PaymentRequest: &messagingpb.PaymentRequestWidget{PaymentRequestId: &paymentrequestpb.PaymentRequestId{Value: bytes.Repeat([]byte{8}, 16)}},
+		}},
+	}}
+	redactedRequest := mustContent(t, chatID, messageID, requestWidget)
+	assert.True(t, proto.Equal(requestWidget, redactedRequest))
+	assert.NotSame(t, requestWidget.GetWidget().GetPaymentRequest(), redactedRequest.GetWidget().GetPaymentRequest())
+	assert.NoError(t, redactedRequest.Validate())
 
 	// A widget variant this function does not know is not passed through.
 	for _, in := range []*messagingpb.Content{

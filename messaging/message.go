@@ -13,11 +13,13 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
 	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/database"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/paymentrequest"
 	"github.com/code-payments/flipcash2-server/poll"
 	"github.com/code-payments/flipcash2-server/redact"
 )
@@ -203,6 +205,23 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 		}
 	}
 
+	// A payment request may be sent only by its creator, in its chat, but
+	// whatever its status and any number of times: it is live from creation,
+	// and sending it writes nothing on it (see canSendPaymentRequest). A
+	// private group's plaintext was refused above, as for a poll, and its
+	// requests travel inside encrypted content; a DM that reaches this is
+	// refused, since a request is only ever made in a group.
+	if requestID := sentPaymentRequestID(req.Content); requestID != nil {
+		allowed, err := canSendPaymentRequest(ctx, s.requests, req.ChatId, userID, requestID)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure getting payment request to send")
+			return nil, status.Error(codes.Internal, "")
+		}
+		if !allowed {
+			return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
+		}
+	}
+
 	// Share any media into the chat — validate the sender owns each blob and it is
 	// a READY original, then grant the chat listen access — before the message is
 	// persisted and broadcast, so the grants are durable before any recipient can
@@ -233,9 +252,10 @@ func (s *Server) EditMessage(ctx context.Context, req *messagingpb.EditMessageRe
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
 	// The replacement content is held to the same whitelist as a send, less a
-	// poll, which is only ever sent: a message is never edited into one.
+	// poll or a payment request, which are only ever sent: a message is never
+	// edited into one.
 	repliedMessageID, ok := clientAllowedContent(req.Content)
-	if !ok || sentPollID(req.Content) != nil {
+	if !ok || sentPollID(req.Content) != nil || sentPaymentRequestID(req.Content) != nil {
 		return &messagingpb.EditMessageResponse{Result: messagingpb.EditMessageResponse_DENIED}, nil
 	}
 
@@ -446,16 +466,18 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 // clientAllowedContent reports whether content is a message body a client may
 // author via SendMessage or EditMessage, and extracts the replied-to message ID
 // when it is a reply. The permitted set is a whitelist — currently a text or media
-// message, a reply whose own body is text or media, encrypted content, or a
-// poll widget — so it excludes server-injected content (e.g. cash payment
-// messages, and every other widget, which only the server sends; see
-// flipcashteam) and any content type added later until it is explicitly
-// allowed. A text, as a message or a reply's body, may carry link previews,
-// each of which must be well formed and describe a whole link in that text
-// (see validLinkPreviews); a media caption may carry none. A poll widget is
-// top-level only, never a reply's body, and is sent, never edited in (see
-// sentPollID); whether its sender may send it is the poll's to say (see
-// poll.PrepareSend). repliedMessageID is non-nil only for a valid reply,
+// message, a reply whose own body is text or media, encrypted content, a poll
+// widget or a payment request widget — so it excludes server-injected content
+// (e.g. cash payment messages, and every other widget, which only the server
+// sends; see flipcashteam) and any content type added later until it is
+// explicitly allowed. A text, as a message or a reply's body, may carry link
+// previews, each of which must be well formed and describe a whole link in
+// that text (see validLinkPreviews); a media caption may carry none. A poll
+// widget and a payment request widget are top-level only, never a reply's
+// body, and are sent, never edited in (see sentPollID and
+// sentPaymentRequestID); whether its sender may send a poll is the poll's to
+// say (see poll.PrepareSend), and a payment request only its creator sends,
+// in its chat (see canSendPaymentRequest). repliedMessageID is non-nil only for a valid reply,
 // signaling the caller to verify the replied-to message exists and is
 // repliable. Whether encrypted content is allowed depends on the chat and so
 // is the caller's to enforce (see encryptionVerdictOf), as is the rule that an
@@ -488,7 +510,7 @@ func clientAllowedContent(content []*messagingpb.Content) (repliedMessageID *mes
 	case *messagingpb.Content_Encrypted:
 		return nil, true
 	case *messagingpb.Content_Widget:
-		return nil, c.Widget.GetPoll() != nil
+		return nil, c.Widget.GetPoll() != nil || c.Widget.GetPaymentRequest() != nil
 	default:
 		return nil, false
 	}
@@ -501,6 +523,34 @@ func sentPollID(content []*messagingpb.Content) *pollpb.PollId {
 		return nil
 	}
 	return content[0].GetWidget().GetPoll().GetPollId()
+}
+
+// sentPaymentRequestID returns the payment request a message body sends, or
+// nil when it sends none. A request is only ever sent as the whole body (see
+// clientAllowedContent).
+func sentPaymentRequestID(content []*messagingpb.Content) *paymentrequestpb.PaymentRequestId {
+	if len(content) != 1 {
+		return nil
+	}
+	return content[0].GetWidget().GetPaymentRequest().GetPaymentRequestId()
+}
+
+// canSendPaymentRequest reports whether userID may send the payment request
+// requestID in chatID as a messagingpb.PaymentRequestWidget: only its creator,
+// and only in the chat it was made for. Unlike a poll's, the send is judged
+// whatever the request's status, may be made any number of times, and writes
+// nothing on the request, which is live from creation and shown alike by every
+// message carrying it (see paymentrequest). A request that does not exist is
+// refused like any other, so the refusal says nothing of which IDs exist.
+func canSendPaymentRequest(ctx context.Context, requests paymentrequest.Store, chatID *commonpb.ChatId, userID *commonpb.UserId, requestID *paymentrequestpb.PaymentRequestId) (bool, error) {
+	r, err := requests.Get(ctx, requestID)
+	switch {
+	case errors.Is(err, paymentrequest.ErrNotFound):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	return bytes.Equal(r.ChatID.GetValue(), chatID.GetValue()) && bytes.Equal(r.Creator.GetValue(), userID.GetValue()), nil
 }
 
 // isEncrypted reports whether content is end-to-end encrypted (see

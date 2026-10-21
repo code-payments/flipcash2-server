@@ -168,9 +168,10 @@ func (m *Message) IsDeletable() bool {
 		*messagingpb.Content_Encrypted:
 		return true
 	case *messagingpb.Content_Widget:
-		// A poll is sent by its creator, so its message is theirs to delete,
-		// which leaves the poll as it is. Every other widget is the server's.
-		return c.Widget.GetPoll() != nil
+		// A poll or a payment request is sent by its creator, so its message
+		// is theirs to delete, which leaves the poll or the request as it is.
+		// Every other widget is the server's.
+		return c.Widget.GetPoll() != nil || c.Widget.GetPaymentRequest() != nil
 	default:
 		return false
 	}

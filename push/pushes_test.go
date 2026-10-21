@@ -13,6 +13,7 @@ import (
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
 	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 
@@ -343,6 +344,23 @@ func TestChatMessagePush_Widget(t *testing.T) {
 	dmPoll, err := BuildDmPush(ctx, nil, chatID, pollMessage, senderID, "Alice")
 	require.NoError(t, err)
 	require.Nil(t, dmPoll)
+
+	// So is a payment request, which likewise only a group carries.
+	requestMessage := testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Widget{
+		Widget: &messagingpb.WidgetContent{Type: &messagingpb.WidgetContent_PaymentRequest{
+			PaymentRequest: &messagingpb.PaymentRequestWidget{PaymentRequestId: &paymentrequestpb.PaymentRequestId{Value: bytes.Repeat([]byte{6}, 16)}},
+		}},
+	}})
+	requestPush, err := BuildGroupChatPush(ctx, nil, groupID, requestMessage, senderID, "Alice", "", "Group Title")
+	require.NoError(t, err)
+	require.NotNil(t, requestPush)
+	require.Equal(t, "Group Title", requestPush.title)
+	require.Equal(t, "Alice is requesting money from the group", requestPush.body)
+	require.True(t, proto.Equal(requestMessage, requestPush.payload.ChatMetadata.GetMessage()))
+
+	dmRequest, err := BuildDmPush(ctx, nil, chatID, requestMessage, senderID, "Alice")
+	require.NoError(t, err)
+	require.Nil(t, dmRequest)
 
 	// A widget variant this server does not know earns no push.
 	unknown := testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Widget{Widget: &messagingpb.WidgetContent{}}})

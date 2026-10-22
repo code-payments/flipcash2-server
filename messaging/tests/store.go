@@ -67,6 +67,7 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_Reactions_TypeCapConcurrent,
 		testStore_Reactions_GetReactors,
 		testStore_Reactions_Boost,
+		testStore_Reactions_BoostDm,
 		testStore_Reactions_BoostOrder,
 		testStore_Reactions_BoostPastTypeCap,
 	} {
@@ -2548,18 +2549,6 @@ func testStore_Reactions_Boost(t *testing.T, s messaging.Store) {
 	msgID := msg.ID
 	const emoji = "🔥"
 
-	// A boost in a DM is refused before anything is read: nothing to pay a
-	// creator with, so nothing is recorded, and the DM's reaction state is
-	// untouched.
-	dmID := generateChatID()
-	dm, _, err := s.PutMessage(ctx, dmID, sender, textContent("dm"), at(1), generateClientID(), true)
-	require.NoError(t, err)
-	_, _, _, err = s.AddBoost(ctx, dmID, dm.ID, userA, emoji, boostInput(1_000_000, at(2)))
-	require.ErrorIs(t, err, messaging.ErrBoostGroupOnly)
-	dmSummary, err := s.GetReactionSummary(ctx, dmID, dm.ID)
-	require.NoError(t, err)
-	require.Empty(t, dmSummary)
-
 	// A boost worth nothing is refused and records nothing: no reaction, no
 	// payment to replay.
 	empty := boostInput(0, at(2))
@@ -2895,6 +2884,63 @@ func testStore_Reactions_BoostPastTypeCap(t *testing.T, s messaging.Store) {
 	summary, err := s.GetReactionSummary(ctx, chatID, msgID)
 	require.NoError(t, err)
 	require.Len(t, summary, messaging.MaxReactionTypesPerMessage+1)
+}
+
+// testStore_Reactions_BoostDm pins a boost in a DM: recorded as in a group,
+// with the total on the aggregate, the sample (which a DM's overlay is read
+// from) and the reactor list, credited once, pinning the reaction, and
+// writing no per-viewer row (the read stays refused for a DM).
+func testStore_Reactions_BoostDm(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	dmID := generateChatID()
+	sender := model.MustGenerateUserID()
+	payer := model.MustGenerateUserID()
+	const emoji = "🔥"
+
+	msg, _, err := s.PutMessage(ctx, dmID, sender, textContent("boost me"), at(1), generateClientID(), true)
+	require.NoError(t, err)
+	_, created, _, err := s.AddReaction(ctx, dmID, msg.ID, payer, emoji, at(2))
+	require.NoError(t, err)
+	require.True(t, created)
+
+	boost := boostInput(2_500_000, at(3))
+	r, credited, created, err := s.AddBoost(ctx, dmID, msg.ID, payer, emoji, boost)
+	require.NoError(t, err)
+	require.True(t, credited)
+	require.False(t, created, "the payer had already reacted")
+	require.Equal(t, uint64(1), r.Count)
+	require.Equal(t, uint64(2), r.Version)
+	require.Equal(t, uint64(2_500_000), r.BoostUsdMicros)
+	require.NotNil(t, r.Self)
+	require.Equal(t, uint64(2_500_000), r.Self.BoostUsdMicros)
+	require.Equal(t, at(2), r.Self.ReactedTs, "the reaction keeps its own time")
+
+	// A replay credits nothing.
+	_, credited, _, err = s.AddBoost(ctx, dmID, msg.ID, payer, emoji, boost)
+	require.NoError(t, err)
+	require.False(t, credited)
+
+	// The sample holds the payer with their total: it is what a DM's self
+	// overlay is answered from.
+	summary, err := s.GetReactionSummary(ctx, dmID, msg.ID)
+	require.NoError(t, err)
+	require.Len(t, summary, 1)
+	require.Equal(t, uint64(2_500_000), summary[0].BoostUsdMicros)
+	require.Len(t, summary[0].SampleReactors, 1)
+	require.Equal(t, payer.Value, summary[0].SampleReactors[0].UserID.Value)
+	require.Equal(t, uint64(2_500_000), summary[0].SampleReactors[0].BoostUsdMicros)
+
+	reactors, version, _, err := s.GetReactors(ctx, dmID, msg.ID, emoji)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), version)
+	require.Len(t, reactors, 1)
+	require.Equal(t, uint64(2_500_000), reactors[0].BoostUsdMicros)
+
+	_, _, err = s.RemoveReaction(ctx, dmID, msg.ID, payer, emoji)
+	require.ErrorIs(t, err, messaging.ErrReactionBoosted)
+
+	_, err = s.GetSelfReactions(ctx, dmID, payer, []*messagingpb.MessageId{msg.ID})
+	require.ErrorIs(t, err, messaging.ErrSelfReactionsGroupOnly)
 }
 
 // boostInput is a fresh payment of usdMicros recorded at ts, with a distinct

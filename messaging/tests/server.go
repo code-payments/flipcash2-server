@@ -97,6 +97,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_Reactions_GroupSelfReaction,
 		testServer_Reactions_RemoveBoosted,
 		testServer_Reactions_Boost,
+		testServer_Reactions_BoostDm,
 		// Typing
 		testServer_NotifyIsTyping,
 		// Cross-cutting
@@ -5274,7 +5275,7 @@ func testServer_Reactions_RemoveBoosted(t *testing.T, badges badge.Store, blockl
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const fire, thumbsUp = "🔥", "👍"
 
-	// A group: boosts are a group's (the store refuses a DM).
+	// A group (a DM's boosts are pinned by testServer_Reactions_BoostDm).
 	chatID := chat.MustGenerateGroupChatID()
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 		ID:           chatID,
@@ -5330,6 +5331,56 @@ func testServer_Reactions_RemoveBoosted(t *testing.T, badges badge.Store, blockl
 	require.EqualValues(t, 1, removed.Reaction.Count)
 }
 
+// testServer_Reactions_BoostDm pins a boost in a DM from the RPCs and the
+// stream: both members get one BOOSTED update on their user streams, the
+// summary carries the totals, the booster's self overlay (read off the
+// sample in a DM) carries their own total, and the reaction is permanent.
+func testServer_Reactions_BoostDm(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	const fire = "🔥"
+
+	m, err := e.sendContentToChat(e.keysA, e.chatID, encryptedContent(1), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, m.Result)
+	msgID := m.Message.MessageId
+
+	// B reacts to A's message, then pays A to boost it.
+	added, err := e.addReactionInChat(e.keysB, e.chatID, msgID, fire)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, added.Result)
+
+	reaction, credited, err := e.sender.RecordBoost(e.ctx, e.chatID, msgID, e.userB, fire, boostInput(3_000_000, time.Now()))
+	require.NoError(t, err)
+	require.True(t, credited)
+	require.EqualValues(t, 1, reaction.Count)
+	require.EqualValues(t, 3_000_000, reaction.BoostUsdMicros)
+
+	for _, recipient := range []*commonpb.UserId{e.userA, e.userB} {
+		e.waitForReactionUpdate(recipient, messagingpb.ReactionUpdate_BOOSTED, msgID.Value, fire, e.userB)
+	}
+
+	for _, keys := range []model.KeyPair{e.keysA, e.keysB} {
+		summary, err := e.getReactionSummaryInChat(keys, e.chatID, msgID)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetReactionSummaryResponse_OK, summary.Result)
+		require.Len(t, summary.Summary.Reactions, 1)
+		require.InDelta(t, 3.0, summary.Summary.Reactions[0].BoostUsd, 1e-9)
+		require.Len(t, summary.Summary.Reactions[0].SampleReactors, 1)
+		require.InDelta(t, 3.0, summary.Summary.Reactions[0].SampleReactors[0].BoostUsd, 1e-9)
+	}
+	summaryB, err := e.getReactionSummaryInChat(e.keysB, e.chatID, msgID)
+	require.NoError(t, err)
+	require.NotNil(t, summaryB.Summary.Reactions[0].SelfReactor)
+	require.InDelta(t, 3.0, summaryB.Summary.Reactions[0].SelfReactor.BoostUsd, 1e-9)
+	summaryA, err := e.getReactionSummaryInChat(e.keysA, e.chatID, msgID)
+	require.NoError(t, err)
+	require.Nil(t, summaryA.Summary.Reactions[0].SelfReactor)
+
+	removed, err := e.removeReactionInChat(e.keysB, e.chatID, msgID, fire)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.RemoveReactionResponse_CANNOT_REMOVE_BOOSTED, removed.Result)
+}
+
 // testServer_Reactions_Boost pins what a recorded boost looks like from the
 // RPCs and the stream: the summary leads with the boosted emoji and carries
 // the totals, the sample and the reactor list put boosters first, the
@@ -5340,9 +5391,9 @@ func testServer_Reactions_Boost(t *testing.T, badges badge.Store, blocklists blo
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const fire, thumbsUp = "🔥", "👍"
 
-	// A group, since boosts are a group's (the intent refuses a DM), and
-	// since a group's self overlay is read off the viewer-keyed row rather
-	// than the sample: the test must go through that path.
+	// A group, since a group's self overlay is read off the viewer-keyed
+	// row rather than the sample: the test must go through that path (a
+	// DM's is testServer_Reactions_BoostDm).
 	chatID := chat.MustGenerateGroupChatID()
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 		ID:           chatID,

@@ -351,8 +351,9 @@ func textVerdict(speaker chat.SpeakerStanding, split *paymentrequestpb.Split) (r
 		}
 		return paymentrequestpb.CreatePaymentRequestResponse_OK, true
 	default:
-		// Only a DM takes optional encryption, and a DM is refused by its ID
-		// before any standing is asked for.
+		// No other mode exists. A DM is refused by its ID before any standing
+		// is asked for; were one to reach here, its pairwise scheme has no
+		// split text scheme, so it is ENCRYPTION_NOT_ALLOWED above.
 		return paymentrequestpb.CreatePaymentRequestResponse_CHAT_NOT_SUPPORTED, false
 	}
 }

@@ -212,6 +212,49 @@ func TestValidateBoostPayouts(t *testing.T) {
 }
 
 // userID is a distinct 16-byte user ID per n.
+func TestDmBoostPayees(t *testing.T) {
+	payer, sender := userID(1), userID(2)
+
+	got, err := DmBoostPayees(payer, sender)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.True(t, sameUser(sender, got[0].UserID))
+	require.EqualValues(t, 10000, got[0].Bps)
+
+	_, err = DmBoostPayees(payer, payer)
+	require.ErrorIs(t, err, ErrBoostOwnMessage)
+	_, err = DmBoostPayees(payer, nil)
+	require.ErrorIs(t, err, ErrBoostNoPayee)
+	_, err = DmBoostPayees(nil, sender)
+	require.ErrorIs(t, err, ErrBoostNoPayer)
+}
+
+func TestValidateDmBoostPayouts(t *testing.T) {
+	payer, sender, stranger := userID(1), userID(2), userID(3)
+	const tolerance = 0.005
+
+	total, err := ValidateDmBoostPayouts(payer, sender, []BoostPayout{{sender, 0.01}}, tolerance)
+	require.NoError(t, err)
+	require.Equal(t, 0.01, total)
+
+	for name, tc := range map[string]struct {
+		sender  *commonpb.UserId
+		payouts []BoostPayout
+		err     error
+	}{
+		"own message":     {payer, []BoostPayout{{payer, 1.00}}, ErrBoostOwnMessage},
+		"stranger paid":   {sender, []BoostPayout{{stranger, 1.00}}, ErrBoostPayoutMismatch},
+		"payer paid":      {sender, []BoostPayout{{payer, 1.00}}, ErrBoostPayoutMismatch},
+		"sender split":    {sender, []BoostPayout{{sender, 0.80}, {sender, 0.20}}, ErrBoostPayoutMismatch},
+		"sender and more": {sender, []BoostPayout{{sender, 0.80}, {stranger, 0.20}}, ErrBoostPayoutMismatch},
+		"no payouts":      {sender, nil, ErrBoostPayoutMismatch},
+		"empty payout":    {sender, []BoostPayout{{sender, 0}}, ErrBoostPayoutEmpty},
+	} {
+		_, err := ValidateDmBoostPayouts(payer, tc.sender, tc.payouts, tolerance)
+		require.ErrorIs(t, err, tc.err, name)
+	}
+}
+
 func userID(n byte) *commonpb.UserId {
 	id := make([]byte, 16)
 	id[15] = n

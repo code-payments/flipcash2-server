@@ -242,7 +242,7 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	if cfg.lobbyLimits != nil {
 		opts = append(opts, chat.WithLobbyLimits(*cfg.lobbyLimits))
 	}
-	hydrator := chat.NewHydrator(log, accounts, blocklist, s, media, messaging, profiles, access.Rules(), teamUserID)
+	hydrator := chat.NewHydrator(log, blocklist, s, media, messaging, profiles, access.Rules(), teamUserID)
 	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, systemMessages, pusher, access, hydrator, userBus, chatBus, cfg.disablePublicGroupRoster, opts...)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
@@ -1915,12 +1915,9 @@ func testServer_GetChat_Dm_NoCreator(t *testing.T, s chat.Store) {
 func testServer_GetChat_Dm_UseE2ee_TeamAccount(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
-	// The Flipcash team account's DMs never carry use_e2ee, even when both
-	// members are staff: the server writes into them on the team's behalf and
-	// holds no keys for it.
+	// The Flipcash team account's DMs never carry use_e2ee: the server writes
+	// into them on the team's behalf and holds no keys for it.
 	chatID := e.putDMWithPeer(chatpb.ChatType_DM, e.teamUserID, at(1))
-	e.accounts.setStaff(e.userID, true)
-	e.accounts.setStaff(e.teamUserID, true)
 
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
@@ -1972,55 +1969,25 @@ func testServer_GetChat_Dm_TeamAccount_NeverSpeak(t *testing.T, s chat.Store) {
 func testServer_GetChat_Dm_UseE2ee(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
-	// use_e2ee is set exactly when both members of a DM are staff, whatever the
-	// DM's type and whichever read serves it, and never on a group.
+	// use_e2ee is set on every DM, whatever its type and whichever read serves
+	// it, and never on a group.
 	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_DM} {
-		peer := model.MustGenerateUserID()
-		chatID := e.putDMWithPeer(chatType, peer, at(1))
+		chatID := e.putDMWithPeer(chatType, model.MustGenerateUserID(), at(1))
 
-		assertUseE2ee := func(want bool) {
-			t.Helper()
-			resp := e.getChat(e.keys, chatID)
-			require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-			require.Equal(t, want, resp.Metadata.UseE2Ee)
+		resp := e.getChat(e.keys, chatID)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+		require.True(t, resp.Metadata.UseE2Ee)
 
-			feed, err := e.getDmFeedOfType(chatType, &commonpb.QueryOptions{})
-			require.NoError(t, err)
-			require.Equal(t, chatpb.GetDmChatFeedResponse_OK, feed.Result)
-			require.Len(t, feed.Chats, 1)
-			require.Equal(t, chatID.Value, feed.Chats[0].ChatId.Value)
-			require.Equal(t, want, feed.Chats[0].UseE2Ee)
-		}
-
-		// Neither member is staff.
-		assertUseE2ee(false)
-
-		// Only the viewer is staff.
-		e.accounts.setStaff(e.userID, true)
-		assertUseE2ee(false)
-
-		// Only the peer is staff.
-		e.accounts.setStaff(e.userID, false)
-		e.accounts.setStaff(peer, true)
-		assertUseE2ee(false)
-
-		// Both are staff: the flag is decided per read, so it appears with no
-		// write to the chat.
-		e.accounts.setStaff(e.userID, true)
-		assertUseE2ee(true)
-
-		// And is withdrawn the same way.
-		e.accounts.setStaff(peer, false)
-		assertUseE2ee(false)
-
-		e.accounts.setStaff(e.userID, false)
+		feed, err := e.getDmFeedOfType(chatType, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Equal(t, chatpb.GetDmChatFeedResponse_OK, feed.Result)
+		require.Len(t, feed.Chats, 1)
+		require.Equal(t, chatID.Value, feed.Chats[0].ChatId.Value)
+		require.True(t, feed.Chats[0].UseE2Ee)
 	}
 
-	// A group of staff members never carries it.
-	other := model.MustGenerateUserID()
-	e.accounts.setStaff(e.userID, true)
-	e.accounts.setStaff(other, true)
-	groupID := e.putGroup("Staff", at(2), other)
+	// A group never carries it.
+	groupID := e.putGroup("Group", at(2), model.MustGenerateUserID())
 	resp := e.getChat(e.keys, groupID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.False(t, resp.Metadata.UseE2Ee)
@@ -3496,7 +3463,6 @@ func testServer_KeyEnvelope_Gates(t *testing.T, s chat.Store) {
 // stands whatever a later call carries, and it is kept when they leave.
 func testServer_KeyEnvelope_Creator(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
-	e.accounts.setStaff(e.userID, true)
 
 	created := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
 	require.Equal(t, chatpb.StartChatResponse_OK, created.Result)
@@ -3945,11 +3911,10 @@ func testServer_StartChat_ModerationFailureIsInternal(t *testing.T, s chat.Store
 	require.Empty(t, groups)
 }
 
-// testServer_StartChat_PrivateGroup pins the creation of a private group: only
-// a staff user may create one while private groups are being built, it has no
-// rules to satisfy, and it is otherwise created as any group is — title
-// moderated, the creator its only member, announced to their devices, and
-// retry-safe.
+// testServer_StartChat_PrivateGroup pins the creation of a private group: any
+// user may create one, it has no rules to satisfy, and it is otherwise created
+// as any group is — title moderated, the creator its only member, announced to
+// their devices, and retry-safe.
 func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.profiles.displayNames[string(e.userID.Value)] = "Founder"
@@ -3961,16 +3926,10 @@ func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
 		return groups
 	}
 
-	// Anyone but a staff user is refused, and nothing is written.
-	resp := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
-	require.Equal(t, chatpb.StartChatResponse_DENIED, resp.Result)
-	require.Nil(t, resp.Chat)
-	require.Empty(t, groups())
-
-	// A staff user creates one holding nothing: there is no rule to satisfy.
-	e.accounts.setStaff(e.userID, true)
+	// A user who is not staff and holds nothing creates one: there is no rule
+	// to satisfy.
 	key := newIdempotencyKey()
-	resp = e.mustStartPrivateGroupChat(e.keys, key, privateGroupParams("Sunday Hikers"))
+	resp := e.mustStartPrivateGroupChat(e.keys, key, privateGroupParams("Sunday Hikers"))
 	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
 	md := resp.Chat
 	require.NotNil(t, md)
@@ -4005,8 +3964,7 @@ func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
 	require.True(t, toCreator[0].GetMemberJoined().GetMetadata().GetIsPrivate())
 
 	// A retry names the same group and is answered from its record, whatever
-	// it carries and whether or not the caller is still staff.
-	e.accounts.setStaff(e.userID, false)
+	// it carries.
 	again := e.mustStartPrivateGroupChat(e.keys, key, privateGroupParams("Renamed"))
 	require.Equal(t, chatpb.StartChatResponse_OK, again.Result)
 	require.Equal(t, md.ChatId.Value, again.Chat.ChatId.Value)
@@ -4019,7 +3977,6 @@ func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
 	require.Len(t, groups(), 1)
 
 	// Its title is moderated like any group's.
-	e.accounts.setStaff(e.userID, true)
 	e.moderator.titleFlagged = true
 	e.moderator.titleCategories = []string{"gibberish", "solicitation"}
 	resp = e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("DM for signals"))
@@ -4221,7 +4178,6 @@ func testServer_PrivateGroup_Visibility(t *testing.T, s chat.Store) {
 // group, and that nobody speaks in one, its creator included.
 func testServer_PrivateGroup_Membership(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
-	e.accounts.setStaff(e.userID, true)
 
 	created := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
 	require.Equal(t, chatpb.StartChatResponse_OK, created.Result)
@@ -5147,7 +5103,6 @@ func testServer_StartChat_WithDescriptionAndCover(t *testing.T, s chat.Store) {
 	require.NoError(t, protoutil.ProtoEqualError(md.CoverPicture, announced.GetCoverPicture()))
 
 	// A private group takes both the same way.
-	e.accounts.setStaff(e.userID, true)
 	privateCover := &blobpb.BlobId{Value: []byte("group-cover-0002")}
 	e.media.setAttachable(privateCover)
 	privateParams := privateGroupParams("Private Described")
@@ -6280,7 +6235,6 @@ func testServer_Lobby_Deny(t *testing.T, s chat.Store) {
 // join.
 func testServer_PrivateGroup_UserJoinedMessages(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
-	e.accounts.setStaff(e.userID, true)
 
 	requireJoin := func(call userJoinedCall, userID, admittedBy *commonpb.UserId, rosterVersion uint64) {
 		t.Helper()

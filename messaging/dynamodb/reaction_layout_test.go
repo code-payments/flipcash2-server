@@ -23,7 +23,7 @@ import (
 
 // TestMessaging_DynamoDBStore_SelfReactionLayout pins the per-chat-type write
 // the shared suite cannot see: a group reaction lands a viewer-keyed row in
-// message_self_reactions and a DM reaction lands none. The DM's overlay is
+// message_self_reactions and a DM reaction, plain or boosted, lands none. The DM's overlay is
 // answered from the sample, so the row would be a transactional write nothing
 // reads; a regression that restores it would pass every behavioural test and
 // silently add a third item to the commonest reaction write.
@@ -69,6 +69,23 @@ func TestMessaging_DynamoDBStore_SelfReactionLayout(t *testing.T) {
 	dmID := &commonpb.ChatId{Value: make([]byte, 32)}
 	dmMsg := react(dmID)
 	require.Empty(t, selfRows(dmID), "a DM reaction writes no viewer-keyed row")
+
+	// Nor does a DM boost, whether it backs a held reaction or adds one. A
+	// boosted reaction cannot be removed, so it is on a message of its own.
+	boostClientID := &messagingpb.ClientMessageId{Value: make([]byte, messaging.ClientMessageIDSize)}
+	boostClientID.Value[0] = 1
+	boostMsg, _, err := s.PutMessage(ctx, dmID, user, nil, ts, boostClientID, true)
+	require.NoError(t, err)
+	_, created, _, err := s.AddReaction(ctx, dmID, boostMsg.ID, user, "👍", ts)
+	require.NoError(t, err)
+	require.True(t, created)
+	for _, emoji := range []string{"👍", "🔥"} {
+		boost := messaging.BoostInput{IntentID: &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()}, Amount: &commonpb.CryptoPaymentAmount{Quarks: 1_000_000}, UsdMicros: 1_000_000, Ts: ts}
+		_, credited, _, err := s.AddBoost(ctx, dmID, boostMsg.ID, user, emoji, boost)
+		require.NoError(t, err)
+		require.True(t, credited)
+	}
+	require.Empty(t, selfRows(dmID), "a DM boost writes no viewer-keyed row")
 
 	// Both removals are whole transactions; the group's takes its row with it.
 	_, removed, err := s.RemoveReaction(ctx, groupID, groupMsg, user, "👍")

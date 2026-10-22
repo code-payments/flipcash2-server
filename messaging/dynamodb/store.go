@@ -2188,9 +2188,6 @@ func (s *store) AddBoost(
 	emoji string,
 	boost messaging.BoostInput,
 ) (*messaging.Reaction, bool, bool, error) {
-	if !chat.IsGroupChatID(chatID) {
-		return nil, false, false, messaging.ErrBoostGroupOnly
-	}
 	if boost.IntentID == nil || len(boost.IntentID.Value) == 0 {
 		return nil, false, false, errors.New("boost has no intent id")
 	}
@@ -2254,9 +2251,8 @@ func (s *store) AddBoost(
 			return nil, false, false, err
 		}
 		items = append(items, record)
-		{
-			// The viewer-keyed copy (see the table comment): every boost is a
-			// group's, refused above otherwise, so there is always one.
+		if chat.IsGroupChatID(chatID) {
+			// The viewer-keyed copy, groups only (see the table comment).
 			// Unconditioned: it exists exactly when the reactor row does, and
 			// [0] already decides that.
 			items = append(items, types.TransactWriteItem{Put: &types.Put{

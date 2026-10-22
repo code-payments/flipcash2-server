@@ -311,7 +311,7 @@ func TestAccess_Speaking(t *testing.T) {
 		require.NoError(t, err)
 		return s
 	}
-	dmSpeaking := SpeakerStanding{CanSpeak: true, Encryption: EncryptionOptional, Scheme: messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305}
+	dmSpeaking := SpeakerStanding{CanSpeak: true, Encryption: EncryptionRequired, Scheme: messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305}
 	privateSpeaking := SpeakerStanding{CanSpeak: true, Encryption: EncryptionRequired, Scheme: messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305}
 
 	// A DM, with no read beyond membership.
@@ -922,7 +922,7 @@ func TestAccess_Governance(t *testing.T) {
 
 	refused := SpeakerStanding{}
 	plaintext := SpeakerStanding{CanSpeak: true}
-	pairwise := SpeakerStanding{CanSpeak: true, Encryption: EncryptionOptional, Scheme: messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305}
+	pairwise := SpeakerStanding{CanSpeak: true, Encryption: EncryptionRequired, Scheme: messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305}
 	chatKey := SpeakerStanding{CanSpeak: true, Encryption: EncryptionRequired, Scheme: messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305}
 
 	type viewer struct {

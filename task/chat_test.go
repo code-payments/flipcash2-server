@@ -792,6 +792,46 @@ func TestExecutor_RecordReactionBoost(t *testing.T) {
 	requireBoost(1, 5_000_000)
 }
 
+// A DM boost pays the other member for their message, and is recorded as a
+// group's is: once, crediting the whole payment.
+func TestExecutor_RecordReactionBoost_Dm(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	senderUserID, senderKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, payerUserID)
+	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+		ID:           dmChatID,
+		Type:         chatpb.ChatType_DM,
+		Members:      []*commonpb.UserId{senderUserID, payerUserID},
+		LastActivity: time.Now(),
+	}))
+	msg := e.putText(t, dmChatID, senderUserID)
+	_, _, _, err := e.messages.AddReaction(e.ctx, dmChatID, msg.ID, payerUserID, "🔥", time.Now())
+	require.NoError(t, err)
+
+	intentRecord, _ := e.pay(t, reactionBoostMetadata(dmChatID, msg.ID, "🔥"), payerKeys, senderKeys)
+	require.NoError(t, e.integration.AllowCreation(e.ctx, intentRecord, nil, nil))
+	tasks, err := e.integration.GetTasksToSchedule(e.ctx, intentRecord)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, intent.TaskTypeRecordReactionBoost, tasks[0].Type)
+
+	for range 2 {
+		require.NoError(t, e.executor.Execute(e.ctx, tasks[0]))
+
+		summary, err := e.messages.GetReactionSummary(e.ctx, dmChatID, msg.ID)
+		require.NoError(t, err)
+		require.Len(t, summary, 1)
+		assert.EqualValues(t, 1, summary[0].Count)
+		assert.EqualValues(t, 2_500_000, summary[0].BoostUsdMicros)
+		require.Len(t, summary[0].SampleReactors, 1)
+		assert.True(t, proto.Equal(payerUserID, summary[0].SampleReactors[0].UserID))
+		assert.EqualValues(t, 2_500_000, summary[0].SampleReactors[0].BoostUsdMicros)
+	}
+}
+
 // A boost that pays both the message's sender and the group's creator is a
 // multi payment, and the boost credits the whole of it, the creator's cut
 // included.
@@ -916,21 +956,24 @@ func TestExecutor_RecordReactionBoost_PrivateGroup(t *testing.T) {
 	}
 }
 
-// A boost task only ever records a reaction boost in a group: one that
-// references any other payment, or a chat that is not a group, fails rather
-// than recording.
+// A boost task only ever records a reaction boost in a group or a DM: one
+// that references any other payment, or a chat ID that is neither, fails
+// rather than recording.
 func TestExecutor_RecordReactionBoost_Mismatched(t *testing.T) {
 	e := newGroupPaymentEnv(t)
 
-	payerUserID, payerKeys := e.bindUser(t)
-	recipientUserID, recipientKeys := e.bindUser(t)
-	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, payerUserID, recipientUserID)
+	_, payerKeys := e.bindUser(t)
+	_, recipientKeys := e.bindUser(t)
 
 	groupPayment, _ := e.pay(t, groupPaymentMetadata(chat.MustGenerateGroupChatID()), payerKeys, recipientKeys)
 	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewRecordReactionBoostTask(groupPayment)), "not a reaction boost")
 
-	boostInDm, _ := e.pay(t, reactionBoostMetadata(dmChatID, &messagingpb.MessageId{Value: 1}, "🔥"), payerKeys, recipientKeys)
-	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewRecordReactionBoostTask(boostInDm)), "chat id is not a group")
+	malformedID := &commonpb.ChatId{Value: make([]byte, 20)}
+	malformed, _ := e.pay(t, reactionBoostMetadata(malformedID, &messagingpb.MessageId{Value: 1}, "🔥"), payerKeys, recipientKeys)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewRecordReactionBoostTask(malformed)), "not a group or a dm")
+	malformedSummary, err := e.messages.GetReactionSummary(e.ctx, malformedID, &messagingpb.MessageId{Value: 1})
+	require.NoError(t, err)
+	require.Empty(t, malformedSummary)
 
 	// And a group payment task refuses a boost.
 	groupID := chat.MustGenerateGroupChatID()

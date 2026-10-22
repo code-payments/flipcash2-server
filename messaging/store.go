@@ -61,12 +61,6 @@ var ErrReactionBoosted = errors.New("reaction is boosted and cannot be removed")
 // rather than recorded as a boost that looks plain.
 var ErrBoostEmpty = errors.New("boost is worth nothing")
 
-// ErrBoostGroupOnly is returned by Store.AddBoost for a DM: a boost pays the
-// group's creator (see boost.go), so there is no such thing as a boost in a
-// DM, and the write is refused before anything is read rather than leaving a
-// reaction no one can remove with no one paid for it.
-var ErrBoostGroupOnly = errors.New("boosts are recorded for groups only")
-
 // MessageRef identifies a single message within a chat. It is the unit of a
 // cross-chat batch read (see Store.GetMessagesByRefs) — e.g. one ref per chat to
 // fetch every chat's last message for the feed.
@@ -281,10 +275,7 @@ type Store interface {
 
 	// GetMessage returns a single message by ID, or ErrMessageNotFound. The read
 	// is strongly consistent: it reflects every send, edit and delete that
-	// completed before it. EditMessage's callers judge the edit against it — an
-	// encrypted message may not be downgraded to plaintext — and a lagging read
-	// could miss an upgrade to encrypted that the caller's expected
-	// event_sequence already names.
+	// completed before it.
 	GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*Message, error)
 
 	// MessageExists reports whether a message exists in the chat. It is a
@@ -440,11 +431,12 @@ type Store interface {
 	// created whether it added the reaction (false when userID had already
 	// reacted, and on a replay).
 	//
-	// It is for groups only: a DM's ID is ErrBoostGroupOnly, and
-	// boost.UsdMicros must be positive, a boost worth nothing being
-	// ErrBoostEmpty; both are refused before the intent ID is looked at and
-	// record nothing. boost.IntentID and boost.Amount must be set; a boost
-	// without either is an error, and nothing is written.
+	// It records a boost in a DM as in a group, except that a DM keeps no
+	// per-viewer row of it (see GetSelfReactions). boost.UsdMicros must be
+	// positive, a boost worth nothing being ErrBoostEmpty, refused before the
+	// intent ID is looked at and recording nothing. boost.IntentID and
+	// boost.Amount must be set; a boost without either is an error, and
+	// nothing is written.
 	//
 	// A boost adds its reaction whatever the message's distinct-emoji count:
 	// the money has been paid, so the cap that AddReaction enforces is not

@@ -21,7 +21,7 @@ func TestTextVerdict(t *testing.T) {
 	}
 	public := chat.SpeakerStanding{CanSpeak: true, Encryption: chat.EncryptionNone}
 	private := chat.SpeakerStanding{CanSpeak: true, Encryption: chat.EncryptionRequired, Scheme: messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305}
-	dm := chat.SpeakerStanding{CanSpeak: true, Encryption: chat.EncryptionOptional, Scheme: messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305}
+	dm := chat.SpeakerStanding{CanSpeak: true, Encryption: chat.EncryptionRequired, Scheme: messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305}
 
 	for _, tc := range []struct {
 		name    string
@@ -35,7 +35,7 @@ func TestTextVerdict(t *testing.T) {
 		{"private plaintext", private, plaintext, paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_REQUIRED},
 		{"private wrong scheme", private, encrypted(paymentrequestpb.EncryptedPaymentRequestText_UNKNOWN), paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_NOT_ALLOWED},
 		{"chat scheme with no request scheme", chat.SpeakerStanding{CanSpeak: true, Encryption: chat.EncryptionRequired}, encrypted(paymentrequestpb.EncryptedPaymentRequestText_CHAT_KEY_XCHACHA20POLY1305), paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_NOT_ALLOWED},
-		{"dm", dm, plaintext, paymentrequestpb.CreatePaymentRequestResponse_CHAT_NOT_SUPPORTED},
+		{"dm", dm, encrypted(paymentrequestpb.EncryptedPaymentRequestText_CHAT_KEY_XCHACHA20POLY1305), paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_NOT_ALLOWED},
 	} {
 		result, ok := textVerdict(tc.speaker, tc.split)
 		require.Equal(t, tc.want, result, tc.name)

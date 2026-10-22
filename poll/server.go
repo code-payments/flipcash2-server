@@ -211,8 +211,10 @@ func (s *Server) CreatePoll(ctx context.Context, req *pollpb.CreatePollRequest) 
 		CreatorID:  userID,
 		Definition: proto.Clone(definition).(*pollpb.PollDefinition),
 		CreatedAt:  now,
-		// Only a keyed private group takes encrypted content, and its polls are
-		// live from creation (see Poll.Live).
+		// A DM, which also takes encrypted content alone, is refused by its ID
+		// above, so the chat is a keyed private group exactly when it takes
+		// encrypted content, and its polls are live from creation (see
+		// Poll.Live).
 		Live:   speaker.Encryption == chat.EncryptionRequired,
 		Status: StatusOpen,
 	}
@@ -264,7 +266,7 @@ func (s *Server) replayCreatePoll(ctx context.Context, log *zap.Logger, userID *
 // textVerdict judges a definition's text against what the chat takes, as the
 // speaker's standing says (see chat.SpeakerStanding): a public group takes
 // plaintext alone, and a keyed private group text encrypted under its scheme
-// alone. ok is false, with the result to answer, when the chat does not take
+// alone (a DM never gets here; see CreatePoll). ok is false, with the result to answer, when the chat does not take
 // the text.
 func textVerdict(speaker chat.SpeakerStanding, definition *pollpb.PollDefinition) (result pollpb.CreatePollResponse_Result, ok bool) {
 	switch speaker.Encryption {
@@ -283,8 +285,9 @@ func textVerdict(speaker chat.SpeakerStanding, definition *pollpb.PollDefinition
 		}
 		return pollpb.CreatePollResponse_OK, true
 	default:
-		// Only a DM takes optional encryption, and a DM is refused by its ID
-		// before any standing is asked for.
+		// No other mode exists. A DM is refused by its ID before any standing
+		// is asked for; were one to reach here, its pairwise scheme has no
+		// poll text scheme, so it is ENCRYPTION_NOT_ALLOWED above.
 		return pollpb.CreatePollResponse_CHAT_NOT_SUPPORTED, false
 	}
 }

@@ -3496,7 +3496,6 @@ func testServer_KeyEnvelope_Gates(t *testing.T, s chat.Store) {
 // stands whatever a later call carries, and it is kept when they leave.
 func testServer_KeyEnvelope_Creator(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
-	e.accounts.setStaff(e.userID, true)
 
 	created := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
 	require.Equal(t, chatpb.StartChatResponse_OK, created.Result)
@@ -3945,11 +3944,10 @@ func testServer_StartChat_ModerationFailureIsInternal(t *testing.T, s chat.Store
 	require.Empty(t, groups)
 }
 
-// testServer_StartChat_PrivateGroup pins the creation of a private group: only
-// a staff user may create one while private groups are being built, it has no
-// rules to satisfy, and it is otherwise created as any group is — title
-// moderated, the creator its only member, announced to their devices, and
-// retry-safe.
+// testServer_StartChat_PrivateGroup pins the creation of a private group: any
+// user may create one, it has no rules to satisfy, and it is otherwise created
+// as any group is — title moderated, the creator its only member, announced to
+// their devices, and retry-safe.
 func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.profiles.displayNames[string(e.userID.Value)] = "Founder"
@@ -3961,16 +3959,10 @@ func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
 		return groups
 	}
 
-	// Anyone but a staff user is refused, and nothing is written.
-	resp := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
-	require.Equal(t, chatpb.StartChatResponse_DENIED, resp.Result)
-	require.Nil(t, resp.Chat)
-	require.Empty(t, groups())
-
-	// A staff user creates one holding nothing: there is no rule to satisfy.
-	e.accounts.setStaff(e.userID, true)
+	// A user who is not staff and holds nothing creates one: there is no rule
+	// to satisfy.
 	key := newIdempotencyKey()
-	resp = e.mustStartPrivateGroupChat(e.keys, key, privateGroupParams("Sunday Hikers"))
+	resp := e.mustStartPrivateGroupChat(e.keys, key, privateGroupParams("Sunday Hikers"))
 	require.Equal(t, chatpb.StartChatResponse_OK, resp.Result)
 	md := resp.Chat
 	require.NotNil(t, md)
@@ -4005,8 +3997,7 @@ func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
 	require.True(t, toCreator[0].GetMemberJoined().GetMetadata().GetIsPrivate())
 
 	// A retry names the same group and is answered from its record, whatever
-	// it carries and whether or not the caller is still staff.
-	e.accounts.setStaff(e.userID, false)
+	// it carries.
 	again := e.mustStartPrivateGroupChat(e.keys, key, privateGroupParams("Renamed"))
 	require.Equal(t, chatpb.StartChatResponse_OK, again.Result)
 	require.Equal(t, md.ChatId.Value, again.Chat.ChatId.Value)
@@ -4019,7 +4010,6 @@ func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
 	require.Len(t, groups(), 1)
 
 	// Its title is moderated like any group's.
-	e.accounts.setStaff(e.userID, true)
 	e.moderator.titleFlagged = true
 	e.moderator.titleCategories = []string{"gibberish", "solicitation"}
 	resp = e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("DM for signals"))
@@ -4221,7 +4211,6 @@ func testServer_PrivateGroup_Visibility(t *testing.T, s chat.Store) {
 // group, and that nobody speaks in one, its creator included.
 func testServer_PrivateGroup_Membership(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
-	e.accounts.setStaff(e.userID, true)
 
 	created := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
 	require.Equal(t, chatpb.StartChatResponse_OK, created.Result)
@@ -5147,7 +5136,6 @@ func testServer_StartChat_WithDescriptionAndCover(t *testing.T, s chat.Store) {
 	require.NoError(t, protoutil.ProtoEqualError(md.CoverPicture, announced.GetCoverPicture()))
 
 	// A private group takes both the same way.
-	e.accounts.setStaff(e.userID, true)
 	privateCover := &blobpb.BlobId{Value: []byte("group-cover-0002")}
 	e.media.setAttachable(privateCover)
 	privateParams := privateGroupParams("Private Described")
@@ -6280,7 +6268,6 @@ func testServer_Lobby_Deny(t *testing.T, s chat.Store) {
 // join.
 func testServer_PrivateGroup_UserJoinedMessages(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
-	e.accounts.setStaff(e.userID, true)
 
 	requireJoin := func(call userJoinedCall, userID, admittedBy *commonpb.UserId, rosterVersion uint64) {
 		t.Helper()

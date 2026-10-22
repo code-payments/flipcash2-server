@@ -53,11 +53,9 @@ import (
 // so they insert the new chat without a refetch. There is no one else to
 // tell.
 //
-// A private group (see Chat.IsPrivate) is created the same way, with two
-// differences. It carries no rules, so there are none to validate or satisfy.
-// And while private groups are being built, only a staff user may create one
-// (DENIED otherwise, see canCreatePrivateGroup). What is created is a group
-// without a key: the creator's client stores the chat key's envelope as a
+// A private group (see Chat.IsPrivate) is created the same way, except that it
+// carries no rules, so there are none to validate or satisfy. What is created
+// is a group without a key: the creator's client stores the chat key's envelope as a
 // second step (see SetKeyEnvelope), since the envelope is bound to the chat
 // ID this RPC returns, and until it has, nothing happens in the group (see
 // Chat.IsPrivate).
@@ -128,16 +126,7 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 	}
 
 	var creationRules CreationRules
-	if isPrivate {
-		allowed, err := s.canCreatePrivateGroup(ctx, userID)
-		if err != nil {
-			log.With(zap.Error(err)).Warn("Failure checking private group creation")
-			return nil, status.Error(codes.Internal, "")
-		}
-		if !allowed {
-			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_DENIED}, nil
-		}
-	} else {
+	if !isPrivate {
 		creationRules, err = RulesFromProto(rules)
 		if err != nil {
 			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_INVALID_RULES}, nil
@@ -282,14 +271,6 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		Result: chatpb.StartChatResponse_OK,
 		Chat:   md,
 	}, nil
-}
-
-// canCreatePrivateGroup reports whether userID may create a private group:
-// today, only a staff user. It is a transitional gate, like use_e2ee's (see
-// useE2ee): private groups were built in steps behind it, and clients have
-// not shipped them. Opening creation to everyone is removing this check.
-func (s *Server) canCreatePrivateGroup(ctx context.Context, userID *commonpb.UserId) (bool, error) {
-	return s.accounts.IsStaff(ctx, userID)
 }
 
 // replayStartChat answers a StartChat whose group c already exists: an earlier

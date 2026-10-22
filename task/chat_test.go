@@ -133,10 +133,10 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	cash := msgs[0].Content[0].GetCash()
 	require.NotNil(t, cash)
 	assert.Equal(t, rawIntentID, cash.IntentId.GetValue())
-	assert.EqualValues(t, 10_000, cash.Amount.GetQuarks())
-	assert.Equal(t, "usd", cash.Amount.GetCurrency())
-	assert.EqualValues(t, 1.0, cash.Amount.GetNativeAmount())
-	assert.True(t, proto.Equal(recipientUserID, cash.GetReceiver()))
+	assert.EqualValues(t, 10_000, cash.TotalAmount.GetQuarks())
+	assert.Equal(t, "usd", cash.TotalAmount.GetCurrency())
+	assert.EqualValues(t, 1.0, cash.TotalAmount.GetNativeAmount())
+	assert.True(t, proto.Equal(recipientUserID, cash.GetSingleReceiver()))
 	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetVerb())
 
 	// Tasks are delivered at least once, so re-execution must not duplicate
@@ -299,8 +299,8 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	cash := msgs[0].Content[0].GetCash()
 	require.NotNil(t, cash)
 	assert.Equal(t, rawIntentID, cash.IntentId.GetValue())
-	assert.EqualValues(t, 10_000, cash.Amount.GetQuarks())
-	assert.True(t, proto.Equal(recipientUserID, cash.GetReceiver()))
+	assert.EqualValues(t, 10_000, cash.TotalAmount.GetQuarks())
+	assert.True(t, proto.Equal(recipientUserID, cash.GetSingleReceiver()))
 	assert.Equal(t, expectedVerb, cash.GetVerb())
 
 	// Tasks are delivered at least once, so re-execution must not duplicate
@@ -496,10 +496,10 @@ func TestExecutor_SendGroupPaymentMessage(t *testing.T) {
 	cash := msgs[0].Content[0].GetCash()
 	require.NotNil(t, cash)
 	assert.Equal(t, rawIntentID, cash.IntentId.GetValue())
-	assert.EqualValues(t, 25_000, cash.Amount.GetQuarks())
-	assert.Equal(t, "usd", cash.Amount.GetCurrency())
-	assert.EqualValues(t, 2.5, cash.Amount.GetNativeAmount())
-	assert.True(t, proto.Equal(recipientUserID, cash.GetReceiver()))
+	assert.EqualValues(t, 25_000, cash.TotalAmount.GetQuarks())
+	assert.Equal(t, "usd", cash.TotalAmount.GetCurrency())
+	assert.EqualValues(t, 2.5, cash.TotalAmount.GetNativeAmount())
+	assert.True(t, proto.Equal(recipientUserID, cash.GetSingleReceiver()))
 	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetVerb())
 
 	// Tasks are delivered at least once, so re-execution must not duplicate
@@ -527,7 +527,124 @@ func TestExecutor_SendGroupPaymentMessage(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
 	require.True(t, proto.Equal(payerUserID, msgs[1].SenderID))
-	assert.True(t, proto.Equal(recipientUserID, msgs[1].Content[0].GetCash().GetReceiver()))
+	assert.True(t, proto.Equal(recipientUserID, msgs[1].Content[0].GetCash().GetSingleReceiver()))
+}
+
+// A group payment to several members at once posts one cash message listing
+// every recipient with their part, in the payment's order, with the whole
+// payment as its total.
+func TestExecutor_SendGroupPaymentMessage_MultiPayment(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	payerUserID, payerKeys := e.bindUser(t)
+	e.accounts.staff[string(payerUserID.Value)] = true
+	recipient1UserID, recipient1Keys := e.bindUser(t)
+	recipient2UserID, recipient2Keys := e.bindUser(t)
+	recipient3UserID, recipient3Keys := e.bindUser(t)
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Title:        "Group",
+		CreatorID:    payerUserID,
+		Members:      []*commonpb.UserId{payerUserID, recipient1UserID, recipient2UserID, recipient3UserID},
+		LastActivity: time.Now(),
+	}))
+
+	// $1.00, $2.50 and $0.50: $4.00 in all.
+	intentRecord := e.multiPay(t, groupPaymentMetadata(groupID), payerKeys,
+		multiPayment{to: recipient2Keys, quarks: 10_000},
+		multiPayment{to: recipient1Keys, quarks: 25_000},
+		multiPayment{to: recipient3Keys, quarks: 5_000},
+	)
+	require.NoError(t, e.integration.AllowCreation(e.ctx, intentRecord, nil, nil))
+
+	tasks, err := e.integration.GetTasksToSchedule(e.ctx, intentRecord)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, intent.TaskTypeSendGroupPaymentMessage, tasks[0].Type)
+
+	require.NoError(t, e.executor.Execute(e.ctx, tasks[0]))
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Len(t, msgs[0].Content, 1)
+	require.True(t, proto.Equal(payerUserID, msgs[0].SenderID))
+
+	cash := msgs[0].Content[0].GetCash()
+	require.NotNil(t, cash)
+	rawIntentID, err := base58.Decode(intentRecord.IntentId)
+	require.NoError(t, err)
+	assert.Equal(t, rawIntentID, cash.IntentId.GetValue())
+	assert.EqualValues(t, 40_000, cash.TotalAmount.GetQuarks())
+	assert.Equal(t, "usd", cash.TotalAmount.GetCurrency())
+	assert.InDelta(t, 4.0, cash.TotalAmount.GetNativeAmount(), 1e-9)
+	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetVerb())
+	assert.Nil(t, cash.GetSingleReceiver())
+
+	items := cash.GetMultiReceiver().GetItems()
+	require.Len(t, items, 3)
+	for j, expected := range []struct {
+		userID *commonpb.UserId
+		usd    float64
+		quarks uint64
+	}{
+		{recipient2UserID, 1.0, 10_000},
+		{recipient1UserID, 2.5, 25_000},
+		{recipient3UserID, 0.5, 5_000},
+	} {
+		assert.True(t, proto.Equal(expected.userID, items[j].GetReceiver()), j)
+		assert.InDelta(t, expected.usd, items[j].GetNativeAmount(), 1e-9, j)
+		assert.EqualValues(t, expected.quarks, items[j].GetQuarks(), j)
+	}
+	require.NoError(t, cash.ValidateAll())
+
+	// Tasks are delivered at least once, so re-execution must not duplicate
+	// the message.
+	require.NoError(t, e.executor.Execute(e.ctx, tasks[0]))
+	msgs, err = e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+}
+
+// A payment message task fails, to be retried, rather than send a message it
+// cannot make whole: a DM payment task for a payment to several people, or a
+// group payment task naming a recipient who is not a Flipcash user.
+func TestExecutor_SendPaymentMessage_InvalidRecipients(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	payerUserID, payerKeys := e.bindUser(t)
+	recipient1UserID, recipient1Keys := e.bindUser(t)
+	_, recipient2Keys := e.bindUser(t)
+
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, payerUserID, recipient1UserID)
+	dmMultiPayment := e.multiPay(t, &intentpb.ChatMetadata{
+		ChatId: dmChatID,
+		Type: &intentpb.ChatMetadata_DmPayment_{
+			DmPayment: &intentpb.ChatMetadata_DmPayment{Action: intentpb.PaymentAction_SEND},
+		},
+	}, payerKeys,
+		multiPayment{to: recipient1Keys, quarks: 10_000},
+		multiPayment{to: recipient2Keys, quarks: 10_000},
+	)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewSendDmPaymentMessageTask(dmMultiPayment)), "dm payment has 2 recipients")
+
+	msgs, err := e.messages.GetMessages(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+
+	groupID := chat.MustGenerateGroupChatID()
+	toStranger := e.multiPay(t, groupPaymentMetadata(groupID), payerKeys,
+		multiPayment{to: recipient1Keys, quarks: 10_000},
+		multiPayment{to: model.MustGenerateKeyPair(), quarks: 10_000},
+	)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewSendGroupPaymentMessageTask(toStranger)), "is not a flipcash user")
+
+	msgs, err = e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Empty(t, msgs)
 }
 
 // A group payment task only ever sends a group payment into a group: one that

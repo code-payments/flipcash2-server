@@ -169,17 +169,20 @@ func TestChatMessagePush_Cash(t *testing.T) {
 
 	// The core mint's name needs no lookup, so no OCP data provider either.
 	cashMessage := func(verb messagingpb.CashContent_Verb, receiver *commonpb.UserId) *messagingpb.Message {
-		return testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Cash{Cash: &messagingpb.CashContent{
+		cash := &messagingpb.CashContent{
 			IntentId: &commonpb.IntentId{Value: bytes.Repeat([]byte{6}, 32)},
-			Amount: &commonpb.CryptoPaymentAmount{
+			TotalAmount: &commonpb.CryptoPaymentAmount{
 				Currency:     "usd",
 				NativeAmount: 2.5,
 				Quarks:       2_500_000,
 				Mint:         &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
 			},
-			Receiver: receiver,
-			Verb:     verb,
-		}}})
+			Verb: verb,
+		}
+		if receiver != nil {
+			cash.Recipient = &messagingpb.CashContent_SingleReceiver{SingleReceiver: receiver}
+		}
+		return testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Cash{Cash: cash}})
 	}
 	amount := "$2.50 of " + ocp_common.CoreMintName
 
@@ -202,9 +205,12 @@ func TestChatMessagePush_Cash(t *testing.T) {
 		require.Equal(t, "Sunday Hikers", group.title)
 		require.Equal(t, "Alice "+tc.groupVerb+" Bob "+amount, group.body)
 
-		receiver, err := BuildGroupChatReceiverPush(ctx, nil, groupID, message, senderID, "Alice", "Sunday Hikers")
+		receivers, err := BuildGroupChatReceiverPushes(ctx, nil, groupID, message, senderID, "Alice", "Sunday Hikers")
 		require.NoError(t, err)
-		require.NotNil(t, receiver)
+		require.Len(t, receivers, 1)
+		require.Len(t, receivers[0].Receivers, 1)
+		require.True(t, proto.Equal(receiverID, receivers[0].Receivers[0]))
+		receiver := receivers[0].Push
 		require.Equal(t, "Sunday Hikers", receiver.title)
 		require.Equal(t, "Alice "+tc.groupVerb+" you "+amount, receiver.body)
 		require.True(t, proto.Equal(group.payload, receiver.payload))
@@ -216,14 +222,14 @@ func TestChatMessagePush_Cash(t *testing.T) {
 	}
 
 	// No receiver push for cash naming no receiver, nor for anything else.
-	none, err := BuildGroupChatReceiverPush(ctx, nil, groupID, cashMessage(messagingpb.CashContent_SENT, nil), senderID, "Alice", "Sunday Hikers")
+	none, err := BuildGroupChatReceiverPushes(ctx, nil, groupID, cashMessage(messagingpb.CashContent_SENT, nil), senderID, "Alice", "Sunday Hikers")
 	require.NoError(t, err)
-	require.Nil(t, none)
-	none, err = BuildGroupChatReceiverPush(ctx, nil, groupID, testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Text{
+	require.Empty(t, none)
+	none, err = BuildGroupChatReceiverPushes(ctx, nil, groupID, testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Text{
 		Text: &messagingpb.TextContent{Text: "hello"},
 	}}), senderID, "Alice", "Sunday Hikers")
 	require.NoError(t, err)
-	require.Nil(t, none)
+	require.Empty(t, none)
 
 	// A receiver name is ignored for anything but cash.
 	text, err := BuildGroupChatPush(ctx, nil, groupID, testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Text{
@@ -231,6 +237,66 @@ func TestChatMessagePush_Cash(t *testing.T) {
 	}}), senderID, "Alice", "Bob", "Sunday Hikers")
 	require.NoError(t, err)
 	require.Equal(t, "Alice: hello", text.body)
+}
+
+// TestChatMessagePush_MultiCash: a group cash message paying several members
+// tells everyone else the total and how many were paid, naming no one, and
+// tells each receiver their own part. Receivers whose part reads the same
+// share one push, in the order the first of them appears. Every push shares
+// the title and the payload.
+func TestChatMessagePush_MultiCash(t *testing.T) {
+	ctx := context.Background()
+	groupID := &commonpb.ChatId{Value: bytes.Repeat([]byte{4}, 16)}
+	senderID := &commonpb.UserId{Value: bytes.Repeat([]byte{2}, 16)}
+	receiver1 := &commonpb.UserId{Value: bytes.Repeat([]byte{5}, 16)}
+	receiver2 := &commonpb.UserId{Value: bytes.Repeat([]byte{6}, 16)}
+	receiver3 := &commonpb.UserId{Value: bytes.Repeat([]byte{7}, 16)}
+
+	// $1.50 to the first and third, $1.00 to the second: $4.00 in all. The
+	// core mint's name needs no lookup, so no OCP data provider either.
+	message := testChatMessage(&messagingpb.Content{Type: &messagingpb.Content_Cash{Cash: &messagingpb.CashContent{
+		IntentId: &commonpb.IntentId{Value: bytes.Repeat([]byte{8}, 32)},
+		TotalAmount: &commonpb.CryptoPaymentAmount{
+			Currency:     "usd",
+			NativeAmount: 4.0,
+			Quarks:       4_000_000,
+			Mint:         &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
+		},
+		Recipient: &messagingpb.CashContent_MultiReceiver{MultiReceiver: &messagingpb.CashContent_Payments{
+			Items: []*messagingpb.CashContent_Payment{
+				{Receiver: receiver1, NativeAmount: 1.5, Quarks: 1_500_000},
+				{Receiver: receiver2, NativeAmount: 1.0, Quarks: 1_000_000},
+				{Receiver: receiver3, NativeAmount: 1.5, Quarks: 1_500_000},
+			},
+		}},
+	}}})
+	of := " of " + ocp_common.CoreMintName
+
+	// A receiver name is ignored: there is no one receiver to name.
+	group, err := BuildGroupChatPush(ctx, nil, groupID, message, senderID, "Alice", "Bob", "Sunday Hikers")
+	require.NoError(t, err)
+	require.Equal(t, "Sunday Hikers", group.title)
+	require.Equal(t, "Alice sent $4.00"+of+" to 3 people", group.body)
+
+	receivers, err := BuildGroupChatReceiverPushes(ctx, nil, groupID, message, senderID, "Alice", "Sunday Hikers")
+	require.NoError(t, err)
+	require.Len(t, receivers, 2)
+	for j, expected := range []struct {
+		receivers []*commonpb.UserId
+		body      string
+	}{
+		{[]*commonpb.UserId{receiver1, receiver3}, "Alice sent you $1.50" + of},
+		{[]*commonpb.UserId{receiver2}, "Alice sent you $1.00" + of},
+	} {
+		require.Len(t, receivers[j].Receivers, len(expected.receivers), j)
+		for k, receiver := range expected.receivers {
+			require.True(t, proto.Equal(receiver, receivers[j].Receivers[k]), j)
+		}
+		require.Equal(t, "Sunday Hikers", receivers[j].Push.title)
+		require.Equal(t, expected.body, receivers[j].Push.body)
+		require.True(t, proto.Equal(group.payload, receivers[j].Push.payload))
+		require.True(t, proto.Equal(group.mutedPayload, receivers[j].Push.mutedPayload))
+	}
 }
 
 // TestChatMessagePush_Widget: a widget's body is its plain-text stand-in, a

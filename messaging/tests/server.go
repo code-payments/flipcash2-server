@@ -114,6 +114,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_SendMessage_PushPerChatType,
 		testServer_SendMessage_GroupChatPush,
 		testServer_SendMessage_GroupPaymentPush,
+		testServer_SendMessage_GroupMultiPaymentPush,
 		testServer_GroupCashMessage,
 		testServer_SendMessage_SuppressedForBlockedSender,
 		testServer_SendMessage_MutedRecipientsFlagged,
@@ -4669,13 +4670,13 @@ func testServer_SendMessage_GroupPaymentPush(t *testing.T, badges badge.Store, b
 	pay := func() *messagingpb.Message {
 		sent, err := e.sender.Send(e.ctx, chatID, e.userA, []*messagingpb.Content{{Type: &messagingpb.Content_Cash{Cash: &messagingpb.CashContent{
 			IntentId: &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()},
-			Amount: &commonpb.CryptoPaymentAmount{
+			TotalAmount: &commonpb.CryptoPaymentAmount{
 				Currency:     "usd",
 				NativeAmount: 2.5,
 				Quarks:       2_500_000,
 				Mint:         &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
 			},
-			Receiver: e.userB,
+			Recipient: &messagingpb.CashContent_SingleReceiver{SingleReceiver: e.userB},
 		}}}}, generateClientID(), true)
 		require.NoError(t, err)
 		return sent
@@ -4758,6 +4759,122 @@ func testServer_SendMessage_GroupPaymentPush(t *testing.T, badges badge.Store, b
 	requireUsers(pushes["Alice sent Bob "+amount], userC)
 }
 
+// testServer_SendMessage_GroupMultiPaymentPush: a group cash message paying
+// several members pushes each receiver their own part, addressed to them, and
+// every other member but the sender one that counts the receivers and names
+// none of them. Receivers whose part reads the same share one push. Each
+// receiver goes through the same pipeline as any page: one who blocked the
+// sender gets none, and one who has left gets none, without costing the
+// others theirs.
+func testServer_SendMessage_GroupMultiPaymentPush(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Alice"))
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userB, "Bob"))
+
+	userC, _ := e.addUser()
+	userD, _ := e.addUser()
+	bystander, _ := e.addUser()
+
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB, userC, userD, bystander},
+		Title:        "Trip Planning",
+		LastActivity: at(1),
+	}))
+
+	// $1.50 to Bob and D, $1.00 to C: $4.00 in all.
+	of := " of " + ocp_common.CoreMintName
+	pay := func() *messagingpb.Message {
+		sent, err := e.sender.Send(e.ctx, chatID, e.userA, []*messagingpb.Content{{Type: &messagingpb.Content_Cash{Cash: &messagingpb.CashContent{
+			IntentId: &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()},
+			TotalAmount: &commonpb.CryptoPaymentAmount{
+				Currency:     "usd",
+				NativeAmount: 4.0,
+				Quarks:       4_000_000,
+				Mint:         &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
+			},
+			Recipient: &messagingpb.CashContent_MultiReceiver{MultiReceiver: &messagingpb.CashContent_Payments{
+				Items: []*messagingpb.CashContent_Payment{
+					{Receiver: e.userB, NativeAmount: 1.5, Quarks: 1_500_000},
+					{Receiver: userC, NativeAmount: 1.0, Quarks: 1_000_000},
+					{Receiver: userD, NativeAmount: 1.5, Quarks: 1_500_000},
+				},
+			}},
+		}}}}, generateClientID(), true)
+		require.NoError(t, err)
+		return sent
+	}
+	// pushesFor waits for the payment's pushes, want of them, and returns them
+	// keyed by body.
+	seen := 0
+	pushesFor := func(sent *messagingpb.Message, want int) map[string]capturedPush {
+		require.Eventually(t, func() bool {
+			return len(e.pusher.snapshot()) >= seen+want
+		}, 5*time.Second, 10*time.Millisecond)
+		// Nothing more arrives for the payment.
+		require.Never(t, func() bool {
+			return len(e.pusher.snapshot()) > seen+want
+		}, 200*time.Millisecond, 20*time.Millisecond)
+		pushes := e.pusher.snapshot()[seen:]
+		seen += len(pushes)
+
+		byBody := make(map[string]capturedPush, len(pushes))
+		for _, p := range pushes {
+			require.Equal(t, "Trip Planning", p.title)
+			require.True(t, proto.Equal(sent, p.payload.ChatMetadata.GetMessage()))
+			require.True(t, p.badged)
+			byBody[p.body] = p
+		}
+		require.Len(t, byBody, len(pushes))
+		return byBody
+	}
+	requireUsers := func(p capturedPush, users ...*commonpb.UserId) {
+		got := make([][]byte, len(p.users))
+		for i, u := range p.users {
+			got[i] = u.Value
+		}
+		want := make([][]byte, len(users))
+		for i, u := range users {
+			want[i] = u.Value
+		}
+		require.ElementsMatch(t, want, got)
+	}
+	requirePush := func(pushes map[string]capturedPush, body string, users ...*commonpb.UserId) {
+		p, ok := pushes[body]
+		require.True(t, ok, body)
+		requireUsers(p, users...)
+	}
+
+	// Each receiver hears their own part, the two paid the same in one push;
+	// the bystander hears the total and the count, Bob's name included
+	// nowhere; the sender hears nothing.
+	pushes := pushesFor(pay(), 3)
+	requirePush(pushes, "Alice sent you $1.50"+of, e.userB, userD)
+	requirePush(pushes, "Alice sent you $1.00"+of, userC)
+	requirePush(pushes, "Alice sent $4.00"+of+" to 3 people", bystander)
+
+	// A receiver who blocked the sender gets nothing, and the one who shares
+	// their part still gets theirs.
+	_, err := e.blocklist.Block(e.ctx, e.userB, e.userA, time.Now())
+	require.NoError(t, err)
+	pushes = pushesFor(pay(), 3)
+	requirePush(pushes, "Alice sent you $1.50"+of, userD)
+	requirePush(pushes, "Alice sent you $1.00"+of, userC)
+	requirePush(pushes, "Alice sent $4.00"+of+" to 3 people", bystander)
+	_, err = e.blocklist.Unblock(e.ctx, e.userB, e.userA)
+	require.NoError(t, err)
+
+	// A receiver who has left the group is not pushed into it, and the count
+	// is still of everyone paid.
+	_, _, err = chats.RemoveGroupMember(e.ctx, chatID, userC, false)
+	require.NoError(t, err)
+	pushes = pushesFor(pay(), 2)
+	requirePush(pushes, "Alice sent you $1.50"+of, e.userB, userD)
+	requirePush(pushes, "Alice sent $4.00"+of+" to 3 people", bystander)
+}
+
 // testServer_GroupCashMessage: a group payment's cash message is a message
 // like a DM's. Only the server writes one, so no client may send cash, naming
 // a receiver or not; once written, its payer cannot delete it, members can
@@ -4780,13 +4897,13 @@ func testServer_GroupCashMessage(t *testing.T, badges badge.Store, blocklists bl
 	cash := func() []*messagingpb.Content {
 		return []*messagingpb.Content{{Type: &messagingpb.Content_Cash{Cash: &messagingpb.CashContent{
 			IntentId: &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()},
-			Amount: &commonpb.CryptoPaymentAmount{
+			TotalAmount: &commonpb.CryptoPaymentAmount{
 				Currency:     "usd",
 				NativeAmount: 2.5,
 				Quarks:       2_500_000,
 				Mint:         &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
 			},
-			Receiver: e.userB,
+			Recipient: &messagingpb.CashContent_SingleReceiver{SingleReceiver: e.userB},
 		}}}}
 	}
 
@@ -4818,7 +4935,7 @@ func testServer_GroupCashMessage(t *testing.T, badges badge.Store, blocklists bl
 	require.Len(t, preview.Messages.Messages, 1)
 	previewed := preview.Messages.Messages[0]
 	require.True(t, proto.Equal(sent.Content[0], previewed.Content[0]))
-	require.True(t, proto.Equal(e.userB, previewed.Content[0].GetCash().GetReceiver()))
+	require.True(t, proto.Equal(e.userB, previewed.Content[0].GetCash().GetSingleReceiver()))
 }
 
 func testServer_SendMessage_SuppressedForBlockedSender(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

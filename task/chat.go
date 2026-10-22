@@ -124,10 +124,10 @@ func (e *Executor) sendGroupPaymentMessage(ctx context.Context, record *ocp_task
 // broadcasting one BOOSTED update. A returned error means the task is retried
 // with backoff.
 //
-// Nothing about the group or the message is checked again: the payer's
-// membership, the message and the emoji's room on it were judged when the
-// payment was validated (see intent.Integration), and the payment has
-// happened since, so the boost lands even if the payer has left or the
+// Nothing about the chat (a group or a DM) or the message is checked again:
+// the payer's membership, the message and the payer's reaction were judged
+// when the payment was validated (see intent.Integration), and the payment
+// has happened since, so the boost lands even if the payer has left or the
 // message has been deleted in between. Who was paid is not read here at all:
 // the payouts were judged at validation, and the boost credits the whole
 // payment.
@@ -135,7 +135,8 @@ func (e *Executor) sendGroupPaymentMessage(ctx context.Context, record *ocp_task
 // Idempotency under at-least-once delivery comes from the store, which
 // records a boost once per intent ID on the message; a repeat changes nothing
 // and broadcasts nothing. Refusals that a validated payment never produces
-// (an emoji that is not one, a DM, a payment worth nothing) are returned like
+// (an emoji that is not one, a chat ID that is neither a group's nor a DM's,
+// a payment worth nothing) are returned like
 // any failure, so they are retried and surfaced rather than dropping the
 // record of a payment that was made.
 func (e *Executor) recordReactionBoost(ctx context.Context, record *ocp_task.Record) error {
@@ -150,8 +151,8 @@ func (e *Executor) recordReactionBoost(ctx context.Context, record *ocp_task.Rec
 	}
 
 	chatID := intent.GetChatMetadata(intentRecord.AppMetadata).GetChatId()
-	if !chat.IsGroupChatID(chatID) {
-		return errors.New("chat id is not a group")
+	if !chat.IsGroupChatID(chatID) && len(chatID.GetValue()) != chat.DmChatIDSize {
+		return errors.New("chat id is not a group or a dm")
 	}
 
 	payment, err := intent.GetDirectPayment(intentRecord)

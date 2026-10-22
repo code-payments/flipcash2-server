@@ -649,19 +649,22 @@ func getMultiDirectPayment(intentRecord *ocp_intent.Record) (*DirectPayment, err
 
 // validateReactionBoostAppMetadata enforces that a payment carrying chat app
 // metadata is a well-formed reaction boost: a payment by a member of a group
-// to put money behind their reaction with an emoji on one of its messages,
-// paid to the message's sender and the group's creator exactly as the boost
-// rule divides it (messaging.ValidateBoostPayouts: 80% to the sender and 20%
-// to the creator, or the whole to one of them when the message is the
-// creator's or the creator boosts). No one boosts their own message. A boost
-// that pays one person is a SendPublicPayment and one that pays both a
-// SendPublicMultiPayment, and each intent carries its case alone; a multi
-// payment is also held to its staff gate (validateMultiPayment) before it
-// gets here. The task it schedules records the boost through the messaging
-// Sender, which gates on nothing, so every gate is applied here, before any
-// money moves; the task could only drop the record of a payment already made.
+// or a DM to put money behind their reaction with an emoji on one of its
+// messages. In a group it is paid to the message's sender and the group's
+// creator exactly as the boost rule divides it
+// (messaging.ValidateBoostPayouts: 80% to the sender and 20% to the creator,
+// or the whole to one of them when the message is the creator's or the
+// creator boosts); in a DM it is a boost of the other member's message, paid
+// to them whole (messaging.ValidateDmBoostPayouts). No one boosts their own
+// message. A boost that pays one person is a SendPublicPayment and one that
+// pays both a SendPublicMultiPayment, and each intent carries its case alone
+// (so a DM boost is always a SendPublicPayment); a multi payment is also
+// held to its staff gate (validateMultiPayment) before it gets here. The
+// task it schedules records the boost through the messaging Sender, which
+// gates on nothing, so every gate is applied here, before any money moves;
+// the task could only drop the record of a payment already made.
 //
-// The payer must be a member of the group, the same gate as adding a
+// The payer must be a member of the chat, the same gate as adding a
 // reaction (a reaction is a member's alone; speaking is not required). The
 // message must exist and be reactable, which a deleted message still is: its
 // tombstone keeps its sender, who is paid like the sender of any other. The emoji
@@ -676,8 +679,9 @@ func getMultiDirectPayment(intentRecord *ocp_intent.Record) (*DirectPayment, err
 // Standing is judged now, not when the task runs: a payer who leaves before
 // the boost lands is still credited, since the payment has happened.
 //
-// No block check is applied, as for group payments. No boost to or from the
-// Flipcash team account is allowed.
+// No block check is applied, as for DM and group payments, and a DM boost
+// pays no DM fee: the DM exists, so its gate has been paid. No boost to or
+// from the Flipcash team account is allowed.
 func (i *Integration) validateReactionBoostAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
 	chatMetadata := appMetadata.GetChat()
 	boost := chatMetadata.GetReactionBoost()
@@ -686,8 +690,9 @@ func (i *Integration) validateReactionBoostAppMetadata(ctx context.Context, inte
 	}
 
 	chatID := chatMetadata.GetChatId()
-	if !chat.IsGroupChatID(chatID) {
-		return ocp_transaction.NewIntentValidationError("chat id is not a group")
+	isGroup := chat.IsGroupChatID(chatID)
+	if !isGroup && len(chatID.GetValue()) != chat.DmChatIDSize {
+		return ocp_transaction.NewIntentValidationError("chat id is not a group or a dm")
 	}
 
 	emoji := boost.GetEmoji().GetValue()
@@ -732,20 +737,24 @@ func (i *Integration) validateReactionBoostAppMetadata(ctx context.Context, inte
 		payouts[j] = messaging.BoostPayout{UserID: payeeUserID, Amount: destination.NativeAmount}
 	}
 
-	// A group that does not exist has no members, so this also refuses one.
+	// A chat that does not exist has no members, so this also refuses one.
 	isMember, err := i.access.IsMember(ctx, chatID, payerUserID)
 	if err != nil {
 		return err
 	}
 	if !isMember {
-		return ocp_transaction.NewIntentDeniedError("payer is not a member of the group")
+		return ocp_transaction.NewIntentDeniedError("payer is not a member of the chat")
 	}
 
-	rules, err := i.chats.GetGroupRules(ctx, chatID)
-	if errors.Is(err, chat.ErrChatNotFound) {
-		return ocp_transaction.NewIntentDeniedError("group not found")
-	} else if err != nil {
-		return err
+	var creatorID *commonpb.UserId
+	if isGroup {
+		rules, err := i.chats.GetGroupRules(ctx, chatID)
+		if errors.Is(err, chat.ErrChatNotFound) {
+			return ocp_transaction.NewIntentDeniedError("group not found")
+		} else if err != nil {
+			return err
+		}
+		creatorID = rules.CreatorID
 	}
 
 	// Read after membership, as AddReaction does, so a non-member cannot
@@ -760,7 +769,12 @@ func (i *Integration) validateReactionBoostAppMetadata(ctx context.Context, inte
 		return ocp_transaction.NewIntentDeniedError("message cannot be reacted to")
 	}
 
-	payees, err := messaging.BoostPayees(payerUserID, rules.CreatorID, message.SenderID)
+	var payees []messaging.BoostShare
+	if isGroup {
+		payees, err = messaging.BoostPayees(payerUserID, creatorID, message.SenderID)
+	} else {
+		payees, err = messaging.DmBoostPayees(payerUserID, message.SenderID)
+	}
 	if errors.Is(err, messaging.ErrBoostOwnMessage) {
 		return ocp_transaction.NewIntentDeniedError("payer cannot boost their own message")
 	} else if err != nil {
@@ -777,29 +791,24 @@ func (i *Integration) validateReactionBoostAppMetadata(ctx context.Context, inte
 	// Each share is held to half the currency's smallest unit, the slack OCP
 	// allows between a payment's amount and its quarks.
 	tolerance := 0.5 * send.MinimumTransferValue(currency_lib.Code(payment.Amount.Currency))
-	if _, err := messaging.ValidateBoostPayouts(payerUserID, rules.CreatorID, message.SenderID, payouts, tolerance); err != nil {
+	if isGroup {
+		_, err = messaging.ValidateBoostPayouts(payerUserID, creatorID, message.SenderID, payouts, tolerance)
+	} else {
+		_, err = messaging.ValidateDmBoostPayouts(payerUserID, message.SenderID, payouts, tolerance)
+	}
+	if err != nil {
 		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf("boost payouts are not allowed: %v", err))
 	}
 
-	selfReactions, err := i.messages.GetSelfReactions(ctx, chatID, payerUserID, []*messagingpb.MessageId{boost.GetMessageId()})
+	reacted, err := messaging.HoldsReaction(ctx, i.messages, chatID, boost.GetMessageId(), payerUserID, emoji)
 	if err != nil {
 		return err
 	}
-	if !hasEmoji(selfReactions, emoji) {
+	if !reacted {
 		return ocp_transaction.NewIntentDeniedError("payer has not reacted with the emoji")
 	}
 
 	return nil
-}
-
-// hasEmoji reports whether any of a viewer's reactions is with emoji.
-func hasEmoji(reactions []messaging.SelfReaction, emoji string) bool {
-	for _, reaction := range reactions {
-		if reaction.Emoji == emoji {
-			return true
-		}
-	}
-	return false
 }
 
 // validateMinimumBoost enforces the least a reaction boost may pay: every

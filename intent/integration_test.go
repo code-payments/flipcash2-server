@@ -1270,10 +1270,58 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 		}
 	})
 
-	t.Run("denied_dm_chat_id", func(t *testing.T) {
-		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, payerUserID, creatorUserID)
-		record := boost(dmChatID, byCreator.ID, "🔥", payerKeys, creatorKeys)
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "not a group")
+	// In a DM a boost is of the other member's message, paid to them whole
+	// as a single payment.
+	t.Run("dm", func(t *testing.T) {
+		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, payerUserID, memberUserID)
+		require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+			ID:      dmChatID,
+			Type:    chatpb.ChatType_DM,
+			Members: []*commonpb.UserId{payerUserID, memberUserID},
+		}))
+		byOther := e.putMessage(t, dmChatID, memberUserID)
+		byPayer := e.putMessage(t, dmChatID, payerUserID)
+		e.react(t, dmChatID, byOther.ID, payerUserID, "🔥")
+		e.react(t, dmChatID, byPayer.ID, payerUserID, "🔥")
+
+		require.NoError(t, e.integration.AllowCreation(e.ctx, boost(dmChatID, byOther.ID, "🔥", payerKeys, memberKeys), nil, nil))
+
+		for name, tc := range map[string]struct {
+			record *ocp_intent.Record
+			err    string
+		}{
+			"own message":       {boost(dmChatID, byPayer.ID, "🔥", payerKeys, memberKeys), "cannot boost their own message"},
+			"paying a stranger": {boost(dmChatID, byOther.ID, "🔥", payerKeys, creatorKeys), "boost payouts are not allowed"},
+			"paying themself":   {boost(dmChatID, byOther.ID, "🔥", payerKeys, payerKeys), "boost payouts are not allowed"},
+			"not reacted":       {boost(dmChatID, byOther.ID, "🎉", payerKeys, memberKeys), "has not reacted"},
+			"not a member":      {boost(dmChatID, byOther.ID, "🔥", outsiderKeys, memberKeys), "not a member"},
+			"no such dm":        {boost(chat.MustDeriveDmChatID(chatpb.ChatType_DM, payerUserID, creatorUserID), byOther.ID, "🔥", payerKeys, memberKeys), "not a member"},
+			"malformed chat id": {boost(&commonpb.ChatId{Value: make([]byte, 20)}, byOther.ID, "🔥", payerKeys, memberKeys), "not a group or a dm"},
+		} {
+			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, tc.record, nil, nil), tc.err, name)
+		}
+
+		// The reaction the other member holds is theirs, not the payer's.
+		mine := e.putMessage(t, dmChatID, memberUserID)
+		e.react(t, dmChatID, mine.ID, memberUserID, "🔥")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(dmChatID, mine.ID, "🔥", payerKeys, memberKeys), nil, nil), "has not reacted")
+
+		// The minimum applies as in a group.
+		record := boost(dmChatID, byOther.ID, "🔥", payerKeys, memberKeys)
+		record.SendPublicPaymentMetadata.NativeAmount = 0.0049
+		record.SendPublicPaymentMetadata.UsdMarketValue = 0.0049
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "below the minimum of 0.01 USD")
+
+		// A DM boost pays one person, so it is never a multi payment.
+		e.setStaff(payerUserID)
+		defer delete(e.staff, string(payerUserID.Value))
+		split := multiPaymentIntentRecord(base58.Encode(payerKeys.Public()), base58.Encode(memberKeys.Public()), base58.Encode(creatorKeys.Public()))
+		appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
+			Domain: &intentpb.AppMetadata_Chat{Chat: reactionBoostMetadata(dmChatID, byOther.ID, "🔥")},
+		})
+		require.NoError(t, err)
+		split.AppMetadata = appMetadata
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, split, nil, nil), "must be a single payment")
 	})
 
 	t.Run("denied_invalid_emoji", func(t *testing.T) {
@@ -1441,6 +1489,16 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 		byPayer := e.putMessage(t, groupID, payerUserID)
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(groupID, byTeam.ID, "🔥", payerKeys, e.teamKeys), nil, nil), "flipcash team")
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(groupID, byPayer.ID, "🔥", e.teamKeys, payerKeys), nil, nil), "flipcash team")
+
+		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, payerUserID, e.team)
+		require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+			ID:      dmChatID,
+			Type:    chatpb.ChatType_DM,
+			Members: []*commonpb.UserId{payerUserID, e.team},
+		}))
+		byTeam = e.putMessage(t, dmChatID, e.team)
+		e.react(t, dmChatID, byTeam.ID, payerUserID, "🔥")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(dmChatID, byTeam.ID, "🔥", payerKeys, e.teamKeys), nil, nil), "flipcash team")
 	})
 }
 

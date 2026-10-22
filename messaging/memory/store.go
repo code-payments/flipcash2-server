@@ -648,9 +648,6 @@ func (m *memory) AddBoost(
 	emoji string,
 	boost messaging.BoostInput,
 ) (*messaging.Reaction, bool, bool, error) {
-	if !chat.IsGroupChatID(chatID) {
-		return nil, false, false, messaging.ErrBoostGroupOnly
-	}
 	if boost.IntentID == nil || len(boost.IntentID.Value) == 0 {
 		return nil, false, false, errors.New("boost has no intent id")
 	}

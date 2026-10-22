@@ -15,18 +15,22 @@ import (
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/model"
 )
 
 // A boost is a payment made to put money behind a reaction: the payer's
-// reaction with an emoji on a group message carries the payment's value, the
-// emoji's total grows by it, and the emoji is listed ahead of ones with less
-// money behind it (see ReactionLess and Reactor.BoostUsdMicros). The payment
-// is divided between the message's sender and the group's creator. This file
-// is the rule for that division; the record of one boost is Boost (model.go)
-// and what it does to the reaction state is the Store's (AddBoost).
+// reaction with an emoji on a message in a group or a DM carries the
+// payment's value, the emoji's total grows by it, and the emoji is listed
+// ahead of ones with less money behind it (see ReactionLess and
+// Reactor.BoostUsdMicros). In a group the payment is divided between the
+// message's sender and the group's creator; in a DM it pays the sender. This
+// file is the rule for that division; the record of one boost is Boost
+// (model.go) and what it does to the reaction state is the Store's
+// (AddBoost).
 //
-// The division is fixed, not the payer's to choose (see BoostPayees):
+// The division is fixed, not the payer's to choose. In a group (see
+// BoostPayees):
 //
 //   - No one boosts their own message (ErrBoostOwnMessage), the creator
 //     included.
@@ -37,6 +41,9 @@ import (
 //     payment: they are both payees, and are paid once.
 //   - A boost by the creator pays the sender the whole payment: the
 //     creator's part would be paid to themself, so it is not taken out.
+//
+// In a DM (see DmBoostPayees), the payer boosts the other member's message
+// alone (ErrBoostOwnMessage for their own) and pays them the whole payment.
 //
 // So a boost is one payment to one person, the whole amount, unless it pays
 // two, and only then is anything divided. Either way the reaction is credited
@@ -74,8 +81,9 @@ var (
 	ErrBoostOwnMessage = errors.New("boost of one's own message")
 
 	// ErrBoostNoPayee is returned when the payment would pay no one but the
-	// payer: the creator boosting a message with no sender. A message with
-	// no sender cannot be reacted to, so no validated boost reaches it.
+	// payer: the creator boosting a message with no sender, or anyone
+	// boosting a DM message with none. A message with no sender cannot be
+	// reacted to, so no validated boost reaches it.
 	ErrBoostNoPayee = errors.New("boost would pay no one but the payer")
 
 	// ErrBoostPayoutMismatch is returned when the payouts do not name exactly
@@ -142,6 +150,25 @@ func BoostPayees(payer, creator, sender *commonpb.UserId) ([]BoostShare, error) 
 	}, nil
 }
 
+// DmBoostPayees is who a boost by payer must pay in a DM, given the
+// message's sender: the sender, at the whole. It returns ErrBoostNoPayer
+// when payer is nil, ErrBoostNoPayee when sender is nil, and
+// ErrBoostOwnMessage when payer is the sender. The sender of a DM message is
+// one of its two members, so a message not the payer's is the other
+// member's. The user ID returned is the caller's own value, not a copy.
+func DmBoostPayees(payer, sender *commonpb.UserId) ([]BoostShare, error) {
+	if payer == nil {
+		return nil, ErrBoostNoPayer
+	}
+	if sender == nil {
+		return nil, ErrBoostNoPayee
+	}
+	if sameUser(sender, payer) {
+		return nil, ErrBoostOwnMessage
+	}
+	return []BoostShare{{UserID: sender, Bps: 10000}}, nil
+}
+
 // ValidateBoostPayouts checks a boost's payouts against the rule above for a
 // boost by payer on a message sent by sender in a group created by creator,
 // and returns the payment's total, the sum of the payouts' amounts. The
@@ -154,7 +181,23 @@ func ValidateBoostPayouts(payer, creator, sender *commonpb.UserId, payouts []Boo
 	if err != nil {
 		return 0, err
 	}
+	return validatePayouts(payees, payouts, tolerance)
+}
 
+// ValidateDmBoostPayouts is ValidateBoostPayouts for a boost by payer on a
+// message sent by sender in a DM: the one payout must pay the sender (see
+// DmBoostPayees).
+func ValidateDmBoostPayouts(payer, sender *commonpb.UserId, payouts []BoostPayout, tolerance float64) (total float64, err error) {
+	payees, err := DmBoostPayees(payer, sender)
+	if err != nil {
+		return 0, err
+	}
+	return validatePayouts(payees, payouts, tolerance)
+}
+
+// validatePayouts checks payouts against payees and returns their total, as
+// ValidateBoostPayouts describes.
+func validatePayouts(payees []BoostShare, payouts []BoostPayout, tolerance float64) (total float64, err error) {
 	for _, payout := range payouts {
 		if !(payout.Amount > 0) || math.IsInf(payout.Amount, 0) {
 			return 0, fmt.Errorf("%w: amount %v", ErrBoostPayoutEmpty, payout.Amount)
@@ -201,6 +244,42 @@ func ValidateBoostPayouts(payer, creator, sender *commonpb.UserId, payouts []Boo
 	return total, nil
 }
 
+// HoldsReaction reports whether userID holds a reaction with emoji on a
+// message, as the store reads it now. A group's answer is the user's own
+// rows (Store.GetSelfReactions); a DM keeps none, and its two members never
+// outgrow an emoji's sample, so a DM's is read off the sample (see
+// Server.applySelfReactions).
+func HoldsReaction(ctx context.Context, messages Store, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, userID *commonpb.UserId, emoji string) (bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		reactions, err := messages.GetReactionSummary(ctx, chatID, messageID)
+		if err != nil {
+			return false, err
+		}
+		for _, reaction := range reactions {
+			if reaction.Emoji != emoji {
+				continue
+			}
+			for _, reactor := range reaction.SampleReactors {
+				if sameUser(reactor.UserID, userID) {
+					return true, nil
+				}
+			}
+		}
+		return false, nil
+	}
+
+	reactions, err := messages.GetSelfReactions(ctx, chatID, userID, []*messagingpb.MessageId{messageID})
+	if err != nil {
+		return false, err
+	}
+	for _, reaction := range reactions {
+		if reaction.Emoji == emoji {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // sameUser reports whether two user IDs name the same user; nil names no one
 // and matches nothing.
 func sameUser(a, b *commonpb.UserId) bool {
@@ -218,9 +297,8 @@ func sameUser(a, b *commonpb.UserId) bool {
 // was validated, and the money has moved. What it refuses is malformed
 // input, none of which a validated payment produces: a value that is not a
 // single emoji (ErrInvalidEmoji, the reaction RPCs' own ValidateEmoji,
-// applied here since no RPC guards this path), and from the store a DM
-// (ErrBoostGroupOnly), a boost worth nothing (ErrBoostEmpty), or a missing
-// intent ID or amount. No push is sent and no message is posted; the boost
+// applied here since no RPC guards this path), and from the store a boost
+// worth nothing (ErrBoostEmpty), or a missing intent ID or amount. No push is sent and no message is posted; the boost
 // shows on the reaction itself.
 //
 // Like the store it is idempotent on the payment's intent ID: a replay

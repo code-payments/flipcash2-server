@@ -242,7 +242,7 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	if cfg.lobbyLimits != nil {
 		opts = append(opts, chat.WithLobbyLimits(*cfg.lobbyLimits))
 	}
-	hydrator := chat.NewHydrator(log, accounts, blocklist, s, media, messaging, profiles, access.Rules(), teamUserID)
+	hydrator := chat.NewHydrator(log, blocklist, s, media, messaging, profiles, access.Rules(), teamUserID)
 	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, systemMessages, pusher, access, hydrator, userBus, chatBus, cfg.disablePublicGroupRoster, opts...)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		chatpb.RegisterChatServer(s, server)
@@ -1915,12 +1915,9 @@ func testServer_GetChat_Dm_NoCreator(t *testing.T, s chat.Store) {
 func testServer_GetChat_Dm_UseE2ee_TeamAccount(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
-	// The Flipcash team account's DMs never carry use_e2ee, even when both
-	// members are staff: the server writes into them on the team's behalf and
-	// holds no keys for it.
+	// The Flipcash team account's DMs never carry use_e2ee: the server writes
+	// into them on the team's behalf and holds no keys for it.
 	chatID := e.putDMWithPeer(chatpb.ChatType_DM, e.teamUserID, at(1))
-	e.accounts.setStaff(e.userID, true)
-	e.accounts.setStaff(e.teamUserID, true)
 
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
@@ -1972,55 +1969,25 @@ func testServer_GetChat_Dm_TeamAccount_NeverSpeak(t *testing.T, s chat.Store) {
 func testServer_GetChat_Dm_UseE2ee(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
-	// use_e2ee is set exactly when both members of a DM are staff, whatever the
-	// DM's type and whichever read serves it, and never on a group.
+	// use_e2ee is set on every DM, whatever its type and whichever read serves
+	// it, and never on a group.
 	for _, chatType := range []chatpb.ChatType{chatpb.ChatType_CONTACT_DM, chatpb.ChatType_DM} {
-		peer := model.MustGenerateUserID()
-		chatID := e.putDMWithPeer(chatType, peer, at(1))
+		chatID := e.putDMWithPeer(chatType, model.MustGenerateUserID(), at(1))
 
-		assertUseE2ee := func(want bool) {
-			t.Helper()
-			resp := e.getChat(e.keys, chatID)
-			require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-			require.Equal(t, want, resp.Metadata.UseE2Ee)
+		resp := e.getChat(e.keys, chatID)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+		require.True(t, resp.Metadata.UseE2Ee)
 
-			feed, err := e.getDmFeedOfType(chatType, &commonpb.QueryOptions{})
-			require.NoError(t, err)
-			require.Equal(t, chatpb.GetDmChatFeedResponse_OK, feed.Result)
-			require.Len(t, feed.Chats, 1)
-			require.Equal(t, chatID.Value, feed.Chats[0].ChatId.Value)
-			require.Equal(t, want, feed.Chats[0].UseE2Ee)
-		}
-
-		// Neither member is staff.
-		assertUseE2ee(false)
-
-		// Only the viewer is staff.
-		e.accounts.setStaff(e.userID, true)
-		assertUseE2ee(false)
-
-		// Only the peer is staff.
-		e.accounts.setStaff(e.userID, false)
-		e.accounts.setStaff(peer, true)
-		assertUseE2ee(false)
-
-		// Both are staff: the flag is decided per read, so it appears with no
-		// write to the chat.
-		e.accounts.setStaff(e.userID, true)
-		assertUseE2ee(true)
-
-		// And is withdrawn the same way.
-		e.accounts.setStaff(peer, false)
-		assertUseE2ee(false)
-
-		e.accounts.setStaff(e.userID, false)
+		feed, err := e.getDmFeedOfType(chatType, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Equal(t, chatpb.GetDmChatFeedResponse_OK, feed.Result)
+		require.Len(t, feed.Chats, 1)
+		require.Equal(t, chatID.Value, feed.Chats[0].ChatId.Value)
+		require.True(t, feed.Chats[0].UseE2Ee)
 	}
 
-	// A group of staff members never carries it.
-	other := model.MustGenerateUserID()
-	e.accounts.setStaff(e.userID, true)
-	e.accounts.setStaff(other, true)
-	groupID := e.putGroup("Staff", at(2), other)
+	// A group never carries it.
+	groupID := e.putGroup("Group", at(2), model.MustGenerateUserID())
 	resp := e.getChat(e.keys, groupID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
 	require.False(t, resp.Metadata.UseE2Ee)

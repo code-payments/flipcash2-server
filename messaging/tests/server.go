@@ -284,6 +284,19 @@ func newServerEnvWithTeam(t *testing.T, badges badge.Store, blocklists blocklist
 	return env
 }
 
+// useOpenGroup points the env's chat at a new public group of userA and userB
+// with no rules, so open to all: the chat for a test of plaintext content,
+// which no DM takes (see chat.EncryptionRequired).
+func (e *serverEnv) useOpenGroup(chats chat.Store) {
+	e.chatID = chat.MustGenerateGroupChatID()
+	require.NoError(e.t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           e.chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+}
+
 func (e *serverEnv) addUser() (*commonpb.UserId, model.KeyPair) {
 	userID := model.MustGenerateUserID()
 	keys := model.MustGenerateKeyPair()
@@ -370,6 +383,12 @@ func (p *capturingPusher) inFlightCounts() (current, most int) {
 
 func (e *serverEnv) send(keys model.KeyPair, text string, clientID *messagingpb.ClientMessageId) (*messagingpb.SendMessageResponse, error) {
 	return e.sendContent(keys, textContent(text), clientID)
+}
+
+// sendEncrypted sends encrypted content in the env's chat, the only content a
+// DM takes, for a test that needs a message there and not what it says.
+func (e *serverEnv) sendEncrypted(keys model.KeyPair, clientID *messagingpb.ClientMessageId) (*messagingpb.SendMessageResponse, error) {
+	return e.sendContent(keys, encryptedContent(1), clientID)
 }
 
 func (e *serverEnv) sendContent(keys model.KeyPair, content []*messagingpb.Content, clientID *messagingpb.ClientMessageId) (*messagingpb.SendMessageResponse, error) {
@@ -822,6 +841,7 @@ func (e *serverEnv) chatGrantedRead(blobID *blobpb.BlobId) bool {
 
 func testServer_SendAndGet(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 
 	resp, err := e.send(e.keysA, "hello", generateClientID())
 	require.NoError(t, err)
@@ -842,6 +862,7 @@ func testServer_SendAndGet(t *testing.T, badges badge.Store, blocklists blocklis
 
 func testServer_SendMedia(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 
 	// Media owned by the sender is sent, and the blob is granted to the chat.
 	ownedBlob := e.putReadyBlob(e.userA)
@@ -875,6 +896,7 @@ func testServer_SendMedia(t *testing.T, badges badge.Store, blocklists blocklist
 // drops its link and the image's download URL.
 func testServer_LinkPreviews(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 	const link = "https://news.example/story?id=7"
 	const text = "worth a read: " + link + "."
 
@@ -988,6 +1010,7 @@ func testServer_LinkPreviews(t *testing.T, badges badge.Store, blocklists blockl
 
 func testServer_ResolvesMediaOnRead(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 
 	// A sends a media message referencing a blob that has a derived rendition, so the
 	// read path is exercised expanding the full set, not just the ORIGINAL.
@@ -1074,6 +1097,7 @@ func testServer_ResolvesMediaOnRead(t *testing.T, badges badge.Store, blocklists
 
 func testServer_SendMessage_Idempotent(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 
 	clientID := generateClientID()
 	first, err := e.send(e.keysA, "hi", clientID)
@@ -1095,6 +1119,7 @@ func testServer_SendMessage_Idempotent(t *testing.T, badges badge.Store, blockli
 
 func testServer_SendReply(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 
 	// Seed a message to reply to.
 	original, err := e.send(e.keysA, "original", generateClientID())
@@ -1172,6 +1197,7 @@ func testServer_SendMessage_DisallowedContent(t *testing.T, badges badge.Store, 
 // see testServer_PollWidget.)
 func testServer_WidgetContent(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 
 	sendResp, err := e.sendContent(e.keysA, widgetContent("alice_1"), generateClientID())
 	require.NoError(t, err)
@@ -1212,12 +1238,13 @@ func testServer_WidgetContent(t *testing.T, badges badge.Store, blocklists block
 	require.Equal(t, messagingpb.DeleteMessageResponse_CANNOT_DELETE, deleted.Result)
 }
 
-// testServer_EncryptedContent: a DM carries encrypted content like any other
-// user-authored message — sent, read, replied to, reacted to, edited, deleted —
-// with the ciphertext passed through untouched, a redacted read included, and a
-// generic push body in place of a preview the server cannot render (and only
-// the message's ID in a push it would not fit in). An edit may upgrade
-// plaintext to encrypted but never downgrade encrypted to plaintext.
+// testServer_EncryptedContent: a DM takes encrypted content alone, as a
+// user-authored message like any other — sent, read, reacted to, edited,
+// deleted — with the ciphertext passed through untouched, a redacted read
+// included, and a generic push body in place of a preview the server cannot
+// render (and only the message's ID in a push it would not fit in). Plaintext
+// is refused, a reply included, as a send and as an edit; a plaintext message
+// from before may still be edited into an encrypted one.
 func testServer_EncryptedContent(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
@@ -1261,10 +1288,17 @@ func testServer_EncryptedContent(t *testing.T, badges badge.Store, blocklists bl
 	require.Equal(t, "Sent you a message", encryptedPush.body)
 	require.True(t, proto.Equal(sent.Message, encryptedPush.payload.ChatMetadata.GetMessage()))
 
-	// An encrypted message may be replied to and reacted to.
-	reply, err := e.sendContentToChat(e.keysB, chatID, replyContent(msgID.Value, "plain reply"), generateClientID())
-	require.NoError(t, err)
-	require.Equal(t, messagingpb.SendMessageResponse_OK, reply.Result)
+	// An encrypted message may be reacted to. A reply is encrypted whole, so
+	// a plaintext one is refused, as is plaintext of any kind.
+	for _, content := range [][]*messagingpb.Content{
+		textContent("plaintext"),
+		replyContent(msgID.Value, "plain reply"),
+	} {
+		resp, err := e.sendContentToChat(e.keysB, chatID, content, generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_ENCRYPTION_REQUIRED, resp.Result)
+		require.Nil(t, resp.Message)
+	}
 	react, err := e.addReactionInChat(e.keysB, chatID, msgID, "👍")
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.AddReactionResponse_OK, react.Result)
@@ -1278,32 +1312,32 @@ func testServer_EncryptedContent(t *testing.T, badges badge.Store, blocklists bl
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_DENIED, nestedResp.Result)
 
-	// The sender may edit an encrypted message, and a plaintext one into an
-	// encrypted one.
+	// The sender may edit an encrypted message.
 	edited, err := e.editMessageInChat(e.keysA, chatID, msgID, encryptedContent(3), sent.Message.EventSequence)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.EditMessageResponse_OK, edited.Result)
 	require.True(t, proto.Equal(encryptedContent(3)[0], edited.Message.Content[0]))
 
 	// An encrypted message is never downgraded: an edit to plaintext, bare or
-	// as a reply, is CANNOT_EDIT and the message keeps its ciphertext.
+	// as a reply, is ENCRYPTION_REQUIRED and the message keeps its ciphertext.
 	for _, downgrade := range [][]*messagingpb.Content{
 		textContent("plaintext"),
-		replyContent(reply.Message.MessageId.Value, "plaintext reply"),
+		replyContent(msgID.Value, "plaintext reply"),
 	} {
 		resp, err := e.editMessageInChat(e.keysA, chatID, msgID, downgrade, edited.Message.EventSequence)
 		require.NoError(t, err)
-		require.Equal(t, messagingpb.EditMessageResponse_CANNOT_EDIT, resp.Result)
+		require.Equal(t, messagingpb.EditMessageResponse_ENCRYPTION_REQUIRED, resp.Result)
 	}
 	unchanged, err := e.getMessageInChatWithMode(e.keysA, chatID, msgID, messagingpb.ViewMode_FULL)
 	require.NoError(t, err)
 	require.True(t, proto.Equal(encryptedContent(3)[0], unchanged.Message.Content[0]))
 	require.Equal(t, edited.Message.EventSequence, unchanged.Message.EventSequence)
 
-	plain, err := e.sendContentToChat(e.keysA, chatID, textContent("plaintext"), generateClientID())
+	// A plaintext message sent before DMs took encrypted content alone is
+	// upgraded by an edit like any other.
+	plain, _, err := messages.PutMessage(e.ctx, chatID, e.userA, textContent("plaintext"), time.Now(), generateClientID(), true)
 	require.NoError(t, err)
-	require.Equal(t, messagingpb.SendMessageResponse_OK, plain.Result)
-	upgraded, err := e.editMessageInChat(e.keysA, chatID, plain.Message.MessageId, encryptedContent(4), plain.Message.EventSequence)
+	upgraded, err := e.editMessageInChat(e.keysA, chatID, plain.ID, encryptedContent(4), plain.EventSequence)
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.EditMessageResponse_OK, upgraded.Result)
 	require.True(t, proto.Equal(encryptedContent(4)[0], upgraded.Message.Content[0]))
@@ -1403,7 +1437,7 @@ func testServer_EncryptedContent_NotInGroups(t *testing.T, badges badge.Store, b
 func testServer_SendMessage_Broadcast(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
-	resp, err := e.send(e.keysA, "broadcast me", generateClientID())
+	resp, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	id := resp.Message.MessageId.Value
 
@@ -1934,7 +1968,7 @@ func testServer_TeamAccount_Refused(t *testing.T, badges badge.Store, blocklists
 	}
 
 	// A DM with anyone else is unaffected.
-	sent, err := e.send(e.keysA, "hello", generateClientID())
+	sent, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
 }
@@ -1949,6 +1983,7 @@ func testServer_GetMessage_NotFound(t *testing.T, badges badge.Store, blocklists
 
 func testServer_EditMessage(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 
 	// userA sends a message; in this phase event_sequence == message_id.
 	sent, err := e.send(e.keysA, "original", generateClientID())
@@ -2046,6 +2081,7 @@ func testServer_EditMessage(t *testing.T, badges badge.Store, blocklists blockli
 
 func testServer_DeleteMessage(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 
 	// userA sends a message; in this phase event_sequence == message_id.
 	sent, err := e.send(e.keysA, "delete me", generateClientID())
@@ -2120,6 +2156,7 @@ func testServer_GetMessages_NotFound(t *testing.T, badges badge.Store, blocklist
 
 func testServer_GetMessages_Paging(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 
 	// Seed 5 messages, assigned gapless IDs 1..5.
 	for i := 0; i < 5; i++ {
@@ -2160,6 +2197,7 @@ func testServer_GetMessages_Paging(t *testing.T, badges badge.Store, blocklists 
 
 func testServer_GetMessages_ByIDs(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 
 	for i := 0; i < 5; i++ {
 		_, err := e.send(e.keysA, "m", generateClientID())
@@ -2181,6 +2219,7 @@ func testServer_GetMessages_ByIDs(t *testing.T, badges badge.Store, blocklists b
 
 func testServer_GetDelta(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
 
 	// Seed 3 messages, assigned gapless IDs 1..3.
 	for i := 0; i < 3; i++ {
@@ -2373,9 +2412,9 @@ func testServer_GetDelta_Batches(t *testing.T, badges badge.Store, blocklists bl
 func testServer_AdvancePointer(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
-	m1, err := e.send(e.keysA, "first", generateClientID())
+	m1, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
-	m2, err := e.send(e.keysA, "second", generateClientID())
+	m2, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 
 	// A forward advance succeeds and broadcasts userB's new READ pointer to the
@@ -2407,9 +2446,9 @@ func testServer_AdvancePointer(t *testing.T, badges badge.Store, blocklists bloc
 func testServer_AdvancePointer_PointerTypes(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
-	m1, err := e.send(e.keysA, "first", generateClientID())
+	m1, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
-	m2, err := e.send(e.keysA, "second", generateClientID())
+	m2, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 
 	// Advance userB's DELIVERED pointer to m1: it broadcasts a DELIVERED update to
@@ -2483,7 +2522,7 @@ func testServer_AdvancePointer_GroupNotBroadcast(t *testing.T, badges badge.Stor
 	}
 
 	// The env's DM still broadcasts pointer advances.
-	dmSent, err := e.send(e.keysA, "dm", generateClientID())
+	dmSent, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	dmResp, err := e.advancePointer(e.keysB, messagingpb.Pointer_READ, dmSent.Message.MessageId)
 	require.NoError(t, err)
@@ -2503,7 +2542,7 @@ func testServer_Reactions(t *testing.T, badges badge.Store, blocklists blocklist
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
 
-	sent, err := e.send(e.keysA, "react to me", generateClientID())
+	sent, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	msgID := sent.Message.MessageId
 
@@ -2577,7 +2616,7 @@ func testServer_Reactions_Reactors(t *testing.T, badges badge.Store, blocklists 
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
 
-	sent, err := e.send(e.keysA, "react", generateClientID())
+	sent, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	msgID := sent.Message.MessageId
 
@@ -2649,13 +2688,13 @@ func testServer_Reactions_Summaries(t *testing.T, badges badge.Store, blocklists
 	const thumbsUp = "👍"
 	const heart = "❤️"
 
-	m1, err := e.send(e.keysA, "first", generateClientID())
+	m1, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	msg1 := m1.Message.MessageId
-	m2, err := e.send(e.keysA, "second", generateClientID())
+	m2, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	msg2 := m2.Message.MessageId
-	m3, err := e.send(e.keysA, "third", generateClientID())
+	m3, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	msg3 := m3.Message.MessageId // stays reactionless
 
@@ -2733,7 +2772,7 @@ func testServer_Reactions_SummaryOrder(t *testing.T, badges badge.Store, blockli
 		joy      = "😂"  // F0 9F 98 82: the highest
 	)
 
-	m, err := e.send(e.keysA, "ordered", generateClientID())
+	m, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	msgID := m.Message.MessageId
 
@@ -2802,7 +2841,7 @@ func testServer_Reactions_Errors(t *testing.T, badges badge.Store, blocklists bl
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
 
-	sent, err := e.send(e.keysA, "hi", generateClientID())
+	sent, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	msgID := sent.Message.MessageId
 	ghost := &messagingpb.MessageId{Value: msgID.Value + 999}
@@ -2851,7 +2890,7 @@ func testServer_Reactions_Errors(t *testing.T, badges badge.Store, blocklists bl
 	// The cap is filled straight through the store (which treats the emoji as an
 	// opaque key) to avoid enumerating MaxReactionTypesPerMessage real emoji; the
 	// server path then validates and rejects one real emoji over the line.
-	capped, err := e.send(e.keysA, "popular", generateClientID())
+	capped, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	for i := 0; i < messaging.MaxReactionTypesPerMessage; i++ {
 		_, _, tooMany, err := messages.AddReaction(e.ctx, e.chatID, capped.Message.MessageId, e.userA, fmt.Sprintf("e-%d", i), at(int64(i+1)))
@@ -3445,8 +3484,8 @@ func testServer_ViewMode(t *testing.T, badges badge.Store, blocklists blocklist.
 	require.NotEqual(t, "open to all", getResp.Message.Content[0].GetText().GetText())
 
 	// A DM is its members' alone under every mode, and a member may ask for a
-	// placeholder there too.
-	dmSent, err := e.send(e.keysA, "just us", generateClientID())
+	// redacted read there too, which passes its encrypted content through.
+	dmSent, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, dmSent.Result)
 	for _, mode := range every {
@@ -3458,7 +3497,7 @@ func testServer_ViewMode(t *testing.T, badges badge.Store, blocklists blocklist.
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.GetMessageResponse_OK, getResp.Result)
 	require.True(t, getResp.Message.Redacted)
-	require.NotEqual(t, "just us", getResp.Message.Content[0].GetText().GetText())
+	require.True(t, proto.Equal(encryptedContent(1)[0], getResp.Message.Content[0]))
 
 	// A mode this server does not know is refused at the door, not guessed at.
 	req := &messagingpb.GetMessageRequest{ChatId: groupID, MessageId: textID, ViewMode: messagingpb.ViewMode(99)}
@@ -3580,7 +3619,7 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 	canListen(e.keysA)
 
 	// A DM in the same env is untouched by any of this: DMs carry no rules.
-	dmResp, err := e.send(e.keysA, "still a dm", generateClientID())
+	dmResp, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, dmResp.Result)
 }
@@ -3592,6 +3631,9 @@ func testServer_StaffOnlyGroup_Rules(t *testing.T, badges badge.Store, blocklist
 // creator's, may be deleted without touching the poll.
 func testServer_PollWidget(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	// The env's chat is the other chat a poll is not sent in, a group, since a
+	// DM refuses a poll as the plaintext it is before the poll is looked at.
+	e.useOpenGroup(chats)
 
 	groupID := chat.MustGenerateGroupChatID()
 	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
@@ -4255,7 +4297,7 @@ func testServer_BalanceGatedGroup_Rules(t *testing.T, badges badge.Store, blockl
 	e.ocpBalance.setErr(nil)
 
 	// A DM in the same env is untouched by any of this: DMs carry no rules.
-	dmResp, err := e.send(e.keysA, "still a dm", generateClientID())
+	dmResp, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, dmResp.Result)
 }
@@ -4339,7 +4381,7 @@ func testServer_Broadcast_IncludesActor(t *testing.T, badges badge.Store, blockl
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	const emoji = "👍"
 
-	sent, err := e.send(e.keysA, "react to me", generateClientID())
+	sent, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	msgID := sent.Message.MessageId
 
@@ -4374,7 +4416,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	// The push path recovers the chat type from the canonical DM derivation,
 	// so the chats must live at their derived IDs (unlike the env's default
 	// random-ID chat).
-	send := func(chatType chatpb.ChatType, text string) *messagingpb.Message {
+	send := func(chatType chatpb.ChatType, ciphertext byte) *messagingpb.Message {
 		chatID := chat.MustDeriveDmChatID(chatType, e.userA, e.userB)
 		require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
 			ID:           chatID,
@@ -4382,7 +4424,7 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 			Members:      []*commonpb.UserId{e.userA, e.userB},
 			LastActivity: at(1),
 		}))
-		resp, err := e.sendContentToChat(e.keysA, chatID, textContent(text), generateClientID())
+		resp, err := e.sendContentToChat(e.keysA, chatID, encryptedContent(ciphertext), generateClientID())
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
 		return resp.Message
@@ -4398,12 +4440,12 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 		return pushes
 	}
 
-	dmMessage := send(chatpb.ChatType_DM, "dm message")
+	dmMessage := send(chatpb.ChatType_DM, 1)
 	pushes := waitForPushes(1)
 
 	dmPush := pushes[0]
 	require.Equal(t, "Sender Name", dmPush.title)
-	require.Equal(t, "dm message", dmPush.body)
+	require.Equal(t, "Sent you a message", dmPush.body)
 	require.Empty(t, dmPush.payload.TitleSubstitutions)
 	require.Len(t, dmPush.users, 1)
 	require.Equal(t, e.userB.Value, dmPush.users[0].Value)
@@ -4417,12 +4459,12 @@ func testServer_SendMessage_PushPerChatType(t *testing.T, badges badge.Store, bl
 	require.NotContains(t, dmPush.body, senderPhone)
 	require.NotContains(t, dmPush.payload.String(), strings.TrimPrefix(senderPhone, "+"))
 
-	contactMessage := send(chatpb.ChatType_CONTACT_DM, "contact message")
+	contactMessage := send(chatpb.ChatType_CONTACT_DM, 2)
 	pushes = waitForPushes(2)
 
 	contactPush := pushes[1]
 	require.Equal(t, "{0}", contactPush.title)
-	require.Equal(t, "contact message", contactPush.body)
+	require.Equal(t, "Sent you a message", contactPush.body)
 	require.Len(t, contactPush.payload.TitleSubstitutions, 1)
 	require.Equal(t, senderPhone, contactPush.payload.TitleSubstitutions[0].GetPhoneNumberToContactName().GetValue())
 	require.Len(t, contactPush.users, 1)
@@ -4918,7 +4960,7 @@ func testServer_SendMessage_SuppressedForBlockedSender(t *testing.T, badges badg
 	require.NoError(t, err)
 	require.True(t, added)
 
-	resp, err := e.sendContentToChat(e.keysA, chatID, textContent("blocked hello"), generateClientID())
+	resp, err := e.sendContentToChat(e.keysA, chatID, encryptedContent(1), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
 
@@ -4938,7 +4980,7 @@ func testServer_SendMessage_SuppressedForBlockedSender(t *testing.T, badges badg
 	require.NoError(t, err)
 	require.True(t, removed)
 
-	resp, err = e.sendContentToChat(e.keysA, chatID, textContent("unblocked hello"), generateClientID())
+	resp, err = e.sendContentToChat(e.keysA, chatID, encryptedContent(2), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
 
@@ -4947,7 +4989,7 @@ func testServer_SendMessage_SuppressedForBlockedSender(t *testing.T, badges badg
 	}, 5*time.Second, 10*time.Millisecond)
 	pushes := e.pusher.snapshot()
 	require.Len(t, pushes, 1)
-	require.Equal(t, "unblocked hello", pushes[0].body)
+	require.True(t, proto.Equal(resp.Message, pushes[0].payload.ChatMetadata.GetMessage()))
 	require.Len(t, pushes[0].users, 1)
 	require.Equal(t, e.userB.Value, pushes[0].users[0].Value)
 }
@@ -5152,7 +5194,7 @@ func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.St
 	_, _, err := chats.SetMute(e.ctx, dmID, e.userB, chat.Mute{Forever: true})
 	require.NoError(t, err)
 
-	resp, err := e.sendContentToChat(e.keysA, dmID, textContent("quiet dm"), generateClientID())
+	resp, err := e.sendContentToChat(e.keysA, dmID, encryptedContent(1), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
 
@@ -5215,7 +5257,7 @@ func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.St
 	_, _, err = chats.SetMute(e.ctx, lapsedID, e.userB, chat.Mute{Until: at(1)})
 	require.NoError(t, err)
 
-	resp, err = e.sendContentToChat(e.keysA, lapsedID, textContent("lapsed"), generateClientID())
+	resp, err = e.sendContentToChat(e.keysA, lapsedID, encryptedContent(2), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
 

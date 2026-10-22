@@ -377,8 +377,8 @@ func (a *Access) recordMembership(c *Chat, userID *commonpb.UserId) func(context
 //   - governanceDm: a DM. Its two members are its audience, fixed by its ID;
 //     no one else is admitted in any form. Its members are evaluated against
 //     the rules derived for it (a Never speaker rule in a DM with the team
-//     account, see RuleEvaluator.RulesOf), and speak plaintext or under the
-//     pairwise scheme.
+//     account, see RuleEvaluator.RulesOf), and speak under the pairwise
+//     scheme alone.
 //   - governancePublicGroup: a public group. A non-member reads it in full
 //     when they satisfy its listener rules (everyone does when it carries
 //     none) and redacted otherwise; its members speak plaintext when they
@@ -488,15 +488,12 @@ type Encryption uint8
 const (
 	// EncryptionNone: the chat takes plaintext alone. A public group.
 	EncryptionNone Encryption = iota
-	// EncryptionOptional: the chat takes plaintext, and encrypted content
-	// under SpeakerStanding.Scheme. A DM, whose pairwise key either member's client
-	// derives on its own, so a conversation can mix the two as clients
-	// adopt it.
-	EncryptionOptional
 	// EncryptionRequired: the chat takes encrypted content under
-	// SpeakerStanding.Scheme and nothing else. A private group with its key (see
-	// Chat.IsPrivate): the key is the group's definition, so plaintext never
-	// appears in one.
+	// SpeakerStanding.Scheme and nothing else. A DM, whose pairwise key either
+	// member's client derives on its own, or a private group with its key (see
+	// Chat.IsPrivate), whose key is the group's definition. A DM from before
+	// E2EE reached everyone may still hold plaintext messages, but no client
+	// adds one.
 	EncryptionRequired
 )
 
@@ -566,8 +563,10 @@ func (a *Access) SpeakerStanding(ctx context.Context, chatID *commonpb.ChatId, u
 
 // dmSpeaker is a DM member's standing to speak: they speak when they satisfy
 // the DM's derived rules — always, except in a DM with the team account, whose
-// Never rule no one satisfies — and the DM takes plaintext or content under
-// its pairwise scheme, which either member's client derives on its own.
+// Never rule no one satisfies — and the DM takes content under its pairwise
+// scheme alone, which either member's client derives on its own. The team's
+// DMs are plaintext, written by the server alone (see messaging.Sender), which
+// no speaker gate stands behind.
 func (a *Access) dmSpeaker(ctx context.Context, rules RuleSet, userID *commonpb.UserId) (SpeakerStanding, error) {
 	ok, err := a.rules.CanSpeakWithRules(ctx, rules, userID)
 	if err != nil || !ok {
@@ -575,7 +574,7 @@ func (a *Access) dmSpeaker(ctx context.Context, rules RuleSet, userID *commonpb.
 	}
 	return SpeakerStanding{
 		CanSpeak:   true,
-		Encryption: EncryptionOptional,
+		Encryption: EncryptionRequired,
 		Scheme:     messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305,
 	}, nil
 }

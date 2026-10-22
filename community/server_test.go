@@ -66,7 +66,7 @@ func newServerEnv(t *testing.T) *serverEnv {
 	rules := chat.NewRuleEvaluator(accounts, balance.NewClient(log, accounts, nil), chats, nil)
 	unexpected := unexpectedReaders{t: t}
 	profiles := &fakeProfiles{byUser: make(map[string]*profilepb.UserProfile)}
-	hydrator := chat.NewHydrator(log, accounts, unexpected, chats, unexpected, unexpected, profiles, rules, nil)
+	hydrator := chat.NewHydrator(log, unexpected, chats, unexpected, unexpected, profiles, rules, nil)
 
 	server := community.NewServer(log, authz, accounts, chats, hydrator, ocpData, profiles)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {

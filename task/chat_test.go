@@ -320,8 +320,8 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	require.Len(t, msgs, 1)
 }
 
-// staffAccounts marks the users in staff as staff, which multi payments
-// require while they roll out.
+// staffAccounts marks the users in staff as staff, which a group payment's
+// multi payment requires while it rolls out.
 type staffAccounts struct {
 	account.Store
 
@@ -841,7 +841,6 @@ func TestExecutor_RecordReactionBoost_MultiPayment(t *testing.T) {
 	creatorUserID, creatorKeys := e.bindUser(t)
 	senderUserID, senderKeys := e.bindUser(t)
 	payerUserID, payerKeys := e.bindUser(t)
-	e.accounts.staff[string(payerUserID.Value)] = true
 
 	groupID := chat.MustGenerateGroupChatID()
 	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
@@ -887,7 +886,6 @@ func TestExecutor_RecordReactionBoost_PrivateGroup(t *testing.T) {
 	creatorUserID, creatorKeys := e.bindUser(t)
 	senderUserID, senderKeys := e.bindUser(t)
 	payerUserID, payerKeys := e.bindUser(t)
-	e.accounts.staff[string(payerUserID.Value)] = true
 
 	groupID := chat.MustGenerateGroupChatID()
 	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{

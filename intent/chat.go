@@ -429,11 +429,11 @@ const MaxGroupPaymentReceivers = 10
 // to one or more others. A payment to one member is a SendPublicPayment and a
 // payment to several at once (2 to MaxGroupPaymentReceivers) a
 // SendPublicMultiPayment, which has passed its staff gate
-// (validateMultiPayment) before it gets here. The task it schedules posts one
-// cash message into the group as the payer, through the messaging Sender,
-// which no rule gates, so every gate a send would face is applied here,
-// before any money moves, rather than by the task, which could only drop the
-// message of a payment already made.
+// (validateStaffOnlyMultiPayment) before it gets here. The task it schedules
+// posts one cash message into the group as the payer, through the messaging
+// Sender, which no rule gates, so every gate a send would face is applied
+// here, before any money moves, rather than by the task, which could only
+// drop the message of a payment already made.
 //
 // The payer must be able to speak in the group (chat.Access.SpeakerStanding:
 // a member who satisfies its rules, so not a non-creator in a creator-only
@@ -830,9 +830,8 @@ func getMultiDirectPayment(intentRecord *ocp_intent.Record) (*DirectPayment, err
 // to them whole (messaging.ValidateDmBoostPayouts). No one boosts their own
 // message. A boost that pays one person is a SendPublicPayment and one that
 // pays both a SendPublicMultiPayment, and each intent carries its case alone
-// (so a DM boost is always a SendPublicPayment); a multi payment is also
-// held to its staff gate (validateMultiPayment) before it gets here. The
-// task it schedules records the boost through the messaging Sender, which
+// (so a DM boost is always a SendPublicPayment); a multi payment carrying a
+// boost has no staff gate, unlike a group payment's. The task it schedules records the boost through the messaging Sender, which
 // gates on nothing, so every gate is applied here, before any money moves;
 // the task could only drop the record of a payment already made.
 //

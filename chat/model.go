@@ -433,11 +433,20 @@ func (c *Chat) IsCreator(userID *commonpb.UserId) bool {
 // PermissionsFor returns what userID may do in the chat (see Permissions),
 // given whether they are a member — which the caller has established, since
 // a group's membership is not on its record. A non-member may do nothing. A
-// member may edit the chat if and only if they created it: a DM has no
-// creator, so a DM is never editable, and a group's creator who has left it
-// edits nothing until they rejoin.
+// member may edit and moderate the chat if and only if they created it: a DM
+// has no creator, so a DM is never editable or moderated, and a group's
+// creator who has left it edits and moderates nothing until they rejoin.
+// Public and private groups alike: a private group's creator moderates it on
+// the same footing as a public group's.
 func (c *Chat) PermissionsFor(userID *commonpb.UserId, isMember bool) Permissions {
-	return Permissions{CanEdit: isMember && c.IsCreator(userID)}
+	isCreatorMember := isMember && c.IsCreator(userID)
+	return Permissions{
+		CanEdit: isCreatorMember,
+		Moderation: ModerationPermissions{
+			CanSilence: isCreatorMember,
+			CanBan:     isCreatorMember,
+		},
+	}
 }
 
 // GroupEdit is a change to a group's editable record fields (see
@@ -701,21 +710,104 @@ func (m Mute) Normalize() (Mute, error) {
 	return Mute{Until: until.UTC()}, nil
 }
 
+// ErrSilenceUntilOutOfRange indicates that a timed silence ends outside the
+// range a store can record (see Silence.Until).
+var ErrSilenceUntilOutOfRange = errors.New("silence until is out of range")
+
+// Silence is a silence a group's creator set on a user: until an instant, or
+// until the creator lifts it (Forever). While a silence is active the user
+// may still read the group, react and vote, but not speak in it (send, edit,
+// show typing); they may still delete their own messages. It is the creator's
+// restriction on the user, not the user's own setting, and it knows nothing
+// of membership: it may be set on a user who has never joined, and it
+// survives their leaving and rejoining.
+//
+// It has exactly a Mute's shape and storage, and every rule of one holds of
+// it, which its methods delegate to: Until is recorded at second precision
+// and must lie in [Unix epoch, MaxMuteUntil), else the write is rejected with
+// ErrSilenceUntilOutOfRange; a store encodes an indefinite silence as
+// MaxMuteUntil, as it does a mute; and a timed silence past its Until has
+// lapsed but stays recorded, as stored, until replaced or cleared — nothing
+// sweeps it and nothing is published when it lapses — so a reader decides
+// with Active, never from presence alone.
+type Silence struct {
+	Forever bool
+	Until   time.Time
+}
+
+// Active reports whether the silence is in force at now.
+func (s Silence) Active(now time.Time) bool {
+	return Mute(s).Active(now)
+}
+
+// ToProto projects the silence onto a chatpb.SilenceState.
+func (s Silence) ToProto() *chatpb.SilenceState {
+	if s.Forever {
+		return &chatpb.SilenceState{Duration: &chatpb.SilenceState_Forever_{Forever: &chatpb.SilenceState_Forever{}}}
+	}
+	return &chatpb.SilenceState{Duration: &chatpb.SilenceState_Until{Until: timestamppb.New(s.Until)}}
+}
+
+// SilenceFromProto is the inverse of Silence.ToProto. A SilenceState carrying
+// neither duration — which validation rejects before a request reaches here —
+// reads as a timed silence at the zero time, which no store records.
+func SilenceFromProto(s *chatpb.SilenceState) Silence {
+	switch d := s.GetDuration().(type) {
+	case *chatpb.SilenceState_Forever_:
+		return Silence{Forever: true}
+	case *chatpb.SilenceState_Until:
+		return Silence{Until: d.Until.AsTime()}
+	default:
+		return Silence{}
+	}
+}
+
+// Normalize returns the silence as a store records it, by Mute.Normalize's
+// rules, or ErrSilenceUntilOutOfRange when it cannot be recorded. Every store
+// applies it on write, so equality of two normalized silences is what "the
+// silence already recorded" means.
+func (s Silence) Normalize() (Silence, error) {
+	normalized, err := Mute(s).Normalize()
+	if errors.Is(err, ErrMuteUntilOutOfRange) {
+		return Silence{}, ErrSilenceUntilOutOfRange
+	}
+	return Silence(normalized), err
+}
+
 // ViewerState is what a chat holds about one user, independent of whether
-// they are a member: state the user set for themselves (today, a mute) and a
-// version over all of it. It is private to that user and never shared with
-// other members, and shown to the user only while they are a member (see
-// Server.hydrate). The record outlives membership — the version never resets
-// — but what it holds may not: a mute is cleared, best effort, when the user
-// leaves the chat (see Server.LeaveChat), so a user who returns to a group
-// starts unmuted unless that clear failed.
+// they are a member: state the user set for themselves (today, a mute),
+// restrictions the group's creator set on them (a silence, a ban; see
+// Store.SetSilence and Store.BanUser), and a version over all of it. It is
+// private to that user and never shared with other members, and shown to the
+// user only while they are a member (see Server.hydrate) — except that the
+// restrictions are also the creator's to list (see
+// Store.GetRestrictedUsersPage). The record outlives membership — the version
+// never resets — but what it holds may not: a mute is cleared, best effort,
+// when the user leaves the chat (see Server.LeaveChat), so a user who returns
+// to a group starts unmuted unless that clear failed. Restrictions are not:
+// they are the creator's, and survive any number of departures and returns,
+// which is the point of them.
 //
 // Mute is the recorded mute, or nil when none is set; see Mute for what a
-// recorded mute may still mean. Version is state, not a delta: every real
-// change — a mute set, replaced or cleared — moves it by exactly one and an
+// recorded mute may still mean. Silence is likewise the recorded silence, or
+// nil, lapsed or not (see Silence). BannedAt is when the user was banned,
+// or nil when they are not: a ban has no duration, and holds until lifted
+// (see Store.UnbanUser). A banned user is never a member of the group nor
+// waiting in its lobby, which the store guarantees in the writes that join,
+// admit or enqueue them (see ErrBanned). RestrictedAt is the time of the
+// latest real silence or ban set on the user — a silence replaced moves it,
+// lifting one restriction leaves it as it is while the other remains — and
+// is set exactly when Silence or BannedAt is: it orders the creator's
+// listing, most recently restricted first.
+//
+// Version is state, not a delta: every real change — a mute or silence set,
+// replaced or cleared, a ban made or lifted — moves it by exactly one and an
 // idempotent no-op leaves it alone, so a client keeps the greater of two
-// versions and drops the rest, whatever order they arrived in. It is not the
-// roster version (see RosterSummary), which nothing here ever moves.
+// versions and drops the rest, whatever order they arrived in. The user's own
+// settings and the creator's restrictions share it, since one ViewerState
+// carries both. It is not the roster version (see RosterSummary), which
+// nothing here ever moves; a ban that removes a member moves both, each by
+// its own rule.
 //
 // What a client is shown alongside the record is the chat's Permissions for
 // the user (see ToProto), computed from the chat's record and the user's
@@ -727,24 +819,124 @@ func (m Mute) Normalize() (Mute, error) {
 // the user's devices as a RosterUpdate carrying fresh metadata — rather than
 // moving the version on every transition of a user who may hold no record.
 type ViewerState struct {
-	Mute    *Mute
-	Version uint64
+	Mute         *Mute
+	Silence      *Silence
+	BannedAt     *time.Time
+	RestrictedAt *time.Time
+	Version      uint64
+}
+
+// IsRestricted reports whether the creator has set any restriction on the
+// user, in force or not: a silence recorded, lapsed or not, or a ban.
+func (v ViewerState) IsRestricted() bool {
+	return v.Silence != nil || v.BannedAt != nil
+}
+
+// ActiveSilence returns the recorded silence when it is in force at now,
+// else nil.
+func (v ViewerState) ActiveSilence(now time.Time) *Silence {
+	if v.Silence == nil || !v.Silence.Active(now) {
+		return nil
+	}
+	return v.Silence
+}
+
+// IsBanned reports whether the user is banned from the group.
+func (v ViewerState) IsBanned() bool {
+	return v.BannedAt != nil
+}
+
+// RestrictedUser is one user's restrictions in a group as the creator's
+// listing carries them (see Store.GetRestrictedUsersPage): who, and their
+// whole ViewerState in the group, whose RestrictedAt is always set.
+type RestrictedUser struct {
+	UserID *commonpb.UserId
+	State  ViewerState
+}
+
+// Position is the user's place in the listing's order.
+func (r RestrictedUser) Position() RestrictionPosition {
+	var at time.Time
+	if r.State.RestrictedAt != nil {
+		at = *r.State.RestrictedAt
+	}
+	return RestrictionPosition{RestrictedAt: at, UserID: r.UserID}
+}
+
+// RestrictionPosition is a place in a group's listing of restricted users:
+// most recently restricted first, ties broken by user ID descending, so the
+// order is total and a page can resume strictly after the last user it
+// carried. Ties are nanosecond coincidences within one group, so the
+// tie-break exists for totality rather than for anything a client sees.
+type RestrictionPosition struct {
+	RestrictedAt time.Time
+	UserID       *commonpb.UserId
+}
+
+// Compare orders positions in listing order: negative when p comes before o
+// (restricted later, or the same instant with the greater user ID), positive
+// when after, zero when they name the same place.
+func (p RestrictionPosition) Compare(o RestrictionPosition) int {
+	if c := o.RestrictedAt.Compare(p.RestrictedAt); c != 0 {
+		return c
+	}
+	return bytes.Compare(o.UserID.GetValue(), p.UserID.GetValue())
+}
+
+// BanResult is what Store.BanUser did: the user's ViewerState after the
+// call; whether the ban was made (Changed false when it was already in
+// force, with nothing written); whether it removed the user from the roster
+// (Departed), with Roster the group's summary as of the write — after the
+// departure when there was one, as read otherwise; and whether it removed
+// the user from the group's lobby (LeftLobby).
+type BanResult struct {
+	State     ViewerState
+	Changed   bool
+	Departed  bool
+	Roster    RosterSummary
+	LeftLobby bool
 }
 
 // Permissions is what a user may do in a chat beyond what membership alone
-// allows every member: today, whether they may edit its record (see
-// Server.EditChat). It is computed from the chat's record and the user's
-// membership (see Chat.PermissionsFor), never stored, and shown to the user
-// alone on their ViewerState — a client shows an affordance if and only if
-// its flag is set, so the flags are the server's word on what an RPC will
-// admit, and every gate must agree with them.
+// allows every member: whether they may edit its record (see
+// Server.EditChat), and how they may moderate it (see ModerationPermissions). It is
+// computed from the chat's record and the user's membership (see
+// Chat.PermissionsFor), never stored, and shown to the user alone on their
+// ViewerState — a client shows an affordance if and only if its flag is set,
+// so the flags are the server's word on what an RPC will admit, and every
+// gate must agree with them.
 type Permissions struct {
-	CanEdit bool
+	CanEdit    bool
+	Moderation ModerationPermissions
 }
 
-// ToProto projects the permissions onto a chatpb.ViewerState_Permissions.
+// ModerationPermissions is how a user may moderate a chat's users (see
+// moderation.go): whether they may silence and unsilence them, and whether
+// they may ban and unban them. Holding either lets them list who is
+// restricted. Each gates its own RPCs, so the two can be granted apart; today
+// both go to the same people (see Chat.PermissionsFor).
+type ModerationPermissions struct {
+	CanSilence bool
+	CanBan     bool
+}
+
+// Any reports whether the user may moderate the chat at all, which is what
+// listing its restricted users requires.
+func (m ModerationPermissions) Any() bool {
+	return m.CanSilence || m.CanBan
+}
+
+// ToProto projects the permissions onto a chatpb.ViewerState_Permissions,
+// leaving moderation unset when it grants nothing, as the proto describes.
 func (p Permissions) ToProto() *chatpb.ViewerState_Permissions {
-	return &chatpb.ViewerState_Permissions{CanEdit: p.CanEdit}
+	out := &chatpb.ViewerState_Permissions{CanEdit: p.CanEdit}
+	if p.Moderation.Any() {
+		out.Moderation = &chatpb.ViewerState_ModerationPermissions{
+			CanSilence: p.Moderation.CanSilence,
+			CanBan:     p.Moderation.CanBan,
+		}
+	}
+	return out
 }
 
 // MembersPage is one page of a group's joined members in user-ID order (see
@@ -814,16 +1006,21 @@ func (v ViewerState) ActiveMute(now time.Time) *Mute {
 }
 
 // ToProto projects the state onto a chatpb.ViewerState exactly as recorded:
-// the version, under settings the mute if one is recorded, lapsed or not,
-// and the user's permissions in the chat as the caller computed them (see
+// the version, under settings the mute if one is recorded, under
+// restrictions the silence if one is recorded, each lapsed or not, and the
+// user's permissions in the chat as the caller computed them (see
 // Permissions). A version names one exact state, and every carrier of that
 // version — a response, a hydrated Metadata, a ViewerStateChanged — must
 // agree on it, which they could not if the projection depended on the clock
-// it was made at. Whether a timed mute is still in force is the reader's call
-// against its own clock (see Mute.Active); the server makes that call only
-// where it acts on it, in the push fan-out. The permissions are always
-// carried, empty for a user who may do nothing, so a carrier never leaves a
-// client to guess whether they were withheld or are none.
+// it was made at. Whether a timed mute or silence is still in force is the
+// reader's call against its own clock (see Mute.Active, Silence.Active); the
+// server makes that call only where it acts on it, in the push fan-out and
+// the speaker gate. Restrictions are absent when no silence is recorded: a
+// ban is not carried, since a banned user is never a member and a non-member
+// is shown no ViewerState (see the proto's ViewerState.Restrictions). The
+// permissions are always carried, empty for a user who may do nothing, so a
+// carrier never leaves a client to guess whether they were withheld or are
+// none.
 func (v ViewerState) ToProto(permissions Permissions) *chatpb.ViewerState {
 	out := &chatpb.ViewerState{
 		Settings:    &chatpb.ViewerState_Settings{},
@@ -832,6 +1029,9 @@ func (v ViewerState) ToProto(permissions Permissions) *chatpb.ViewerState {
 	}
 	if v.Mute != nil {
 		out.Settings.Mute = v.Mute.ToProto()
+	}
+	if v.Silence != nil {
+		out.Restrictions = &chatpb.ViewerState_Restrictions{Silence: v.Silence.ToProto()}
 	}
 	return out
 }
@@ -842,6 +1042,18 @@ func (v ViewerState) Clone() ViewerState {
 	if v.Mute != nil {
 		mute := *v.Mute
 		out.Mute = &mute
+	}
+	if v.Silence != nil {
+		silence := *v.Silence
+		out.Silence = &silence
+	}
+	if v.BannedAt != nil {
+		bannedAt := *v.BannedAt
+		out.BannedAt = &bannedAt
+	}
+	if v.RestrictedAt != nil {
+		restrictedAt := *v.RestrictedAt
+		out.RestrictedAt = &restrictedAt
 	}
 	return out
 }

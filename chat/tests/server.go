@@ -163,6 +163,18 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_FeaturedGroups_Refused,
 		testServer_FeaturedGroups_UnknownUsername,
 		testServer_HoldingsSummary,
+		testServer_Moderation_Gates,
+		testServer_Moderation_Silence,
+		testServer_Moderation_SilenceNonMember,
+		testServer_Moderation_BanMember,
+		testServer_Moderation_BanNonMember,
+		testServer_Moderation_BanPrivateGroup,
+		testServer_Moderation_BannedReads,
+		testServer_Moderation_GetRestrictedUsers,
+		testServer_Moderation_GetRestrictedUsers_Paging,
+		testServer_Moderation_MalformedTarget,
+		testServer_Moderation_GetRestrictedUsers_UnknownUser,
+		testServer_Moderation_MentionSuggestions,
 	} {
 		tf(t, s)
 		teardown()
@@ -536,6 +548,10 @@ type fakeProfileReader struct {
 	profilePictures map[string]*blobpb.Media
 	joinedAt        map[string]time.Time
 
+	// unknown holds users the profile domain does not know, whom
+	// GetLimitedPublicProfilesForRow leaves out.
+	unknown map[string]struct{}
+
 	// phoneNumbersErr, when set, fails every GetPhoneNumbers call.
 	phoneNumbersErr error
 }
@@ -547,6 +563,7 @@ func newFakeProfileReader() *fakeProfileReader {
 		usernames:       make(map[string]string),
 		profilePictures: make(map[string]*blobpb.Media),
 		joinedAt:        make(map[string]time.Time),
+		unknown:         make(map[string]struct{}),
 	}
 }
 
@@ -586,11 +603,15 @@ func (f *fakeProfileReader) GetPhoneNumbers(_ context.Context, userIDs []*common
 
 // GetLimitedPublicProfilesForRow returns an entry for every user asked about, the way the real
 // reader does for a chat's members: they are all users the profile domain knows,
-// so each has at least a join timestamp even with no name or picture set.
+// so each has at least a join timestamp even with no name or picture set. A
+// user a test marks unknown is left out.
 func (f *fakeProfileReader) GetLimitedPublicProfilesForRow(_ context.Context, userIDs []*commonpb.UserId) (map[string]*profilepb.UserProfile, error) {
 	out := make(map[string]*profilepb.UserProfile)
 	for _, userID := range userIDs {
 		key := string(userID.Value)
+		if _, ok := f.unknown[key]; ok {
+			continue
+		}
 
 		joinedAt, ok := f.joinedAt[key]
 		if !ok {
@@ -4541,11 +4562,18 @@ func muteForever() *chatpb.MuteState {
 }
 
 // viewerState is the ViewerState every carrier projects: the mute under
-// settings (nil for none), the permissions, and the version.
-func viewerState(version uint64, mute *chatpb.MuteState, canEdit bool) *chatpb.ViewerState {
+// settings (nil for none), the permissions, and the version. isCreator is
+// whether the viewer is the group's creator while a member, which grants
+// can_edit and both moderation permissions together (see
+// chat.Chat.PermissionsFor).
+func viewerState(version uint64, mute *chatpb.MuteState, isCreator bool) *chatpb.ViewerState {
+	permissions := &chatpb.ViewerState_Permissions{CanEdit: isCreator}
+	if isCreator {
+		permissions.Moderation = &chatpb.ViewerState_ModerationPermissions{CanSilence: true, CanBan: true}
+	}
 	return &chatpb.ViewerState{
 		Settings:    &chatpb.ViewerState_Settings{Mute: mute},
-		Permissions: &chatpb.ViewerState_Permissions{CanEdit: canEdit},
+		Permissions: permissions,
 		Version:     version,
 	}
 }

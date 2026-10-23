@@ -21,8 +21,9 @@ import (
 // expires_at sweeping departed members' tombstones (see tombstoneTTL);
 // chat_user_state is keyed by (pk, sk) = (user, chat) — plus one "#meta"
 // aggregates item per chat — with a sparse GSI of a chat's recorded mutes by
-// when they end (see gsiByMuted) and an inverted GSI of a chat's records by
-// user (see gsiUserStateByUser); chat_activity is keyed by (pk, sk) = (chat,
+// when they end (see gsiByMuted), an inverted GSI of a chat's records by
+// user (see gsiUserStateByUser) and a sparse GSI of a chat's restricted
+// users by when they were restricted (see gsiRestricted); chat_activity is keyed by (pk, sk) = (chat,
 // user) with two LSIs, one by last_sent_at (lsiByLastSentAt) and one by
 // activity_score (lsiByActivityScore), and TTL on
 // expires_at; chat_key_envelopes is keyed by (pk, sk) = (user, chat) with no
@@ -33,7 +34,10 @@ import (
 // index; chat_holdings is keyed by pk = chat with a GSI ranking a mint's
 // groups by holdings (see gsiByMintRank) and a GSI of the refresh queue by
 // due time (see refreshQueueIndex). It is idempotent and blocks until
-// all tables are ACTIVE.
+// all tables are ACTIVE. It creates missing tables only: a table that
+// exists is left as it is, and so is never given an index added to its
+// definition here since it was created — gsiRestricted on a live
+// chat_user_state is added out of band (see the store's doc).
 func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
@@ -130,6 +134,7 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String(attrChat), AttributeType: types.ScalarAttributeTypeB},
 				{AttributeName: aws.String(attrMutedUntil), AttributeType: types.ScalarAttributeTypeN},
+				{AttributeName: aws.String(attrRestrictedSort), AttributeType: types.ScalarAttributeTypeB},
 			},
 			KeySchema: []types.KeySchemaElement{
 				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
@@ -163,6 +168,21 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 					KeySchema: []types.KeySchemaElement{
 						{AttributeName: aws.String(attrChat), KeyType: types.KeyTypeHash},
 						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+				{
+					// Sparse index of a chat's restricted users in listing
+					// order: restricted_sort exists only while a silence or a
+					// ban is recorded, so a lifted restriction leaves the index
+					// (see gsiRestricted). Full item projected, since a listing
+					// carries each user's whole state. Added after the table
+					// went live, so an existing table gets it out of band, not
+					// from here (see the store's doc).
+					IndexName: aws.String(gsiRestricted),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrChat), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrRestrictedSort), KeyType: types.KeyTypeRange},
 					},
 					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
 				},

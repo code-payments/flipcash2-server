@@ -73,6 +73,12 @@ import (
 // lost, since a retry is the no-op path, and the lobby and the chat are there
 // to read.
 //
+// A user the group's creator has banned (see Store.BanUser) holds no entry —
+// the ban removes one — and gains none until unbanned: EnterLobby is BANNED,
+// judged by the store in the write that would make the entry (see
+// ErrBanned), and an admission finds no one waiting (NOT_IN_LOBBY), even
+// when the ban lands between the creator's read of the lobby and the write.
+//
 // Caps (see LobbyLimits) are the store's to enforce in the write that would
 // exceed them, so they hold under concurrent entries; the server only names
 // them (lobbyLimits, DefaultLobbyLimits in production).
@@ -142,6 +148,8 @@ func (s *Server) EnterLobby(ctx context.Context, req *chatpb.EnterLobbyRequest) 
 	switch {
 	case errors.Is(err, ErrAlreadyMember):
 		return &chatpb.EnterLobbyResponse{Result: chatpb.EnterLobbyResponse_ALREADY_MEMBER}, nil
+	case errors.Is(err, ErrBanned):
+		return &chatpb.EnterLobbyResponse{Result: chatpb.EnterLobbyResponse_BANNED}, nil
 	case errors.Is(err, ErrLobbyFull):
 		return &chatpb.EnterLobbyResponse{Result: chatpb.EnterLobbyResponse_LOBBY_FULL}, nil
 	case errors.Is(err, ErrTooManyLobbies):
@@ -346,7 +354,9 @@ func (s *Server) AdmitLobbyMember(ctx context.Context, req *chatpb.AdmitLobbyMem
 	envelope := KeyEnvelopeFromProto(req.KeyEnvelope, userID)
 	changed, roster, err := s.chats.AdmitFromLobby(ctx, c.ID, req.UserId, envelope)
 	switch {
-	case errors.Is(err, ErrNotInLobby):
+	case errors.Is(err, ErrNotInLobby), errors.Is(err, ErrBanned):
+		// A banned user is not waiting: the ban removed their entry (see
+		// above).
 		return &chatpb.AdmitLobbyMemberResponse{Result: chatpb.AdmitLobbyMemberResponse_NOT_IN_LOBBY}, nil
 	case errors.Is(err, ErrChatNotFound):
 		return &chatpb.AdmitLobbyMemberResponse{Result: chatpb.AdmitLobbyMemberResponse_NOT_FOUND}, nil

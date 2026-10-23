@@ -371,7 +371,9 @@ func (s *Server) DeleteMessage(ctx context.Context, req *messagingpb.DeleteMessa
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	if allowed, err := s.canSpeak(ctx, log, req.ChatId, userID); err != nil {
+	// The speaker gate less a silence (see canDelete): a silenced member may
+	// still take back their own messages.
+	if allowed, err := s.canDelete(ctx, log, req.ChatId, userID); err != nil {
 		return nil, err
 	} else if !allowed {
 		return &messagingpb.DeleteMessageResponse{Result: messagingpb.DeleteMessageResponse_DENIED}, nil

@@ -124,10 +124,12 @@ func (f *fakeOcpBalance) GetBalances(_ context.Context, req *ocp_balancepb.GetBa
 }
 
 // fakeChats is a Store that serves rules from a map of group records,
-// membership from a set, and key envelopes from another, counting the reads
-// of each, so a test can see which evaluations touched the store. Only
-// GetGroupRules, IsMember and GetKeyEnvelope are exercised, as above; any
-// other read, the record's included, panics on the nil embedded Store.
+// membership from a set, key envelopes from another and viewer states from a
+// map, counting the reads of each, so a test can see which evaluations
+// touched the store. Only GetGroupRules, IsMember, GetKeyEnvelope and
+// GetViewerStates are exercised, as above; any other read, the record's
+// included, panics on the nil embedded Store. Each counter is moved by one
+// read alone, so the concurrent reads of a speaker gate never share one.
 type fakeChats struct {
 	Store
 
@@ -139,10 +141,30 @@ type fakeChats struct {
 
 	envelopes     map[string]bool
 	envelopeReads int
+
+	states     map[string]ViewerState
+	stateReads int
 }
 
 func newFakeChats() *fakeChats {
-	return &fakeChats{chats: make(map[string]*Chat), members: make(map[string]bool), envelopes: make(map[string]bool)}
+	return &fakeChats{chats: make(map[string]*Chat), members: make(map[string]bool), envelopes: make(map[string]bool), states: make(map[string]ViewerState)}
+}
+
+// setState records userID's viewer state in chatID, as a moderation write
+// would leave it.
+func (f *fakeChats) setState(chatID *commonpb.ChatId, userID *commonpb.UserId, state ViewerState) {
+	f.states[string(chatID.Value)+string(userID.Value)] = state
+}
+
+func (f *fakeChats) GetViewerStates(_ context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]ViewerState, error) {
+	f.stateReads++
+	out := make(map[string]ViewerState)
+	for _, chatID := range chatIDs {
+		if state, ok := f.states[string(chatID.Value)+string(userID.Value)]; ok {
+			out[string(chatID.Value)] = state
+		}
+	}
+	return out, nil
 }
 
 // storeKey records that userID has a key envelope for chatID; discardKey

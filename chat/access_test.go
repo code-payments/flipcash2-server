@@ -1128,3 +1128,146 @@ func TestAccess_Governance(t *testing.T) {
 		})
 	}
 }
+
+// TestAccess_Silence pins a silence's reach: it takes speech from a group
+// member, public or private, on the very next ask and whatever a remembered
+// admission says, but not deletion of their own messages, nor reading; it
+// lapses on its own; and a DM reads no restriction at all.
+func TestAccess_Silence(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	a := NewAccess(f.chats, f.rules, WithSpeakerAdmissionTTL(time.Hour))
+
+	creator := model.MustGenerateUserID()
+	private := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: creator})
+	f.chats.storeKey(private.ID, creator)
+	for _, chatID := range []*commonpb.ChatId{f.gated.ID, private.ID} {
+		f.chats.join(chatID, f.funded)
+	}
+
+	canSpeak := func(chatID *commonpb.ChatId) bool {
+		t.Helper()
+		ok, err := a.CanSpeak(ctx, chatID, f.funded)
+		require.NoError(t, err)
+		return ok
+	}
+	canDelete := func(chatID *commonpb.ChatId) bool {
+		t.Helper()
+		ok, err := a.CanDelete(ctx, chatID, f.funded)
+		require.NoError(t, err)
+		return ok
+	}
+
+	for _, chatID := range []*commonpb.ChatId{f.gated.ID, private.ID} {
+		// Speaking, and remembered as speaking where a verdict is remembered.
+		require.True(t, canSpeak(chatID))
+		require.True(t, canDelete(chatID))
+
+		// Silenced: no speech on the very next ask, the remembered admission
+		// notwithstanding, but deletion and reading stand.
+		f.chats.setState(chatID, f.funded, ViewerState{Silence: &Silence{Forever: true}})
+		speaker, err := a.SpeakerStanding(ctx, chatID, f.funded)
+		require.NoError(t, err)
+		require.Equal(t, SpeakerStanding{Silenced: true}, speaker)
+		require.False(t, canSpeak(chatID))
+		require.True(t, canDelete(chatID))
+		ok, err := a.CanListen(ctx, chatID, f.funded)
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		// A silence that has lapsed takes nothing.
+		f.chats.setState(chatID, f.funded, ViewerState{Silence: &Silence{Until: time.Now().Add(-time.Second)}})
+		require.True(t, canSpeak(chatID))
+
+		// A timed one still in force does.
+		f.chats.setState(chatID, f.funded, ViewerState{Silence: &Silence{Until: time.Now().Add(time.Hour)}})
+		require.False(t, canSpeak(chatID))
+		require.True(t, canDelete(chatID))
+	}
+
+	// A silence carves out deletion only from a refusal it caused: a
+	// silenced member of a keyless private group, who would be refused
+	// anyway, deletes nothing, and neither does a silenced non-member.
+	keyless := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: creator})
+	f.chats.join(keyless.ID, f.funded)
+	f.chats.setState(keyless.ID, f.funded, ViewerState{Silence: &Silence{Forever: true}})
+	require.False(t, canDelete(keyless.ID))
+	f.chats.setState(f.gated.ID, f.unfunded, ViewerState{Silence: &Silence{Forever: true}})
+	ok, err := a.CanDelete(ctx, f.gated.ID, f.unfunded)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// A DM reads no restriction: there is no creator to set one.
+	peer := model.MustGenerateUserID()
+	dm := MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, f.funded, peer)
+	f.chats.join(dm, f.funded)
+	f.chats.join(dm, peer)
+	reads := f.chats.stateReads
+	require.True(t, canSpeak(dm))
+	require.True(t, canDelete(dm))
+	require.Equal(t, reads, f.chats.stateReads)
+}
+
+// TestAccess_Ban pins a ban's reach on reads: a banned non-member of a public
+// group previews it and no more, whatever its rules say of them and whatever
+// admission was remembered before the ban, while a REDACTED read reads no ban
+// at all; lifting it restores the full read at once.
+func TestAccess_Ban(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	a := NewAccess(f.chats, f.rules)
+
+	open := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP})
+	for _, c := range []*Chat{f.gated, open} {
+		// Admitted, and remembered where a rule was evaluated.
+		ok, err := a.CanListen(ctx, c.ID, f.funded)
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		bannedAt := time.Now()
+		f.chats.setState(c.ID, f.funded, ViewerState{BannedAt: &bannedAt})
+		preview := ListenerStanding{CanPreview: true}
+		for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED} {
+			standing, err := a.ListenerStanding(ctx, c.ID, f.funded, mode)
+			require.NoError(t, err)
+			require.Equal(t, preview, standing, mode)
+			standing, err = a.ListenerStandingWithChat(ctx, c, f.funded, mode)
+			require.NoError(t, err)
+			require.Equal(t, preview, standing, mode)
+			standing, err = a.ListenerStandingWithRules(ctx, c.ID, c.ChatRules(), f.funded, mode)
+			require.NoError(t, err)
+			require.Equal(t, preview, standing, mode)
+		}
+		require.Equal(t, ReadingDenied, preview.Reading(messagingpb.ViewMode_FULL))
+		require.Equal(t, ReadingRedacted, preview.Reading(messagingpb.ViewMode_FULL_OR_REDACTED))
+
+		// REDACTED is answered with nothing read, the ban included.
+		reads := f.chats.stateReads
+		standing, err := a.ListenerStanding(ctx, c.ID, f.funded, messagingpb.ViewMode_REDACTED)
+		require.NoError(t, err)
+		require.Equal(t, preview, standing)
+		require.Equal(t, reads, f.chats.stateReads)
+
+		// Lifted, the full read is back on the next ask.
+		f.chats.setState(c.ID, f.funded, ViewerState{})
+		ok, err = a.CanListen(ctx, c.ID, f.funded)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+
+	// A user the rules refuse is previewed without the ban being read, since
+	// a ban only ever takes a full read away.
+	reads := f.chats.stateReads
+	standing, err := a.ListenerStanding(ctx, f.gated.ID, f.unfunded, messagingpb.ViewMode_FULL_OR_REDACTED)
+	require.NoError(t, err)
+	require.Equal(t, ListenerStanding{CanPreview: true}, standing)
+	require.Equal(t, reads, f.chats.stateReads)
+
+	// A member's read never asks: a banned user is never a member.
+	f.chats.join(open.ID, f.unfunded)
+	reads = f.chats.stateReads
+	ok, err := a.CanListen(ctx, open.ID, f.unfunded)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, reads, f.chats.stateReads)
+}

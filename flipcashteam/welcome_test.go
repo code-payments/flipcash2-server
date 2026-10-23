@@ -17,21 +17,20 @@ import (
 	ocp_headers "github.com/code-payments/ocp-server/grpc/headers"
 )
 
-func TestSendWelcomeV1(t *testing.T) {
+func TestSendWelcomeV2(t *testing.T) {
 	e := newChatEnv(t)
 
-	chatID, sent, err := flipcashteam.SendWelcomeV1(e.ctx, e.chats, e.sender, e.user, "alice_1")
+	chatID, sent, err := flipcashteam.SendWelcomeV2(e.ctx, e.chats, e.sender, e.user, "alice_1")
 	require.NoError(t, err)
 	require.Equal(t, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user).Value, chatID.Value)
 
 	// Every line is text but the third, a widget sharing the user's profile
 	// (empty here).
 	expected := []string{
-		"Welcome to Flipcash!",
-		"Tell people your Flipcash username is alice_1 to connect with you",
+		"Welcome to Flipcash, the group money app",
+		"Tell people your Flipcash username is alice_1 so they can find you, or share your profile with them",
 		"",
-		"Flipcash is the only chat app where people have to send you cash before they can message you, so you can say goodbye to spam",
-		"Happy chatting!",
+		"Enjoy!",
 	}
 	require.Len(t, sent, len(expected))
 	for i, text := range expected {
@@ -46,7 +45,7 @@ func TestSendWelcomeV1(t *testing.T) {
 
 	// A retry, even with another handle, returns the first welcome and sends
 	// nothing new.
-	_, replayed, err := flipcashteam.SendWelcomeV1(e.ctx, e.chats, e.sender, e.user, "bob")
+	_, replayed, err := flipcashteam.SendWelcomeV2(e.ctx, e.chats, e.sender, e.user, "bob")
 	require.NoError(t, err)
 	require.Len(t, replayed, len(expected))
 	require.Equal(t, expected[1], replayed[1].Content[0].GetText().Text)
@@ -74,8 +73,8 @@ func TestWelcomer(t *testing.T) {
 		require.NoError(t, err)
 		return len(msgs)
 	}
-	require.Eventually(t, func() bool { return stored() == 5 }, time.Second, 10*time.Millisecond)
-	require.Never(t, func() bool { return stored() != 5 }, 200*time.Millisecond, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return stored() == 4 }, time.Second, 10*time.Millisecond)
+	require.Never(t, func() bool { return stored() != 4 }, 200*time.Millisecond, 10*time.Millisecond)
 }
 
 // TestWelcomer_MinClientVersion: a welcome goes only to a user whose handle
@@ -112,7 +111,7 @@ func TestWelcomer_MinClientVersion(t *testing.T) {
 				return len(msgs)
 			}
 			if tc.welcomed {
-				require.Eventually(t, func() bool { return stored() == 5 }, time.Second, 10*time.Millisecond)
+				require.Eventually(t, func() bool { return stored() == 4 }, time.Second, 10*time.Millisecond)
 			} else {
 				require.Never(t, func() bool { return stored() != 0 }, 200*time.Millisecond, 10*time.Millisecond)
 			}
@@ -129,13 +128,13 @@ func withUserAgent(t *testing.T, ctx context.Context, userAgent string) context.
 	return ctx
 }
 
-func TestSendWelcomeV1_InvalidUsername(t *testing.T) {
+func TestSendWelcomeV2_InvalidUsername(t *testing.T) {
 	e := newChatEnv(t)
 
 	// A handle not in canonical form is refused, never repaired: it did not
 	// come from the store.
 	for _, username := range []string{"", "a", "Alice_1", "has space", "has/slash", "waytoolongausername"} {
-		_, _, err := flipcashteam.SendWelcomeV1(e.ctx, e.chats, e.sender, e.user, username)
+		_, _, err := flipcashteam.SendWelcomeV2(e.ctx, e.chats, e.sender, e.user, username)
 		require.ErrorIs(t, err, profile.ErrInvalidUsername, "username: %q", username)
 	}
 

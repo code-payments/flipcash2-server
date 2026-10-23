@@ -28,14 +28,15 @@ import (
 //	                  values below), creator and chat (B; the chat is the
 //	                  16-byte group chat ID), created_at (epoch nanos,
 //	                  exactly: a creator's share is paid at created_at to the
-//	                  nanosecond, which PaymentRequest.Validate checks), split
-//	                  (the marshalled paymentrequestpb.Split, shares' paid
-//	                  included, rewritten whole whenever a share is paid),
-//	                  payment_intent_ids (M: each debtor's user ID, hex, to
-//	                  their share's payment intent ID, B; written at creation
-//	                  and never again), status (N, see the status values
-//	                  below), version (N), and closed_at (epoch nanos) once
-//	                  the request is final.
+//	                  nanosecond, which PaymentRequest.Validate checks),
+//	                  details (B: the type's message marshalled, for a split
+//	                  the paymentrequestpb.Split, shares' paid included,
+//	                  rewritten whole whenever a share is paid),
+//	                  intent_ids (M: each debtor's user ID, hex, to their
+//	                  share's payment intent ID, B; written at creation and
+//	                  never again), status (N, see the status values below),
+//	                  version (N), and closed_at (epoch nanos) once the
+//	                  request is final.
 //
 // The request is the only item in its partition today. The sort key is there
 // so a type that outgrows one item (a request's shares or contributions as
@@ -44,9 +45,11 @@ import (
 // table exists. Such an item takes its own sk and must omit the index
 // attributes below.
 //
-// type says which of the request's type fields is set, and every reader
-// refuses a value it does not know rather than guess: a server that predates a
-// type fails reads of it instead of serving it as a split.
+// type says which of the request's type fields is set, and so which message
+// details holds; it is the only thing that says so, since every type stores its
+// message in the same attribute. Every reader refuses a value it does not know
+// rather than guess: a server that predates a type fails reads of it instead
+// of serving it as a split.
 //
 // A chat's requests are listed (GetChatPage) from two sparse GSIs, one per
 // section, each hashed on chat so a page is one key-range Query:
@@ -108,22 +111,22 @@ const (
 	// requestSK is the sort key of a request's own item.
 	requestSK = "#meta"
 
-	attrPK             = "pk"                 // B, the request ID
-	attrSK             = "sk"                 // S, requestSK for the request itself
-	attrType           = "type"               // N, see the type values
-	attrCreator        = "creator"            // B
-	attrChat           = "chat"               // B, the group chat ID (GSI hash of both section indexes)
-	attrCreatedAt      = "created_at"         // N, Unix nanos
-	attrSplit          = "split"              // B, the marshalled Split
-	attrIntentIDs      = "payment_intent_ids" // M, hex debtor user ID → B payment intent ID
-	attrStatus         = "status"             // N, see the status values
-	attrVersion        = "version"            // N
-	attrClosedAt       = "closed_at"          // N, Unix nanos; present only once final
-	attrOpenSort       = "open_sort"          // B, sortKey(ends_at, ID); present only while open
-	attrResolvedSort   = "resolved_sort"      // B, sortKey(closed_at, ID); present only once final
-	attrExpiryQueue    = "expiry_queue"       // S, expiryQueuePK (GSI hash); present only while queued
-	attrExpiryDueAt    = "expiry_due_at"      // N, Unix nanos (GSI range); when the request is next due
-	attrExpiryAttempts = "expiry_attempts"    // N, failed attempts so far
+	attrPK             = "pk"              // B, the request ID
+	attrSK             = "sk"              // S, requestSK for the request itself
+	attrType           = "type"            // N, see the type values
+	attrCreator        = "creator"         // B
+	attrChat           = "chat"            // B, the group chat ID (GSI hash of both section indexes)
+	attrCreatedAt      = "created_at"      // N, Unix nanos
+	attrDetails        = "details"         // B, the type's marshalled message
+	attrIntentIDs      = "intent_ids"      // M, hex debtor user ID → B payment intent ID
+	attrStatus         = "status"          // N, see the status values
+	attrVersion        = "version"         // N
+	attrClosedAt       = "closed_at"       // N, Unix nanos; present only once final
+	attrOpenSort       = "open_sort"       // B, sortKey(ends_at, ID); present only while open
+	attrResolvedSort   = "resolved_sort"   // B, sortKey(closed_at, ID); present only once final
+	attrExpiryQueue    = "expiry_queue"    // S, expiryQueuePK (GSI hash); present only while queued
+	attrExpiryDueAt    = "expiry_due_at"   // N, Unix nanos (GSI range); when the request is next due
+	attrExpiryAttempts = "expiry_attempts" // N, failed attempts so far
 
 	// maxWriteAttempts bounds how many times one change is tried against
 	// concurrent writers before it fails, and writeBackoffBase and
@@ -134,7 +137,8 @@ const (
 )
 
 // The stored type values, by stable number: which of PaymentRequest's type
-// fields is set. A new type takes the next number.
+// fields is set, and so which message details holds. A new type takes the next
+// number.
 const (
 	typeSplit = 1
 )
@@ -188,7 +192,7 @@ func (s *store) Create(ctx context.Context, r *paymentrequest.PaymentRequest) er
 	if err := r.Validate(); err != nil {
 		return err
 	}
-	split, err := proto.Marshal(r.Split)
+	details, err := proto.Marshal(r.Split)
 	if err != nil {
 		return fmt.Errorf("marshalling split: %w", err)
 	}
@@ -205,7 +209,7 @@ func (s *store) Create(ctx context.Context, r *paymentrequest.PaymentRequest) er
 		attrCreator:        avB(r.Creator.Value),
 		attrChat:           avB(r.ChatID.Value),
 		attrCreatedAt:      avNInt(r.CreatedAt.UnixNano()),
-		attrSplit:          avB(split),
+		attrDetails:        avB(details),
 		attrIntentIDs:      &types.AttributeValueMemberM{Value: intentIDs},
 		attrStatus:         avNInt(statusOpen),
 		attrVersion:        avNInt(1),
@@ -331,12 +335,12 @@ func (s *store) PayShare(ctx context.Context, id *paymentrequestpb.PaymentReques
 		readVersion, readStatus := r.Version, r.Status
 		share.Paid = proto.Clone(paid).(*paymentrequestpb.PaidShare)
 		r.Version++
-		split, err := proto.Marshal(r.Split)
+		details, err := proto.Marshal(r.Split)
 		if err != nil {
 			return nil, false, fmt.Errorf("marshalling split: %w", err)
 		}
 		ch := &change{set: map[string]types.AttributeValue{
-			attrSplit:   avB(split),
+			attrDetails: avB(details),
 			attrVersion: avNInt(int64(r.Version)),
 		}}
 		if r.Status == paymentrequest.StatusOpen && r.AllSharesPaid() {
@@ -699,9 +703,9 @@ func wait(ctx context.Context, backoff *time.Duration) error {
 }
 
 func requestFromItem(item map[string]types.AttributeValue) (*paymentrequest.PaymentRequest, error) {
-	// Decide the type before reading anything type-specific, and refuse one
-	// this server does not know: an absent split would otherwise unmarshal as
-	// an empty one.
+	// Decide the type before reading details, and refuse one this server does
+	// not know: details is every type's attribute, so another type's message
+	// could otherwise be read as a split.
 	storedType, err := parseInt(item[attrType])
 	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", attrType, err)
@@ -709,12 +713,12 @@ func requestFromItem(item map[string]types.AttributeValue) (*paymentrequest.Paym
 	if storedType != typeSplit {
 		return nil, fmt.Errorf("unexpected payment request type %d", storedType)
 	}
-	splitBytes, ok := item[attrSplit].(*types.AttributeValueMemberB)
+	details, ok := item[attrDetails].(*types.AttributeValueMemberB)
 	if !ok {
-		return nil, fmt.Errorf("%s is missing or not binary", attrSplit)
+		return nil, fmt.Errorf("%s is missing or not binary", attrDetails)
 	}
 	split := &paymentrequestpb.Split{}
-	if err := proto.Unmarshal(splitBytes.Value, split); err != nil {
+	if err := proto.Unmarshal(details.Value, split); err != nil {
 		return nil, fmt.Errorf("unmarshalling split: %w", err)
 	}
 
@@ -761,7 +765,7 @@ func requestFromItem(item map[string]types.AttributeValue) (*paymentrequest.Paym
 	return r, nil
 }
 
-// intentIDsFromItem decodes the payment_intent_ids map: each debtor's user ID,
+// intentIDsFromItem decodes the intent_ids map: each debtor's user ID,
 // hex, to their share's payment intent ID.
 func intentIDsFromItem(av types.AttributeValue) (map[string][]byte, error) {
 	m, ok := av.(*types.AttributeValueMemberM)

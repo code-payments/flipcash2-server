@@ -9,11 +9,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/mr-tron/base58"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/intent"
@@ -184,6 +186,82 @@ func (e *Executor) recordReactionBoost(ctx context.Context, record *ocp_task.Rec
 	return nil
 }
 
+// recordRequestedPayment records a requested payment: it marks the payer's
+// share of the payment request paid by the payment's intent, as of when the
+// intent was created (paymentrequest.Store.PayShare, which completes the
+// request if it was the last unpaid share), then injects one cash message into the group as the
+// payer, naming the request's creator as its single receiver and carrying the
+// request's ID. A returned error means the task is retried with backoff.
+//
+// Nothing about the request or the group is checked again: the request being
+// open, the payer's unpaid share, the amount, the currency and the payee were
+// judged when the payment was validated (see intent.Integration), and the
+// payment has happened since. So the share is recorded whatever the request's
+// status now (a close or an expiry in between must not lose a payment; the
+// store records a payment's share whatever the status), and the message lands
+// whoever has left the group. A share the creator marked paid by hand in
+// between is replaced by this payment (see paymentrequest.PaidShareSupersedes),
+// so the record shows the money that arrived. A share already paid by a
+// payment (a repeat of this task) is the store's no-op, and the message is
+// still sent: the money moved either way, and the message records that it
+// did.
+//
+// The share is marked before the message is sent, so a failure between the
+// two is retried as a no-op mark and then the one message; the reverse order
+// could post a message for a share never marked. Idempotency under
+// at-least-once delivery comes from the store for the share (its first
+// payment stands) and, for the message, from the task's UUID as its client
+// message ID (see sendCashMessage). Refusals that a validated payment never
+// produces (a request that does not exist, a payer with no share, a payment
+// to several people) are returned like any failure, so they are retried and
+// surfaced rather than dropping the record of a payment that was made. That
+// includes a payment whose intent is not the share's (the store refuses it,
+// see paymentrequest.ValidatePaymentIntent): only a path that skipped intent
+// validation produces one, and it fails here on every retry rather than
+// passing as a no-op on a share already paid.
+func (e *Executor) recordRequestedPayment(ctx context.Context, record *ocp_task.Record) error {
+	payment, err := e.loadChatPayment(ctx, record)
+	if err != nil {
+		return err
+	}
+
+	requested := payment.chatMetadata.GetRequestedPayment()
+	if requested == nil {
+		return errors.New("intent is not a requested payment")
+	}
+
+	// A share is paid to the request's creator alone, so a requested payment
+	// is never a multi payment.
+	if len(payment.recipients) != 1 {
+		return fmt.Errorf("requested payment has %d recipients", len(payment.recipients))
+	}
+
+	chatID := payment.chatMetadata.GetChatId()
+	if !chat.IsGroupChatID(chatID) {
+		return errors.New("chat id is not a group")
+	}
+
+	// The share was paid when the payment was made, not when this task runs:
+	// a retried task must not move paid_at (nor, for the last share, the
+	// request's closed_at) later, past an ends_at the payment was validated
+	// before.
+	requestID := requested.GetPaymentRequestId()
+	if _, _, err := e.requests.PayShare(ctx, requestID, payment.senderUserID, &paymentrequestpb.PaidShare{
+		PaidAt: timestamppb.New(payment.intentRecord.CreatedAt),
+		How: &paymentrequestpb.PaidShare_Intent{
+			Intent: &commonpb.IntentId{Value: payment.rawIntentID},
+		},
+	}, time.Now()); err != nil {
+		// paymentrequest.ErrNotFound, ErrNotAShare and ErrWrongIntent
+		// included: a validated payment never produces them, so they are
+		// surfaced, not dropped.
+		return fmt.Errorf("failed to mark share paid: %w", err)
+	}
+
+	payment.paymentRequestID = requestID
+	return e.sendCashMessage(ctx, chatID, payment)
+}
+
 // chatPayment is a validated chat payment, reloaded for the task that injects
 // its cash message.
 type chatPayment struct {
@@ -201,6 +279,11 @@ type chatPayment struct {
 
 	// amount is the whole payment, every recipient's part together.
 	amount *commonpb.CryptoPaymentAmount
+
+	// paymentRequestID is the payment request whose share the payment paid,
+	// set by recordRequestedPayment alone and carried on its cash message;
+	// nil for every other payment.
+	paymentRequestID *paymentrequestpb.PaymentRequestId
 }
 
 // chatPaymentRecipient is one recipient of a chat payment and their part of
@@ -272,7 +355,9 @@ func (e *Executor) loadChatPayment(ctx context.Context, record *ocp_task.Record)
 // sendCashMessage sends the payment's cash message into chatID as the
 // payer: carrying the whole payment as its total, and naming its recipient as
 // its single receiver, or, for a payment to several, listing each recipient
-// with their part, in the payment's order, as its multi receiver.
+// with their part, in the payment's order, as its multi receiver. A requested
+// payment's message also carries the request's ID (payment.paymentRequestID);
+// every other cash message leaves it unset.
 //
 // Idempotency under at-least-once delivery comes from the messaging layer:
 // sends dedupe on (chatID, clientMessageID), and the client message ID is the
@@ -282,7 +367,8 @@ func (e *Executor) sendCashMessage(ctx context.Context, chatID *commonpb.ChatId,
 		IntentId:    &commonpb.IntentId{Value: payment.rawIntentID},
 		TotalAmount: payment.amount,
 		// The verb is how the client renders the payment.
-		Verb: intent.GetChatPaymentVerb(payment.intentRecord.AppMetadata, payment.intentRecord.CreatedAt),
+		Verb:             intent.GetChatPaymentVerb(payment.intentRecord.AppMetadata, payment.intentRecord.CreatedAt),
+		PaymentRequestId: payment.paymentRequestID,
 	}
 	switch len(payment.recipients) {
 	case 0:

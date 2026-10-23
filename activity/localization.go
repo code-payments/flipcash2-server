@@ -32,6 +32,10 @@ func injectLocalizedTextForHistory(record *history.Record, notification *activit
 			// whose record is the total and names no one, so it must not
 			// read Gave, which is a payment handed off in person.
 			localizedText = "Sent"
+		case intent.GetRequestedPayment(record.AppMetadata) != nil:
+			// A requested payment is always a send, of the payer's share to
+			// the request's creator, who is named beside it.
+			localizedText = "Sent"
 		case notification.GetDirectlySentCrypto().GetDestinationIdentifier() == nil:
 			localizedText = "Gave"
 		case intent.GetChatPaymentVerb(record.AppMetadata, record.CreatedAt) == messagingpb.CashContent_TIPPED:

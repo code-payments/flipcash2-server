@@ -2,6 +2,7 @@ package task_test
 
 import (
 	"context"
+	"crypto/rand"
 	"testing"
 	"time"
 
@@ -11,12 +12,14 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
 
 	"github.com/code-payments/flipcash2-server/account"
 	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
@@ -31,11 +34,14 @@ import (
 	"github.com/code-payments/flipcash2-server/messaging"
 	messagingmemory "github.com/code-payments/flipcash2-server/messaging/memory"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/paymentrequest"
+	paymentrequestmemory "github.com/code-payments/flipcash2-server/paymentrequest/memory"
 	profilememory "github.com/code-payments/flipcash2-server/profile/memory"
 	"github.com/code-payments/flipcash2-server/push"
 	"github.com/code-payments/flipcash2-server/task"
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
+	ocp_task "github.com/code-payments/ocp-server/ocp/data/task"
 	ocp_integration "github.com/code-payments/ocp-server/ocp/integration"
 )
 
@@ -55,8 +61,9 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, nil)
-	executor := task.NewExecutor(accounts, chats, sender, ocpData)
-	integration := intent.NewIntegration(accounts, chats, messages, profiles, nil, nil, nil)
+	requests := paymentrequestmemory.NewInMemory()
+	executor := task.NewExecutor(accounts, chats, requests, sender, ocpData)
+	integration := intent.NewIntegration(accounts, chats, messages, profiles, requests, nil, nil, nil)
 
 	senderUserID := model.MustGenerateUserID()
 	senderKeys := model.MustGenerateKeyPair()
@@ -218,8 +225,9 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	}
 	chats := chatmemory.NewInMemory([]*commonpb.UserId{teamUserID})
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, teamUserID)
-	executor := task.NewExecutor(accounts, chats, sender, ocpData)
-	integration := intent.NewIntegration(accounts, chats, messages, profiles, nil, nil, nil)
+	requests := paymentrequestmemory.NewInMemory()
+	executor := task.NewExecutor(accounts, chats, requests, sender, ocpData)
+	integration := intent.NewIntegration(accounts, chats, messages, profiles, requests, nil, nil, nil)
 
 	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
 
@@ -330,6 +338,7 @@ type groupPaymentEnv struct {
 	accounts    *staffAccounts
 	chats       chat.Store
 	messages    messaging.Store
+	requests    paymentrequest.Store
 	ocpData     ocp_data.Provider
 	executor    ocp_integration.TaskExecutor
 	integration ocp_integration.SubmitIntent
@@ -350,15 +359,17 @@ func newGroupPaymentEnv(t *testing.T) *groupPaymentEnv {
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
 	sender := messaging.NewSender(log, badgememory.NewInMemory(), chats, messages, profiles, blocklistmemory.NewInMemory(), media, ocpData, push.NewNoOpPusher(), bus, chatBus, nil)
 	access := chat.NewAccess(chats, chat.NewRuleEvaluator(accounts, nil, chats, nil), chat.WithSpeakerAdmissionTTL(0))
+	requests := paymentrequestmemory.NewInMemory()
 
 	return &groupPaymentEnv{
 		ctx:         ctx,
 		accounts:    accounts,
 		chats:       chats,
 		messages:    messages,
+		requests:    requests,
 		ocpData:     ocpData,
-		executor:    task.NewExecutor(accounts, chats, sender, ocpData),
-		integration: intent.NewIntegration(accounts, chats, messages, profiles, access, nil, nil),
+		executor:    task.NewExecutor(accounts, chats, requests, sender, ocpData),
+		integration: intent.NewIntegration(accounts, chats, messages, profiles, requests, access, nil, nil),
 	}
 }
 
@@ -373,12 +384,16 @@ func (e *groupPaymentEnv) bindUser(t *testing.T) (*commonpb.UserId, model.KeyPai
 // pay validates and saves a payment from one user to another carrying
 // chatMetadata, returning the intent record and its raw ID.
 func (e *groupPaymentEnv) pay(t *testing.T, chatMetadata *intentpb.ChatMetadata, from, to model.KeyPair) (*ocp_intent.Record, []byte) {
+	return e.payWithIntentID(t, chatMetadata, from, to, model.MustGenerateKeyPair().Public())
+}
+
+// payWithIntentID is pay under the intent ID rawIntentID.
+func (e *groupPaymentEnv) payWithIntentID(t *testing.T, chatMetadata *intentpb.ChatMetadata, from, to model.KeyPair, rawIntentID []byte) (*ocp_intent.Record, []byte) {
 	appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
 		Domain: &intentpb.AppMetadata_Chat{Chat: chatMetadata},
 	})
 	require.NoError(t, err)
 
-	rawIntentID := []byte(model.MustGenerateKeyPair().Public())
 	intentRecord := &ocp_intent.Record{
 		IntentId:              base58.Encode(rawIntentID),
 		IntentType:            ocp_intent.SendPublicPayment,
@@ -501,6 +516,7 @@ func TestExecutor_SendGroupPaymentMessage(t *testing.T) {
 	assert.EqualValues(t, 2.5, cash.TotalAmount.GetNativeAmount())
 	assert.True(t, proto.Equal(recipientUserID, cash.GetSingleReceiver()))
 	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetVerb())
+	assert.Nil(t, cash.GetPaymentRequestId())
 
 	// Tasks are delivered at least once, so re-execution must not duplicate
 	// the message.
@@ -967,4 +983,363 @@ func TestExecutor_RecordReactionBoost_Mismatched(t *testing.T) {
 	summary, err := e.messages.GetReactionSummary(e.ctx, groupID, &messagingpb.MessageId{Value: 1})
 	require.NoError(t, err)
 	require.Empty(t, summary)
+}
+
+// putGroup creates a public group with no rules, created by creator, whose
+// members are creator and members.
+func (e *groupPaymentEnv) putGroup(t *testing.T, creator *commonpb.UserId, members ...*commonpb.UserId) *commonpb.ChatId {
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Title:        "Group",
+		CreatorID:    creator,
+		Members:      append([]*commonpb.UserId{creator}, members...),
+		LastActivity: time.Now(),
+	}))
+	return groupID
+}
+
+// putRequest creates an open USD split by creator in chatID, ending in an
+// hour, asking each of debtors for $2.50, what pay pays.
+func (e *groupPaymentEnv) putRequest(t *testing.T, chatID *commonpb.ChatId, creator *commonpb.UserId, debtors ...*commonpb.UserId) *paymentrequest.PaymentRequest {
+	key := make([]byte, paymentrequest.IdempotencyKeySize)
+	_, err := rand.Read(key)
+	require.NoError(t, err)
+
+	split := &paymentrequestpb.Split{
+		Text: &paymentrequestpb.Split_Plaintext{
+			Plaintext: &paymentrequestpb.PaymentRequestText{Title: "Dinner"},
+		},
+		Currency: "usd",
+		EndsAt:   timestamppb.New(time.Now().Add(time.Hour)),
+	}
+	for _, debtor := range debtors {
+		split.Shares = append(split.Shares, &paymentrequestpb.Share{UserId: debtor, NativeAmount: 2.5})
+	}
+
+	id := paymentrequest.MustDeriveID(creator, &paymentrequestpb.IdempotencyKey{Value: key})
+	r, err := paymentrequest.NewSplitRequest(id, creator, chatID, split, time.Now())
+	require.NoError(t, err)
+	require.NoError(t, e.requests.Create(e.ctx, r))
+	return r
+}
+
+func requestedPaymentMetadata(chatID *commonpb.ChatId, requestID *paymentrequestpb.PaymentRequestId) *intentpb.ChatMetadata {
+	return &intentpb.ChatMetadata{
+		ChatId: chatID,
+		Type: &intentpb.ChatMetadata_RequestedPayment_{
+			RequestedPayment: &intentpb.ChatMetadata_RequestedPayment{PaymentRequestId: requestID},
+		},
+	}
+}
+
+// payShare saves and validates a $2.50 payment of the payer's share of r,
+// under the payment intent ID r holds for it, returning the intent record and
+// its raw ID.
+func (e *groupPaymentEnv) payShare(t *testing.T, r *paymentrequest.PaymentRequest, from, to model.KeyPair) (*ocp_intent.Record, []byte) {
+	payerUserID, err := e.accounts.GetUserId(e.ctx, &commonpb.PublicKey{Value: from.Public()})
+	require.NoError(t, err)
+	intentID := r.PaymentIntentID(payerUserID)
+	require.NotNil(t, intentID)
+
+	intentRecord, rawIntentID := e.payWithIntentID(t, requestedPaymentMetadata(r.ChatID, r.ID), from, to, intentID)
+	require.NoError(t, e.integration.AllowCreation(e.ctx, intentRecord, nil, nil))
+	return intentRecord, rawIntentID
+}
+
+// scheduled returns the one task a validated intent schedules.
+func (e *groupPaymentEnv) scheduled(t *testing.T, intentRecord *ocp_intent.Record) *ocp_task.Record {
+	tasks, err := e.integration.GetTasksToSchedule(e.ctx, intentRecord)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	return tasks[0]
+}
+
+// requireRequestedCash checks that msg is the cash message of a requested
+// payment of r's share by payer, paid by the intent rawIntentID.
+func requireRequestedCash(t *testing.T, msg *messaging.Message, r *paymentrequest.PaymentRequest, payer *commonpb.UserId, rawIntentID []byte) {
+	require.True(t, proto.Equal(payer, msg.SenderID))
+	require.Len(t, msg.Content, 1)
+	cash := msg.Content[0].GetCash()
+	require.NotNil(t, cash)
+	assert.Equal(t, rawIntentID, cash.IntentId.GetValue())
+	assert.EqualValues(t, 25_000, cash.TotalAmount.GetQuarks())
+	assert.Equal(t, "usd", cash.TotalAmount.GetCurrency())
+	assert.EqualValues(t, 2.5, cash.TotalAmount.GetNativeAmount())
+	assert.True(t, proto.Equal(r.Creator, cash.GetSingleReceiver()))
+	assert.True(t, proto.Equal(r.ID, cash.GetPaymentRequestId()))
+	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetVerb())
+	require.NoError(t, cash.ValidateAll())
+}
+
+func TestExecutor_RecordRequestedPayment(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+	otherUserID, otherKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, creatorUserID, payerUserID, otherUserID)
+	r := e.putRequest(t, groupID, creatorUserID, creatorUserID, payerUserID, otherUserID)
+
+	// A validated payment schedules the requested payment task, and executing
+	// it marks the payer's share paid with the payment's intent and posts the
+	// cash message into the group as the payer, to the creator, naming the
+	// request.
+	intentRecord, rawIntentID := e.payShare(t, r, payerKeys, creatorKeys)
+	task := e.scheduled(t, intentRecord)
+	assert.Equal(t, intent.TaskTypeRecordRequestedPayment, task.Type)
+	require.NoError(t, e.executor.Execute(e.ctx, task))
+
+	stored, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, paymentrequest.StatusOpen, stored.Status)
+	assert.EqualValues(t, 2, stored.Version)
+	paid := stored.Share(payerUserID).GetPaid()
+	require.NotNil(t, paid)
+	assert.Equal(t, rawIntentID, paid.GetIntent().GetValue())
+	assert.Nil(t, stored.Share(otherUserID).GetPaid())
+
+	// The share was paid when the payment was made, not when the task ran.
+	assert.True(t, intentRecord.CreatedAt.Equal(paid.PaidAt.AsTime()), "paid_at %s, intent created %s", paid.PaidAt.AsTime(), intentRecord.CreatedAt)
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+
+	// Tasks are delivered at least once, so re-execution changes neither the
+	// share nor the message.
+	require.NoError(t, e.executor.Execute(e.ctx, task))
+	again, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, again.Version)
+	assert.True(t, proto.Equal(paid, again.Share(payerUserID).GetPaid()))
+	msgs, err = e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+
+	// The last share paid completes the request, closed when that payment
+	// was made, not when its task ran.
+	intentRecord, otherIntentID := e.payShare(t, r, otherKeys, creatorKeys)
+	require.NoError(t, e.executor.Execute(e.ctx, e.scheduled(t, intentRecord)))
+
+	stored, err = e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, paymentrequest.StatusCompleted, stored.Status)
+	assert.EqualValues(t, 3, stored.Version)
+	assert.True(t, stored.AllSharesPaid())
+	assert.Equal(t, otherIntentID, stored.Share(otherUserID).GetPaid().GetIntent().GetValue())
+	assert.True(t, intentRecord.CreatedAt.Equal(stored.Share(otherUserID).GetPaid().PaidAt.AsTime()))
+	require.NotNil(t, stored.ClosedAt)
+	assert.True(t, intentRecord.CreatedAt.Equal(*stored.ClosedAt), "closed_at %s, intent created %s", *stored.ClosedAt, intentRecord.CreatedAt)
+
+	msgs, err = e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	requireRequestedCash(t, msgs[1], r, otherUserID, otherIntentID)
+}
+
+// A second payment of a share made before the first's task has marked it
+// passes validation, which reads the share unpaid, but cannot commit: it must
+// use the share's one payment intent ID, which OCP stores at most once. So
+// the share is paid, and its message posted, once.
+func TestExecutor_RecordRequestedPayment_OncePerShare(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, creatorUserID, payerUserID)
+	r := e.putRequest(t, groupID, creatorUserID, payerUserID)
+
+	intentRecord, rawIntentID := e.payShare(t, r, payerKeys, creatorKeys)
+
+	second := intentRecord.Clone()
+	second.Id = 0
+	second.Version = 0
+	second.CreatedAt = time.Now()
+	require.NoError(t, e.integration.AllowCreation(e.ctx, &second, nil, nil))
+	require.ErrorIs(t, e.ocpData.SaveIntent(e.ctx, &second), ocp_intent.ErrStaleVersion)
+
+	require.NoError(t, e.executor.Execute(e.ctx, e.scheduled(t, intentRecord)))
+
+	stored, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, rawIntentID, stored.Share(payerUserID).GetPaid().GetIntent().GetValue())
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+}
+
+// A share the creator marks paid by hand between the payment's validation
+// and its task is replaced by the payment, so the record shows the money that
+// arrived, and the payment's message is posted once.
+func TestExecutor_RecordRequestedPayment_PaidByHand(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, creatorUserID, payerUserID)
+	r := e.putRequest(t, groupID, creatorUserID, payerUserID)
+
+	intentRecord, rawIntentID := e.payShare(t, r, payerKeys, creatorKeys)
+
+	manual := &paymentrequestpb.PaidShare{
+		PaidAt: timestamppb.Now(),
+		How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
+	}
+	marked, changed, err := e.requests.PayShare(e.ctx, r.ID, payerUserID, manual, time.Now())
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	require.Equal(t, paymentrequest.StatusCompleted, marked.Status)
+
+	task := e.scheduled(t, intentRecord)
+	require.NoError(t, e.executor.Execute(e.ctx, task))
+
+	// The hand mark completed the request; the payment replaces it at the
+	// next version and leaves the completion as it was.
+	stored, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, marked.Version+1, stored.Version)
+	assert.Equal(t, paymentrequest.StatusCompleted, stored.Status)
+	assert.True(t, marked.ClosedAt.Equal(*stored.ClosedAt))
+	paid := stored.Share(payerUserID).GetPaid()
+	assert.Equal(t, rawIntentID, paid.GetIntent().GetValue())
+	assert.True(t, intentRecord.CreatedAt.Equal(paid.PaidAt.AsTime()))
+
+	// A repeat of the task changes nothing.
+	require.NoError(t, e.executor.Execute(e.ctx, task))
+	again, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, stored.Version, again.Version)
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+}
+
+// A request closed between the payment's validation and its task still has
+// the share recorded, and stays closed; the message is posted, even if the
+// payer has left the group in between.
+func TestExecutor_RecordRequestedPayment_ClosedSinceValidation(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+	otherUserID, _ := e.bindUser(t)
+
+	groupID := e.putGroup(t, creatorUserID, payerUserID, otherUserID)
+	r := e.putRequest(t, groupID, creatorUserID, payerUserID, otherUserID)
+
+	intentRecord, rawIntentID := e.payShare(t, r, payerKeys, creatorKeys)
+
+	closed, changed, err := e.requests.Close(e.ctx, r.ID, time.Now())
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, _, err = e.chats.RemoveGroupMember(e.ctx, groupID, payerUserID, false)
+	require.NoError(t, err)
+
+	require.NoError(t, e.executor.Execute(e.ctx, e.scheduled(t, intentRecord)))
+
+	stored, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, paymentrequest.StatusClosed, stored.Status)
+	assert.Equal(t, closed.Version+1, stored.Version)
+	assert.Equal(t, rawIntentID, stored.Share(payerUserID).GetPaid().GetIntent().GetValue())
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+}
+
+// A requested payment task fails, to be retried, rather than mark a share or
+// post a message it cannot make whole: for a payment that is not a requested
+// payment, one to several people, one naming a request that does not exist,
+// or one by a payer with no share.
+func TestExecutor_RecordRequestedPayment_Mismatched(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+	otherUserID, otherKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, creatorUserID, payerUserID, otherUserID)
+	r := e.putRequest(t, groupID, creatorUserID, payerUserID)
+
+	groupPayment, _ := e.pay(t, groupPaymentMetadata(groupID), payerKeys, creatorKeys)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewRecordRequestedPaymentTask(groupPayment)), "not a requested payment")
+
+	multi := e.multiPay(t, requestedPaymentMetadata(groupID, r.ID), payerKeys,
+		multiPayment{to: creatorKeys, quarks: 10_000},
+		multiPayment{to: otherKeys, quarks: 10_000},
+	)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewRecordRequestedPaymentTask(multi)), "requested payment has 2 recipients")
+
+	toDm, _ := e.pay(t, requestedPaymentMetadata(chat.MustDeriveDmChatID(chatpb.ChatType_DM, payerUserID, creatorUserID), r.ID), payerKeys, creatorKeys)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewRecordRequestedPaymentTask(toDm)), "chat id is not a group")
+
+	missing := paymentrequest.MustDeriveID(creatorUserID, &paymentrequestpb.IdempotencyKey{Value: make([]byte, paymentrequest.IdempotencyKeySize)})
+	toMissing, _ := e.pay(t, requestedPaymentMetadata(groupID, missing), payerKeys, creatorKeys)
+	require.ErrorIs(t, e.executor.Execute(e.ctx, intent.NewRecordRequestedPaymentTask(toMissing)), paymentrequest.ErrNotFound)
+
+	noShare, _ := e.pay(t, requestedPaymentMetadata(groupID, r.ID), otherKeys, creatorKeys)
+	require.ErrorIs(t, e.executor.Execute(e.ctx, intent.NewRecordRequestedPaymentTask(noShare)), paymentrequest.ErrNotAShare)
+
+	// A payment of the share under any intent but the share's, which
+	// validation would have refused, is refused by the store too.
+	wrongIntent, _ := e.pay(t, requestedPaymentMetadata(groupID, r.ID), payerKeys, creatorKeys)
+	require.ErrorIs(t, e.executor.Execute(e.ctx, intent.NewRecordRequestedPaymentTask(wrongIntent)), paymentrequest.ErrWrongIntent)
+
+	// And a group payment task refuses a requested payment.
+	requested, _ := e.pay(t, requestedPaymentMetadata(groupID, r.ID), payerKeys, creatorKeys)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewSendGroupPaymentMessageTask(requested)), "not a group payment")
+
+	stored, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, stored.Version)
+	assert.Nil(t, stored.Share(payerUserID).GetPaid())
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+}
+
+// A payment of a share already paid under an intent that is not the share's
+// can only come from a path that skipped validation. Its task fails, on every
+// retry, rather than passing as a no-op on the paid share, and posts nothing.
+func TestExecutor_RecordRequestedPayment_WrongIntentOnPaidShare(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, creatorUserID, payerUserID)
+	r := e.putRequest(t, groupID, creatorUserID, payerUserID)
+
+	intentRecord, rawIntentID := e.payShare(t, r, payerKeys, creatorKeys)
+	require.NoError(t, e.executor.Execute(e.ctx, e.scheduled(t, intentRecord)))
+
+	unvalidated, _ := e.pay(t, requestedPaymentMetadata(groupID, r.ID), payerKeys, creatorKeys)
+	task := intent.NewRecordRequestedPaymentTask(unvalidated)
+	for range 2 {
+		require.ErrorIs(t, e.executor.Execute(e.ctx, task), paymentrequest.ErrWrongIntent)
+	}
+
+	stored, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, stored.Version)
+	assert.Equal(t, rawIntentID, stored.Share(payerUserID).GetPaid().GetIntent().GetValue())
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
 }

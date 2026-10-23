@@ -25,6 +25,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
 	pollpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/poll/v1"
 	pushpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/push/v1"
 
@@ -40,6 +41,8 @@ import (
 	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/messaging"
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/paymentrequest"
+	paymentrequest_memory "github.com/code-payments/flipcash2-server/paymentrequest/memory"
 	"github.com/code-payments/flipcash2-server/poll"
 	poll_memory "github.com/code-payments/flipcash2-server/poll/memory"
 	"github.com/code-payments/flipcash2-server/profile"
@@ -67,6 +70,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_WidgetContent,
 		testServer_PollWidget,
 		testServer_PollWidget_PrivateGroup,
+		testServer_PaymentRequestWidget,
+		testServer_PaymentRequestWidget_PrivateGroup,
 		testServer_SendMessage_Broadcast,
 		testServer_SendBatch,
 		testServer_SendBatch_SideEffects,
@@ -152,6 +157,10 @@ type serverEnv struct {
 
 	// polls is the poll store the server checks a poll's send against.
 	polls poll.Store
+
+	// requests is the payment request store the server checks a payment
+	// request's send against.
+	requests paymentrequest.Store
 }
 
 // fakeOcpBalance is the OCP balance service behind the env's balance client,
@@ -276,7 +285,8 @@ func newServerEnvWithTeam(t *testing.T, badges badge.Store, blocklists blocklist
 	// test (see chat.DefaultSpeakerAdmissionTTL).
 	access := chat.NewAccess(chats, chat.NewRuleEvaluator(env.accounts, balances, chats, teamUserID), chat.WithSpeakerAdmissionTTL(0))
 	env.polls = poll_memory.NewInMemory()
-	server := messaging.NewServer(log, authz, chats, media, messages, env.polls, access, sender)
+	env.requests = paymentrequest_memory.NewInMemory()
+	server := messaging.NewServer(log, authz, chats, media, messages, env.polls, env.requests, access, sender)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
 		messagingpb.RegisterMessagingServer(s, server)
 	}))
@@ -3781,6 +3791,174 @@ func testServer_PollWidget_PrivateGroup(t *testing.T, badges badge.Store, blockl
 	resp, err := e.sendContentToChat(e.keysA, groupID, pollWidgetContent(p.ID), generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_ENCRYPTION_REQUIRED, resp.Result)
+}
+
+// testServer_PaymentRequestWidget pins sending a payment request in a public
+// group: only its creator, only in its chat, but whatever its status and any
+// number of times, with nothing written on the request. A request is never a
+// reply's body or an edit, and its message, which is its creator's, may be
+// deleted without touching the request.
+func testServer_PaymentRequestWidget(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	groupID := chat.MustGenerateGroupChatID()
+	otherGroupID := chat.MustGenerateGroupChatID()
+	for _, id := range []*commonpb.ChatId{groupID, otherGroupID} {
+		require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+			ID:           id,
+			Type:         chatpb.ChatType_GROUP,
+			Members:      []*commonpb.UserId{e.userA, e.userB},
+			CreatorID:    e.userA,
+			LastActivity: at(1),
+		}))
+	}
+
+	request := e.putPaymentRequest(groupID, e.userA, e.userB)
+
+	// Not the creator's to send, not this chat's, not a request at all.
+	for name, tc := range map[string]struct {
+		keys      model.KeyPair
+		chatID    *commonpb.ChatId
+		requestID *paymentrequestpb.PaymentRequestId
+	}{
+		"not the creator": {e.keysB, groupID, request.ID},
+		"another group":   {e.keysA, otherGroupID, request.ID},
+		"unknown request": {e.keysA, groupID, paymentrequest.MustDeriveID(e.userA, &paymentrequestpb.IdempotencyKey{Value: model.MustGenerateUserID().Value})},
+	} {
+		resp, err := e.sendContentToChat(tc.keys, tc.chatID, paymentRequestWidgetContent(tc.requestID), generateClientID())
+		require.NoError(t, err, name)
+		require.Equal(t, messagingpb.SendMessageResponse_DENIED, resp.Result, name)
+	}
+
+	// Nor a reply's body.
+	original, err := e.sendContentToChat(e.keysA, groupID, textContent("original"), generateClientID())
+	require.NoError(t, err)
+	replyRequest := []*messagingpb.Content{{Type: &messagingpb.Content_Reply{Reply: &messagingpb.ReplyContent{
+		RepliedMessageId: original.Message.MessageId,
+		Content:          paymentRequestWidgetContent(request.ID),
+	}}}}
+	replyResp, err := e.sendContentToChat(e.keysA, groupID, replyRequest, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, replyResp.Result)
+
+	// The creator's send goes through, and so does another: every message
+	// carrying the request shows the same request.
+	sent, err := e.sendContentToChat(e.keysA, groupID, paymentRequestWidgetContent(request.ID), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	require.True(t, proto.Equal(paymentRequestWidgetContent(request.ID)[0], sent.Message.Content[0]))
+
+	again, err := e.sendContentToChat(e.keysA, groupID, paymentRequestWidgetContent(request.ID), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, again.Result)
+	require.NotEqual(t, sent.Message.MessageId.Value, again.Message.MessageId.Value)
+
+	// Sending writes nothing on the request.
+	stored, err := e.requests.Get(e.ctx, request.ID)
+	require.NoError(t, err)
+	require.Equal(t, request.Version, stored.Version)
+	require.Equal(t, paymentrequest.StatusOpen, stored.Status)
+
+	// It is a message like any other to read, reply to and react to.
+	read, err := e.getMessageInChat(e.keysB, groupID, sent.Message.MessageId)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.GetMessageResponse_OK, read.Result)
+	require.True(t, proto.Equal(sent.Message.Content[0], read.Message.Content[0]))
+
+	reply, err := e.sendContentToChat(e.keysB, groupID, replyContent(sent.Message.MessageId.Value, "paying"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, reply.Result)
+
+	reacted, err := e.addReactionInChat(e.keysB, groupID, sent.Message.MessageId, "👍")
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, reacted.Result)
+
+	// A message is never edited into a request, and a request's message is
+	// not edited.
+	editToRequest, err := e.editMessageInChat(e.keysA, groupID, original.Message.MessageId, paymentRequestWidgetContent(request.ID), original.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_DENIED, editToRequest.Result)
+
+	editRequest, err := e.editMessageInChat(e.keysA, groupID, sent.Message.MessageId, textContent("edited"), sent.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_CANNOT_EDIT, editRequest.Result)
+
+	// Only its creator may delete its message, which leaves the request as
+	// it was, and it may still be sent.
+	read, err = e.getMessageInChat(e.keysA, groupID, sent.Message.MessageId)
+	require.NoError(t, err)
+	notTheirs, err := e.deleteMessageInChat(e.keysB, groupID, sent.Message.MessageId, read.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_DENIED, notTheirs.Result)
+	deleted, err := e.deleteMessageInChat(e.keysA, groupID, sent.Message.MessageId, read.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, deleted.Result)
+
+	afterDelete, err := e.requests.Get(e.ctx, request.ID)
+	require.NoError(t, err)
+	require.Equal(t, stored.Version, afterDelete.Version)
+	require.Equal(t, stored.Status, afterDelete.Status)
+	require.True(t, proto.Equal(stored.ToProto(time.Now()), afterDelete.ToProto(time.Now())))
+
+	resent, err := e.sendContentToChat(e.keysA, groupID, paymentRequestWidgetContent(request.ID), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resent.Result)
+
+	// Whatever its status: a closed request is still sent.
+	_, changed, err := e.requests.Close(e.ctx, request.ID, time.Now())
+	require.NoError(t, err)
+	require.True(t, changed)
+	closed, err := e.sendContentToChat(e.keysA, groupID, paymentRequestWidgetContent(request.ID), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, closed.Result)
+}
+
+// testServer_PaymentRequestWidget_PrivateGroup pins that a private group takes
+// no plaintext payment request widget: its requests are sent inside encrypted
+// content.
+func testServer_PaymentRequestWidget_PrivateGroup(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	groupID := e.putPrivateGroup(chats, e.userB)
+	e.storeChatKey(chats, groupID, e.userA)
+	request := e.putPaymentRequest(groupID, e.userA, e.userB)
+
+	resp, err := e.sendContentToChat(e.keysA, groupID, paymentRequestWidgetContent(request.ID), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_ENCRYPTION_REQUIRED, resp.Result)
+}
+
+// putPaymentRequest stores an open split request in chatID by creatorID,
+// asking debtorID for a dollar, straight into the payment request store, as
+// the payment request service would create it.
+func (e *serverEnv) putPaymentRequest(chatID *commonpb.ChatId, creatorID, debtorID *commonpb.UserId) *paymentrequest.PaymentRequest {
+	r, err := paymentrequest.NewSplitRequest(
+		paymentrequest.MustDeriveID(creatorID, &paymentrequestpb.IdempotencyKey{Value: model.MustGenerateUserID().Value}),
+		creatorID,
+		chatID,
+		&paymentrequestpb.Split{
+			Text: &paymentrequestpb.Split_Plaintext{Plaintext: &paymentrequestpb.PaymentRequestText{
+				Title: "Dinner",
+			}},
+			Currency: "usd",
+			EndsAt:   timestamppb.New(time.Now().Add(time.Hour)),
+			Shares:   []*paymentrequestpb.Share{{UserId: debtorID, NativeAmount: 1}},
+		},
+		time.Now(),
+	)
+	require.NoError(e.t, err)
+	require.NoError(e.t, e.requests.Create(e.ctx, r))
+	return r
+}
+
+// paymentRequestWidgetContent builds a message body sending the payment
+// request requestID.
+func paymentRequestWidgetContent(requestID *paymentrequestpb.PaymentRequestId) []*messagingpb.Content {
+	return []*messagingpb.Content{{
+		Type: &messagingpb.Content_Widget{Widget: &messagingpb.WidgetContent{
+			Type: &messagingpb.WidgetContent_PaymentRequest{PaymentRequest: &messagingpb.PaymentRequestWidget{PaymentRequestId: requestID}},
+		}},
+	}}
 }
 
 // putPoll stores a COUNT poll in chatID by creatorID, live or not, ending at

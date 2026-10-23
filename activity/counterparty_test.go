@@ -13,6 +13,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
 
 	accountmemory "github.com/code-payments/flipcash2-server/account/memory"
 	"github.com/code-payments/flipcash2-server/chat"
@@ -29,7 +30,7 @@ type counterpartyEnv struct {
 	payer, recipient         *commonpb.UserId
 	payerKeys, recipientKeys model.KeyPair
 
-	dmPayment, groupPayment, reactionBoost []byte
+	dmPayment, groupPayment, reactionBoost, requestedPayment []byte
 
 	// boostChatID is the group reactionBoost was paid in.
 	boostChatID *commonpb.ChatId
@@ -61,6 +62,14 @@ func newCounterpartyEnv(t *testing.T) *counterpartyEnv {
 		ChatId: chat.MustGenerateGroupChatID(),
 		Type: &intentpb.ChatMetadata_GroupPayment_{
 			GroupPayment: &intentpb.ChatMetadata_GroupPayment{Action: intentpb.PaymentAction_SEND},
+		},
+	})
+	e.requestedPayment = chatAppMetadata(t, &intentpb.ChatMetadata{
+		ChatId: chat.MustGenerateGroupChatID(),
+		Type: &intentpb.ChatMetadata_RequestedPayment_{
+			RequestedPayment: &intentpb.ChatMetadata_RequestedPayment{
+				PaymentRequestId: &paymentrequestpb.PaymentRequestId{Value: make([]byte, 16)},
+			},
 		},
 	})
 	e.boostChatID = chat.MustGenerateGroupChatID()
@@ -102,7 +111,8 @@ func chatAppMetadata(t *testing.T, chatMetadata *intentpb.ChatMetadata) []byte {
 
 // TestHistoryCounterparties: a group payment names the other party by user
 // ID from both sides, and reads Sent and Received, exactly as a DM payment
-// does. A reaction boost paying one person names the other party the same
+// does, and so does a requested payment, from its payer to the request's
+// creator. A reaction boost paying one person names the other party the same
 // way, and the payer's side reads Boosted. A payment carrying no chat
 // metadata, like one handed off in person, names no one, and the payer's side
 // reads Gave.
@@ -120,6 +130,7 @@ func TestHistoryCounterparties(t *testing.T) {
 		sentText    string
 	}{
 		{"group_payment", e.groupPayment, true, false, "Sent"},
+		{"requested_payment", e.requestedPayment, true, false, "Sent"},
 		{"dm_payment", e.dmPayment, true, false, "Sent"},
 		{"reaction_boost", e.reactionBoost, true, true, "Boosted"},
 		{"no_chat_metadata", nil, false, false, "Gave"},

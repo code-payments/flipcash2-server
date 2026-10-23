@@ -57,10 +57,11 @@ import (
 //     this is a member reading REDACTED, who could decrypt it anyway.
 //   - Widget: the same variant, built field by field like the content that
 //     holds it. A ShareProfileWidget's username becomes redactedUsername, so
-//     the viewer sees a profile was shared but not whose. A PollWidget is
-//     kept as is: it carries only the poll's ID, and what the poll asks is
-//     the poll service's to show, behind its own gate. A variant this
-//     function does not know is ErrUnsupportedContent.
+//     the viewer sees a profile was shared but not whose. A PollWidget and
+//     a PaymentRequestWidget are kept as is: each carries only an ID, and
+//     what the poll asks, or the request asks for, is its own service's to
+//     show, behind its own gate. A variant this function does not know is
+//     ErrUnsupportedContent.
 //
 // A nil content, or one of a kind this function does not know, is
 // ErrUnsupportedContent: nothing unknown is passed through, and the caller
@@ -219,6 +220,12 @@ func widgetContent(w *messagingpb.WidgetContent) (*messagingpb.WidgetContent, er
 		// gated by the poll service on its own, so it passes through.
 		return &messagingpb.WidgetContent{Type: &messagingpb.WidgetContent_Poll{
 			Poll: proto.Clone(t.Poll).(*messagingpb.PollWidget),
+		}}, nil
+	case *messagingpb.WidgetContent_PaymentRequest:
+		// Likewise a payment request's ID says nothing of what it asks for,
+		// and seeing the request is gated by its own service.
+		return &messagingpb.WidgetContent{Type: &messagingpb.WidgetContent_PaymentRequest{
+			PaymentRequest: proto.Clone(t.PaymentRequest).(*messagingpb.PaymentRequestWidget),
 		}}, nil
 	default:
 		return nil, ErrUnsupportedContent

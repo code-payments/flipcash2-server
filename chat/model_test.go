@@ -163,3 +163,27 @@ func newIdempotencyKey() *chatpb.IdempotencyKey {
 	id := uuid.New()
 	return &chatpb.IdempotencyKey{Value: id[:]}
 }
+
+func TestPermissionsFor(t *testing.T) {
+	creatorID := model.MustGenerateUserID()
+	memberID := model.MustGenerateUserID()
+	group := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, CreatorID: creatorID}
+	dm := &Chat{ID: MustDeriveDmChatID(chatpb.ChatType_DM, creatorID, memberID), Type: chatpb.ChatType_DM}
+
+	all := Permissions{CanEdit: true, Moderation: ModerationPermissions{CanSilence: true, CanBan: true}}
+	require.Equal(t, all, group.PermissionsFor(creatorID, true))
+	require.Equal(t, Permissions{}, group.PermissionsFor(creatorID, false))
+	require.Equal(t, Permissions{}, group.PermissionsFor(memberID, true))
+	require.Equal(t, Permissions{}, dm.PermissionsFor(creatorID, true))
+
+	// Moderation is projected only when it grants something.
+	require.Nil(t, Permissions{CanEdit: true}.ToProto().Moderation)
+	for _, m := range []ModerationPermissions{{CanSilence: true}, {CanBan: true}, {CanSilence: true, CanBan: true}} {
+		require.True(t, m.Any())
+		got := Permissions{Moderation: m}.ToProto().Moderation
+		require.NotNil(t, got)
+		require.Equal(t, m.CanSilence, got.CanSilence)
+		require.Equal(t, m.CanBan, got.CanBan)
+	}
+	require.False(t, ModerationPermissions{}.Any())
+}

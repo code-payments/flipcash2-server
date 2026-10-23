@@ -116,6 +116,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_PrivateGroup_Keyed,
 		testServer_BalanceGatedGroup_Rules,
 		testServer_SpeakerBalanceGroup_Rules,
+		testServer_SilencedMember,
+		testServer_BannedNonMember_Reads,
 		testServer_Broadcast_IncludesActor,
 		testServer_SendMessage_PushPerChatType,
 		testServer_SendMessage_GroupChatPush,

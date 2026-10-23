@@ -28,15 +28,23 @@ import (
 //
 // The read is a composer's, so it is gated on CanSpeak: a member who
 // satisfies the group's rules, including its speaker rules, so a member of a
-// creator-only group who is not its creator gets no suggestions. A DM has
-// one candidate, the other member, and is refused before anything is read.
+// creator-only group who is not its creator gets no suggestions, and one the
+// creator has silenced gets none either. A DM has one candidate, the other
+// member, and is refused before anything is read.
 //
-// The caller, users the caller has blocked, users without a username, and
-// users the profile domain no longer knows are dropped after the read, so the
+// The caller, users the caller has blocked, users the group's creator has
+// banned (see Store.BanUser), users without a username, and users the profile
+// domain no longer knows are dropped after the read, so the
 // read takes a few more records than the pool holds; when more than that are
 // dropped the pool is simply smaller. A user who has blocked the caller is
 // still suggested: the caller still sees their messages in the group, and a
-// block governs what reaches the blocker, not what the caller may write.
+// block governs what reaches the blocker, not what the caller may write. A
+// silenced user is still suggested: they are still in the group and read
+// what mentions them. A banned user is not: they are out of the group until
+// unbanned, and a mention would reach no one. Bans are found with one
+// eventually consistent read of the candidates' viewer states (see
+// Store.GetViewerStatesForUsers), so a user banned a moment ago may still be
+// suggested, which a ranking tolerates.
 
 const (
 	// mentionSuggestionsSize is the most suggestions a response carries. It
@@ -86,7 +94,7 @@ func (s *Server) GetMentionSuggestions(ctx context.Context, req *chatpb.GetMenti
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	suggestions, err := s.mentionSuggestions(ctx, userID, senders)
+	suggestions, err := s.mentionSuggestions(ctx, c.ID, userID, senders)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure building mention suggestions")
 		return nil, status.Error(codes.Internal, "")
@@ -100,8 +108,8 @@ func (s *Server) GetMentionSuggestions(ctx context.Context, req *chatpb.GetMenti
 // mentionSuggestions turns a group's recent senders into the viewer's
 // suggestions, in the senders' order: the filters described above, then at
 // most mentionSuggestionsSize of what remains, each with its public profile.
-// The block read and the profile read are independent and run concurrently.
-func (s *Server) mentionSuggestions(ctx context.Context, viewerID *commonpb.UserId, senders []RecentSender) ([]*chatpb.MentionSuggestion, error) {
+// The block, ban and profile reads are independent and run concurrently.
+func (s *Server) mentionSuggestions(ctx context.Context, chatID *commonpb.ChatId, viewerID *commonpb.UserId, senders []RecentSender) ([]*chatpb.MentionSuggestion, error) {
 	candidates := make([]RecentSender, 0, len(senders))
 	candidateIDs := make([]*commonpb.UserId, 0, len(senders))
 	for _, sender := range senders {
@@ -118,11 +126,16 @@ func (s *Server) mentionSuggestions(ctx context.Context, viewerID *commonpb.User
 
 	var (
 		blocked        map[string]bool
+		states         map[string]ViewerState
 		publicProfiles map[string]*profilepb.UserProfile
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) {
 		blocked, err = s.blocklist.GetBlocked(gctx, viewerID, candidateIDs)
+		return err
+	})
+	g.Go(func() (err error) {
+		states, err = s.chats.GetViewerStatesForUsers(gctx, chatID, candidateIDs)
 		return err
 	})
 	g.Go(func() (err error) {
@@ -138,7 +151,7 @@ func (s *Server) mentionSuggestions(ctx context.Context, viewerID *commonpb.User
 			break
 		}
 		key := string(candidate.UserID.Value)
-		if blocked[key] {
+		if blocked[key] || states[key].IsBanned() {
 			continue
 		}
 		// A user the profile domain no longer knows, or one without a

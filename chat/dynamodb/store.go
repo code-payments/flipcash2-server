@@ -3,6 +3,7 @@ package dynamodb
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -109,6 +110,40 @@ import (
 //	          an item. Nothing deletes an item: a cleared mute drops
 //	          muted_until (and so its gsiByMuted entry) and keeps the record
 //	          and its version.
+//
+//	          The same record carries the restrictions a group's creator set
+//	          on the user (see chat.Store.SetSilence and BanUser), sharing
+//	          its version with the mute: silenced_until (epoch seconds,
+//	          encoded as muted_until is), banned_at (epoch nanos) and
+//	          restricted_sort, present exactly while either is recorded (see
+//	          restrictedSort). A restriction's writes never name muted_until
+//	          or the #meta count, and a mute's never name a restriction's
+//	          attributes, so neither can disturb the other, and the
+//	          departure's ClearMute leaves a silence and a ban standing. A
+//	          restriction carries chat like any record, so it is in
+//	          gsiUserStateByUser, and gsiByMuted's filter skips it.
+//
+//	          The sparse gsiRestricted on (chat, restricted_sort) holds
+//	          exactly the restricted users and lists a chat's most recently
+//	          restricted first, the creator's listing, billed by the page and
+//	          eventually consistent as that listing allows. A lapsed silence
+//	          stays in it until cleared; the reader filters by its clock.
+//	          CreateTables leaves an existing table as it is, so the index is
+//	          added to the live table out of band (by the infrastructure's
+//	          terraform), and must be ACTIVE before the listing ships;
+//	          nothing else reads it, and writes that fill it are safe
+//	          before it exists, since DynamoDB backfills a new index from
+//	          the items as they stand.
+//
+//	          A ban is where the record meets the roster: it is one
+//	          transaction of the record, the user's departure when they are
+//	          a member (the membership transition, see
+//	          transitionMembership), their lobby entry and its counts when
+//	          they are waiting, and a check of whichever they were not, so
+//	          what the ban read is what it undid (see BanUser). The writes
+//	          that let a user in — a join, an admission, a lobby entry —
+//	          each carry a check that the record holds no banned_at (see
+//	          banCheck), so a ban and a way in never both land.
 //
 //	chat_activity  pk = "chat#<id>", sk = "user#<id>" (one item per (group,
 //	          user) the user has sent in; see chat.RecentSender). A group's
@@ -283,6 +318,13 @@ const (
 	// chat_user_state: a chat's records in user order, full item projected.
 	gsiUserStateByUser = "by_user"
 
+	// gsiRestricted is the sparse (chat, restricted_sort) index on
+	// chat_user_state: the users with a restriction recorded on a chat, most
+	// recently restricted first when read descending (see
+	// GetRestrictedUsersPage). Full item projected, since a listing carries
+	// each user's whole state.
+	gsiRestricted = "by_restricted"
+
 	// lsiByLastSentAt is the (chat, last_sent_at) LSI on chat_activity: a
 	// group's activity records in recency order (see GetRecentSenders).
 	lsiByLastSentAt = "by_last_sent_at"
@@ -354,6 +396,9 @@ const (
 	attrChat                 = "chat"             // chat_user_state records: the raw chat ID bytes (B), keying gsiByMuted and gsiUserStateByUser
 	attrMutedUntil           = "muted_until"      // chat_user_state: epoch seconds, present only while a mute is recorded — see muteForeverUntil
 	attrMutedCount           = "muted_count"      // chat_user_state #meta item: records with a mute recorded
+	attrSilencedUntil        = "silenced_until"   // chat_user_state: epoch seconds, present only while a silence is recorded — encoded as muted_until is (see muteForeverUntil)
+	attrBannedAt             = "banned_at"        // chat_user_state: epoch nanos of the ban, present only while one is recorded
+	attrRestrictedSort       = "restricted_sort"  // chat_user_state: see restrictedSort, present only while a silence or ban is recorded, keying gsiRestricted
 	attrLastSentAt           = "last_sent_at"     // chat_activity: epoch ms of the latest recorded send
 	attrActivityScore        = "activity_score"   // chat_activity: epoch ms, see chat.NextActivityScore; absent on records written before scores
 	attrScheme               = "scheme"           // chat_key_envelopes: chatpb.KeyEnvelope_Scheme, by number
@@ -622,7 +667,8 @@ func (s *store) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 // never runs without it. Each member is an independent conditional transition: an
 // already-joined member is left untouched (preserving their original
 // joined_at), while a new or departed member is (re)joined with a fresh join
-// time. joined_at is present iff joined — the sparse gsiByJoinedAt keys off its
+// time, carrying a check that they are not banned (see banCheck). joined_at
+// is present iff joined — the sparse gsiByJoinedAt keys off its
 // presence — so rejoining also clears the tombstone's left_at, and its
 // expires_at, so the rejoined row cannot be swept.
 //
@@ -637,13 +683,31 @@ func (s *store) addGroupMembers(ctx context.Context, chatID *commonpb.ChatId, us
 
 	changed := false
 	for _, userID := range userIDs {
-		joined, err := s.transitionMembership(ctx, chatID, s.joinUpdate(chatID, userID), 1, &roster, nil)
+		joined, err := s.transitionMembership(ctx, chatID, s.joinUpdate(chatID, userID), 1, &roster, []types.TransactWriteItem{
+			{ConditionCheck: s.banCheck(chatID, userID)},
+		})
+		if errors.As(err, new(alongsideConditionFailed)) {
+			return changed, roster, chat.ErrBanned
+		}
 		if err != nil {
 			return changed, roster, err
 		}
 		changed = changed || joined
 	}
 	return changed, roster, nil
+}
+
+// banCheck is the check a write that lets userID into chatID carries: that
+// their chat_user_state record holds no ban (see BanUser). A user with no
+// record passes. It is what makes a ban and a join, an admission or a lobby
+// entry exclusive: the ban's transaction writes the record, so whichever
+// commits second sees the other.
+func (s *store) banCheck(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.ConditionCheck {
+	return &types.ConditionCheck{
+		TableName:           aws.String(s.userStateTable),
+		Key:                 userStateKey(chatID, userID),
+		ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrBannedAt)),
+	}
 }
 
 // joinUpdate is the membership transition that (re)joins userID to chatID
@@ -678,13 +742,36 @@ func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, 
 		return false, chat.RosterSummary{}, err
 	}
 
-	// Tombstone, don't delete: the item keeps the departure's version for as
-	// long as it could matter, then expires (see tombstoneTTL). Only a joined
-	// member transitions — the condition makes removing a non-member (or an
-	// unknown user) a no-op rather than an upsert of a malformed tombstone.
-	// Removing joined_at drops the member from the sparse gsiByJoinedAt.
+	// The departing user's key envelope goes in the same transaction, so it
+	// is deleted iff the departure happens. The delete is unconditional: a
+	// user with no envelope leaves all the same.
+	var alongside []types.TransactWriteItem
+	if discardKeyEnvelope {
+		alongside = append(alongside, s.keyEnvelopeDiscard(chatID, userID))
+	}
+	changed, err := s.transitionMembership(ctx, chatID, s.leaveUpdate(chatID, userID), -1, &roster, alongside)
+	return changed, roster, err
+}
+
+// keyEnvelopeDiscard is the unconditional delete of userID's key envelope for
+// chatID that a departure carries when asked to (see RemoveGroupMember).
+func (s *store) keyEnvelopeDiscard(chatID *commonpb.ChatId, userID *commonpb.UserId) types.TransactWriteItem {
+	return types.TransactWriteItem{Delete: &types.Delete{
+		TableName: aws.String(s.keyEnvelopesTable),
+		Key:       keyEnvelopeKey(chatID, userID),
+	}}
+}
+
+// leaveUpdate is the membership transition that departs userID from chatID,
+// for transitionMembership to carry. Tombstone, don't delete: the item keeps
+// the departure's version for as long as it could matter, then expires (see
+// tombstoneTTL). Only a joined member transitions — the condition makes
+// removing a non-member (or an unknown user) a no-op rather than an upsert of
+// a malformed tombstone. Removing joined_at drops the member from the sparse
+// gsiByJoinedAt.
+func (s *store) leaveUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.Update {
 	now := time.Now().UTC()
-	leave := &types.Update{
+	return &types.Update{
 		TableName: aws.String(s.groupMembersTable),
 		Key: map[string]types.AttributeValue{
 			attrPK: avS(chatPK(chatID)),
@@ -702,18 +789,6 @@ func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, 
 			":expires": avN(uint64(now.Add(tombstoneTTL).Unix())),
 		},
 	}
-	// The departing user's key envelope goes in the same transaction, so it
-	// is deleted iff the departure happens. The delete is unconditional: a
-	// user with no envelope leaves all the same.
-	var alongside []types.TransactWriteItem
-	if discardKeyEnvelope {
-		alongside = append(alongside, types.TransactWriteItem{Delete: &types.Delete{
-			TableName: aws.String(s.keyEnvelopesTable),
-			Key:       keyEnvelopeKey(chatID, userID),
-		}})
-	}
-	changed, err := s.transitionMembership(ctx, chatID, leave, -1, &roster, alongside)
-	return changed, roster, err
 }
 
 // readRosterSummaryForWrite is the strongly consistent read of the #meta item
@@ -2459,7 +2534,12 @@ func (s *store) SetMute(ctx context.Context, chatID *commonpb.ChatId, userID *co
 			{Update: s.mutedCountUpdate(chatID, 1)},
 		}})
 		if err == nil {
-			return chat.ViewerState{Mute: &mute, Version: current.Version + 1}, true, nil
+			// The record as the condition proved it, less nothing a mute's
+			// write touched: restrictions recorded beside it stand.
+			state := current.Clone()
+			state.Mute = &mute
+			state.Version++
+			return state, true, nil
 		}
 		reasons, ok := cancellationReasons(err)
 		if !ok || len(reasons) != 2 {
@@ -2532,7 +2612,10 @@ func (s *store) ClearMute(ctx context.Context, chatID *commonpb.ChatId, userID *
 			{Update: s.mutedCountUpdate(chatID, -1)},
 		}})
 		if err == nil {
-			return chat.ViewerState{Version: current.Version + 1}, true, nil
+			state := current.Clone()
+			state.Mute = nil
+			state.Version++
+			return state, true, nil
 		}
 		reasons, ok := cancellationReasons(err)
 		if !ok || len(reasons) != 2 {
@@ -2799,8 +2882,10 @@ func userStateKey(chatID *commonpb.ChatId, userID *commonpb.UserId) map[string]t
 }
 
 // viewerStateFromItem decodes a chat_user_state item. A missing version reads
-// as zero and a missing muted_until as no mute; muted_until at or above
-// muteForeverUntil is the indefinite mute.
+// as zero, a missing muted_until as no mute and a missing silenced_until as
+// no silence; either at or above muteForeverUntil is indefinite. A missing
+// banned_at is no ban, and RestrictedAt is the time restricted_sort leads
+// with (see restrictedSort).
 func viewerStateFromItem(item map[string]types.AttributeValue) (chat.ViewerState, error) {
 	var state chat.ViewerState
 	if av, ok := item[attrVersion]; ok {
@@ -2811,17 +2896,462 @@ func viewerStateFromItem(item map[string]types.AttributeValue) (chat.ViewerState
 		state.Version = version
 	}
 	if av, ok := item[attrMutedUntil]; ok {
-		until, err := parseN(av)
+		forever, until, err := untilFromAttr(av)
 		if err != nil {
 			return chat.ViewerState{}, fmt.Errorf("parsing %s: %w", attrMutedUntil, err)
 		}
-		if until >= muteForeverUntil {
-			state.Mute = &chat.Mute{Forever: true}
-		} else {
-			state.Mute = &chat.Mute{Until: time.Unix(int64(until), 0).UTC()}
+		state.Mute = &chat.Mute{Forever: forever, Until: until}
+	}
+	if av, ok := item[attrSilencedUntil]; ok {
+		forever, until, err := untilFromAttr(av)
+		if err != nil {
+			return chat.ViewerState{}, fmt.Errorf("parsing %s: %w", attrSilencedUntil, err)
 		}
+		state.Silence = &chat.Silence{Forever: forever, Until: until}
+	}
+	if av, ok := item[attrBannedAt]; ok {
+		nanos, err := parseN(av)
+		if err != nil {
+			return chat.ViewerState{}, fmt.Errorf("parsing %s: %w", attrBannedAt, err)
+		}
+		bannedAt := time.Unix(0, int64(nanos)).UTC()
+		state.BannedAt = &bannedAt
+	}
+	if av, ok := item[attrRestrictedSort]; ok {
+		sort := asB(av)
+		if len(sort) < 8 {
+			return chat.ViewerState{}, fmt.Errorf("parsing %s: %d bytes", attrRestrictedSort, len(sort))
+		}
+		restrictedAt := time.Unix(0, int64(binary.BigEndian.Uint64(sort))).UTC()
+		state.RestrictedAt = &restrictedAt
 	}
 	return state, nil
+}
+
+// untilAttr encodes a mute's or a silence's end as muted_until and
+// silenced_until hold it: epoch seconds, or muteForeverUntil when indefinite.
+// The value is normalized (see chat.Mute.Normalize), so a timed end lies
+// below the sentinel.
+func untilAttr(forever bool, until time.Time) types.AttributeValue {
+	if forever {
+		return avN(muteForeverUntil)
+	}
+	return avN(uint64(until.Unix()))
+}
+
+// untilFromAttr is the inverse of untilAttr: a value at or above
+// muteForeverUntil is indefinite.
+func untilFromAttr(av types.AttributeValue) (forever bool, until time.Time, err error) {
+	secs, err := parseN(av)
+	if err != nil {
+		return false, time.Time{}, err
+	}
+	if secs >= muteForeverUntil {
+		return true, time.Time{}, nil
+	}
+	return false, time.Unix(int64(secs), 0).UTC(), nil
+}
+
+// restrictedSort is the gsiRestricted range key of a restriction made at
+// restrictedAt on userID: the time's epoch nanos, big-endian, then the
+// user's raw ID. Read descending, the index is then chat.RestrictionPosition
+// order — most recent first, ties to the greater user ID — and the order is
+// total, so a page resumes strictly below the key of the position it ended
+// at with a key condition alone, whether or not that user is still listed.
+// The time is recovered from it on read (see viewerStateFromItem), so no
+// attribute repeats it.
+func restrictedSort(restrictedAt time.Time, userID *commonpb.UserId) []byte {
+	out := binary.BigEndian.AppendUint64(make([]byte, 0, 8+len(userID.Value)), uint64(restrictedAt.UnixNano()))
+	return append(out, userID.Value...)
+}
+
+// restrictionTime is now as a restriction records it: at nanosecond
+// precision, in UTC, with no monotonic reading, which is what the record
+// reads back; or an error when it is before the Unix epoch, which
+// restrictedSort cannot order.
+func restrictionTime(now time.Time) (time.Time, error) {
+	if now.Before(time.Unix(0, 0)) {
+		return time.Time{}, fmt.Errorf("restriction time before the unix epoch")
+	}
+	return time.Unix(0, now.UnixNano()).UTC(), nil
+}
+
+// GetViewerStatesForUsers is one eventually consistent batch read of the
+// users' records on the chat, keyed by (user, chat) like every record.
+func (s *store) GetViewerStatesForUsers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]chat.ViewerState, error) {
+	seen := make(map[string]struct{}, len(userIDs))
+	keys := make([]map[string]types.AttributeValue, 0, len(userIDs))
+	for _, userID := range userIDs {
+		if _, dup := seen[string(userID.Value)]; dup {
+			continue
+		}
+		seen[string(userID.Value)] = struct{}{}
+		keys = append(keys, userStateKey(chatID, userID))
+	}
+
+	out := make(map[string]chat.ViewerState, len(keys))
+	err := s.batchGet(ctx, s.userStateTable, keys, "", nil, false, func(item map[string]types.AttributeValue) error {
+		userID, err := userIDFromPK(item)
+		if err != nil {
+			return err
+		}
+		state, err := viewerStateFromItem(item)
+		if err != nil {
+			return err
+		}
+		out[string(userID.Value)] = state
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetSilence is one conditional update of the record, which needs no read and
+// no retry: there is no count to keep beside it, so a first silence and a
+// replaced one are the same write — silenced_until set, restricted_sort moved
+// to now, version added to (creating the record at one) — conditioned on the
+// silence recorded differing from this one. A failed condition is the no-op,
+// and returns the record it judged.
+func (s *store) SetSilence(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, silence chat.Silence, now time.Time) (chat.ViewerState, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.ViewerState{}, false, fmt.Errorf("not a group chat id")
+	}
+	silence, err := silence.Normalize()
+	if err != nil {
+		return chat.ViewerState{}, false, err
+	}
+	now, err = restrictionTime(now)
+	if err != nil {
+		return chat.ViewerState{}, false, err
+	}
+
+	out, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:           aws.String(s.userStateTable),
+		Key:                 userStateKey(chatID, userID),
+		UpdateExpression:    aws.String("SET #chat = :chat, #until = :until, #sort = :sort ADD #version :one"),
+		ConditionExpression: aws.String("attribute_not_exists(#until) OR #until <> :until"),
+		ExpressionAttributeNames: map[string]string{
+			"#chat":    attrChat,
+			"#until":   attrSilencedUntil,
+			"#sort":    attrRestrictedSort,
+			"#version": attrVersion,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":chat":  avB(chatID.Value),
+			":until": untilAttr(silence.Forever, silence.Until),
+			":sort":  avB(restrictedSort(now, userID)),
+			":one":   avN(1),
+		},
+		ReturnValues:                        types.ReturnValueAllNew,
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	})
+	if err == nil {
+		state, err := viewerStateFromItem(out.Attributes)
+		return state, true, err
+	}
+	var ccf *types.ConditionalCheckFailedException
+	if !errors.As(err, &ccf) {
+		return chat.ViewerState{}, false, err
+	}
+	state, err := viewerStateFromItem(ccf.Item)
+	return state, false, err
+}
+
+func (s *store) ClearSilence(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.ViewerState{}, false, fmt.Errorf("not a group chat id")
+	}
+	return s.liftRestriction(ctx, chatID, userID, attrSilencedUntil, attrBannedAt)
+}
+
+func (s *store) UnbanUser(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.ViewerState{}, false, fmt.Errorf("not a group chat id")
+	}
+	return s.liftRestriction(ctx, chatID, userID, attrBannedAt, attrSilencedUntil)
+}
+
+// liftRestriction removes the restriction attribute attr from the record,
+// and restricted_sort with it unless the other restriction, other, is
+// recorded too, which keeps the user in gsiRestricted at the time they were
+// last restricted. Whether other is recorded decides the write, so each
+// attempt is conditioned on the case it assumes: attr present, and other
+// absent (the first guess, the common case) or present. A failed condition
+// returns the record, which says which case holds — attr absent is the no-op,
+// returned as it stands, the zero state when there is no record — so the
+// loop never reads; it ends within two attempts unless the other restriction
+// keeps moving under it.
+func (s *store) liftRestriction(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, attr, other string) (chat.ViewerState, bool, error) {
+	otherRecorded := false
+	for attempt := 0; attempt < maxUserStateAttempts; attempt++ {
+		update := "REMOVE #attr, #sort ADD #version :one"
+		condition := "attribute_exists(#attr) AND attribute_not_exists(#other)"
+		if otherRecorded {
+			update = "REMOVE #attr ADD #version :one"
+			condition = "attribute_exists(#attr) AND attribute_exists(#other)"
+		}
+		names := map[string]string{"#attr": attr, "#other": other, "#version": attrVersion}
+		if !otherRecorded {
+			names["#sort"] = attrRestrictedSort
+		}
+		out, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:                           aws.String(s.userStateTable),
+			Key:                                 userStateKey(chatID, userID),
+			UpdateExpression:                    aws.String(update),
+			ConditionExpression:                 aws.String(condition),
+			ExpressionAttributeNames:            names,
+			ExpressionAttributeValues:           map[string]types.AttributeValue{":one": avN(1)},
+			ReturnValues:                        types.ReturnValueAllNew,
+			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		})
+		if err == nil {
+			state, err := viewerStateFromItem(out.Attributes)
+			return state, true, err
+		}
+		var ccf *types.ConditionalCheckFailedException
+		if !errors.As(err, &ccf) {
+			return chat.ViewerState{}, false, err
+		}
+		if _, ok := ccf.Item[attr]; !ok {
+			state, err := viewerStateFromItem(ccf.Item)
+			return state, false, err
+		}
+		_, otherRecorded = ccf.Item[other]
+	}
+	return chat.ViewerState{}, false, fmt.Errorf("lifting %s for user %x on chat %x: attempts exhausted", attr, userID.Value, chatID.Value)
+}
+
+// BanUser reads, strongly consistent, what the ban must undo — the user's
+// record, the group's roster summary (which is also the existence check, see
+// readRosterSummaryForWrite), their membership row and their lobby entry —
+// and writes it in one transaction conditioned on all of it still holding:
+//
+//   - the record: banned_at and restricted_sort set to now and version added
+//     to, conditioned on no ban and on the version read, so a concurrent
+//     write of the record, a mute included, sends the ban back to read again
+//     and the state returned is exactly what was written;
+//   - a member's departure: the membership transition RemoveGroupMember
+//     makes, with the roster summary's compare-and-set and the key envelope's
+//     discard when asked (see transitionMembership, which carries the rest
+//     alongside it); a non-member's row checked to be absent or not joined
+//     instead, so a join landing after the read cancels the ban rather than
+//     outliving it;
+//   - a waiting user's entry: its conditional delete and both counts' moves,
+//     as LeaveLobby makes them; an absent entry checked to be absent still,
+//     so an entry made after the read cancels the ban likewise.
+//
+// A failed condition anywhere is a write that landed since the read, and the
+// ban goes back to read again; a TransactionConflict backs off first. Both
+// share the attempt budget, the membership transition's own retries apart.
+// A ban already recorded, found by any read, is the no-op: nothing is
+// written, since a banned user holds no membership or entry to remove (every
+// way in checks the ban, see banCheck).
+func (s *store) BanUser(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, now time.Time, discardKeyEnvelope bool) (chat.BanResult, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.BanResult{}, fmt.Errorf("not a group chat id")
+	}
+	now, err := restrictionTime(now)
+	if err != nil {
+		return chat.BanResult{}, err
+	}
+
+	backoff := membershipBackoffBase
+	for attempt := 0; attempt < maxUserStateAttempts; attempt++ {
+		roster, err := s.readRosterSummaryForWrite(ctx, chatID)
+		if err != nil {
+			return chat.BanResult{}, err
+		}
+		stateItem, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName:      aws.String(s.userStateTable),
+			Key:            userStateKey(chatID, userID),
+			ConsistentRead: aws.Bool(true),
+		})
+		if err != nil {
+			return chat.BanResult{}, err
+		}
+		current, err := viewerStateFromItem(stateItem.Item)
+		if err != nil {
+			return chat.BanResult{}, err
+		}
+		if current.IsBanned() {
+			return chat.BanResult{State: current, Roster: roster}, nil
+		}
+		joined, err := s.IsMember(ctx, chatID, userID)
+		if err != nil {
+			return chat.BanResult{}, err
+		}
+		entries, err := s.GetLobbyEntries(ctx, userID, []*commonpb.ChatId{chatID})
+		if err != nil {
+			return chat.BanResult{}, err
+		}
+		_, waiting := entries[string(chatID.Value)]
+
+		record := types.TransactWriteItem{Update: &types.Update{
+			TableName:        aws.String(s.userStateTable),
+			Key:              userStateKey(chatID, userID),
+			UpdateExpression: aws.String("SET #chat = :chat, #banned = :now, #sort = :sort ADD #version :one"),
+			ConditionExpression: aws.String(
+				"attribute_not_exists(#banned) AND (attribute_not_exists(#version) OR #version = :version)",
+			),
+			ExpressionAttributeNames: map[string]string{
+				"#chat":    attrChat,
+				"#banned":  attrBannedAt,
+				"#sort":    attrRestrictedSort,
+				"#version": attrVersion,
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":chat":    avB(chatID.Value),
+				":now":     avN(uint64(now.UnixNano())),
+				":sort":    avB(restrictedSort(now, userID)),
+				":one":     avN(1),
+				":version": avN(current.Version),
+			},
+		}}
+		var lobby []types.TransactWriteItem
+		if waiting {
+			lobby = append([]types.TransactWriteItem{{Delete: s.lobbyEntryDelete(chatID, userID)}}, s.lobbyCountDecrements(chatID, userID)...)
+		} else {
+			lobby = []types.TransactWriteItem{{ConditionCheck: &types.ConditionCheck{
+				TableName:                aws.String(s.lobbiesTable),
+				Key:                      lobbyKey(chatID, userID),
+				ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
+				ExpressionAttributeNames: map[string]string{"#pk": attrPK},
+			}}}
+		}
+
+		state := current.Clone()
+		state.BannedAt = &now
+		state.RestrictedAt = &now
+		state.Version++
+		result := chat.BanResult{State: state, Changed: true, Roster: roster, LeftLobby: waiting}
+
+		if joined {
+			alongside := append([]types.TransactWriteItem{record}, lobby...)
+			if discardKeyEnvelope {
+				alongside = append(alongside, s.keyEnvelopeDiscard(chatID, userID))
+			}
+			departed, err := s.transitionMembership(ctx, chatID, s.leaveUpdate(chatID, userID), -1, &roster, alongside)
+			if errors.As(err, new(alongsideConditionFailed)) {
+				continue
+			}
+			if err != nil {
+				return chat.BanResult{}, err
+			}
+			if !departed {
+				// The user left since the read: read again, and ban the
+				// non-member they now are.
+				continue
+			}
+			result.Departed = true
+			result.Roster = roster
+			return result, nil
+		}
+
+		transactItems := []types.TransactWriteItem{
+			record,
+			{ConditionCheck: &types.ConditionCheck{
+				TableName: aws.String(s.groupMembersTable),
+				Key: map[string]types.AttributeValue{
+					attrPK: avS(chatPK(chatID)),
+					attrSK: avS(userPK(userID)),
+				},
+				ConditionExpression:       aws.String("attribute_not_exists(#state) OR #state <> :joined"),
+				ExpressionAttributeNames:  map[string]string{"#state": attrState},
+				ExpressionAttributeValues: map[string]types.AttributeValue{":joined": avN(memberStateJoined)},
+			}},
+		}
+		transactItems = append(transactItems, lobby...)
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
+		if err == nil {
+			return result, nil
+		}
+		reasons, ok := cancellationReasons(err)
+		if !ok || len(reasons) != len(transactItems) {
+			return chat.BanResult{}, err
+		}
+		codes := make([]string, len(reasons))
+		for i, reason := range reasons {
+			codes[i] = aws.ToString(reason.Code)
+		}
+		switch {
+		case slices.Contains(codes, conditionalCheckFailedCode):
+			continue
+		case isTransactionConflict(codes):
+			select {
+			case <-ctx.Done():
+				return chat.BanResult{}, ctx.Err()
+			case <-time.After(backoff + rand.N(backoff)):
+			}
+			backoff = min(2*backoff, membershipBackoffMax)
+		default:
+			return chat.BanResult{}, err
+		}
+	}
+	return chat.BanResult{}, fmt.Errorf("banning user %x from chat %x: attempts exhausted", userID.Value, chatID.Value)
+}
+
+// GetRestrictedUsersPage is a descending range on gsiRestricted, which holds
+// exactly the chat's restricted users in listing order, so the page is billed
+// by what it returns. A page resumes below the key of the position it is
+// given, a key condition built from the position alone (see restrictedSort).
+// The read is eventually consistent, a GSI's, as the contract allows.
+func (s *store) GetRestrictedUsersPage(ctx context.Context, chatID *commonpb.ChatId, after *chat.RestrictionPosition, limit int) ([]chat.RestrictedUser, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, fmt.Errorf("not a group chat id")
+	}
+
+	condition := "#chat = :chat"
+	names := map[string]string{"#chat": attrChat}
+	values := map[string]types.AttributeValue{":chat": avB(chatID.Value)}
+	if after != nil {
+		if after.RestrictedAt.Before(time.Unix(0, 0)) {
+			return nil, fmt.Errorf("restriction position before the unix epoch")
+		}
+		condition += " AND #sort < :after"
+		names["#sort"] = attrRestrictedSort
+		values[":after"] = avB(restrictedSort(after.RestrictedAt, after.UserID))
+	}
+
+	users := make([]chat.RestrictedUser, 0)
+	var startKey map[string]types.AttributeValue
+	for {
+		input := &dynamodb.QueryInput{
+			TableName:                 aws.String(s.userStateTable),
+			IndexName:                 aws.String(gsiRestricted),
+			KeyConditionExpression:    aws.String(condition),
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
+			ScanIndexForward:          aws.Bool(false),
+			ExclusiveStartKey:         startKey,
+		}
+		if limit > 0 {
+			input.Limit = aws.Int32(int32(limit - len(users)))
+		}
+		out, err := s.client.Query(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			userID, err := userIDFromPK(item)
+			if err != nil {
+				return nil, err
+			}
+			state, err := viewerStateFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			users = append(users, chat.RestrictedUser{UserID: userID, State: state})
+			if limit > 0 && len(users) == limit {
+				return users, nil
+			}
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			return users, nil
+		}
+		startKey = out.LastEvaluatedKey
+	}
 }
 
 // RecordSend reads the user's chat_activity item and, unless the read already
@@ -3146,15 +3676,18 @@ func (e alongsideConditionFailed) Error() string {
 	return fmt.Sprintf("write %d alongside the membership transition failed its condition", e.Index)
 }
 
-// EnterLobby is one transaction over the entry, both counts and the user's
-// membership record: the entry is put conditionally on not existing, each
-// count is moved conditionally on being under its cap, and the membership
-// row in group_members is checked to be absent or not joined, so a member, a
-// lobby at its cap, or a user at theirs, cancels the whole write and nothing
-// is recorded. The membership check is what keeps an entry from landing for
-// a user whose admission committed between the caller's gate and this write.
-// The cancellation's per-item reasons tell the cases apart with no read: a
-// joined member is ErrAlreadyMember, judged first; an entry that exists is
+// EnterLobby is one transaction over the entry, both counts, the user's
+// membership record and their chat_user_state record: the entry is put
+// conditionally on not existing, each count is moved conditionally on being
+// under its cap, the membership row in group_members is checked to be absent
+// or not joined, and the state record to hold no ban (see banCheck), so a
+// member, a banned user, a lobby at its cap, or a user at theirs, cancels the
+// whole write and nothing is recorded. The membership check is what keeps an
+// entry from landing for a user whose admission committed between the
+// caller's gate and this write, and the ban check one for a user banned
+// meanwhile. The cancellation's per-item reasons tell the cases apart with no
+// read: a joined member is ErrAlreadyMember, judged first; a banned user is
+// ErrBanned, judged next; an entry that exists is
 // the no-op, returned from the item the failure hands back, judged before
 // the caps so a repeat never reports a full lobby; a failed lobby count is
 // ErrLobbyFull, judged before the user's; a failed user count is
@@ -3192,6 +3725,7 @@ func (s *store) EnterLobby(ctx context.Context, chatID *commonpb.ChatId, userID 
 			ExpressionAttributeNames:  map[string]string{"#state": attrState},
 			ExpressionAttributeValues: map[string]types.AttributeValue{":joined": avN(memberStateJoined)},
 		}},
+		{ConditionCheck: s.banCheck(chatID, userID)},
 	}
 
 	backoff := membershipBackoffBase
@@ -3211,6 +3745,8 @@ func (s *store) EnterLobby(ctx context.Context, chatID *commonpb.ChatId, userID 
 		switch {
 		case codes[3] == conditionalCheckFailedCode:
 			return chat.LobbyEntry{}, false, chat.ErrAlreadyMember
+		case codes[4] == conditionalCheckFailedCode:
+			return chat.LobbyEntry{}, false, chat.ErrBanned
 		case codes[0] == conditionalCheckFailedCode:
 			existing, err := lobbyEntryFromItem(reasons[0].Item)
 			return existing, false, err
@@ -3411,10 +3947,14 @@ func (s *store) GetLobbyPage(ctx context.Context, chatID *commonpb.ChatId, after
 }
 
 // AdmitFromLobby is the join transition (see addGroupMembers) carrying the
-// lobby's side of the admission alongside: the entry's conditional delete,
-// its two count decrements and an unconditional put of the key envelope, so
-// the four commit with the membership or not at all. A failed delete
-// condition is the user not waiting, reported as ErrNotInLobby. A join that
+// lobby's side of the admission alongside: the check that the user is not
+// banned (see banCheck), the entry's conditional delete, its two count
+// decrements and an unconditional put of the key envelope, so the four
+// writes commit with the membership or not at all. A failed ban check is
+// ErrBanned, and is placed first so that it is the failure reported when the
+// delete fails too, as it does for a banned user, who holds no entry; a
+// failed delete condition alone is the user not waiting, reported as
+// ErrNotInLobby. A join that
 // is a no-op — the user was a member already — writes nothing, the entry
 // included: the caller gates on membership before asking, so an entry left
 // behind this way is a race's residue the user clears by leaving the lobby.
@@ -3431,15 +3971,24 @@ func (s *store) AdmitFromLobby(ctx context.Context, chatID *commonpb.ChatId, use
 		return false, chat.RosterSummary{}, err
 	}
 
-	alongside := append([]types.TransactWriteItem{{Delete: s.lobbyEntryDelete(chatID, userID)}}, s.lobbyCountDecrements(chatID, userID)...)
+	alongside := []types.TransactWriteItem{
+		{ConditionCheck: s.banCheck(chatID, userID)},
+		{Delete: s.lobbyEntryDelete(chatID, userID)},
+	}
+	alongside = append(alongside, s.lobbyCountDecrements(chatID, userID)...)
 	alongside = append(alongside, types.TransactWriteItem{Put: &types.Put{
 		TableName: aws.String(s.keyEnvelopesTable),
 		Item:      keyEnvelopeItem(chatID, userID, envelope),
 	}})
 	changed, err := s.transitionMembership(ctx, chatID, s.joinUpdate(chatID, userID), 1, &roster, alongside)
 	var failed alongsideConditionFailed
-	if errors.As(err, &failed) && failed.Index == 0 {
-		return false, roster, chat.ErrNotInLobby
+	if errors.As(err, &failed) {
+		switch failed.Index {
+		case 0:
+			return false, roster, chat.ErrBanned
+		case 1:
+			return false, roster, chat.ErrNotInLobby
+		}
 	}
 	return changed, roster, err
 }

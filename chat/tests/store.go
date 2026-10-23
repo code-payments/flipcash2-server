@@ -83,6 +83,14 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_UserState_GetMutedUsers,
 		testStore_UserState_GetMutedUsersPage_Bounds,
 		testStore_UserState_MutedCount,
+		testStore_Restriction_Silence,
+		testStore_Restriction_IndependentOfMute,
+		testStore_Restriction_BanMember,
+		testStore_Restriction_BanNonMember,
+		testStore_Restriction_BanRefusesWaysIn,
+		testStore_Restriction_BanRaces,
+		testStore_Restriction_List,
+		testStore_Restriction_ViewerStatesForUsers,
 		testStore_GroupChat_MembersByID,
 		testStore_Activity_RecentSenders,
 		testStore_Activity_Throttle,
@@ -4350,4 +4358,650 @@ func testStore_Holdings_MintMismatch(t *testing.T, s chat.Store) {
 	require.NoError(t, err)
 	require.False(t, changed)
 	requireQueuedFor(snapshotted, mint)
+}
+
+// restrictedAt is a restriction time a test passes and expects back: at(s),
+// as a pointer for a ViewerState.
+func restrictedAt(seconds int64) *time.Time {
+	t := at(seconds)
+	return &t
+}
+
+// privateGroup creates a private group with creator as its only member.
+func privateGroup(t *testing.T, s chat.Store, creator *commonpb.UserId) *commonpb.ChatId {
+	t.Helper()
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, s.PutChat(context.Background(), &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{creator},
+		Title:        "Private",
+		IsPrivate:    true,
+		CreatorID:    creator,
+		LastActivity: at(1),
+	}))
+	return groupID
+}
+
+// requireNoViewerState checks that the user has no record on the chat.
+func requireNoViewerState(t *testing.T, s chat.Store, chatID *commonpb.ChatId, userID *commonpb.UserId) {
+	t.Helper()
+	states, err := s.GetViewerStates(context.Background(), userID, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	assert.Empty(t, states)
+}
+
+// waitForRestrictedUsers reads chatID's restricted users whole until they are
+// exactly want, in order: the listing is read off an index that may trail the
+// writes (see chat.Store.GetRestrictedUsersPage). It returns the listing.
+func waitForRestrictedUsers(t *testing.T, s chat.Store, chatID *commonpb.ChatId, want ...*commonpb.UserId) []chat.RestrictedUser {
+	t.Helper()
+	var users []chat.RestrictedUser
+	require.Eventually(t, func() bool {
+		var err error
+		users, err = s.GetRestrictedUsersPage(context.Background(), chatID, nil, 0)
+		require.NoError(t, err)
+		got := make([]*commonpb.UserId, len(users))
+		for i, u := range users {
+			got[i] = u.UserID
+		}
+		return slices.EqualFunc(userIDValues(want), userIDValues(got), bytes.Equal)
+	}, 5*time.Second, 10*time.Millisecond)
+	return users
+}
+
+// testStore_Restriction_Silence pins a silence's lifecycle on the record: set
+// at second precision with RestrictedAt the time passed, the same silence a
+// no-op that leaves RestrictedAt where it was, a different one a replace that
+// moves it, and a clear that drops both and keeps the record and its version.
+func testStore_Restriction_Silence(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	group := chat.MustGenerateGroupChatID()
+	user := model.MustGenerateUserID()
+
+	state, changed, err := s.SetSilence(ctx, group, user, chat.Silence{Until: at(100).Add(750 * time.Millisecond)}, at(10))
+	require.NoError(t, err)
+	assert.True(t, changed)
+	want := chat.ViewerState{Silence: &chat.Silence{Until: at(100)}, RestrictedAt: restrictedAt(10), Version: 1}
+	assert.Equal(t, want, state)
+	requireViewerState(t, s, group, user, want)
+	assert.NotNil(t, state.ActiveSilence(at(99)))
+	assert.Nil(t, state.ActiveSilence(at(100)))
+	assert.True(t, state.IsRestricted())
+	assert.False(t, state.IsBanned())
+
+	// The projection carries the silence under restrictions, lapsed or not.
+	pb := state.ToProto(chat.Permissions{})
+	require.NotNil(t, pb.Restrictions)
+	assert.True(t, proto.Equal(chat.Silence{Until: at(100)}.ToProto(), pb.Restrictions.Silence))
+	assert.Nil(t, pb.Settings.Mute)
+
+	// The silence already recorded moves nothing, RestrictedAt included.
+	state, changed, err = s.SetSilence(ctx, group, user, chat.Silence{Until: at(100)}, at(20))
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Equal(t, want, state)
+
+	// A different one replaces it and is a restriction made now.
+	state, changed, err = s.SetSilence(ctx, group, user, chat.Silence{Forever: true, Until: at(5)}, at(30))
+	require.NoError(t, err)
+	assert.True(t, changed)
+	want = chat.ViewerState{Silence: &chat.Silence{Forever: true}, RestrictedAt: restrictedAt(30), Version: 2}
+	assert.Equal(t, want, state)
+	requireViewerState(t, s, group, user, want)
+	assert.NotNil(t, state.ActiveSilence(time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)))
+
+	state, changed, err = s.ClearSilence(ctx, group, user)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, chat.ViewerState{Version: 3}, state)
+	requireViewerState(t, s, group, user, chat.ViewerState{Version: 3})
+	assert.Nil(t, state.ToProto(chat.Permissions{}).Restrictions)
+
+	state, changed, err = s.ClearSilence(ctx, group, user)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Equal(t, chat.ViewerState{Version: 3}, state)
+
+	// Clearing what was never set leaves no record behind.
+	stranger := model.MustGenerateUserID()
+	state, changed, err = s.ClearSilence(ctx, group, stranger)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Equal(t, chat.ViewerState{}, state)
+	requireNoViewerState(t, s, group, stranger)
+
+	// Out of range is refused with nothing written.
+	_, _, err = s.SetSilence(ctx, group, stranger, chat.Silence{Until: chat.MaxMuteUntil}, at(10))
+	require.ErrorIs(t, err, chat.ErrSilenceUntilOutOfRange)
+	_, _, err = s.SetSilence(ctx, group, stranger, chat.Silence{Until: time.Unix(-1, 0)}, at(10))
+	require.ErrorIs(t, err, chat.ErrSilenceUntilOutOfRange)
+	requireNoViewerState(t, s, group, stranger)
+
+	// Restrictions are a group's alone.
+	dm := generateDmChatID()
+	_, _, err = s.SetSilence(ctx, dm, user, chat.Silence{Forever: true}, at(10))
+	require.Error(t, err)
+	_, _, err = s.ClearSilence(ctx, dm, user)
+	require.Error(t, err)
+	_, err = s.BanUser(ctx, dm, user, at(10), false)
+	require.Error(t, err)
+	_, _, err = s.UnbanUser(ctx, dm, user)
+	require.Error(t, err)
+	_, err = s.GetRestrictedUsersPage(ctx, dm, nil, 0)
+	require.Error(t, err)
+}
+
+// testStore_Restriction_IndependentOfMute pins that the user's mute and the
+// creator's restrictions share the record and its version and nothing else:
+// a mute's writes, first, replacing or clearing, never touch a restriction,
+// and a restriction's never touch the mute or the chat's muted count.
+func testStore_Restriction_IndependentOfMute(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	user := model.MustGenerateUserID()
+	c := putGroupChat(t, s, "Group", at(1), creator, user)
+	group := c.ID
+
+	// A silence first, then a first mute: the mute's counted write keeps the
+	// silence.
+	_, _, err := s.SetSilence(ctx, group, user, chat.Silence{Until: at(100)}, at(10))
+	require.NoError(t, err)
+	requireMutedCount(t, s, group, 0)
+	requireMutedUsers(t, s, group, at(0))
+	state, changed, err := s.SetMute(ctx, group, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	assert.True(t, changed)
+	want := chat.ViewerState{
+		Mute:         &chat.Mute{Forever: true},
+		Silence:      &chat.Silence{Until: at(100)},
+		RestrictedAt: restrictedAt(10),
+		Version:      2,
+	}
+	assert.Equal(t, want, state)
+	requireViewerState(t, s, group, user, want)
+	requireMutedCount(t, s, group, 1)
+
+	// Replacing the mute keeps the silence too.
+	state, _, err = s.SetMute(ctx, group, user, chat.Mute{Until: at(200)})
+	require.NoError(t, err)
+	want.Mute = &chat.Mute{Until: at(200)}
+	want.Version = 3
+	assert.Equal(t, want, state)
+
+	// A silence replaced or cleared keeps the mute and its count.
+	state, _, err = s.SetSilence(ctx, group, user, chat.Silence{Forever: true}, at(20))
+	require.NoError(t, err)
+	want.Silence = &chat.Silence{Forever: true}
+	want.RestrictedAt = restrictedAt(20)
+	want.Version = 4
+	assert.Equal(t, want, state)
+	requireMutedCount(t, s, group, 1)
+	requireMutedUsers(t, s, group, at(0), user)
+
+	// A ban keeps the mute and the silence.
+	result, err := s.BanUser(ctx, group, user, at(30), false)
+	require.NoError(t, err)
+	assert.True(t, result.Changed)
+	want.BannedAt = restrictedAt(30)
+	want.RestrictedAt = restrictedAt(30)
+	want.Version = 5
+	assert.Equal(t, want, result.State)
+	requireMutedCount(t, s, group, 1)
+
+	// The departure's ClearMute clears the mute alone: the silence and the
+	// ban stand.
+	state, changed, err = s.ClearMute(ctx, group, user)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	want.Mute = nil
+	want.Version = 6
+	assert.Equal(t, want, state)
+	requireViewerState(t, s, group, user, want)
+	requireMutedCount(t, s, group, 0)
+
+	// Clearing the silence keeps the ban, and RestrictedAt with it.
+	state, changed, err = s.ClearSilence(ctx, group, user)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	want.Silence = nil
+	want.Version = 7
+	assert.Equal(t, want, state)
+	requireMutedCount(t, s, group, 0)
+
+	// A mute set on a banned user's record keeps the ban.
+	state, _, err = s.SetMute(ctx, group, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	want.Mute = &chat.Mute{Forever: true}
+	want.Version = 8
+	assert.Equal(t, want, state)
+
+	// Unbanning, with no silence left, drops RestrictedAt and keeps the mute.
+	state, changed, err = s.UnbanUser(ctx, group, user)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, chat.ViewerState{Mute: &chat.Mute{Forever: true}, Version: 9}, state)
+	requireViewerState(t, s, group, user, chat.ViewerState{Mute: &chat.Mute{Forever: true}, Version: 9})
+	requireMutedCount(t, s, group, 1)
+}
+
+// testStore_Restriction_BanMember pins a ban of a joined member: one write
+// that records the ban and departs them exactly as RemoveGroupMember would,
+// roster version, tombstone and all, discarding their key envelope only when
+// asked; a repeat is the no-op, and the restriction survives their absence.
+func testStore_Restriction_BanMember(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	member := model.MustGenerateUserID()
+	keeper := model.MustGenerateUserID()
+	c := putGroupChat(t, s, "Group", at(1), creator, member, keeper)
+	group := c.ID
+	for i, u := range []*commonpb.UserId{member, keeper} {
+		_, err := s.SetKeyEnvelope(ctx, group, u, keyEnvelope(byte(i+1), u))
+		require.NoError(t, err)
+	}
+	_, _, err := s.SetSilence(ctx, group, member, chat.Silence{Forever: true}, at(5))
+	require.NoError(t, err)
+
+	result, err := s.BanUser(ctx, group, member, at(10), true)
+	require.NoError(t, err)
+	assert.Equal(t, chat.BanResult{
+		State: chat.ViewerState{
+			Silence:      &chat.Silence{Forever: true},
+			BannedAt:     restrictedAt(10),
+			RestrictedAt: restrictedAt(10),
+			Version:      2,
+		},
+		Changed:  true,
+		Departed: true,
+		Roster:   chat.RosterSummary{MemberCount: 2, Version: 1},
+	}, result)
+	requireViewerState(t, s, group, member, result.State)
+	requireRosterSummary(t, s, group, 2, 1)
+	isMember, err := s.IsMember(ctx, group, member)
+	require.NoError(t, err)
+	assert.False(t, isMember)
+	_, err = s.GetKeyEnvelope(ctx, group, member)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// The departure is a tombstone at the ban's roster version, as any.
+	memberships, err := s.GetGroupMembershipsForUser(ctx, member)
+	require.NoError(t, err)
+	require.Len(t, memberships, 1)
+	assert.False(t, memberships[0].Joined)
+	assert.EqualValues(t, 1, memberships[0].Version)
+
+	// Banning again is the no-op: nothing is written, and the roster is as
+	// it stands.
+	again, err := s.BanUser(ctx, group, member, at(20), true)
+	require.NoError(t, err)
+	assert.Equal(t, chat.BanResult{State: result.State, Roster: chat.RosterSummary{MemberCount: 2, Version: 1}}, again)
+	requireRosterSummary(t, s, group, 2, 1)
+
+	// Not asked to discard, the envelope stays, as on a leave.
+	result, err = s.BanUser(ctx, group, keeper, at(30), false)
+	require.NoError(t, err)
+	assert.True(t, result.Changed)
+	assert.True(t, result.Departed)
+	assert.False(t, result.LeftLobby)
+	assert.Equal(t, chat.RosterSummary{MemberCount: 1, Version: 2}, result.Roster)
+	assert.Equal(t, chat.ViewerState{BannedAt: restrictedAt(30), RestrictedAt: restrictedAt(30), Version: 1}, result.State)
+	_, err = s.GetKeyEnvelope(ctx, group, keeper)
+	require.NoError(t, err)
+
+	// The restrictions outlive the departure, a departure's ClearMute
+	// included, and come back with an unbanned user who rejoins.
+	_, _, err = s.ClearMute(ctx, group, member)
+	require.NoError(t, err)
+	state, changed, err := s.UnbanUser(ctx, group, member)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	want := chat.ViewerState{Silence: &chat.Silence{Forever: true}, RestrictedAt: restrictedAt(10), Version: 3}
+	assert.Equal(t, want, state)
+	isMember, err = s.IsMember(ctx, group, member)
+	require.NoError(t, err)
+	assert.False(t, isMember, "unbanning does not readmit")
+	changed, roster := addGroupMembers(t, s, group, member)
+	assert.True(t, changed)
+	assert.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 3}, roster)
+	requireViewerState(t, s, group, member, want)
+
+	// A silenced member who leaves and returns is silenced still.
+	removeGroupMember(t, s, group, member)
+	_, _, err = s.ClearMute(ctx, group, member)
+	require.NoError(t, err)
+	addGroupMembers(t, s, group, member)
+	requireViewerState(t, s, group, member, want)
+
+	// A group that does not exist has no one to ban.
+	_, err = s.BanUser(ctx, chat.MustGenerateGroupChatID(), member, at(40), false)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+}
+
+// testStore_Restriction_BanNonMember pins a ban of someone the group does not
+// hold: the record alone, with the roster as it stands, and a user waiting in
+// the lobby taken out of it with both counts.
+func testStore_Restriction_BanNonMember(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	group := privateGroup(t, s, creator)
+	stranger := model.MustGenerateUserID()
+
+	result, err := s.BanUser(ctx, group, stranger, at(10), true)
+	require.NoError(t, err)
+	assert.Equal(t, chat.BanResult{
+		State:   chat.ViewerState{BannedAt: restrictedAt(10), RestrictedAt: restrictedAt(10), Version: 1},
+		Changed: true,
+		Roster:  chat.RosterSummary{MemberCount: 1},
+	}, result)
+	requireRosterSummary(t, s, group, 1, 0)
+	memberships, err := s.GetGroupMembershipsForUser(ctx, stranger)
+	require.NoError(t, err)
+	assert.Empty(t, memberships)
+
+	// A user waiting in the lobby leaves it. The caps are tight, so the
+	// places the entry held, in the lobby and among the user's lobbies,
+	// show as freed by the next entries.
+	tight := chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1}
+	waiting := model.MustGenerateUserID()
+	_, _, err = s.EnterLobby(ctx, group, waiting, tight)
+	require.NoError(t, err)
+	_, _, err = s.EnterLobby(ctx, group, model.MustGenerateUserID(), tight)
+	require.ErrorIs(t, err, chat.ErrLobbyFull)
+
+	result, err = s.BanUser(ctx, group, waiting, at(20), false)
+	require.NoError(t, err)
+	assert.True(t, result.Changed)
+	assert.False(t, result.Departed)
+	assert.True(t, result.LeftLobby)
+	assert.Equal(t, chat.RosterSummary{MemberCount: 1}, result.Roster)
+	entries, err := s.GetLobbyEntries(ctx, waiting, []*commonpb.ChatId{group})
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+	waitForLobbyPage(t, s, group, 0)
+
+	_, changed, err := s.EnterLobby(ctx, group, model.MustGenerateUserID(), tight)
+	require.NoError(t, err)
+	assert.True(t, changed, "the lobby's place was freed")
+	_, changed, err = s.EnterLobby(ctx, privateGroup(t, s, creator), waiting, tight)
+	require.NoError(t, err)
+	assert.True(t, changed, "the user's place was freed")
+}
+
+// testStore_Restriction_BanRefusesWaysIn pins ErrBanned: a banned user is
+// refused every write that would let them in — a join, a lobby entry, an
+// admission — with nothing written, and let in again once unbanned.
+func testStore_Restriction_BanRefusesWaysIn(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	group := privateGroup(t, s, creator)
+	user := model.MustGenerateUserID()
+
+	_, err := s.BanUser(ctx, group, user, at(10), false)
+	require.NoError(t, err)
+
+	changed, roster, err := s.AddGroupMembers(ctx, group, []*commonpb.UserId{user})
+	require.ErrorIs(t, err, chat.ErrBanned)
+	assert.False(t, changed)
+	assert.Equal(t, chat.RosterSummary{MemberCount: 1}, roster)
+	requireRosterSummary(t, s, group, 1, 0)
+
+	// The users before the banned one in a batch are joined, the rest not.
+	before, after := model.MustGenerateUserID(), model.MustGenerateUserID()
+	changed, roster, err = s.AddGroupMembers(ctx, group, []*commonpb.UserId{before, user, after})
+	require.ErrorIs(t, err, chat.ErrBanned)
+	assert.True(t, changed)
+	assert.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 1}, roster)
+	isMember, err := s.IsMember(ctx, group, after)
+	require.NoError(t, err)
+	assert.False(t, isMember)
+
+	_, _, err = s.EnterLobby(ctx, group, user, lobbyLimits)
+	require.ErrorIs(t, err, chat.ErrBanned)
+	entries, err := s.GetLobbyEntries(ctx, user, []*commonpb.ChatId{group})
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+
+	// Judged before the lobby: a banned user holds no entry, and is told why.
+	_, _, err = s.AdmitFromLobby(ctx, group, user, keyEnvelope(1, creator))
+	require.ErrorIs(t, err, chat.ErrBanned)
+	_, err = s.GetKeyEnvelope(ctx, group, user)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	isMember, err = s.IsMember(ctx, group, user)
+	require.NoError(t, err)
+	assert.False(t, isMember)
+	requireRosterSummary(t, s, group, 2, 1)
+
+	// A member is a member whatever the record holds: the no-op is judged
+	// first, and the join it would have been is not refused.
+	changed, _, err = s.AddGroupMembers(ctx, group, []*commonpb.UserId{before})
+	require.NoError(t, err)
+	assert.False(t, changed)
+
+	// Unbanned, the user comes in by any way; unbanning again is the no-op.
+	state, changed, err := s.UnbanUser(ctx, group, user)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, chat.ViewerState{Version: 2}, state)
+	state, changed, err = s.UnbanUser(ctx, group, user)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Equal(t, chat.ViewerState{Version: 2}, state)
+
+	_, changed, err = s.EnterLobby(ctx, group, user, lobbyLimits)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	changed, roster, err = s.AdmitFromLobby(ctx, group, user, keyEnvelope(1, creator))
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, chat.RosterSummary{MemberCount: 3, Version: 2}, roster)
+
+	// Banned again as a member, and joined again once unbanned.
+	result, err := s.BanUser(ctx, group, user, at(20), true)
+	require.NoError(t, err)
+	assert.True(t, result.Departed)
+	_, _, err = s.AddGroupMembers(ctx, group, []*commonpb.UserId{user})
+	require.ErrorIs(t, err, chat.ErrBanned)
+	_, _, err = s.UnbanUser(ctx, group, user)
+	require.NoError(t, err)
+	changed, roster = addGroupMembers(t, s, group, user)
+	assert.True(t, changed)
+	assert.Equal(t, chat.RosterSummary{MemberCount: 3, Version: 4}, roster)
+
+	// Unbanning someone never banned writes nothing.
+	stranger := model.MustGenerateUserID()
+	state, changed, err = s.UnbanUser(ctx, group, stranger)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Equal(t, chat.ViewerState{}, state)
+	requireNoViewerState(t, s, group, stranger)
+}
+
+// testStore_Restriction_BanRaces pins that a ban and a way in are exclusive
+// under concurrency: whichever lands first, the user ends banned, not a
+// member and not waiting, and a refused way in is ErrBanned.
+func testStore_Restriction_BanRaces(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	group := privateGroup(t, s, creator)
+
+	for i := 0; i < 8; i++ {
+		joiner, waiter := model.MustGenerateUserID(), model.MustGenerateUserID()
+		var wg sync.WaitGroup
+		errs := make([]error, 4)
+		wg.Add(4)
+		go func() {
+			defer wg.Done()
+			_, _, errs[0] = s.AddGroupMembers(ctx, group, []*commonpb.UserId{joiner})
+		}()
+		go func() {
+			defer wg.Done()
+			_, errs[1] = s.BanUser(ctx, group, joiner, at(int64(i)), true)
+		}()
+		go func() {
+			defer wg.Done()
+			_, _, errs[2] = s.EnterLobby(ctx, group, waiter, lobbyLimits)
+		}()
+		go func() {
+			defer wg.Done()
+			_, errs[3] = s.BanUser(ctx, group, waiter, at(int64(i)), false)
+		}()
+		wg.Wait()
+
+		for _, err := range []error{errs[0], errs[2]} {
+			if err != nil {
+				require.ErrorIs(t, err, chat.ErrBanned)
+			}
+		}
+		require.NoError(t, errs[1])
+		require.NoError(t, errs[3])
+		for _, u := range []*commonpb.UserId{joiner, waiter} {
+			isMember, err := s.IsMember(ctx, group, u)
+			require.NoError(t, err)
+			assert.False(t, isMember)
+			entries, err := s.GetLobbyEntries(ctx, u, []*commonpb.ChatId{group})
+			require.NoError(t, err)
+			assert.Empty(t, entries)
+			states, err := s.GetViewerStates(ctx, u, []*commonpb.ChatId{group})
+			require.NoError(t, err)
+			assert.True(t, states[string(group.Value)].IsBanned())
+		}
+	}
+
+	// The roster summary agrees with the rows: every join undone by a ban
+	// counted its departure.
+	summary, members, err := s.GetGroupRoster(ctx, group)
+	require.NoError(t, err)
+	assert.EqualValues(t, len(members), summary.MemberCount)
+	assert.EqualValues(t, 1, summary.MemberCount)
+}
+
+// testStore_Restriction_List pins the creator's listing: every user with a
+// restriction recorded, most recently restricted first, paged strictly after
+// a position, a replaced silence moving its user to the front, a user
+// keeping their place while one of two restrictions is lifted, and leaving
+// once both are; a mute alone is no restriction.
+func testStore_Restriction_List(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	c := putGroupChat(t, s, "Group", at(1), creator)
+	group := c.ID
+	other := putGroupChat(t, s, "Other", at(1), creator).ID
+	a, b, d, e := model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()
+
+	waitForRestrictedUsers(t, s, group)
+
+	_, _, err := s.SetSilence(ctx, group, a, chat.Silence{Until: at(100)}, at(10))
+	require.NoError(t, err)
+	_, err = s.BanUser(ctx, group, b, at(20), false)
+	require.NoError(t, err)
+	_, _, err = s.SetSilence(ctx, group, d, chat.Silence{Forever: true}, at(30))
+	require.NoError(t, err)
+	_, err = s.BanUser(ctx, group, d, at(40), false)
+	require.NoError(t, err)
+	_, _, err = s.SetMute(ctx, group, e, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	_, _, err = s.SetSilence(ctx, other, e, chat.Silence{Forever: true}, at(50))
+	require.NoError(t, err)
+
+	users := waitForRestrictedUsers(t, s, group, d, b, a)
+	assert.Equal(t, chat.ViewerState{
+		Silence:      &chat.Silence{Forever: true},
+		BannedAt:     restrictedAt(40),
+		RestrictedAt: restrictedAt(40),
+		Version:      2,
+	}, users[0].State)
+	assert.Equal(t, chat.ViewerState{BannedAt: restrictedAt(20), RestrictedAt: restrictedAt(20), Version: 1}, users[1].State)
+	// A lapsed silence is listed still: leaving it out is the reader's call.
+	assert.Equal(t, chat.ViewerState{Silence: &chat.Silence{Until: at(100)}, RestrictedAt: restrictedAt(10), Version: 1}, users[2].State)
+	waitForRestrictedUsers(t, s, other, e)
+
+	// Paged one at a time, strictly after each position.
+	var walked []*commonpb.UserId
+	var after *chat.RestrictionPosition
+	for {
+		page, err := s.GetRestrictedUsersPage(ctx, group, after, 1)
+		require.NoError(t, err)
+		if len(page) == 0 {
+			break
+		}
+		require.Len(t, page, 1)
+		walked = append(walked, page[0].UserID)
+		position := page[0].Position()
+		after = &position
+	}
+	assert.Equal(t, userIDValues([]*commonpb.UserId{d, b, a}), userIDValues(walked))
+
+	// A position need not name a listed user: the page resumes below it.
+	page, err := s.GetRestrictedUsersPage(ctx, group, &chat.RestrictionPosition{RestrictedAt: at(25), UserID: e}, 0)
+	require.NoError(t, err)
+	assert.Len(t, page, 2)
+
+	// A replaced silence is a restriction made now.
+	_, _, err = s.SetSilence(ctx, group, a, chat.Silence{Forever: true}, at(60))
+	require.NoError(t, err)
+	waitForRestrictedUsers(t, s, group, a, d, b)
+
+	// Lifting one of two keeps the user where they were; lifting the last
+	// takes them out.
+	_, _, err = s.ClearSilence(ctx, group, d)
+	require.NoError(t, err)
+	users = waitForRestrictedUsers(t, s, group, a, d, b)
+	assert.Equal(t, chat.ViewerState{BannedAt: restrictedAt(40), RestrictedAt: restrictedAt(40), Version: 3}, users[1].State)
+	_, _, err = s.UnbanUser(ctx, group, d)
+	require.NoError(t, err)
+	_, _, err = s.UnbanUser(ctx, group, b)
+	require.NoError(t, err)
+	waitForRestrictedUsers(t, s, group, a)
+	_, _, err = s.ClearSilence(ctx, group, a)
+	require.NoError(t, err)
+	waitForRestrictedUsers(t, s, group)
+}
+
+// testStore_Restriction_ViewerStatesForUsers pins the chat-scoped batch read:
+// each user's record on the one chat, whatever it holds, the users with
+// none absent, duplicates collapsed, and more users than one batch read
+// takes.
+func testStore_Restriction_ViewerStatesForUsers(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	group := chat.MustGenerateGroupChatID()
+	other := chat.MustGenerateGroupChatID()
+	banned, silenced, muted := model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()
+
+	_, err := s.BanUser(ctx, group, banned, at(10), false)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+	c := putGroupChat(t, s, "Group", at(1), model.MustGenerateUserID())
+	group = c.ID
+	_, err = s.BanUser(ctx, group, banned, at(10), false)
+	require.NoError(t, err)
+	_, _, err = s.SetSilence(ctx, group, silenced, chat.Silence{Forever: true}, at(20))
+	require.NoError(t, err)
+	_, _, err = s.SetMute(ctx, group, muted, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	_, _, err = s.SetSilence(ctx, other, banned, chat.Silence{Forever: true}, at(30))
+	require.NoError(t, err)
+
+	states, err := s.GetViewerStatesForUsers(ctx, group, nil)
+	require.NoError(t, err)
+	assert.Empty(t, states)
+
+	userIDs := []*commonpb.UserId{banned, silenced, muted, banned}
+	for range 150 {
+		userIDs = append(userIDs, model.MustGenerateUserID())
+	}
+	want := map[string]chat.ViewerState{
+		string(banned.Value):   {BannedAt: restrictedAt(10), RestrictedAt: restrictedAt(10), Version: 1},
+		string(silenced.Value): {Silence: &chat.Silence{Forever: true}, RestrictedAt: restrictedAt(20), Version: 1},
+		string(muted.Value):    {Mute: &chat.Mute{Forever: true}, Version: 1},
+	}
+	require.Eventually(t, func() bool {
+		states, err = s.GetViewerStatesForUsers(ctx, group, userIDs)
+		require.NoError(t, err)
+		return assert.ObjectsAreEqual(want, states)
+	}, 5*time.Second, 10*time.Millisecond)
+
+	// And the strongly consistent read the speaker gate uses carries the
+	// restrictions too.
+	requireViewerState(t, s, group, banned, want[string(banned.Value)])
+	requireViewerState(t, s, group, silenced, want[string(silenced.Value)])
 }

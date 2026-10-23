@@ -26,7 +26,8 @@ import (
 //     listener rules, so a qualifying user can preview a group before joining,
 //     and every non-member does when the group carries none, and redacted
 //     otherwise, so any registered user can see a gated group's shape (see
-//     present).
+//     present). A user the group's creator has banned reads it redacted
+//     whatever its rules say of them (see chat.Access).
 //   - overlayStanding: the reaction summaries and reactor lists. They carry
 //     no ViewMode, since they return no message, and are answered for anyone
 //     who may read the chat at all — a member, or any non-member of a public
@@ -41,16 +42,22 @@ import (
 //     A pointer advance leaves a per-user item in the chat's partition, and a
 //     reaction is something other members see, so neither is open to a
 //     non-member however well they satisfy the rules.
-//   - canSpeak and speakerStanding: every send — a message, an edit, a deletion, a
+//   - canSpeak and speakerStanding: every send — a message, an edit, a
 //     typing notification. Members who satisfy the listener and speaker
 //     rules, which in a DM with the Flipcash team account include a Never
 //     rule no one satisfies (see chat.RuleEvaluator); in a private group,
 //     members of one that has its chat key, with no rule asked (see
-//     chat.Access.SpeakerStanding). A send or edit asks for the whole standing,
+//     chat.Access.SpeakerStanding); and in any group, only while its creator
+//     has not silenced them (see chat.Silence), which is read on every ask
+//     and never remembered. A send or edit asks for the whole standing,
 //     since it also says what the chat takes — plaintext, or encrypted
 //     content under which scheme — which encryptionVerdict applies to the
-//     content; a deletion or typing notification carries nothing to judge
-//     and asks the boolean.
+//     content; a typing notification carries nothing to judge and asks the
+//     boolean.
+//   - canDelete: a deletion. The speaker gate, except that a silence does not
+//     refuse it (see chat.Access.CanDelete): a silenced member may still
+//     delete their own messages, while a non-member, a member a rule
+//     excludes, or a member of a keyless private group may not.
 //
 // A member's read is answered on membership alone, without evaluating a rule,
 // even though a listener rule is what admitted them: reads are the hot path,
@@ -103,6 +110,15 @@ func (s *Server) canSpeak(ctx context.Context, log *zap.Logger, chatID *commonpb
 	ok, err := s.access.CanSpeak(ctx, chatID, userID)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure checking chat speak access")
+		return false, status.Error(codes.Internal, "")
+	}
+	return ok, nil
+}
+
+func (s *Server) canDelete(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
+	ok, err := s.access.CanDelete(ctx, chatID, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure checking chat delete access")
 		return false, status.Error(codes.Internal, "")
 	}
 	return ok, nil

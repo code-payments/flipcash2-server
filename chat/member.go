@@ -42,6 +42,13 @@ import (
 // A public group without listener rules is open: the empty set is satisfied
 // by everyone, so anyone may join it, as anyone may read it (see Access).
 //
+// A user the group's creator has banned (see Store.BanUser) is refused as
+// BANNED, public or private group, until unbanned. The ban is judged by the
+// store in the write that would join them (see ErrBanned), so a ban racing a
+// join never leaves a banned member; it is not read ahead of the rules, so a
+// banned user who also fails the rules is told RULES_NOT_SATISFIED, the
+// answer they would get after an unban too.
+//
 // Each transition that actually happens is broadcast as a RosterUpdate to the
 // chat's members and to the affected user (see publishRosterUpdate): the user
 // learns what happened to them, and the other members only that the roster
@@ -113,7 +120,10 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	// both may pass the membership check above, but only the one whose write
 	// is the transition sees changed, and only it broadcasts.
 	changed, roster, err := s.chats.AddGroupMembers(ctx, req.ChatId, []*commonpb.UserId{userID})
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrBanned):
+		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_BANNED}, nil
+	case err != nil:
 		log.With(zap.Error(err)).Warn("Failure adding group member")
 		return nil, status.Error(codes.Internal, "")
 	}

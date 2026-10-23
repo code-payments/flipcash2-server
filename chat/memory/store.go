@@ -216,6 +216,11 @@ func (m *memory) AddGroupMembers(_ context.Context, chatID *commonpb.ChatId, use
 		if m.isJoinedLocked(key, string(userID.Value)) {
 			continue // Already joined: no transition.
 		}
+		// Banned is judged after the no-op, as the persistent stores judge it,
+		// and stops the batch there, as their per-user writes do.
+		if m.isBannedLocked(key, string(userID.Value)) {
+			return changed, m.rosterSummaryLocked(chatID), chat.ErrBanned
+		}
 		// A (re)join is a fresh record: a new join time, stamped with the
 		// version the transition advances the roster to.
 		m.groupVersions[key]++
@@ -788,6 +793,199 @@ func (m *memory) GetViewerStates(_ context.Context, userID *commonpb.UserId, cha
 	return out, nil
 }
 
+func (m *memory) GetViewerStatesForUsers(_ context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]chat.ViewerState, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	out := make(map[string]chat.ViewerState)
+	for _, userID := range userIDs {
+		if state, ok := m.viewerStates[string(userID.Value)][string(chatID.Value)]; ok {
+			out[string(userID.Value)] = state.Clone()
+		}
+	}
+	return out, nil
+}
+
+// isBannedLocked reports whether the user's record on the chat holds a ban.
+func (m *memory) isBannedLocked(chatKey, userKey string) bool {
+	state := m.viewerStates[userKey][chatKey]
+	return state != nil && state.IsBanned()
+}
+
+// viewerStateLocked returns the user's record on the chat, creating an empty
+// one when create is set and there is none; without create, a missing record
+// is nil. A created record is the caller's to change: every caller that
+// creates one moves it.
+func (m *memory) viewerStateLocked(chatID *commonpb.ChatId, userID *commonpb.UserId, create bool) *chat.ViewerState {
+	byChat := m.viewerStates[string(userID.Value)]
+	if byChat == nil {
+		if !create {
+			return nil
+		}
+		byChat = make(map[string]*chat.ViewerState)
+		m.viewerStates[string(userID.Value)] = byChat
+	}
+	state := byChat[string(chatID.Value)]
+	if state == nil && create {
+		state = &chat.ViewerState{}
+		byChat[string(chatID.Value)] = state
+	}
+	return state
+}
+
+// restrictionTime is now as a restriction records it: at the persistent
+// store's nanosecond precision, in UTC, with no monotonic reading, so two
+// stores return equal times; or an error when it is before the Unix epoch,
+// which no store records.
+func restrictionTime(now time.Time) (time.Time, error) {
+	if now.Before(time.Unix(0, 0)) {
+		return time.Time{}, fmt.Errorf("restriction time before the unix epoch")
+	}
+	return time.Unix(0, now.UnixNano()).UTC(), nil
+}
+
+func (m *memory) SetSilence(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, silence chat.Silence, now time.Time) (chat.ViewerState, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.ViewerState{}, false, fmt.Errorf("not a group chat id")
+	}
+	silence, err := silence.Normalize()
+	if err != nil {
+		return chat.ViewerState{}, false, err
+	}
+	now, err = restrictionTime(now)
+	if err != nil {
+		return chat.ViewerState{}, false, err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	if state := m.viewerStateLocked(chatID, userID, false); state != nil && state.Silence != nil && *state.Silence == silence {
+		return state.Clone(), false, nil
+	}
+	state := m.viewerStateLocked(chatID, userID, true)
+	state.Silence = &silence
+	state.RestrictedAt = &now
+	state.Version++
+	return state.Clone(), true, nil
+}
+
+func (m *memory) ClearSilence(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.ViewerState{}, false, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	state := m.viewerStateLocked(chatID, userID, false)
+	if state == nil {
+		return chat.ViewerState{}, false, nil
+	}
+	if state.Silence == nil {
+		return state.Clone(), false, nil
+	}
+	state.Silence = nil
+	if !state.IsRestricted() {
+		state.RestrictedAt = nil
+	}
+	state.Version++
+	return state.Clone(), true, nil
+}
+
+func (m *memory) BanUser(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, now time.Time, discardKeyEnvelope bool) (chat.BanResult, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.BanResult{}, fmt.Errorf("not a group chat id")
+	}
+	now, err := restrictionTime(now)
+	if err != nil {
+		return chat.BanResult{}, err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	chatKey, userKey := string(chatID.Value), string(userID.Value)
+	if _, ok := m.chats[chatKey]; !ok {
+		return chat.BanResult{}, chat.ErrChatNotFound
+	}
+	if state := m.viewerStateLocked(chatID, userID, false); state != nil && state.IsBanned() {
+		return chat.BanResult{State: state.Clone(), Roster: m.rosterSummaryLocked(chatID)}, nil
+	}
+
+	var result chat.BanResult
+	if m.isJoinedLocked(chatKey, userKey) {
+		// The departure RemoveGroupMember makes.
+		m.groupVersions[chatKey]++
+		m.groupMembers[chatKey][userKey] = &memberRecord{version: m.groupVersions[chatKey]}
+		if discardKeyEnvelope {
+			delete(m.keyEnvelopes[userKey], chatKey)
+		}
+		result.Departed = true
+	}
+	result.LeftLobby = m.leaveLobbyLocked(chatID, userID)
+
+	state := m.viewerStateLocked(chatID, userID, true)
+	state.BannedAt = &now
+	state.RestrictedAt = &now
+	state.Version++
+
+	result.State = state.Clone()
+	result.Changed = true
+	result.Roster = m.rosterSummaryLocked(chatID)
+	return result, nil
+}
+
+func (m *memory) UnbanUser(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.ViewerState{}, false, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	state := m.viewerStateLocked(chatID, userID, false)
+	if state == nil {
+		return chat.ViewerState{}, false, nil
+	}
+	if !state.IsBanned() {
+		return state.Clone(), false, nil
+	}
+	state.BannedAt = nil
+	if !state.IsRestricted() {
+		state.RestrictedAt = nil
+	}
+	state.Version++
+	return state.Clone(), true, nil
+}
+
+func (m *memory) GetRestrictedUsersPage(_ context.Context, chatID *commonpb.ChatId, after *chat.RestrictionPosition, limit int) ([]chat.RestrictedUser, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, fmt.Errorf("not a group chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	users := make([]chat.RestrictedUser, 0)
+	for userKey, byChat := range m.viewerStates {
+		state := byChat[string(chatID.Value)]
+		if state == nil || !state.IsRestricted() {
+			continue
+		}
+		user := chat.RestrictedUser{UserID: &commonpb.UserId{Value: []byte(userKey)}, State: state.Clone()}
+		if after != nil && user.Position().Compare(*after) <= 0 {
+			continue
+		}
+		users = append(users, user)
+	}
+	slices.SortFunc(users, func(a, b chat.RestrictedUser) int { return a.Position().Compare(b.Position()) })
+	if limit > 0 && len(users) > limit {
+		users = users[:limit]
+	}
+	return users, nil
+}
+
 func (m *memory) GetMutedUsers(_ context.Context, chatID *commonpb.ChatId, now time.Time, limit int) ([]*commonpb.UserId, error) {
 	m.Lock()
 	defer m.Unlock()
@@ -986,10 +1184,13 @@ func (m *memory) EnterLobby(_ context.Context, chatID *commonpb.ChatId, userID *
 	defer m.Unlock()
 
 	userKey, chatKey := string(userID.Value), string(chatID.Value)
-	// Membership first, then an existing entry, then the lobby's cap before
-	// the user's, as the persistent stores judge them.
+	// Membership first, then a ban, then an existing entry, then the lobby's
+	// cap before the user's, as the persistent stores judge them.
 	if m.isJoinedLocked(chatKey, userKey) {
 		return chat.LobbyEntry{}, false, chat.ErrAlreadyMember
+	}
+	if m.isBannedLocked(chatKey, userKey) {
+		return chat.LobbyEntry{}, false, chat.ErrBanned
 	}
 	if enteredAt, ok := m.lobbies[userKey][chatKey]; ok {
 		return chat.LobbyEntry{UserID: cloneUserID(userID), EnteredAt: enteredAt}, false, nil
@@ -1080,6 +1281,9 @@ func (m *memory) AdmitFromLobby(_ context.Context, chatID *commonpb.ChatId, user
 	// persistent stores judge it (see chat.Store.AdmitFromLobby).
 	if m.isJoinedLocked(chatKey, userKey) {
 		return false, m.rosterSummaryLocked(chatID), nil
+	}
+	if m.isBannedLocked(chatKey, userKey) {
+		return false, m.rosterSummaryLocked(chatID), chat.ErrBanned
 	}
 	if _, ok := m.lobbies[userKey][chatKey]; !ok {
 		return false, chat.RosterSummary{}, chat.ErrNotInLobby

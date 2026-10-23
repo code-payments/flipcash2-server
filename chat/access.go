@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/ReneKroon/ttlcache"
+	"golang.org/x/sync/errgroup"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -38,8 +39,12 @@ const DefaultSpeakerAdmissionTTL = 30 * time.Second
 //     public group, and only a public group, if they satisfy its listener
 //     rules right now, which every non-member does when it carries none.
 //   - CanSpeak: may the user produce something other members see — a message,
-//     an edit, a deletion, a typing notification. Members only, and only as
-//     the chat's governance allows.
+//     an edit, a typing notification. Members only, only as the chat's
+//     governance allows, and in a group only while its creator has not
+//     silenced them (see Silence).
+//   - CanDelete: may the user delete their own message. CanSpeak, except that
+//     a silence does not take it away: a silenced member may still take back
+//     what they said.
 //
 // Membership is always checked first: it is the cheaper check (a keyed read,
 // cached for a DM), and it answers for a member without evaluating a rule — a
@@ -109,6 +114,34 @@ const DefaultSpeakerAdmissionTTL = 30 * time.Second
 // shown to any registered user (see Server.GetChat), which is how a user sees
 // what they would ask to join. Its members speak in it on membership and the
 // group's key alone (see privateGroupSpeaker).
+//
+// A group's creator moderates it (see Server.SilenceUser and Server.BanUser),
+// and both restrictions are answered here, read from the user's ViewerState
+// in the group, strongly consistent, on every ask that turns on one — never
+// remembered, so a restriction takes effect on the very next ask on every
+// server:
+//
+//   - A silence takes speech from a member: CanSpeak is false while it is
+//     active (see ViewerState.ActiveSilence), whatever the chat's governance
+//     would say. It is read alongside membership on every speaker ask in a
+//     group, public or private, and judged after the governance's verdict, so
+//     a remembered admission to speak (see above) answers the rules alone and
+//     never hides a silence. Deletion of one's own messages is carved out
+//     (see CanDelete); everything else a silence leaves alone — reading,
+//     reacting, voting, paying a requested share, boosting — gates on
+//     membership or reading and never asks.
+//   - A ban takes a full read from a non-member of a public group, whatever
+//     its listener rules say of them: a banned user previews it, redacted, as
+//     anyone may (see publicGroupNonMember). It is read only once the rules or
+//     a remembered admission would grant a full read, since that is all a ban
+//     takes away, and then on every such ask, so an admission from before the
+//     ban never outlives it. A REDACTED read reads no ban, since it is
+//     answered without the rules either way, and anyone may see a public
+//     group's public view.
+//     A banned user is never a member (see ErrBanned), so no member's gate
+//     reads one, and a private group gives a non-member nothing already.
+//
+// A DM has no creator to moderate it, so no DM ask reads a restriction.
 //
 // A chat that does not exist admits no one: IsMember, CanListen and CanSpeak all
 // report false, not ErrChatNotFound, for a chat ID nothing is stored under. A
@@ -427,16 +460,10 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 		return memberListenerStanding, nil
 	}
 
-	// A remembered admission answers before the rules are read: only a
-	// non-member of a group governed by its rules is ever remembered (see
-	// publicGroupNonMember). A redacted read is answered without the rules'
-	// verdict, so it neither consults nor makes one.
-	if mode != messagingpb.ViewMode_REDACTED && a.admitted != nil {
-		if _, ok := a.admitted.Get(admissionKey(chatID, userID)); ok {
-			return ListenerStanding{CanListen: true, CanPreview: true}, nil
-		}
-	}
-
+	// The rules are read before a remembered admission is consulted, since
+	// only a public group's non-member is remembered, and a remembered one
+	// still has their ban read (see publicGroupNonMember). The read is the
+	// one a store caches forever, so it costs nothing in steady state.
 	rules, err := loadRules(ctx)
 	if errors.Is(err, ErrChatNotFound) {
 		return ListenerStanding{}, nil
@@ -459,24 +486,43 @@ func (a *Access) standing(ctx context.Context, chatID *commonpb.ChatId, userID *
 }
 
 // publicGroupNonMember is a non-member's standing in a group governed by its rules
-// (see Access): under REDACTED a preview, without the rules being evaluated;
-// otherwise a full read for whoever satisfies the listener rules — everyone,
-// when the group carries none — and a preview for whoever does not. An
-// admission is remembered for listenerAdmissionTTL only when a listener rule
-// was evaluated for it: an open group's costs nothing to find again.
+// (see Access): under REDACTED a preview, with nothing read; otherwise a full
+// read for whoever satisfies the listener rules — everyone, when the group
+// carries none — unless the group's creator has banned them (see
+// Store.BanUser), and a preview for everyone else. A ban only ever takes a
+// full read away, so it is read, strongly consistent, only once the rules or
+// a remembered admission would grant one, and then on every such ask: a ban
+// made since the admission takes effect at once, and a user the rules refuse
+// costs no ban read. The admission itself says nothing of a ban, so one is
+// remembered for a banned user like anyone, for listenerAdmissionTTL, and
+// only when a listener rule was evaluated for it: an open group's costs
+// nothing to find again.
 func (a *Access) publicGroupNonMember(ctx context.Context, chatID *commonpb.ChatId, rules RuleSet, userID *commonpb.UserId, mode messagingpb.ViewMode) (ListenerStanding, error) {
 	if mode == messagingpb.ViewMode_REDACTED {
 		return ListenerStanding{CanPreview: true}, nil
 	}
-	ok, err := a.rules.CanListenWithRules(ctx, rules, userID)
+	admitted := false
+	if a.admitted != nil {
+		_, admitted = a.admitted.Get(admissionKey(chatID, userID))
+	}
+	if !admitted {
+		ok, err := a.rules.CanListenWithRules(ctx, rules, userID)
+		if err != nil {
+			return ListenerStanding{}, err
+		}
+		if !ok {
+			return ListenerStanding{CanPreview: true}, nil
+		}
+		if a.admitted != nil && rules.hasListenerRules() {
+			a.admitted.SetWithTTL(admissionKey(chatID, userID), struct{}{}, a.admittedTTL)
+		}
+	}
+	state, err := a.viewerState(ctx, chatID, userID)
 	if err != nil {
 		return ListenerStanding{}, err
 	}
-	if !ok {
+	if state.IsBanned() {
 		return ListenerStanding{CanPreview: true}, nil
-	}
-	if a.admitted != nil && rules.hasListenerRules() {
-		a.admitted.SetWithTTL(admissionKey(chatID, userID), struct{}{}, a.admittedTTL)
 	}
 	return ListenerStanding{CanListen: true, CanPreview: true}, nil
 }
@@ -504,9 +550,16 @@ const (
 // takes are decided together so that nothing outside this package has to know
 // what makes a chat take encrypted content — a DM's pairwise key, a private
 // group's stored chat key — only that it does. A refused speaker is the zero
-// value: CanSpeak false and nothing about the chat.
+// value: CanSpeak false and nothing about the chat — except for Silenced.
 type SpeakerStanding struct {
 	CanSpeak bool
+
+	// Silenced reports that the user was refused only because the group's
+	// creator has silenced them (see Silence): a member whom the chat's
+	// governance would otherwise let speak. It is set only with CanSpeak
+	// false, and is what lets a deletion be carved out of the silence (see
+	// Access.CanDelete) without a second gate.
+	Silenced bool
 
 	// Encryption is how the chat takes encrypted content (see Encryption).
 	Encryption Encryption
@@ -525,23 +578,62 @@ func (s SpeakerStanding) takesEncrypted() bool {
 }
 
 // CanSpeak reports whether userID may send in chatID (see SpeakerStanding), for a
-// caller that sends nothing the chat could judge: a deletion, a typing
-// notification, a mention suggestion.
+// caller that sends nothing the chat could judge: a typing notification, a
+// mention suggestion.
 func (a *Access) CanSpeak(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
 	speaker, err := a.SpeakerStanding(ctx, chatID, userID)
 	return speaker.CanSpeak, err
 }
 
+// CanDelete reports whether userID may delete their own messages in chatID:
+// they may speak there, or would but for a silence (see
+// SpeakerStanding.Silenced). A silence stops a member adding to the
+// conversation, never taking back what they added; every other refusal —
+// not a member, a rule unmet, a keyless private group — refuses a deletion as
+// it refuses a send. Whose message it is, is the caller's to check.
+func (a *Access) CanDelete(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
+	speaker, err := a.SpeakerStanding(ctx, chatID, userID)
+	return speaker.CanSpeak || speaker.Silenced, err
+}
+
 // SpeakerStanding is userID's standing to speak in chatID (see SpeakerStanding): a
 // non-member never speaks, and a member speaks as the chat's governance
-// decides (see governance). Membership is checked first, so a chat's rules
-// are never evaluated for a send on behalf of a non-member. It is the zero
-// value, not an error, for a chat that does not exist.
+// decides (see governance), and in a group only while not silenced (see
+// Access). Membership is checked first, so a chat's rules are never evaluated
+// for a send on behalf of a non-member. In a group the user's ViewerState is
+// read, strongly consistent, concurrently with membership, so a silence costs
+// a send no extra round trip; it is judged after the governance's verdict,
+// which a silenced member is still given (as Silenced) for CanDelete. A DM
+// reads nothing more. It is the zero value, not an error, for a chat that
+// does not exist.
 func (a *Access) SpeakerStanding(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (SpeakerStanding, error) {
-	isMember, err := a.chats.IsMember(ctx, chatID, userID)
-	if err != nil || !isMember {
-		return SpeakerStanding{}, err
+	var (
+		isMember bool
+		state    ViewerState
+	)
+	if IsGroupChatID(chatID) {
+		g, gctx := errgroup.WithContext(ctx)
+		g.Go(func() (err error) {
+			isMember, err = a.chats.IsMember(gctx, chatID, userID)
+			return err
+		})
+		g.Go(func() (err error) {
+			state, err = a.viewerState(gctx, chatID, userID)
+			return err
+		})
+		if err := g.Wait(); err != nil {
+			return SpeakerStanding{}, err
+		}
+	} else {
+		var err error
+		if isMember, err = a.chats.IsMember(ctx, chatID, userID); err != nil {
+			return SpeakerStanding{}, err
+		}
 	}
+	if !isMember {
+		return SpeakerStanding{}, nil
+	}
+
 	rules, err := a.rules.rulesFor(ctx, chatID, userID)
 	if errors.Is(err, ErrChatNotFound) {
 		// Membership just confirmed the chat; a not-found here is a chat deleted
@@ -551,14 +643,22 @@ func (a *Access) SpeakerStanding(ctx context.Context, chatID *commonpb.ChatId, u
 	if err != nil {
 		return SpeakerStanding{}, err
 	}
+	var speaker SpeakerStanding
 	switch gov, ruleSet := governanceOf(chatID, rules); gov {
 	case governanceDm:
-		return a.dmSpeaker(ctx, ruleSet, userID)
+		speaker, err = a.dmSpeaker(ctx, ruleSet, userID)
 	case governancePublicGroup:
-		return a.publicGroupSpeaker(ctx, chatID, ruleSet, userID)
+		speaker, err = a.publicGroupSpeaker(ctx, chatID, ruleSet, userID)
 	default:
-		return a.privateGroupSpeaker(ctx, chatID, rules)
+		speaker, err = a.privateGroupSpeaker(ctx, chatID, rules)
 	}
+	if err != nil {
+		return SpeakerStanding{}, err
+	}
+	if speaker.CanSpeak && state.ActiveSilence(time.Now()) != nil {
+		return SpeakerStanding{Silenced: true}, nil
+	}
+	return speaker, nil
 }
 
 // dmSpeaker is a DM member's standing to speak: they speak when they satisfy
@@ -635,6 +735,17 @@ func (a *Access) privateGroupSpeaker(ctx context.Context, chatID *commonpb.ChatI
 		Encryption: EncryptionRequired,
 		Scheme:     messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305,
 	}, nil
+}
+
+// viewerState is userID's ViewerState in the group chatID — the zero state
+// when they have no record — read strongly consistent, as every gate reads
+// what it acts on: a restriction set a moment ago must hold on the next ask.
+func (a *Access) viewerState(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (ViewerState, error) {
+	states, err := a.chats.GetViewerStates(ctx, userID, []*commonpb.ChatId{chatID})
+	if err != nil {
+		return ViewerState{}, err
+	}
+	return states[string(chatID.Value)], nil
 }
 
 // hasKey reports whether the private group whose rules the caller holds has

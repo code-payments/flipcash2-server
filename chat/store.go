@@ -46,6 +46,13 @@ var (
 	// ErrKeyEnvelopeNotFound indicates that a user has no key envelope stored
 	// for a chat.
 	ErrKeyEnvelopeNotFound = errors.New("key envelope not found")
+
+	// ErrBanned indicates that a user is banned from the group they were to
+	// join, enter the lobby of, or be admitted to (see Store.BanUser). It is
+	// judged in the write that would have let them in, against their
+	// ViewerState as of that write, so a ban and a concurrent join can never
+	// both land.
+	ErrBanned = errors.New("banned")
 )
 
 // MaxGroupChatCreationMembers is the largest initial member set a group chat
@@ -96,19 +103,27 @@ type DmFeedCursor struct {
 // misses IDs of the wrong family for its semantics — except the viewer-state
 // methods, which accept both and do not care which.
 //
-// Viewer state (see ViewerState) is one record per (user, chat), written only
-// by that user's own actions and read back only to them — plus the chat-scoped
-// reads GetMutedUsers, GetMutedUsersPage and GetMutedCount, which serve the
-// push fan-out. Records are sparse: nothing is written when a chat is created
-// or joined, a record appears on the user's first write, and nothing removes
-// it — a cleared mute leaves the record and its version behind. The record
-// knows nothing of membership: a departure clears a mute only because the
-// leave handler calls ClearMute (see Server.LeaveChat), and whether the user
-// may act on the chat is likewise the caller's gate. Every write is
-// conditional — a single update, or one transaction where a store keeps an
-// aggregate alongside the record — and moves Version by exactly one on a real
-// change and not at all on a no-op, so a retried or duplicated request is
-// harmless.
+// Viewer state (see ViewerState) is one record per (user, chat), written by
+// that user's own actions (a mute) and by the group creator's moderation of
+// them (a silence, a ban), and read back to them — plus the chat-scoped reads
+// GetMutedUsers, GetMutedUsersPage and GetMutedCount, which serve the push
+// fan-out, GetRestrictedUsersPage, the creator's listing, and
+// GetViewerStatesForUsers. Records are sparse: nothing is written when a chat
+// is created or joined, a record appears on the first write about the user,
+// and nothing removes it — a cleared mute or a lifted restriction leaves the
+// record and its version behind. The user's own settings and the creator's
+// restrictions are independent within it: a mute's writes never touch a
+// restriction, and a restriction's never touch a mute or the muted count.
+// The record knows nothing of membership: a departure clears a mute only
+// because the leave handler calls ClearMute (see Server.LeaveChat), which
+// leaves a silence and a ban as they are, and whether the caller may act on
+// the chat, or on the user, is likewise the caller's gate. The one tie to the
+// roster is a ban, which removes the user from it, and from the lobby, in the
+// same write (see BanUser), and which the writes that join a user check (see
+// ErrBanned). Every write is conditional — a single update, or one
+// transaction where a store keeps an aggregate or the roster alongside the
+// record — and moves Version by exactly one on a real change and not at all
+// on a no-op, so a retried or duplicated request is harmless.
 //
 // A key envelope (see KeyEnvelope) is likewise one record per (user, chat),
 // for a private group: the group's chat key as that user can open it. It is
@@ -163,6 +178,15 @@ type Store interface {
 	// another writer, and so is what a caller should publish as current. It
 	// returns ErrChatNotFound if the chat does not exist, and an error if chatID
 	// is not a group chat ID.
+	//
+	// A banned user (see BanUser) is refused with ErrBanned, judged in the
+	// write that would join them, after whether they are joined already: a
+	// banned user never is, so a member is the no-op whatever their record
+	// says. Each user is their own write, so the users before a banned one in
+	// userIDs are joined and the rest are not tried; the server joins one user
+	// at a time (see Server.JoinChat), and a creation's members, written by
+	// PutChat, are not checked, since a group that does not exist yet has
+	// banned no one.
 	AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (changed bool, roster RosterSummary, err error)
 
 	// RemoveGroupMember ends a user's membership in a group chat. Departure is
@@ -433,13 +457,16 @@ type Store interface {
 	// whether anything moved: recording the mute already recorded (after
 	// Mute.Normalize) is a no-op that returns the current state at its
 	// current version. It returns ErrMuteUntilOutOfRange for a timed mute
-	// outside the recordable range (see Mute).
+	// outside the recordable range (see Mute). It touches nothing of the
+	// user's restrictions.
 	SetMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mute Mute) (state ViewerState, changed bool, err error)
 
 	// ClearMute removes userID's mute on chatID, lapsed or not, and returns
 	// the state after the write. Clearing when no mute is recorded is a no-op
 	// that returns the current state — the zero state when the user has no
-	// record, which the no-op does not create.
+	// record, which the no-op does not create. It touches nothing of the
+	// user's restrictions, which is what lets a departure clear a mute (see
+	// Server.LeaveChat) and leave a silence or a ban standing.
 	ClearMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (state ViewerState, changed bool, err error)
 
 	// GetViewerStates returns userID's state on each of chatIDs that they have
@@ -449,6 +476,84 @@ type Store interface {
 	// so the user who just muted sees the mute. An empty chatIDs is an empty
 	// result, not an error.
 	GetViewerStates(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]ViewerState, error)
+
+	// GetViewerStatesForUsers returns the state of each of userIDs on chatID
+	// that has a record, keyed by string(userID.Value): the transpose of
+	// GetViewerStates, one chat and many users. A user with no record is
+	// absent rather than reported, and duplicate IDs collapse. The read is
+	// eventually consistent, at half the cost of a strong one: it may trail a
+	// write by a moment, which its readers tolerate, since they rank and show
+	// people (e.g. dropping banned users from mention suggestions) rather than
+	// gate an action — a gate reads the user's own state with GetViewerStates.
+	// An empty userIDs is an empty result, not an error.
+	GetViewerStatesForUsers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]ViewerState, error)
+
+	// SetSilence records silence as userID's silence in the group chatID as of
+	// now, replacing any silence already set, and returns the state after the
+	// write. changed reports whether anything moved: recording the silence
+	// already recorded (after Silence.Normalize) is a no-op that returns the
+	// current state at its current version, and leaves RestrictedAt where it
+	// was; a real change moves RestrictedAt to now. It touches nothing of the
+	// user's mute, and nothing of the roster or the lobby: a silence may be
+	// set on a user who is not a member. It returns ErrSilenceUntilOutOfRange
+	// for a timed silence outside the recordable range (see Silence), and an
+	// error if chatID is not a group chat ID or now is before the Unix epoch.
+	SetSilence(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, silence Silence, now time.Time) (state ViewerState, changed bool, err error)
+
+	// ClearSilence removes userID's silence in the group chatID, lapsed or
+	// not, and returns the state after the write; RestrictedAt is removed with
+	// it unless the user is banned. Clearing when no silence is recorded is a
+	// no-op that returns the current state — the zero state when the user has
+	// no record, which the no-op does not create. It returns an error if
+	// chatID is not a group chat ID.
+	ClearSilence(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (state ViewerState, changed bool, err error)
+
+	// BanUser bans userID from the group chatID as of now (see BanResult). In
+	// one write it records the ban on the user's ViewerState, moving
+	// RestrictedAt to now; when the user is a joined member, removes them
+	// from the roster exactly as RemoveGroupMember does (one membership
+	// transition, a departure like any other), discarding their key envelope
+	// when discardKeyEnvelope is set, under the same rule; and when they are
+	// waiting in the group's lobby, removes their entry with its counts as
+	// LeaveLobby does. What the user holds is judged as of the write, so a
+	// join, an admission or an entry racing the ban either lands first and is
+	// undone by it, or lands after and is refused (see ErrBanned): a banned
+	// user never holds a membership or an entry. A ban leaves a silence, and
+	// a mute, as they are.
+	//
+	// Banning a user already banned is a no-op that writes nothing, returning
+	// Changed false with the state at its current version and the roster as
+	// read. Like RemoveGroupMember, whether a departure takes the envelope is
+	// the caller's to say (see Server.LeaveChat). It returns ErrChatNotFound
+	// if the chat does not exist, and an error if chatID is not a group chat
+	// ID or now is before the Unix epoch. It does not check who the user is:
+	// that the creator cannot be banned is the caller's gate.
+	BanUser(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, now time.Time, discardKeyEnvelope bool) (BanResult, error)
+
+	// UnbanUser lifts userID's ban from the group chatID and returns the state
+	// after the write; RestrictedAt is removed with it unless the user is
+	// silenced. It does not return the user to the group or its lobby: they
+	// join or enter again like anyone. Unbanning a user who is not banned is
+	// a no-op that returns the current state, the zero state when the user
+	// has no record, which the no-op does not create. It returns an error if
+	// chatID is not a group chat ID.
+	UnbanUser(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (state ViewerState, changed bool, err error)
+
+	// GetRestrictedUsersPage returns one page of the users with a restriction
+	// recorded in the group chatID (see ViewerState.IsRestricted), in listing
+	// order (see RestrictionPosition): most recently restricted first,
+	// strictly after the after position (nil starts at the most recent), at
+	// most limit of them (limit <= 0 means unbounded), each with their whole
+	// ViewerState. A position need not name a user still restricted, or
+	// restricted at that time. A lapsed silence is still a restriction
+	// recorded, and listed; leaving it out is the caller's call against its
+	// clock. The read may lag a write by a moment — it is served from an
+	// index of the restricted users rather than their records — so a user
+	// just restricted may be missing and one just released may still appear,
+	// which the creator's listing tolerates. A group with no restrictions, or
+	// that does not exist, is an empty page. It returns an error if chatID is
+	// not a group chat ID.
+	GetRestrictedUsersPage(ctx context.Context, chatID *commonpb.ChatId, after *RestrictionPosition, limit int) ([]RestrictedUser, error)
 
 	// GetMutedUsers returns the users whose mute on chatID is active at now
 	// (see Mute.Active), at most limit of them when limit is positive; which
@@ -565,6 +670,11 @@ type Store interface {
 	// and the lobby's cap before the user's. It returns an error if chatID
 	// is not a group chat ID. It does not check that the chat exists or that
 	// it is a private group: those are the caller's.
+	//
+	// A banned user (see BanUser) is refused with ErrBanned, judged in the same
+	// write against their ViewerState, after membership (a banned user is
+	// never a member) and before an existing entry (a banned user never holds
+	// one), so a ban and a concurrent entry never both land.
 	EnterLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, limits LobbyLimits) (entry LobbyEntry, changed bool, err error)
 
 	// LeaveLobby removes userID from chatID's lobby, reporting whether they
@@ -596,8 +706,12 @@ type Store interface {
 	// AddGroupMembers does, and changed false when the user was a member
 	// already (nothing is written, their entry included). It returns
 	// ErrNotInLobby when the user is not waiting, with nothing written;
-	// ErrChatNotFound if the chat does not exist; and an error if chatID is
-	// not a group chat ID or envelope.WrappedBy is nil.
+	// ErrBanned when the user is banned (see BanUser), judged in the same
+	// write against their ViewerState, after the membership no-op and before
+	// the lobby (a banned user holds no entry, so a ban landing first is
+	// reported as the ban it is rather than as ErrNotInLobby); ErrChatNotFound
+	// if the chat does not exist; and an error if chatID is not a group chat
+	// ID or envelope.WrappedBy is nil.
 	AdmitFromLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope KeyEnvelope) (changed bool, roster RosterSummary, err error)
 
 	// SetFeaturedGroups replaces userID's featured groups with chatIDs, in

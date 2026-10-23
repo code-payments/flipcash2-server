@@ -21,8 +21,8 @@ import (
 // mutable — and can be mutated by other processes, which this cache can never
 // observe — so group membership checks and member lists always defer to the
 // backing store. The rest of the store is passed straight through, viewer
-// state, activity reads and key envelopes included: a user's state is theirs
-// to change at any time, a group's recent senders change with every send, and
+// state (restrictions included), activity reads and key envelopes included: a
+// user's state is theirs, or their group creator's, to change at any time, a group's recent senders change with every send, and
 // both reads are already one strongly consistent query, so nothing of either
 // is held.
 //
@@ -226,6 +226,30 @@ func (c *Cache) ClearMute(ctx context.Context, chatID *commonpb.ChatId, userID *
 
 func (c *Cache) GetViewerStates(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.ViewerState, error) {
 	return c.db.GetViewerStates(ctx, userID, chatIDs)
+}
+
+func (c *Cache) GetViewerStatesForUsers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]chat.ViewerState, error) {
+	return c.db.GetViewerStatesForUsers(ctx, chatID, userIDs)
+}
+
+func (c *Cache) SetSilence(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, silence chat.Silence, now time.Time) (chat.ViewerState, bool, error) {
+	return c.db.SetSilence(ctx, chatID, userID, silence, now)
+}
+
+func (c *Cache) ClearSilence(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, bool, error) {
+	return c.db.ClearSilence(ctx, chatID, userID)
+}
+
+func (c *Cache) BanUser(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, now time.Time, discardKeyEnvelope bool) (chat.BanResult, error) {
+	return c.db.BanUser(ctx, chatID, userID, now, discardKeyEnvelope)
+}
+
+func (c *Cache) UnbanUser(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, bool, error) {
+	return c.db.UnbanUser(ctx, chatID, userID)
+}
+
+func (c *Cache) GetRestrictedUsersPage(ctx context.Context, chatID *commonpb.ChatId, after *chat.RestrictionPosition, limit int) ([]chat.RestrictedUser, error) {
+	return c.db.GetRestrictedUsersPage(ctx, chatID, after, limit)
 }
 
 func (c *Cache) GetMutedUsers(ctx context.Context, chatID *commonpb.ChatId, now time.Time, limit int) ([]*commonpb.UserId, error) {

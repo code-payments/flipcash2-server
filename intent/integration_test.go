@@ -821,9 +821,9 @@ func TestIntegration_GetTasksToSchedule_GroupPayment(t *testing.T) {
 	require.NoError(t, tasks[0].Validate())
 }
 
-// A multi payment is made for a reaction boost alone, and is limited to staff
-// while multi payments roll out. A staff boost that passes is covered by
-// TestIntegration_AllowCreation_ReactionBoost.
+// A multi payment is made for a reaction boost or a group payment alone. A
+// group payment's is limited to staff while it rolls out, and a boost's is
+// open to everyone (covered by TestIntegration_AllowCreation_ReactionBoost).
 func TestIntegration_AllowCreation_MultiPayment(t *testing.T) {
 	e := newIntegrationEnv(t)
 
@@ -843,9 +843,9 @@ func TestIntegration_AllowCreation_MultiPayment(t *testing.T) {
 		record.AppMetadata = appMetadata
 		return record
 	}
-	boost := func(payer model.KeyPair) *ocp_intent.Record {
+	groupPayment := func(payer model.KeyPair) *ocp_intent.Record {
 		record := multiPaymentIntentRecord(base58.Encode(payer.Public()), recipients...)
-		return withChatMetadata(record, reactionBoostMetadata(chat.MustGenerateGroupChatID(), &messagingpb.MessageId{Value: 1}, "🔥"))
+		return withChatMetadata(record, groupChatMetadata(chat.MustGenerateGroupChatID(), intentpb.PaymentAction_SEND))
 	}
 
 	// Whoever pays, staff included.
@@ -863,18 +863,18 @@ func TestIntegration_AllowCreation_MultiPayment(t *testing.T) {
 	})
 
 	t.Run("non-staff payer", func(t *testing.T) {
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(nonStaffKeys), nil, nil), "multi payments are limited to staff")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, groupPayment(nonStaffKeys), nil, nil), "multi payments are limited to staff")
 	})
 
 	t.Run("payer is not a flipcash user", func(t *testing.T) {
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(model.MustGenerateKeyPair()), nil, nil), "payer is not a flipcash user")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, groupPayment(model.MustGenerateKeyPair()), nil, nil), "payer is not a flipcash user")
 	})
 
 	// Staff recipients don't make a non-staff payer's multi payment allowed
 	t.Run("staff recipients", func(t *testing.T) {
 		e.setStaff(recipient1UserID)
 		e.setStaff(recipient2UserID)
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, boost(nonStaffKeys), nil, nil), "multi payments are limited to staff")
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, groupPayment(nonStaffKeys), nil, nil), "multi payments are limited to staff")
 	})
 }
 
@@ -1165,11 +1165,6 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 	// 80% to the sender and 20% to the creator, the creator's share within a
 	// quark of exact.
 	t.Run("multi_payment", func(t *testing.T) {
-		e.setStaff(payerUserID)
-		e.setStaff(creatorUserID)
-		defer delete(e.staff, string(payerUserID.Value))
-		defer delete(e.staff, string(creatorUserID.Value))
-
 		// Each payment is a fiat amount, in USD, carried by the quarks worth
 		// it (10_000 to the dollar here), as OCP has checked by validation.
 		type pay struct {
@@ -1250,11 +1245,10 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 			}
 		}
 
-		// Multi payments are limited to staff while they roll out, a boost's
-		// included.
-		delete(e.staff, string(payerUserID.Value))
+		// A boost's multi payment is open to everyone, unlike a group
+		// payment's: neither the payer nor the creator is staff here.
 		record := multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.80}, pay{creatorKeys, 0.20})
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "multi payments are limited to staff")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, record, nil, nil))
 	})
 
 	// Paying the wrong person pays a stranger to the boost.
@@ -1322,8 +1316,6 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "below the minimum of 0.01 USD")
 
 		// A DM boost pays one person, so it is never a multi payment.
-		e.setStaff(payerUserID)
-		defer delete(e.staff, string(payerUserID.Value))
 		split := multiPaymentIntentRecord(base58.Encode(payerKeys.Public()), base58.Encode(memberKeys.Public()), base58.Encode(creatorKeys.Public()))
 		appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
 			Domain: &intentpb.AppMetadata_Chat{Chat: reactionBoostMetadata(dmChatID, byOther.ID, "🔥")},
@@ -1474,8 +1466,6 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 
 		// Two payees: a multi payment, 80% to the sender and 20% to the
 		// creator.
-		e.setStaff(payerUserID)
-		defer delete(e.staff, string(payerUserID.Value))
 		split := multiPaymentIntentRecord(base58.Encode(payerKeys.Public()), base58.Encode(memberKeys.Public()), base58.Encode(creatorKeys.Public()))
 		metadata := split.SendPublicMultiPaymentMetadata
 		metadata.Payments[0].Quantity, metadata.Payments[1].Quantity, metadata.Quantity = 8_000, 2_000, 10_000

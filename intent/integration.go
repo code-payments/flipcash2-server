@@ -144,18 +144,16 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 
 	case ocp_intent.SendPublicMultiPayment:
 		// A multi payment is made for one of two things: a reaction boost
-		// that pays both the message's sender and the group's creator, or a
-		// group payment to several members at once. One carrying any other
-		// app metadata (a requested payment, which pays its request's creator
-		// alone, included), or none, is refused before anything is read.
+		// that pays both the message's sender and the group's creator, open
+		// to everyone, or a group payment to several members at once, which
+		// is behind its staff gate. One carrying any other app metadata (a
+		// requested payment, which pays its request's creator alone,
+		// included), or none, is refused before anything is read.
 		switch appMetadata.GetChat().GetType().(type) {
 		case *intentpb.ChatMetadata_ReactionBoost_:
-			if err := i.validateMultiPayment(ctx, intentRecord); err != nil {
-				return err
-			}
 			return i.validateReactionBoostAppMetadata(ctx, intentRecord, &appMetadata)
 		case *intentpb.ChatMetadata_GroupPayment_:
-			if err := i.validateMultiPayment(ctx, intentRecord); err != nil {
+			if err := i.validateStaffOnlyMultiPayment(ctx, intentRecord); err != nil {
 				return err
 			}
 			return i.validateGroupAppMetadata(ctx, intentRecord, &appMetadata)
@@ -211,12 +209,12 @@ func (i *Integration) OnSuccess(ctx context.Context, intentRecord *ocp_intent.Re
 	return nil
 }
 
-// validateMultiPayment allows a multi payment only from a staff user. It is a
-// transitional gate while multi payments roll out, so opening them to
-// everyone is removing this check. It gates every multi payment, so only
-// staff can make a boost that pays two people or a group payment to several
-// members at once.
-func (i *Integration) validateMultiPayment(ctx context.Context, intentRecord *ocp_intent.Record) error {
+// validateStaffOnlyMultiPayment allows a multi payment only from a staff
+// user. It is a transitional gate while group payments to several members
+// roll out, so opening them to everyone is removing this check. It gates
+// group payments alone: a reaction boost that pays two people is open to
+// everyone.
+func (i *Integration) validateStaffOnlyMultiPayment(ctx context.Context, intentRecord *ocp_intent.Record) error {
 	payer, err := ocp_common.NewAccountFromPublicKeyString(intentRecord.InitiatorOwnerAccount)
 	if err != nil {
 		return err

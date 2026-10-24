@@ -43,21 +43,6 @@ func SendUsdfDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.Us
 	return pusher.SendPushes(ctx, title, body, customPayload, user)
 }
 
-func SendUsdfDepositProcessingPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, dollarAmount float64) error {
-	title := amountPrinter.Sprintf("Adding $%.2f", dollarAmount)
-	body := "Processing is almost complete"
-	customPayload := &pushpb.Payload{
-		Category: pushpb.Payload_DEPOSIT_WITHDRAWAL,
-		GroupKey: pushpb.Payload_DEPOSIT_WITHDRAWAL.String(),
-		Navigation: &pushpb.Navigation{
-			Type: &pushpb.Navigation_CurrencyInfo{
-				CurrencyInfo: &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
-			},
-		},
-	}
-	return pusher.SendPushes(ctx, title, body, customPayload, user)
-}
-
 func SendFlipcashCurrencyDepositedPush(ctx context.Context, pusher Pusher, user *commonpb.UserId, mint *commonpb.PublicKey, currencyName string, usdMarketValue float64) error {
 	title := fmt.Sprintf("%s Now Available", currencyName)
 	body := amountPrinter.Sprintf(

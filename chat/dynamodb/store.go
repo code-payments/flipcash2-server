@@ -194,7 +194,7 @@ import (
 //	          the chat key in the same item (see chat.InviteKeyCopy): its
 //	          presence is marked by invite_id (the raw invite ID, B); the
 //	          copy is in scheme (a chatpb.InviteKeyEnvelope_Scheme), nonce,
-//	          ciphertext and signature, as in the invite's own #copy, beside
+//	          ciphertext and signature, as in the invite's own #key, beside
 //	          the joiner's secret envelope (secret_scheme, secret_nonce,
 //	          secret_ciphertext, as on the invite's record), and wrapped_by
 //	          is the invite's creator. Every write puts the whole item, so
@@ -321,7 +321,7 @@ import (
 //	          use. All three are eventually consistent, as their readers
 //	          allow; the cap's race is the contract's.
 //
-//	          sk = "#copy" (see skInviteCopy), the invite's copy of the chat
+//	          sk = "#key" (see skInviteKey), the invite's copy of the chat
 //	          key: key_envelope (the chatpb.InviteKeyEnvelope marshalled
 //	          whole, B), and expires_at
 //	          (DynamoDB TTL, epoch seconds, the invite's expiry rounded up),
@@ -449,9 +449,9 @@ const (
 	// skMeta is the sort key of a group's aggregates item in group_members.
 	skMeta = "#meta"
 
-	// skInviteCopy is the sort key of an invite's copy of the chat key. The
+	// skInviteKey is the sort key of an invite's copy of the chat key. The
 	// invite's record is skMeta.
-	skInviteCopy = "#copy"
+	skInviteKey = "#key"
 
 	attrPK                   = "pk"
 	attrSK                   = "sk"
@@ -511,7 +511,7 @@ const (
 	attrSecretNonce          = "secret_nonce"      // chat_key_envelopes copies: the secret envelope's nonce (B)
 	attrSecretCiphertext     = "secret_ciphertext" // chat_key_envelopes copies: the encrypted secret (B)
 	attrSecretEnvelope       = "secret_envelope"   // chat_invites #meta: the creator's chatpb.InviteSecretEnvelope, marshalled (B)
-	attrKeyEnvelope          = "key_envelope"      // chat_invites #copy: the chatpb.InviteKeyEnvelope, marshalled (B)
+	attrKeyEnvelope          = "key_envelope"      // chat_invites #key: the chatpb.InviteKeyEnvelope, marshalled (B)
 	attrCreatedSort          = "created_sort"      // chat_invites #meta: see inviteCreatedSort, keying gsiInvitesByChat
 	attrCreatorSort          = "creator_sort"      // chat_invites #meta: see inviteCreatorSort, keying gsiInvitesByChatCreator
 	attrActiveSort           = "active_sort"       // chat_invites #meta: see inviteActiveSort, present while neither revoked nor used up, keying gsiInvitesActive
@@ -4896,7 +4896,7 @@ func inviteCopyItem(invite chat.Invite, keyCopy *chatpb.InviteKeyEnvelope) (map[
 	if err != nil {
 		return nil, err
 	}
-	item := inviteKey(invite.ID, skInviteCopy)
+	item := inviteKey(invite.ID, skInviteKey)
 	item[attrKeyEnvelope] = avB(envelope)
 	if invite.ExpiresAt != nil {
 		item[attrExpiresAt] = avN(inviteCopyTTL(*invite.ExpiresAt))
@@ -5356,7 +5356,7 @@ func (s *store) RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, invit
 			}},
 			{Delete: &types.Delete{
 				TableName: aws.String(s.invitesTable),
-				Key:       inviteKey(inviteID, skInviteCopy),
+				Key:       inviteKey(inviteID, skInviteKey),
 			}},
 		}
 		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
@@ -5419,7 +5419,7 @@ type inviteJoinRead struct {
 // readInviteJoin is the read a join with an invite starts from, one strongly
 // consistent BatchGetItem of five items across three tables: the group's
 // #meta and the joiner's membership record in group_members, the invite's
-// #meta and #copy in chat_invites, and the joiner's entry in chatID's lobby
+// #meta and #key in chat_invites, and the joiner's entry in chatID's lobby
 // in chat_lobbies. Each item is read consistently, but not the five as a
 // set, so a write landing in the middle of the read may show in some items
 // and not others; the join's write is conditioned on what it read of each,
@@ -5429,7 +5429,7 @@ func (s *store) readInviteJoin(ctx context.Context, chatID *commonpb.ChatId, use
 	summaryKey := map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skMeta)}
 	req := map[string]types.KeysAndAttributes{
 		s.groupMembersTable: {Keys: []map[string]types.AttributeValue{summaryKey, memberKey}, ConsistentRead: aws.Bool(true)},
-		s.invitesTable:      {Keys: []map[string]types.AttributeValue{inviteKey(inviteID, skMeta), inviteKey(inviteID, skInviteCopy)}, ConsistentRead: aws.Bool(true)},
+		s.invitesTable:      {Keys: []map[string]types.AttributeValue{inviteKey(inviteID, skMeta), inviteKey(inviteID, skInviteKey)}, ConsistentRead: aws.Bool(true)},
 		s.lobbiesTable:      {Keys: []map[string]types.AttributeValue{lobbyKey(chatID, userID)}, ConsistentRead: aws.Bool(true)},
 	}
 
@@ -5463,7 +5463,7 @@ func (s *store) readInviteJoin(ctx context.Context, chatID *commonpb.ChatId, use
 					return inviteJoinRead{}, err
 				}
 				read.invite = &invite
-			case skInviteCopy:
+			case skInviteKey:
 				keyCopy := &chatpb.InviteKeyEnvelope{}
 				if err := unmarshalInviteEnvelope(item, attrKeyEnvelope, keyCopy); err != nil {
 					return inviteJoinRead{}, err
@@ -5587,7 +5587,7 @@ func (s *store) JoinWithInvite(ctx context.Context, chatID *commonpb.ChatId, use
 		if lastUse {
 			alongside = append(alongside, types.TransactWriteItem{Delete: &types.Delete{
 				TableName: aws.String(s.invitesTable),
-				Key:       inviteKey(inviteID, skInviteCopy),
+				Key:       inviteKey(inviteID, skInviteKey),
 			}})
 		}
 		alongside = append(alongside, types.TransactWriteItem{Put: &types.Put{

@@ -92,7 +92,7 @@ func TestChat_DynamoDBInviteItems(t *testing.T) {
 	for _, attr := range indexAttrs {
 		require.Contains(t, meta, attr)
 	}
-	copyItem := item(expiring.ID, skInviteCopy)
+	copyItem := item(expiring.ID, skInviteKey)
 	require.NotEmpty(t, copyItem)
 	for _, attr := range indexAttrs {
 		require.NotContains(t, copyItem, attr)
@@ -117,7 +117,7 @@ func TestChat_DynamoDBInviteItems(t *testing.T) {
 	require.True(t, created)
 	require.NotContains(t, item(lasting.ID, skMeta), attrExpiresAt)
 	require.NotContains(t, item(lasting.ID, skMeta), attrInviteExpiresAt)
-	require.NotContains(t, item(lasting.ID, skInviteCopy), attrExpiresAt)
+	require.NotContains(t, item(lasting.ID, skInviteKey), attrExpiresAt)
 
 	// A revoke removes the record from the active index and deletes the
 	// copy, and the record stays, listed.
@@ -128,7 +128,7 @@ func TestChat_DynamoDBInviteItems(t *testing.T) {
 	require.NotContains(t, meta, attrActiveSort)
 	require.Contains(t, meta, attrRevokedAt)
 	require.Contains(t, meta, attrCreatedSort)
-	require.Empty(t, item(expiring.ID, skInviteCopy))
+	require.Empty(t, item(expiring.ID, skInviteKey))
 
 	// A used-up invite is not counted toward the cap: its last use, written
 	// here as the join will write it, removes it from the active index.
@@ -296,7 +296,7 @@ func TestChat_DynamoDBInviteJoinItems(t *testing.T) {
 	meta := item(skMeta)
 	require.EqualValues(t, 1, useCount(meta))
 	require.Contains(t, meta, attrActiveSort)
-	require.NotEmpty(t, item(skInviteCopy))
+	require.NotEmpty(t, item(skInviteKey))
 
 	// A member's join writes nothing.
 	result, err = testStore.JoinWithInvite(ctx, groupID, first, invite.ID, secret, now)
@@ -314,7 +314,7 @@ func TestChat_DynamoDBInviteJoinItems(t *testing.T) {
 	require.NotContains(t, meta, attrActiveSort)
 	require.Contains(t, meta, attrCreatedSort)
 	require.Contains(t, meta, attrCreatorSort)
-	require.Empty(t, item(skInviteCopy))
+	require.Empty(t, item(skInviteKey))
 
 	// The joiners' envelopes carry no index attribute of the invite's.
 	out, err := testEnv.Client.GetItem(ctx, &dynamodb.GetItemInput{

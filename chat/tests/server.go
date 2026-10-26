@@ -75,6 +75,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_GetRoster_Paging,
 		testServer_GetRoster_Dm,
 		testServer_GetRoster_Gates,
+		testServer_GetRoster_Invite,
 		testServer_GetRoster_PublicGroupDisabled,
 		testServer_GetMentionSuggestions,
 		testServer_GetMentionSuggestions_Size,
@@ -183,6 +184,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_Invite_Cap,
 		testServer_Invite_Retry,
 		testServer_Invite_Get,
+		testServer_Invite_GetUnauthenticated,
 		testServer_Invite_List,
 		testServer_Invite_Revoke,
 		testServer_Invite_Permissions,
@@ -911,6 +913,24 @@ func (e *serverEnv) getRoster(keys model.KeyPair, chatID *commonpb.ChatId, opts 
 
 func (e *serverEnv) mustGetRoster(keys model.KeyPair, chatID *commonpb.ChatId, opts *commonpb.QueryOptions) *chatpb.GetRosterResponse {
 	resp, err := e.getRoster(keys, chatID, opts)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// getRosterWithInvite asks for a roster as keys, sending an invite's token
+// (see chat.Server.GetRoster).
+func (e *serverEnv) getRosterWithInvite(keys model.KeyPair, chatID *commonpb.ChatId, token *chatpb.InviteToken, opts *commonpb.QueryOptions) *chatpb.GetRosterResponse {
+	req := &chatpb.GetRosterRequest{ChatId: chatID, QueryOptions: opts, InviteToken: token}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.GetRoster(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// getPublicRoster asks for a roster with no auth at all, an invite's token
+// alone, which may be nil (see chat.Server.GetRoster).
+func (e *serverEnv) getPublicRoster(chatID *commonpb.ChatId, token *chatpb.InviteToken, opts *commonpb.QueryOptions) *chatpb.GetRosterResponse {
+	resp, err := e.client.GetRoster(e.ctx, &chatpb.GetRosterRequest{ChatId: chatID, QueryOptions: opts, InviteToken: token})
 	require.NoError(e.t, err)
 	return resp
 }
@@ -1697,6 +1717,126 @@ func testServer_GetRoster_Gates(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
 }
 
+// testServer_GetRoster_Invite pins the roster read with an invite's token: the
+// page a member gets, with auth or without, while the invite admits users to
+// this chat, and DENIED otherwise, as is a request with neither auth nor a
+// token. A ban does not stop it, a member's token is never looked at, the
+// invite is read again on every page, and reading counts no use. Auth that
+// is set must still be valid.
+func testServer_GetRoster_Invite(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	strangerID, strangerKeys := e.addBoundUser("Stranger")
+	joinerID, _ := e.addBoundUser("Joiner")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers", model.MustGenerateUserID(), model.MustGenerateUserID())
+	token, invite := e.mustCreateInvite(e.keys, chatID)
+
+	member := e.mustGetRoster(e.keys, chatID, nil)
+	require.Equal(t, chatpb.GetRosterResponse_OK, member.Result)
+	require.Len(t, member.Members, 3)
+
+	// The token alone is served the member's page, and so is a non-member
+	// with auth who sends it.
+	require.NoError(t, protoutil.ProtoEqualError(member, e.getPublicRoster(chatID, token, nil)))
+	require.NoError(t, protoutil.ProtoEqualError(member, e.getRosterWithInvite(strangerKeys, chatID, token, nil)))
+
+	// Reading counts no use.
+	e.waitForChatInvites(e.keys, chatID, invite)
+
+	// Neither auth nor a token, or a non-member without a token, is DENIED.
+	resp := e.getPublicRoster(chatID, nil, nil)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
+	require.Empty(t, resp.Members)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, e.mustGetRoster(strangerKeys, chatID, nil).Result)
+
+	// A member's token is never looked at: one that names no invite changes
+	// nothing.
+	require.NoError(t, protoutil.ProtoEqualError(member, e.getRosterWithInvite(e.keys, chatID, newInviteToken(), nil)))
+
+	// A token that names no invite, or an invite to another chat, is DENIED.
+	unknown := newInviteToken()
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, e.getPublicRoster(chatID, unknown, nil).Result)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, e.getRosterWithInvite(strangerKeys, chatID, unknown, nil).Result)
+	other := e.putKeyedPrivateGroup("Other")
+	otherToken, _ := e.mustCreateInvite(e.keys, other)
+	require.Equal(t, chatpb.GetRosterResponse_OK, e.getPublicRoster(other, otherToken, nil).Result)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, e.getPublicRoster(chatID, otherToken, nil).Result)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, e.getRosterWithInvite(strangerKeys, chatID, otherToken, nil).Result)
+
+	// A token never serves a public group or a DM.
+	public := e.putGroup("Open", at(1))
+	dm := e.putDM(at(1))
+	for _, id := range []*commonpb.ChatId{public, dm} {
+		resp = e.getPublicRoster(id, token, nil)
+		require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
+		require.Empty(t, resp.Members)
+		require.Equal(t, chatpb.GetRosterResponse_DENIED, e.getRosterWithInvite(strangerKeys, id, token, nil).Result)
+	}
+
+	// A ban stops a user joining, not reading the roster with a link.
+	require.Equal(t, chatpb.BanUserResponse_OK, e.mustBanUser(e.keys, chatID, strangerID))
+	require.NoError(t, protoutil.ProtoEqualError(member, e.getRosterWithInvite(strangerKeys, chatID, token, nil)))
+
+	// Auth that is set must be valid: a request altered after it was signed
+	// is refused, not answered off its token.
+	req := &chatpb.GetRosterRequest{ChatId: chatID}
+	require.NoError(t, strangerKeys.Auth(req, &req.Auth))
+	req.InviteToken = token
+	_, err := e.client.GetRoster(e.ctx, req)
+	require.Error(t, err)
+
+	// A walk with the token pages the roster as a member's does.
+	var walked [][]byte
+	var pageToken *commonpb.PagingToken
+	for {
+		resp = e.getPublicRoster(chatID, token, &commonpb.QueryOptions{PageSize: 1, PagingToken: pageToken})
+		require.Equal(t, chatpb.GetRosterResponse_OK, resp.Result)
+		walked = append(walked, memberUserIDs(resp.Members)...)
+		if !resp.HasMore {
+			break
+		}
+		pageToken = resp.PagingToken
+	}
+	require.Equal(t, memberUserIDs(member.Members), walked)
+
+	// The invite is read again on every page: once revoked, the walk ends.
+	first := e.getPublicRoster(chatID, token, &commonpb.QueryOptions{PageSize: 1})
+	require.True(t, first.HasMore)
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, invite.InviteId).Result)
+	resp = e.getPublicRoster(chatID, token, &commonpb.QueryOptions{PageSize: 1, PagingToken: first.PagingToken})
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
+	require.Empty(t, resp.Members)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, e.getRosterWithInvite(strangerKeys, chatID, token, nil).Result)
+
+	// An invite used up admits no one, and so shows no one.
+	limitedToken := newInviteToken()
+	limitedReq := createInviteRequest(e.keys, chatID, limitedToken)
+	limitedReq.MaxUses = 1
+	limited := e.createInvite(e.keys, limitedReq)
+	require.Equal(t, chatpb.CreateInviteResponse_OK, limited.Result)
+	require.Equal(t, chatpb.GetRosterResponse_OK, e.getPublicRoster(chatID, limitedToken, nil).Result)
+	_, err = e.store.JoinWithInvite(e.ctx, chatID, joinerID, limited.Invite.InviteId, inviteSecret(3), time.Now())
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, e.getPublicRoster(chatID, limitedToken, nil).Result)
+
+	// Nor does one past its expiry. Written through the store, which takes an
+	// expiry in the past, so the read is deterministic.
+	expiredToken := newInviteToken()
+	expiresAt := time.Now().Add(-time.Minute)
+	_, created, err := e.store.CreateInvite(e.ctx, chat.Invite{
+		ID:             chat.MustDeriveInviteID(expiredToken),
+		ChatID:         chatID,
+		CreatedBy:      e.userID,
+		CreatedAt:      time.Now().Add(-time.Hour),
+		ExpiresAt:      &expiresAt,
+		SecretEnvelope: inviteSecret(1),
+	}, signedInviteKeyEnvelope(e.keys, chatID, chat.MustDeriveInviteID(expiredToken)), chat.MaxActiveInvites, time.Now())
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, e.getPublicRoster(chatID, expiredToken, nil).Result)
+}
+
 // testServer_GetRoster_PublicGroupDisabled pins the operator's switch: with
 // public group rosters disabled, a member of a public group is DENIED, as is
 // a non-member (the switch is judged before membership), while a DM's participant and a private group's member are
@@ -1734,8 +1874,16 @@ func testServer_GetRoster_PublicGroupDisabled(t *testing.T, s chat.Store) {
 	resp = e.mustGetRoster(e.keys, chat.MustGenerateGroupChatID(), nil)
 	require.Equal(t, chatpb.GetRosterResponse_NOT_FOUND, resp.Result)
 
-	_, err := e.client.GetRoster(e.ctx, &chatpb.GetRosterRequest{ChatId: group})
-	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	// Auth that fails is refused on that ground, not by the switch. A request
+	// with neither auth nor an invite's token is DENIED before anything.
+	req := &chatpb.GetRosterRequest{ChatId: dm}
+	require.NoError(t, e.keys.Auth(req, &req.Auth))
+	req.ChatId = group
+	_, err := e.client.GetRoster(e.ctx, req)
+	require.Error(t, err)
+	require.NotEqual(t, codes.OK, status.Code(err))
+	resp = e.getPublicRoster(group, nil, nil)
+	require.Equal(t, chatpb.GetRosterResponse_DENIED, resp.Result)
 }
 
 func testServer_GetDmChatFeed_Empty(t *testing.T, s chat.Store) {
@@ -7319,6 +7467,14 @@ func (e *serverEnv) getInvite(keys model.KeyPair, token *chatpb.InviteToken) *ch
 	return resp
 }
 
+// getPublicInvite previews an invite with no auth at all, the token alone
+// (see chat.Server.GetInvite).
+func (e *serverEnv) getPublicInvite(token *chatpb.InviteToken) *chatpb.GetInviteResponse {
+	resp, err := e.client.GetInvite(e.ctx, &chatpb.GetInviteRequest{InviteToken: token})
+	require.NoError(e.t, err)
+	return resp
+}
+
 func (e *serverEnv) getChatInvites(keys model.KeyPair, chatID *commonpb.ChatId, opts *commonpb.QueryOptions) (*chatpb.GetChatInvitesResponse, error) {
 	req := &chatpb.GetChatInvitesRequest{ChatId: chatID, QueryOptions: opts}
 	require.NoError(e.t, keys.Auth(req, &req.Auth))
@@ -7790,6 +7946,61 @@ func testServer_Invite_Get(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, invite.InviteId).Result)
 	require.Equal(t, chatpb.Invite_REVOKED, e.getInvite(strangerKeys, token).Status)
 	require.Equal(t, chatpb.Invite_REVOKED, e.getInvite(e.keys, token).Status)
+}
+
+// testServer_Invite_GetUnauthenticated pins the preview with no auth, as a web
+// page that a link opens asks for it: the token alone gets the chat's public
+// view and the invite's status, never BANNED, and counts no use. Auth that is
+// set must still be valid.
+func testServer_Invite_GetUnauthenticated(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	bannedID, _ := e.addBoundUser("Banned")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+
+	// No invite has the ID of a token never used.
+	unknown := e.getPublicInvite(newInviteToken())
+	require.Equal(t, chatpb.GetInviteResponse_NOT_FOUND, unknown.Result)
+	require.Nil(t, unknown.Chat)
+
+	token, invite := e.mustCreateInvite(e.keys, chatID)
+
+	// The chat exactly as GetChat shows it with no auth: the record alone.
+	resp := e.getPublicInvite(token)
+	require.Equal(t, chatpb.GetInviteResponse_OK, resp.Result)
+	require.Equal(t, chatpb.Invite_ACTIVE, resp.Status)
+	require.NoError(t, protoutil.ProtoEqualError(e.getPublicChat(chatID, messagingpb.ViewMode_REDACTED).Metadata, resp.Chat))
+	require.Equal(t, chatID.Value, resp.Chat.ChatId.Value)
+	require.Equal(t, "Sunday Hikers", resp.Chat.Title)
+	require.True(t, resp.Chat.IsPrivate)
+	require.Empty(t, resp.Chat.Members)
+	require.Nil(t, resp.Chat.ViewerState)
+	require.Nil(t, resp.Chat.LastMessage)
+	require.False(t, resp.Chat.InLobby)
+
+	// Looking counts no use.
+	e.waitForChatInvites(e.keys, chatID, invite)
+
+	// A ban names a user, and a caller with no auth is no one.
+	require.Equal(t, chatpb.BanUserResponse_OK, e.mustBanUser(e.keys, chatID, bannedID))
+	resp = e.getPublicInvite(token)
+	require.Equal(t, chatpb.GetInviteResponse_OK, resp.Result)
+	require.Equal(t, chatpb.Invite_ACTIVE, resp.Status)
+
+	// Auth that is set must be valid: a request altered after it was signed
+	// is refused, not answered as if it carried none.
+	req := &chatpb.GetInviteRequest{InviteToken: token}
+	require.NoError(t, e.keys.Auth(req, &req.Auth))
+	req.InviteToken = newInviteToken()
+	_, err := e.client.GetInvite(e.ctx, req)
+	require.Error(t, err)
+
+	// A revoked invite reads REVOKED.
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, invite.InviteId).Result)
+	resp = e.getPublicInvite(token)
+	require.Equal(t, chatpb.GetInviteResponse_OK, resp.Result)
+	require.Equal(t, chatpb.Invite_REVOKED, resp.Status)
 }
 
 // testServer_Invite_List pins GetChatInvites: every invite, newest first,

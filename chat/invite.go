@@ -56,7 +56,10 @@ import (
 //     chat is the retry the proto promises, OK with that invite whatever its
 //     status and whatever the rest of the request says, with no gate asked;
 //     an invite with that ID by anyone else or to any other chat is DENIED.
-//     Otherwise the shared gate; then the group must have its key
+//     Otherwise, while invites are being rolled out, only a staff user may
+//     create one (DENIED otherwise, see canCreateInvite; a retry is answered
+//     whatever the caller's staff flag says now); then the shared gate; then
+//     the group must have its key
 //     (Access.hasKey, DENIED otherwise: an invite to a keyless group would
 //     carry a copy of a key that does not exist); then expires_at, if set,
 //     must be after now and at most MaxInviteDuration away
@@ -246,6 +249,15 @@ func (s *Server) CreateInvite(ctx context.Context, req *chatpb.CreateInviteReque
 		return nil, status.Error(codes.Internal, "")
 	}
 
+	allowed, err := s.canCreateInvite(ctx, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure checking invite creation")
+		return nil, status.Error(codes.Internal, "")
+	}
+	if !allowed {
+		return &chatpb.CreateInviteResponse{Result: chatpb.CreateInviteResponse_DENIED}, nil
+	}
+
 	c, result, err := s.inviterChat(ctx, log, req.ChatId, userID)
 	if err != nil {
 		return nil, err
@@ -321,6 +333,14 @@ func (s *Server) CreateInvite(ctx context.Context, req *chatpb.CreateInviteReque
 		Result: chatpb.CreateInviteResponse_OK,
 		Invite: stored.ToProto(now),
 	}, nil
+}
+
+// canCreateInvite reports whether userID may create an invite: today, only a
+// staff user. It is a transitional gate, like the one private groups were
+// built behind: clients have not shipped invites. Opening creation to every
+// user who may invite (Permissions.CanInvite) is removing this check.
+func (s *Server) canCreateInvite(ctx context.Context, userID *commonpb.UserId) (bool, error) {
+	return s.accounts.IsStaff(ctx, userID)
 }
 
 // createInviteRetry answers a CreateInvite whose ID is already held by

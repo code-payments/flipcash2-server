@@ -18,7 +18,7 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, requestsTable st
 		TableName:   aws.String(requestsTable),
 		BillingMode: types.BillingModePayPerRequest,
 		AttributeDefinitions: []types.AttributeDefinition{
-			{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeB},
+			{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
 			{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
 			{AttributeName: aws.String(attrChat), AttributeType: types.ScalarAttributeTypeB},
 			{AttributeName: aws.String(attrOpenSort), AttributeType: types.ScalarAttributeTypeB},

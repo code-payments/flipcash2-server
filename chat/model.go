@@ -754,9 +754,11 @@ const MaxInviteDuration = 365 * 24 * time.Hour
 const MaxActiveInvites = 20
 
 // Invite is an invite link to a private group (see chatpb.Invite): who made
-// it, how many distinct users may join with it (MaxUses, 0 for no limit) and
-// how many have (UseCount), when it stops admitting anyone (ExpiresAt, nil
-// for never), and whether it was revoked (RevokedAt, nil if not). The secret
+// it, how many joins it allows (MaxUses, 0 for no limit) and how many it has
+// admitted (UseCount), when it stops admitting anyone (ExpiresAt, nil for
+// never), and whether it was revoked (RevokedAt, nil if not). Every join
+// that makes someone a member counts, so a user who leaves and joins again
+// with it uses another; who joined with which invite is not recorded. The secret
 // envelope is the link's secret encrypted by CreatedBy for themself, which
 // the server cannot open and returns to them so they can share the link
 // again. The link's token is never part of it: the server never stores one

@@ -329,10 +329,11 @@ import (
 //	          It carries no index attribute, so the key material is in no
 //	          index.
 //
-//	          sk = "use#<user id>", one per user who joined with the invite,
-//	          written by the join that counts their use (the join's own
-//	          doc says what each holds). Like the copy, these must carry
-//	          none of the record's index attributes.
+//	          Nothing records who joined with an invite: use_count counts
+//	          joins, every one that makes someone a member, so no per-user
+//	          item is needed to tell a first join from a return. Any item
+//	          added to the partition later must carry none of the record's
+//	          index attributes, as the copy does not.
 //
 //	          No item carries a version. Every field of the record is
 //	          monotone — use_count only grows, revoked_at is set once, the
@@ -499,7 +500,7 @@ const (
 	attrRefreshAttempts      = "refresh_attempts"  // chat_holdings: refreshes failed in a row since the last that succeeded
 	attrCreatedBy            = "created_by"        // chat_invites #meta: the creator's raw ID (B)
 	attrMaxUses              = "max_uses"          // chat_invites #meta: 0 for no limit
-	attrUseCount             = "use_count"         // chat_invites #meta: distinct users who joined with it
+	attrUseCount             = "use_count"         // chat_invites #meta: joins it has admitted
 	attrCreatedAt            = "created_at"        // chat_invites #meta: epoch nanos
 	attrInviteExpiresAt      = "invite_expires_at" // chat_invites #meta: epoch nanos, absent when it never expires; not expires_at, the TTL
 	attrRevokedAt            = "revoked_at"        // chat_invites #meta: epoch nanos, absent while not revoked

@@ -58,8 +58,8 @@ var (
 	// that the one that does is an invite to another chat.
 	ErrInviteNotFound = errors.New("invite not found")
 
-	// ErrInviteExhausted indicates that an invite's MaxUses distinct users
-	// have joined with it, so it admits no one (see Invite.StatusAt).
+	// ErrInviteExhausted indicates that an invite has admitted MaxUses
+	// joins, so it admits no one (see Invite.StatusAt).
 	ErrInviteExhausted = errors.New("invite exhausted")
 
 	// ErrInviteExpired indicates that an invite's ExpiresAt has passed, so it

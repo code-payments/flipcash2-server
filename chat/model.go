@@ -860,6 +860,32 @@ func (i Invite) Clone() Invite {
 	return clone
 }
 
+// Position is the invite's place in its chat's listing (see InvitePosition).
+func (i Invite) Position() InvitePosition {
+	return InvitePosition{CreatedAt: i.CreatedAt, InviteID: i.ID}
+}
+
+// InvitePosition is a place in a chat's listing of invites (see
+// Store.GetChatInvitesPage): most recently created first, ties broken by
+// invite ID descending, so the order is total and a page can resume strictly
+// after the last invite it carried. Ties in creation time are nanosecond
+// coincidences within one chat, so the tie-break exists for totality rather
+// than for anything a client sees.
+type InvitePosition struct {
+	CreatedAt time.Time
+	InviteID  *chatpb.InviteId
+}
+
+// Compare orders positions in listing order: negative when p comes before o
+// (created later, or at the same instant with the greater invite ID),
+// positive when after, zero when they name the same place.
+func (p InvitePosition) Compare(o InvitePosition) int {
+	if c := o.CreatedAt.Compare(p.CreatedAt); c != 0 {
+		return c
+	}
+	return bytes.Compare(o.InviteID.GetValue(), p.InviteID.GetValue())
+}
+
 // ErrMuteUntilOutOfRange indicates that a timed mute ends outside the range a
 // store can record (see Mute.Until).
 var ErrMuteUntilOutOfRange = errors.New("mute until is out of range")

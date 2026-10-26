@@ -162,6 +162,19 @@ type DmFeedCursor struct {
 // admission (AdmitFromLobby) is where the lobby meets the roster: the entry
 // leaves, the key envelope lands and the membership transitions in one
 // write, so a user is never admitted without a key or left waiting after.
+//
+// An invite (see Invite) is one record per invite ID, kept with the invite's
+// copy of the chat key (chatpb.InviteKeyEnvelope), which the store holds
+// exactly while the invite may be ACTIVE: it is written with the invite, and
+// deleted in the write that revokes it (see RevokeInvite), and in the join
+// that takes its last use, and soon after it expires. Nothing reads the copy
+// but the join, so no method here returns it. Like the rest, an invite is
+// written against the IDs alone: that the chat exists, is a private group
+// with its key, and that the caller may invite to it, are the caller's
+// gates. No invite carries a version: every field is immutable except
+// UseCount, which only grows, and RevokedAt, which is set once, so a write
+// conditioned on the fields it read is its own compare-and-set, and a
+// version would be needed only if an invite could ever be edited.
 type Store interface {
 	// PutChat persists a new chat and its membership. It returns ErrChatExists
 	// if a chat with the same ID already exists, ErrNoMembers if the member set
@@ -733,6 +746,65 @@ type Store interface {
 	// if the chat does not exist; and an error if chatID is not a group chat
 	// ID or envelope.WrappedBy is nil.
 	AdmitFromLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope KeyEnvelope) (changed bool, roster RosterSummary, err error)
+
+	// CreateInvite records invite, an invite to the group invite.ChatID,
+	// with keyCopy, the invite's copy of the chat key, and returns the invite
+	// that stands after the call. An invite ID names one invite, whatever it
+	// is an invite to: when one is stored with invite.ID — to any chat, by
+	// any creator, in any status — nothing is written and the stored invite
+	// is returned with created false, whatever the call carried, so a retry
+	// gets the invite its first attempt made and the caller tells a retry
+	// from a clash by comparing the two. Otherwise a chat already holding
+	// maxActive invites ACTIVE as of now (see Invite.StatusAt) is refused
+	// with ErrTooManyInvites, with nothing written. Existence is judged
+	// first, so a retry of an invite that exists is returned however many
+	// the chat holds, and never refused at the cap.
+	//
+	// The invite is stored as given, its times at nanosecond precision,
+	// and returned as stored with created true. The count of ACTIVE invites
+	// may trail writes briefly, so two creates racing at the cap can both
+	// land and leave the chat one over: accepted, since today only a chat's
+	// creator creates its invites. It returns an error if invite.ChatID is
+	// not a group chat ID, invite.ID is not InviteIDSize bytes, CreatedBy is
+	// not a user ID, SecretEnvelope or keyCopy is nil, UseCount is not zero,
+	// RevokedAt is set, CreatedAt or ExpiresAt is before the Unix epoch, now
+	// is before the Unix epoch, or maxActive is less than one. It checks
+	// neither the copy's signature nor how far away ExpiresAt is: those are
+	// the caller's, with the gates above.
+	CreateInvite(ctx context.Context, invite Invite, keyCopy *chatpb.InviteKeyEnvelope, maxActive int, now time.Time) (stored Invite, created bool, err error)
+
+	// GetInvite returns the invite with inviteID, or ErrInviteNotFound when
+	// there is none. The read is strongly consistent: it reflects every
+	// write that completed before it, so a revoke or a use is never missed
+	// by a read that follows it.
+	GetInvite(ctx context.Context, inviteID *chatpb.InviteId) (Invite, error)
+
+	// GetChatInvitesPage returns up to limit of chatID's invites, whatever
+	// their status, in listing order (see InvitePosition: most recently
+	// created first), strictly after the given position, or from the start
+	// when it is nil. A limit of zero or less means no limit. With createdBy
+	// nil it lists every invite to the chat; with it set, only the invites
+	// createdBy made to it, in the same order. The read is eventually
+	// consistent: an invite just created may be absent, and one just revoked
+	// or used may read as it was a moment before, so a caller showing an
+	// invite's status after changing it shows what the change returned. A
+	// chat with no invites, or that does not exist, is an empty result. It
+	// returns an error if chatID is not a group chat ID, createdBy is set
+	// and not a user ID, or after names an ID that is not InviteIDSize bytes
+	// or a time before the Unix epoch.
+	GetChatInvitesPage(ctx context.Context, chatID *commonpb.ChatId, createdBy *commonpb.UserId, after *InvitePosition, limit int) ([]Invite, error)
+
+	// RevokeInvite revokes chatID's invite inviteID as of now, and in the
+	// same write deletes the invite's copy of the chat key, returning the
+	// invite as revoked. Its UseCount is as the store read it, and may trail
+	// a join that landed concurrently: a revoke is never refused or retried
+	// for a join, so revoking an invite that is busy succeeds. An invite already revoked is a no-op
+	// that keeps its first revoke time and returns it with changed false;
+	// one expired or used up is revoked like any other, with changed true.
+	// It returns ErrInviteNotFound when no invite has inviteID, or the one
+	// that does is an invite to another chat, with nothing written; and an
+	// error if chatID is not a group chat ID or now is before the Unix epoch.
+	RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, inviteID *chatpb.InviteId, now time.Time) (invite Invite, changed bool, err error)
 
 	// SetFeaturedGroups replaces userID's featured groups with chatIDs, in
 	// that order, and returns the list that stands after the call. A list

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"strconv"
@@ -23,9 +24,10 @@ import (
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
+	"github.com/code-payments/flipcash2-server/model"
 )
 
-// The chat store spans nine tables:
+// The chat store spans ten tables:
 //
 //	chats     pk = "chat#<id>" (one item per chat). Canonical metadata: type,
 //	          members (the DM participants; absent for groups), title, creator
@@ -187,6 +189,17 @@ import (
 //	          RemoveGroupMember), so no departed user keeps one. No item
 //	          expires.
 //
+//	          A member who joined with an invite holds the invite's copy of
+//	          the chat key in the same item (see chat.InviteKeyCopy): its
+//	          presence is marked by invite_id (the raw invite ID, B); the
+//	          copy is in scheme (a chatpb.InviteKeyEnvelope_Scheme), nonce,
+//	          ciphertext and signature, as in the invite's own #copy, beside
+//	          the joiner's secret envelope (secret_scheme, secret_nonce,
+//	          secret_ciphertext, as on the invite's record), and wrapped_by
+//	          is the invite's creator. Every write puts the whole item, so
+//	          an envelope the member wraps for themself replaces the copy
+//	          and its secret envelope with it.
+//
 //	chat_lobbies  pk = "user#<id>", sk = "chat#<id>" (one item per (user,
 //	          private group) the user is waiting in the lobby of; see
 //	          chat.LobbyEntry), with entered_at (epoch nanos). gsiLobbyByChat
@@ -282,6 +295,51 @@ import (
 //	          writes: at a refresh per group per interval it is far below a
 //	          partition's throughput until there are many thousands of gated
 //	          groups, and the key can be sharded then.
+//
+//	chat_invites  pk = "invite#<id>" (one partition per invite; see
+//	          chat.Invite), holding every item of the invite, so that a join
+//	          with it reads and writes one partition:
+//
+//	          sk = "#meta" (see skMeta), the invite's record: chat and
+//	          created_by (raw IDs, B), max_uses, use_count, created_at and
+//	          invite_expires_at (epoch nanos; absent for an invite that never
+//	          expires — not expires_at, which is the table's TTL and would
+//	          delete the record), revoked_at (epoch nanos, absent while not
+//	          revoked), and the creator's secret envelope (secret_scheme,
+//	          secret_nonce, secret_ciphertext). Three sparse GSIs are keyed by
+//	          attributes the record alone carries: gsiInvitesByChat on (chat,
+//	          created_sort) lists a chat's invites newest first,
+//	          gsiInvitesByChatCreator on (chat, creator_sort) one creator's
+//	          invites to it the same way, a key range on the creator's
+//	          prefix, and gsiInvitesActive on (chat, active_sort) holds the
+//	          invites neither revoked nor used up by when they expire, so a
+//	          count of the range above now is the chat's ACTIVE invites, the
+//	          cap's (see CreateInvite). active_sort is removed by the write
+//	          that revokes the invite and by the join that takes its last
+//	          use. All three are eventually consistent, as their readers
+//	          allow; the cap's race is the contract's.
+//
+//	          sk = "#copy" (see skInviteCopy), the invite's copy of the chat
+//	          key: scheme, nonce, ciphertext and signature, and expires_at
+//	          (DynamoDB TTL, epoch seconds, the invite's expiry rounded up),
+//	          absent for an invite that never expires. It exists exactly
+//	          while the invite may be ACTIVE: written with the record,
+//	          deleted in the write that revokes it and in the join that
+//	          takes its last use, and swept by TTL soon after it expires.
+//	          It carries no index attribute, so the key material is in no
+//	          index.
+//
+//	          sk = "use#<user id>", one per user who joined with the invite,
+//	          written by the join that counts their use (the join's own
+//	          doc says what each holds). Like the copy, these must carry
+//	          none of the record's index attributes.
+//
+//	          No item carries a version. Every field of the record is
+//	          monotone — use_count only grows, revoked_at is set once, the
+//	          rest never change — so every write is conditioned on the
+//	          fields it read, which is its compare-and-set, and on the
+//	          record existing. A version would be needed only if an invite
+//	          could ever be edited.
 const (
 	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
 	// all of a user's DM types. Superseded by gsiByTypeActivity; retained until
@@ -358,6 +416,25 @@ const (
 	// one queue, one partition of refreshQueueIndex.
 	refreshQueuePK = "queue#refresh"
 
+	// gsiInvitesByChat is the sparse (chat, created_sort) index on
+	// chat_invites: a chat's invites, most recently created first when read
+	// descending (see GetChatInvitesPage).
+	gsiInvitesByChat = "by_chat"
+
+	// gsiInvitesByChatCreator is the sparse (chat, creator_sort) index on
+	// chat_invites: one creator's invites to a chat, a key range on the
+	// creator's prefix, most recently created first when read descending.
+	gsiInvitesByChatCreator = "by_chat_creator"
+
+	// gsiInvitesActive is the sparse (chat, active_sort) index on
+	// chat_invites: a chat's invites that are neither revoked nor used up,
+	// by when they expire, so a range above now is exactly its ACTIVE
+	// invites (see countActiveInvites).
+	gsiInvitesActive = "by_chat_active"
+
+	// inviteKeyPrefix prefixes an invite ID in the chat_invites pk.
+	inviteKeyPrefix = "invite#"
+
 	// chatKeyPrefix prefixes a chat ID in the chats table pk, the dm_inbox sk
 	// and the chat_user_state sk. The chat ID is recovered from the key, so it
 	// is not stored as its own attribute — except in chat_user_state, where a
@@ -367,6 +444,10 @@ const (
 
 	// skMeta is the sort key of a group's aggregates item in group_members.
 	skMeta = "#meta"
+
+	// skInviteCopy is the sort key of an invite's copy of the chat key. The
+	// invite's record is skMeta.
+	skInviteCopy = "#copy"
 
 	attrPK                   = "pk"
 	attrSK                   = "sk"
@@ -393,29 +474,43 @@ const (
 	attrLastMessageID        = "last_message_id"
 	attrMemberCount          = "member_count" // #meta item: joined member count
 	attrVersion              = "version"
-	attrChat                 = "chat"             // chat_user_state records: the raw chat ID bytes (B), keying gsiByMuted and gsiUserStateByUser
-	attrMutedUntil           = "muted_until"      // chat_user_state: epoch seconds, present only while a mute is recorded — see muteForeverUntil
-	attrMutedCount           = "muted_count"      // chat_user_state #meta item: records with a mute recorded
-	attrSilencedUntil        = "silenced_until"   // chat_user_state: epoch seconds, present only while a silence is recorded — encoded as muted_until is (see muteForeverUntil)
-	attrBannedAt             = "banned_at"        // chat_user_state: epoch nanos of the ban, present only while one is recorded
-	attrRestrictedSort       = "restricted_sort"  // chat_user_state: see restrictedSort, present only while a silence or ban is recorded, keying gsiRestricted
-	attrLastSentAt           = "last_sent_at"     // chat_activity: epoch ms of the latest recorded send
-	attrActivityScore        = "activity_score"   // chat_activity: epoch ms, see chat.NextActivityScore; absent on records written before scores
-	attrScheme               = "scheme"           // chat_key_envelopes: chatpb.KeyEnvelope_Scheme, by number
-	attrNonce                = "nonce"            // chat_key_envelopes: the envelope's nonce (B)
-	attrCiphertext           = "ciphertext"       // chat_key_envelopes: the wrapped chat key (B)
-	attrWrappedBy            = "wrapped_by"       // chat_key_envelopes: the raw ID of the user who stored the envelope (B)
-	attrEnteredAt            = "entered_at"       // chat_lobbies: epoch nanos of the entry, keying gsiLobbyByChat
-	attrLobbyCount           = "lobby_count"      // chat_lobbies #meta items: a lobby's size (chat# pk) or a user's lobbies (user# pk)
-	attrFeaturedCount        = "featured_count"   // chat_featured_groups #meta item: how many groups the list holds
-	attrMint                 = "mint"             // chat_holdings: the raw mint the snapshot is of (B), keying gsiByMintRank
-	attrQuarks               = "quarks"           // chat_holdings: the members' total, in the mint's quarks
-	attrHolderCount          = "holder_count"     // chat_holdings: members holding any of the mint
-	attrAsOf                 = "as_of"            // chat_holdings: epoch ms the snapshot was taken
-	attrRank                 = "rank"             // chat_holdings: see holdingsRank, keying gsiByMintRank
-	attrRefreshQueue         = "refresh_queue"    // chat_holdings: refreshQueuePK on a queued group, keying refreshQueueIndex
-	attrRefreshDueAt         = "refresh_due_at"   // chat_holdings: epoch ms the group's next refresh is due
-	attrRefreshAttempts      = "refresh_attempts" // chat_holdings: refreshes failed in a row since the last that succeeded
+	attrChat                 = "chat"              // chat_user_state records: the raw chat ID bytes (B), keying gsiByMuted and gsiUserStateByUser
+	attrMutedUntil           = "muted_until"       // chat_user_state: epoch seconds, present only while a mute is recorded — see muteForeverUntil
+	attrMutedCount           = "muted_count"       // chat_user_state #meta item: records with a mute recorded
+	attrSilencedUntil        = "silenced_until"    // chat_user_state: epoch seconds, present only while a silence is recorded — encoded as muted_until is (see muteForeverUntil)
+	attrBannedAt             = "banned_at"         // chat_user_state: epoch nanos of the ban, present only while one is recorded
+	attrRestrictedSort       = "restricted_sort"   // chat_user_state: see restrictedSort, present only while a silence or ban is recorded, keying gsiRestricted
+	attrLastSentAt           = "last_sent_at"      // chat_activity: epoch ms of the latest recorded send
+	attrActivityScore        = "activity_score"    // chat_activity: epoch ms, see chat.NextActivityScore; absent on records written before scores
+	attrScheme               = "scheme"            // chat_key_envelopes: chatpb.KeyEnvelope_Scheme, by number
+	attrNonce                = "nonce"             // chat_key_envelopes: the envelope's nonce (B)
+	attrCiphertext           = "ciphertext"        // chat_key_envelopes: the wrapped chat key (B)
+	attrWrappedBy            = "wrapped_by"        // chat_key_envelopes: the raw ID of the user who stored the envelope (B)
+	attrEnteredAt            = "entered_at"        // chat_lobbies: epoch nanos of the entry, keying gsiLobbyByChat
+	attrLobbyCount           = "lobby_count"       // chat_lobbies #meta items: a lobby's size (chat# pk) or a user's lobbies (user# pk)
+	attrFeaturedCount        = "featured_count"    // chat_featured_groups #meta item: how many groups the list holds
+	attrMint                 = "mint"              // chat_holdings: the raw mint the snapshot is of (B), keying gsiByMintRank
+	attrQuarks               = "quarks"            // chat_holdings: the members' total, in the mint's quarks
+	attrHolderCount          = "holder_count"      // chat_holdings: members holding any of the mint
+	attrAsOf                 = "as_of"             // chat_holdings: epoch ms the snapshot was taken
+	attrRank                 = "rank"              // chat_holdings: see holdingsRank, keying gsiByMintRank
+	attrRefreshQueue         = "refresh_queue"     // chat_holdings: refreshQueuePK on a queued group, keying refreshQueueIndex
+	attrRefreshDueAt         = "refresh_due_at"    // chat_holdings: epoch ms the group's next refresh is due
+	attrRefreshAttempts      = "refresh_attempts"  // chat_holdings: refreshes failed in a row since the last that succeeded
+	attrCreatedBy            = "created_by"        // chat_invites #meta: the creator's raw ID (B)
+	attrMaxUses              = "max_uses"          // chat_invites #meta: 0 for no limit
+	attrUseCount             = "use_count"         // chat_invites #meta: distinct users who joined with it
+	attrCreatedAt            = "created_at"        // chat_invites #meta: epoch nanos
+	attrInviteExpiresAt      = "invite_expires_at" // chat_invites #meta: epoch nanos, absent when it never expires; not expires_at, the TTL
+	attrRevokedAt            = "revoked_at"        // chat_invites #meta: epoch nanos, absent while not revoked
+	attrSecretScheme         = "secret_scheme"     // chat_invites #meta, chat_key_envelopes copies: chatpb.InviteSecretEnvelope_Scheme, by number
+	attrSecretNonce          = "secret_nonce"      // chat_invites #meta, chat_key_envelopes copies: the secret envelope's nonce (B)
+	attrSecretCiphertext     = "secret_ciphertext" // chat_invites #meta, chat_key_envelopes copies: the encrypted secret (B)
+	attrCreatedSort          = "created_sort"      // chat_invites #meta: see inviteCreatedSort, keying gsiInvitesByChat
+	attrCreatorSort          = "creator_sort"      // chat_invites #meta: see inviteCreatorSort, keying gsiInvitesByChatCreator
+	attrActiveSort           = "active_sort"       // chat_invites #meta: see inviteActiveSort, present while neither revoked nor used up, keying gsiInvitesActive
+	attrSignature            = "signature"         // chat_invites #copy, chat_key_envelopes copies: the copy's signature (B)
+	attrInviteID             = "invite_id"         // chat_key_envelopes: the raw invite ID (B) of a copy, absent on a wrapped envelope
 
 	// Keys of the min_listener_balance map.
 	attrBalanceCurrency     = "currency"
@@ -485,6 +580,7 @@ type store struct {
 	lobbiesTable        string
 	featuredGroupsTable string
 	holdingsTable       string
+	invitesTable        string
 
 	exclusions chat.FeedExclusions
 }
@@ -493,7 +589,7 @@ type store struct {
 // creating every DM with a user in excludedFromFeed excluding them from the
 // feed (see chat.FeedExclusions); nil excludes no one. Use CreateTables to
 // provision the tables.
-func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
+func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
 	return &store{
 		exclusions:          chat.NewFeedExclusions(excludedFromFeed),
 		client:              client,
@@ -506,6 +602,7 @@ func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembe
 		lobbiesTable:        lobbiesTable,
 		featuredGroupsTable: featuredGroupsTable,
 		holdingsTable:       holdingsTable,
+		invitesTable:        invitesTable,
 	}
 }
 
@@ -3585,6 +3682,9 @@ func (s *store) SetKeyEnvelope(ctx context.Context, chatID *commonpb.ChatId, use
 	if envelope.WrappedBy == nil {
 		return chat.KeyEnvelope{}, fmt.Errorf("key envelope has no wrapper")
 	}
+	if c := envelope.InviteCopy; c != nil && (c.InviteID == nil || c.Envelope == nil || c.SecretEnvelope == nil) {
+		return chat.KeyEnvelope{}, fmt.Errorf("invite key copy is incomplete")
+	}
 
 	// An envelope the user wrapped themself stands: the put is refused when
 	// one is stored, and the refusal returns it.
@@ -3635,27 +3735,58 @@ func keyEnvelopeKey(chatID *commonpb.ChatId, userID *commonpb.UserId) map[string
 	}
 }
 
-// keyEnvelopeItem is userID's envelope for chatID as stored, key included.
+// keyEnvelopeItem is userID's envelope for chatID as stored, key included:
+// a wrapped envelope's scheme, nonce and ciphertext, or an invite's copy
+// (see the table's doc), and who stored it.
 func keyEnvelopeItem(chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) map[string]types.AttributeValue {
 	item := keyEnvelopeKey(chatID, userID)
-	item[attrScheme] = avN(uint64(envelope.Scheme))
-	item[attrNonce] = avB(envelope.Nonce)
-	item[attrCiphertext] = avB(envelope.Ciphertext)
+	if c := envelope.InviteCopy; c != nil {
+		item[attrInviteID] = avB(c.InviteID.GetValue())
+		putInviteKeyEnvelope(item, c.Envelope)
+		putSecretEnvelope(item, c.SecretEnvelope)
+	} else {
+		item[attrScheme] = avN(uint64(envelope.Scheme))
+		item[attrNonce] = avB(envelope.Nonce)
+		item[attrCiphertext] = avB(envelope.Ciphertext)
+	}
 	item[attrWrappedBy] = avB(envelope.WrappedBy.Value)
 	return item
 }
 
-// keyEnvelopeFromItem decodes a chat_key_envelopes item. Every attribute is
-// written with every item, so one missing its wrapper is a corrupt item
-// rather than a default.
+// keyEnvelopeFromItem decodes a chat_key_envelopes item, an invite's copy
+// when it carries invite_id. Every attribute of its kind is written with
+// every item, so one missing its wrapper is a corrupt item rather than a
+// default.
 func keyEnvelopeFromItem(item map[string]types.AttributeValue) (chat.KeyEnvelope, error) {
-	scheme, err := parseN(item[attrScheme])
-	if err != nil {
-		return chat.KeyEnvelope{}, err
-	}
 	wrappedBy := asB(item[attrWrappedBy])
 	if len(wrappedBy) == 0 {
 		return chat.KeyEnvelope{}, fmt.Errorf("key envelope item has no wrapper")
+	}
+	if av, ok := item[attrInviteID]; ok {
+		inviteID := asB(av)
+		if len(inviteID) == 0 {
+			return chat.KeyEnvelope{}, fmt.Errorf("invite key copy item has no invite id")
+		}
+		envelope, err := inviteKeyEnvelopeFromItem(item)
+		if err != nil {
+			return chat.KeyEnvelope{}, err
+		}
+		secretEnvelope, err := secretEnvelopeFromItem(item)
+		if err != nil {
+			return chat.KeyEnvelope{}, err
+		}
+		return chat.KeyEnvelope{
+			WrappedBy: &commonpb.UserId{Value: bytes.Clone(wrappedBy)},
+			InviteCopy: &chat.InviteKeyCopy{
+				InviteID:       &chatpb.InviteId{Value: bytes.Clone(inviteID)},
+				Envelope:       envelope,
+				SecretEnvelope: secretEnvelope,
+			},
+		}, nil
+	}
+	scheme, err := parseN(item[attrScheme])
+	if err != nil {
+		return chat.KeyEnvelope{}, err
 	}
 	return chat.KeyEnvelope{
 		Scheme:     chatpb.KeyEnvelope_Scheme(scheme),
@@ -4635,4 +4766,572 @@ func holdingsRefreshFromItem(item map[string]types.AttributeValue) (chat.Holding
 		DueAt:    time.UnixMilli(dueAt),
 		Attempts: uint32(attempts),
 	}, nil
+}
+
+// The chat_invites table (see the store's doc) holds every item of one
+// invite in the invite's own partition, so that the join, which reads and
+// writes several of them, touches one partition and nothing else's.
+
+// inviteNeverExpires is the expiry an invite that never expires sorts at in
+// gsiInvitesActive: above every instant, so it is ACTIVE as of any now.
+const inviteNeverExpires = math.MaxUint64
+
+// maxInviteAttempts bounds the retries of an invite's writes: a
+// TransactionConflict, which a concurrent write to the same item causes (a
+// racing create of the same ID, or a join landing while the invite is
+// revoked). Each is rare, and a burst of joins is what exhausts it.
+const maxInviteAttempts = maxMembershipAttempts
+
+func invitePK(inviteID *chatpb.InviteId) string {
+	return inviteKeyPrefix + hex.EncodeToString(inviteID.GetValue())
+}
+
+func inviteKey(inviteID *chatpb.InviteId, sk string) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		attrPK: avS(invitePK(inviteID)),
+		attrSK: avS(sk),
+	}
+}
+
+// inviteIDFromPK recovers an invite's ID from the pk of one of its items.
+func inviteIDFromPK(item map[string]types.AttributeValue) (*chatpb.InviteId, error) {
+	key := asS(item[attrPK])
+	if !strings.HasPrefix(key, inviteKeyPrefix) {
+		return nil, fmt.Errorf("invite key %q has no %q prefix", key, inviteKeyPrefix)
+	}
+	id, err := hex.DecodeString(strings.TrimPrefix(key, inviteKeyPrefix))
+	if err != nil {
+		return nil, fmt.Errorf("decoding invite id from key %q: %w", key, err)
+	}
+	return &chatpb.InviteId{Value: id}, nil
+}
+
+// inviteCreatedSort is the gsiInvitesByChat range key of an invite created
+// at createdAt: the time's epoch nanos, big-endian, then the invite's ID.
+// Read descending, the index is then chat.InvitePosition order, and the key
+// is fixed width, so a page resumes strictly below the key of the position
+// it ended at with a key condition alone.
+func inviteCreatedSort(createdAt time.Time, inviteID *chatpb.InviteId) []byte {
+	out := binary.BigEndian.AppendUint64(make([]byte, 0, 8+chat.InviteIDSize), uint64(createdAt.UnixNano()))
+	return append(out, inviteID.GetValue()...)
+}
+
+// inviteCreatorSort is the gsiInvitesByChatCreator range key: the creator's
+// raw ID, then inviteCreatedSort, so one creator's invites to a chat are a
+// key range on their ID's prefix, in the same order as the chat's.
+func inviteCreatorSort(createdBy *commonpb.UserId, createdAt time.Time, inviteID *chatpb.InviteId) []byte {
+	out := append(make([]byte, 0, model.UserIDSize+8+chat.InviteIDSize), createdBy.GetValue()...)
+	return append(out, inviteCreatedSort(createdAt, inviteID)...)
+}
+
+// inviteActiveSort is the gsiInvitesActive range key of an invite expiring
+// at expiresAt (nil for never): the expiry's epoch nanos, big-endian,
+// inviteNeverExpires for never, then the invite's ID, which makes the key
+// unique to the invite. An invite is ACTIVE as of now exactly when it holds
+// the key and the key is at or above activeAsOf(now).
+func inviteActiveSort(expiresAt *time.Time, inviteID *chatpb.InviteId) []byte {
+	expiry := uint64(inviteNeverExpires)
+	if expiresAt != nil {
+		expiry = uint64(expiresAt.UnixNano())
+	}
+	out := binary.BigEndian.AppendUint64(make([]byte, 0, 8+chat.InviteIDSize), expiry)
+	return append(out, inviteID.GetValue()...)
+}
+
+// activeAsOf is the lowest gsiInvitesActive key of an invite still ACTIVE
+// as of now: one expiring a nanosecond after it, since an invite is EXPIRED
+// from the instant it expires (see chat.Invite.StatusAt). A bare 8-byte
+// prefix sorts below every key that begins with it.
+func activeAsOf(now time.Time) []byte {
+	return binary.BigEndian.AppendUint64(nil, uint64(now.UnixNano())+1)
+}
+
+// inviteCopyTTL is the TTL of the copy of an invite expiring at expiresAt,
+// in epoch seconds: the expiry rounded up, so the sweep, which works in
+// whole seconds, never takes a copy before its invite expires.
+func inviteCopyTTL(expiresAt time.Time) uint64 {
+	secs := expiresAt.Unix()
+	if expiresAt.UnixNano()%int64(time.Second) != 0 {
+		secs++
+	}
+	return uint64(secs)
+}
+
+// inviteMetaItem is the record of invite as created, key and index
+// attributes included. A new invite is neither revoked nor used up, so it
+// is in all three indexes.
+func inviteMetaItem(invite chat.Invite) map[string]types.AttributeValue {
+	item := inviteKey(invite.ID, skMeta)
+	item[attrChat] = avB(invite.ChatID.Value)
+	item[attrCreatedBy] = avB(invite.CreatedBy.Value)
+	item[attrMaxUses] = avN(uint64(invite.MaxUses))
+	item[attrUseCount] = avN(uint64(invite.UseCount))
+	item[attrCreatedAt] = avN(uint64(invite.CreatedAt.UnixNano()))
+	if invite.ExpiresAt != nil {
+		item[attrInviteExpiresAt] = avN(uint64(invite.ExpiresAt.UnixNano()))
+	}
+	putSecretEnvelope(item, invite.SecretEnvelope)
+	item[attrCreatedSort] = avB(inviteCreatedSort(invite.CreatedAt, invite.ID))
+	item[attrCreatorSort] = avB(inviteCreatorSort(invite.CreatedBy, invite.CreatedAt, invite.ID))
+	item[attrActiveSort] = avB(inviteActiveSort(invite.ExpiresAt, invite.ID))
+	return item
+}
+
+// inviteCopyItem is the invite's copy of the chat key, key included, with
+// the invite's expiry as its TTL when it has one. It carries no index
+// attribute, so the key material is in no index.
+func inviteCopyItem(invite chat.Invite, keyCopy *chatpb.InviteKeyEnvelope) map[string]types.AttributeValue {
+	item := inviteKey(invite.ID, skInviteCopy)
+	putInviteKeyEnvelope(item, keyCopy)
+	if invite.ExpiresAt != nil {
+		item[attrExpiresAt] = avN(inviteCopyTTL(*invite.ExpiresAt))
+	}
+	return item
+}
+
+// putInviteKeyEnvelope writes an invite's copy of the chat key into item,
+// under the attributes an invite's #copy and a member's copy in
+// chat_key_envelopes share.
+func putInviteKeyEnvelope(item map[string]types.AttributeValue, envelope *chatpb.InviteKeyEnvelope) {
+	item[attrScheme] = avN(uint64(envelope.GetScheme()))
+	item[attrNonce] = avB(envelope.GetNonce())
+	item[attrCiphertext] = avB(envelope.GetCiphertext())
+	item[attrSignature] = avB(envelope.GetSignature())
+}
+
+// inviteKeyEnvelopeFromItem is the inverse of putInviteKeyEnvelope.
+func inviteKeyEnvelopeFromItem(item map[string]types.AttributeValue) (*chatpb.InviteKeyEnvelope, error) {
+	scheme, err := parseN(item[attrScheme])
+	if err != nil {
+		return nil, fmt.Errorf("reading invite key copy scheme: %w", err)
+	}
+	return &chatpb.InviteKeyEnvelope{
+		Scheme:     chatpb.InviteKeyEnvelope_Scheme(scheme),
+		Nonce:      bytes.Clone(asB(item[attrNonce])),
+		Ciphertext: bytes.Clone(asB(item[attrCiphertext])),
+		Signature:  bytes.Clone(asB(item[attrSignature])),
+	}, nil
+}
+
+// putSecretEnvelope writes an invite secret envelope into item, under the
+// attributes an invite's #meta and a member's copy in chat_key_envelopes
+// share.
+func putSecretEnvelope(item map[string]types.AttributeValue, envelope *chatpb.InviteSecretEnvelope) {
+	item[attrSecretScheme] = avN(uint64(envelope.GetScheme()))
+	item[attrSecretNonce] = avB(envelope.GetNonce())
+	item[attrSecretCiphertext] = avB(envelope.GetCiphertext())
+}
+
+// secretEnvelopeFromItem is the inverse of putSecretEnvelope.
+func secretEnvelopeFromItem(item map[string]types.AttributeValue) (*chatpb.InviteSecretEnvelope, error) {
+	scheme, err := parseN(item[attrSecretScheme])
+	if err != nil {
+		return nil, fmt.Errorf("reading invite secret envelope scheme: %w", err)
+	}
+	return &chatpb.InviteSecretEnvelope{
+		Scheme:     chatpb.InviteSecretEnvelope_Scheme(scheme),
+		Nonce:      bytes.Clone(asB(item[attrSecretNonce])),
+		Ciphertext: bytes.Clone(asB(item[attrSecretCiphertext])),
+	}, nil
+}
+
+// inviteFromItem decodes an invite's #meta item, from the table or any of
+// its indexes, which project every attribute.
+func inviteFromItem(item map[string]types.AttributeValue) (chat.Invite, error) {
+	inviteID, err := inviteIDFromPK(item)
+	if err != nil {
+		return chat.Invite{}, err
+	}
+	chatID := asB(item[attrChat])
+	if len(chatID) == 0 {
+		return chat.Invite{}, fmt.Errorf("invite item has no chat")
+	}
+	createdBy := asB(item[attrCreatedBy])
+	if len(createdBy) == 0 {
+		return chat.Invite{}, fmt.Errorf("invite item has no creator")
+	}
+	maxUses, err := parseN(item[attrMaxUses])
+	if err != nil {
+		return chat.Invite{}, fmt.Errorf("reading %s: %w", attrMaxUses, err)
+	}
+	useCount, err := parseN(item[attrUseCount])
+	if err != nil {
+		return chat.Invite{}, fmt.Errorf("reading %s: %w", attrUseCount, err)
+	}
+	if maxUses > math.MaxUint32 || useCount > math.MaxUint32 {
+		return chat.Invite{}, fmt.Errorf("invite uses out of range")
+	}
+	createdAt, err := parseN(item[attrCreatedAt])
+	if err != nil {
+		return chat.Invite{}, fmt.Errorf("reading %s: %w", attrCreatedAt, err)
+	}
+	secretEnvelope, err := secretEnvelopeFromItem(item)
+	if err != nil {
+		return chat.Invite{}, err
+	}
+	invite := chat.Invite{
+		ID:             inviteID,
+		ChatID:         &commonpb.ChatId{Value: bytes.Clone(chatID)},
+		CreatedBy:      &commonpb.UserId{Value: bytes.Clone(createdBy)},
+		MaxUses:        uint32(maxUses),
+		UseCount:       uint32(useCount),
+		CreatedAt:      time.Unix(0, int64(createdAt)).UTC(),
+		SecretEnvelope: secretEnvelope,
+	}
+	if av, ok := item[attrInviteExpiresAt]; ok {
+		nanos, err := parseN(av)
+		if err != nil {
+			return chat.Invite{}, fmt.Errorf("reading %s: %w", attrInviteExpiresAt, err)
+		}
+		expiresAt := time.Unix(0, int64(nanos)).UTC()
+		invite.ExpiresAt = &expiresAt
+	}
+	if av, ok := item[attrRevokedAt]; ok {
+		nanos, err := parseN(av)
+		if err != nil {
+			return chat.Invite{}, fmt.Errorf("reading %s: %w", attrRevokedAt, err)
+		}
+		revokedAt := time.Unix(0, int64(nanos)).UTC()
+		invite.RevokedAt = &revokedAt
+	}
+	return invite, nil
+}
+
+// CreateInvite counts the chat's ACTIVE invites off gsiInvitesActive, then,
+// under the cap, writes the invite in one transaction: its record, put
+// conditionally on no item holding its ID, and its copy. A failed condition
+// is an invite that exists, returned from the item the failure hands back
+// with nothing written. At the cap, the ID is read, strongly consistent,
+// before the create is refused, so an invite that exists is returned rather
+// than ErrTooManyInvites: existence is judged first either way. The count is
+// a GSI's, eventually consistent, which is the race the contract accepts. A
+// TransactionConflict is retried with backoff.
+func (s *store) CreateInvite(ctx context.Context, invite chat.Invite, keyCopy *chatpb.InviteKeyEnvelope, maxActive int, now time.Time) (chat.Invite, bool, error) {
+	if err := chat.ValidateNewInvite(invite, keyCopy); err != nil {
+		return chat.Invite{}, false, err
+	}
+	if maxActive < 1 {
+		return chat.Invite{}, false, fmt.Errorf("invite cap must be at least one")
+	}
+	if now.Before(time.Unix(0, 0)) {
+		return chat.Invite{}, false, fmt.Errorf("now is before the unix epoch")
+	}
+
+	stored := invite.Clone()
+	stored.CreatedAt = chat.InviteTime(invite.CreatedAt)
+	if invite.ExpiresAt != nil {
+		expiresAt := chat.InviteTime(*invite.ExpiresAt)
+		stored.ExpiresAt = &expiresAt
+	}
+
+	active, err := s.countActiveInvites(ctx, invite.ChatID, now, maxActive)
+	if err != nil {
+		return chat.Invite{}, false, err
+	}
+	if active >= maxActive {
+		existing, err := s.GetInvite(ctx, invite.ID)
+		switch {
+		case err == nil:
+			return existing, false, nil
+		case errors.Is(err, chat.ErrInviteNotFound):
+			return chat.Invite{}, false, chat.ErrTooManyInvites
+		default:
+			return chat.Invite{}, false, err
+		}
+	}
+
+	transactItems := []types.TransactWriteItem{
+		{Put: &types.Put{
+			TableName:                           aws.String(s.invitesTable),
+			Item:                                inviteMetaItem(stored),
+			ConditionExpression:                 aws.String("attribute_not_exists(#pk)"),
+			ExpressionAttributeNames:            map[string]string{"#pk": attrPK},
+			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		}},
+		{Put: &types.Put{
+			TableName: aws.String(s.invitesTable),
+			Item:      inviteCopyItem(stored, keyCopy),
+		}},
+	}
+
+	backoff := membershipBackoffBase
+	for attempt := 0; ; attempt++ {
+		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
+		if err == nil {
+			return stored.Clone(), true, nil
+		}
+		reasons, ok := cancellationReasons(err)
+		if !ok || len(reasons) != len(transactItems) {
+			return chat.Invite{}, false, err
+		}
+		codes := make([]string, len(reasons))
+		for i, reason := range reasons {
+			codes[i] = aws.ToString(reason.Code)
+		}
+		switch {
+		case codes[0] == conditionalCheckFailedCode:
+			existing, err := inviteFromItem(reasons[0].Item)
+			return existing, false, err
+		case isTransactionConflict(codes):
+			if attempt+1 >= maxInviteAttempts {
+				return chat.Invite{}, false, fmt.Errorf("creating invite %x: %w", invite.ID.Value, err)
+			}
+			select {
+			case <-ctx.Done():
+				return chat.Invite{}, false, ctx.Err()
+			case <-time.After(backoff + rand.N(backoff)):
+			}
+			backoff = min(2*backoff, membershipBackoffMax)
+		default:
+			return chat.Invite{}, false, err
+		}
+	}
+}
+
+// countActiveInvites counts chatID's invites ACTIVE as of now, up to limit:
+// a COUNT query of gsiInvitesActive above activeAsOf(now), which holds
+// exactly the invites neither revoked nor used up, so the range is the ones
+// not yet expired too. The count stops at limit, so it costs at most the
+// cap's worth of index entries however many the chat holds.
+func (s *store) countActiveInvites(ctx context.Context, chatID *commonpb.ChatId, now time.Time, limit int) (int, error) {
+	count := 0
+	var startKey map[string]types.AttributeValue
+	for {
+		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(s.invitesTable),
+			IndexName:              aws.String(gsiInvitesActive),
+			KeyConditionExpression: aws.String("#chat = :chat AND #active >= :now"),
+			ExpressionAttributeNames: map[string]string{
+				"#chat":   attrChat,
+				"#active": attrActiveSort,
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":chat": avB(chatID.Value),
+				":now":  avB(activeAsOf(now)),
+			},
+			Select:            types.SelectCount,
+			Limit:             aws.Int32(int32(limit - count)),
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return 0, err
+		}
+		count += int(out.Count)
+		if count >= limit || len(out.LastEvaluatedKey) == 0 {
+			return count, nil
+		}
+		startKey = out.LastEvaluatedKey
+	}
+}
+
+// GetInvite is a strongly consistent point read of the invite's record.
+func (s *store) GetInvite(ctx context.Context, inviteID *chatpb.InviteId) (chat.Invite, error) {
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(s.invitesTable),
+		Key:            inviteKey(inviteID, skMeta),
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return chat.Invite{}, err
+	}
+	if len(out.Item) == 0 {
+		return chat.Invite{}, chat.ErrInviteNotFound
+	}
+	return inviteFromItem(out.Item)
+}
+
+// GetChatInvitesPage is a descending range on gsiInvitesByChat, or on
+// gsiInvitesByChatCreator for one creator's invites, either of which holds
+// exactly the invites it lists, so the page is billed by what it returns. A
+// page resumes below the key of the position it is given, a key condition
+// built from the position alone (see inviteCreatedSort): the chat's index
+// takes it as an upper bound, and the creator's as the upper end of a range
+// on the creator's prefix, which BETWEEN bounds inclusively, so its key is
+// the predecessor of the position's (see predecessorKey). The read is
+// eventually consistent, a GSI's, as the contract allows.
+func (s *store) GetChatInvitesPage(ctx context.Context, chatID *commonpb.ChatId, createdBy *commonpb.UserId, after *chat.InvitePosition, limit int) ([]chat.Invite, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return nil, fmt.Errorf("not a group chat id")
+	}
+	if createdBy != nil && len(createdBy.Value) != model.UserIDSize {
+		return nil, fmt.Errorf("creator is not a user id")
+	}
+	if after != nil {
+		if err := chat.ValidateInvitePosition(*after); err != nil {
+			return nil, err
+		}
+	}
+
+	index := gsiInvitesByChat
+	condition := "#chat = :chat"
+	names := map[string]string{"#chat": attrChat}
+	values := map[string]types.AttributeValue{":chat": avB(chatID.Value)}
+	switch {
+	case createdBy != nil:
+		index = gsiInvitesByChatCreator
+		names["#sort"] = attrCreatorSort
+		lo := createdBy.Value
+		hi := append(bytes.Clone(createdBy.Value), bytes.Repeat([]byte{0xff}, 8+chat.InviteIDSize)...)
+		if after != nil {
+			var ok bool
+			hi, ok = predecessorKey(inviteCreatorSort(createdBy, after.CreatedAt, after.InviteID))
+			if !ok || bytes.Compare(hi, lo) < 0 {
+				// Nothing of the creator's sorts below the position.
+				return []chat.Invite{}, nil
+			}
+		}
+		condition += " AND #sort BETWEEN :lo AND :hi"
+		values[":lo"] = avB(lo)
+		values[":hi"] = avB(hi)
+	case after != nil:
+		names["#sort"] = attrCreatedSort
+		condition += " AND #sort < :after"
+		values[":after"] = avB(inviteCreatedSort(after.CreatedAt, after.InviteID))
+	}
+
+	invites := make([]chat.Invite, 0)
+	var startKey map[string]types.AttributeValue
+	for {
+		input := &dynamodb.QueryInput{
+			TableName:                 aws.String(s.invitesTable),
+			IndexName:                 aws.String(index),
+			KeyConditionExpression:    aws.String(condition),
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
+			ScanIndexForward:          aws.Bool(false),
+			ExclusiveStartKey:         startKey,
+		}
+		if limit > 0 {
+			input.Limit = aws.Int32(int32(limit - len(invites)))
+		}
+		out, err := s.client.Query(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			invite, err := inviteFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			invites = append(invites, invite)
+			if limit > 0 && len(invites) == limit {
+				return invites, nil
+			}
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			return invites, nil
+		}
+		startKey = out.LastEvaluatedKey
+	}
+}
+
+// predecessorKey is the greatest key of key's width that sorts below it,
+// treating the key as a big-endian number and subtracting one, and false
+// when key is all zeros, which nothing of its width sorts below. Every key
+// it is given is of one fixed width, so among them "at most the
+// predecessor" is exactly "below key".
+func predecessorKey(key []byte) ([]byte, bool) {
+	out := bytes.Clone(key)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] > 0 {
+			out[i]--
+			return out, true
+		}
+		out[i] = 0xff
+	}
+	return nil, false
+}
+
+// RevokeInvite reads the invite's record, strongly consistent, and answers
+// from it when there is nothing to write: no invite, an invite to another
+// chat, or one already revoked. Otherwise it writes one transaction: the
+// record's revoke time set and its active_sort removed (so it leaves
+// gsiInvitesActive), conditioned on the chat and on no revoke, and the copy
+// deleted. It is deliberately not conditioned on the use count it read: a
+// link that leaked is the one most likely to be taking joins while it is
+// revoked, and a revoke must not lose to each of them. Joins are refused
+// once revoked_at is set (see JoinWithInvite), so the two still serialize on
+// it; the invite returned carries the use count as read, which may trail a
+// join that landed in between. A failed condition is a concurrent revoke,
+// settled from the item the failure hands back. A TransactionConflict is
+// retried with backoff.
+func (s *store) RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, inviteID *chatpb.InviteId, now time.Time) (chat.Invite, bool, error) {
+	if !chat.IsGroupChatID(chatID) {
+		return chat.Invite{}, false, fmt.Errorf("not a group chat id")
+	}
+	if now.Before(time.Unix(0, 0)) {
+		return chat.Invite{}, false, fmt.Errorf("now is before the unix epoch")
+	}
+	revokedAt := chat.InviteTime(now)
+
+	stored, err := s.GetInvite(ctx, inviteID)
+	if err != nil {
+		return chat.Invite{}, false, err
+	}
+
+	backoff := membershipBackoffBase
+	for attempt := 0; ; attempt++ {
+		if !bytes.Equal(stored.ChatID.Value, chatID.Value) {
+			return chat.Invite{}, false, chat.ErrInviteNotFound
+		}
+		if stored.RevokedAt != nil {
+			return stored, false, nil
+		}
+		if attempt >= maxInviteAttempts {
+			return chat.Invite{}, false, fmt.Errorf("revoking invite %x: attempts exhausted", inviteID.Value)
+		}
+
+		transactItems := []types.TransactWriteItem{
+			{Update: &types.Update{
+				TableName:           aws.String(s.invitesTable),
+				Key:                 inviteKey(inviteID, skMeta),
+				UpdateExpression:    aws.String("SET #revokedAt = :revokedAt REMOVE #active"),
+				ConditionExpression: aws.String("#chat = :chat AND attribute_not_exists(#revokedAt)"),
+				ExpressionAttributeNames: map[string]string{
+					"#revokedAt": attrRevokedAt,
+					"#active":    attrActiveSort,
+					"#chat":      attrChat,
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":revokedAt": avN(uint64(revokedAt.UnixNano())),
+					":chat":      avB(chatID.Value),
+				},
+				ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+			}},
+			{Delete: &types.Delete{
+				TableName: aws.String(s.invitesTable),
+				Key:       inviteKey(inviteID, skInviteCopy),
+			}},
+		}
+		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
+		if err == nil {
+			stored.RevokedAt = &revokedAt
+			return stored, true, nil
+		}
+		reasons, ok := cancellationReasons(err)
+		if !ok || len(reasons) != len(transactItems) {
+			return chat.Invite{}, false, err
+		}
+		codes := make([]string, len(reasons))
+		for i, reason := range reasons {
+			codes[i] = aws.ToString(reason.Code)
+		}
+		switch {
+		case codes[0] == conditionalCheckFailedCode:
+			// Revoked since the read; judge again from the record, which is
+			// never deleted, so the item is there.
+			if stored, err = inviteFromItem(reasons[0].Item); err != nil {
+				return chat.Invite{}, false, err
+			}
+		case isTransactionConflict(codes):
+			select {
+			case <-ctx.Done():
+				return chat.Invite{}, false, ctx.Err()
+			case <-time.After(backoff + rand.N(backoff)):
+			}
+			backoff = min(2*backoff, membershipBackoffMax)
+		default:
+			return chat.Invite{}, false, err
+		}
+	}
 }

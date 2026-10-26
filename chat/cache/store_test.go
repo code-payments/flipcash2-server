@@ -522,3 +522,51 @@ func TestCache_RecordSend_InvalidInputsReachTheStore(t *testing.T) {
 	_, err = c.RecordSend(ctx, generateDmChatID(), user, time.Now())
 	require.Error(t, err)
 }
+
+// TestCache_Invites_PassThrough: invites go through the cache to the backing
+// store uncached — a revoke through it is read back through it at once.
+func TestCache_Invites_PassThrough(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	us := cache.NewInCache(memory.NewInMemory(nil))
+
+	token := make([]byte, chat.InviteTokenSize)
+	_, err := rand.Read(token)
+	require.NoError(t, err)
+	invite := chat.Invite{
+		ID:        chat.MustDeriveInviteID(&chatpb.InviteToken{Value: token}),
+		ChatID:    chat.MustGenerateGroupChatID(),
+		CreatedBy: model.MustGenerateUserID(),
+		CreatedAt: now,
+		SecretEnvelope: &chatpb.InviteSecretEnvelope{
+			Scheme:     chatpb.InviteSecretEnvelope_X25519_XCHACHA20POLY1305,
+			Nonce:      make([]byte, 24),
+			Ciphertext: make([]byte, 48),
+		},
+	}
+	keyCopy := &chatpb.InviteKeyEnvelope{
+		Scheme:     chatpb.InviteKeyEnvelope_XCHACHA20POLY1305,
+		Nonce:      make([]byte, 24),
+		Ciphertext: make([]byte, 48),
+		Signature:  make([]byte, 64),
+	}
+	_, created, err := us.CreateInvite(ctx, invite, keyCopy, chat.MaxActiveInvites, now)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	got, err := us.GetInvite(ctx, invite.ID)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.Invite_ACTIVE, got.StatusAt(now))
+
+	_, changed, err := us.RevokeInvite(ctx, invite.ChatID, invite.ID, now)
+	require.NoError(t, err)
+	require.True(t, changed)
+	got, err = us.GetInvite(ctx, invite.ID)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.Invite_REVOKED, got.StatusAt(now))
+
+	page, err := us.GetChatInvitesPage(ctx, invite.ChatID, nil, nil, 0)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	require.Equal(t, chatpb.Invite_REVOKED, page[0].StatusAt(now))
+}

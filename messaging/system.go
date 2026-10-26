@@ -33,12 +33,13 @@ const userJoinedFallbackText = "A new member joined the group"
 var userJoinedClientMessageIDNamespace = uuid.MustParse("ed9db3a4-e725-4119-ae69-6f72f97a0cab")
 
 // SendUserJoined writes the system message telling a group's members that
-// userID joined it: Admitted naming admittedBy when someone let them in, and
-// Direct when admittedBy is nil, for a user who joined on their own.
-// rosterVersion is the group's roster version after the join, which names the
-// join: the message's client message ID is derived from it, so a repeat of
-// one join writes nothing and every later join (a rejoin included) writes its
-// own.
+// userID joined it, and how (see chat.JoinMethod): Direct for a user who
+// joined on their own, Admitted naming who let them in, and Invited naming
+// who created the invite they joined with. rosterVersion is the group's
+// roster version after the join, which names the join: the message's client
+// message ID is derived from it (and the chat and user, never the method), so
+// a repeat of one join writes nothing and every later join (a rejoin
+// included) writes its own.
 //
 // It is a system message (see SendBatch): no read pointer is advanced, no
 // activity is recorded and no one is pushed, and it does not count toward
@@ -46,21 +47,35 @@ var userJoinedClientMessageIDNamespace = uuid.MustParse("ed9db3a4-e725-4119-ae69
 // last message and moves its last activity, and it is broadcast on the chat's
 // topic like any send.
 //
-// Only a group takes one; a DM is refused.
-func (s *Sender) SendUserJoined(ctx context.Context, chatID *commonpb.ChatId, userID, admittedBy *commonpb.UserId, rosterVersion uint64) error {
+// Only a group takes one; a DM is refused, as is a method of a kind this
+// does not know or, for Admitted and Invited, naming no one.
+func (s *Sender) SendUserJoined(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, method chat.JoinMethod, rosterVersion uint64) error {
 	if !chat.IsGroupChatID(chatID) {
 		return errors.New("user joined messages are for groups only")
 	}
 
 	joined := &messagingpb.SystemContent_UserJoined{UserId: userID}
-	if admittedBy == nil {
+	switch method.Kind {
+	case chat.JoinDirect:
 		joined.Method = &messagingpb.SystemContent_UserJoined_Direct_{
 			Direct: &messagingpb.SystemContent_UserJoined_Direct{},
 		}
-	} else {
-		joined.Method = &messagingpb.SystemContent_UserJoined_Admitted_{
-			Admitted: &messagingpb.SystemContent_UserJoined_Admitted{AdmittedBy: admittedBy},
+	case chat.JoinAdmitted:
+		if method.By == nil {
+			return errors.New("admitted join names no one")
 		}
+		joined.Method = &messagingpb.SystemContent_UserJoined_Admitted_{
+			Admitted: &messagingpb.SystemContent_UserJoined_Admitted{AdmittedBy: method.By},
+		}
+	case chat.JoinInvited:
+		if method.By == nil {
+			return errors.New("invited join names no one")
+		}
+		joined.Method = &messagingpb.SystemContent_UserJoined_Invited_{
+			Invited: &messagingpb.SystemContent_UserJoined_Invited{InvitedBy: method.By},
+		}
+	default:
+		return errors.Errorf("unknown join method %d", method.Kind)
 	}
 	content := []*messagingpb.Content{{
 		Type: &messagingpb.Content_System{System: &messagingpb.SystemContent{

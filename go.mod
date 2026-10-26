@@ -15,7 +15,7 @@ require (
 	github.com/aws/smithy-go v1.27.7
 	github.com/buckket/go-blurhash v1.1.0
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/code-payments/flipcash2-protobuf-api v1.29.1-0.20261023142657-b77bf78ff8d9
+	github.com/code-payments/flipcash2-protobuf-api v1.30.1-0.20261026173157-5a80753a28b6
 	github.com/code-payments/ocp-protobuf-api v1.17.1-0.20261016120110-6f70c0d8e832
 	github.com/code-payments/ocp-server v1.27.1-0.20261016133142-d1b9b228d45d
 	github.com/devsisters/go-applereceipt v0.0.0-20240805020915-fa22a0160fc2
@@ -105,7 +105,6 @@ require (
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
-	github.com/steebchen/prisma-client-go v0.47.0 // indirect
 	github.com/tyler-smith/go-bip39 v1.1.0 // indirect
 	github.com/xeipuuv/gojsonpointer v0.0.0-20190905194746-02993c407bfb // indirect
 	github.com/xeipuuv/gojsonreference v0.0.0-20180127040603-bd5ef7bd5415 // indirect

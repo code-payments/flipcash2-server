@@ -21,12 +21,13 @@ const (
 	serverLobbiesTable        = "chat_lobbies_server_test"
 	serverFeaturedGroupsTable = "chat_featured_groups_server_test"
 	serverHoldingsTable       = "chat_holdings_server_test"
+	serverInvitesTable        = "chat_invites_server_test"
 )
 
 func TestChat_DynamoDBServer(t *testing.T) {
-	require.NoError(t, CreateTables(context.Background(), testEnv.Client, serverChatsTable, serverDmInboxTable, serverGroupMembersTable, serverUserStateTable, serverActivityTable, serverKeyEnvelopesTable, serverLobbiesTable, serverFeaturedGroupsTable, serverHoldingsTable))
+	require.NoError(t, CreateTables(context.Background(), testEnv.Client, serverChatsTable, serverDmInboxTable, serverGroupMembersTable, serverUserStateTable, serverActivityTable, serverKeyEnvelopesTable, serverLobbiesTable, serverFeaturedGroupsTable, serverHoldingsTable, serverInvitesTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, serverChatsTable, serverDmInboxTable, serverGroupMembersTable, serverUserStateTable, serverActivityTable, serverKeyEnvelopesTable, serverLobbiesTable, serverFeaturedGroupsTable, serverHoldingsTable, nil)
+	testStore := NewInDynamoDB(testEnv.Client, serverChatsTable, serverDmInboxTable, serverGroupMembersTable, serverUserStateTable, serverActivityTable, serverKeyEnvelopesTable, serverLobbiesTable, serverFeaturedGroupsTable, serverHoldingsTable, serverInvitesTable, nil)
 	teardown := func() {
 		testStore.(*store).reset()
 	}

@@ -104,6 +104,7 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_KeyEnvelope_OwnWrapStands,
 		testStore_KeyEnvelope_DiscardedOnLeave,
 		testStore_KeyEnvelope_Concurrent,
+		testStore_KeyEnvelope_InviteCopy,
 		testStore_Lobby_EnterAndLeave,
 		testStore_Lobby_Limits,
 		testStore_Lobby_Page,
@@ -122,6 +123,27 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_HoldingsQueue_EnqueuedAtCreation,
 		testStore_HoldingsQueue_ClaimAndReschedule,
 		testStore_HoldingsQueue_EntryWithoutSnapshot,
+		testStore_Invite_CreateAndGet,
+		testStore_Invite_CreateExisting,
+		testStore_Invite_CapCountsActive,
+		testStore_Invite_CreateConcurrent,
+		testStore_Invite_Page,
+		testStore_Invite_Revoke,
+		testStore_InviteJoin_Join,
+		testStore_InviteJoin_AlreadyMember,
+		testStore_InviteJoin_OwnInvite,
+		testStore_InviteJoin_Rejoin,
+		testStore_InviteJoin_Limits,
+		testStore_InviteJoin_Status,
+		testStore_InviteJoin_Banned,
+		testStore_InviteJoin_Lobby,
+		testStore_InviteJoin_Envelope,
+		testStore_InviteJoin_Revoke,
+		testStore_InviteJoin_Concurrent,
+		testStore_InviteJoin_RefusedKeepsLobby,
+		testStore_InviteJoin_RaceAdmit,
+		testStore_InviteJoin_RaceLobby,
+		testStore_InviteJoin_RaceBan,
 	} {
 		tf(t, s)
 		teardown()
@@ -5004,4 +5026,1359 @@ func testStore_Restriction_ViewerStatesForUsers(t *testing.T, s chat.Store) {
 	// restrictions too.
 	requireViewerState(t, s, group, banned, want[string(banned.Value)])
 	requireViewerState(t, s, group, silenced, want[string(silenced.Value)])
+}
+
+// inviteKeyCopy is an invite's copy of the chat key. The store never opens
+// or verifies one, so any bytes of the right length stand in.
+func inviteKeyCopy(fill byte) *chatpb.InviteKeyEnvelope {
+	return &chatpb.InviteKeyEnvelope{
+		Scheme:     chatpb.InviteKeyEnvelope_XCHACHA20POLY1305,
+		Nonce:      bytes.Repeat([]byte{fill}, 24),
+		Ciphertext: bytes.Repeat([]byte{fill}, 48),
+		Signature:  bytes.Repeat([]byte{fill}, 64),
+	}
+}
+
+// inviteSecret is a secret envelope, as an inviter or a joiner makes one.
+func inviteSecret(fill byte) *chatpb.InviteSecretEnvelope {
+	return &chatpb.InviteSecretEnvelope{
+		Scheme:     chatpb.InviteSecretEnvelope_X25519_XCHACHA20POLY1305,
+		Nonce:      bytes.Repeat([]byte{fill}, 24),
+		Ciphertext: bytes.Repeat([]byte{fill}, 48),
+	}
+}
+
+// newInvite is a new invite by creator to chatID, created at createdAt, with
+// an ID derived from a fresh token as a client derives one.
+func newInvite(chatID *commonpb.ChatId, creator *commonpb.UserId, maxUses uint32, createdAt time.Time, expiresAt *time.Time) chat.Invite {
+	return chat.Invite{
+		ID:             chat.MustDeriveInviteID(&chatpb.InviteToken{Value: randomBytes(chat.InviteTokenSize)}),
+		ChatID:         chatID,
+		CreatedBy:      creator,
+		MaxUses:        maxUses,
+		CreatedAt:      createdAt,
+		ExpiresAt:      expiresAt,
+		SecretEnvelope: inviteSecret(1),
+	}
+}
+
+// createInvite creates invite under maxActive as of now, requiring that it
+// is created, and returns it as stored.
+func createInvite(t *testing.T, s chat.Store, invite chat.Invite, maxActive int, now time.Time) chat.Invite {
+	t.Helper()
+	stored, created, err := s.CreateInvite(context.Background(), invite, inviteKeyCopy(2), maxActive, now)
+	require.NoError(t, err)
+	require.True(t, created)
+	requireInviteEqual(t, invite, stored)
+	return stored
+}
+
+// createInviteEventually is createInvite for a create that the cap's count,
+// which may trail writes (see chat.Store.CreateInvite), refuses until a
+// revoke that freed a place reaches it. A refusal writes nothing, so the
+// create is simply asked again.
+func createInviteEventually(t *testing.T, s chat.Store, invite chat.Invite, maxActive int, now time.Time) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		_, created, err := s.CreateInvite(context.Background(), invite, inviteKeyCopy(2), maxActive, now)
+		if errors.Is(err, chat.ErrTooManyInvites) {
+			return false
+		}
+		require.NoError(t, err)
+		require.True(t, created)
+		return true
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
+// requireInviteEqual checks that got is want, field by field, times to the
+// nanosecond.
+func requireInviteEqual(t *testing.T, want, got chat.Invite) {
+	t.Helper()
+	requireTimePtrEqual := func(name string, want, got *time.Time) {
+		t.Helper()
+		if want == nil {
+			require.Nil(t, got, name)
+			return
+		}
+		require.NotNil(t, got, name)
+		require.True(t, want.Equal(*got), "%s: want %v, got %v", name, *want, *got)
+	}
+	require.Equal(t, want.ID.GetValue(), got.ID.GetValue())
+	require.Equal(t, want.ChatID.GetValue(), got.ChatID.GetValue())
+	require.Equal(t, want.CreatedBy.GetValue(), got.CreatedBy.GetValue())
+	require.Equal(t, want.MaxUses, got.MaxUses)
+	require.Equal(t, want.UseCount, got.UseCount)
+	require.True(t, want.CreatedAt.Equal(got.CreatedAt), "created at: want %v, got %v", want.CreatedAt, got.CreatedAt)
+	requireTimePtrEqual("expires at", want.ExpiresAt, got.ExpiresAt)
+	requireTimePtrEqual("revoked at", want.RevokedAt, got.RevokedAt)
+	require.True(t, proto.Equal(want.SecretEnvelope, got.SecretEnvelope), "secret envelope")
+}
+
+// inviteIDValues is the IDs of invites, in order.
+func inviteIDValues(invites []chat.Invite) [][]byte {
+	out := make([][]byte, len(invites))
+	for i, invite := range invites {
+		out[i] = invite.ID.Value
+	}
+	return out
+}
+
+// waitForInvites reads chatID's invites whole (createdBy's alone when set)
+// until they are exactly want, in order: the listing is read off an index
+// that may trail the writes (see chat.Store.GetChatInvitesPage).
+func waitForInvites(t *testing.T, s chat.Store, chatID *commonpb.ChatId, createdBy *commonpb.UserId, want ...chat.Invite) []chat.Invite {
+	t.Helper()
+	var invites []chat.Invite
+	require.Eventually(t, func() bool {
+		var err error
+		invites, err = s.GetChatInvitesPage(context.Background(), chatID, createdBy, nil, 0)
+		require.NoError(t, err)
+		return slices.EqualFunc(inviteIDValues(want), inviteIDValues(invites), bytes.Equal)
+	}, 5*time.Second, 10*time.Millisecond)
+	return invites
+}
+
+// testStore_Invite_CreateAndGet pins that an invite reads back exactly as
+// created, with and without a limit and an expiry, at nanosecond precision,
+// against the IDs alone, and that a create of the wrong shape is refused.
+func testStore_Invite_CreateAndGet(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	groupID := chat.MustGenerateGroupChatID()
+	creator := model.MustGenerateUserID()
+
+	_, err := s.GetInvite(ctx, newInvite(groupID, creator, 0, now, nil).ID)
+	require.ErrorIs(t, err, chat.ErrInviteNotFound)
+
+	// Unlimited and never expiring.
+	open := newInvite(groupID, creator, 0, now, nil)
+	createInvite(t, s, open, chat.MaxActiveInvites, now)
+	got, err := s.GetInvite(ctx, open.ID)
+	require.NoError(t, err)
+	requireInviteEqual(t, open, got)
+	require.Equal(t, chatpb.Invite_ACTIVE, got.StatusAt(now))
+
+	// Limited and expiring, with its own secret envelope; times keep their
+	// nanoseconds.
+	expiresAt := now.Add(24*time.Hour + 123*time.Nanosecond)
+	limited := newInvite(groupID, creator, 5, now.Add(7*time.Nanosecond), &expiresAt)
+	limited.SecretEnvelope = inviteSecret(9)
+	createInvite(t, s, limited, chat.MaxActiveInvites, now)
+	got, err = s.GetInvite(ctx, limited.ID)
+	require.NoError(t, err)
+	requireInviteEqual(t, limited, got)
+	require.Equal(t, chatpb.Invite_ACTIVE, got.StatusAt(now))
+	require.Equal(t, chatpb.Invite_EXPIRED, got.StatusAt(expiresAt))
+	require.Equal(t, bytes.Repeat([]byte{9}, 48), got.SecretEnvelope.Ciphertext)
+
+	// The returned invite is the caller's to change.
+	got.SecretEnvelope.Ciphertext[0] = 0
+	got.ChatID.Value[0] ^= 0xff
+	again, err := s.GetInvite(ctx, limited.ID)
+	require.NoError(t, err)
+	requireInviteEqual(t, limited, again)
+
+	// A create of the wrong shape writes nothing.
+	for name, mutate := range map[string]func(*chat.Invite){
+		"dm chat":       func(i *chat.Invite) { i.ChatID = generateDmChatID() },
+		"short id":      func(i *chat.Invite) { i.ID = &chatpb.InviteId{Value: randomBytes(8)} },
+		"no creator":    func(i *chat.Invite) { i.CreatedBy = nil },
+		"no secret":     func(i *chat.Invite) { i.SecretEnvelope = nil },
+		"used":          func(i *chat.Invite) { i.UseCount = 1 },
+		"revoked":       func(i *chat.Invite) { i.RevokedAt = &now },
+		"before epoch":  func(i *chat.Invite) { i.CreatedAt = time.Unix(-1, 0) },
+		"expiry before": func(i *chat.Invite) { e := time.Unix(-1, 0); i.ExpiresAt = &e },
+	} {
+		invite := newInvite(groupID, creator, 0, now, nil)
+		mutate(&invite)
+		_, _, err := s.CreateInvite(ctx, invite, inviteKeyCopy(2), chat.MaxActiveInvites, now)
+		require.Error(t, err, name)
+		_, err = s.GetInvite(ctx, invite.ID)
+		require.ErrorIs(t, err, chat.ErrInviteNotFound, name)
+	}
+	invite := newInvite(groupID, creator, 0, now, nil)
+	_, _, err = s.CreateInvite(ctx, invite, nil, chat.MaxActiveInvites, now)
+	require.Error(t, err)
+	_, _, err = s.CreateInvite(ctx, invite, inviteKeyCopy(2), 0, now)
+	require.Error(t, err)
+	_, err = s.GetInvite(ctx, invite.ID)
+	require.ErrorIs(t, err, chat.ErrInviteNotFound)
+}
+
+// testStore_Invite_CreateExisting pins that an invite ID names one invite:
+// a create naming one that is stored, whatever else it carries and whatever
+// the stored one's status, writes nothing and returns the stored one, and
+// is judged before the cap, so a retry at the cap is never refused.
+func testStore_Invite_CreateExisting(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	groupID := chat.MustGenerateGroupChatID()
+	creator := model.MustGenerateUserID()
+
+	first := createInvite(t, s, newInvite(groupID, creator, 3, now, nil), 2, now)
+
+	// Another chat, creator, limit, expiry and secret: the stored invite.
+	clash := first
+	clash.ChatID = chat.MustGenerateGroupChatID()
+	clash.CreatedBy = model.MustGenerateUserID()
+	clash.MaxUses = 9
+	expiresAt := now.Add(time.Hour)
+	clash.ExpiresAt = &expiresAt
+	clash.CreatedAt = now.Add(time.Minute)
+	clash.SecretEnvelope = inviteSecret(7)
+	stored, created, err := s.CreateInvite(ctx, clash, inviteKeyCopy(8), 2, now)
+	require.NoError(t, err)
+	require.False(t, created)
+	requireInviteEqual(t, first, stored)
+	got, err := s.GetInvite(ctx, first.ID)
+	require.NoError(t, err)
+	requireInviteEqual(t, first, got)
+	waitForInvites(t, s, groupID, nil, first)
+	page, err := s.GetChatInvitesPage(ctx, clash.ChatID, nil, nil, 0)
+	require.NoError(t, err)
+	require.Empty(t, page)
+
+	// At the cap, a retry is still answered with the invite, while a new
+	// invite is refused.
+	second := createInvite(t, s, newInvite(groupID, creator, 0, now.Add(time.Second), nil), 2, now)
+	stored, created, err = s.CreateInvite(ctx, first, inviteKeyCopy(2), 2, now)
+	require.NoError(t, err)
+	require.False(t, created)
+	requireInviteEqual(t, first, stored)
+	stored, created, err = s.CreateInvite(ctx, second, inviteKeyCopy(2), 1, now)
+	require.NoError(t, err)
+	require.False(t, created)
+	requireInviteEqual(t, second, stored)
+	refused := newInvite(groupID, creator, 0, now, nil)
+	_, _, err = s.CreateInvite(ctx, refused, inviteKeyCopy(2), 2, now)
+	require.ErrorIs(t, err, chat.ErrTooManyInvites)
+	_, err = s.GetInvite(ctx, refused.ID)
+	require.ErrorIs(t, err, chat.ErrInviteNotFound)
+
+	// Whatever the stored invite's status.
+	revoked, changed, err := s.RevokeInvite(ctx, groupID, first.ID, now)
+	require.NoError(t, err)
+	require.True(t, changed)
+	stored, created, err = s.CreateInvite(ctx, first, inviteKeyCopy(2), 2, now)
+	require.NoError(t, err)
+	require.False(t, created)
+	requireInviteEqual(t, revoked, stored)
+}
+
+// testStore_Invite_CapCountsActive pins that the cap counts the chat's
+// invites ACTIVE as of the create's now, and no others: not a revoked one,
+// not one expired by then, not one whose last use a join took, and not
+// another chat's.
+func testStore_Invite_CapCountsActive(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	groupID := chat.MustGenerateGroupChatID()
+	creator := model.MustGenerateUserID()
+	const maxActive = 2
+
+	expiresAt := now.Add(time.Hour)
+	expiring := createInvite(t, s, newInvite(groupID, creator, 0, now, &expiresAt), maxActive, now)
+	lasting := createInvite(t, s, newInvite(groupID, creator, 1, now, nil), maxActive, now)
+	_, _, err := s.CreateInvite(ctx, newInvite(groupID, creator, 0, now, nil), inviteKeyCopy(2), maxActive, now)
+	require.ErrorIs(t, err, chat.ErrTooManyInvites)
+
+	// Another chat's invites are not this one's.
+	createInvite(t, s, newInvite(chat.MustGenerateGroupChatID(), creator, 0, now, nil), maxActive, now)
+
+	// A revoked invite frees its place.
+	_, changed, err := s.RevokeInvite(ctx, groupID, lasting.ID, now)
+	require.NoError(t, err)
+	require.True(t, changed)
+	createInviteEventually(t, s, newInvite(groupID, creator, 0, now, nil), maxActive, now)
+	_, _, err = s.CreateInvite(ctx, newInvite(groupID, creator, 0, now, nil), inviteKeyCopy(2), maxActive, now)
+	require.ErrorIs(t, err, chat.ErrTooManyInvites)
+
+	// An expired one is not counted from the instant it expires, with
+	// nothing written: just before, it still is.
+	_, _, err = s.CreateInvite(ctx, newInvite(groupID, creator, 0, now, nil), inviteKeyCopy(2), maxActive, expiresAt.Add(-time.Nanosecond))
+	require.ErrorIs(t, err, chat.ErrTooManyInvites)
+	createInvite(t, s, newInvite(groupID, creator, 0, now, nil), maxActive, expiresAt)
+	_, _, err = s.CreateInvite(ctx, newInvite(groupID, creator, 0, now, nil), inviteKeyCopy(2), maxActive, expiresAt)
+	require.ErrorIs(t, err, chat.ErrTooManyInvites)
+	got, err := s.GetInvite(ctx, expiring.ID)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.Invite_EXPIRED, got.StatusAt(expiresAt))
+
+	// A used-up one frees its place from the join that takes its last use,
+	// and not before.
+	privateID := privateGroup(t, s, creator)
+	single := createInvite(t, s, newInvite(privateID, creator, 2, now, nil), 1, now)
+	_, _, err = s.CreateInvite(ctx, newInvite(privateID, creator, 0, now, nil), inviteKeyCopy(2), 1, now)
+	require.ErrorIs(t, err, chat.ErrTooManyInvites)
+	joinWithInvite(t, s, privateID, model.MustGenerateUserID(), single, inviteSecret(5), now)
+	_, _, err = s.CreateInvite(ctx, newInvite(privateID, creator, 0, now, nil), inviteKeyCopy(2), 1, now)
+	require.ErrorIs(t, err, chat.ErrTooManyInvites)
+	joinWithInvite(t, s, privateID, model.MustGenerateUserID(), single, inviteSecret(5), now)
+	createInviteEventually(t, s, newInvite(privateID, creator, 0, now, nil), 1, now)
+}
+
+// testStore_Invite_CreateConcurrent pins that concurrent creates of one ID
+// agree: exactly one creates it, and every caller is told the invite stored.
+func testStore_Invite_CreateConcurrent(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	groupID := chat.MustGenerateGroupChatID()
+	creator := model.MustGenerateUserID()
+	id := newInvite(groupID, creator, 0, now, nil).ID
+
+	const writers = 8
+	results := make([]chat.Invite, writers)
+	createdBy := make([]bool, writers)
+	errs := make([]error, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			invite := newInvite(groupID, creator, uint32(i), now, nil)
+			invite.ID = id
+			results[i], createdBy[i], errs[i] = s.CreateInvite(ctx, invite, inviteKeyCopy(byte(i)), chat.MaxActiveInvites, now)
+		}()
+	}
+	wg.Wait()
+
+	got, err := s.GetInvite(ctx, id)
+	require.NoError(t, err)
+	created := 0
+	for i := 0; i < writers; i++ {
+		require.NoError(t, errs[i])
+		requireInviteEqual(t, got, results[i])
+		if createdBy[i] {
+			created++
+		}
+	}
+	require.Equal(t, 1, created)
+}
+
+// testStore_Invite_Page pins the listing: a chat's invites whatever their
+// status, most recently created first with ties to the greater ID, paged
+// strictly after a position without repeats or gaps, and one creator's alone
+// in the same order when asked; another chat's never appear.
+func testStore_Invite_Page(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	groupID := chat.MustGenerateGroupChatID()
+	alice := model.MustGenerateUserID()
+	bob := model.MustGenerateUserID()
+
+	page, err := s.GetChatInvitesPage(ctx, groupID, nil, nil, 0)
+	require.NoError(t, err)
+	require.Empty(t, page)
+
+	// Seven invites, two of them created at the same instant, by two
+	// creators; a revoked one is listed like any other.
+	var invites []chat.Invite
+	for i, creator := range []*commonpb.UserId{alice, bob, alice, alice, bob, alice, bob} {
+		createdAt := now.Add(time.Duration(i) * time.Second)
+		if i == 4 {
+			createdAt = now.Add(3 * time.Second)
+		}
+		invites = append(invites, createInvite(t, s, newInvite(groupID, creator, 0, createdAt, nil), chat.MaxActiveInvites, now))
+	}
+	revoked, _, err := s.RevokeInvite(ctx, groupID, invites[2].ID, now)
+	require.NoError(t, err)
+	invites[2] = revoked
+	createInvite(t, s, newInvite(chat.MustGenerateGroupChatID(), alice, 0, now.Add(time.Hour), nil), chat.MaxActiveInvites, now)
+
+	want := slices.Clone(invites)
+	slices.SortFunc(want, func(a, b chat.Invite) int { return a.Position().Compare(b.Position()) })
+	whole := waitForInvites(t, s, groupID, nil, want...)
+	for i := range want {
+		requireInviteEqual(t, want[i], whole[i])
+		if i > 0 {
+			require.Negative(t, whole[i-1].Position().Compare(whole[i].Position()))
+		}
+	}
+	require.True(t, whole[0].CreatedAt.After(whole[len(whole)-1].CreatedAt))
+
+	walk := func(createdBy *commonpb.UserId, limit int) []chat.Invite {
+		t.Helper()
+		var walked []chat.Invite
+		var after *chat.InvitePosition
+		for {
+			page, err := s.GetChatInvitesPage(ctx, groupID, createdBy, after, limit)
+			require.NoError(t, err)
+			require.LessOrEqual(t, len(page), limit)
+			walked = append(walked, page...)
+			if len(page) < limit {
+				return walked
+			}
+			pos := page[len(page)-1].Position()
+			after = &pos
+		}
+	}
+
+	// Pages of two walk the same order and stop at the end.
+	require.Equal(t, inviteIDValues(want), inviteIDValues(walk(nil, 2)))
+
+	// One creator's invites alone, in the same order, paged too.
+	for _, creator := range []*commonpb.UserId{alice, bob} {
+		var theirs []chat.Invite
+		for _, invite := range want {
+			if bytes.Equal(invite.CreatedBy.Value, creator.Value) {
+				theirs = append(theirs, invite)
+			}
+		}
+		waitForInvites(t, s, groupID, creator, theirs...)
+		require.Equal(t, inviteIDValues(theirs), inviteIDValues(walk(creator, 1)))
+		require.Equal(t, inviteIDValues(theirs), inviteIDValues(walk(creator, 2)))
+	}
+	page, err = s.GetChatInvitesPage(ctx, groupID, model.MustGenerateUserID(), nil, 0)
+	require.NoError(t, err)
+	require.Empty(t, page)
+
+	// Resuming from the last position reads nothing more, either way.
+	last := want[len(want)-1].Position()
+	for _, createdBy := range []*commonpb.UserId{nil, alice, bob} {
+		page, err = s.GetChatInvitesPage(ctx, groupID, createdBy, &last, 10)
+		require.NoError(t, err)
+		require.Empty(t, page)
+	}
+
+	// Groups only, a creator is a user ID, and a position names an invite.
+	_, err = s.GetChatInvitesPage(ctx, generateDmChatID(), nil, nil, 0)
+	require.Error(t, err)
+	_, err = s.GetChatInvitesPage(ctx, groupID, &commonpb.UserId{Value: randomBytes(8)}, nil, 0)
+	require.Error(t, err)
+	_, err = s.GetChatInvitesPage(ctx, groupID, nil, &chat.InvitePosition{CreatedAt: now, InviteID: &chatpb.InviteId{Value: randomBytes(4)}}, 0)
+	require.Error(t, err)
+}
+
+// testStore_Invite_Revoke pins a revoke: recorded once, at its time, on an
+// invite of the chat named, whatever its status; a repeat the no-op that
+// keeps the first time; and an unknown invite, or another chat's, not found.
+func testStore_Invite_Revoke(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	groupID := chat.MustGenerateGroupChatID()
+	creator := model.MustGenerateUserID()
+
+	invite := createInvite(t, s, newInvite(groupID, creator, 2, now, nil), chat.MaxActiveInvites, now)
+
+	// Another chat's invite, or none, is not found, and nothing is written.
+	_, _, err := s.RevokeInvite(ctx, chat.MustGenerateGroupChatID(), invite.ID, now)
+	require.ErrorIs(t, err, chat.ErrInviteNotFound)
+	_, _, err = s.RevokeInvite(ctx, groupID, newInvite(groupID, creator, 0, now, nil).ID, now)
+	require.ErrorIs(t, err, chat.ErrInviteNotFound)
+	got, err := s.GetInvite(ctx, invite.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.RevokedAt)
+
+	revokedAt := now.Add(time.Minute + 5*time.Nanosecond)
+	revoked, changed, err := s.RevokeInvite(ctx, groupID, invite.ID, revokedAt)
+	require.NoError(t, err)
+	require.True(t, changed)
+	want := invite
+	want.RevokedAt = &revokedAt
+	requireInviteEqual(t, want, revoked)
+	require.Equal(t, chatpb.Invite_REVOKED, revoked.StatusAt(revokedAt))
+	got, err = s.GetInvite(ctx, invite.ID)
+	require.NoError(t, err)
+	requireInviteEqual(t, want, got)
+
+	// A repeat keeps the first revoke.
+	again, changed, err := s.RevokeInvite(ctx, groupID, invite.ID, revokedAt.Add(time.Hour))
+	require.NoError(t, err)
+	require.False(t, changed)
+	requireInviteEqual(t, want, again)
+
+	// An expired invite is revoked like any other, and reads REVOKED, the
+	// first of the reasons, from then on.
+	expiresAt := now.Add(-time.Hour)
+	expired := createInvite(t, s, newInvite(groupID, creator, 0, now.Add(-2*time.Hour), &expiresAt), chat.MaxActiveInvites, now)
+	require.Equal(t, chatpb.Invite_EXPIRED, expired.StatusAt(now))
+	revoked, changed, err = s.RevokeInvite(ctx, groupID, expired.ID, now)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, chatpb.Invite_REVOKED, revoked.StatusAt(now))
+	require.True(t, revoked.RevokedAt.Equal(now))
+
+	// Groups only.
+	_, _, err = s.RevokeInvite(ctx, generateDmChatID(), invite.ID, now)
+	require.Error(t, err)
+}
+
+// testStore_KeyEnvelope_InviteCopy pins that an invite's copy is a key
+// envelope like any other: stored and read back whole, replaced by an
+// envelope the member wraps for themself, which reads back with no copy, and
+// discarded with a departure.
+func testStore_KeyEnvelope_InviteCopy(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	joiner := model.MustGenerateUserID()
+	leaver := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	_, _, err := s.AddGroupMembers(ctx, groupID, []*commonpb.UserId{joiner, leaver})
+	require.NoError(t, err)
+	invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+
+	copied := chat.NewInviteKeyEnvelope(invite, inviteKeyCopy(3), inviteSecret(4))
+	stored, err := s.SetKeyEnvelope(ctx, groupID, joiner, copied)
+	require.NoError(t, err)
+	require.True(t, copied.Equal(stored))
+	got, err := s.GetKeyEnvelope(ctx, groupID, joiner)
+	require.NoError(t, err)
+	require.True(t, copied.Equal(got))
+	require.True(t, got.IsInviteCopy())
+	require.Equal(t, creator.Value, got.WrappedBy.Value)
+	require.Equal(t, invite.ID.Value, got.InviteCopy.InviteID.Value)
+	require.True(t, proto.Equal(inviteKeyCopy(3), got.InviteCopy.Envelope))
+	require.True(t, proto.Equal(inviteSecret(4), got.InviteCopy.SecretEnvelope))
+
+	// The joiner's own envelope replaces the copy, which leaves nothing of
+	// itself behind.
+	own := keyEnvelope(5, joiner)
+	stored, err = s.SetKeyEnvelope(ctx, groupID, joiner, own)
+	require.NoError(t, err)
+	require.True(t, own.Equal(stored))
+	got, err = s.GetKeyEnvelope(ctx, groupID, joiner)
+	require.NoError(t, err)
+	require.True(t, own.Equal(got))
+	require.False(t, got.IsInviteCopy())
+	require.Nil(t, got.InviteCopy)
+
+	// A copy goes with a departure that discards the envelope.
+	_, err = s.SetKeyEnvelope(ctx, groupID, leaver, chat.NewInviteKeyEnvelope(invite, inviteKeyCopy(6), inviteSecret(7)))
+	require.NoError(t, err)
+	changed, _, err := s.RemoveGroupMember(ctx, groupID, leaver, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, err = s.GetKeyEnvelope(ctx, groupID, leaver)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// A copy missing a part is refused.
+	incomplete := chat.NewInviteKeyEnvelope(invite, nil, inviteSecret(8))
+	_, err = s.SetKeyEnvelope(ctx, groupID, leaver, incomplete)
+	require.Error(t, err)
+	_, err = s.GetKeyEnvelope(ctx, groupID, leaver)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+}
+
+// joinWithInvite joins user to chatID with invite as of now, requiring that
+// the join is made, and returns what it did.
+func joinWithInvite(t *testing.T, s chat.Store, chatID *commonpb.ChatId, user *commonpb.UserId, invite chat.Invite, secret *chatpb.InviteSecretEnvelope, now time.Time) chat.JoinWithInviteResult {
+	t.Helper()
+	result, err := s.JoinWithInvite(context.Background(), chatID, user, invite.ID, secret, now)
+	require.NoError(t, err)
+	require.True(t, result.Changed)
+	return result
+}
+
+// requireUseCount checks the invite's stored use count.
+func requireUseCount(t *testing.T, s chat.Store, invite chat.Invite, want uint32) {
+	t.Helper()
+	got, err := s.GetInvite(context.Background(), invite.ID)
+	require.NoError(t, err)
+	require.Equal(t, want, got.UseCount)
+}
+
+// requireNotJoined checks that a join refused for user wrote nothing of
+// theirs: no membership and no key envelope.
+func requireNotJoined(t *testing.T, s chat.Store, chatID *commonpb.ChatId, user *commonpb.UserId) {
+	t.Helper()
+	isMember, err := s.IsMember(context.Background(), chatID, user)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	_, err = s.GetKeyEnvelope(context.Background(), chatID, user)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+}
+
+// testStore_InviteJoin_Join pins a join with an invite: in one write the
+// user becomes a member at the roster's next version, the invite counts one
+// use, and the user holds the invite's copy with their own secret envelope,
+// wrapped by the invite's creator, over any envelope they held; and a call
+// of the wrong shape, or for a group that does not exist, writes nothing.
+func testStore_InviteJoin_Join(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	user := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+
+	// Calls of the wrong shape.
+	for name, call := range map[string]func() error{
+		"dm chat": func() error {
+			_, err := s.JoinWithInvite(ctx, generateDmChatID(), user, invite.ID, inviteSecret(5), now)
+			return err
+		},
+		"short user": func() error {
+			_, err := s.JoinWithInvite(ctx, groupID, &commonpb.UserId{Value: randomBytes(4)}, invite.ID, inviteSecret(5), now)
+			return err
+		},
+		"short invite": func() error {
+			_, err := s.JoinWithInvite(ctx, groupID, user, &chatpb.InviteId{Value: randomBytes(4)}, inviteSecret(5), now)
+			return err
+		},
+		"no secret": func() error {
+			_, err := s.JoinWithInvite(ctx, groupID, user, invite.ID, nil, now)
+			return err
+		},
+		"before epoch": func() error {
+			_, err := s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), time.Unix(-1, 0))
+			return err
+		},
+	} {
+		require.Error(t, call(), name)
+	}
+
+	// A group that does not exist, though the invite names it.
+	missing := chat.MustGenerateGroupChatID()
+	orphan := createInvite(t, s, newInvite(missing, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	_, err := s.JoinWithInvite(ctx, missing, user, orphan.ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+	requireNotJoined(t, s, groupID, user)
+	requireUseCount(t, s, invite, 0)
+
+	// A stale envelope of their own, from an earlier stay, is replaced.
+	_, err = s.SetKeyEnvelope(ctx, groupID, user, keyEnvelope(9, user))
+	require.NoError(t, err)
+
+	result := joinWithInvite(t, s, groupID, user, invite, inviteSecret(5), now)
+	require.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 1}, result.Roster)
+	require.False(t, result.LeftLobby)
+	want := invite
+	want.UseCount = 1
+	requireInviteEqual(t, want, result.Invite)
+	requireUseCount(t, s, invite, 1)
+	requireRosterSummary(t, s, groupID, 2, 1)
+	isMember, err := s.IsMember(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, isMember)
+	records, err := s.GetGroupMemberRecords(ctx, user, []*commonpb.ChatId{groupID})
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), records[string(groupID.Value)].Version)
+
+	got, err := s.GetKeyEnvelope(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, chat.NewInviteKeyEnvelope(invite, inviteKeyCopy(2), inviteSecret(5)).Equal(got))
+	require.True(t, got.IsInviteCopy())
+	require.Equal(t, creator.Value, got.WrappedBy.Value)
+	require.Equal(t, invite.ID.Value, got.InviteCopy.InviteID.Value)
+
+	// The result is the caller's to change.
+	result.Invite.ChatID.Value[0] ^= 0xff
+	requireUseCount(t, s, invite, 1)
+	stored, err := s.GetInvite(ctx, invite.ID)
+	require.NoError(t, err)
+	require.Equal(t, groupID.Value, stored.ChatID.Value)
+}
+
+// testStore_InviteJoin_AlreadyMember pins that a member's join is the no-op
+// whatever the invite's status: nothing written, no use counted, their
+// envelope untouched, and the invite and roster as read, so a retry of a
+// join that took the last use is the no-op and not ErrInviteExhausted.
+func testStore_InviteJoin_AlreadyMember(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	user := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+
+	joinWithInvite(t, s, groupID, user, invite, inviteSecret(5), now)
+	own := keyEnvelope(6, user)
+	_, err := s.SetKeyEnvelope(ctx, groupID, user, own)
+	require.NoError(t, err)
+
+	result, err := s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(7), now)
+	require.NoError(t, err)
+	require.False(t, result.Changed)
+	require.False(t, result.LeftLobby)
+	require.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 1}, result.Roster)
+	want := invite
+	want.UseCount = 1
+	requireInviteEqual(t, want, result.Invite)
+	requireUseCount(t, s, invite, 1)
+	requireRosterSummary(t, s, groupID, 2, 1)
+	got, err := s.GetKeyEnvelope(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, own.Equal(got))
+
+	// The creator, a member from creation, too.
+	result, err = s.JoinWithInvite(ctx, groupID, creator, invite.ID, inviteSecret(7), now)
+	require.NoError(t, err)
+	require.False(t, result.Changed)
+	requireUseCount(t, s, invite, 1)
+	_, err = s.GetKeyEnvelope(ctx, groupID, creator)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// A retry of the join that took the last use, and a member's join with
+	// an invite revoked since: the no-op either way.
+	single := createInvite(t, s, newInvite(groupID, creator, 1, now, nil), chat.MaxActiveInvites, now)
+	other := model.MustGenerateUserID()
+	result = joinWithInvite(t, s, groupID, other, single, inviteSecret(5), now)
+	require.Equal(t, chatpb.Invite_EXHAUSTED, result.Invite.StatusAt(now))
+	result, err = s.JoinWithInvite(ctx, groupID, other, single.ID, inviteSecret(5), now)
+	require.NoError(t, err)
+	require.False(t, result.Changed)
+	require.EqualValues(t, 1, result.Invite.UseCount)
+	_, _, err = s.RevokeInvite(ctx, groupID, invite.ID, now)
+	require.NoError(t, err)
+	result, err = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(7), now)
+	require.NoError(t, err)
+	require.False(t, result.Changed)
+	require.Equal(t, chatpb.Invite_REVOKED, result.Invite.StatusAt(now))
+	requireRosterSummary(t, s, groupID, 3, 2)
+
+	// A member's join with an invite that is not the chat's is still not
+	// found: the result has no invite to carry.
+	_, err = s.JoinWithInvite(ctx, groupID, user, newInvite(groupID, creator, 0, now, nil).ID, inviteSecret(7), now)
+	require.ErrorIs(t, err, chat.ErrInviteNotFound)
+}
+
+// testStore_InviteJoin_OwnInvite pins that the invite's creator never joins
+// with it once they are not a member: the join would put the invite's copy,
+// wrapped by them, over the envelope they hold, the group's key for its
+// creator. Nothing is written, whatever the invite's status, while a member
+// creator's join is still the no-op.
+func testStore_InviteJoin_OwnInvite(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	own := keyEnvelope(6, creator)
+	_, err := s.SetKeyEnvelope(ctx, groupID, creator, own)
+	require.NoError(t, err)
+	invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+
+	result, err := s.JoinWithInvite(ctx, groupID, creator, invite.ID, inviteSecret(5), now)
+	require.NoError(t, err)
+	require.False(t, result.Changed)
+
+	changed, _, err := s.RemoveGroupMember(ctx, groupID, creator, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, err = s.JoinWithInvite(ctx, groupID, creator, invite.ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrOwnInvite)
+	isMember, err := s.IsMember(ctx, groupID, creator)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	requireUseCount(t, s, invite, 0)
+	got, err := s.GetKeyEnvelope(ctx, groupID, creator)
+	require.NoError(t, err)
+	require.True(t, own.Equal(got))
+
+	// Judged before the invite's status: a revoked one is refused the same.
+	_, _, err = s.RevokeInvite(ctx, groupID, invite.ID, now)
+	require.NoError(t, err)
+	_, err = s.JoinWithInvite(ctx, groupID, creator, invite.ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrOwnInvite)
+}
+
+// testStore_InviteJoin_Rejoin pins that every join counts: a member who
+// leaves, giving no use back, and joins again with the same invite uses
+// another, and holds the copy again, the departure having discarded it.
+func testStore_InviteJoin_Rejoin(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	user := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	invite := createInvite(t, s, newInvite(groupID, creator, 5, now, nil), chat.MaxActiveInvites, now)
+
+	joinWithInvite(t, s, groupID, user, invite, inviteSecret(5), now)
+	changed, _, err := s.RemoveGroupMember(ctx, groupID, user, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, err = s.GetKeyEnvelope(ctx, groupID, user)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	requireUseCount(t, s, invite, 1)
+
+	result := joinWithInvite(t, s, groupID, user, invite, inviteSecret(6), now)
+	require.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 3}, result.Roster)
+	require.EqualValues(t, 2, result.Invite.UseCount)
+	requireUseCount(t, s, invite, 2)
+	got, err := s.GetKeyEnvelope(ctx, groupID, user)
+	require.NoError(t, err)
+	require.True(t, chat.NewInviteKeyEnvelope(invite, inviteKeyCopy(2), inviteSecret(6)).Equal(got))
+}
+
+// testStore_InviteJoin_Limits pins MaxUses: the join that takes the last
+// use leaves the invite EXHAUSTED and out of the chat's ACTIVE count, and
+// every join after it is ErrInviteExhausted with nothing written, a return
+// by one of its own joiners included; an invite without a limit never runs
+// out.
+func testStore_InviteJoin_Limits(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	first, second, third := model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	invite := createInvite(t, s, newInvite(groupID, creator, 2, now, nil), 1, now)
+
+	// While it is ACTIVE, it fills a cap of one.
+	_, _, err := s.CreateInvite(ctx, newInvite(groupID, creator, 0, now, nil), inviteKeyCopy(2), 1, now)
+	require.ErrorIs(t, err, chat.ErrTooManyInvites)
+
+	result := joinWithInvite(t, s, groupID, first, invite, inviteSecret(5), now)
+	require.Equal(t, chatpb.Invite_ACTIVE, result.Invite.StatusAt(now))
+	require.True(t, result.Invite.IsLastUse())
+	result = joinWithInvite(t, s, groupID, second, invite, inviteSecret(5), now)
+	require.EqualValues(t, 2, result.Invite.UseCount)
+	require.Equal(t, chatpb.Invite_EXHAUSTED, result.Invite.StatusAt(now))
+	require.Equal(t, chat.RosterSummary{MemberCount: 3, Version: 2}, result.Roster)
+	got, err := s.GetKeyEnvelope(ctx, groupID, second)
+	require.NoError(t, err)
+	require.True(t, got.IsInviteCopy())
+
+	// Used up, it no longer counts toward the cap.
+	createInviteEventually(t, s, newInvite(groupID, creator, 0, now, nil), 1, now)
+
+	_, err = s.JoinWithInvite(ctx, groupID, third, invite.ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrInviteExhausted)
+	requireNotJoined(t, s, groupID, third)
+	requireUseCount(t, s, invite, 2)
+
+	// A joiner who leaves gives no use back, and cannot return with it.
+	changed, _, err := s.RemoveGroupMember(ctx, groupID, first, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, err = s.JoinWithInvite(ctx, groupID, first, invite.ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrInviteExhausted)
+	requireNotJoined(t, s, groupID, first)
+	requireUseCount(t, s, invite, 2)
+	requireRosterSummary(t, s, groupID, 2, 3)
+
+	// Without a limit, many joins never use it up.
+	unlimited := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	for i := range 5 {
+		result := joinWithInvite(t, s, groupID, model.MustGenerateUserID(), unlimited, inviteSecret(5), now)
+		require.EqualValues(t, i+1, result.Invite.UseCount)
+		require.Equal(t, chatpb.Invite_ACTIVE, result.Invite.StatusAt(now))
+		require.False(t, result.Invite.IsLastUse())
+	}
+	requireUseCount(t, s, unlimited, 5)
+}
+
+// testStore_InviteJoin_Status pins that an invite that is not ACTIVE admits
+// no one, with nothing written, each refusal naming the first reason, and
+// that an unknown invite, or another chat's, is not found.
+func testStore_InviteJoin_Status(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	user := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+
+	refused := func(invite chat.Invite, at time.Time, want error) {
+		t.Helper()
+		_, err := s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), at)
+		require.ErrorIs(t, err, want)
+		requireNotJoined(t, s, groupID, user)
+		requireUseCount(t, s, invite, invite.UseCount)
+	}
+
+	// Expired: from the instant it expires.
+	expiresAt := now.Add(-time.Hour)
+	expired := createInvite(t, s, newInvite(groupID, creator, 0, now.Add(-2*time.Hour), &expiresAt), chat.MaxActiveInvites, now)
+	refused(expired, now, chat.ErrInviteExpired)
+	refused(expired, expiresAt, chat.ErrInviteExpired)
+	expiresSoon := now.Add(time.Hour)
+	expiring := createInvite(t, s, newInvite(groupID, creator, 0, now, &expiresSoon), chat.MaxActiveInvites, now)
+	refused(expiring, expiresSoon, chat.ErrInviteExpired)
+
+	// Revoked, and revoked and expired: revoked.
+	revoked := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	_, _, err := s.RevokeInvite(ctx, groupID, revoked.ID, now)
+	require.NoError(t, err)
+	refused(revoked, now, chat.ErrInviteRevoked)
+	_, _, err = s.RevokeInvite(ctx, groupID, expired.ID, now)
+	require.NoError(t, err)
+	refused(expired, now, chat.ErrInviteRevoked)
+
+	// Unknown, and another chat's.
+	_, err = s.JoinWithInvite(ctx, groupID, user, newInvite(groupID, creator, 0, now, nil).ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrInviteNotFound)
+	requireNotJoined(t, s, groupID, user)
+	otherGroup := privateGroup(t, s, creator)
+	elsewhere := createInvite(t, s, newInvite(otherGroup, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	refused(elsewhere, now, chat.ErrInviteNotFound)
+	isMember, err := s.IsMember(ctx, otherGroup, user)
+	require.NoError(t, err)
+	require.False(t, isMember)
+
+	// The expiring invite still admits just before it expires.
+	result := joinWithInvite(t, s, groupID, user, expiring, inviteSecret(5), expiresSoon.Add(-time.Nanosecond))
+	require.EqualValues(t, 1, result.Invite.UseCount)
+	requireRosterSummary(t, s, groupID, 2, 1)
+}
+
+// testStore_InviteJoin_Banned pins that a banned user is refused in the
+// write with nothing written, and that the invite is judged first: a banned
+// user holding a link that admits no one is told of the link.
+func testStore_InviteJoin_Banned(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	user := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	invite := createInvite(t, s, newInvite(groupID, creator, 1, now, nil), chat.MaxActiveInvites, now)
+	_, err := s.BanUser(ctx, groupID, user, now, true)
+	require.NoError(t, err)
+
+	_, err = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrBanned)
+	requireNotJoined(t, s, groupID, user)
+	requireUseCount(t, s, invite, 0)
+	requireRosterSummary(t, s, groupID, 1, 0)
+
+	// The refusal used nothing: the one use is still there for someone else.
+	joinWithInvite(t, s, groupID, model.MustGenerateUserID(), invite, inviteSecret(5), now)
+
+	revoked := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	_, _, err = s.RevokeInvite(ctx, groupID, revoked.ID, now)
+	require.NoError(t, err)
+	_, err = s.JoinWithInvite(ctx, groupID, user, revoked.ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrInviteRevoked)
+	_, err = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrInviteExhausted)
+
+	// Unbanned, they join like anyone.
+	_, _, err = s.UnbanUser(ctx, groupID, user)
+	require.NoError(t, err)
+	open := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	joinWithInvite(t, s, groupID, user, open, inviteSecret(5), now)
+}
+
+// testStore_InviteJoin_Lobby pins that a join with an invite takes the
+// joiner out of the group's lobby, with both counts, in the same write, and
+// reports it; a joiner not waiting leaves no lobby behind.
+func testStore_InviteJoin_Lobby(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	waiting := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	tight := chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1}
+
+	_, changed, err := s.EnterLobby(ctx, groupID, waiting, tight)
+	require.NoError(t, err)
+	require.True(t, changed)
+	waitForLobbyPage(t, s, groupID, 1)
+
+	result := joinWithInvite(t, s, groupID, waiting, invite, inviteSecret(5), now)
+	require.True(t, result.LeftLobby)
+	entries, err := s.GetLobbyEntries(ctx, waiting, []*commonpb.ChatId{groupID})
+	require.NoError(t, err)
+	require.Empty(t, entries)
+	waitForLobbyPage(t, s, groupID, 0)
+
+	// Both counts were freed: the lobby's one place takes someone else, and
+	// the joiner's one lobby is free for another group's.
+	_, changed, err = s.EnterLobby(ctx, groupID, model.MustGenerateUserID(), tight)
+	require.NoError(t, err)
+	require.True(t, changed)
+	elsewhere := chat.MustGenerateGroupChatID()
+	_, changed, err = s.EnterLobby(ctx, elsewhere, waiting, tight)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	// Waiting elsewhere is not waiting here.
+	otherGroup := privateGroup(t, s, creator)
+	otherInvite := createInvite(t, s, newInvite(otherGroup, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	result = joinWithInvite(t, s, otherGroup, waiting, otherInvite, inviteSecret(5), now)
+	require.False(t, result.LeftLobby)
+	entries, err = s.GetLobbyEntries(ctx, waiting, []*commonpb.ChatId{elsewhere, otherGroup})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Contains(t, entries, string(elsewhere.Value))
+
+	// Not waiting at all.
+	result = joinWithInvite(t, s, groupID, model.MustGenerateUserID(), invite, inviteSecret(5), now)
+	require.False(t, result.LeftLobby)
+}
+
+// testStore_InviteJoin_Envelope pins that the copy a join stores is an
+// envelope like any other: the joiner's own replaces it, and a departure or
+// a ban that discards the envelope takes it.
+func testStore_InviteJoin_Envelope(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	rewrapper, leaver, banned := model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	for _, user := range []*commonpb.UserId{rewrapper, leaver, banned} {
+		joinWithInvite(t, s, groupID, user, invite, inviteSecret(5), now)
+	}
+
+	own := keyEnvelope(6, rewrapper)
+	stored, err := s.SetKeyEnvelope(ctx, groupID, rewrapper, own)
+	require.NoError(t, err)
+	require.True(t, own.Equal(stored))
+	got, err := s.GetKeyEnvelope(ctx, groupID, rewrapper)
+	require.NoError(t, err)
+	require.True(t, own.Equal(got))
+	require.Nil(t, got.InviteCopy)
+
+	changed, _, err := s.RemoveGroupMember(ctx, groupID, leaver, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, err = s.GetKeyEnvelope(ctx, groupID, leaver)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	ban, err := s.BanUser(ctx, groupID, banned, now, true)
+	require.NoError(t, err)
+	require.True(t, ban.Departed)
+	_, err = s.GetKeyEnvelope(ctx, groupID, banned)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+}
+
+// testStore_InviteJoin_Revoke pins that a revoke lands on an invite that
+// has been taking joins, keeping their count, and that it admits no one
+// after.
+func testStore_InviteJoin_Revoke(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	invite := createInvite(t, s, newInvite(groupID, creator, 5, now, nil), chat.MaxActiveInvites, now)
+	for range 2 {
+		joinWithInvite(t, s, groupID, model.MustGenerateUserID(), invite, inviteSecret(5), now)
+	}
+
+	revoked, changed, err := s.RevokeInvite(ctx, groupID, invite.ID, now)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.EqualValues(t, 2, revoked.UseCount)
+
+	user := model.MustGenerateUserID()
+	_, err = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrInviteRevoked)
+	requireNotJoined(t, s, groupID, user)
+	requireUseCount(t, s, invite, 2)
+	requireRosterSummary(t, s, groupID, 3, 2)
+}
+
+// testStore_InviteJoin_Concurrent pins that an invite never admits more
+// than MaxUses joins, however many race for it: of many users joining at
+// once, exactly MaxUses join, every other is ErrInviteExhausted, and the
+// count and the roster agree.
+func testStore_InviteJoin_Concurrent(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+
+	for _, maxUses := range []uint32{1, 3} {
+		groupID := privateGroup(t, s, creator)
+		invite := createInvite(t, s, newInvite(groupID, creator, maxUses, now, nil), chat.MaxActiveInvites, now)
+
+		const joiners = 8
+		errs := make([]error, joiners)
+		var wg sync.WaitGroup
+		for i := range joiners {
+			wg.Go(func() {
+				_, errs[i] = s.JoinWithInvite(ctx, groupID, model.MustGenerateUserID(), invite.ID, inviteSecret(5), now)
+			})
+		}
+		wg.Wait()
+
+		var joined, exhausted int
+		for _, err := range errs {
+			switch {
+			case err == nil:
+				joined++
+			case errors.Is(err, chat.ErrInviteExhausted):
+				exhausted++
+			default:
+				require.NoError(t, err)
+			}
+		}
+		require.EqualValues(t, maxUses, joined, "max uses %d", maxUses)
+		require.Equal(t, joiners-int(maxUses), exhausted, "max uses %d", maxUses)
+		requireUseCount(t, s, invite, maxUses)
+		requireRosterSummary(t, s, groupID, 1+uint64(maxUses), uint64(maxUses))
+	}
+}
+
+// inviteRaceRounds is how many times each race between a join with an
+// invite and a lobby or ban write is run concurrently (see raceOrders).
+const inviteRaceRounds = 8
+
+// raceOrders runs round once per order of two writes a and b that round
+// hands to its run: a then b, b then a, then both at once inviteRaceRounds
+// times. The sequential orders pin both outcomes whatever the scheduler
+// favours, since against one backend the same write tends to win every
+// concurrent round; the concurrent rounds are what may catch one write
+// between the other's read and its write. Each round sets up its own state.
+func raceOrders(round func(run func(a, b func()))) {
+	orders := []func(a, b func()){
+		func(a, b func()) { a(); b() },
+		func(a, b func()) { b(); a() },
+	}
+	for range inviteRaceRounds {
+		orders = append(orders, func(a, b func()) {
+			var wg sync.WaitGroup
+			wg.Go(a)
+			wg.Go(b)
+			wg.Wait()
+		})
+	}
+	for _, run := range orders {
+		round(run)
+	}
+}
+
+// requireLobbyFreed checks that user holds no entry in chatID's lobby and
+// that neither count holds a place for one: the lobby's one place, under a
+// LobbySize of 1, takes someone else, and the user's one lobby, under a
+// LobbiesPerUser of 1, takes another group's. It is for a user who waited
+// in no other lobby.
+func requireLobbyFreed(t *testing.T, s chat.Store, chatID *commonpb.ChatId, user *commonpb.UserId) {
+	t.Helper()
+	ctx := context.Background()
+	tight := chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1}
+
+	entries, err := s.GetLobbyEntries(ctx, user, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	require.Empty(t, entries)
+	_, changed, err := s.EnterLobby(ctx, chatID, model.MustGenerateUserID(), tight)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, changed, err = s.EnterLobby(ctx, chat.MustGenerateGroupChatID(), user, tight)
+	require.NoError(t, err)
+	require.True(t, changed)
+}
+
+// testStore_InviteJoin_RefusedKeepsLobby pins that a join with an invite
+// that admits no one leaves a waiting user where they were: their entry and
+// both counts untouched, so they keep their place, and a later join with an
+// invite that admits them takes them out as any does.
+func testStore_InviteJoin_RefusedKeepsLobby(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	user := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	tight := chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1}
+
+	entry, changed, err := s.EnterLobby(ctx, groupID, user, tight)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	expiresAt := now.Add(-time.Hour)
+	expired := createInvite(t, s, newInvite(groupID, creator, 0, now.Add(-2*time.Hour), &expiresAt), chat.MaxActiveInvites, now)
+	revoked := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	_, _, err = s.RevokeInvite(ctx, groupID, revoked.ID, now)
+	require.NoError(t, err)
+	usedUp := createInvite(t, s, newInvite(groupID, creator, 1, now, nil), chat.MaxActiveInvites, now)
+	joinWithInvite(t, s, groupID, model.MustGenerateUserID(), usedUp, inviteSecret(5), now)
+	elsewhere := createInvite(t, s, newInvite(privateGroup(t, s, creator), creator, 0, now, nil), chat.MaxActiveInvites, now)
+
+	for _, refusal := range []struct {
+		inviteID *chatpb.InviteId
+		want     error
+	}{
+		{expired.ID, chat.ErrInviteExpired},
+		{revoked.ID, chat.ErrInviteRevoked},
+		{usedUp.ID, chat.ErrInviteExhausted},
+		{elsewhere.ID, chat.ErrInviteNotFound},
+		{newInvite(groupID, creator, 0, now, nil).ID, chat.ErrInviteNotFound},
+	} {
+		_, err := s.JoinWithInvite(ctx, groupID, user, refusal.inviteID, inviteSecret(5), now)
+		require.ErrorIs(t, err, refusal.want)
+		requireNotJoined(t, s, groupID, user)
+
+		// Still waiting, at the first entry's time, and both places still
+		// theirs: the lobby is full to anyone else, and they wait in no other.
+		entries, err := s.GetLobbyEntries(ctx, user, []*commonpb.ChatId{groupID})
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		require.True(t, entry.EnteredAt.Equal(entries[string(groupID.Value)].EnteredAt))
+		_, _, err = s.EnterLobby(ctx, groupID, model.MustGenerateUserID(), tight)
+		require.ErrorIs(t, err, chat.ErrLobbyFull)
+		_, _, err = s.EnterLobby(ctx, chat.MustGenerateGroupChatID(), user, tight)
+		require.ErrorIs(t, err, chat.ErrTooManyLobbies)
+	}
+
+	// An invite that admits them takes them out with both counts.
+	open := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	result := joinWithInvite(t, s, groupID, user, open, inviteSecret(5), now)
+	require.True(t, result.LeftLobby)
+	requireLobbyFreed(t, s, groupID, user)
+}
+
+// testStore_InviteJoin_RaceAdmit pins a waiting user's join with an invite
+// racing the creator's admission of them: exactly one of the two joins them,
+// the other is the no-op, and what stands is the winner's alone — the use
+// counted only when the invite won, the envelope the winner stored, the entry
+// and both counts gone, the roster moved once.
+func testStore_InviteJoin_RaceAdmit(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		groupID := privateGroup(t, s, creator)
+		invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+		_, changed, err := s.EnterLobby(ctx, groupID, user, chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1})
+		require.NoError(t, err)
+		require.True(t, changed)
+
+		admitted := keyEnvelope(3, creator)
+		var (
+			admitChanged bool
+			admitErr     error
+			joinResult   chat.JoinWithInviteResult
+			joinErr      error
+		)
+		run(func() {
+			admitChanged, _, admitErr = s.AdmitFromLobby(ctx, groupID, user, admitted)
+		}, func() {
+			joinResult, joinErr = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), now)
+		})
+		require.NoError(t, admitErr)
+		require.NoError(t, joinErr)
+		require.NotEqual(t, admitChanged, joinResult.Changed, "exactly one of the two joins")
+
+		isMember, err := s.IsMember(ctx, groupID, user)
+		require.NoError(t, err)
+		require.True(t, isMember)
+		requireRosterSummary(t, s, groupID, 2, 1)
+		got, err := s.GetKeyEnvelope(ctx, groupID, user)
+		require.NoError(t, err)
+		if joinResult.Changed {
+			require.True(t, joinResult.LeftLobby)
+			requireUseCount(t, s, invite, 1)
+			require.NotNil(t, got.InviteCopy)
+			require.Equal(t, invite.ID.Value, got.InviteCopy.InviteID.Value)
+		} else {
+			requireUseCount(t, s, invite, 0)
+			require.True(t, admitted.Equal(got))
+		}
+		requireLobbyFreed(t, s, groupID, user)
+	})
+}
+
+// testStore_InviteJoin_RaceLobby pins a join with an invite racing the
+// joiner's own lobby writes: an entry is either refused (the join landed
+// first) or taken out by the join (the entry landed first), and a withdrawal
+// either removes the entry or finds the join had; either way the joiner ends
+// a member with no entry and both counts freed, the lobby's side moved
+// exactly once.
+func testStore_InviteJoin_RaceLobby(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+
+	// Entering.
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		groupID := privateGroup(t, s, creator)
+		invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+
+		var (
+			enterErr   error
+			joinResult chat.JoinWithInviteResult
+			joinErr    error
+		)
+		run(func() {
+			_, _, enterErr = s.EnterLobby(ctx, groupID, user, lobbyLimits)
+		}, func() {
+			joinResult, joinErr = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), now)
+		})
+		require.NoError(t, joinErr)
+		require.True(t, joinResult.Changed)
+		if enterErr == nil {
+			require.True(t, joinResult.LeftLobby, "an entry made first is taken out by the join")
+		} else {
+			require.ErrorIs(t, enterErr, chat.ErrAlreadyMember)
+			require.False(t, joinResult.LeftLobby)
+		}
+		requireRosterSummary(t, s, groupID, 2, 1)
+		requireLobbyFreed(t, s, groupID, user)
+	})
+
+	// Withdrawing.
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		groupID := privateGroup(t, s, creator)
+		invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+		_, changed, err := s.EnterLobby(ctx, groupID, user, lobbyLimits)
+		require.NoError(t, err)
+		require.True(t, changed)
+
+		var (
+			left       bool
+			leaveErr   error
+			joinResult chat.JoinWithInviteResult
+			joinErr    error
+		)
+		run(func() {
+			left, leaveErr = s.LeaveLobby(ctx, groupID, user)
+		}, func() {
+			joinResult, joinErr = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), now)
+		})
+		require.NoError(t, leaveErr)
+		require.NoError(t, joinErr)
+		require.True(t, joinResult.Changed)
+		require.NotEqual(t, left, joinResult.LeftLobby, "exactly one of the two removes the entry")
+		requireRosterSummary(t, s, groupID, 2, 1)
+		requireLobbyFreed(t, s, groupID, user)
+	})
+}
+
+// testStore_InviteJoin_RaceBan pins a waiting user's join with an invite
+// racing the creator's ban of them: either the ban lands first and the join
+// is ErrBanned, using nothing, or the join lands first and the ban removes
+// the member it made. Either way the user ends banned, not a member, with no
+// envelope and no entry, both counts freed, and the lobby's side moved by
+// exactly one of the two.
+func testStore_InviteJoin_RaceBan(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		groupID := privateGroup(t, s, creator)
+		invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+		_, changed, err := s.EnterLobby(ctx, groupID, user, chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1})
+		require.NoError(t, err)
+		require.True(t, changed)
+
+		var (
+			ban        chat.BanResult
+			banErr     error
+			joinResult chat.JoinWithInviteResult
+			joinErr    error
+		)
+		run(func() {
+			ban, banErr = s.BanUser(ctx, groupID, user, now, true)
+		}, func() {
+			joinResult, joinErr = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), now)
+		})
+		require.NoError(t, banErr)
+		require.True(t, ban.Changed)
+
+		if joinErr == nil {
+			require.True(t, joinResult.Changed)
+			require.True(t, joinResult.LeftLobby)
+			require.True(t, ban.Departed, "a join landing first is undone by the ban")
+			require.False(t, ban.LeftLobby)
+			requireUseCount(t, s, invite, 1)
+			requireRosterSummary(t, s, groupID, 1, 2)
+		} else {
+			require.ErrorIs(t, joinErr, chat.ErrBanned)
+			require.False(t, ban.Departed)
+			require.True(t, ban.LeftLobby)
+			requireUseCount(t, s, invite, 0)
+			requireRosterSummary(t, s, groupID, 1, 0)
+		}
+
+		requireNotJoined(t, s, groupID, user)
+		states, err := s.GetViewerStates(ctx, user, []*commonpb.ChatId{groupID})
+		require.NoError(t, err)
+		require.True(t, states[string(groupID.Value)].IsBanned())
+		requireLobbyFreed(t, s, groupID, user)
+	})
 }

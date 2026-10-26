@@ -28,17 +28,28 @@ import (
 // stores theirs as the second step of creating the group, and a private group
 // has a key exactly when they have (see KeyEnvelope). It is also how an
 // admitted member replaces the envelope the creator wrapped for them with one
-// that depends on no one else's key. In both cases the first envelope a
-// caller stores for themself stands (see Store.SetKeyEnvelope): a later call
-// with a different one changes nothing and is ALREADY_SET, so two of a
-// creator's devices setting up the same new group cannot end up holding
-// different keys, and a repeat of the stored envelope is OK, so a retry after
-// a lost response is.
+// that depends on no one else's key, and how a member who joined with an
+// invite replaces the invite's copy of the chat key they hold (see
+// InviteKeyCopy): the copy and the secret envelope stored with it go in the
+// same write, since together they are one stored envelope the caller did not
+// wrap, replaced as one the creator wrapped for them is. In every case the
+// first envelope a caller stores for themself stands (see
+// Store.SetKeyEnvelope): a later call with a different one changes nothing
+// and is ALREADY_SET, so two of a creator's devices setting up the same new
+// group cannot end up holding different keys, and a repeat of the stored
+// envelope is OK, so a retry after a lost response is.
 //
 // The server cannot tell a good envelope from a bad one. A caller who stores
 // one that does not hold the group's key has locked only themself out, since
 // an envelope is read back by its own user alone; for the creator of a group
 // with no key yet, whatever they store is the group's key.
+//
+// GetKeyEnvelope returns what is stored for the caller: an envelope someone
+// wrapped as key_envelope, and an invite's copy as invite_key_bundle, the
+// copy with the caller's secret envelope (see InviteKeyCopy.ToProto); exactly
+// one of the two. Either way wrapped_by is who stored it (for a copy, the
+// invite's creator, who signed it) and wrapped_by_public_key that user's
+// account key, which a copy's signature is checked against.
 //
 // Nothing is published by either: a user's other devices fetch the envelope
 // when they need it.
@@ -48,7 +59,9 @@ import (
 // and Server.EnterLobby); nothing is published for that either, since the
 // creator's client is the one that stored it. Every other envelope a group
 // holds was stored by the creator admitting that member (see
-// Server.AdmitLobbyMember), until the member replaces it with their own.
+// Server.AdmitLobbyMember), or is an invite's copy stored by the member's
+// join with it (see Server.JoinChat and Store.JoinWithInvite), until the
+// member replaces it with their own.
 
 func (s *Server) SetKeyEnvelope(ctx context.Context, req *chatpb.SetKeyEnvelopeRequest) (*chatpb.SetKeyEnvelopeResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
@@ -111,11 +124,32 @@ func (s *Server) GetKeyEnvelope(ctx context.Context, req *chatpb.GetKeyEnvelopeR
 		log.With(zap.Error(err)).Warn("Failure getting key envelope")
 		return nil, status.Error(codes.Internal, "")
 	}
-	return &chatpb.GetKeyEnvelopeResponse{
-		Result:      chatpb.GetKeyEnvelopeResponse_OK,
-		KeyEnvelope: envelope.ToProto(),
-		WrappedBy:   envelope.WrappedBy,
-	}, nil
+
+	// The wrapper's public key is the account's, as for a lobby member (see
+	// hydrateLobbyMembers): it is what the client opens the envelope against,
+	// or checks an invite copy's signature against, when it has learned none
+	// for the wrapper outside this service.
+	keys, err := s.accounts.GetPubKeys(ctx, envelope.WrappedBy)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure getting key envelope wrapper's public key")
+		return nil, status.Error(codes.Internal, "")
+	}
+	if len(keys) == 0 {
+		log.With(zap.String("wrapped_by", model.UserIDString(envelope.WrappedBy))).Warn("Key envelope wrapper has no public key")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	resp := &chatpb.GetKeyEnvelopeResponse{
+		Result:             chatpb.GetKeyEnvelopeResponse_OK,
+		WrappedBy:          envelope.WrappedBy,
+		WrappedByPublicKey: keys[0],
+	}
+	if envelope.IsInviteCopy() {
+		resp.Envelope = &chatpb.GetKeyEnvelopeResponse_InviteKeyBundle_{InviteKeyBundle: envelope.InviteCopy.ToProto()}
+	} else {
+		resp.Envelope = &chatpb.GetKeyEnvelopeResponse_KeyEnvelope{KeyEnvelope: envelope.ToProto()}
+	}
+	return resp, nil
 }
 
 // keyEnvelopeAllowed is the gate SetKeyEnvelope and GetKeyEnvelope share,

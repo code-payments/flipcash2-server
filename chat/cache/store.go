@@ -21,8 +21,8 @@ import (
 // mutable — and can be mutated by other processes, which this cache can never
 // observe — so group membership checks and member lists always defer to the
 // backing store. The rest of the store is passed straight through, viewer
-// state (restrictions included), activity reads and key envelopes included: a
-// user's state is theirs, or their group creator's, to change at any time, a group's recent senders change with every send, and
+// state (restrictions included), activity reads, key envelopes and invites
+// included: a user's state is theirs, or their group creator's, to change at any time, a group's recent senders change with every send, and
 // both reads are already one strongly consistent query, so nothing of either
 // is held.
 //
@@ -356,6 +356,31 @@ func (c *Cache) SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, 
 
 func (c *Cache) GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (chat.FeaturedGroups, error) {
 	return c.db.GetFeaturedGroups(ctx, userID)
+}
+
+// The invite methods pass through: an invite's use count and revoke change
+// with every join and revoke, from any process, and its record is read once
+// per create, preview, join or listing, so there is nothing worth holding.
+func (c *Cache) CreateInvite(ctx context.Context, invite chat.Invite, keyCopy *chatpb.InviteKeyEnvelope, maxActive int, now time.Time) (chat.Invite, bool, error) {
+	return c.db.CreateInvite(ctx, invite, keyCopy, maxActive, now)
+}
+
+func (c *Cache) GetInvite(ctx context.Context, inviteID *chatpb.InviteId) (chat.Invite, error) {
+	return c.db.GetInvite(ctx, inviteID)
+}
+
+func (c *Cache) GetChatInvitesPage(ctx context.Context, chatID *commonpb.ChatId, createdBy *commonpb.UserId, after *chat.InvitePosition, limit int) ([]chat.Invite, error) {
+	return c.db.GetChatInvitesPage(ctx, chatID, createdBy, after, limit)
+}
+
+func (c *Cache) RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, inviteID *chatpb.InviteId, now time.Time) (chat.Invite, bool, error) {
+	return c.db.RevokeInvite(ctx, chatID, inviteID, now)
+}
+
+// JoinWithInvite passes through, like every membership write: group
+// membership is never cached.
+func (c *Cache) JoinWithInvite(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, inviteID *chatpb.InviteId, secretEnvelope *chatpb.InviteSecretEnvelope, now time.Time) (chat.JoinWithInviteResult, error) {
+	return c.db.JoinWithInvite(ctx, chatID, userID, inviteID, secretEnvelope, now)
 }
 
 // The holdings methods pass through: a snapshot is replaced by a refresh in

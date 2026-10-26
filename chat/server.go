@@ -140,10 +140,56 @@ type Media interface {
 // messaging.Sender satisfies it directly.
 type SystemMessenger interface {
 	// SendUserJoined writes the system message telling a group's members that
-	// userID joined it: admitted by admittedBy, or on their own when it is nil.
-	// rosterVersion is the roster version after the join, which names it: a
-	// repeat of one join writes nothing.
-	SendUserJoined(ctx context.Context, chatID *commonpb.ChatId, userID, admittedBy *commonpb.UserId, rosterVersion uint64) error
+	// userID joined it, and how (see JoinMethod). rosterVersion is the roster
+	// version after the join, which names it: a repeat of one join writes
+	// nothing.
+	SendUserJoined(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, method JoinMethod, rosterVersion uint64) error
+}
+
+// JoinMethod is how a user came to join a group, as a UserJoined system
+// message records it (see SystemMessenger): on their own (JoinedDirectly),
+// let in by someone (AdmittedBy), or with someone's invite (InvitedBy). It
+// names the way and the user behind it, and nothing of the message's shape:
+// that is the messaging domain's, which chat cannot import.
+type JoinMethod struct {
+	// Kind is which way they joined.
+	Kind JoinMethodKind
+
+	// By is the user who admitted them (JoinAdmitted) or who created the
+	// invite they joined with (JoinInvited), and nil for JoinDirect.
+	By *commonpb.UserId
+}
+
+// JoinMethodKind is the way a user joined a group (see JoinMethod).
+type JoinMethodKind uint8
+
+const (
+	// JoinDirect is a join on the user's own, needing no one (a private
+	// group's creator rejoining it).
+	JoinDirect JoinMethodKind = iota
+
+	// JoinAdmitted is a join someone let them in to (a private group's
+	// creator admitting them from its lobby).
+	JoinAdmitted
+
+	// JoinInvited is a join with someone's invite (see Invite), needing no
+	// one's approval.
+	JoinInvited
+)
+
+// JoinedDirectly is a join on the user's own (see JoinDirect).
+func JoinedDirectly() JoinMethod {
+	return JoinMethod{Kind: JoinDirect}
+}
+
+// AdmittedBy is a join userID let the user in to (see JoinAdmitted).
+func AdmittedBy(userID *commonpb.UserId) JoinMethod {
+	return JoinMethod{Kind: JoinAdmitted, By: userID}
+}
+
+// InvitedBy is a join with an invite userID created (see JoinInvited).
+func InvitedBy(userID *commonpb.UserId) JoinMethod {
+	return JoinMethod{Kind: JoinInvited, By: userID}
 }
 
 // UserEventPublisher is the write slice of the event domain the Chat service
@@ -217,6 +263,11 @@ type Server struct {
 	// WithLobbyLimits to exercise the refusals without thousands of users.
 	lobbyLimits LobbyLimits
 
+	// maxActiveInvites caps the ACTIVE invites a private group may hold (see
+	// invite.go). MaxActiveInvites in production; tests lower it with
+	// WithMaxActiveInvites to exercise the refusal cheaply.
+	maxActiveInvites int
+
 	chatpb.UnimplementedChatServer
 }
 
@@ -228,6 +279,14 @@ type ServerOption func(*Server)
 func WithLobbyLimits(limits LobbyLimits) ServerOption {
 	return func(s *Server) {
 		s.lobbyLimits = limits
+	}
+}
+
+// WithMaxActiveInvites overrides MaxActiveInvites, the most ACTIVE invites a
+// private group may hold (see Store.CreateInvite). n must be at least one.
+func WithMaxActiveInvites(n int) ServerOption {
+	return func(s *Server) {
+		s.maxActiveInvites = n
 	}
 }
 
@@ -284,6 +343,7 @@ func NewServer(
 		maxGroupFeedChats:  maxGroupFeedChats,
 		rosterWholeReadCap: rosterWholeReadCap,
 		lobbyLimits:        DefaultLobbyLimits,
+		maxActiveInvites:   MaxActiveInvites,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -363,30 +423,46 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 		return nil, status.Error(codes.Internal, "")
 	}
 
+	md, ok, err := s.chatAsSeenBy(ctx, log, c, userID, req.GetViewMode())
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
+	}
+
+	return &chatpb.GetChatResponse{
+		Result:   chatpb.GetChatResponse_OK,
+		Metadata: md,
+	}, nil
+}
+
+// chatAsSeenBy is c's metadata as userID sees it under mode, which is what
+// GetChat returns them (see GetChat), and ok false when they may not see it
+// at all: a DM they are not a member of. Its other callers return a chat "as
+// the caller sees it with GetChat" (see GetInvite). A gRPC error is returned
+// only for a failed read.
+func (s *Server) chatAsSeenBy(ctx context.Context, log *zap.Logger, c *Chat, userID *commonpb.UserId, mode messagingpb.ViewMode) (md *chatpb.Metadata, ok bool, err error) {
 	// The caller's standing is decided off the record where it can be — a DM's
 	// members are on it — and otherwise by a keyed membership check rather
 	// than a scan of the member list, so a group's membership is never
 	// enumerated on behalf of a caller who turns out not to be a member — and,
 	// for a non-member of a group, the listener rules.
-	standing, err := s.access.ListenerStandingWithChat(ctx, c, userID, req.GetViewMode())
+	standing, err := s.access.ListenerStandingWithChat(ctx, c, userID, mode)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure determining chat standing")
-		return nil, status.Error(codes.Internal, "")
+		return nil, false, status.Error(codes.Internal, "")
 	}
 	if !standing.IsMember && !IsGroupChatID(c.ID) {
-		return &chatpb.GetChatResponse{Result: chatpb.GetChatResponse_DENIED}, nil
+		return nil, false, nil
 	}
 
-	metadata, err := s.hydrator.hydrate(ctx, userID, standing, standing.Reading(req.GetViewMode()), fullDetail, []*Chat{c})
+	metadata, err := s.hydrator.hydrate(ctx, userID, standing, standing.Reading(mode), fullDetail, []*Chat{c})
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
-		return nil, status.Error(codes.Internal, "")
+		return nil, false, status.Error(codes.Internal, "")
 	}
-
-	return &chatpb.GetChatResponse{
-		Result:   chatpb.GetChatResponse_OK,
-		Metadata: metadata[0],
-	}, nil
+	return metadata[0], true, nil
 }
 
 // getPublicChat is GetChat for an unauthenticated caller: the chat's public

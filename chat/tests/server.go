@@ -3,6 +3,7 @@ package tests
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -175,6 +176,23 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_Moderation_MalformedTarget,
 		testServer_Moderation_GetRestrictedUsers_UnknownUser,
 		testServer_Moderation_MentionSuggestions,
+		testServer_Invite_Create,
+		testServer_Invite_Gates,
+		testServer_Invite_ExpiresAt,
+		testServer_Invite_Signature,
+		testServer_Invite_Cap,
+		testServer_Invite_Retry,
+		testServer_Invite_Get,
+		testServer_Invite_List,
+		testServer_Invite_Revoke,
+		testServer_Invite_Permissions,
+		testServer_InviteJoin,
+		testServer_InviteJoin_Announcements,
+		testServer_InviteJoin_NoOps,
+		testServer_InviteJoin_Rejoin,
+		testServer_InviteJoin_Refused,
+		testServer_InviteJoin_PublicGroup,
+		testServer_InviteJoin_Creator,
 	} {
 		tf(t, s)
 		teardown()
@@ -215,6 +233,9 @@ type serverConfig struct {
 
 	// lobbyLimits, when set, override chat.DefaultLobbyLimits.
 	lobbyLimits *chat.LobbyLimits
+
+	// maxActiveInvites, when set, overrides chat.MaxActiveInvites.
+	maxActiveInvites int
 }
 
 func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
@@ -254,6 +275,9 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	if cfg.lobbyLimits != nil {
 		opts = append(opts, chat.WithLobbyLimits(*cfg.lobbyLimits))
 	}
+	if cfg.maxActiveInvites > 0 {
+		opts = append(opts, chat.WithMaxActiveInvites(cfg.maxActiveInvites))
+	}
 	hydrator := chat.NewHydrator(log, blocklist, s, media, messaging, profiles, access.Rules(), teamUserID)
 	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, systemMessages, pusher, access, hydrator, userBus, chatBus, cfg.disablePublicGroupRoster, opts...)
 	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
@@ -289,6 +313,15 @@ func (e *serverEnv) addUser() (*commonpb.UserId, model.KeyPair) {
 	keys := model.MustGenerateKeyPair()
 	e.authz.Add(userID, keys)
 	return userID, keys
+}
+
+// bindKey records keys as userID's public key in the account store, which
+// the test authorizer does not, for RPCs that report a user's key (such as
+// GetKeyEnvelope's wrapped_by_public_key). Binding the same key again is a
+// no-op.
+func (e *serverEnv) bindKey(userID *commonpb.UserId, keys model.KeyPair) {
+	_, err := e.accounts.Bind(e.ctx, userID, keys.Proto())
+	require.NoError(e.t, err)
 }
 
 // staffAccounts is an account.Store whose staff flag a test can set: the
@@ -681,14 +714,10 @@ func (f *fakeBlocklistReader) GetBlocked(_ context.Context, ownerID *commonpb.Us
 type userJoinedCall struct {
 	chatID        *commonpb.ChatId
 	userID        *commonpb.UserId
-	admittedBy    *commonpb.UserId
+	method        chat.JoinMethod
 	rosterVersion uint64
 }
 
-// fakeSystemMessenger is a chat.SystemMessenger for server tests: it records
-// every join it is asked to write, and fails each with err when set. The
-// chat server calls it on the request path, so a test reads its calls with no
-// waiting.
 // fakePusher records every push the server sends, for tests to assert on
 // what would reach a device.
 type fakePusher struct {
@@ -758,16 +787,20 @@ func requireLobbyPush(t *testing.T, got fakePush, chatID *commonpb.ChatId, title
 	require.Nil(t, got.payload.ChatMetadata.GetSendingUserId())
 }
 
+// fakeSystemMessenger is a chat.SystemMessenger for server tests: it records
+// every join it is asked to write, and fails each with err when set. The
+// chat server calls it on the request path, so a test reads its calls with no
+// waiting.
 type fakeSystemMessenger struct {
 	mu    sync.Mutex
 	joins []userJoinedCall
 	err   error
 }
 
-func (f *fakeSystemMessenger) SendUserJoined(_ context.Context, chatID *commonpb.ChatId, userID, admittedBy *commonpb.UserId, rosterVersion uint64) error {
+func (f *fakeSystemMessenger) SendUserJoined(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, method chat.JoinMethod, rosterVersion uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.joins = append(f.joins, userJoinedCall{chatID: chatID, userID: userID, admittedBy: admittedBy, rosterVersion: rosterVersion})
+	f.joins = append(f.joins, userJoinedCall{chatID: chatID, userID: userID, method: method, rosterVersion: rosterVersion})
 	return f.err
 }
 
@@ -775,6 +808,20 @@ func (f *fakeSystemMessenger) setErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.err = err
+}
+
+// requireUserJoinedCall asserts that call wrote userID's join by method at
+// rosterVersion.
+func requireUserJoinedCall(t *testing.T, call userJoinedCall, userID *commonpb.UserId, method chat.JoinMethod, rosterVersion uint64) {
+	t.Helper()
+	require.Equal(t, userID.Value, call.userID.Value)
+	require.Equal(t, method.Kind, call.method.Kind)
+	if method.By == nil {
+		require.Nil(t, call.method.By)
+	} else {
+		require.Equal(t, method.By.Value, call.method.By.GetValue())
+	}
+	require.Equal(t, rosterVersion, call.rosterVersion)
 }
 
 // userJoinedCalls returns the joins recorded for chatID, in order.
@@ -3442,8 +3489,9 @@ func testServer_KeyEnvelope_Gates(t *testing.T, s chat.Store) {
 		require.Equal(t, set, e.mustSetKeyEnvelope(keys, chatID, keyEnvelopeProto(1)).Result)
 		got := e.mustGetKeyEnvelope(keys, chatID)
 		require.Equal(t, get, got.Result)
-		require.Nil(t, got.KeyEnvelope)
+		require.Nil(t, got.Envelope)
 		require.Nil(t, got.WrappedBy)
+		require.Nil(t, got.WrappedByPublicKey)
 	}
 
 	// A DM has no key envelopes, for its members or anyone.
@@ -3484,6 +3532,7 @@ func testServer_KeyEnvelope_Gates(t *testing.T, s chat.Store) {
 // stands whatever a later call carries, and it is kept when they leave.
 func testServer_KeyEnvelope_Creator(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
 
 	created := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
 	require.Equal(t, chatpb.StartChatResponse_OK, created.Result)
@@ -3498,8 +3547,9 @@ func testServer_KeyEnvelope_Creator(t *testing.T, s chat.Store) {
 		t.Helper()
 		got := e.mustGetKeyEnvelope(e.keys, chatID)
 		require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, got.Result)
-		require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(1), got.KeyEnvelope))
+		require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(1), got.GetKeyEnvelope()))
 		require.Equal(t, e.userID.Value, got.WrappedBy.GetValue())
+		require.True(t, proto.Equal(e.keys.Proto(), got.WrappedByPublicKey))
 	}
 	requireStored()
 
@@ -3530,6 +3580,8 @@ func testServer_KeyEnvelope_Member(t *testing.T, s chat.Store) {
 	// No RPC admits a member to a private group yet, so the membership and
 	// the envelope the creator would have wrapped are written by hand.
 	memberID, memberKeys := e.addUser()
+	e.bindKey(e.userID, e.keys)
+	e.bindKey(memberID, memberKeys)
 	chatID := e.putPrivateGroup("Sunday Hikers", memberID)
 	require.Equal(t, chatpb.SetKeyEnvelopeResponse_OK, e.mustSetKeyEnvelope(e.keys, chatID, keyEnvelopeProto(1)).Result)
 	_, err := s.SetKeyEnvelope(e.ctx, chatID, memberID, chat.KeyEnvelopeFromProto(keyEnvelopeProto(2), e.userID))
@@ -3537,8 +3589,12 @@ func testServer_KeyEnvelope_Member(t *testing.T, s chat.Store) {
 
 	got := e.mustGetKeyEnvelope(memberKeys, chatID)
 	require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, got.Result)
-	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(2), got.KeyEnvelope))
+	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(2), got.GetKeyEnvelope()))
 	require.Equal(t, e.userID.Value, got.WrappedBy.GetValue())
+
+	// The creator wrapped it, so their public key is the one reported: it is
+	// what the member opens the envelope against.
+	require.True(t, proto.Equal(e.keys.Proto(), got.WrappedByPublicKey))
 
 	// The member wraps the key for themself, which replaces the creator's
 	// envelope and then stands.
@@ -3546,12 +3602,13 @@ func testServer_KeyEnvelope_Member(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.SetKeyEnvelopeResponse_ALREADY_SET, e.mustSetKeyEnvelope(memberKeys, chatID, keyEnvelopeProto(4)).Result)
 	got = e.mustGetKeyEnvelope(memberKeys, chatID)
 	require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, got.Result)
-	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(3), got.KeyEnvelope))
+	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(3), got.GetKeyEnvelope()))
 	require.Equal(t, memberID.Value, got.WrappedBy.GetValue())
+	require.True(t, proto.Equal(memberKeys.Proto(), got.WrappedByPublicKey))
 
 	// Each member's envelope is their own: the creator's is untouched.
 	got = e.mustGetKeyEnvelope(e.keys, chatID)
-	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(1), got.KeyEnvelope))
+	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(1), got.GetKeyEnvelope()))
 
 	// Leaving discards the member's envelope and no one else's.
 	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(memberKeys, chatID).Result)
@@ -6135,6 +6192,7 @@ func testServer_Lobby_GetLobbyMembers(t *testing.T, s chat.Store) {
 func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.profiles.displayNames[string(e.userID.Value)] = "Creator"
+	e.bindKey(e.userID, e.keys)
 	userID, userKeys := e.addBoundUser("Waiting")
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 
@@ -6153,8 +6211,12 @@ func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	require.True(t, isMember)
 	envelope := e.mustGetKeyEnvelope(userKeys, chatID)
 	require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, envelope.Result)
-	require.True(t, proto.Equal(wrapped, envelope.KeyEnvelope))
+	require.True(t, proto.Equal(wrapped, envelope.GetKeyEnvelope()))
 	require.Equal(t, e.userID.Value, envelope.WrappedBy.Value)
+
+	// With the creator's public key, which nothing else returns to a member,
+	// so the admitted user can open the envelope against it.
+	require.True(t, proto.Equal(e.keys.Proto(), envelope.WrappedByPublicKey))
 	got := e.getChat(userKeys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, got.Result)
 	require.False(t, got.Metadata.InLobby)
@@ -6192,7 +6254,7 @@ func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	// A repeat is the no-op the proto promises, their envelope untouched.
 	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(3)).Result)
 	envelope = e.mustGetKeyEnvelope(userKeys, chatID)
-	require.True(t, proto.Equal(wrapped, envelope.KeyEnvelope))
+	require.True(t, proto.Equal(wrapped, envelope.GetKeyEnvelope()))
 	time.Sleep(100 * time.Millisecond)
 	require.Len(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID), 2)
 	require.Len(t, e.pusher.pushesTo(userID), 1)
@@ -6213,7 +6275,7 @@ func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(userKeys, chatID).Result)
 	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(5)).Result)
 	envelope = e.mustGetKeyEnvelope(userKeys, chatID)
-	require.True(t, proto.Equal(keyEnvelopeProto(5), envelope.KeyEnvelope))
+	require.True(t, proto.Equal(keyEnvelopeProto(5), envelope.GetKeyEnvelope()))
 
 	// Each wait and each admission is pushed again.
 	e.waitForPushes(e.userID, 2)
@@ -6264,16 +6326,6 @@ func testServer_Lobby_Deny(t *testing.T, s chat.Store) {
 func testServer_PrivateGroup_UserJoinedMessages(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 
-	requireJoin := func(call userJoinedCall, userID, admittedBy *commonpb.UserId, rosterVersion uint64) {
-		t.Helper()
-		require.Equal(t, userID.Value, call.userID.Value)
-		if admittedBy == nil {
-			require.Nil(t, call.admittedBy)
-		} else {
-			require.Equal(t, admittedBy.Value, call.admittedBy.GetValue())
-		}
-		require.Equal(t, rosterVersion, call.rosterVersion)
-	}
 	rosterVersion := func(chatID *commonpb.ChatId) uint64 {
 		t.Helper()
 		got := e.getChat(e.keys, chatID)
@@ -6299,7 +6351,7 @@ func testServer_PrivateGroup_UserJoinedMessages(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(2)).Result)
 	calls := e.systemMessages.userJoinedCalls(chatID)
 	require.Len(t, calls, 1)
-	requireJoin(calls[0], userID, e.userID, rosterVersion(chatID))
+	requireUserJoinedCall(t, calls[0], userID, chat.AdmittedBy(e.userID), rosterVersion(chatID))
 
 	// A repeat is the no-op, and writes nothing.
 	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(3)).Result)
@@ -6312,7 +6364,7 @@ func testServer_PrivateGroup_UserJoinedMessages(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
 	calls = e.systemMessages.userJoinedCalls(chatID)
 	require.Len(t, calls, 2)
-	requireJoin(calls[1], e.userID, nil, joined.Chat.RosterSummary.Version)
+	requireUserJoinedCall(t, calls[1], e.userID, chat.JoinedDirectly(), joined.Chat.RosterSummary.Version)
 
 	// Their join of a group they are in is the no-op.
 	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, chatID).Result)
@@ -6328,7 +6380,7 @@ func testServer_PrivateGroup_UserJoinedMessages(t *testing.T, s chat.Store) {
 	require.True(t, isMember)
 	calls = e.systemMessages.userJoinedCalls(chatID)
 	require.Len(t, calls, 3)
-	requireJoin(calls[2], otherID, e.userID, rosterVersion(chatID))
+	requireUserJoinedCall(t, calls[2], otherID, chat.AdmittedBy(e.userID), rosterVersion(chatID))
 	e.systemMessages.setErr(nil)
 
 	// A public group's join writes none.
@@ -7201,4 +7253,1160 @@ func testServer_Moderation_GetRestrictedUsers_UnknownUser(t *testing.T, s chat.S
 		opts = &commonpb.QueryOptions{PageSize: 1, PagingToken: resp.PagingToken}
 	}
 	require.Equal(t, [][]byte{last.Value, known.Value}, walked)
+}
+
+// newInviteToken is a fresh invite token, as a client derives one from a
+// link's secret.
+func newInviteToken() *chatpb.InviteToken {
+	return &chatpb.InviteToken{Value: randomBytes(chat.InviteTokenSize)}
+}
+
+// signedInviteKeyEnvelope is an invite's copy of chatID's key for inviteID,
+// signed by keys as chatpb.InviteKeyEnvelope specifies. The server cannot
+// open the copy, so random bytes stand in for the encrypted key.
+func signedInviteKeyEnvelope(keys model.KeyPair, chatID *commonpb.ChatId, inviteID *chatpb.InviteId) *chatpb.InviteKeyEnvelope {
+	envelope := &chatpb.InviteKeyEnvelope{
+		Scheme:     chatpb.InviteKeyEnvelope_XCHACHA20POLY1305,
+		Nonce:      randomBytes(24),
+		Ciphertext: randomBytes(48),
+	}
+	var m []byte
+	m = append(m, "flipcash-group-invite-sig-v1"...)
+	m = append(m, chatID.Value...)
+	m = append(m, inviteID.Value...)
+	m = append(m, envelope.Nonce...)
+	m = append(m, envelope.Ciphertext...)
+	envelope.Signature = ed25519.Sign(keys.Private(), m)
+	return envelope
+}
+
+// createInviteRequest is a well-formed CreateInvite for chatID with token,
+// its copy signed by keys: unlimited and never expiring.
+func createInviteRequest(keys model.KeyPair, chatID *commonpb.ChatId, token *chatpb.InviteToken) *chatpb.CreateInviteRequest {
+	return &chatpb.CreateInviteRequest{
+		ChatId:         chatID,
+		InviteToken:    token,
+		KeyEnvelope:    signedInviteKeyEnvelope(keys, chatID, chat.MustDeriveInviteID(token)),
+		SecretEnvelope: inviteSecret(1),
+	}
+}
+
+func (e *serverEnv) sendCreateInvite(keys model.KeyPair, req *chatpb.CreateInviteRequest) (*chatpb.CreateInviteResponse, error) {
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.CreateInvite(e.ctx, req)
+}
+
+func (e *serverEnv) createInvite(keys model.KeyPair, req *chatpb.CreateInviteRequest) *chatpb.CreateInviteResponse {
+	resp, err := e.sendCreateInvite(keys, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// mustCreateInvite creates an unlimited, never-expiring invite to chatID as
+// keys, requiring OK, and returns its token and the invite.
+func (e *serverEnv) mustCreateInvite(keys model.KeyPair, chatID *commonpb.ChatId) (*chatpb.InviteToken, *chatpb.Invite) {
+	token := newInviteToken()
+	resp := e.createInvite(keys, createInviteRequest(keys, chatID, token))
+	require.Equal(e.t, chatpb.CreateInviteResponse_OK, resp.Result)
+	return token, resp.Invite
+}
+
+func (e *serverEnv) getInvite(keys model.KeyPair, token *chatpb.InviteToken) *chatpb.GetInviteResponse {
+	req := &chatpb.GetInviteRequest{InviteToken: token}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.GetInvite(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) getChatInvites(keys model.KeyPair, chatID *commonpb.ChatId, opts *commonpb.QueryOptions) (*chatpb.GetChatInvitesResponse, error) {
+	req := &chatpb.GetChatInvitesRequest{ChatId: chatID, QueryOptions: opts}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.GetChatInvites(e.ctx, req)
+}
+
+func (e *serverEnv) mustGetChatInvites(keys model.KeyPair, chatID *commonpb.ChatId, opts *commonpb.QueryOptions) *chatpb.GetChatInvitesResponse {
+	resp, err := e.getChatInvites(keys, chatID, opts)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// waitForChatInvites reads chatID's invites whole as keys until they are
+// exactly want, in order, with want's statuses and use counts: the listing
+// is read off an index that may trail writes (see
+// chat.Store.GetChatInvitesPage).
+func (e *serverEnv) waitForChatInvites(keys model.KeyPair, chatID *commonpb.ChatId, want ...*chatpb.Invite) []*chatpb.Invite {
+	var got []*chatpb.Invite
+	require.Eventually(e.t, func() bool {
+		resp := e.mustGetChatInvites(keys, chatID, nil)
+		require.Equal(e.t, chatpb.GetChatInvitesResponse_OK, resp.Result)
+		got = resp.Invites
+		if len(got) != len(want) {
+			return false
+		}
+		for i := range want {
+			if !bytes.Equal(want[i].InviteId.Value, got[i].InviteId.Value) || want[i].Status != got[i].Status || want[i].UseCount != got[i].UseCount {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 10*time.Millisecond)
+	return got
+}
+
+func (e *serverEnv) revokeInvite(keys model.KeyPair, chatID *commonpb.ChatId, inviteID *chatpb.InviteId) *chatpb.RevokeInviteResponse {
+	req := &chatpb.RevokeInviteRequest{ChatId: chatID, InviteId: inviteID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.RevokeInvite(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// withStatus is a copy of invite with status, for an invite expected to have
+// moved on since it was returned.
+func withStatus(invite *chatpb.Invite, status chatpb.Invite_Status) *chatpb.Invite {
+	clone := proto.Clone(invite).(*chatpb.Invite)
+	clone.Status = status
+	return clone
+}
+
+// privateGroupViewerState is viewerState for a private group, whose creator,
+// while a member, may also invite (see chat.Chat.PermissionsFor).
+func privateGroupViewerState(version uint64, mute *chatpb.MuteState, isCreator bool) *chatpb.ViewerState {
+	state := viewerState(version, nil, isCreator)
+	state.Settings.Mute = mute
+	state.Permissions.CanInvite = isCreator
+	return state
+}
+
+// testServer_Invite_Create pins a created invite: what CreateInvite returns
+// and stores, limited or not, expiring or not.
+func testServer_Invite_Create(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+
+	// Unlimited and never expiring.
+	before := time.Now()
+	token := newInviteToken()
+	req := createInviteRequest(e.keys, chatID, token)
+	resp := e.createInvite(e.keys, req)
+	require.Equal(t, chatpb.CreateInviteResponse_OK, resp.Result)
+	invite := resp.Invite
+	require.NoError(t, invite.Validate())
+	require.Equal(t, chat.MustDeriveInviteID(token).Value, invite.InviteId.Value)
+	require.Equal(t, chatID.Value, invite.ChatId.Value)
+	require.Equal(t, e.userID.Value, invite.CreatedBy.Value)
+	require.Zero(t, invite.MaxUses)
+	require.Zero(t, invite.UseCount)
+	require.False(t, invite.CreatedAt.AsTime().Before(before))
+	require.False(t, invite.CreatedAt.AsTime().After(time.Now()))
+	require.Nil(t, invite.ExpiresAt)
+	require.Equal(t, chatpb.Invite_ACTIVE, invite.Status)
+	require.True(t, proto.Equal(req.SecretEnvelope, invite.SecretEnvelope))
+
+	// Limited and expiring.
+	expiresAt := time.Now().Add(24 * time.Hour)
+	token = newInviteToken()
+	req = createInviteRequest(e.keys, chatID, token)
+	req.MaxUses = 5
+	req.ExpiresAt = timestamppb.New(expiresAt)
+	req.SecretEnvelope = inviteSecret(9)
+	resp = e.createInvite(e.keys, req)
+	require.Equal(t, chatpb.CreateInviteResponse_OK, resp.Result)
+	limited := resp.Invite
+	require.NoError(t, limited.Validate())
+	require.Equal(t, chat.MustDeriveInviteID(token).Value, limited.InviteId.Value)
+	require.EqualValues(t, 5, limited.MaxUses)
+	require.Zero(t, limited.UseCount)
+	require.True(t, expiresAt.Equal(limited.ExpiresAt.AsTime()))
+	require.Equal(t, chatpb.Invite_ACTIVE, limited.Status)
+	require.True(t, proto.Equal(inviteSecret(9), limited.SecretEnvelope))
+
+	// Both are stored as returned, newest first.
+	listed := e.waitForChatInvites(e.keys, chatID, limited, invite)
+	require.NoError(t, protoutil.ProtoEqualError(limited, listed[0]))
+	require.NoError(t, protoutil.ProtoEqualError(invite, listed[1]))
+
+	// Nothing is published.
+	time.Sleep(100 * time.Millisecond)
+	for _, ev := range e.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, chatID.Value) }) {
+		require.Fail(t, "unexpected chat event", "%v", ev.Event)
+	}
+	for _, ev := range e.userObserver.GetEvents(func(k *commonpb.UserId) bool { return bytes.Equal(k.Value, e.userID.Value) }) {
+		require.Fail(t, "unexpected user event", "%v", ev.Event)
+	}
+}
+
+// testServer_Invite_Gates pins who may create, list and revoke invites: a
+// private group's creator while a member, and no one else of anything else.
+func testServer_Invite_Gates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	memberID, memberKeys := e.addBoundUser("Member")
+	_, strangerKeys := e.addBoundUser("Stranger")
+
+	keyed := e.putKeyedPrivateGroup("Keyed", memberID)
+	_, invite := e.mustCreateInvite(e.keys, keyed)
+
+	requireAllResults := func(keys model.KeyPair, chatID *commonpb.ChatId, create chatpb.CreateInviteResponse_Result, list chatpb.GetChatInvitesResponse_Result, revoke chatpb.RevokeInviteResponse_Result) {
+		t.Helper()
+		require.Equal(t, create, e.createInvite(keys, createInviteRequest(keys, chatID, newInviteToken())).Result)
+		listed := e.mustGetChatInvites(keys, chatID, nil)
+		require.Equal(t, list, listed.Result)
+		require.Empty(t, listed.Invites)
+		require.Equal(t, revoke, e.revokeInvite(keys, chatID, invite.InviteId).Result)
+	}
+	requireAllDenied := func(keys model.KeyPair, chatID *commonpb.ChatId) {
+		t.Helper()
+		requireAllResults(keys, chatID, chatpb.CreateInviteResponse_DENIED, chatpb.GetChatInvitesResponse_DENIED, chatpb.RevokeInviteResponse_DENIED)
+	}
+
+	// A DM, for its members and anyone; a public group, its creator included.
+	dm := e.putDM(at(1))
+	requireAllDenied(e.keys, dm)
+	requireAllDenied(strangerKeys, dm)
+	public := e.putGroup("Public", at(1), memberID)
+	requireAllDenied(e.keys, public)
+	requireAllDenied(memberKeys, public)
+
+	// A group that does not exist.
+	missing := chat.MustGenerateGroupChatID()
+	requireAllResults(e.keys, missing, chatpb.CreateInviteResponse_NOT_FOUND, chatpb.GetChatInvitesResponse_NOT_FOUND, chatpb.RevokeInviteResponse_NOT_FOUND)
+
+	// A member who is not the creator, and a stranger.
+	requireAllDenied(memberKeys, keyed)
+	requireAllDenied(strangerKeys, keyed)
+
+	// A keyless private group: its creator lists and revokes (there is
+	// nothing to revoke), but creates nothing.
+	keyless := e.putPrivateGroup("Keyless", memberID)
+	requireAllResults(e.keys, keyless, chatpb.CreateInviteResponse_DENIED, chatpb.GetChatInvitesResponse_OK, chatpb.RevokeInviteResponse_NOT_FOUND)
+
+	// A creator who has left does nothing until they rejoin, and their invite
+	// is still there when they do.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, keyed).Result)
+	requireAllDenied(e.keys, keyed)
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, keyed).Result)
+	e.waitForChatInvites(e.keys, keyed, invite)
+	_, again := e.mustCreateInvite(e.keys, keyed)
+	e.waitForChatInvites(e.keys, keyed, again, invite)
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, keyed, invite.InviteId).Result)
+
+	// While invites are being rolled out, a creator who is not staff creates
+	// nothing, but still lists and revokes what they made.
+	e.accounts.setStaff(e.userID, false)
+	require.Equal(t, chatpb.CreateInviteResponse_DENIED, e.createInvite(e.keys, createInviteRequest(e.keys, keyed, newInviteToken())).Result)
+	e.waitForChatInvites(e.keys, keyed, again, withStatus(invite, chatpb.Invite_REVOKED))
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, keyed, again.InviteId).Result)
+	e.accounts.setStaff(e.userID, true)
+
+	// A caller with no account key bound cannot have a copy checked: every
+	// registered user has one, so its absence is an internal failure.
+	noKeyID, noKeyKeys := e.addUser()
+	e.accounts.setStaff(noKeyID, true)
+	noKeyGroup := chat.MustGenerateGroupChatID()
+	require.NoError(t, e.store.PutChat(e.ctx, &chat.Chat{
+		ID:           noKeyGroup,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{noKeyID},
+		Title:        "No Key",
+		IsPrivate:    true,
+		CreatorID:    noKeyID,
+		LastActivity: at(1),
+	}))
+	_, err := e.store.SetKeyEnvelope(e.ctx, noKeyGroup, noKeyID, chat.KeyEnvelopeFromProto(keyEnvelopeProto(1), noKeyID))
+	require.NoError(t, err)
+	_, err = e.sendCreateInvite(noKeyKeys, createInviteRequest(noKeyKeys, noKeyGroup, newInviteToken()))
+	require.Equal(t, codes.Internal, status.Code(err))
+}
+
+// testServer_Invite_ExpiresAt pins the bounds on an invite's expiry: after
+// now, and at most chat.MaxInviteDuration away.
+func testServer_Invite_ExpiresAt(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+
+	create := func(expiresAt time.Time) *chatpb.CreateInviteResponse {
+		t.Helper()
+		req := createInviteRequest(e.keys, chatID, newInviteToken())
+		req.ExpiresAt = timestamppb.New(expiresAt)
+		return e.createInvite(e.keys, req)
+	}
+
+	for name, expiresAt := range map[string]time.Time{
+		"past":   time.Now().Add(-time.Hour),
+		"now":    time.Now(),
+		"beyond": time.Now().Add(chat.MaxInviteDuration + time.Minute),
+	} {
+		resp := create(expiresAt)
+		require.Equal(t, chatpb.CreateInviteResponse_INVALID_EXPIRES_AT, resp.Result, name)
+		require.Nil(t, resp.Invite, name)
+	}
+
+	// The bound itself, measured from before the server's own now, and just
+	// inside it.
+	for _, expiresAt := range []time.Time{
+		time.Now().Add(chat.MaxInviteDuration),
+		time.Now().Add(chat.MaxInviteDuration - time.Minute),
+		time.Now().Add(time.Minute),
+	} {
+		resp := create(expiresAt)
+		require.Equal(t, chatpb.CreateInviteResponse_OK, resp.Result)
+		require.True(t, expiresAt.Equal(resp.Invite.ExpiresAt.AsTime()))
+	}
+}
+
+// testServer_Invite_Signature pins that a copy is accepted only with a
+// signature by the caller's account key over this chat, this invite's ID and
+// the copy as sent.
+func testServer_Invite_Signature(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+	other := e.putKeyedPrivateGroup("Other")
+
+	for name, mutate := range map[string]func(req *chatpb.CreateInviteRequest){
+		"another key": func(req *chatpb.CreateInviteRequest) {
+			req.KeyEnvelope = signedInviteKeyEnvelope(model.MustGenerateKeyPair(), chatID, chat.MustDeriveInviteID(req.InviteToken))
+		},
+		"another chat": func(req *chatpb.CreateInviteRequest) {
+			req.KeyEnvelope = signedInviteKeyEnvelope(e.keys, other, chat.MustDeriveInviteID(req.InviteToken))
+		},
+		"another invite": func(req *chatpb.CreateInviteRequest) {
+			req.KeyEnvelope = signedInviteKeyEnvelope(e.keys, chatID, chat.MustDeriveInviteID(newInviteToken()))
+		},
+		"tampered ciphertext": func(req *chatpb.CreateInviteRequest) {
+			req.KeyEnvelope.Ciphertext[0] ^= 1
+		},
+		"tampered nonce": func(req *chatpb.CreateInviteRequest) {
+			req.KeyEnvelope.Nonce[23] ^= 1
+		},
+	} {
+		req := createInviteRequest(e.keys, chatID, newInviteToken())
+		mutate(req)
+		resp := e.createInvite(e.keys, req)
+		require.Equal(t, chatpb.CreateInviteResponse_INVALID_SIGNATURE, resp.Result, name)
+		require.Nil(t, resp.Invite, name)
+	}
+
+	// Nothing was stored for any of them.
+	time.Sleep(100 * time.Millisecond)
+	require.Empty(t, e.mustGetChatInvites(e.keys, chatID, nil).Invites)
+}
+
+// testServer_Invite_Cap pins the cap on a chat's ACTIVE invites: a create
+// past it is refused, a revoke frees a place, and a retry of an invite that
+// exists is never refused at it.
+func testServer_Invite_Cap(t *testing.T, s chat.Store) {
+	e := newServerEnvWithConfig(t, s, serverConfig{maxActiveInvites: 2})
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+
+	firstToken, first := e.mustCreateInvite(e.keys, chatID)
+	_, second := e.mustCreateInvite(e.keys, chatID)
+	refused := e.createInvite(e.keys, createInviteRequest(e.keys, chatID, newInviteToken()))
+	require.Equal(t, chatpb.CreateInviteResponse_TOO_MANY_INVITES, refused.Result)
+	require.Nil(t, refused.Invite)
+
+	// Another chat's cap is its own.
+	e.mustCreateInvite(e.keys, e.putKeyedPrivateGroup("Other"))
+
+	// A retry at the cap is answered from the invite it made.
+	retried := e.createInvite(e.keys, createInviteRequest(e.keys, chatID, firstToken))
+	require.Equal(t, chatpb.CreateInviteResponse_OK, retried.Result)
+	require.NoError(t, protoutil.ProtoEqualError(first, retried.Invite))
+
+	// A revoke frees a place, once the count the cap reads catches up with
+	// it (see chat.Store.CreateInvite); a refusal writes nothing, so the
+	// create is simply asked again.
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, second.InviteId).Result)
+	req := createInviteRequest(e.keys, chatID, newInviteToken())
+	require.Eventually(t, func() bool {
+		resp := e.createInvite(e.keys, req)
+		if resp.Result == chatpb.CreateInviteResponse_TOO_MANY_INVITES {
+			return false
+		}
+		require.Equal(t, chatpb.CreateInviteResponse_OK, resp.Result)
+		return true
+	}, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, chatpb.CreateInviteResponse_TOO_MANY_INVITES, e.createInvite(e.keys, createInviteRequest(e.keys, chatID, newInviteToken())).Result)
+}
+
+// testServer_Invite_Retry pins that a token names one invite: a retry by its
+// creator for its chat gets the invite the first attempt made, whatever else
+// it carries and whatever the invite's status, and anyone else, or any other
+// chat, is DENIED.
+func testServer_Invite_Retry(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+	other := e.putKeyedPrivateGroup("Other")
+	otherCreatorID, otherCreatorKeys := e.addBoundUser("Other Creator")
+	theirs := chat.MustGenerateGroupChatID()
+	require.NoError(t, e.store.PutChat(e.ctx, &chat.Chat{
+		ID:           theirs,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{otherCreatorID},
+		Title:        "Theirs",
+		IsPrivate:    true,
+		CreatorID:    otherCreatorID,
+		LastActivity: at(1),
+	}))
+	_, err := e.store.SetKeyEnvelope(e.ctx, theirs, otherCreatorID, chat.KeyEnvelopeFromProto(keyEnvelopeProto(1), otherCreatorID))
+	require.NoError(t, err)
+
+	token, first := e.mustCreateInvite(e.keys, chatID)
+
+	// The same token with every other field changed.
+	changed := createInviteRequest(e.keys, chatID, token)
+	changed.MaxUses = 7
+	changed.ExpiresAt = timestamppb.New(time.Now().Add(time.Hour))
+	changed.SecretEnvelope = inviteSecret(5)
+	retried := e.createInvite(e.keys, changed)
+	require.Equal(t, chatpb.CreateInviteResponse_OK, retried.Result)
+	require.NoError(t, protoutil.ProtoEqualError(first, retried.Invite))
+
+	// Even one whose copy would not verify: the lookup comes first.
+	unsigned := createInviteRequest(e.keys, chatID, token)
+	unsigned.KeyEnvelope.Ciphertext[0] ^= 1
+	retried = e.createInvite(e.keys, unsigned)
+	require.Equal(t, chatpb.CreateInviteResponse_OK, retried.Result)
+	require.NoError(t, protoutil.ProtoEqualError(first, retried.Invite))
+
+	// And whether or not the caller is still staff.
+	e.accounts.setStaff(e.userID, false)
+	retried = e.createInvite(e.keys, createInviteRequest(e.keys, chatID, token))
+	require.Equal(t, chatpb.CreateInviteResponse_OK, retried.Result)
+	require.NoError(t, protoutil.ProtoEqualError(first, retried.Invite))
+	e.accounts.setStaff(e.userID, true)
+
+	// The same token for another chat, by its creator or anyone else's.
+	require.Equal(t, chatpb.CreateInviteResponse_DENIED, e.createInvite(e.keys, createInviteRequest(e.keys, other, token)).Result)
+	require.Equal(t, chatpb.CreateInviteResponse_DENIED, e.createInvite(otherCreatorKeys, createInviteRequest(otherCreatorKeys, theirs, token)).Result)
+
+	// The same token by another user for the same chat.
+	require.Equal(t, chatpb.CreateInviteResponse_DENIED, e.createInvite(otherCreatorKeys, createInviteRequest(otherCreatorKeys, chatID, token)).Result)
+
+	// A revoked invite is still the one a retry gets, now REVOKED.
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, first.InviteId).Result)
+	retried = e.createInvite(e.keys, createInviteRequest(e.keys, chatID, token))
+	require.Equal(t, chatpb.CreateInviteResponse_OK, retried.Result)
+	require.NoError(t, protoutil.ProtoEqualError(withStatus(first, chatpb.Invite_REVOKED), retried.Invite))
+
+	// Even once its creator has left the chat.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	retried = e.createInvite(e.keys, createInviteRequest(e.keys, chatID, token))
+	require.Equal(t, chatpb.CreateInviteResponse_OK, retried.Result)
+	require.NoError(t, protoutil.ProtoEqualError(withStatus(first, chatpb.Invite_REVOKED), retried.Invite))
+}
+
+// testServer_Invite_Get pins the preview of an invite: the chat as the caller
+// sees it with GetChat, the invite's status and nothing else of it, and
+// BANNED alone for a user banned from the chat.
+func testServer_Invite_Get(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	_, strangerKeys := e.addBoundUser("Stranger")
+	bannedID, bannedKeys := e.addBoundUser("Banned")
+	joinerID, _ := e.addBoundUser("Joiner")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+
+	// No invite has the ID of a token never used.
+	unknown := e.getInvite(strangerKeys, newInviteToken())
+	require.Equal(t, chatpb.GetInviteResponse_NOT_FOUND, unknown.Result)
+	require.Nil(t, unknown.Chat)
+
+	token, invite := e.mustCreateInvite(e.keys, chatID)
+
+	// The creator sees the chat as a member does.
+	resp := e.getInvite(e.keys, token)
+	require.Equal(t, chatpb.GetInviteResponse_OK, resp.Result)
+	require.Equal(t, chatpb.Invite_ACTIVE, resp.Status)
+	require.NoError(t, protoutil.ProtoEqualError(e.getChat(e.keys, chatID).Metadata, resp.Chat))
+	require.NoError(t, protoutil.ProtoEqualError(privateGroupViewerState(0, nil, true), resp.Chat.ViewerState))
+	require.Len(t, resp.Chat.Members, 1)
+
+	// A stranger sees the record, not waiting in its lobby, and then waiting.
+	resp = e.getInvite(strangerKeys, token)
+	require.Equal(t, chatpb.GetInviteResponse_OK, resp.Result)
+	require.Equal(t, chatpb.Invite_ACTIVE, resp.Status)
+	require.NoError(t, protoutil.ProtoEqualError(e.getChat(strangerKeys, chatID).Metadata, resp.Chat))
+	require.Equal(t, chatID.Value, resp.Chat.ChatId.Value)
+	require.True(t, resp.Chat.IsPrivate)
+	require.Empty(t, resp.Chat.Members)
+	require.Nil(t, resp.Chat.ViewerState)
+	require.False(t, resp.Chat.InLobby)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(strangerKeys, chatID).Result)
+	resp = e.getInvite(strangerKeys, token)
+	require.Equal(t, chatpb.GetInviteResponse_OK, resp.Result)
+	require.True(t, resp.Chat.InLobby)
+
+	// Looking counts no use.
+	e.waitForChatInvites(e.keys, chatID, invite)
+
+	// A user banned from the chat gets BANNED and nothing else.
+	require.Equal(t, chatpb.BanUserResponse_OK, e.mustBanUser(e.keys, chatID, bannedID))
+	banned := e.getInvite(bannedKeys, token)
+	require.Equal(t, chatpb.GetInviteResponse_BANNED, banned.Result)
+	require.Nil(t, banned.Chat)
+	require.Equal(t, chatpb.Invite_UNKNOWN, banned.Status)
+
+	// An invite used up reads EXHAUSTED.
+	limitedToken := newInviteToken()
+	limitedReq := createInviteRequest(e.keys, chatID, limitedToken)
+	limitedReq.MaxUses = 1
+	limited := e.createInvite(e.keys, limitedReq)
+	require.Equal(t, chatpb.CreateInviteResponse_OK, limited.Result)
+	_, err := e.store.JoinWithInvite(e.ctx, chatID, joinerID, limited.Invite.InviteId, inviteSecret(3), time.Now())
+	require.NoError(t, err)
+	require.Equal(t, chatpb.Invite_EXHAUSTED, e.getInvite(strangerKeys, limitedToken).Status)
+
+	// An invite past its expiry reads EXPIRED. Written through the store,
+	// which takes an expiry in the past, so the read is deterministic.
+	expiredToken := newInviteToken()
+	expiresAt := time.Now().Add(-time.Minute)
+	_, created, err := e.store.CreateInvite(e.ctx, chat.Invite{
+		ID:             chat.MustDeriveInviteID(expiredToken),
+		ChatID:         chatID,
+		CreatedBy:      e.userID,
+		CreatedAt:      time.Now().Add(-time.Hour),
+		ExpiresAt:      &expiresAt,
+		SecretEnvelope: inviteSecret(1),
+	}, signedInviteKeyEnvelope(e.keys, chatID, chat.MustDeriveInviteID(expiredToken)), chat.MaxActiveInvites, time.Now())
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, chatpb.Invite_EXPIRED, e.getInvite(strangerKeys, expiredToken).Status)
+
+	// A revoked invite reads REVOKED, to anyone.
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, invite.InviteId).Result)
+	require.Equal(t, chatpb.Invite_REVOKED, e.getInvite(strangerKeys, token).Status)
+	require.Equal(t, chatpb.Invite_REVOKED, e.getInvite(e.keys, token).Status)
+}
+
+// testServer_Invite_List pins GetChatInvites: every invite, newest first,
+// whatever its status, with its use count and secret envelope, paged with a
+// token bound to the chat.
+func testServer_Invite_List(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	joinerID, _ := e.addBoundUser("Joiner")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+	other := e.putKeyedPrivateGroup("Other")
+
+	// Five invites, created in order, each with its own secret envelope.
+	const n = 5
+	invites := make([]*chatpb.Invite, n)
+	for i := range n {
+		req := createInviteRequest(e.keys, chatID, newInviteToken())
+		req.SecretEnvelope = inviteSecret(byte(10 + i))
+		if i == 1 {
+			req.MaxUses = 3
+		}
+		resp := e.createInvite(e.keys, req)
+		require.Equal(t, chatpb.CreateInviteResponse_OK, resp.Result)
+		invites[i] = resp.Invite
+		time.Sleep(2 * time.Millisecond)
+	}
+	newestFirst := make([]*chatpb.Invite, n)
+	for i := range n {
+		newestFirst[i] = invites[n-1-i]
+	}
+	listed := e.waitForChatInvites(e.keys, chatID, newestFirst...)
+	for i := range n {
+		require.NoError(t, protoutil.ProtoEqualError(newestFirst[i], listed[i]), i)
+		require.True(t, proto.Equal(inviteSecret(byte(10+n-1-i)), listed[i].SecretEnvelope), i)
+	}
+
+	// A revoked invite and a used one are listed with their status and
+	// count.
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, invites[3].InviteId).Result)
+	_, err := e.store.JoinWithInvite(e.ctx, chatID, joinerID, invites[1].InviteId, inviteSecret(3), time.Now())
+	require.NoError(t, err)
+	used := proto.Clone(invites[1]).(*chatpb.Invite)
+	used.UseCount = 1
+	newestFirst[1] = withStatus(invites[3], chatpb.Invite_REVOKED)
+	newestFirst[3] = used
+	listed = e.waitForChatInvites(e.keys, chatID, newestFirst...)
+	for i := range n {
+		require.NoError(t, protoutil.ProtoEqualError(newestFirst[i], listed[i]), i)
+	}
+
+	// Pages of two, with no repeats or gaps and an exact has_more.
+	var pages [][][]byte
+	var token *commonpb.PagingToken
+	for {
+		resp := e.mustGetChatInvites(e.keys, chatID, &commonpb.QueryOptions{PageSize: 2, PagingToken: token})
+		require.Equal(t, chatpb.GetChatInvitesResponse_OK, resp.Result)
+		var ids [][]byte
+		for _, invite := range resp.Invites {
+			ids = append(ids, invite.InviteId.Value)
+		}
+		pages = append(pages, ids)
+		if !resp.HasMore {
+			require.Nil(t, resp.PagingToken)
+			break
+		}
+		require.NotNil(t, resp.PagingToken)
+		token = resp.PagingToken
+	}
+	require.Equal(t, [][][]byte{
+		{invites[4].InviteId.Value, invites[3].InviteId.Value},
+		{invites[2].InviteId.Value, invites[1].InviteId.Value},
+		{invites[0].InviteId.Value},
+	}, pages)
+
+	// A page that ends exactly at the last invite has no more.
+	whole := e.mustGetChatInvites(e.keys, chatID, &commonpb.QueryOptions{PageSize: n})
+	require.Len(t, whole.Invites, n)
+	require.False(t, whole.HasMore)
+	require.Nil(t, whole.PagingToken)
+
+	// The token is the chat's: replayed into another chat it is refused, as
+	// is a malformed one.
+	first := e.mustGetChatInvites(e.keys, chatID, &commonpb.QueryOptions{PageSize: 2})
+	require.True(t, first.HasMore)
+	_, err = e.getChatInvites(e.keys, other, &commonpb.QueryOptions{PagingToken: first.PagingToken})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = e.getChatInvites(e.keys, chatID, &commonpb.QueryOptions{PagingToken: &commonpb.PagingToken{Value: []byte{1, 2, 3}}})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	// The other chat has none.
+	empty := e.mustGetChatInvites(e.keys, other, nil)
+	require.Equal(t, chatpb.GetChatInvitesResponse_OK, empty.Result)
+	require.Empty(t, empty.Invites)
+	require.False(t, empty.HasMore)
+}
+
+// testServer_Invite_Revoke pins RevokeInvite: the chat's invite alone, a
+// repeat the OK no-op, and the revoke seen in the preview and the listing.
+func testServer_Invite_Revoke(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	_, strangerKeys := e.addBoundUser("Stranger")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+	other := e.putKeyedPrivateGroup("Other")
+
+	token, invite := e.mustCreateInvite(e.keys, chatID)
+	_, otherInvite := e.mustCreateInvite(e.keys, other)
+
+	// An ID no invite has, and another chat's invite.
+	require.Equal(t, chatpb.RevokeInviteResponse_NOT_FOUND, e.revokeInvite(e.keys, chatID, chat.MustDeriveInviteID(newInviteToken())).Result)
+	require.Equal(t, chatpb.RevokeInviteResponse_NOT_FOUND, e.revokeInvite(e.keys, chatID, otherInvite.InviteId).Result)
+	require.Equal(t, chatpb.Invite_ACTIVE, e.getInvite(strangerKeys, token).Status)
+
+	// Revoked, then again.
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, invite.InviteId).Result)
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, invite.InviteId).Result)
+	require.Equal(t, chatpb.Invite_REVOKED, e.getInvite(strangerKeys, token).Status)
+	listed := e.waitForChatInvites(e.keys, chatID, withStatus(invite, chatpb.Invite_REVOKED))
+	require.NoError(t, protoutil.ProtoEqualError(withStatus(invite, chatpb.Invite_REVOKED), listed[0]))
+
+	// The other chat's invite is untouched.
+	e.waitForChatInvites(e.keys, other, otherInvite)
+}
+
+// testServer_Invite_Permissions pins can_invite on ViewerState: a private
+// group's creator while a member, and no one else.
+func testServer_Invite_Permissions(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	memberID, memberKeys := e.addUser()
+	private := e.putKeyedPrivateGroup("Private", memberID)
+	public := e.putOwnedGroup("Public", nil, memberID)
+
+	require.NoError(t, protoutil.ProtoEqualError(privateGroupViewerState(0, nil, true), e.getChat(e.keys, private).Metadata.ViewerState))
+	require.True(t, e.getChat(e.keys, private).Metadata.ViewerState.Permissions.CanInvite)
+	require.NoError(t, protoutil.ProtoEqualError(privateGroupViewerState(0, nil, false), e.getChat(memberKeys, private).Metadata.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, e.getChat(memberKeys, private).Metadata.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(viewerState(0, nil, true), e.getChat(e.keys, public).Metadata.ViewerState))
+	require.False(t, e.getChat(e.keys, public).Metadata.ViewerState.Permissions.CanInvite)
+
+	// A creator who leaves may not invite, and is shown no state at all.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, private).Result)
+	require.Nil(t, e.getChat(e.keys, private).Metadata.ViewerState)
+	rejoined := e.mustJoinChat(e.keys, private)
+	require.Equal(t, chatpb.JoinChatResponse_OK, rejoined.Result)
+	require.True(t, rejoined.Chat.ViewerState.Permissions.CanInvite)
+}
+
+// joinChatWithInvite is a JoinChat of chatID as keys passing the invite
+// token and the joiner's secret envelope.
+func (e *serverEnv) joinChatWithInvite(keys model.KeyPair, chatID *commonpb.ChatId, token *chatpb.InviteToken, secret *chatpb.InviteSecretEnvelope) *chatpb.JoinChatResponse {
+	req := &chatpb.JoinChatRequest{
+		ChatId: chatID,
+		Invite: &chatpb.JoinChatRequest_InviteParameters{InviteToken: token, SecretEnvelope: secret},
+	}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.JoinChat(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// createInviteWithCopy creates an invite to chatID as keys, unlimited and
+// never expiring unless maxUses is set, requiring OK, and returns its token,
+// the signed copy of the chat key it carries, and the invite.
+func (e *serverEnv) createInviteWithCopy(keys model.KeyPair, chatID *commonpb.ChatId, maxUses uint32) (*chatpb.InviteToken, *chatpb.InviteKeyEnvelope, *chatpb.Invite) {
+	token := newInviteToken()
+	req := createInviteRequest(keys, chatID, token)
+	req.MaxUses = maxUses
+	resp := e.createInvite(keys, req)
+	require.Equal(e.t, chatpb.CreateInviteResponse_OK, resp.Result)
+	return token, req.KeyEnvelope, resp.Invite
+}
+
+// requireInviteUseCount asserts the invite's use count as the store holds
+// it, read strongly consistent.
+func (e *serverEnv) requireInviteUseCount(inviteID *chatpb.InviteId, want uint32) {
+	e.t.Helper()
+	invite, err := e.store.GetInvite(e.ctx, inviteID)
+	require.NoError(e.t, err)
+	require.Equal(e.t, want, invite.UseCount)
+}
+
+// requireNotMember asserts that userID is not a member of chatID and holds
+// no key envelope for it.
+func (e *serverEnv) requireNotMember(chatID *commonpb.ChatId, userID *commonpb.UserId) {
+	e.t.Helper()
+	isMember, err := e.store.IsMember(e.ctx, chatID, userID)
+	require.NoError(e.t, err)
+	require.False(e.t, isMember)
+	_, err = e.store.GetKeyEnvelope(e.ctx, chatID, userID)
+	require.ErrorIs(e.t, err, chat.ErrKeyEnvelopeNotFound)
+}
+
+// withUseCount is a copy of invite with useCount, for an invite expected to
+// have been used since it was returned.
+func withUseCount(invite *chatpb.Invite, useCount uint32) *chatpb.Invite {
+	clone := proto.Clone(invite).(*chatpb.Invite)
+	clone.UseCount = useCount
+	return clone
+}
+
+// requireInviteKeyBundle asserts that resp is an OK GetKeyEnvelope holding
+// an invite's copy and nothing else: the invite inviteID's copy exactly as
+// created, signed by the creator whose key resp reports, with the joiner's
+// secret envelope exactly as sent.
+func requireInviteKeyBundle(t *testing.T, resp *chatpb.GetKeyEnvelopeResponse, chatID *commonpb.ChatId, inviteID *chatpb.InviteId, keyCopy *chatpb.InviteKeyEnvelope, secret *chatpb.InviteSecretEnvelope, creatorID *commonpb.UserId, creatorKeys model.KeyPair) {
+	t.Helper()
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, resp.Result)
+	require.NoError(t, resp.Validate())
+	require.Nil(t, resp.GetKeyEnvelope())
+	bundle := resp.GetInviteKeyBundle()
+	require.NotNil(t, bundle)
+	require.Equal(t, inviteID.Value, bundle.InviteId.Value)
+	require.True(t, proto.Equal(keyCopy, bundle.KeyEnvelope))
+	require.True(t, proto.Equal(secret, bundle.SecretEnvelope))
+	require.Equal(t, creatorID.Value, resp.WrappedBy.Value)
+	require.True(t, proto.Equal(creatorKeys.Proto(), resp.WrappedByPublicKey))
+	require.True(t, chat.VerifyInviteSignature(resp.WrappedByPublicKey, chatID, bundle.InviteId, bundle.KeyEnvelope))
+}
+
+// testServer_InviteJoin pins a join with an invite end to end: previewed,
+// joined, the member's metadata returned, the invite's copy and the joiner's
+// secret fetched as invite_key_bundle, then replaced by the joiner's own
+// envelope, and the use counted.
+func testServer_InviteJoin(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	joinerID, joinerKeys := e.addBoundUser("Joiner")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+	token, keyCopy, invite := e.createInviteWithCopy(e.keys, chatID, 0)
+
+	// Previewed by a stranger.
+	preview := e.getInvite(joinerKeys, token)
+	require.Equal(t, chatpb.GetInviteResponse_OK, preview.Result)
+	require.Equal(t, chatpb.Invite_ACTIVE, preview.Status)
+
+	// Joined, and shown the chat as a member.
+	secret := inviteSecret(7)
+	joined := e.joinChatWithInvite(joinerKeys, chatID, token, secret)
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	require.Equal(t, chatID.Value, joined.Chat.ChatId.Value)
+	require.True(t, joined.Chat.IsPrivate)
+	require.False(t, joined.Chat.InLobby)
+	require.Len(t, joined.Chat.Members, 1)
+	require.Equal(t, joinerID.Value, joined.Chat.Members[0].UserId.Value)
+	require.NoError(t, protoutil.ProtoEqualError(privateGroupViewerState(0, nil, false), joined.Chat.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2, Version: 1}, joined.Chat.RosterSummary))
+	isMember, err := s.IsMember(e.ctx, chatID, joinerID)
+	require.NoError(t, err)
+	require.True(t, isMember)
+
+	// The invite's copy and the joiner's secret, as invite_key_bundle.
+	requireInviteKeyBundle(t, e.mustGetKeyEnvelope(joinerKeys, chatID), chatID, invite.InviteId, keyCopy, secret, e.userID, e.keys)
+
+	// The joiner replaces the copy with their own envelope, which then
+	// stands.
+	own := keyEnvelopeProto(8)
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_OK, e.mustSetKeyEnvelope(joinerKeys, chatID, own).Result)
+	envelope := e.mustGetKeyEnvelope(joinerKeys, chatID)
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, envelope.Result)
+	require.NoError(t, envelope.Validate())
+	require.Nil(t, envelope.GetInviteKeyBundle())
+	require.True(t, proto.Equal(own, envelope.GetKeyEnvelope()))
+	require.Equal(t, joinerID.Value, envelope.WrappedBy.Value)
+	require.True(t, proto.Equal(joinerKeys.Proto(), envelope.WrappedByPublicKey))
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_ALREADY_SET, e.mustSetKeyEnvelope(joinerKeys, chatID, keyEnvelopeProto(9)).Result)
+
+	// One use counted.
+	e.waitForChatInvites(e.keys, chatID, withUseCount(invite, 1))
+	e.requireInviteUseCount(invite.InviteId, 1)
+}
+
+// testServer_InviteJoin_Announcements pins how a join with an invite is
+// announced: as an admission is, with the UserJoined message naming the
+// invite's creator, a MemberLeft to the creator only when the joiner was
+// waiting in the lobby, and no push to anyone.
+func testServer_InviteJoin_Announcements(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+	token, _, _ := e.createInviteWithCopy(e.keys, chatID, 0)
+
+	// A joiner who was not waiting.
+	joinerID, joinerKeys := e.addBoundUser("Joiner")
+	joined := e.joinChatWithInvite(joinerKeys, chatID, token, inviteSecret(1))
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	summary := &chatpb.RosterSummary{MemberCount: 2, Version: 1}
+	require.NoError(t, protoutil.ProtoEqualError(summary, joined.Chat.RosterSummary))
+
+	e.waitForRosterUpdates(joinerID, chatID, 1)
+	onChat, excludes := e.rosterUpdatesOnChatTopic(chatID)
+	require.Len(t, onChat, 1)
+	require.NotNil(t, onChat[0].GetMembershipChanged())
+	require.NoError(t, protoutil.ProtoEqualError(summary, onChat[0].RosterSummary))
+	require.Len(t, excludes[0], 1)
+	require.Equal(t, joinerID.Value, excludes[0][0].Value)
+	toJoiner := e.rosterUpdatesOnUserTopic(joinerID, chatID)
+	require.Len(t, toJoiner, 1)
+	memberJoined := toJoiner[0].GetMemberJoined()
+	require.NotNil(t, memberJoined)
+	require.Equal(t, joinerID.Value, memberJoined.Member.UserId.Value)
+	require.Equal(t, "Joiner", memberJoined.Member.UserProfile.DisplayName)
+	require.NotNil(t, memberJoined.Member.JoinedAt)
+	require.Equal(t, uint64(1), memberJoined.Member.Version)
+	require.NoError(t, protoutil.ProtoEqualError(joined.Chat, memberJoined.Metadata))
+	require.NoError(t, protoutil.ProtoEqualError(summary, toJoiner[0].RosterSummary))
+
+	calls := e.systemMessages.userJoinedCalls(chatID)
+	require.Len(t, calls, 1)
+	requireUserJoinedCall(t, calls[0], joinerID, chat.InvitedBy(e.userID), 1)
+
+	// Nothing to the creator: no lobby update and no push.
+	time.Sleep(100 * time.Millisecond)
+	require.Empty(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID))
+	require.Empty(t, e.pusher.pushesTo(e.userID))
+	require.Empty(t, e.pusher.pushesTo(joinerID))
+
+	// A joiner who was waiting leaves the lobby in the same step, and the
+	// creator hears it as for an admission; still nobody is pushed for the
+	// join, the creator only for the entry.
+	waitingID, waitingKeys := e.addBoundUser("Waiting")
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(waitingKeys, chatID).Result)
+	e.waitForLobbyUpdates(e.userID, chatID, 1)
+	e.waitForPushes(e.userID, 1)
+	require.True(t, e.getChat(waitingKeys, chatID).Metadata.InLobby)
+
+	joined = e.joinChatWithInvite(waitingKeys, chatID, token, inviteSecret(2))
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	require.False(t, joined.Chat.InLobby)
+	require.False(t, e.getChat(waitingKeys, chatID).Metadata.InLobby)
+	updates := e.waitForLobbyUpdates(e.userID, chatID, 2)
+	require.Len(t, updates, 2)
+	require.Equal(t, waitingID.Value, updates[1].GetMemberLeft().GetUserId().GetValue())
+	e.requireNoLobbyUpdatesOnChatTopic(chatID)
+	empty, err := e.getLobbyMembers(e.keys, chatID, nil)
+	require.NoError(t, err)
+	require.Empty(t, empty.Members)
+	entries, err := s.GetLobbyEntries(e.ctx, waitingID, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	require.Empty(t, entries)
+
+	calls = e.systemMessages.userJoinedCalls(chatID)
+	require.Len(t, calls, 2)
+	requireUserJoinedCall(t, calls[1], waitingID, chat.InvitedBy(e.userID), joined.Chat.RosterSummary.Version)
+
+	time.Sleep(100 * time.Millisecond)
+	require.Len(t, e.pusher.pushesTo(e.userID), 1)
+	require.Empty(t, e.pusher.pushesTo(waitingID))
+}
+
+// testServer_InviteJoin_NoOps pins that a member's JoinChat is the no-op
+// whatever invite it carries, the same, a revoked one, an unknown token or
+// one to another chat: OK, nothing announced, no use counted and their
+// envelope untouched.
+func testServer_InviteJoin_NoOps(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	joinerID, joinerKeys := e.addBoundUser("Joiner")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+	other := e.putKeyedPrivateGroup("Other")
+	token, _, invite := e.createInviteWithCopy(e.keys, chatID, 0)
+	revokedToken, _, revoked := e.createInviteWithCopy(e.keys, chatID, 0)
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, revoked.InviteId).Result)
+	otherToken, _, otherInvite := e.createInviteWithCopy(e.keys, other, 0)
+
+	joined := e.joinChatWithInvite(joinerKeys, chatID, token, inviteSecret(1))
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	e.waitForRosterUpdates(joinerID, chatID, 1)
+
+	// Set in between, so a write of the copy over it would show.
+	own := keyEnvelopeProto(8)
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_OK, e.mustSetKeyEnvelope(joinerKeys, chatID, own).Result)
+
+	for name, again := range map[string]*chatpb.JoinChatResponse{
+		"same invite":       e.joinChatWithInvite(joinerKeys, chatID, token, inviteSecret(2)),
+		"revoked invite":    e.joinChatWithInvite(joinerKeys, chatID, revokedToken, inviteSecret(2)),
+		"unknown token":     e.joinChatWithInvite(joinerKeys, chatID, newInviteToken(), inviteSecret(2)),
+		"other chat invite": e.joinChatWithInvite(joinerKeys, chatID, otherToken, inviteSecret(2)),
+		"no invite":         e.mustJoinChat(joinerKeys, chatID),
+	} {
+		require.Equal(t, chatpb.JoinChatResponse_OK, again.Result, name)
+		require.Equal(t, chatID.Value, again.Chat.ChatId.Value, name)
+		require.NoError(t, protoutil.ProtoEqualError(joined.Chat.RosterSummary, again.Chat.RosterSummary), name)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	onChat, _ := e.rosterUpdatesOnChatTopic(chatID)
+	require.Len(t, onChat, 1)
+	require.Len(t, e.rosterUpdatesOnUserTopic(joinerID, chatID), 1)
+	require.Len(t, e.systemMessages.userJoinedCalls(chatID), 1)
+	require.Empty(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID))
+	e.requireInviteUseCount(invite.InviteId, 1)
+	e.requireInviteUseCount(revoked.InviteId, 0)
+	e.requireInviteUseCount(otherInvite.InviteId, 0)
+	envelope := e.mustGetKeyEnvelope(joinerKeys, chatID)
+	require.True(t, proto.Equal(own, envelope.GetKeyEnvelope()))
+	require.Equal(t, joinerID.Value, envelope.WrappedBy.Value)
+	e.requireNotMember(other, joinerID)
+}
+
+// testServer_InviteJoin_Rejoin pins a return with the same invite: the
+// departure discards the envelope, and the return is a join like the first,
+// counting another use, storing the copy again and writing its own
+// UserJoined.
+func testServer_InviteJoin_Rejoin(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	joinerID, joinerKeys := e.addBoundUser("Joiner")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+	token, keyCopy, invite := e.createInviteWithCopy(e.keys, chatID, 0)
+
+	first := e.joinChatWithInvite(joinerKeys, chatID, token, inviteSecret(1))
+	require.Equal(t, chatpb.JoinChatResponse_OK, first.Result)
+
+	// Leaving discards the invite's copy.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(joinerKeys, chatID).Result)
+	e.requireNotMember(chatID, joinerID)
+
+	// And the return stores it again, with the new secret.
+	secret := inviteSecret(4)
+	second := e.joinChatWithInvite(joinerKeys, chatID, token, secret)
+	require.Equal(t, chatpb.JoinChatResponse_OK, second.Result)
+	require.Greater(t, second.Chat.RosterSummary.Version, first.Chat.RosterSummary.Version)
+	requireInviteKeyBundle(t, e.mustGetKeyEnvelope(joinerKeys, chatID), chatID, invite.InviteId, keyCopy, secret, e.userID, e.keys)
+	e.requireInviteUseCount(invite.InviteId, 2)
+	e.waitForChatInvites(e.keys, chatID, withUseCount(invite, 2))
+
+	calls := e.systemMessages.userJoinedCalls(chatID)
+	require.Len(t, calls, 2)
+	requireUserJoinedCall(t, calls[0], joinerID, chat.InvitedBy(e.userID), first.Chat.RosterSummary.Version)
+	requireUserJoinedCall(t, calls[1], joinerID, chat.InvitedBy(e.userID), second.Chat.RosterSummary.Version)
+
+	// Leaving after replacing the copy discards their own envelope too.
+	require.Equal(t, chatpb.SetKeyEnvelopeResponse_OK, e.mustSetKeyEnvelope(joinerKeys, chatID, keyEnvelopeProto(8)).Result)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(joinerKeys, chatID).Result)
+	e.requireNotMember(chatID, joinerID)
+}
+
+// testServer_InviteJoin_Refused pins every refusal of a join with an invite,
+// each with nothing changed: not a member, no envelope, no use counted and
+// nothing announced.
+func testServer_InviteJoin_Refused(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+	other := e.putKeyedPrivateGroup("Other")
+
+	requireRefused := func(keys model.KeyPair, userID *commonpb.UserId, token *chatpb.InviteToken, want chatpb.JoinChatResponse_Result) {
+		t.Helper()
+		resp := e.joinChatWithInvite(keys, chatID, token, inviteSecret(1))
+		require.Equal(t, want, resp.Result)
+		require.Nil(t, resp.Chat)
+		e.requireNotMember(chatID, userID)
+	}
+
+	userID, userKeys := e.addBoundUser("User")
+
+	// An unknown token, and another chat's invite.
+	requireRefused(userKeys, userID, newInviteToken(), chatpb.JoinChatResponse_INVITE_NOT_FOUND)
+	otherToken, _, otherInvite := e.createInviteWithCopy(e.keys, other, 0)
+	requireRefused(userKeys, userID, otherToken, chatpb.JoinChatResponse_INVITE_NOT_FOUND)
+	e.requireInviteUseCount(otherInvite.InviteId, 0)
+	e.requireNotMember(other, userID)
+
+	// Used up.
+	limitedToken, _, limited := e.createInviteWithCopy(e.keys, chatID, 1)
+	firstID, firstKeys := e.addBoundUser("First")
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.joinChatWithInvite(firstKeys, chatID, limitedToken, inviteSecret(1)).Result)
+	requireRefused(userKeys, userID, limitedToken, chatpb.JoinChatResponse_INVITE_EXHAUSTED)
+	e.requireInviteUseCount(limited.InviteId, 1)
+
+	// Expired. Written through the store, which takes an expiry in the past.
+	expiredToken := newInviteToken()
+	expiresAt := time.Now().Add(-time.Minute)
+	_, created, err := e.store.CreateInvite(e.ctx, chat.Invite{
+		ID:             chat.MustDeriveInviteID(expiredToken),
+		ChatID:         chatID,
+		CreatedBy:      e.userID,
+		CreatedAt:      time.Now().Add(-time.Hour),
+		ExpiresAt:      &expiresAt,
+		SecretEnvelope: inviteSecret(1),
+	}, signedInviteKeyEnvelope(e.keys, chatID, chat.MustDeriveInviteID(expiredToken)), chat.MaxActiveInvites, time.Now())
+	require.NoError(t, err)
+	require.True(t, created)
+	requireRefused(userKeys, userID, expiredToken, chatpb.JoinChatResponse_INVITE_EXPIRED)
+	e.requireInviteUseCount(chat.MustDeriveInviteID(expiredToken), 0)
+
+	// Revoked.
+	revokedToken, _, revoked := e.createInviteWithCopy(e.keys, chatID, 0)
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, revoked.InviteId).Result)
+	requireRefused(userKeys, userID, revokedToken, chatpb.JoinChatResponse_INVITE_REVOKED)
+	e.requireInviteUseCount(revoked.InviteId, 0)
+
+	// A banned user with an ACTIVE invite is BANNED; with one that admits no
+	// one, they are told of the invite.
+	activeToken, _, active := e.createInviteWithCopy(e.keys, chatID, 0)
+	bannedID, bannedKeys := e.addBoundUser("Banned")
+	require.Equal(t, chatpb.BanUserResponse_OK, e.mustBanUser(e.keys, chatID, bannedID))
+	requireRefused(bannedKeys, bannedID, activeToken, chatpb.JoinChatResponse_BANNED)
+	requireRefused(bannedKeys, bannedID, revokedToken, chatpb.JoinChatResponse_INVITE_REVOKED)
+	e.requireInviteUseCount(active.InviteId, 0)
+
+	// Without an invite, a private group is DENIED.
+	without := e.mustJoinChat(userKeys, chatID)
+	require.Equal(t, chatpb.JoinChatResponse_DENIED, without.Result)
+	e.requireNotMember(chatID, userID)
+
+	// Only the one real join was announced.
+	time.Sleep(100 * time.Millisecond)
+	calls := e.systemMessages.userJoinedCalls(chatID)
+	require.Len(t, calls, 1)
+	require.Equal(t, firstID.Value, calls[0].userID.Value)
+	onChat, _ := e.rosterUpdatesOnChatTopic(chatID)
+	require.Len(t, onChat, 1)
+	require.Empty(t, e.rosterUpdatesOnUserTopic(userID, chatID))
+	require.Empty(t, e.rosterUpdatesOnUserTopic(bannedID, chatID))
+}
+
+// testServer_InviteJoin_PublicGroup pins that a public group checks its
+// rules and never an invite: a non-member passing one is INVITE_NOT_FOUND,
+// with the rules not evaluated, whether or not they would pass; a member
+// passing one gets the no-op.
+func testServer_InviteJoin_PublicGroup(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	private := e.putKeyedPrivateGroup("Private")
+	token, _, invite := e.createInviteWithCopy(e.keys, private, 0)
+	userID, userKeys := e.addBoundUser("User")
+
+	// An open group, whose empty rules everyone satisfies.
+	open := e.putGroup("Open", at(1))
+	for name, tok := range map[string]*chatpb.InviteToken{
+		"real invite":   token,
+		"unknown token": newInviteToken(),
+	} {
+		resp := e.joinChatWithInvite(userKeys, open, tok, inviteSecret(1))
+		require.Equal(t, chatpb.JoinChatResponse_INVITE_NOT_FOUND, resp.Result, name)
+		require.Nil(t, resp.Chat, name)
+		isMember, err := s.IsMember(e.ctx, open, userID)
+		require.NoError(t, err)
+		require.False(t, isMember, name)
+	}
+	e.requireInviteUseCount(invite.InviteId, 0)
+	e.requireNotMember(private, userID)
+
+	// A group whose rule cannot be evaluated: without an invite the join
+	// fails evaluating it, and with one it is never evaluated.
+	unpriced := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{model.MustGenerateUserID()},
+		Title:                  "Unpriced",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "xyz", NativeAmount: 1},
+		LastActivity:           at(1),
+	}
+	require.NoError(t, s.PutChat(e.ctx, unpriced))
+	e.ocpBalance.setBalance(userKeys.Proto(), ocp_common.ToCoreMintQuarks(1))
+	_, err := e.joinChat(userKeys, unpriced.ID)
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.Equal(t, chatpb.JoinChatResponse_INVITE_NOT_FOUND, e.joinChatWithInvite(userKeys, unpriced.ID, token, inviteSecret(1)).Result)
+	isMember, err := s.IsMember(e.ctx, unpriced.ID, userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
+
+	// Without an invite, the open group is joined as ever, and a member
+	// passing one then is the no-op.
+	joined := e.mustJoinChat(userKeys, open)
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	e.waitForRosterUpdates(userID, open, 1)
+	again := e.joinChatWithInvite(userKeys, open, token, inviteSecret(1))
+	require.Equal(t, chatpb.JoinChatResponse_OK, again.Result)
+	require.NoError(t, protoutil.ProtoEqualError(joined.Chat.RosterSummary, again.Chat.RosterSummary))
+	time.Sleep(100 * time.Millisecond)
+	require.Len(t, e.rosterUpdatesOnUserTopic(userID, open), 1)
+	e.requireInviteUseCount(invite.InviteId, 0)
+	require.Empty(t, e.systemMessages.userJoinedCalls(open))
+}
+
+// testServer_InviteJoin_Creator pins that a private group's creator rejoins
+// on their own whatever invite they pass: OK, a Direct UserJoined, no use
+// counted, and their own envelope kept.
+func testServer_InviteJoin_Creator(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
+	e.accounts.setStaff(e.userID, true)
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+	token, _, invite := e.createInviteWithCopy(e.keys, chatID, 0)
+
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	joined := e.joinChatWithInvite(e.keys, chatID, token, inviteSecret(1))
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	require.True(t, joined.Chat.ViewerState.Permissions.CanInvite)
+
+	calls := e.systemMessages.userJoinedCalls(chatID)
+	require.Len(t, calls, 1)
+	requireUserJoinedCall(t, calls[0], e.userID, chat.JoinedDirectly(), joined.Chat.RosterSummary.Version)
+	e.requireInviteUseCount(invite.InviteId, 0)
+	envelope := e.mustGetKeyEnvelope(e.keys, chatID)
+	require.True(t, proto.Equal(keyEnvelopeProto(1), envelope.GetKeyEnvelope()))
+	require.Equal(t, e.userID.Value, envelope.WrappedBy.Value)
+
+	// So they do passing a revoked invite or an unknown token.
+	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, chatID, invite.InviteId).Result)
+	for i, tok := range []*chatpb.InviteToken{token, newInviteToken()} {
+		require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+		joined = e.joinChatWithInvite(e.keys, chatID, tok, inviteSecret(1))
+		require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+		calls = e.systemMessages.userJoinedCalls(chatID)
+		require.Len(t, calls, 2+i)
+		requireUserJoinedCall(t, calls[1+i], e.userID, chat.JoinedDirectly(), joined.Chat.RosterSummary.Version)
+	}
+	e.requireInviteUseCount(invite.InviteId, 0)
 }

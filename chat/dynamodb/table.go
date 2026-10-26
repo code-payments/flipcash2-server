@@ -12,8 +12,8 @@ import (
 
 // CreateTables provisions the chats, dm_inbox, group_members,
 // chat_user_state, chat_activity, chat_key_envelopes, chat_lobbies,
-// chat_featured_groups and chat_holdings tables with on-demand billing. The chats table is keyed
-// by pk only; dm_inbox is keyed by (pk, sk) with a GSI ordering each user's DMs
+// chat_featured_groups, chat_holdings and chat_invites tables with on-demand
+// billing. The chats table is keyed by pk only; dm_inbox is keyed by (pk, sk) with a GSI ordering each user's DMs
 // by last_activity; group_members is keyed by (pk, sk) = (chat, user) — plus
 // one "#meta" aggregates item per group — with an inverted GSI for listing a
 // user's group chats, a sparse GSI of a group's joined members by join time
@@ -33,12 +33,17 @@ import (
 // (pk, sk) = (user, position) — plus one "#meta" item per user — with no
 // index; chat_holdings is keyed by pk = chat with a GSI ranking a mint's
 // groups by holdings (see gsiByMintRank) and a GSI of the refresh queue by
-// due time (see refreshQueueIndex). It is idempotent and blocks until
-// all tables are ACTIVE. It creates missing tables only: a table that
+// due time (see refreshQueueIndex); chat_invites is keyed by (pk, sk) =
+// (invite, item) with three sparse GSIs on the invite's record, a chat's
+// invites by creation (gsiInvitesByChat), one creator's invites to a chat by
+// creation (gsiInvitesByChatCreator) and a chat's invites that are neither
+// revoked nor used up by expiry (gsiInvitesActive), and TTL on expires_at,
+// which only an invite's copy of the chat key carries. It is idempotent and
+// blocks until all tables are ACTIVE. It creates missing tables only: a table that
 // exists is left as it is, and so is never given an index added to its
 // definition here since it was created — gsiRestricted on a live
 // chat_user_state is added out of band (see the store's doc).
-func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable string) error {
+func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
 			TableName:   aws.String(chatsTable),
@@ -326,6 +331,61 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				},
 			},
 		},
+		{
+			TableName:   aws.String(invitesTable),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrChat), AttributeType: types.ScalarAttributeTypeB},
+				{AttributeName: aws.String(attrCreatedSort), AttributeType: types.ScalarAttributeTypeB},
+				{AttributeName: aws.String(attrCreatorSort), AttributeType: types.ScalarAttributeTypeB},
+				{AttributeName: aws.String(attrActiveSort), AttributeType: types.ScalarAttributeTypeB},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+			},
+			// All three are keyed by attributes only an invite's record
+			// carries: the copy, and every item a join adds to the
+			// partition, must omit chat and the three sorts, or they leak
+			// in. Each projects the whole record, which holds no key
+			// material: the secret envelope opens only with its creator's
+			// account key, and the copy is an item of its own.
+			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
+				{
+					IndexName: aws.String(gsiInvitesByChat),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrChat), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrCreatedSort), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+				{
+					IndexName: aws.String(gsiInvitesByChatCreator),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrChat), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrCreatorSort), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+				{
+					// Sparse on active_sort too, which a revoke and the join
+					// that takes the last use remove, so the index is the
+					// chat's invites that may be ACTIVE and a count of it is
+					// the cap's (see countActiveInvites). The count reads only
+					// keys, but the whole record is projected so that a later
+					// reader of the active invites (one creator's, say) needs
+					// no new index; a projection cannot be changed in place.
+					IndexName: aws.String(gsiInvitesActive),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrChat), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrActiveSort), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+			},
+		},
 	}
 
 	for _, input := range inputs {
@@ -346,7 +406,10 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 	if err := ensureTTL(ctx, client, groupMembersTable, attrExpiresAt); err != nil {
 		return err
 	}
-	return ensureTTL(ctx, client, activityTable, attrExpiresAt)
+	if err := ensureTTL(ctx, client, activityTable, attrExpiresAt); err != nil {
+		return err
+	}
+	return ensureTTL(ctx, client, invitesTable, attrExpiresAt)
 }
 
 // ensureTTL idempotently enables DynamoDB TTL on table's attr. Enabling TTL when
@@ -404,6 +467,9 @@ func (s *store) reset() {
 		panic(err)
 	}
 	if err := clearTable(ctx, s.client, s.holdingsTable, []string{attrPK}); err != nil {
+		panic(err)
+	}
+	if err := clearTable(ctx, s.client, s.invitesTable, []string{attrPK, attrSK}); err != nil {
 		panic(err)
 	}
 }

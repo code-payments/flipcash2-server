@@ -133,7 +133,7 @@ func TestSendWelcomeV2_InvalidUsername(t *testing.T) {
 
 	// A handle not in canonical form is refused, never repaired: it did not
 	// come from the store.
-	for _, username := range []string{"", "a", "Alice_1", "has space", "has/slash", "waytoolongausername"} {
+	for _, username := range []string{"", "a", "Alice_1", "has space", "has/slash", "a_handle_of_thirty_one_chars_xx"} {
 		_, _, err := flipcashteam.SendWelcomeV2(e.ctx, e.chats, e.sender, e.user, username)
 		require.ErrorIs(t, err, profile.ErrInvalidUsername, "username: %q", username)
 	}

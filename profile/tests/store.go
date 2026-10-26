@@ -482,7 +482,7 @@ func testUsername(t *testing.T, s profile.Store) {
 	require.ErrorIs(t, err, profile.ErrNotFound)
 
 	// Only canonical handles are ever held, so nothing else reaches the store.
-	for _, invalid := range []string{"", "a", "Uppercase", "has-a-dash", "has space", "sixteencharacter"} {
+	for _, invalid := range []string{"", "a", "Uppercase", "has-a-dash", "has space", "a_handle_of_thirty_one_chars_xx"} {
 		require.ErrorIs(t, s.SetUsername(ctx, user1, invalid), profile.ErrInvalidUsername)
 	}
 	_, err = s.GetUserIdByUsername(ctx, "uppercase")
@@ -698,23 +698,24 @@ func testDefaultUsernameStore(t *testing.T, s profile.Store) {
 
 	// A long name is cut to fit.
 	long := model.MustGenerateUserID()
-	require.Equal(t, "christopher_j_2", setName(long, "Christopher Johnson", "christopher_johnson"))
+	require.Equal(t, "christopher_johnson_smith_jo_2", setName(long, "Christopher Johnson Smith Jones", "christopher_johnson_smith_jones"))
 
 	// A name whose low numbers are all held, and whose cuts for four- and
-	// five-digit numbers are reserved words ("developers", "developer"), has no
-	// handle left to give. For numbers of three digits or more the cut is already
-	// "developers", so 2 through 99 are all it ever had. The display name is still
-	// set, and the result says the user was left without a handle.
+	// five-digit numbers spell reserved words ("notifications", "notification"),
+	// has no handle left to give. For numbers of three digits or more the cut
+	// already spells "notifications", so 2 through 99 are all it ever had. The
+	// display name is still set, and the result says the user was left without a
+	// handle.
 	for n := 2; n < 100; n++ {
-		require.NoError(t, s.SetUsername(ctx, model.MustGenerateUserID(), fmt.Sprintf("developers_x_%d", n)))
+		require.NoError(t, s.SetUsername(ctx, model.MustGenerateUserID(), fmt.Sprintf("n_o_t_i_f_i_c_a_t_i_o_n_s_x_%d", n)))
 	}
 	saturated := model.MustGenerateUserID()
-	result, err = s.SetDisplayNameWithDefaultUsername(ctx, saturated, "Developers X", "developers_x")
+	result, err = s.SetDisplayNameWithDefaultUsername(ctx, saturated, "N O T I F I C A T I O N S X", "n_o_t_i_f_i_c_a_t_i_o_n_s_x")
 	require.NoError(t, err)
 	require.Equal(t, profile.DefaultUsernameResult{NoneAvailable: true}, result)
 	p, err := s.GetFullProfile(ctx, saturated, false)
 	require.NoError(t, err)
-	require.Equal(t, "Developers X", p.DisplayName)
+	require.Equal(t, "N O T I F I C A T I O N S X", p.DisplayName)
 	require.Nil(t, p.Username)
 
 	// Users taking the same name at once each get a distinct handle. A user who

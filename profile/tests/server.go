@@ -707,7 +707,7 @@ func testSetUsername(t *testing.T, accounts account.Store, profiles profile.Stor
 		for _, invalid := range []string{
 			"",
 			"a",
-			"sixteen_chars_ab",
+			"a_handle_of_thirty_one_chars_xx",
 			"has space",
 			"has-dash",
 			"emoji_🙂",
@@ -1751,20 +1751,20 @@ func testDefaultUsername(t *testing.T, accounts account.Store, profiles profile.
 	})
 
 	t.Run("A name with no handle left sets the display name and warns", func(t *testing.T) {
-		// Every number "developers_x" can take is held: 2 through 99, since past
+		// Every number "n_o_t_i_f_i_c_a_t_i_o_n_s_x" can take is held: 2 through 99, since past
 		// that and for every random number its cut is a reserved word.
 		for n := 2; n < 100; n++ {
-			require.NoError(t, profiles.SetUsername(ctx, model.MustGenerateUserID(), fmt.Sprintf("developers_x_%d", n)))
+			require.NoError(t, profiles.SetUsername(ctx, model.MustGenerateUserID(), fmt.Sprintf("n_o_t_i_f_i_c_a_t_i_o_n_s_x_%d", n)))
 		}
 		_ = warnings.TakeAll()
 
 		u := newUser()
-		require.Equal(t, profilepb.SetDisplayNameResponse_OK, setDisplayName(u, "Developers X"))
+		require.Equal(t, profilepb.SetDisplayNameResponse_OK, setDisplayName(u, "N O T I F I C A T I O N S X"))
 		require.Empty(t, username(u))
 
 		logged := warnings.FilterMessage("No default username available").TakeAll()
 		require.Len(t, logged, 1)
-		require.Equal(t, "developers_x", logged[0].ContextMap()["username_base"])
+		require.Equal(t, "n_o_t_i_f_i_c_a_t_i_o_n_s_x", logged[0].ContextMap()["username_base"])
 	})
 }
 

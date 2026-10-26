@@ -13,7 +13,7 @@ import (
 )
 
 // maxUsernameLength is the longest handle a user may hold.
-const maxUsernameLength = 15
+const maxUsernameLength = 30
 
 // usernamePattern is the set of handles a user may hold, mirroring what
 // profile.v1.Username enforces on the wire: X's character set, minus upper
@@ -502,11 +502,13 @@ func defaultUsernameCandidateWithStem(stem, number string) (string, bool) {
 // with the given count of digits, or false when that leaves nothing usable.
 //
 // The stem is cut so the whole handle fits maxUsernameLength, which makes it a
-// function of the digit count alone: "christopher_johnson" gives
-// "christopher_j_2" but "christopher_10". An underscore left dangling by the cut
-// is dropped, so the number is always set off by exactly one. A cut can also
-// leave a stem that is reserved where the whole base was not ("developers_x" cut
-// to "developers"), which makes every number of that length unusable.
+// function of the digit count alone: "christopher_johnson_smith_jones" gives
+// "christopher_johnson_smith_jo_2" but "christopher_johnson_smith_100". An
+// underscore left dangling by the cut is dropped, so the number is always set off
+// by exactly one. A cut can also leave a stem that is reserved where the whole
+// base was not ("n_o_t_i_f_i_c_a_t_i_o_n_s_x" cut to "n_o_t_i_f_i_c_a_t_i_o_n_s",
+// which spells "notifications"), which makes every number of that length
+// unusable.
 func defaultUsernameStem(base string, digits int) (string, bool) {
 	stem := base
 	if maxStem := maxUsernameLength - 1 - digits; len(stem) > maxStem {

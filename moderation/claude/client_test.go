@@ -619,7 +619,7 @@ const (
 
 // TestClassifyUsername checks that handles which squat a known entity, or which
 // are harmful in their own right, are flagged. Every input is a valid username —
-// lower case, at most 15 characters of [a-z0-9_] — since that is all the
+// lower case, at most 30 characters of [a-z0-9_] — since that is all the
 // classifier is ever handed in production.
 func TestClassifyUsername(t *testing.T) {
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")

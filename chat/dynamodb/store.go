@@ -5336,3 +5336,235 @@ func (s *store) RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, invit
 		}
 	}
 }
+
+// maxInviteJoinAttempts bounds the reads a join with an invite starts over
+// from (see JoinWithInvite). A join starts over when the invite or the
+// joiner's lobby entry moved between its read and its write, which for the
+// invite is another join landing first, or a revoke: joins to a group are
+// serialized by its roster summary anyway, so a join waiting behind a burst
+// of others loses once to each, and the bound is the burst it outlasts.
+// Every start over is also a membership transition's attempt, which has its
+// own budget for the summary's races and conflicts (see
+// transitionMembership).
+const maxInviteJoinAttempts = 2 * maxMembershipAttempts
+
+// inviteJoinRead is what a join with an invite starts from (see
+// readInviteJoin): the group's roster summary, whether the joiner is a
+// member, the invite's record and copy (nil when there is none), and
+// whether the joiner is waiting in the group's lobby.
+type inviteJoinRead struct {
+	roster    chat.RosterSummary
+	joined    bool
+	invite    *chat.Invite
+	keyCopy   *chatpb.InviteKeyEnvelope
+	inLobby   bool
+	chatFound bool
+}
+
+// readInviteJoin is the read a join with an invite starts from, one strongly
+// consistent BatchGetItem of five items across three tables: the group's
+// #meta and the joiner's membership record in group_members, the invite's
+// #meta and #copy in chat_invites, and the joiner's entry in chatID's lobby
+// in chat_lobbies. Each item is read consistently, but not the five as a
+// set, so a write landing in the middle of the read may show in some items
+// and not others; the join's write is conditioned on what it read of each,
+// which is what makes a mixed read harmless (see JoinWithInvite).
+func (s *store) readInviteJoin(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, inviteID *chatpb.InviteId) (inviteJoinRead, error) {
+	memberKey := map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(userPK(userID))}
+	summaryKey := map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(skMeta)}
+	req := map[string]types.KeysAndAttributes{
+		s.groupMembersTable: {Keys: []map[string]types.AttributeValue{summaryKey, memberKey}, ConsistentRead: aws.Bool(true)},
+		s.invitesTable:      {Keys: []map[string]types.AttributeValue{inviteKey(inviteID, skMeta), inviteKey(inviteID, skInviteCopy)}, ConsistentRead: aws.Bool(true)},
+		s.lobbiesTable:      {Keys: []map[string]types.AttributeValue{lobbyKey(chatID, userID)}, ConsistentRead: aws.Bool(true)},
+	}
+
+	var read inviteJoinRead
+	for len(req) > 0 {
+		resp, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})
+		if err != nil {
+			return inviteJoinRead{}, err
+		}
+		for _, item := range resp.Responses[s.groupMembersTable] {
+			switch asS(item[attrSK]) {
+			case skMeta:
+				roster, err := rosterSummaryFromItem(item)
+				if err != nil {
+					return inviteJoinRead{}, err
+				}
+				read.roster, read.chatFound = roster, true
+			default:
+				state, err := parseN(item[attrState])
+				if err != nil {
+					return inviteJoinRead{}, fmt.Errorf("reading membership state: %w", err)
+				}
+				read.joined = state == memberStateJoined
+			}
+		}
+		for _, item := range resp.Responses[s.invitesTable] {
+			switch asS(item[attrSK]) {
+			case skMeta:
+				invite, err := inviteFromItem(item)
+				if err != nil {
+					return inviteJoinRead{}, err
+				}
+				read.invite = &invite
+			case skInviteCopy:
+				keyCopy, err := inviteKeyEnvelopeFromItem(item)
+				if err != nil {
+					return inviteJoinRead{}, err
+				}
+				read.keyCopy = keyCopy
+			}
+		}
+		read.inLobby = read.inLobby || len(resp.Responses[s.lobbiesTable]) > 0
+
+		req = map[string]types.KeysAndAttributes{}
+		for table, unprocessed := range resp.UnprocessedKeys {
+			if len(unprocessed.Keys) > 0 {
+				req[table] = unprocessed
+			}
+		}
+	}
+	return read, nil
+}
+
+// JoinWithInvite reads what the join depends on (see readInviteJoin), judges
+// it — the chat, then the invite's existence and chat, then the membership
+// no-op, then the invite's status — and writes the join as one membership
+// transition (see transitionMembership) carrying, in order:
+//
+//   - [0] the ban check (see banCheck), a failure of which is ErrBanned;
+//   - [1] the invite's record, use_count compare-and-set from the count read
+//     to one more, conditioned too on the chat, on no revoke and on the
+//     expiry being after now, and on the last use with active_sort removed,
+//     so it leaves gsiInvitesActive;
+//   - on the last use, the unconditional delete of the invite's copy;
+//   - the unconditional put of the joiner's key envelope, the copy (see
+//     chat.NewInviteKeyEnvelope), over whatever they held;
+//   - when the read found the joiner in the lobby, the entry's conditional
+//     delete and both counts' decrements (see lobbyEntryDelete), and when it
+//     did not, a check that no entry exists, so an entry landing between the
+//     read and the write is not left behind.
+//
+// The use count is a compare-and-set rather than an ADD: it is what makes
+// the last use exact, and joins to the group already serialize on its
+// roster summary, so it adds no contention of its own. Any failed condition
+// past the ban's is the invite or the lobby entry moving since the read — a
+// concurrent join, a revoke, an entry or a departure from the lobby — and
+// the join starts over from a fresh read, at once, as a lost race and not a
+// throttled write (see maxInviteJoinAttempts), where it is judged again. A
+// read showing an ACTIVE invite with no copy is either a revoke or a last
+// use landing in the middle of the read, which a fresh read settles, or a
+// broken invariant, which outlasts the attempts and is reported as an
+// error. The roster summary is re-read with the rest on every start over,
+// and the transition refreshes it on its own races.
+//
+// The transaction is at most nine items, far under maxTransactWriteItems,
+// and puts nothing in an index the item was not in: the envelope and the
+// lobby items carry no index attribute, and the record only loses one.
+func (s *store) JoinWithInvite(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, inviteID *chatpb.InviteId, secretEnvelope *chatpb.InviteSecretEnvelope, now time.Time) (chat.JoinWithInviteResult, error) {
+	if err := chat.ValidateInviteJoin(chatID, userID, inviteID, secretEnvelope, now); err != nil {
+		return chat.JoinWithInviteResult{}, err
+	}
+
+	lost := "the invite or the lobby entry moved"
+	for attempt := 0; attempt < maxInviteJoinAttempts; attempt++ {
+		read, err := s.readInviteJoin(ctx, chatID, userID, inviteID)
+		if err != nil {
+			return chat.JoinWithInviteResult{}, err
+		}
+		if !read.chatFound {
+			return chat.JoinWithInviteResult{}, chat.ErrChatNotFound
+		}
+		if read.invite == nil || !bytes.Equal(read.invite.ChatID.Value, chatID.Value) {
+			return chat.JoinWithInviteResult{}, chat.ErrInviteNotFound
+		}
+		invite := *read.invite
+		if read.joined {
+			return chat.JoinWithInviteResult{Roster: read.roster, Invite: invite}, nil
+		}
+		if err := invite.AdmitsAt(now); err != nil {
+			return chat.JoinWithInviteResult{}, err
+		}
+		if read.keyCopy == nil {
+			// Revoked or used up in the middle of the read, or broken: read
+			// again.
+			lost = "the invite is active with no key copy"
+			continue
+		}
+
+		lastUse := invite.IsLastUse()
+		inviteUpdate := &types.Update{
+			TableName:           aws.String(s.invitesTable),
+			Key:                 inviteKey(inviteID, skMeta),
+			UpdateExpression:    aws.String("SET #useCount = :next"),
+			ConditionExpression: aws.String("#chat = :chat AND #useCount = :read AND attribute_not_exists(#revokedAt) AND (attribute_not_exists(#expiresAt) OR #expiresAt > :now)"),
+			ExpressionAttributeNames: map[string]string{
+				"#useCount":  attrUseCount,
+				"#chat":      attrChat,
+				"#revokedAt": attrRevokedAt,
+				"#expiresAt": attrInviteExpiresAt,
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":next": avN(uint64(invite.UseCount) + 1),
+				":read": avN(uint64(invite.UseCount)),
+				":chat": avB(chatID.Value),
+				":now":  avN(uint64(now.UnixNano())),
+			},
+		}
+		if lastUse {
+			inviteUpdate.UpdateExpression = aws.String("SET #useCount = :next REMOVE #active")
+			inviteUpdate.ExpressionAttributeNames["#active"] = attrActiveSort
+		}
+
+		alongside := []types.TransactWriteItem{
+			{ConditionCheck: s.banCheck(chatID, userID)},
+			{Update: inviteUpdate},
+		}
+		if lastUse {
+			alongside = append(alongside, types.TransactWriteItem{Delete: &types.Delete{
+				TableName: aws.String(s.invitesTable),
+				Key:       inviteKey(inviteID, skInviteCopy),
+			}})
+		}
+		alongside = append(alongside, types.TransactWriteItem{Put: &types.Put{
+			TableName: aws.String(s.keyEnvelopesTable),
+			Item:      keyEnvelopeItem(chatID, userID, chat.NewInviteKeyEnvelope(invite, read.keyCopy, secretEnvelope)),
+		}})
+		if read.inLobby {
+			alongside = append(alongside, types.TransactWriteItem{Delete: s.lobbyEntryDelete(chatID, userID)})
+			alongside = append(alongside, s.lobbyCountDecrements(chatID, userID)...)
+		} else {
+			alongside = append(alongside, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+				TableName:                aws.String(s.lobbiesTable),
+				Key:                      lobbyKey(chatID, userID),
+				ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
+				ExpressionAttributeNames: map[string]string{"#pk": attrPK},
+			}})
+		}
+
+		roster := read.roster
+		changed, err := s.transitionMembership(ctx, chatID, s.joinUpdate(chatID, userID), 1, &roster, alongside)
+		var failed alongsideConditionFailed
+		switch {
+		case errors.As(err, &failed) && failed.Index == 0:
+			return chat.JoinWithInviteResult{}, chat.ErrBanned
+		case errors.As(err, &failed):
+			lost = "the invite or the lobby entry moved"
+			continue
+		case err != nil:
+			return chat.JoinWithInviteResult{}, err
+		case !changed:
+			// A member since the read: the no-op, with nothing written.
+			return chat.JoinWithInviteResult{Roster: roster, Invite: invite}, nil
+		}
+		invite.UseCount++
+		return chat.JoinWithInviteResult{
+			Changed:   true,
+			Roster:    roster,
+			Invite:    invite,
+			LeftLobby: read.inLobby,
+		}, nil
+	}
+	return chat.JoinWithInviteResult{}, fmt.Errorf("joining chat %x with invite %x: attempts exhausted (%s)", chatID.Value, inviteID.Value, lost)
+}

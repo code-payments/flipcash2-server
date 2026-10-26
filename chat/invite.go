@@ -112,6 +112,27 @@ func ValidateNewInvite(invite Invite, keyCopy *chatpb.InviteKeyEnvelope) error {
 	return nil
 }
 
+// ValidateInviteJoin reports whether the arguments of a join with an invite
+// (see Store.JoinWithInvite) have the shape a store writes: a group chat, a
+// user, an invite ID of InviteIDSize bytes, the joiner's secret envelope, and
+// a now at or after the Unix epoch, which the invite's instants are compared
+// with as Unix nanoseconds.
+func ValidateInviteJoin(chatID *commonpb.ChatId, userID *commonpb.UserId, inviteID *chatpb.InviteId, secretEnvelope *chatpb.InviteSecretEnvelope, now time.Time) error {
+	switch {
+	case !IsGroupChatID(chatID):
+		return fmt.Errorf("invite join: not a group chat id")
+	case len(userID.GetValue()) != model.UserIDSize:
+		return fmt.Errorf("invite join: not a user id")
+	case len(inviteID.GetValue()) != InviteIDSize:
+		return fmt.Errorf("invite join: invite id must be %d bytes", InviteIDSize)
+	case secretEnvelope == nil:
+		return fmt.Errorf("invite join: secret envelope is required")
+	case now.Before(time.Unix(0, 0)):
+		return fmt.Errorf("invite join: now is before the unix epoch")
+	}
+	return nil
+}
+
 // ValidateInvitePosition reports whether pos is a place a store can resume a
 // listing of invites from (see Store.GetChatInvitesPage): an invite ID of
 // InviteIDSize bytes, created at or after the Unix epoch.

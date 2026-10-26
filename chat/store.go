@@ -806,6 +806,44 @@ type Store interface {
 	// error if chatID is not a group chat ID or now is before the Unix epoch.
 	RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, inviteID *chatpb.InviteId, now time.Time) (invite Invite, changed bool, err error)
 
+	// JoinWithInvite joins userID to the group chatID with its invite
+	// inviteID as of now (see JoinWithInviteResult): in one write it joins
+	// them as a member (one membership transition, as AddGroupMembers makes
+	// it), counts one use of the invite, stores the invite's copy of the
+	// chat key with secretEnvelope, the link's secret the joiner encrypted
+	// for themself, as their key envelope (see NewInviteKeyEnvelope),
+	// replacing any they hold, as AdmitFromLobby does, and, when they are
+	// waiting in the group's lobby, removes their entry with its counts as
+	// LeaveLobby does. The join that takes the invite's last use (see
+	// Invite.IsLastUse) also deletes the invite's copy, so the copy is held
+	// exactly while the invite may be ACTIVE. Every join counts a use, a
+	// return after leaving included, and nothing records who joined with
+	// which invite.
+	//
+	// A user who is a member already is a no-op that writes nothing — no use
+	// counted, their envelope and any lobby entry untouched — returning
+	// Changed false with the invite and the roster as read. Otherwise, with
+	// nothing written, it returns ErrChatNotFound if the chat does not
+	// exist; ErrInviteNotFound when no invite has inviteID, or the one that
+	// does is an invite to another chat; ErrInviteRevoked, ErrInviteExpired
+	// or ErrInviteExhausted when the invite is not ACTIVE as of now (see
+	// Invite.AdmitsAt); and ErrBanned when the user is banned (see BanUser),
+	// judged in the same write against their ViewerState, so a ban and a
+	// concurrent join never both land. They are judged in that order, the
+	// membership no-op after the invite's existence and before its status:
+	// a retry of a join that took the last use is the no-op it is, not
+	// ErrInviteExhausted, and the invite is judged before the ban, so a
+	// banned user holding a link that admits no one is told of the link, as
+	// a banned user failing a public group's rules is told of the rules. The
+	// invite's status is judged against the invite as of the write: a join
+	// racing a revoke or another join is judged again after it, so an
+	// invite never admits more than MaxUses joins, nor any after its revoke.
+	//
+	// It returns an error if the arguments fail ValidateInviteJoin. It does
+	// not check that the chat is a private group with its key, or that the
+	// caller holds the invite's token: those are the caller's.
+	JoinWithInvite(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, inviteID *chatpb.InviteId, secretEnvelope *chatpb.InviteSecretEnvelope, now time.Time) (JoinWithInviteResult, error)
+
 	// SetFeaturedGroups replaces userID's featured groups with chatIDs, in
 	// that order, and returns the list that stands after the call. A list
 	// equal to the stored one is a no-op that writes nothing and returns it

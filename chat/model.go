@@ -1144,6 +1144,19 @@ type BanResult struct {
 	LeftLobby bool
 }
 
+// JoinWithInviteResult is what Store.JoinWithInvite did: whether the join
+// was made (Changed false when the user was a member already, with nothing
+// written); Roster, the group's summary as of the write — after the join
+// when there was one, as read otherwise; Invite, the invite after the join,
+// its use counted, or as read for a no-op; and whether the join removed the
+// user from the group's lobby (LeftLobby).
+type JoinWithInviteResult struct {
+	Changed   bool
+	Roster    RosterSummary
+	Invite    Invite
+	LeftLobby bool
+}
+
 // Permissions is what a user may do in a chat beyond what membership alone
 // allows every member: whether they may edit its record (see
 // Server.EditChat), how they may moderate it (see ModerationPermissions), and

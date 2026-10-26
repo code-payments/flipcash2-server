@@ -377,6 +377,12 @@ func (c *Cache) RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, invit
 	return c.db.RevokeInvite(ctx, chatID, inviteID, now)
 }
 
+// JoinWithInvite passes through, like every membership write: group
+// membership is never cached.
+func (c *Cache) JoinWithInvite(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, inviteID *chatpb.InviteId, secretEnvelope *chatpb.InviteSecretEnvelope, now time.Time) (chat.JoinWithInviteResult, error) {
+	return c.db.JoinWithInvite(ctx, chatID, userID, inviteID, secretEnvelope, now)
+}
+
 // The holdings methods pass through: a snapshot is replaced by a refresh in
 // any process, and its readers are batched already.
 func (c *Cache) PutGroupHoldings(ctx context.Context, h chat.GroupHoldings) (bool, error) {

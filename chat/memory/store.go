@@ -82,9 +82,10 @@ type memory struct {
 	invites map[string]chat.Invite
 
 	// inviteCopies holds each invite's copy of the chat key, keyed by invite
-	// ID, from the invite's creation until it is revoked. The persistent
-	// store also drops one soon after its invite expires; nothing reads a
-	// copy here, so this one keeps it.
+	// ID, from the invite's creation until it is revoked or a join takes its
+	// last use. The persistent store also drops one soon after its invite
+	// expires; only a join reads a copy, and an expired invite admits no one,
+	// so this one keeps it.
 	inviteCopies map[string]*chatpb.InviteKeyEnvelope
 
 	exclusions chat.FeedExclusions
@@ -1465,6 +1466,72 @@ func (m *memory) RevokeInvite(_ context.Context, chatID *commonpb.ChatId, invite
 	m.invites[string(inviteID.Value)] = stored
 	delete(m.inviteCopies, string(inviteID.Value))
 	return stored.Clone(), true, nil
+}
+
+func (m *memory) JoinWithInvite(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, inviteID *chatpb.InviteId, secretEnvelope *chatpb.InviteSecretEnvelope, now time.Time) (chat.JoinWithInviteResult, error) {
+	if err := chat.ValidateInviteJoin(chatID, userID, inviteID, secretEnvelope, now); err != nil {
+		return chat.JoinWithInviteResult{}, err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	userKey, chatKey, inviteKey := string(userID.Value), string(chatID.Value), string(inviteID.Value)
+	if _, ok := m.chats[chatKey]; !ok {
+		return chat.JoinWithInviteResult{}, chat.ErrChatNotFound
+	}
+	invite, ok := m.invites[inviteKey]
+	if !ok || !bytes.Equal(invite.ChatID.Value, chatID.Value) {
+		return chat.JoinWithInviteResult{}, chat.ErrInviteNotFound
+	}
+	// The judgments in chat.Store.JoinWithInvite's order: a member already
+	// is the no-op whatever the invite's status, then the status, then the
+	// ban.
+	if m.isJoinedLocked(chatKey, userKey) {
+		return chat.JoinWithInviteResult{Roster: m.rosterSummaryLocked(chatID), Invite: invite.Clone()}, nil
+	}
+	if err := invite.AdmitsAt(now); err != nil {
+		return chat.JoinWithInviteResult{}, err
+	}
+	if m.isBannedLocked(chatKey, userKey) {
+		return chat.JoinWithInviteResult{}, chat.ErrBanned
+	}
+	keyCopy, ok := m.inviteCopies[inviteKey]
+	if !ok {
+		return chat.JoinWithInviteResult{}, fmt.Errorf("active invite %x has no key copy", inviteID.Value)
+	}
+
+	byChat := m.keyEnvelopes[userKey]
+	if byChat == nil {
+		byChat = make(map[string]chat.KeyEnvelope)
+		m.keyEnvelopes[userKey] = byChat
+	}
+	byChat[chatKey] = chat.NewInviteKeyEnvelope(invite, keyCopy, secretEnvelope)
+
+	// The last use takes the copy with it, as the persistent store's does.
+	if invite.IsLastUse() {
+		delete(m.inviteCopies, inviteKey)
+	}
+	invite.UseCount++
+	m.invites[inviteKey] = invite
+
+	members := m.groupMembers[chatKey]
+	if members == nil {
+		members = make(map[string]*memberRecord)
+		m.groupMembers[chatKey] = members
+	}
+	m.groupVersions[chatKey]++
+	members[userKey] = &memberRecord{
+		joined:   true,
+		joinedAt: time.Now().UTC(),
+		version:  m.groupVersions[chatKey],
+	}
+	return chat.JoinWithInviteResult{
+		Changed:   true,
+		Roster:    m.rosterSummaryLocked(chatID),
+		Invite:    invite.Clone(),
+		LeftLobby: m.leaveLobbyLocked(chatID, userID),
+	}, nil
 }
 
 func (m *memory) SetFeaturedGroups(_ context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (chat.FeaturedGroups, bool, error) {

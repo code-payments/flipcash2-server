@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -175,12 +176,13 @@ func TestDefaultUsernameCandidate(t *testing.T) {
 		{"jeff_yanta", 2, "jeff_yanta_2"},
 		{"jeff_yanta", 99, "jeff_yanta_99"},
 		{"jeff_yanta", 100, "jeff_yanta_100"},
+		{"christopher_johnson", 2, "christopher_johnson_2"},
 		// The stem gives way to the number so the handle always fits.
-		{"christopher_johnson", 2, "christopher_j_2"},
-		{"christopher_johnson", 9, "christopher_j_9"},
-		{"christopher_johnson", 11, "christopher_11"}, // the cut leaves a dangling underscore, dropped
-		{"christopher_johnson", 100, "christopher_100"},
-		{"abcdefghijklmnopqrstu", 2, "abcdefghijklm_2"},
+		{"christopher_johnson_smith_jones", 2, "christopher_johnson_smith_jo_2"},
+		{"christopher_johnson_smith_jones", 9, "christopher_johnson_smith_jo_9"},
+		{"christopher_johnson_smith_jones", 11, "christopher_johnson_smith_j_11"},
+		{"christopher_johnson_smith_jones", 100, "christopher_johnson_smith_100"}, // the cut leaves a dangling underscore, dropped
+		{"abcdefghijklmnopqrstuvwxyzabcdef", 2, "abcdefghijklmnopqrstuvwxyzab_2"},
 		{"a", 2, "a_2"},
 	} {
 		candidate, ok := defaultUsernameCandidate(tc.base, tc.n)
@@ -192,14 +194,14 @@ func TestDefaultUsernameCandidate(t *testing.T) {
 
 	// A cut that leaves nothing but underscores, or a reserved word, has no usable
 	// handle at that number.
-	_, ok := defaultUsernameCandidate("a_____________b", 2)
+	_, ok := defaultUsernameCandidate("a"+strings.Repeat("_", 27)+"b", 2)
 	require.True(t, ok)
-	_, ok = defaultUsernameCandidate("_____________ab", 2)
+	_, ok = defaultUsernameCandidate(strings.Repeat("_", 28)+"ab", 2)
 	require.False(t, ok)
-	_, ok = defaultUsernameCandidate("support_the_team", 10)
+	_, ok = defaultUsernameCandidate("v_e_r_i_f_i_c_a_t_i_o_n_x", 10)
 	require.True(t, ok)
-	_, ok = defaultUsernameCandidate("support_the_team", 100000)
-	require.False(t, ok) // "support_the_team" cuts to "support", which is reserved
+	_, ok = defaultUsernameCandidate("v_e_r_i_f_i_c_a_t_i_o_n_x", 10000)
+	require.False(t, ok) // the cut leaves "v_e_r_i_f_i_c_a_t_i_o_n", which spells "verification", reserved
 }
 
 func TestFindFreeDefaultUsernames(t *testing.T) {
@@ -286,7 +288,7 @@ func TestFindFreeDefaultUsernames(t *testing.T) {
 		// The search works stems out once per digit count; what it asks for must
 		// match working each number out on its own, cuts and reserved spellings
 		// included.
-		for _, base := range []string{"jeff", "christopher_johnson", "developers_x", "password_x", "newsletter_x", "5", "______________a"} {
+		for _, base := range []string{"jeff", "christopher_johnson_smith_jones", "n_o_t_i_f_i_c_a_t_i_o_n_s_x", "v_e_r_i_f_i_c_a_t_i_o_n_x", "a_d_m_i_n_i_s_t_r_a_t_o_r_x", "5", strings.Repeat("_", 28) + "a"} {
 			var expected []string
 			for n := 2; n <= maxLowDefaultUsernameNumber; n++ {
 				if candidate, ok := defaultUsernameCandidate(base, n); ok {
@@ -428,9 +430,9 @@ func TestAssignDefaultUsername(t *testing.T) {
 
 	t.Run("Random numbers are cut to fit like any other", func(t *testing.T) {
 		claim, _ := claimer()
-		username, err := assignDefaultUsername(ctx, "christopher_johnson", allHeld, claim, draws(number(12345)))
+		username, err := assignDefaultUsername(ctx, "christopher_johnson_smith_jones", allHeld, claim, draws(number(12345)))
 		require.NoError(t, err)
-		require.Equal(t, "christoph_12345", username)
+		require.Equal(t, "christopher_johnson_smit_12345", username)
 	})
 
 	t.Run("Random numbers span 1001 to 99999", func(t *testing.T) {
@@ -456,15 +458,16 @@ func TestAssignDefaultUsername(t *testing.T) {
 	})
 
 	t.Run("Losing the last number with no random fallback leaves no handle", func(t *testing.T) {
-		// developers_x_99 is the only free number and has no random fallback
-		// ("developers" and "developer" are both reserved). A concurrent assignment
+		// n_o_t_i_f_i_c_a_t_i_o_n_s_x_99 is the only free number and has no
+		// random fallback (its cuts spell "notifications" and "notification", both
+		// reserved). A concurrent assignment
 		// commits it first, and the search that follows finds every number held:
 		// the same outcome as arriving after that assignment, not an error.
 		var lost bool
 		held := func(_ context.Context, usernames []string) (map[string]struct{}, error) {
 			result := make(map[string]struct{}, len(usernames))
 			for _, username := range usernames {
-				if username != "developers_x_99" || lost {
+				if username != "n_o_t_i_f_i_c_a_t_i_o_n_s_x_99" || lost {
 					result[username] = struct{}{}
 				}
 			}
@@ -476,47 +479,49 @@ func TestAssignDefaultUsername(t *testing.T) {
 			lost = true
 			return false, ErrUsernameTaken
 		}
-		_, err := assignDefaultUsername(ctx, "developers_x", held, claim, draws())
+		_, err := assignDefaultUsername(ctx, "n_o_t_i_f_i_c_a_t_i_o_n_s_x", held, claim, draws())
 		require.ErrorIs(t, err, ErrNoDefaultUsername)
-		require.Equal(t, []string{"developers_x_99"}, claims)
+		require.Equal(t, []string{"n_o_t_i_f_i_c_a_t_i_o_n_s_x_99"}, claims)
 	})
 
 	t.Run("No usable handle at any number", func(t *testing.T) {
 		// Every cut of this base is underscores alone.
 		claim, claims := claimer()
-		_, err := assignDefaultUsername(ctx, "______________a", allHeld, claim, draws())
+		_, err := assignDefaultUsername(ctx, strings.Repeat("_", 28)+"a", allHeld, claim, draws())
 		require.ErrorIs(t, err, ErrNoDefaultUsername)
 		require.Empty(t, *claims)
 	})
 
 	t.Run("Random numbers are drawn only from digit counts with a usable stem", func(t *testing.T) {
-		// A four-digit number cuts "password_x" to nothing, but a five-digit one to
-		// "password", which is reserved: every draw is four digits, and the draw is
+		// A four-digit number leaves "v_e_r_i_f_i_c_a_t_i_o_n_x" whole, but a
+		// five-digit one cuts it to "v_e_r_i_f_i_c_a_t_i_o_n", which spells
+		// "verification", reserved: every draw is four digits, and the draw is
 		// asked for over exactly 1001-9999.
 		for _, tc := range []struct {
 			draw     int
 			expected string
 		}{
-			{0, "password_x_1001"},
-			{8998, "password_x_9999"},
+			{0, "v_e_r_i_f_i_c_a_t_i_o_n_x_1001"},
+			{8998, "v_e_r_i_f_i_c_a_t_i_o_n_x_9999"},
 		} {
 			claim, _ := claimer()
-			username, err := assignDefaultUsername(ctx, "password_x", allHeld, claim, draws(tc.draw))
+			username, err := assignDefaultUsername(ctx, "v_e_r_i_f_i_c_a_t_i_o_n_x", allHeld, claim, draws(tc.draw))
 			require.NoError(t, err)
 			require.Equal(t, tc.expected, username)
 		}
 
-		// The other way round: "newsletter" is reserved, "newslette" is not.
+		// The other way round: a four-digit cut spells "administrator", which is
+		// reserved, and a five-digit one "administrato", which is not.
 		claim, _ := claimer()
-		username, err := assignDefaultUsername(ctx, "newsletter_x", allHeld, claim, draws(0))
+		username, err := assignDefaultUsername(ctx, "a_d_m_i_n_i_s_t_r_a_t_o_r_x", allHeld, claim, draws(0))
 		require.NoError(t, err)
-		require.Equal(t, "newslette_10000", username)
+		require.Equal(t, "a_d_m_i_n_i_s_t_r_a_t_o_10000", username)
 	})
 
 	t.Run("No random number is drawn when no digit count has a usable stem", func(t *testing.T) {
-		// "developers" and "developer" are both reserved.
+		// "notifications" and "notification" are both reserved.
 		claim, claims := claimer()
-		_, err := assignDefaultUsername(ctx, "developers_x", allHeld, claim, draws())
+		_, err := assignDefaultUsername(ctx, "n_o_t_i_f_i_c_a_t_i_o_n_s_x", allHeld, claim, draws())
 		require.ErrorIs(t, err, ErrNoDefaultUsername)
 		require.Empty(t, *claims)
 	})
@@ -552,10 +557,10 @@ func TestAssignDefaultUsername(t *testing.T) {
 
 func TestRandomDefaultUsernameRanges(t *testing.T) {
 	for base, expected := range map[string][]numberRange{
-		"jeff":         {{1001, 9999}, {10000, 99999}},
-		"password_x":   {{1001, 9999}},
-		"newsletter_x": {{10000, 99999}},
-		"developers_x": nil,
+		"jeff":                        {{1001, 9999}, {10000, 99999}},
+		"v_e_r_i_f_i_c_a_t_i_o_n_x":   {{1001, 9999}},
+		"a_d_m_i_n_i_s_t_r_a_t_o_r_x": {{10000, 99999}},
+		"n_o_t_i_f_i_c_a_t_i_o_n_s_x": nil,
 	} {
 		require.Equal(t, expected, randomDefaultUsernameRanges(base), "base: %q", base)
 	}

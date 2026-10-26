@@ -90,7 +90,7 @@ type Client interface {
 	// A handle is also text other users see when they pay, message, or search
 	// for its holder, so it is scored for harmful content under the same
 	// categories ClassifyDisplayName uses. Overlapping ClassifyText there is
-	// deliberate: a handle is at most 15 characters with no whitespace, rarely
+	// deliberate: a handle is at most 30 characters with no whitespace, rarely
 	// enough for the general classifier to identify a language, so it often
 	// declines with ErrUnsupportedLanguage and leaves this the only classifier
 	// that saw the handle.

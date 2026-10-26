@@ -374,7 +374,7 @@ func (s *Server) SetUsername(ctx context.Context, req *profilepb.SetUsernameRequ
 			log.Warn("Failed to classify username as text", zap.Error(err))
 			return nil, status.Error(codes.Internal, "failed to moderate username")
 		}
-		// ErrUnsupportedLanguage is not fatal here. A handle is at most 15 characters
+		// ErrUnsupportedLanguage is not fatal here. A handle is at most 30 characters
 		// with no whitespace, so the text classifier frequently has too little to
 		// identify a language from, and the username classifier below still covers it.
 		//

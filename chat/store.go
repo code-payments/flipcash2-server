@@ -53,6 +53,26 @@ var (
 	// ViewerState as of that write, so a ban and a concurrent join can never
 	// both land.
 	ErrBanned = errors.New("banned")
+
+	// ErrInviteNotFound indicates that no invite has the ID asked for, or
+	// that the one that does is an invite to another chat.
+	ErrInviteNotFound = errors.New("invite not found")
+
+	// ErrInviteExhausted indicates that an invite's MaxUses distinct users
+	// have joined with it, so it admits no one (see Invite.StatusAt).
+	ErrInviteExhausted = errors.New("invite exhausted")
+
+	// ErrInviteExpired indicates that an invite's ExpiresAt has passed, so it
+	// admits no one (see Invite.StatusAt).
+	ErrInviteExpired = errors.New("invite expired")
+
+	// ErrInviteRevoked indicates that an invite was revoked, so it admits no
+	// one (see Invite.StatusAt).
+	ErrInviteRevoked = errors.New("invite revoked")
+
+	// ErrTooManyInvites indicates that a private group holds as many ACTIVE
+	// invites as allowed (see MaxActiveInvites).
+	ErrTooManyInvites = errors.New("too many invites")
 )
 
 // MaxGroupChatCreationMembers is the largest initial member set a group chat

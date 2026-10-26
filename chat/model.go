@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
@@ -437,7 +438,9 @@ func (c *Chat) IsCreator(userID *commonpb.UserId) bool {
 // has no creator, so a DM is never editable or moderated, and a group's
 // creator who has left it edits and moderates nothing until they rejoin.
 // Public and private groups alike: a private group's creator moderates it on
-// the same footing as a public group's.
+// the same footing as a public group's. Only a private group's creator, while
+// a member, may invite (see Invite): no one else, since anyone who may invite
+// can hand joiners a chat key, and a public group needs no invite.
 func (c *Chat) PermissionsFor(userID *commonpb.UserId, isMember bool) Permissions {
 	isCreatorMember := isMember && c.IsCreator(userID)
 	return Permissions{
@@ -446,6 +449,7 @@ func (c *Chat) PermissionsFor(userID *commonpb.UserId, isMember bool) Permission
 			CanSilence: isCreatorMember,
 			CanBan:     isCreatorMember,
 		},
+		CanInvite: isCreatorMember && c.IsPrivate,
 	}
 }
 
@@ -586,11 +590,22 @@ func originalMedia(blobID *blobpb.BlobId) *blobpb.Media {
 // be the group's first, it is always one they wrapped themself, and it is
 // never deleted, so its presence is one-way. Every other member's envelope is
 // deleted with their departure (see Server.LeaveChat).
+//
+// A member who joined with an invite holds the invite's copy of the chat key
+// in place of an envelope, until they replace it with one they wrapped
+// themself (see InviteKeyCopy and NewInviteKeyEnvelope). It is stored where
+// their envelope would be and is their envelope in every other respect:
+// WrappedBy is the invite's creator, who signed the copy, so their own
+// envelope replaces it (see Store.SetKeyEnvelope), and their departure
+// discards it. Such an envelope has InviteCopy set and Scheme, Nonce and
+// Ciphertext unset, and ToProto does not apply to it.
 type KeyEnvelope struct {
 	Scheme     chatpb.KeyEnvelope_Scheme
 	Nonce      []byte
 	Ciphertext []byte
 	WrappedBy  *commonpb.UserId
+
+	InviteCopy *InviteKeyCopy
 }
 
 // KeyEnvelopeFromProto returns the envelope pb describes, recorded as stored
@@ -615,12 +630,25 @@ func (e KeyEnvelope) ToProto() *chatpb.KeyEnvelope {
 }
 
 // Equal reports whether the two envelopes are the same envelope: the same
-// bytes under the same scheme, stored by the same user.
+// bytes under the same scheme, or the same invite's copy, stored by the same
+// user.
 func (e KeyEnvelope) Equal(other KeyEnvelope) bool {
+	if (e.InviteCopy == nil) != (other.InviteCopy == nil) {
+		return false
+	}
+	if e.InviteCopy != nil && !e.InviteCopy.Equal(*other.InviteCopy) {
+		return false
+	}
 	return e.Scheme == other.Scheme &&
 		bytes.Equal(e.Nonce, other.Nonce) &&
 		bytes.Equal(e.Ciphertext, other.Ciphertext) &&
 		bytes.Equal(e.WrappedBy.GetValue(), other.WrappedBy.GetValue())
+}
+
+// IsInviteCopy reports whether the envelope is an invite's copy of the chat
+// key (see InviteKeyCopy) rather than an envelope someone wrapped.
+func (e KeyEnvelope) IsInviteCopy() bool {
+	return e.InviteCopy != nil
 }
 
 // IsWrappedBy reports whether userID stored the envelope.
@@ -637,6 +665,197 @@ func (e KeyEnvelope) Clone() KeyEnvelope {
 	}
 	if e.WrappedBy != nil {
 		clone.WrappedBy = &commonpb.UserId{Value: bytes.Clone(e.WrappedBy.Value)}
+	}
+	if e.InviteCopy != nil {
+		c := e.InviteCopy.Clone()
+		clone.InviteCopy = &c
+	}
+	return clone
+}
+
+// InviteKeyCopy is what a member who joined with an invite holds in place of
+// a key envelope (see KeyEnvelope): the invite's copy of the chat key, signed
+// by its creator (chatpb.InviteKeyEnvelope), and the link's secret the member
+// encrypted for themself when joining (chatpb.InviteSecretEnvelope), so that
+// any of their devices can open the copy. The server opens neither. It is
+// what GetKeyEnvelope returns as invite_key_bundle.
+type InviteKeyCopy struct {
+	InviteID       *chatpb.InviteId
+	Envelope       *chatpb.InviteKeyEnvelope
+	SecretEnvelope *chatpb.InviteSecretEnvelope
+}
+
+// NewInviteKeyEnvelope is the envelope a user joining with invite holds (see
+// KeyEnvelope): the invite's copy of the chat key and the secret envelope the
+// joiner made, recorded as wrapped by the invite's creator, who signed the
+// copy.
+func NewInviteKeyEnvelope(invite Invite, envelope *chatpb.InviteKeyEnvelope, secretEnvelope *chatpb.InviteSecretEnvelope) KeyEnvelope {
+	return KeyEnvelope{
+		WrappedBy: invite.CreatedBy,
+		InviteCopy: &InviteKeyCopy{
+			InviteID:       invite.ID,
+			Envelope:       envelope,
+			SecretEnvelope: secretEnvelope,
+		},
+	}.Clone()
+}
+
+// ToProto projects the copy onto GetKeyEnvelope's invite_key_bundle.
+func (c InviteKeyCopy) ToProto() *chatpb.GetKeyEnvelopeResponse_InviteKeyBundle {
+	clone := c.Clone()
+	return &chatpb.GetKeyEnvelopeResponse_InviteKeyBundle{
+		InviteId:       clone.InviteID,
+		KeyEnvelope:    clone.Envelope,
+		SecretEnvelope: clone.SecretEnvelope,
+	}
+}
+
+// Equal reports whether the two are the same invite's same copy with the same
+// secret envelope.
+func (c InviteKeyCopy) Equal(other InviteKeyCopy) bool {
+	return proto.Equal(c.InviteID, other.InviteID) &&
+		proto.Equal(c.Envelope, other.Envelope) &&
+		proto.Equal(c.SecretEnvelope, other.SecretEnvelope)
+}
+
+// Clone returns a deep copy of the copy.
+func (c InviteKeyCopy) Clone() InviteKeyCopy {
+	return InviteKeyCopy{
+		InviteID:       cloneProto(c.InviteID),
+		Envelope:       cloneProto(c.Envelope),
+		SecretEnvelope: cloneProto(c.SecretEnvelope),
+	}
+}
+
+// cloneProto deep-copies m, keeping nil as nil.
+func cloneProto[M proto.Message](m M) M {
+	if !m.ProtoReflect().IsValid() {
+		return m
+	}
+	return proto.Clone(m).(M)
+}
+
+// InviteIDSize is the length, in bytes, of an invite's ID (see
+// MustDeriveInviteID).
+const InviteIDSize = 16
+
+// InviteTokenSize is the length, in bytes, of an invite's token
+// (chatpb.InviteToken).
+const InviteTokenSize = 32
+
+// MaxInviteDuration bounds how far after its creation an invite may expire
+// (see Invite.ExpiresAt). It also keeps every instant derived from an expiry,
+// stored as Unix nanoseconds, well inside range.
+const MaxInviteDuration = 365 * 24 * time.Hour
+
+// MaxActiveInvites is the most ACTIVE invites a private group may hold (see
+// Store.CreateInvite). Invites that are used up, expired or revoked do not
+// count.
+const MaxActiveInvites = 20
+
+// Invite is an invite link to a private group (see chatpb.Invite): who made
+// it, how many distinct users may join with it (MaxUses, 0 for no limit) and
+// how many have (UseCount), when it stops admitting anyone (ExpiresAt, nil
+// for never), and whether it was revoked (RevokedAt, nil if not). The secret
+// envelope is the link's secret encrypted by CreatedBy for themself, which
+// the server cannot open and returns to them so they can share the link
+// again. The link's token is never part of it: the server never stores one
+// (see chatpb.InviteToken), and finds an invite by the ID derived from it
+// (see MustDeriveInviteID).
+//
+// Nothing about an invite moves backwards: UseCount only grows, RevokedAt is
+// set once, ExpiresAt is fixed, and no other field ever changes. So its
+// status (see StatusAt) only moves later in the order ACTIVE, EXHAUSTED,
+// EXPIRED, REVOKED, and needs no version: of two reads of an invite, the one
+// with the greater UseCount, or a revoke, is the later. The invite's copy of
+// the chat key is not part of it either: it is read only by a join (see
+// Store.JoinWithInvite), and deleted once the invite stops being ACTIVE.
+type Invite struct {
+	ID             *chatpb.InviteId
+	ChatID         *commonpb.ChatId
+	CreatedBy      *commonpb.UserId
+	MaxUses        uint32
+	UseCount       uint32
+	CreatedAt      time.Time
+	ExpiresAt      *time.Time
+	RevokedAt      *time.Time
+	SecretEnvelope *chatpb.InviteSecretEnvelope
+}
+
+// StatusAt is the invite's status as of now. When more than one reason
+// applies, it is the first of REVOKED, EXPIRED and EXHAUSTED, as the proto
+// orders them. Expiry is the clock's, with nothing written: the invite stops
+// admitting anyone at the instant ExpiresAt, and is EXPIRED from then on.
+func (i Invite) StatusAt(now time.Time) chatpb.Invite_Status {
+	switch {
+	case i.RevokedAt != nil:
+		return chatpb.Invite_REVOKED
+	case i.ExpiresAt != nil && !now.Before(*i.ExpiresAt):
+		return chatpb.Invite_EXPIRED
+	case i.MaxUses > 0 && i.UseCount >= i.MaxUses:
+		return chatpb.Invite_EXHAUSTED
+	default:
+		return chatpb.Invite_ACTIVE
+	}
+}
+
+// AdmitsAt reports whether the invite admits users as of now: nil when it is
+// ACTIVE, and otherwise the error naming why not (ErrInviteRevoked,
+// ErrInviteExpired or ErrInviteExhausted, judged in StatusAt's order).
+func (i Invite) AdmitsAt(now time.Time) error {
+	switch i.StatusAt(now) {
+	case chatpb.Invite_REVOKED:
+		return ErrInviteRevoked
+	case chatpb.Invite_EXPIRED:
+		return ErrInviteExpired
+	case chatpb.Invite_EXHAUSTED:
+		return ErrInviteExhausted
+	default:
+		return nil
+	}
+}
+
+// IsLastUse reports whether one more use of the invite would use it up: what
+// a join that counts a use checks to delete the invite's copy with it (see
+// Store.JoinWithInvite). It is never true of an invite without a limit.
+func (i Invite) IsLastUse() bool {
+	return i.MaxUses > 0 && i.UseCount+1 >= i.MaxUses
+}
+
+// ToProto projects the invite onto a chatpb.Invite, with its status as of
+// now. The proto carries no revoke time; a revoke shows in the status alone.
+func (i Invite) ToProto(now time.Time) *chatpb.Invite {
+	clone := i.Clone()
+	out := &chatpb.Invite{
+		InviteId:       clone.ID,
+		ChatId:         clone.ChatID,
+		CreatedBy:      clone.CreatedBy,
+		MaxUses:        i.MaxUses,
+		UseCount:       i.UseCount,
+		CreatedAt:      timestamppb.New(i.CreatedAt),
+		Status:         i.StatusAt(now),
+		SecretEnvelope: clone.SecretEnvelope,
+	}
+	if i.ExpiresAt != nil {
+		out.ExpiresAt = timestamppb.New(*i.ExpiresAt)
+	}
+	return out
+}
+
+// Clone returns a deep copy of the invite.
+func (i Invite) Clone() Invite {
+	clone := i
+	clone.ID = cloneProto(i.ID)
+	clone.ChatID = cloneProto(i.ChatID)
+	clone.CreatedBy = cloneProto(i.CreatedBy)
+	clone.SecretEnvelope = cloneProto(i.SecretEnvelope)
+	if i.ExpiresAt != nil {
+		t := *i.ExpiresAt
+		clone.ExpiresAt = &t
+	}
+	if i.RevokedAt != nil {
+		t := *i.RevokedAt
+		clone.RevokedAt = &t
 	}
 	return clone
 }
@@ -899,7 +1118,8 @@ type BanResult struct {
 
 // Permissions is what a user may do in a chat beyond what membership alone
 // allows every member: whether they may edit its record (see
-// Server.EditChat), and how they may moderate it (see ModerationPermissions). It is
+// Server.EditChat), how they may moderate it (see ModerationPermissions), and
+// whether they may create, list and revoke its invites (see Invite). It is
 // computed from the chat's record and the user's membership (see
 // Chat.PermissionsFor), never stored, and shown to the user alone on their
 // ViewerState — a client shows an affordance if and only if its flag is set,
@@ -908,6 +1128,7 @@ type BanResult struct {
 type Permissions struct {
 	CanEdit    bool
 	Moderation ModerationPermissions
+	CanInvite  bool
 }
 
 // ModerationPermissions is how a user may moderate a chat's users (see
@@ -929,7 +1150,7 @@ func (m ModerationPermissions) Any() bool {
 // ToProto projects the permissions onto a chatpb.ViewerState_Permissions,
 // leaving moderation unset when it grants nothing, as the proto describes.
 func (p Permissions) ToProto() *chatpb.ViewerState_Permissions {
-	out := &chatpb.ViewerState_Permissions{CanEdit: p.CanEdit}
+	out := &chatpb.ViewerState_Permissions{CanEdit: p.CanEdit, CanInvite: p.CanInvite}
 	if p.Moderation.Any() {
 		out.Moderation = &chatpb.ViewerState_ModerationPermissions{
 			CanSilence: p.Moderation.CanSilence,

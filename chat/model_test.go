@@ -176,6 +176,16 @@ func TestPermissionsFor(t *testing.T) {
 	require.Equal(t, Permissions{}, group.PermissionsFor(memberID, true))
 	require.Equal(t, Permissions{}, dm.PermissionsFor(creatorID, true))
 
+	// A private group's creator, while a member, may also invite, and no one
+	// else may; a public group's creator has nothing to invite to.
+	private := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, CreatorID: creatorID, IsPrivate: true}
+	all.CanInvite = true
+	require.Equal(t, all, private.PermissionsFor(creatorID, true))
+	require.Equal(t, Permissions{}, private.PermissionsFor(creatorID, false))
+	require.Equal(t, Permissions{}, private.PermissionsFor(memberID, true))
+	require.True(t, all.ToProto().CanInvite)
+	require.False(t, group.PermissionsFor(creatorID, true).ToProto().CanInvite)
+
 	// Moderation is projected only when it grants something.
 	require.Nil(t, Permissions{CanEdit: true}.ToProto().Moderation)
 	for _, m := range []ModerationPermissions{{CanSilence: true}, {CanBan: true}, {CanSilence: true, CanBan: true}} {

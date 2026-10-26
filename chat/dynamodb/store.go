@@ -5433,11 +5433,11 @@ func (s *store) readInviteJoin(ctx context.Context, chatID *commonpb.ChatId, use
 // no-op, then the invite's status — and writes the join as one membership
 // transition (see transitionMembership) carrying, in order:
 //
-//   - [0] the ban check (see banCheck), a failure of which is ErrBanned;
-//   - [1] the invite's record, use_count compare-and-set from the count read
+//   - [0] the invite's record, use_count compare-and-set from the count read
 //     to one more, conditioned too on the chat, on no revoke and on the
 //     expiry being after now, and on the last use with active_sort removed,
 //     so it leaves gsiInvitesActive;
+//   - [1] the ban check (see banCheck), a failure of which is ErrBanned;
 //   - on the last use, the unconditional delete of the invite's copy;
 //   - the unconditional put of the joiner's key envelope, the copy (see
 //     chat.NewInviteKeyEnvelope), over whatever they held;
@@ -5448,8 +5448,12 @@ func (s *store) readInviteJoin(ctx context.Context, chatID *commonpb.ChatId, use
 //
 // The use count is a compare-and-set rather than an ADD: it is what makes
 // the last use exact, and joins to the group already serialize on its
-// roster summary, so it adds no contention of its own. Any failed condition
-// past the ban's is the invite or the lobby entry moving since the read — a
+// roster summary, so it adds no contention of its own. The invite's
+// condition comes before the ban's, so a transaction failing both (a banned
+// user's join racing a revoke or the last use) starts over and is told about
+// the invite, which is judged before the ban as the store promises. Any
+// other failed condition but the ban's is the invite or the lobby entry
+// moving since the read — a
 // concurrent join, a revoke, an entry or a departure from the lobby — and
 // the join starts over from a fresh read, at once, as a lost race and not a
 // throttled write (see maxInviteJoinAttempts), where it is judged again. A
@@ -5518,8 +5522,8 @@ func (s *store) JoinWithInvite(ctx context.Context, chatID *commonpb.ChatId, use
 		}
 
 		alongside := []types.TransactWriteItem{
-			{ConditionCheck: s.banCheck(chatID, userID)},
 			{Update: inviteUpdate},
+			{ConditionCheck: s.banCheck(chatID, userID)},
 		}
 		if lastUse {
 			alongside = append(alongside, types.TransactWriteItem{Delete: &types.Delete{
@@ -5547,7 +5551,7 @@ func (s *store) JoinWithInvite(ctx context.Context, chatID *commonpb.ChatId, use
 		changed, err := s.transitionMembership(ctx, chatID, s.joinUpdate(chatID, userID), 1, &roster, alongside)
 		var failed alongsideConditionFailed
 		switch {
-		case errors.As(err, &failed) && failed.Index == 0:
+		case errors.As(err, &failed) && failed.Index == 1:
 			return chat.JoinWithInviteResult{}, chat.ErrBanned
 		case errors.As(err, &failed):
 			lost = "the invite or the lobby entry moved"

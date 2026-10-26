@@ -232,12 +232,15 @@ func (s *Server) joinWithInvite(ctx context.Context, c *Chat, userID *commonpb.U
 		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_OK, Chat: md}, nil
 	}
 
+	// The creator is told the lobby shrank before the reads announceJoin
+	// makes: unlike an admission, they are not the caller, so were a read to
+	// fail they would never learn it, the joiner's retry being the no-op.
+	if result.LeftLobby {
+		s.publishLobbyLeft(c, userID)
+	}
 	md, err := s.announceJoin(ctx, log, c, userID, InvitedBy(result.Invite.CreatedBy), result.Roster)
 	if err != nil {
 		return nil, err
-	}
-	if result.LeftLobby {
-		s.publishLobbyLeft(c, userID)
 	}
 	return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_OK, Chat: md}, nil
 }

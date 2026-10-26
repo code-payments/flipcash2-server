@@ -4086,10 +4086,11 @@ func (s *store) GetLobbyPage(ctx context.Context, chatID *commonpb.ChatId, after
 // ErrBanned, and is placed first so that it is the failure reported when the
 // delete fails too, as it does for a banned user, who holds no entry; a
 // failed delete condition alone is the user not waiting, reported as
-// ErrNotInLobby. A join that
-// is a no-op — the user was a member already — writes nothing, the entry
-// included: the caller gates on membership before asking, so an entry left
-// behind this way is a race's residue the user clears by leaving the lobby.
+// ErrNotInLobby. A join that is a no-op — the user was a member already —
+// writes nothing, and leaves no entry behind, since a member holds none:
+// EnterLobby refuses a member in its write, and every way in (this, and a
+// join with an invite, see JoinWithInvite) removes the entry in the write
+// that joins them.
 func (s *store) AdmitFromLobby(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, envelope chat.KeyEnvelope) (bool, chat.RosterSummary, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return false, chat.RosterSummary{}, fmt.Errorf("not a group chat id")

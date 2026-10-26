@@ -139,6 +139,10 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_InviteJoin_Envelope,
 		testStore_InviteJoin_Revoke,
 		testStore_InviteJoin_Concurrent,
+		testStore_InviteJoin_RefusedKeepsLobby,
+		testStore_InviteJoin_RaceAdmit,
+		testStore_InviteJoin_RaceLobby,
+		testStore_InviteJoin_RaceBan,
 	} {
 		tf(t, s)
 		teardown()
@@ -6053,4 +6057,288 @@ func testStore_InviteJoin_Concurrent(t *testing.T, s chat.Store) {
 		requireUseCount(t, s, invite, maxUses)
 		requireRosterSummary(t, s, groupID, 1+uint64(maxUses), uint64(maxUses))
 	}
+}
+
+// inviteRaceRounds is how many times each race between a join with an
+// invite and a lobby or ban write is run concurrently (see raceOrders).
+const inviteRaceRounds = 8
+
+// raceOrders runs round once per order of two writes a and b that round
+// hands to its run: a then b, b then a, then both at once inviteRaceRounds
+// times. The sequential orders pin both outcomes whatever the scheduler
+// favours, since against one backend the same write tends to win every
+// concurrent round; the concurrent rounds are what may catch one write
+// between the other's read and its write. Each round sets up its own state.
+func raceOrders(round func(run func(a, b func()))) {
+	orders := []func(a, b func()){
+		func(a, b func()) { a(); b() },
+		func(a, b func()) { b(); a() },
+	}
+	for range inviteRaceRounds {
+		orders = append(orders, func(a, b func()) {
+			var wg sync.WaitGroup
+			wg.Go(a)
+			wg.Go(b)
+			wg.Wait()
+		})
+	}
+	for _, run := range orders {
+		round(run)
+	}
+}
+
+// requireLobbyFreed checks that user holds no entry in chatID's lobby and
+// that neither count holds a place for one: the lobby's one place, under a
+// LobbySize of 1, takes someone else, and the user's one lobby, under a
+// LobbiesPerUser of 1, takes another group's. It is for a user who waited
+// in no other lobby.
+func requireLobbyFreed(t *testing.T, s chat.Store, chatID *commonpb.ChatId, user *commonpb.UserId) {
+	t.Helper()
+	ctx := context.Background()
+	tight := chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1}
+
+	entries, err := s.GetLobbyEntries(ctx, user, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	require.Empty(t, entries)
+	_, changed, err := s.EnterLobby(ctx, chatID, model.MustGenerateUserID(), tight)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, changed, err = s.EnterLobby(ctx, chat.MustGenerateGroupChatID(), user, tight)
+	require.NoError(t, err)
+	require.True(t, changed)
+}
+
+// testStore_InviteJoin_RefusedKeepsLobby pins that a join with an invite
+// that admits no one leaves a waiting user where they were: their entry and
+// both counts untouched, so they keep their place, and a later join with an
+// invite that admits them takes them out as any does.
+func testStore_InviteJoin_RefusedKeepsLobby(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	user := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	tight := chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1}
+
+	entry, changed, err := s.EnterLobby(ctx, groupID, user, tight)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	expiresAt := now.Add(-time.Hour)
+	expired := createInvite(t, s, newInvite(groupID, creator, 0, now.Add(-2*time.Hour), &expiresAt), chat.MaxActiveInvites, now)
+	revoked := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	_, _, err = s.RevokeInvite(ctx, groupID, revoked.ID, now)
+	require.NoError(t, err)
+	usedUp := createInvite(t, s, newInvite(groupID, creator, 1, now, nil), chat.MaxActiveInvites, now)
+	joinWithInvite(t, s, groupID, model.MustGenerateUserID(), usedUp, inviteSecret(5), now)
+	elsewhere := createInvite(t, s, newInvite(privateGroup(t, s, creator), creator, 0, now, nil), chat.MaxActiveInvites, now)
+
+	for _, refusal := range []struct {
+		inviteID *chatpb.InviteId
+		want     error
+	}{
+		{expired.ID, chat.ErrInviteExpired},
+		{revoked.ID, chat.ErrInviteRevoked},
+		{usedUp.ID, chat.ErrInviteExhausted},
+		{elsewhere.ID, chat.ErrInviteNotFound},
+		{newInvite(groupID, creator, 0, now, nil).ID, chat.ErrInviteNotFound},
+	} {
+		_, err := s.JoinWithInvite(ctx, groupID, user, refusal.inviteID, inviteSecret(5), now)
+		require.ErrorIs(t, err, refusal.want)
+		requireNotJoined(t, s, groupID, user)
+
+		// Still waiting, at the first entry's time, and both places still
+		// theirs: the lobby is full to anyone else, and they wait in no other.
+		entries, err := s.GetLobbyEntries(ctx, user, []*commonpb.ChatId{groupID})
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		require.True(t, entry.EnteredAt.Equal(entries[string(groupID.Value)].EnteredAt))
+		_, _, err = s.EnterLobby(ctx, groupID, model.MustGenerateUserID(), tight)
+		require.ErrorIs(t, err, chat.ErrLobbyFull)
+		_, _, err = s.EnterLobby(ctx, chat.MustGenerateGroupChatID(), user, tight)
+		require.ErrorIs(t, err, chat.ErrTooManyLobbies)
+	}
+
+	// An invite that admits them takes them out with both counts.
+	open := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+	result := joinWithInvite(t, s, groupID, user, open, inviteSecret(5), now)
+	require.True(t, result.LeftLobby)
+	requireLobbyFreed(t, s, groupID, user)
+}
+
+// testStore_InviteJoin_RaceAdmit pins a waiting user's join with an invite
+// racing the creator's admission of them: exactly one of the two joins them,
+// the other is the no-op, and what stands is the winner's alone — the use
+// counted only when the invite won, the envelope the winner stored, the entry
+// and both counts gone, the roster moved once.
+func testStore_InviteJoin_RaceAdmit(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		groupID := privateGroup(t, s, creator)
+		invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+		_, changed, err := s.EnterLobby(ctx, groupID, user, chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1})
+		require.NoError(t, err)
+		require.True(t, changed)
+
+		admitted := keyEnvelope(3, creator)
+		var (
+			admitChanged bool
+			admitErr     error
+			joinResult   chat.JoinWithInviteResult
+			joinErr      error
+		)
+		run(func() {
+			admitChanged, _, admitErr = s.AdmitFromLobby(ctx, groupID, user, admitted)
+		}, func() {
+			joinResult, joinErr = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), now)
+		})
+		require.NoError(t, admitErr)
+		require.NoError(t, joinErr)
+		require.NotEqual(t, admitChanged, joinResult.Changed, "exactly one of the two joins")
+
+		isMember, err := s.IsMember(ctx, groupID, user)
+		require.NoError(t, err)
+		require.True(t, isMember)
+		requireRosterSummary(t, s, groupID, 2, 1)
+		got, err := s.GetKeyEnvelope(ctx, groupID, user)
+		require.NoError(t, err)
+		if joinResult.Changed {
+			require.True(t, joinResult.LeftLobby)
+			requireUseCount(t, s, invite, 1)
+			require.NotNil(t, got.InviteCopy)
+			require.Equal(t, invite.ID.Value, got.InviteCopy.InviteID.Value)
+		} else {
+			requireUseCount(t, s, invite, 0)
+			require.True(t, admitted.Equal(got))
+		}
+		requireLobbyFreed(t, s, groupID, user)
+	})
+}
+
+// testStore_InviteJoin_RaceLobby pins a join with an invite racing the
+// joiner's own lobby writes: an entry is either refused (the join landed
+// first) or taken out by the join (the entry landed first), and a withdrawal
+// either removes the entry or finds the join had; either way the joiner ends
+// a member with no entry and both counts freed, the lobby's side moved
+// exactly once.
+func testStore_InviteJoin_RaceLobby(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+
+	// Entering.
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		groupID := privateGroup(t, s, creator)
+		invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+
+		var (
+			enterErr   error
+			joinResult chat.JoinWithInviteResult
+			joinErr    error
+		)
+		run(func() {
+			_, _, enterErr = s.EnterLobby(ctx, groupID, user, lobbyLimits)
+		}, func() {
+			joinResult, joinErr = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), now)
+		})
+		require.NoError(t, joinErr)
+		require.True(t, joinResult.Changed)
+		if enterErr == nil {
+			require.True(t, joinResult.LeftLobby, "an entry made first is taken out by the join")
+		} else {
+			require.ErrorIs(t, enterErr, chat.ErrAlreadyMember)
+			require.False(t, joinResult.LeftLobby)
+		}
+		requireRosterSummary(t, s, groupID, 2, 1)
+		requireLobbyFreed(t, s, groupID, user)
+	})
+
+	// Withdrawing.
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		groupID := privateGroup(t, s, creator)
+		invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+		_, changed, err := s.EnterLobby(ctx, groupID, user, lobbyLimits)
+		require.NoError(t, err)
+		require.True(t, changed)
+
+		var (
+			left       bool
+			leaveErr   error
+			joinResult chat.JoinWithInviteResult
+			joinErr    error
+		)
+		run(func() {
+			left, leaveErr = s.LeaveLobby(ctx, groupID, user)
+		}, func() {
+			joinResult, joinErr = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), now)
+		})
+		require.NoError(t, leaveErr)
+		require.NoError(t, joinErr)
+		require.True(t, joinResult.Changed)
+		require.NotEqual(t, left, joinResult.LeftLobby, "exactly one of the two removes the entry")
+		requireRosterSummary(t, s, groupID, 2, 1)
+		requireLobbyFreed(t, s, groupID, user)
+	})
+}
+
+// testStore_InviteJoin_RaceBan pins a waiting user's join with an invite
+// racing the creator's ban of them: either the ban lands first and the join
+// is ErrBanned, using nothing, or the join lands first and the ban removes
+// the member it made. Either way the user ends banned, not a member, with no
+// envelope and no entry, both counts freed, and the lobby's side moved by
+// exactly one of the two.
+func testStore_InviteJoin_RaceBan(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		groupID := privateGroup(t, s, creator)
+		invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+		_, changed, err := s.EnterLobby(ctx, groupID, user, chat.LobbyLimits{LobbySize: 1, LobbiesPerUser: 1})
+		require.NoError(t, err)
+		require.True(t, changed)
+
+		var (
+			ban        chat.BanResult
+			banErr     error
+			joinResult chat.JoinWithInviteResult
+			joinErr    error
+		)
+		run(func() {
+			ban, banErr = s.BanUser(ctx, groupID, user, now, true)
+		}, func() {
+			joinResult, joinErr = s.JoinWithInvite(ctx, groupID, user, invite.ID, inviteSecret(5), now)
+		})
+		require.NoError(t, banErr)
+		require.True(t, ban.Changed)
+
+		if joinErr == nil {
+			require.True(t, joinResult.Changed)
+			require.True(t, joinResult.LeftLobby)
+			require.True(t, ban.Departed, "a join landing first is undone by the ban")
+			require.False(t, ban.LeftLobby)
+			requireUseCount(t, s, invite, 1)
+			requireRosterSummary(t, s, groupID, 1, 2)
+		} else {
+			require.ErrorIs(t, joinErr, chat.ErrBanned)
+			require.False(t, ban.Departed)
+			require.True(t, ban.LeftLobby)
+			requireUseCount(t, s, invite, 0)
+			requireRosterSummary(t, s, groupID, 1, 0)
+		}
+
+		requireNotJoined(t, s, groupID, user)
+		states, err := s.GetViewerStates(ctx, user, []*commonpb.ChatId{groupID})
+		require.NoError(t, err)
+		require.True(t, states[string(groupID.Value)].IsBanned())
+		requireLobbyFreed(t, s, groupID, user)
+	})
 }

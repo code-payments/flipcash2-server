@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,7 +24,7 @@ import (
 
 // The payment request store is one table:
 //
-//	payment_requests  pk = the request ID (B, its 16 bytes), sk = requestSK
+//	payment_requests  pk = "req#<request ID hex>", sk = requestSK
 //	                  (#meta), one item per request: type (N, see the type
 //	                  values below), creator and chat (B; the chat is the
 //	                  16-byte group chat ID), created_at (epoch nanos,
@@ -44,6 +45,11 @@ import (
 // written with it in one transaction; a key schema cannot be changed once the
 // table exists. Such an item takes its own sk and must omit the index
 // attributes below.
+//
+// The table is deployed as payment_requests_v2. The first table keyed a
+// request on its raw binary ID; the prefixed string key leaves room for
+// partitions of other kinds beside requests', and since a key schema cannot
+// change, it took a new table, with the first table's items copied across.
 //
 // type says which of the request's type fields is set, and so which message
 // details holds; it is the only thing that says so, since every type stores its
@@ -108,10 +114,15 @@ const (
 	// hash keys derived from its ID, with the worker querying each.
 	expiryQueuePK = "queue#expiry"
 
+	// requestKeyPrefix prefixes a request's partition key, so the table can
+	// hold partitions of other kinds beside requests' without their keys
+	// colliding.
+	requestKeyPrefix = "req#"
+
 	// requestSK is the sort key of a request's own item.
 	requestSK = "#meta"
 
-	attrPK             = "pk"              // B, the request ID
+	attrPK             = "pk"              // S, requestPK of the request ID
 	attrSK             = "sk"              // S, requestSK for the request itself
 	attrType           = "type"            // N, see the type values
 	attrCreator        = "creator"         // B
@@ -203,7 +214,7 @@ func (s *store) Create(ctx context.Context, r *paymentrequest.PaymentRequest) er
 	}
 
 	item := map[string]types.AttributeValue{
-		attrPK:             avB(r.ID.Value),
+		attrPK:             avS(requestPK(r.ID)),
 		attrSK:             avS(requestSK),
 		attrType:           avNInt(typeSplit),
 		attrCreator:        avB(r.Creator.Value),
@@ -479,8 +490,12 @@ func (s *store) GetDueForExpiry(ctx context.Context, asOf time.Time, limit int) 
 		if err != nil {
 			return nil, err
 		}
+		id, err := requestIDFromPK(item)
+		if err != nil {
+			return nil, err
+		}
 		tasks = append(tasks, &paymentrequest.ExpiryTask{
-			ID:            &paymentrequestpb.PaymentRequestId{Value: asB(item[attrPK])},
+			ID:            id,
 			Attempts:      uint32(attempts),
 			NextAttemptAt: time.Unix(0, dueAt).UTC(),
 		})
@@ -744,8 +759,13 @@ func requestFromItem(item map[string]types.AttributeValue) (*paymentrequest.Paym
 		return nil, err
 	}
 
+	id, err := requestIDFromPK(item)
+	if err != nil {
+		return nil, err
+	}
+
 	r := &paymentrequest.PaymentRequest{
-		ID:               &paymentrequestpb.PaymentRequestId{Value: asB(item[attrPK])},
+		ID:               id,
 		Creator:          &commonpb.UserId{Value: asB(item[attrCreator])},
 		CreatedAt:        time.Unix(0, createdAt).UTC(),
 		ChatID:           &commonpb.ChatId{Value: asB(item[attrChat])},
@@ -833,18 +853,45 @@ func sortableNanos(t time.Time) uint64 {
 	return uint64(t.UnixNano()) ^ (1 << 63)
 }
 
+// requestPK is the partition key of a request's items.
+func requestPK(id *paymentrequestpb.PaymentRequestId) string {
+	return requestKeyPrefix + hex.EncodeToString(id.GetValue())
+}
+
 // requestKey is the key of a request's own item.
 func requestKey(id *paymentrequestpb.PaymentRequestId) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{
-		attrPK: avB(id.GetValue()),
+		attrPK: avS(requestPK(id)),
 		attrSK: avS(requestSK),
 	}
+}
+
+// requestIDFromPK recovers a request ID from an item's pk ("req#<hex>"), the
+// inverse of requestPK.
+func requestIDFromPK(item map[string]types.AttributeValue) (*paymentrequestpb.PaymentRequestId, error) {
+	pk := asS(item[attrPK])
+	encoded, ok := strings.CutPrefix(pk, requestKeyPrefix)
+	if !ok {
+		return nil, fmt.Errorf("unexpected pk %q", pk)
+	}
+	id, err := hex.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("decoding payment request id from pk %q: %w", pk, err)
+	}
+	return &paymentrequestpb.PaymentRequestId{Value: id}, nil
 }
 
 func avS(v string) types.AttributeValue { return &types.AttributeValueMemberS{Value: v} }
 func avB(v []byte) types.AttributeValue { return &types.AttributeValueMemberB{Value: v} }
 func avNInt(v int64) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.FormatInt(v, 10)}
+}
+
+func asS(av types.AttributeValue) string {
+	if s, ok := av.(*types.AttributeValueMemberS); ok {
+		return s.Value
+	}
+	return ""
 }
 
 func asB(av types.AttributeValue) []byte {

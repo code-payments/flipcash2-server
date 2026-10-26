@@ -43,7 +43,7 @@ func TestPaymentRequest_DynamoDBStore_RefusesUnknownType(t *testing.T) {
 	for name, typ := range map[string]int64{"unknown": typeSplit + 1, "missing": 0} {
 		t.Run(name, func(t *testing.T) {
 			item := map[string]types.AttributeValue{
-				attrPK:      avB(id.Value),
+				attrPK:      avS(requestPK(id)),
 				attrSK:      avS(requestSK),
 				attrStatus:  avNInt(statusOpen),
 				attrVersion: avNInt(1),

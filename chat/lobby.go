@@ -27,8 +27,12 @@ import (
 // The lobby: how a user is admitted to a private group (see Chat.IsPrivate and
 // LobbyEntry). A user who wants in enters the group's lobby and waits; the
 // group's creator, who alone sees the lobby, admits them with the chat key
-// wrapped for them, or denies them. JoinChat is DENIED for a private group,
-// so this is the only way in for anyone but the creator.
+// wrapped for them, or denies them. JoinChat is DENIED for a private group
+// to anyone but its creator who holds no invite (see Invite), so this is the
+// way in for everyone without one. A join with an invite also removes the
+// joiner's entry, if they were waiting, in its own write (see
+// Store.JoinWithInvite), and is told to the creator as a MemberLeft like an
+// admission.
 //
 // Every RPC here is gated on the canonical record first, since its absence is
 // the only thing that tells NOT_FOUND from DENIED, then on the chat being a
@@ -52,7 +56,7 @@ import (
 // and fetches their envelope (see Server.GetKeyEnvelope), and a
 // MembershipChanged naming no one to the members. Like the creator's rejoin,
 // it also writes a UserJoined system message into the group's log, as
-// Admitted by the creator (see sendUserJoined).
+// Admitted by the creator (see sendUserJoined and announceJoin).
 //
 // The lobby's own changes reach the creator alone, as LobbyUpdates on their
 // user topic (see publishLobbyUpdate): a MemberEntered carrying the waiting
@@ -370,39 +374,17 @@ func (s *Server) AdmitLobbyMember(ctx context.Context, req *chatpb.AdmitLobbyMem
 		return &chatpb.AdmitLobbyMemberResponse{Result: chatpb.AdmitLobbyMemberResponse_OK}, nil
 	}
 
-	// The caller, the creator, let them in.
-	s.sendUserJoined(ctx, log, c, req.UserId, userID, roster)
 	s.sendLobbyPush(ctx, log, func(ctx context.Context) error {
 		return push.SendLobbyAdmittedPush(ctx, s.pusher, req.UserId, c.ID, c.Title)
 	})
 
-	// Announced as any join is (see JoinChat): to the admitted user's own
-	// devices, their entry as hydrated for them, with the metadata so they
-	// can insert the chat, and the record the write produced; to the
-	// members, only that the roster moved.
-	metadata, err := s.hydrator.hydrate(ctx, req.UserId, memberListenerStanding, ReadingFull, fullDetail, []*Chat{c})
-	if err != nil {
-		// The admission has landed; only the read back failed. The admitted
-		// user is told nothing, and reads the chat on their next open; the
-		// creator's retry is the no-op path.
-		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata for admitted user")
-		return nil, status.Error(codes.Internal, "")
-	}
-	md := metadata[0]
-	rosterSummary := roster.ToProto()
-	md.RosterSummary = rosterSummary
-	member, err := s.announcedMember(ctx, log, c.ID, req.UserId, md.Members[0].UserProfile, roster)
-	if err != nil {
+	// Announced as any join is (see announceJoin), the caller, the creator,
+	// having let them in; and to the creator, the lobby shrank. A failed read
+	// back leaves the admitted user told nothing but the push, and they read
+	// the chat on their next open; the creator's retry is the no-op path.
+	if _, err := s.announceJoin(ctx, log, c, req.UserId, AdmittedBy(userID), roster); err != nil {
 		return nil, err
 	}
-	toJoiner := &chatpb.RosterUpdate{
-		Kind: &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{
-			Member:   member,
-			Metadata: md,
-		}},
-		RosterSummary: rosterSummary,
-	}
-	s.publishRosterUpdate(c.ID, req.UserId, toJoiner, true)
 	s.publishLobbyLeft(c, req.UserId)
 
 	return &chatpb.AdmitLobbyMemberResponse{Result: chatpb.AdmitLobbyMemberResponse_OK}, nil

@@ -1778,9 +1778,11 @@ func testServer_SendBatch_RecordsGroupSenders(t *testing.T, badges badge.Store, 
 }
 
 // testServer_SendUserJoined pins the UserJoined system message: no sender, a
-// fallback naming no one, the method its admitter decides, unread carried
-// forward, the group's last message, broadcast but never pushed; a repeat of
-// one join writes nothing, a later join writes its own, and a DM is refused.
+// fallback naming no one, the method the caller names (Admitted, Direct or
+// Invited), unread carried forward, the group's last message, broadcast but
+// never pushed; a repeat of one join writes nothing, whatever method it
+// names, a later join writes its own, and a DM, an unknown method or one
+// naming no one is refused.
 func testServer_SendUserJoined(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 
@@ -1804,7 +1806,7 @@ func testServer_SendUserJoined(t *testing.T, badges badge.Store, blocklists bloc
 	require.Eventually(t, func() bool { return len(e.pusher.snapshot()) == 1 }, time.Second, 20*time.Millisecond)
 
 	// userB, admitted by Alice.
-	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, e.userA, 1))
+	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, chat.AdmittedBy(e.userA), 1))
 	msg, err := messages.GetMessage(e.ctx, groupID, &messagingpb.MessageId{Value: 2})
 	require.NoError(t, err)
 	require.Nil(t, msg.SenderID)
@@ -1815,6 +1817,7 @@ func testServer_SendUserJoined(t *testing.T, badges badge.Store, blocklists bloc
 	require.Equal(t, "A new member joined the group", system.FallbackText)
 	require.Equal(t, e.userB.Value, system.GetUserJoined().GetUserId().GetValue())
 	require.Equal(t, e.userA.Value, system.GetUserJoined().GetAdmitted().GetAdmittedBy().GetValue())
+	require.NoError(t, msg.ToProto().Validate())
 
 	record, err := chats.GetChatByID(e.ctx, groupID)
 	require.NoError(t, err)
@@ -1827,27 +1830,53 @@ func testServer_SendUserJoined(t *testing.T, badges badge.Store, blocklists bloc
 	require.True(t, proto.Equal(msg.ToProto(), sent[0].Mutations[0].GetMessageSent()))
 
 	// A repeat of the same join writes nothing.
-	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, e.userA, 1))
+	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, chat.AdmittedBy(e.userA), 1))
 	_, err = messages.GetMessage(e.ctx, groupID, &messagingpb.MessageId{Value: 3})
 	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
 
 	// A later join, on their own, writes its own.
-	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userA, nil, 2))
+	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userA, chat.JoinedDirectly(), 2))
 	msg, err = messages.GetMessage(e.ctx, groupID, &messagingpb.MessageId{Value: 3})
 	require.NoError(t, err)
 	require.Nil(t, msg.SenderID)
 	require.Equal(t, uint64(1), msg.UnreadSeq)
 	require.Equal(t, e.userA.Value, msg.Content[0].GetSystem().GetUserJoined().GetUserId().GetValue())
 	require.NotNil(t, msg.Content[0].GetSystem().GetUserJoined().GetDirect())
+	require.NoError(t, msg.ToProto().Validate())
+
+	// A join with Alice's invite writes its own, naming her as who invited
+	// them and still no one in the fallback.
+	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, chat.InvitedBy(e.userA), 3))
+	msg, err = messages.GetMessage(e.ctx, groupID, &messagingpb.MessageId{Value: 4})
+	require.NoError(t, err)
+	require.Nil(t, msg.SenderID)
+	system = msg.Content[0].GetSystem()
+	require.Equal(t, "A new member joined the group", system.FallbackText)
+	require.Equal(t, e.userB.Value, system.GetUserJoined().GetUserId().GetValue())
+	require.Equal(t, e.userA.Value, system.GetUserJoined().GetInvited().GetInvitedBy().GetValue())
+	require.NoError(t, msg.ToProto().Validate())
+
+	// The client message ID names the join alone, never the method, so a
+	// repeat of that join writes nothing whatever method it names.
+	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, chat.InvitedBy(e.userA), 3))
+	require.NoError(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, chat.JoinedDirectly(), 3))
+	_, err = messages.GetMessage(e.ctx, groupID, &messagingpb.MessageId{Value: 5})
+	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
 
 	// Broadcast once per join, and never pushed.
-	require.Eventually(t, func() bool { return len(groupEvents()) == 3 }, time.Second, 20*time.Millisecond)
+	require.Eventually(t, func() bool { return len(groupEvents()) == 4 }, time.Second, 20*time.Millisecond)
 	time.Sleep(100 * time.Millisecond)
-	require.Len(t, groupEvents(), 3)
+	require.Len(t, groupEvents(), 4)
 	require.Len(t, e.pusher.snapshot(), 1)
 
-	// A DM takes none.
-	require.Error(t, e.sender.SendUserJoined(e.ctx, e.chatID, e.userB, e.userA, 1))
+	// A DM takes none, and a method it does not know or one naming no one is
+	// refused, with nothing written.
+	require.Error(t, e.sender.SendUserJoined(e.ctx, e.chatID, e.userB, chat.AdmittedBy(e.userA), 1))
+	require.Error(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, chat.JoinMethod{Kind: chat.JoinInvited + 1, By: e.userA}, 4))
+	require.Error(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, chat.AdmittedBy(nil), 4))
+	require.Error(t, e.sender.SendUserJoined(e.ctx, groupID, e.userB, chat.InvitedBy(nil), 4))
+	_, err = messages.GetMessage(e.ctx, groupID, &messagingpb.MessageId{Value: 5})
+	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
 }
 
 func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

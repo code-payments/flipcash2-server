@@ -140,10 +140,56 @@ type Media interface {
 // messaging.Sender satisfies it directly.
 type SystemMessenger interface {
 	// SendUserJoined writes the system message telling a group's members that
-	// userID joined it: admitted by admittedBy, or on their own when it is nil.
-	// rosterVersion is the roster version after the join, which names it: a
-	// repeat of one join writes nothing.
-	SendUserJoined(ctx context.Context, chatID *commonpb.ChatId, userID, admittedBy *commonpb.UserId, rosterVersion uint64) error
+	// userID joined it, and how (see JoinMethod). rosterVersion is the roster
+	// version after the join, which names it: a repeat of one join writes
+	// nothing.
+	SendUserJoined(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, method JoinMethod, rosterVersion uint64) error
+}
+
+// JoinMethod is how a user came to join a group, as a UserJoined system
+// message records it (see SystemMessenger): on their own (JoinedDirectly),
+// let in by someone (AdmittedBy), or with someone's invite (InvitedBy). It
+// names the way and the user behind it, and nothing of the message's shape:
+// that is the messaging domain's, which chat cannot import.
+type JoinMethod struct {
+	// Kind is which way they joined.
+	Kind JoinMethodKind
+
+	// By is the user who admitted them (JoinAdmitted) or who created the
+	// invite they joined with (JoinInvited), and nil for JoinDirect.
+	By *commonpb.UserId
+}
+
+// JoinMethodKind is the way a user joined a group (see JoinMethod).
+type JoinMethodKind uint8
+
+const (
+	// JoinDirect is a join on the user's own, needing no one (a private
+	// group's creator rejoining it).
+	JoinDirect JoinMethodKind = iota
+
+	// JoinAdmitted is a join someone let them in to (a private group's
+	// creator admitting them from its lobby).
+	JoinAdmitted
+
+	// JoinInvited is a join with someone's invite (see Invite), needing no
+	// one's approval.
+	JoinInvited
+)
+
+// JoinedDirectly is a join on the user's own (see JoinDirect).
+func JoinedDirectly() JoinMethod {
+	return JoinMethod{Kind: JoinDirect}
+}
+
+// AdmittedBy is a join userID let the user in to (see JoinAdmitted).
+func AdmittedBy(userID *commonpb.UserId) JoinMethod {
+	return JoinMethod{Kind: JoinAdmitted, By: userID}
+}
+
+// InvitedBy is a join with an invite userID created (see JoinInvited).
+func InvitedBy(userID *commonpb.UserId) JoinMethod {
+	return JoinMethod{Kind: JoinInvited, By: userID}
 }
 
 // UserEventPublisher is the write slice of the event domain the Chat service

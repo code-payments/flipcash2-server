@@ -290,8 +290,8 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // rules, and read with them (see ChatRules). A private group carries no
 // rules: StartChat writes none. No non-member is admitted to it in any form
 // (see Access), no rule admits anyone to it (see RuleEvaluator), and
-// JoinChat refuses everyone but its creator; each is decided on this flag,
-// not on the absence of rules. Its
+// JoinChat refuses everyone but its creator and holders of its invites (see
+// Invite); each is decided on this flag, not on the absence of rules. Its
 // title, description and pictures are plaintext on the record like any
 // group's, and are shown to any registered user.
 //
@@ -302,7 +302,8 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // and nothing else (see Access.SpeakerStanding and
 // messaging.Server.SendMessage). Its other members are admitted by its
 // creator from its lobby (see LobbyEntry and Server.EnterLobby), with the
-// chat key wrapped for each by the creator.
+// chat key wrapped for each by the creator, or join with an invite (see
+// Invite and Server.JoinChat), holding the invite's copy of the key.
 //
 // CreatorID is the user who created the group, or nil when unknown (a DM has
 // none, and so does any group written before the field existed). It is fixed

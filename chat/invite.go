@@ -69,13 +69,18 @@ import (
 //     invites (TOO_MANY_INVITES; maxActiveInvites, MaxActiveInvites in
 //     production) and, when a concurrent create of the same ID won the race,
 //     returns that invite, judged by the same retry rule.
-//   - GetInvite is any registered user's: the invite for the token
-//     (NOT_FOUND), its chat's record (NOT_FOUND, which a stored invite never
-//     outlives), BANNED for a user banned from the chat, and otherwise the
-//     chat exactly as GetChat shows it to the caller under FULL (see
-//     chatAsSeenBy): a member's metadata in full, a non-member the record
-//     with in_lobby. With it goes the invite's status as of now, and nothing
-//     else of the invite: no use count, no key, nothing written.
+//   - GetInvite is anyone's who holds the link: the token is the credential,
+//     so auth is optional, and checked when set. It reads the invite for the
+//     token (NOT_FOUND), then its chat's record (NOT_FOUND, which a stored
+//     invite never outlives). An authenticated caller is then BANNED if
+//     banned from the chat, and otherwise gets the chat exactly as GetChat
+//     shows it to them under FULL (see chatAsSeenBy): a member's metadata in
+//     full, a non-member the record with in_lobby. A caller with no auth is
+//     no one, so is never BANNED, and gets the chat's public view (see
+//     publicChatMetadata), which for a private group is its record alone; a
+//     web page that a link opens previews the invite this way. With the chat
+//     goes the invite's status as of now, and nothing else of the invite: no
+//     use count, no key, nothing written.
 //   - GetChatInvites pages the chat's invites, every creator's and in every
 //     status, most recently created first (see InvitePosition), up to
 //     maxGetChatInvitesPageSize a page, with an exact has_more and a token
@@ -87,6 +92,9 @@ import (
 //   - RevokeInvite revokes the chat's invite with the given ID (NOT_FOUND
 //     when no invite to this chat has it, another chat's included), deleting
 //     the invite's copy of the chat key in the same write; a repeat is OK.
+//
+// A token also shows the chat's roster while its invite admits users, with or
+// without auth (see GetRoster in roster.go).
 //
 // Nothing here is published: an invite is the inviter's, and its effects
 // (joins) are announced where they happen.
@@ -358,16 +366,21 @@ func createInviteRetry(existing Invite, chatID *commonpb.ChatId, userID *commonp
 }
 
 func (s *Server) GetInvite(ctx context.Context, req *chatpb.GetInviteRequest) (*chatpb.GetInviteResponse, error) {
-	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
-	if err != nil {
-		return nil, err
+	// Auth is optional (see above): without it, userID stays nil.
+	var userID *commonpb.UserId
+	if req.Auth != nil {
+		var err error
+		userID, err = s.authz.Authorize(ctx, req, &req.Auth)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	inviteID := MustDeriveInviteID(req.InviteToken)
-	log := s.log.With(
-		zap.String("user_id", model.UserIDString(userID)),
-		zap.String("invite_id", hex.EncodeToString(inviteID.Value)),
-	)
+	log := s.log.With(zap.String("invite_id", hex.EncodeToString(inviteID.Value)))
+	if userID != nil {
+		log = log.With(zap.String("user_id", model.UserIDString(userID)))
+	}
 
 	invite, err := s.chats.GetInvite(ctx, inviteID)
 	switch {
@@ -386,6 +399,18 @@ func (s *Server) GetInvite(ctx context.Context, req *chatpb.GetInviteRequest) (*
 	case err != nil:
 		log.With(zap.Error(err)).Warn("Failure getting chat")
 		return nil, status.Error(codes.Internal, "")
+	}
+
+	if userID == nil {
+		md, err := s.publicChatMetadata(ctx, log, c)
+		if err != nil {
+			return nil, err
+		}
+		return &chatpb.GetInviteResponse{
+			Result: chatpb.GetInviteResponse_OK,
+			Chat:   md,
+			Status: invite.StatusAt(time.Now()),
+		}, nil
 	}
 
 	// A banned user is told that and nothing else, not even which chat. Read

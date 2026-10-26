@@ -440,7 +440,8 @@ func (s *Server) GetChat(ctx context.Context, req *chatpb.GetChatRequest) (*chat
 // chatAsSeenBy is c's metadata as userID sees it under mode, which is what
 // GetChat returns them (see GetChat), and ok false when they may not see it
 // at all: a DM they are not a member of. Its other callers return a chat "as
-// the caller sees it with GetChat" (see GetInvite). A gRPC error is returned
+// the caller sees it with GetChat" (see GetInvite), and use
+// publicChatMetadata for a caller with no auth. A gRPC error is returned
 // only for a failed read.
 func (s *Server) chatAsSeenBy(ctx context.Context, log *zap.Logger, c *Chat, userID *commonpb.UserId, mode messagingpb.ViewMode) (md *chatpb.Metadata, ok bool, err error) {
 	// The caller's standing is decided off the record where it can be — a DM's
@@ -493,15 +494,27 @@ func (s *Server) getPublicChat(ctx context.Context, req *chatpb.GetChatRequest) 
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	standing := s.access.PublicListenerStanding(c)
-	metadata, err := s.hydrator.hydrate(ctx, nil, standing, standing.Reading(req.GetViewMode()), fullDetail, []*Chat{c})
+	md, err := s.publicChatMetadata(ctx, log, c)
 	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
-		return nil, status.Error(codes.Internal, "")
+		return nil, err
 	}
 
 	return &chatpb.GetChatResponse{
 		Result:   chatpb.GetChatResponse_OK,
-		Metadata: metadata[0],
+		Metadata: md,
 	}, nil
+}
+
+// publicChatMetadata is the group c's public view (see getPublicChat), which
+// is what GetChat returns a caller with no auth. Its other callers return a
+// chat's public view (see GetInvite). A gRPC error is returned only for a
+// failed read.
+func (s *Server) publicChatMetadata(ctx context.Context, log *zap.Logger, c *Chat) (*chatpb.Metadata, error) {
+	standing := s.access.PublicListenerStanding(c)
+	metadata, err := s.hydrator.hydrate(ctx, nil, standing, standing.Reading(messagingpb.ViewMode_REDACTED), fullDetail, []*Chat{c})
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
+		return nil, status.Error(codes.Internal, "")
+	}
+	return metadata[0], nil
 }

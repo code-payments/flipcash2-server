@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"time"
 
@@ -53,11 +54,30 @@ import (
 // never are, since group pointer advances are not broadcast and a page of
 // them would be stale on arrival.
 //
-// The read is a member's alone: who else is in a chat is not shown to anyone
-// outside it, so a non-member is denied whatever the group's listener rules
-// say of them, including one they would admit to read its messages.
-// Membership is decided through the shared Access, off the record for a DM
-// and from the store for a group.
+// The read is a member's, and otherwise only an invite link's holder's: who
+// else is in a chat is not shown to anyone outside it, so a non-member is
+// denied whatever the group's listener rules say of them, including one they
+// would admit to read its messages. Membership is decided through the shared
+// Access, off the record for a DM and from the store for a group.
+//
+// A link's holder is someone who could join the chat at any moment (see
+// invite.go), so the roster is shown to them too: a request carrying the
+// token of an invite to the chat that admits users as of now (Invite.AdmitsAt)
+// is served the page a member gets. The token is the credential, so auth is
+// optional when one is sent, which is how a web page that a link opens shows
+// who is in the group. Nothing ties the token to a user: a caller with no
+// auth is no one, and a ban is not checked even for one with auth, who could
+// as well have sent none. A ban stops a user joining, not reading the roster
+// through a link they hold; the creator stops that by revoking the invite.
+// The invite is read again on every page, strongly consistent, so a walk
+// ends with DENIED once it stops admitting anyone. Only a private group has
+// invites, so a token never serves a public group or a DM. A member's token
+// is never looked at: they are served as a member. Reading counts no use of
+// the invite and writes nothing.
+//
+// A caller with no auth has their invite read before the chat's record, so a
+// token that admits no one costs one point read. Logs carry the invite's ID,
+// never the token (see invite.go).
 //
 // A public group's roster can be switched off by configuration (see
 // Server.disablePublicGroupRoster): a call naming one is then DENIED once the
@@ -87,12 +107,28 @@ const (
 )
 
 func (s *Server) GetRoster(ctx context.Context, req *chatpb.GetRosterRequest) (*chatpb.GetRosterResponse, error) {
-	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
-	if err != nil {
-		return nil, err
+	// Auth is optional when an invite's token is sent (see above): without
+	// it, userID stays nil.
+	var userID *commonpb.UserId
+	if req.Auth != nil {
+		var err error
+		userID, err = s.authz.Authorize(ctx, req, &req.Auth)
+		if err != nil {
+			return nil, err
+		}
+	} else if req.InviteToken == nil {
+		return &chatpb.GetRosterResponse{Result: chatpb.GetRosterResponse_DENIED}, nil
 	}
 
-	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
+	log := s.log.With(zap.String("chat_id", model.ChatIDString(req.ChatId)))
+	if userID != nil {
+		log = log.With(zap.String("user_id", model.UserIDString(userID)))
+	}
+	var inviteID *chatpb.InviteId
+	if req.InviteToken != nil {
+		inviteID = MustDeriveInviteID(req.InviteToken)
+		log = log.With(zap.String("invite_id", hex.EncodeToString(inviteID.Value)))
+	}
 
 	limit := maxGetRosterPageSize
 	if pageSize := req.GetQueryOptions().GetPageSize(); pageSize > 0 && int(pageSize) < limit {
@@ -111,6 +147,20 @@ func (s *Server) GetRoster(ctx context.Context, req *chatpb.GetRosterRequest) (*
 		after = &pos
 	}
 
+	// A caller with no auth is admitted by the invite alone, read first (see
+	// above).
+	var inviteAdmits bool
+	if userID == nil {
+		var err error
+		inviteAdmits, err = s.inviteAdmitsToRoster(ctx, log, req.ChatId, inviteID)
+		if err != nil {
+			return nil, err
+		}
+		if !inviteAdmits {
+			return &chatpb.GetRosterResponse{Result: chatpb.GetRosterResponse_DENIED}, nil
+		}
+	}
+
 	// The canonical record first, as for GetChat: its absence is NOT_FOUND,
 	// and a DM's roster and every chat's rules are on it.
 	c, err := s.chats.GetChatByID(ctx, req.ChatId)
@@ -126,12 +176,27 @@ func (s *Server) GetRoster(ctx context.Context, req *chatpb.GetRosterRequest) (*
 		return &chatpb.GetRosterResponse{Result: chatpb.GetRosterResponse_DENIED}, nil
 	}
 
-	isMember, err := s.access.IsMemberWithChat(ctx, c, userID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure determining chat membership")
-		return nil, status.Error(codes.Internal, "")
+	// A signed caller is admitted as a member, or failing that by their
+	// invite, read only then: a member's token is never read.
+	var isMember bool
+	if userID != nil {
+		isMember, err = s.access.IsMemberWithChat(ctx, c, userID)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure determining chat membership")
+			return nil, status.Error(codes.Internal, "")
+		}
+		if !isMember && inviteID != nil && c.IsPrivate {
+			inviteAdmits, err = s.inviteAdmitsToRoster(ctx, log, c.ID, inviteID)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
-	if !isMember {
+
+	// Only a private group has invites, which an admitting invite already
+	// implies; checked off the record all the same, so a token never serves
+	// any other chat.
+	if !isMember && !(inviteAdmits && c.IsPrivate) {
 		return &chatpb.GetRosterResponse{Result: chatpb.GetRosterResponse_DENIED}, nil
 	}
 
@@ -157,6 +222,26 @@ func (s *Server) GetRoster(ctx context.Context, req *chatpb.GetRosterRequest) (*
 		resp.PagingToken = encodeRosterToken(c.ID, members[len(members)-1].Position())
 	}
 	return resp, nil
+}
+
+// inviteAdmitsToRoster reports whether inviteID names an invite to chatID
+// that admits users as of now, which shows the roster to a caller who is not
+// a member (see above). The read is strongly consistent, so a revoke or a
+// last use that completed before it is seen. A gRPC error is returned only
+// for a failed read.
+func (s *Server) inviteAdmitsToRoster(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, inviteID *chatpb.InviteId) (bool, error) {
+	invite, err := s.chats.GetInvite(ctx, inviteID)
+	switch {
+	case errors.Is(err, ErrInviteNotFound):
+		return false, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure getting invite")
+		return false, status.Error(codes.Internal, "")
+	}
+	if !bytes.Equal(invite.ChatID.GetValue(), chatID.GetValue()) {
+		return false, nil
+	}
+	return invite.AdmitsAt(time.Now()) == nil, nil
 }
 
 // rosterPage reads one page of c's roster in roster order, strictly after

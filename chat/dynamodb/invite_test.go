@@ -16,6 +16,7 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/model"
@@ -99,10 +100,14 @@ func TestChat_DynamoDBInviteItems(t *testing.T) {
 	secs, err := parseN(copyItem[attrExpiresAt])
 	require.NoError(t, err)
 	require.EqualValues(t, expiresAt.Unix()+1, secs)
-	got, err := inviteKeyEnvelopeFromItem(copyItem)
-	require.NoError(t, err)
-	require.Equal(t, keyCopy.Signature, got.Signature)
-	require.Equal(t, keyCopy.Ciphertext, got.Ciphertext)
+	got := &chatpb.InviteKeyEnvelope{}
+	require.NoError(t, unmarshalInviteEnvelope(copyItem, attrKeyEnvelope, got))
+	require.True(t, proto.Equal(keyCopy, got))
+	require.NotContains(t, copyItem, attrSignature)
+	gotSecret := &chatpb.InviteSecretEnvelope{}
+	require.NoError(t, unmarshalInviteEnvelope(meta, attrSecretEnvelope, gotSecret))
+	require.True(t, proto.Equal(expiring.SecretEnvelope, gotSecret))
+	require.NotContains(t, meta, attrSecretScheme)
 
 	// An invite that never expires: neither item carries the TTL, or an
 	// expiry at all.

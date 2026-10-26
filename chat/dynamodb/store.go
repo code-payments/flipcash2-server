@@ -22,6 +22,7 @@ import (
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/model"
@@ -305,8 +306,9 @@ import (
 //	          invite_expires_at (epoch nanos; absent for an invite that never
 //	          expires — not expires_at, which is the table's TTL and would
 //	          delete the record), revoked_at (epoch nanos, absent while not
-//	          revoked), and the creator's secret envelope (secret_scheme,
-//	          secret_nonce, secret_ciphertext). Three sparse GSIs are keyed by
+//	          revoked), and the creator's secret envelope (secret_envelope,
+//	          the chatpb.InviteSecretEnvelope marshalled whole, B; see
+//	          marshalInviteEnvelope). Three sparse GSIs are keyed by
 //	          attributes the record alone carries: gsiInvitesByChat on (chat,
 //	          created_sort) lists a chat's invites newest first,
 //	          gsiInvitesByChatCreator on (chat, creator_sort) one creator's
@@ -320,7 +322,8 @@ import (
 //	          allow; the cap's race is the contract's.
 //
 //	          sk = "#copy" (see skInviteCopy), the invite's copy of the chat
-//	          key: scheme, nonce, ciphertext and signature, and expires_at
+//	          key: key_envelope (the chatpb.InviteKeyEnvelope marshalled
+//	          whole, B), and expires_at
 //	          (DynamoDB TTL, epoch seconds, the invite's expiry rounded up),
 //	          absent for an invite that never expires. It exists exactly
 //	          while the invite may be ACTIVE: written with the record,
@@ -504,13 +507,15 @@ const (
 	attrCreatedAt            = "created_at"        // chat_invites #meta: epoch nanos
 	attrInviteExpiresAt      = "invite_expires_at" // chat_invites #meta: epoch nanos, absent when it never expires; not expires_at, the TTL
 	attrRevokedAt            = "revoked_at"        // chat_invites #meta: epoch nanos, absent while not revoked
-	attrSecretScheme         = "secret_scheme"     // chat_invites #meta, chat_key_envelopes copies: chatpb.InviteSecretEnvelope_Scheme, by number
-	attrSecretNonce          = "secret_nonce"      // chat_invites #meta, chat_key_envelopes copies: the secret envelope's nonce (B)
-	attrSecretCiphertext     = "secret_ciphertext" // chat_invites #meta, chat_key_envelopes copies: the encrypted secret (B)
+	attrSecretScheme         = "secret_scheme"     // chat_key_envelopes copies: chatpb.InviteSecretEnvelope_Scheme, by number
+	attrSecretNonce          = "secret_nonce"      // chat_key_envelopes copies: the secret envelope's nonce (B)
+	attrSecretCiphertext     = "secret_ciphertext" // chat_key_envelopes copies: the encrypted secret (B)
+	attrSecretEnvelope       = "secret_envelope"   // chat_invites #meta: the creator's chatpb.InviteSecretEnvelope, marshalled (B)
+	attrKeyEnvelope          = "key_envelope"      // chat_invites #copy: the chatpb.InviteKeyEnvelope, marshalled (B)
 	attrCreatedSort          = "created_sort"      // chat_invites #meta: see inviteCreatedSort, keying gsiInvitesByChat
 	attrCreatorSort          = "creator_sort"      // chat_invites #meta: see inviteCreatorSort, keying gsiInvitesByChatCreator
 	attrActiveSort           = "active_sort"       // chat_invites #meta: see inviteActiveSort, present while neither revoked nor used up, keying gsiInvitesActive
-	attrSignature            = "signature"         // chat_invites #copy, chat_key_envelopes copies: the copy's signature (B)
+	attrSignature            = "signature"         // chat_key_envelopes copies: the copy's signature (B)
 	attrInviteID             = "invite_id"         // chat_key_envelopes: the raw invite ID (B) of a copy, absent on a wrapped envelope
 
 	// Keys of the min_listener_balance map.
@@ -4862,7 +4867,11 @@ func inviteCopyTTL(expiresAt time.Time) uint64 {
 // inviteMetaItem is the record of invite as created, key and index
 // attributes included. A new invite is neither revoked nor used up, so it
 // is in all three indexes.
-func inviteMetaItem(invite chat.Invite) map[string]types.AttributeValue {
+func inviteMetaItem(invite chat.Invite) (map[string]types.AttributeValue, error) {
+	secretEnvelope, err := marshalInviteEnvelope(invite.SecretEnvelope)
+	if err != nil {
+		return nil, err
+	}
 	item := inviteKey(invite.ID, skMeta)
 	item[attrChat] = avB(invite.ChatID.Value)
 	item[attrCreatedBy] = avB(invite.CreatedBy.Value)
@@ -4872,28 +4881,66 @@ func inviteMetaItem(invite chat.Invite) map[string]types.AttributeValue {
 	if invite.ExpiresAt != nil {
 		item[attrInviteExpiresAt] = avN(uint64(invite.ExpiresAt.UnixNano()))
 	}
-	putSecretEnvelope(item, invite.SecretEnvelope)
+	item[attrSecretEnvelope] = avB(secretEnvelope)
 	item[attrCreatedSort] = avB(inviteCreatedSort(invite.CreatedAt, invite.ID))
 	item[attrCreatorSort] = avB(inviteCreatorSort(invite.CreatedBy, invite.CreatedAt, invite.ID))
 	item[attrActiveSort] = avB(inviteActiveSort(invite.ExpiresAt, invite.ID))
-	return item
+	return item, nil
 }
 
 // inviteCopyItem is the invite's copy of the chat key, key included, with
 // the invite's expiry as its TTL when it has one. It carries no index
 // attribute, so the key material is in no index.
-func inviteCopyItem(invite chat.Invite, keyCopy *chatpb.InviteKeyEnvelope) map[string]types.AttributeValue {
+func inviteCopyItem(invite chat.Invite, keyCopy *chatpb.InviteKeyEnvelope) (map[string]types.AttributeValue, error) {
+	envelope, err := marshalInviteEnvelope(keyCopy)
+	if err != nil {
+		return nil, err
+	}
 	item := inviteKey(invite.ID, skInviteCopy)
-	putInviteKeyEnvelope(item, keyCopy)
+	item[attrKeyEnvelope] = avB(envelope)
 	if invite.ExpiresAt != nil {
 		item[attrExpiresAt] = avN(inviteCopyTTL(*invite.ExpiresAt))
 	}
-	return item
+	return item, nil
 }
 
-// putInviteKeyEnvelope writes an invite's copy of the chat key into item,
-// under the attributes an invite's #copy and a member's copy in
-// chat_key_envelopes share.
+// marshalInviteEnvelope is an envelope as chat_invites stores it: the proto
+// marshalled whole into one attribute, so a field the proto gains later is
+// stored with no change here, where a field per part would drop it unless
+// both backends learned it. The server never reads inside one (the copy's
+// signature is checked off the request, at creation), so nothing is lost by
+// its being opaque. A member's copy in chat_key_envelopes keeps the parts
+// apart, as that table's wrapped envelopes always have (see
+// putInviteKeyEnvelope). Marshalled deterministically, so equal envelopes
+// store equal bytes.
+func marshalInviteEnvelope(envelope proto.Message) ([]byte, error) {
+	if !envelope.ProtoReflect().IsValid() {
+		return nil, fmt.Errorf("marshalling invite envelope: none given")
+	}
+	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling invite envelope: %w", err)
+	}
+	return b, nil
+}
+
+// unmarshalInviteEnvelope is the inverse of marshalInviteEnvelope, reading
+// attr of item into envelope. A missing or empty attribute is a corrupt
+// item, since every envelope written has one.
+func unmarshalInviteEnvelope(item map[string]types.AttributeValue, attr string, envelope proto.Message) error {
+	b := asB(item[attr])
+	if len(b) == 0 {
+		return fmt.Errorf("invite item has no %s", attr)
+	}
+	if err := proto.Unmarshal(b, envelope); err != nil {
+		return fmt.Errorf("unmarshalling %s: %w", attr, err)
+	}
+	return nil
+}
+
+// putInviteKeyEnvelope writes an invite's copy of the chat key into a
+// member's copy in chat_key_envelopes, as parts, like that table's wrapped
+// envelopes (see marshalInviteEnvelope for chat_invites' encoding).
 func putInviteKeyEnvelope(item map[string]types.AttributeValue, envelope *chatpb.InviteKeyEnvelope) {
 	item[attrScheme] = avN(uint64(envelope.GetScheme()))
 	item[attrNonce] = avB(envelope.GetNonce())
@@ -4915,9 +4962,8 @@ func inviteKeyEnvelopeFromItem(item map[string]types.AttributeValue) (*chatpb.In
 	}, nil
 }
 
-// putSecretEnvelope writes an invite secret envelope into item, under the
-// attributes an invite's #meta and a member's copy in chat_key_envelopes
-// share.
+// putSecretEnvelope writes a joiner's invite secret envelope into their
+// copy in chat_key_envelopes, as parts, like putInviteKeyEnvelope.
 func putSecretEnvelope(item map[string]types.AttributeValue, envelope *chatpb.InviteSecretEnvelope) {
 	item[attrSecretScheme] = avN(uint64(envelope.GetScheme()))
 	item[attrSecretNonce] = avB(envelope.GetNonce())
@@ -4967,8 +5013,8 @@ func inviteFromItem(item map[string]types.AttributeValue) (chat.Invite, error) {
 	if err != nil {
 		return chat.Invite{}, fmt.Errorf("reading %s: %w", attrCreatedAt, err)
 	}
-	secretEnvelope, err := secretEnvelopeFromItem(item)
-	if err != nil {
+	secretEnvelope := &chatpb.InviteSecretEnvelope{}
+	if err := unmarshalInviteEnvelope(item, attrSecretEnvelope, secretEnvelope); err != nil {
 		return chat.Invite{}, err
 	}
 	invite := chat.Invite{
@@ -5042,17 +5088,25 @@ func (s *store) CreateInvite(ctx context.Context, invite chat.Invite, keyCopy *c
 		}
 	}
 
+	metaItem, err := inviteMetaItem(stored)
+	if err != nil {
+		return chat.Invite{}, false, err
+	}
+	copyItem, err := inviteCopyItem(stored, keyCopy)
+	if err != nil {
+		return chat.Invite{}, false, err
+	}
 	transactItems := []types.TransactWriteItem{
 		{Put: &types.Put{
 			TableName:                           aws.String(s.invitesTable),
-			Item:                                inviteMetaItem(stored),
+			Item:                                metaItem,
 			ConditionExpression:                 aws.String("attribute_not_exists(#pk)"),
 			ExpressionAttributeNames:            map[string]string{"#pk": attrPK},
 			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 		}},
 		{Put: &types.Put{
 			TableName: aws.String(s.invitesTable),
-			Item:      inviteCopyItem(stored, keyCopy),
+			Item:      copyItem,
 		}},
 	}
 
@@ -5410,8 +5464,8 @@ func (s *store) readInviteJoin(ctx context.Context, chatID *commonpb.ChatId, use
 				}
 				read.invite = &invite
 			case skInviteCopy:
-				keyCopy, err := inviteKeyEnvelopeFromItem(item)
-				if err != nil {
+				keyCopy := &chatpb.InviteKeyEnvelope{}
+				if err := unmarshalInviteEnvelope(item, attrKeyEnvelope, keyCopy); err != nil {
 					return inviteJoinRead{}, err
 				}
 				read.keyCopy = keyCopy

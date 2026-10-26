@@ -5262,7 +5262,8 @@ func testStore_Invite_CreateExisting(t *testing.T, s chat.Store) {
 
 // testStore_Invite_CapCountsActive pins that the cap counts the chat's
 // invites ACTIVE as of the create's now, and no others: not a revoked one,
-// not one expired by then, and not another chat's.
+// not one expired by then, not one whose last use a join took, and not
+// another chat's.
 func testStore_Invite_CapCountsActive(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 	now := time.Now()
@@ -5297,6 +5298,18 @@ func testStore_Invite_CapCountsActive(t *testing.T, s chat.Store) {
 	got, err := s.GetInvite(ctx, expiring.ID)
 	require.NoError(t, err)
 	require.Equal(t, chatpb.Invite_EXPIRED, got.StatusAt(expiresAt))
+
+	// A used-up one frees its place from the join that takes its last use,
+	// and not before.
+	privateID := privateGroup(t, s, creator)
+	single := createInvite(t, s, newInvite(privateID, creator, 2, now, nil), 1, now)
+	_, _, err = s.CreateInvite(ctx, newInvite(privateID, creator, 0, now, nil), inviteKeyCopy(2), 1, now)
+	require.ErrorIs(t, err, chat.ErrTooManyInvites)
+	joinWithInvite(t, s, privateID, model.MustGenerateUserID(), single, inviteSecret(5), now)
+	_, _, err = s.CreateInvite(ctx, newInvite(privateID, creator, 0, now, nil), inviteKeyCopy(2), 1, now)
+	require.ErrorIs(t, err, chat.ErrTooManyInvites)
+	joinWithInvite(t, s, privateID, model.MustGenerateUserID(), single, inviteSecret(5), now)
+	createInviteEventually(t, s, newInvite(privateID, creator, 0, now, nil), 1, now)
 }
 
 // testStore_Invite_CreateConcurrent pins that concurrent creates of one ID

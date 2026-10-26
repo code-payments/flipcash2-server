@@ -16,11 +16,9 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 )
 
-// TestChat_MemoryInviteCopyAndUsedUp covers what no Store method observes:
-// the copy is held from creation until the revoke, and a used-up invite is
-// not counted toward the cap. A use is written here directly, as a join
-// writes it (see TestChat_MemoryInviteJoinCopy for the join itself).
-func TestChat_MemoryInviteCopyAndUsedUp(t *testing.T) {
+// TestChat_MemoryInviteCopy covers what no Store method observes: the copy
+// is held, as a copy of what was passed, from creation until the revoke.
+func TestChat_MemoryInviteCopy(t *testing.T) {
 	ctx := context.Background()
 	m := NewInMemory(nil).(*memory)
 	now := time.Now()
@@ -50,27 +48,13 @@ func TestChat_MemoryInviteCopyAndUsedUp(t *testing.T) {
 		Signature:  bytes.Repeat([]byte{2}, 64),
 	}
 
-	used := newInvite(1)
-	_, created, err := m.CreateInvite(ctx, used, keyCopy, 1, now)
-	require.NoError(t, err)
-	require.True(t, created)
-	require.Contains(t, m.inviteCopies, string(used.ID.Value))
-	keyCopy.Nonce[0] = 9
-	require.Equal(t, byte(2), m.inviteCopies[string(used.ID.Value)].Nonce[0])
-
-	_, _, err = m.CreateInvite(ctx, newInvite(0), keyCopy, 1, now)
-	require.ErrorIs(t, err, chat.ErrTooManyInvites)
-
-	// Its last use taken, it no longer counts.
-	m.Lock()
-	stored := m.invites[string(used.ID.Value)]
-	stored.UseCount = 1
-	m.invites[string(used.ID.Value)] = stored
-	m.Unlock()
 	next := newInvite(0)
-	_, created, err = m.CreateInvite(ctx, next, keyCopy, 1, now)
+	_, created, err := m.CreateInvite(ctx, next, keyCopy, chat.MaxActiveInvites, now)
 	require.NoError(t, err)
 	require.True(t, created)
+	require.Contains(t, m.inviteCopies, string(next.ID.Value))
+	keyCopy.Nonce[0] = 9
+	require.Equal(t, byte(2), m.inviteCopies[string(next.ID.Value)].Nonce[0])
 
 	// The revoke deletes the copy; a repeat changes nothing.
 	_, changed, err := m.RevokeInvite(ctx, groupID, next.ID, now)

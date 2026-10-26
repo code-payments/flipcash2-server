@@ -106,11 +106,17 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_DENIED}, nil
 	}
 
+	// A join of a private group with an invite, by anyone but its creator,
+	// reads no membership here: the store's read of the join does, strongly
+	// consistent, and answers a member with the no-op (see joinWithInvite).
+	if c.IsPrivate && !c.IsCreator(userID) && req.Invite != nil {
+		return s.joinWithInvite(ctx, c, userID, req.Invite)
+	}
+
 	// A current member re-joining is a no-op answered on membership alone,
 	// before the rules or any invite: a member whose balance has since dipped
 	// under the group's requirement is still a member, and a retry after a
-	// lost response must say so rather than refuse them. A retry of a join
-	// with an invite is that too, whatever has become of the invite since.
+	// lost response must say so rather than refuse them.
 	isMember, err := s.chats.IsMember(ctx, req.ChatId, userID)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure checking chat membership")
@@ -123,10 +129,9 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 			// The creator rejoins on their own, needing no approval, and an
 			// invite they pass is ignored (see above).
 		case c.IsPrivate:
-			if req.Invite == nil {
-				return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_DENIED}, nil
-			}
-			return s.joinWithInvite(ctx, c, userID, req.Invite)
+			// With no invite (one is joined with above), their way in is
+			// the lobby.
+			return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_DENIED}, nil
 		case req.Invite != nil:
 			// No invite is made to a public group (see above).
 			return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_INVITE_NOT_FOUND}, nil
@@ -152,16 +157,7 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	// the membership check and it, it would let them back in with neither an
 	// invite nor an envelope.
 	if isMember && c.IsPrivate && !c.IsCreator(userID) {
-		roster, err := s.chats.GetGroupRosterSummary(ctx, c.ID)
-		if err != nil {
-			log.With(zap.Error(err)).Warn("Failure getting group roster summary")
-			return nil, status.Error(codes.Internal, "")
-		}
-		md, err := s.joinedMetadata(ctx, log, c, userID, roster)
-		if err != nil {
-			return nil, err
-		}
-		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_OK, Chat: md}, nil
+		return s.privateMemberNoOp(ctx, log, c, userID)
 	}
 
 	// Idempotent against a concurrent join from another of the user's devices:
@@ -194,11 +190,31 @@ func (s *Server) JoinChat(ctx context.Context, req *chatpb.JoinChatRequest) (*ch
 	}, nil
 }
 
-// joinWithInvite is JoinChat for a non-member of the private group c, other
-// than its creator, who passed an invite: the store's one write (see
-// Store.JoinWithInvite) with the invite named by the token's ID, its refusals
-// mapped onto JoinChat's results, and a real join announced as an admission
-// is, naming the invite's creator.
+// privateMemberNoOp is JoinChat's no-op for userID, a member of the private
+// group c other than its creator, answered without AddGroupMembers: it takes
+// no invite, so had they left since their membership was read, it would let
+// them back in with neither an invite nor an envelope.
+func (s *Server) privateMemberNoOp(ctx context.Context, log *zap.Logger, c *Chat, userID *commonpb.UserId) (*chatpb.JoinChatResponse, error) {
+	roster, err := s.chats.GetGroupRosterSummary(ctx, c.ID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure getting group roster summary")
+		return nil, status.Error(codes.Internal, "")
+	}
+	md, err := s.joinedMetadata(ctx, log, c, userID, roster)
+	if err != nil {
+		return nil, err
+	}
+	return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_OK, Chat: md}, nil
+}
+
+// joinWithInvite is JoinChat for anyone but the private group c's creator
+// who passed an invite: the store's one write (see Store.JoinWithInvite) with
+// the invite named by the token's ID, its refusals mapped onto JoinChat's
+// results, and a real join announced as an admission is, naming the invite's
+// creator. Membership is the store's to read, and a member is its no-op,
+// except that it judges an unknown invite first: only then is membership
+// read here, so a member's join with any token at all is the OK no-op, as
+// JoinChat promises, and everyone else's join costs no read but the store's.
 func (s *Server) joinWithInvite(ctx context.Context, c *Chat, userID *commonpb.UserId, params *chatpb.JoinChatRequest_InviteParameters) (*chatpb.JoinChatResponse, error) {
 	inviteID := MustDeriveInviteID(params.InviteToken)
 	log := s.inviteLog(userID, c.ID, inviteID)
@@ -206,6 +222,14 @@ func (s *Server) joinWithInvite(ctx context.Context, c *Chat, userID *commonpb.U
 	result, err := s.chats.JoinWithInvite(ctx, c.ID, userID, inviteID, params.SecretEnvelope, time.Now())
 	switch {
 	case errors.Is(err, ErrInviteNotFound):
+		isMember, err := s.chats.IsMember(ctx, c.ID, userID)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure checking chat membership")
+			return nil, status.Error(codes.Internal, "")
+		}
+		if isMember {
+			return s.privateMemberNoOp(ctx, log, c, userID)
+		}
 		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_INVITE_NOT_FOUND}, nil
 	case errors.Is(err, ErrInviteExhausted):
 		return &chatpb.JoinChatResponse{Result: chatpb.JoinChatResponse_INVITE_EXHAUSTED}, nil
@@ -223,8 +247,8 @@ func (s *Server) joinWithInvite(ctx context.Context, c *Chat, userID *commonpb.U
 	}
 
 	if !result.Changed {
-		// A member by now: another of their devices joined between the
-		// membership check and the write, and its call announced it.
+		// A member already: a retry, or another of their devices joined
+		// first and its call announced it.
 		md, err := s.joinedMetadata(ctx, log, c, userID, result.Roster)
 		if err != nil {
 			return nil, err

@@ -374,15 +374,17 @@ func (s *Server) AdmitLobbyMember(ctx context.Context, req *chatpb.AdmitLobbyMem
 		return &chatpb.AdmitLobbyMemberResponse{Result: chatpb.AdmitLobbyMemberResponse_OK}, nil
 	}
 
+	// Announced as any join is (see announceJoin), the caller, the creator,
+	// having let them in; then the admitted user is pushed, after the join's
+	// message is in the log, so a tap on the push opens a log that shows it,
+	// and pushed even when a read back fails, leaving them told nothing else
+	// (they read the chat on their next open; the creator's retry is the
+	// no-op path); and to the creator, the lobby shrank.
+	_, err = s.announceJoin(ctx, log, c, req.UserId, AdmittedBy(userID), roster)
 	s.sendLobbyPush(ctx, log, func(ctx context.Context) error {
 		return push.SendLobbyAdmittedPush(ctx, s.pusher, req.UserId, c.ID, c.Title)
 	})
-
-	// Announced as any join is (see announceJoin), the caller, the creator,
-	// having let them in; and to the creator, the lobby shrank. A failed read
-	// back leaves the admitted user told nothing but the push, and they read
-	// the chat on their next open; the creator's retry is the no-op path.
-	if _, err := s.announceJoin(ctx, log, c, req.UserId, AdmittedBy(userID), roster); err != nil {
+	if err != nil {
 		return nil, err
 	}
 	s.publishLobbyLeft(c, req.UserId)

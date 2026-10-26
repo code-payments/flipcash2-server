@@ -291,6 +291,15 @@ func (e *serverEnv) addUser() (*commonpb.UserId, model.KeyPair) {
 	return userID, keys
 }
 
+// bindKey records keys as userID's public key in the account store, which
+// the test authorizer does not, for RPCs that report a user's key (such as
+// GetKeyEnvelope's wrapped_by_public_key). Binding the same key again is a
+// no-op.
+func (e *serverEnv) bindKey(userID *commonpb.UserId, keys model.KeyPair) {
+	_, err := e.accounts.Bind(e.ctx, userID, keys.Proto())
+	require.NoError(e.t, err)
+}
+
 // staffAccounts is an account.Store whose staff flag a test can set: the
 // in-memory store answers IsStaff false for everyone, and has no setter.
 type staffAccounts struct {
@@ -3442,8 +3451,9 @@ func testServer_KeyEnvelope_Gates(t *testing.T, s chat.Store) {
 		require.Equal(t, set, e.mustSetKeyEnvelope(keys, chatID, keyEnvelopeProto(1)).Result)
 		got := e.mustGetKeyEnvelope(keys, chatID)
 		require.Equal(t, get, got.Result)
-		require.Nil(t, got.KeyEnvelope)
+		require.Nil(t, got.Envelope)
 		require.Nil(t, got.WrappedBy)
+		require.Nil(t, got.WrappedByPublicKey)
 	}
 
 	// A DM has no key envelopes, for its members or anyone.
@@ -3484,6 +3494,7 @@ func testServer_KeyEnvelope_Gates(t *testing.T, s chat.Store) {
 // stands whatever a later call carries, and it is kept when they leave.
 func testServer_KeyEnvelope_Creator(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
+	e.bindKey(e.userID, e.keys)
 
 	created := e.mustStartPrivateGroupChat(e.keys, newIdempotencyKey(), privateGroupParams("Sunday Hikers"))
 	require.Equal(t, chatpb.StartChatResponse_OK, created.Result)
@@ -3498,8 +3509,9 @@ func testServer_KeyEnvelope_Creator(t *testing.T, s chat.Store) {
 		t.Helper()
 		got := e.mustGetKeyEnvelope(e.keys, chatID)
 		require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, got.Result)
-		require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(1), got.KeyEnvelope))
+		require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(1), got.GetKeyEnvelope()))
 		require.Equal(t, e.userID.Value, got.WrappedBy.GetValue())
+		require.True(t, proto.Equal(e.keys.Proto(), got.WrappedByPublicKey))
 	}
 	requireStored()
 
@@ -3530,6 +3542,8 @@ func testServer_KeyEnvelope_Member(t *testing.T, s chat.Store) {
 	// No RPC admits a member to a private group yet, so the membership and
 	// the envelope the creator would have wrapped are written by hand.
 	memberID, memberKeys := e.addUser()
+	e.bindKey(e.userID, e.keys)
+	e.bindKey(memberID, memberKeys)
 	chatID := e.putPrivateGroup("Sunday Hikers", memberID)
 	require.Equal(t, chatpb.SetKeyEnvelopeResponse_OK, e.mustSetKeyEnvelope(e.keys, chatID, keyEnvelopeProto(1)).Result)
 	_, err := s.SetKeyEnvelope(e.ctx, chatID, memberID, chat.KeyEnvelopeFromProto(keyEnvelopeProto(2), e.userID))
@@ -3537,8 +3551,12 @@ func testServer_KeyEnvelope_Member(t *testing.T, s chat.Store) {
 
 	got := e.mustGetKeyEnvelope(memberKeys, chatID)
 	require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, got.Result)
-	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(2), got.KeyEnvelope))
+	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(2), got.GetKeyEnvelope()))
 	require.Equal(t, e.userID.Value, got.WrappedBy.GetValue())
+
+	// The creator wrapped it, so their public key is the one reported: it is
+	// what the member opens the envelope against.
+	require.True(t, proto.Equal(e.keys.Proto(), got.WrappedByPublicKey))
 
 	// The member wraps the key for themself, which replaces the creator's
 	// envelope and then stands.
@@ -3546,12 +3564,13 @@ func testServer_KeyEnvelope_Member(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.SetKeyEnvelopeResponse_ALREADY_SET, e.mustSetKeyEnvelope(memberKeys, chatID, keyEnvelopeProto(4)).Result)
 	got = e.mustGetKeyEnvelope(memberKeys, chatID)
 	require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, got.Result)
-	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(3), got.KeyEnvelope))
+	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(3), got.GetKeyEnvelope()))
 	require.Equal(t, memberID.Value, got.WrappedBy.GetValue())
+	require.True(t, proto.Equal(memberKeys.Proto(), got.WrappedByPublicKey))
 
 	// Each member's envelope is their own: the creator's is untouched.
 	got = e.mustGetKeyEnvelope(e.keys, chatID)
-	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(1), got.KeyEnvelope))
+	require.NoError(t, protoutil.ProtoEqualError(keyEnvelopeProto(1), got.GetKeyEnvelope()))
 
 	// Leaving discards the member's envelope and no one else's.
 	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(memberKeys, chatID).Result)
@@ -6135,6 +6154,7 @@ func testServer_Lobby_GetLobbyMembers(t *testing.T, s chat.Store) {
 func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.profiles.displayNames[string(e.userID.Value)] = "Creator"
+	e.bindKey(e.userID, e.keys)
 	userID, userKeys := e.addBoundUser("Waiting")
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 
@@ -6153,8 +6173,12 @@ func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	require.True(t, isMember)
 	envelope := e.mustGetKeyEnvelope(userKeys, chatID)
 	require.Equal(t, chatpb.GetKeyEnvelopeResponse_OK, envelope.Result)
-	require.True(t, proto.Equal(wrapped, envelope.KeyEnvelope))
+	require.True(t, proto.Equal(wrapped, envelope.GetKeyEnvelope()))
 	require.Equal(t, e.userID.Value, envelope.WrappedBy.Value)
+
+	// With the creator's public key, which nothing else returns to a member,
+	// so the admitted user can open the envelope against it.
+	require.True(t, proto.Equal(e.keys.Proto(), envelope.WrappedByPublicKey))
 	got := e.getChat(userKeys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, got.Result)
 	require.False(t, got.Metadata.InLobby)
@@ -6192,7 +6216,7 @@ func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	// A repeat is the no-op the proto promises, their envelope untouched.
 	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(3)).Result)
 	envelope = e.mustGetKeyEnvelope(userKeys, chatID)
-	require.True(t, proto.Equal(wrapped, envelope.KeyEnvelope))
+	require.True(t, proto.Equal(wrapped, envelope.GetKeyEnvelope()))
 	time.Sleep(100 * time.Millisecond)
 	require.Len(t, e.lobbyUpdatesOnUserTopic(e.userID, chatID), 2)
 	require.Len(t, e.pusher.pushesTo(userID), 1)
@@ -6213,7 +6237,7 @@ func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(userKeys, chatID).Result)
 	require.Equal(t, chatpb.AdmitLobbyMemberResponse_OK, e.admitLobbyMember(e.keys, chatID, userID, keyEnvelopeProto(5)).Result)
 	envelope = e.mustGetKeyEnvelope(userKeys, chatID)
-	require.True(t, proto.Equal(keyEnvelopeProto(5), envelope.KeyEnvelope))
+	require.True(t, proto.Equal(keyEnvelopeProto(5), envelope.GetKeyEnvelope()))
 
 	// Each wait and each admission is pushed again.
 	e.waitForPushes(e.userID, 2)

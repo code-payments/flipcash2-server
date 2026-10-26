@@ -111,10 +111,25 @@ func (s *Server) GetKeyEnvelope(ctx context.Context, req *chatpb.GetKeyEnvelopeR
 		log.With(zap.Error(err)).Warn("Failure getting key envelope")
 		return nil, status.Error(codes.Internal, "")
 	}
+
+	// The wrapper's public key is the account's, as for a lobby member (see
+	// hydrateLobbyMembers): it is what the client opens the envelope against
+	// when it has learned none for the wrapper outside this service.
+	keys, err := s.accounts.GetPubKeys(ctx, envelope.WrappedBy)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure getting key envelope wrapper's public key")
+		return nil, status.Error(codes.Internal, "")
+	}
+	if len(keys) == 0 {
+		log.With(zap.String("wrapped_by", model.UserIDString(envelope.WrappedBy))).Warn("Key envelope wrapper has no public key")
+		return nil, status.Error(codes.Internal, "")
+	}
+
 	return &chatpb.GetKeyEnvelopeResponse{
-		Result:      chatpb.GetKeyEnvelopeResponse_OK,
-		KeyEnvelope: envelope.ToProto(),
-		WrappedBy:   envelope.WrappedBy,
+		Result:             chatpb.GetKeyEnvelopeResponse_OK,
+		Envelope:           &chatpb.GetKeyEnvelopeResponse_KeyEnvelope{KeyEnvelope: envelope.ToProto()},
+		WrappedBy:          envelope.WrappedBy,
+		WrappedByPublicKey: keys[0],
 	}, nil
 }
 

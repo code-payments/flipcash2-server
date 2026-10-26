@@ -131,6 +131,7 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_Invite_Revoke,
 		testStore_InviteJoin_Join,
 		testStore_InviteJoin_AlreadyMember,
+		testStore_InviteJoin_OwnInvite,
 		testStore_InviteJoin_Rejoin,
 		testStore_InviteJoin_Limits,
 		testStore_InviteJoin_Status,
@@ -5730,6 +5731,45 @@ func testStore_InviteJoin_AlreadyMember(t *testing.T, s chat.Store) {
 	// found: the result has no invite to carry.
 	_, err = s.JoinWithInvite(ctx, groupID, user, newInvite(groupID, creator, 0, now, nil).ID, inviteSecret(7), now)
 	require.ErrorIs(t, err, chat.ErrInviteNotFound)
+}
+
+// testStore_InviteJoin_OwnInvite pins that the invite's creator never joins
+// with it once they are not a member: the join would put the invite's copy,
+// wrapped by them, over the envelope they hold, the group's key for its
+// creator. Nothing is written, whatever the invite's status, while a member
+// creator's join is still the no-op.
+func testStore_InviteJoin_OwnInvite(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	now := time.Now()
+	creator := model.MustGenerateUserID()
+	groupID := privateGroup(t, s, creator)
+	own := keyEnvelope(6, creator)
+	_, err := s.SetKeyEnvelope(ctx, groupID, creator, own)
+	require.NoError(t, err)
+	invite := createInvite(t, s, newInvite(groupID, creator, 0, now, nil), chat.MaxActiveInvites, now)
+
+	result, err := s.JoinWithInvite(ctx, groupID, creator, invite.ID, inviteSecret(5), now)
+	require.NoError(t, err)
+	require.False(t, result.Changed)
+
+	changed, _, err := s.RemoveGroupMember(ctx, groupID, creator, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, err = s.JoinWithInvite(ctx, groupID, creator, invite.ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrOwnInvite)
+	isMember, err := s.IsMember(ctx, groupID, creator)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	requireUseCount(t, s, invite, 0)
+	got, err := s.GetKeyEnvelope(ctx, groupID, creator)
+	require.NoError(t, err)
+	require.True(t, own.Equal(got))
+
+	// Judged before the invite's status: a revoked one is refused the same.
+	_, _, err = s.RevokeInvite(ctx, groupID, invite.ID, now)
+	require.NoError(t, err)
+	_, err = s.JoinWithInvite(ctx, groupID, creator, invite.ID, inviteSecret(5), now)
+	require.ErrorIs(t, err, chat.ErrOwnInvite)
 }
 
 // testStore_InviteJoin_Rejoin pins that every join counts: a member who

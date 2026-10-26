@@ -70,6 +70,12 @@ var (
 	// one (see Invite.StatusAt).
 	ErrInviteRevoked = errors.New("invite revoked")
 
+	// ErrOwnInvite indicates a join with an invite by the user who created
+	// it, which no caller makes: the creator of a group joins it directly,
+	// and their own envelope, which a join with an invite would replace, is
+	// the group's key (see Store.JoinWithInvite).
+	ErrOwnInvite = errors.New("user created the invite they are joining with")
+
 	// ErrTooManyInvites indicates that a private group holds as many ACTIVE
 	// invites as allowed (see MaxActiveInvites).
 	ErrTooManyInvites = errors.New("too many invites")
@@ -839,9 +845,15 @@ type Store interface {
 	// racing a revoke or another join is judged again after it, so an
 	// invite never admits more than MaxUses joins, nor any after its revoke.
 	//
-	// It returns an error if the arguments fail ValidateInviteJoin. It does
-	// not check that the chat is a private group with its key, or that the
-	// caller holds the invite's token: those are the caller's.
+	// It returns an error if the arguments fail ValidateInviteJoin, and
+	// ErrOwnInvite, with nothing written, when userID created the invite and
+	// is not a member, judged after the membership no-op and before the
+	// invite's status: the join would put the invite's copy, wrapped_by
+	// userID, over the envelope they hold, which for the group's creator is
+	// the group's key, and a copy that reads as wrapped by its holder is one
+	// SetKeyEnvelope never replaces. It does not check that the chat is a
+	// private group with its key, or that the caller holds the invite's
+	// token: those are the caller's.
 	JoinWithInvite(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, inviteID *chatpb.InviteId, secretEnvelope *chatpb.InviteSecretEnvelope, now time.Time) (JoinWithInviteResult, error)
 
 	// SetFeaturedGroups replaces userID's featured groups with chatIDs, in

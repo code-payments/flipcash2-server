@@ -1485,10 +1485,13 @@ func (m *memory) JoinWithInvite(_ context.Context, chatID *commonpb.ChatId, user
 		return chat.JoinWithInviteResult{}, chat.ErrInviteNotFound
 	}
 	// The judgments in chat.Store.JoinWithInvite's order: a member already
-	// is the no-op whatever the invite's status, then the status, then the
-	// ban.
+	// is the no-op whatever the invite's status, then the invite's own
+	// creator, then the status, then the ban.
 	if m.isJoinedLocked(chatKey, userKey) {
 		return chat.JoinWithInviteResult{Roster: m.rosterSummaryLocked(chatID), Invite: invite.Clone()}, nil
+	}
+	if bytes.Equal(invite.CreatedBy.Value, userID.Value) {
+		return chat.JoinWithInviteResult{}, chat.ErrOwnInvite
 	}
 	if err := invite.AdmitsAt(now); err != nil {
 		return chat.JoinWithInviteResult{}, err

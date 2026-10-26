@@ -5485,7 +5485,8 @@ func (s *store) readInviteJoin(ctx context.Context, chatID *commonpb.ChatId, use
 
 // JoinWithInvite reads what the join depends on (see readInviteJoin), judges
 // it — the chat, then the invite's existence and chat, then the membership
-// no-op, then the invite's status — and writes the join as one membership
+// no-op, then the invite's own creator (chat.ErrOwnInvite), then the
+// invite's status — and writes the join as one membership
 // transition (see transitionMembership) carrying, in order:
 //
 //   - [0] the invite's record, use_count compare-and-set from the count read
@@ -5541,6 +5542,9 @@ func (s *store) JoinWithInvite(ctx context.Context, chatID *commonpb.ChatId, use
 		invite := *read.invite
 		if read.joined {
 			return chat.JoinWithInviteResult{Roster: read.roster, Invite: invite}, nil
+		}
+		if bytes.Equal(invite.CreatedBy.Value, userID.Value) {
+			return chat.JoinWithInviteResult{}, chat.ErrOwnInvite
 		}
 		if err := invite.AdmitsAt(now); err != nil {
 			return chat.JoinWithInviteResult{}, err

@@ -210,6 +210,37 @@ func TestCache_GetMembers_GroupNeverCached(t *testing.T) {
 
 func TestCache_GetGroupRules_Cached(t *testing.T) {
 	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	backing := &countingRulesStore{rules: chat.ChatRules{CreatorID: creator, IsPrivate: true}}
+	c := cache.NewInCache(backing)
+
+	// A private group's read is held: its creator and privacy are fixed at
+	// creation, and it carries no rules.
+	chatID := chat.MustGenerateGroupChatID()
+	for i := 0; i < 3; i++ {
+		got, err := c.GetGroupRules(ctx, chatID)
+		require.NoError(t, err)
+		require.True(t, got.IsPrivate)
+		require.Nil(t, got.Rules)
+		require.Equal(t, creator.Value, got.CreatorID.GetValue())
+	}
+	require.Equal(t, 1, backing.callCount())
+
+	// The cache is what answers, even once the backing store would say
+	// otherwise.
+	backing.rules = chat.ChatRules{}
+	got, err := c.GetGroupRules(ctx, chatID)
+	require.NoError(t, err)
+	require.True(t, got.IsPrivate)
+	require.Equal(t, creator.Value, got.CreatorID.GetValue())
+	require.Equal(t, 1, backing.callCount())
+}
+
+// TestCache_GetGroupRules_PublicNotCached pins that a public group's rules,
+// whose minimum balances an edit made by any process may change, are read
+// from the store every time, with or without rules.
+func TestCache_GetGroupRules_PublicNotCached(t *testing.T) {
+	ctx := context.Background()
 	staffOnly := &chatpb.Rules{Listener: []*chatpb.ListenerRules{{Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}}}}}
 	creator := model.MustGenerateUserID()
 	backing := &countingRulesStore{rules: chat.ChatRules{Rules: staffOnly, CreatorID: creator}}
@@ -222,26 +253,52 @@ func TestCache_GetGroupRules_Cached(t *testing.T) {
 		require.True(t, proto.Equal(staffOnly, got.Rules))
 		require.Equal(t, creator.Value, got.CreatorID.GetValue())
 	}
-	require.Equal(t, 1, backing.callCount())
+	require.Equal(t, 3, backing.callCount())
 
-	// Rules and the creator are fixed at creation, so the cache is what
-	// answers even once the backing store would say otherwise.
-	backing.rules = chat.ChatRules{}
+	// A change made behind the cache, as an edit by another process would
+	// be, is read at once.
+	backing.rules = chat.ChatRules{CreatorID: creator}
 	got, err := c.GetGroupRules(ctx, chatID)
 	require.NoError(t, err)
-	require.True(t, proto.Equal(staffOnly, got.Rules))
-	require.Equal(t, creator.Value, got.CreatorID.GetValue())
-	require.Equal(t, 1, backing.callCount())
+	require.Nil(t, got.Rules)
+	require.Equal(t, 4, backing.callCount())
+}
 
-	// The absence of rules is cached too: a group without any is read once.
-	plainID := chat.MustGenerateGroupChatID()
-	for i := 0; i < 2; i++ {
-		got, err := c.GetGroupRules(ctx, plainID)
-		require.NoError(t, err)
-		require.Nil(t, got.Rules)
-		require.Nil(t, got.CreatorID)
+// TestCache_EditGroup_RulesReadBack pins that an edit of a public group's
+// minimum balances, made through the cache, is what the next rules read
+// returns.
+func TestCache_EditGroup_RulesReadBack(t *testing.T) {
+	ctx := context.Background()
+	c := cache.NewInCache(memory.NewInMemory(nil))
+
+	creator := model.MustGenerateUserID()
+	mint := model.MustGenerateKeyPair().Proto()
+	group := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{creator},
+		Title:                  "Gated",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: 10, Mints: []*commonpb.PublicKey{mint}},
+		CreatorID:              creator,
+		LastActivity:           time.Unix(1_700_000_000, 0),
 	}
-	require.Equal(t, 2, backing.callCount())
+	require.NoError(t, c.PutChat(ctx, group))
+
+	rules, err := c.GetGroupRules(ctx, group.ID)
+	require.NoError(t, err)
+	require.Equal(t, float64(10), rules.Rules.GetListener()[0].GetMinimumBalance().GetAmount().GetNativeAmount())
+
+	require.NoError(t, c.EditGroup(ctx, group.ID, chat.GroupEdit{
+		MinimumBalances: &chat.GroupMinimumBalances{
+			Listener: &chat.MinimumBalance{Currency: "usd", NativeAmount: 25, Mints: []*commonpb.PublicKey{mint}},
+			Speaker:  &chat.MinimumBalance{Currency: "usd", NativeAmount: 50, Mints: []*commonpb.PublicKey{mint}},
+		},
+	}))
+	rules, err = c.GetGroupRules(ctx, group.ID)
+	require.NoError(t, err)
+	require.Equal(t, float64(25), rules.Rules.GetListener()[0].GetMinimumBalance().GetAmount().GetNativeAmount())
+	require.Len(t, rules.Rules.GetSpeaker(), 1)
+	require.Equal(t, float64(50), rules.Rules.GetSpeaker()[0].GetMinimumBalance().GetAmount().GetNativeAmount())
 }
 
 func TestCache_GetGroupRules_DoesNotCacheErrors(t *testing.T) {
@@ -257,12 +314,13 @@ func TestCache_GetGroupRules_DoesNotCacheErrors(t *testing.T) {
 	}
 	require.Equal(t, 2, backing.callCount())
 
-	// Once it exists, its rules are served and then held.
+	// Once it exists, a private group's read is served and then held.
 	backing.err = nil
+	backing.rules = chat.ChatRules{IsPrivate: true}
 	for i := 0; i < 2; i++ {
 		got, err := c.GetGroupRules(ctx, chatID)
 		require.NoError(t, err)
-		require.Nil(t, got.Rules)
+		require.True(t, got.IsPrivate)
 	}
 	require.Equal(t, 3, backing.callCount())
 }

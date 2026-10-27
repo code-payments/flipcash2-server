@@ -254,8 +254,8 @@ const (
 // public, like the roster summary. A group with no snapshot, one whose
 // snapshot is not listed (too few holders; see GroupHoldings.Listed), or one
 // whose snapshot names a mint other than the one its record is gated on
-// (which no refresh writes, since the rules are fixed at creation), carries
-// none.
+// (which no refresh writes, since a group's mints are fixed at creation),
+// carries none.
 func (h *Hydrator) hydrate(ctx context.Context, viewerID *commonpb.UserId, standing ListenerStanding, reading Reading, detail metadataDetail, chats []*Chat) ([]*chatpb.Metadata, error) {
 	var msgRefs []MessageRef
 	var seqChatIDs []*commonpb.ChatId

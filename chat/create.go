@@ -125,9 +125,9 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	var creationRules CreationRules
+	var storedRules StoredRules
 	if !isPrivate {
-		creationRules, err = RulesFromProto(rules)
+		storedRules, err = RulesFromProto(rules)
 		if err != nil {
 			return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_INVALID_RULES}, nil
 		}
@@ -210,9 +210,9 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		Type:                   chatpb.ChatType_GROUP,
 		Members:                []*commonpb.UserId{userID},
 		Title:                  title,
-		IsStaffOnly:            creationRules.IsStaffOnly,
-		MinimumListenerBalance: creationRules.MinimumListenerBalance,
-		MinimumSpeakerBalance:  creationRules.MinimumSpeakerBalance,
+		IsStaffOnly:            storedRules.IsStaffOnly,
+		MinimumListenerBalance: storedRules.MinimumListenerBalance,
+		MinimumSpeakerBalance:  storedRules.MinimumSpeakerBalance,
 		IsPrivate:              isPrivate,
 		CreatorID:              userID,
 		Description:            description,

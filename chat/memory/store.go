@@ -312,6 +312,9 @@ func (m *memory) EditGroup(_ context.Context, chatID *commonpb.ChatId, edit chat
 	if !ok {
 		return chat.ErrChatNotFound
 	}
+	if edit.MinimumBalances != nil && (c.IsPrivate || c.MinimumListenerBalance == nil) {
+		return fmt.Errorf("group cannot carry minimum balances")
+	}
 	if edit.Title != nil {
 		c.Title = *edit.Title
 	}
@@ -323,6 +326,13 @@ func (m *memory) EditGroup(_ context.Context, chatID *commonpb.ChatId, edit chat
 	}
 	if edit.CoverPictureBlobID != nil {
 		c.CoverPictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), edit.CoverPictureBlobID.Value...)}
+	}
+	if balances := edit.MinimumBalances; balances != nil {
+		c.MinimumListenerBalance = balances.Listener.Clone()
+		c.MinimumSpeakerBalance = nil
+		if balances.Speaker != nil {
+			c.MinimumSpeakerBalance = balances.Speaker.Clone()
+		}
 	}
 	return nil
 }

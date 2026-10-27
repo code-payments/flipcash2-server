@@ -126,7 +126,10 @@ func event(chatID *commonpb.ChatId, e *messagingpb.Event) (*messagingpb.Event, e
 // message, so it passes as it is; a title, description, profile picture or
 // cover picture change carries the record's own fields, which identify the
 // group to anyone who may read it in any form (see chat.v1.GetChat), so it
-// passes as it is too. A kind this
+// passes as it is too; and a rules change carries the group's rules, which
+// are no message's content and are shown to anyone who may see the group in
+// any form, the public view's Metadata.rules included, since they are what a
+// user weighs before joining, so it passes as it is as well. A kind this
 // version does not know is an error.
 func metadataUpdate(chatID *commonpb.ChatId, md *chatpb.MetadataUpdate) (*chatpb.MetadataUpdate, error) {
 	switch kind := md.GetKind().(type) {
@@ -143,7 +146,8 @@ func metadataUpdate(chatID *commonpb.ChatId, md *chatpb.MetadataUpdate) (*chatpb
 		*chatpb.MetadataUpdate_TitleChanged_,
 		*chatpb.MetadataUpdate_ProfilePictureChanged_,
 		*chatpb.MetadataUpdate_DescriptionChanged_,
-		*chatpb.MetadataUpdate_CoverPictureChanged_:
+		*chatpb.MetadataUpdate_CoverPictureChanged_,
+		*chatpb.MetadataUpdate_RulesChanged_:
 		return proto.Clone(md).(*chatpb.MetadataUpdate), nil
 	default:
 		return nil, fmt.Errorf("redact: unsupported metadata update %T", kind)

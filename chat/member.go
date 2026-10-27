@@ -348,8 +348,9 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 	// KeyEnvelope). The envelope is removed in the write that records the
 	// departure, so the two cannot disagree, which means deciding it before
 	// that write. Whether the group is private, and who created it, come from
-	// the rules read: it is the one a store caches, so a leave pays nothing
-	// for it in steady state.
+	// the rules read: a store caches a private group's, so a leave from one
+	// pays nothing for it in steady state, and a public group's costs one
+	// projected read.
 	rules, err := s.chats.GetGroupRules(ctx, req.ChatId)
 	switch {
 	case errors.Is(err, ErrChatNotFound):

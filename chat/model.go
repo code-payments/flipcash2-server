@@ -255,10 +255,14 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // MinimumListenerBalance a group whose members must hold a balance (nil when
 // the group asks for none). Both are stored state set at creation, surfaced to
 // clients as listener rules (see Rules) and enforced by the messaging service
-// through a RuleEvaluator on sends. Reads, of chat metadata and of messages
-// alike, gate on membership alone, so a member a rule excludes can still see
-// the chat and what it requires of them; enforcing rules on membership changes
-// is the job of whatever path mutates membership.
+// through a RuleEvaluator on sends. IsStaffOnly never changes, and neither do
+// MinimumListenerBalance's currency and mints, but its amount may be edited,
+// and an edit never removes it (see GroupEdit). Reads, of chat metadata and of
+// messages alike, gate on membership alone, so a member a rule excludes,
+// whether it changed or they did, can still see the chat and what it requires
+// of them; enforcing rules on membership changes is the job of whatever path
+// mutates membership, and nothing removes a member who stops satisfying them
+// (see RuleEvaluator).
 //
 // IsCreatorOnlySpeaker marks a group in which only its creator may speak. It
 // is stored state, surfaced to clients as a CreatorRequirement speaker rule
@@ -274,8 +278,9 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // like any other rule, on top of the listener rules. StartChat sets it when
 // a public group asks for it, and only alongside a minimum listener balance
 // in the same currency and mints and smaller by at least a minor unit (see
-// RulesFromProto); like the other rules it is written with the group and
-// never onto one that exists. It is meant to cover MinimumListenerBalance —
+// RulesFromProto), and an edit of a group's minimum balances may add, remove
+// or change it under the same rule (see RulesEditFromProto). It is meant to
+// cover MinimumListenerBalance —
 // the same currency and mints, and at least the amount — so that a speak
 // check values the user's balance once (see RuleEvaluator.CanSpeakWithRules),
 // which every group StartChat writes it on does. A record written otherwise
@@ -455,23 +460,42 @@ func (c *Chat) PermissionsFor(userID *commonpb.UserId, isMember bool) Permission
 }
 
 // GroupEdit is a change to a group's editable record fields (see
-// Store.EditGroup): the title, the description, and the blobs holding the
-// ORIGINALs of its profile picture and cover picture. A nil field is left as
-// it is, so an edit names only what it changes and two edits of different
-// fields never overwrite each other. The description is cleared by naming the
-// empty one; the title and pictures cannot be cleared through an edit — a
-// profile picture is removed with Store.SetGroupPicture — and an edit that
-// names nothing is invalid.
+// Store.EditGroup): the title, the description, the blobs holding the
+// ORIGINALs of its profile picture and cover picture, and a public group's
+// minimum balances. A nil field is left as it is, so an edit names only what
+// it changes and two edits of different fields never overwrite each other.
+// The description is cleared by naming the empty one; the title and pictures
+// cannot be cleared through an edit — a profile picture is removed with
+// Store.SetGroupPicture — and an edit that names nothing is invalid.
+//
+// MinimumBalances sets both minimum balances together, as one pair (see
+// GroupMinimumBalances): the listener balance, and the speaker balance or its
+// absence, which removes one. Writing the pair whole is what keeps the rule
+// between the two (see RulesFromProto) true of whatever is stored, however
+// edits race, with no compare-and-set. No other rule is editable: whether
+// the group is staff-only or creator-only, and the currency and mints of its
+// balances, are fixed at creation, and the edit carries none of them.
 type GroupEdit struct {
 	Title                *string
 	Description          *string
 	ProfilePictureBlobID *blobpb.BlobId
 	CoverPictureBlobID   *blobpb.BlobId
+	MinimumBalances      *GroupMinimumBalances
+}
+
+// GroupMinimumBalances are the minimum balances a public group's members
+// must hold, as an edit sets them (see RulesEditFromProto): Listener, which
+// every such group carries, and Speaker, nil when the group asks none of its
+// speakers. Both are set together, so the pair the edit validated is the
+// pair stored.
+type GroupMinimumBalances struct {
+	Listener *MinimumBalance
+	Speaker  *MinimumBalance
 }
 
 // IsEmpty reports whether the edit names nothing.
 func (e GroupEdit) IsEmpty() bool {
-	return e.Title == nil && e.Description == nil && e.ProfilePictureBlobID == nil && e.CoverPictureBlobID == nil
+	return e.Title == nil && e.Description == nil && e.ProfilePictureBlobID == nil && e.CoverPictureBlobID == nil && e.MinimumBalances == nil
 }
 
 // Clone returns a deep copy of the chat.

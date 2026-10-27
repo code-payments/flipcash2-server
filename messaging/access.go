@@ -63,14 +63,14 @@ import (
 // even though a listener rule is what admitted them: reads are the hot path,
 // and a listener rule can be costly to evaluate (a minimum balance is a
 // valuation by the OCP server). The membership record stands for the rules on
-// a member — someone the rules admitted, who remains admitted until removed.
-// The intended design is for membership to track the rules: when a member
-// stops satisfying a listener rule (their balance drops, their staff flag is
-// revoked), whatever detects the transition removes them from the group, so
-// the record is always current. Until that exists, a member who no longer
-// satisfies a listener rule keeps reading, and is denied only on the send
-// paths, where the rules are evaluated. A non-member's read does evaluate the
-// rules, since nothing else can admit them; Access bounds what that costs.
+// a member — someone the rules admitted, who remains admitted until they
+// leave or are removed. Membership does not track the rules, by decision (see
+// chat.RuleEvaluator): a member who no longer satisfies a listener rule
+// (their balance drops, their staff flag is revoked, the group raises its
+// minimum balance) is grandfathered, keeps reading, and is denied only on the
+// send paths, where the rules are evaluated. A non-member's read does
+// evaluate the rules, since nothing else can admit them; Access bounds what
+// that costs.
 
 func (s *Server) reading(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (chat.Reading, error) {
 	standing, err := s.access.ListenerStanding(ctx, chatID, userID, mode)

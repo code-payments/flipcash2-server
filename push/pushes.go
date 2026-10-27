@@ -262,7 +262,7 @@ func SendLobbyAdmittedPush(ctx context.Context, pusher Pusher, user *commonpb.Us
 // admitted user's.
 const (
 	lobbyEnteredPushBodyFormat = "%s requested to join"
-	lobbyAdmittedPushBody      = "Your request to join was approved"
+	lobbyAdmittedPushBody      = "You were added to the group"
 )
 
 // lobbyPushPayload is a lobby push's payload: grouped and navigating with the

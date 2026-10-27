@@ -6396,7 +6396,7 @@ func testServer_Lobby_Admit(t *testing.T, s chat.Store) {
 	// And pushed to the admitted user; the creator was pushed only the entry.
 	pushes := e.waitForPushes(userID, 1)
 	require.Len(t, pushes, 1)
-	requireLobbyPush(t, pushes[0], chatID, "Sunday Hikers", "Your request to join was approved")
+	requireLobbyPush(t, pushes[0], chatID, "Sunday Hikers", "You were added to the group")
 	require.Len(t, e.pusher.pushesTo(e.userID), 1)
 
 	// A repeat is the no-op the proto promises, their envelope untouched.

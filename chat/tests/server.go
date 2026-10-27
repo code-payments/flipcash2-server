@@ -160,6 +160,13 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_EditChat_AllFields,
 		testServer_ChatProfileDetail_Carriers,
 		testServer_EditChat_ModerationFailureIsInternal,
+		testServer_EditChat_Rules,
+		testServer_EditChat_RulesWithOtherFields,
+		testServer_EditChat_Rules_Fixed,
+		testServer_EditChat_Rules_Invalid,
+		testServer_EditChat_Rules_NotSatisfied,
+		testServer_EditChat_Rules_NoOp,
+		testServer_EditChat_Rules_Grandfathered,
 		testServer_ViewerState_Permissions,
 		testServer_FeaturedGroups_SetAndGet,
 		testServer_FeaturedGroups_Refused,
@@ -5800,6 +5807,425 @@ func testServer_EditChat_NotFound(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.EditChatResponse_NOT_FOUND, resp.Result)
 	require.Nil(t, resp.Chat)
 	require.Empty(t, e.moderator.classifiedTitle)
+}
+
+// putOwnedRuledGroup persists a public group the env user created and is a
+// member of, alongside the given others, carrying the given rules as a
+// record stores them.
+func (e *serverEnv) putOwnedRuledGroup(rules chat.StoredRules, others ...*commonpb.UserId) *commonpb.ChatId {
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, e.store.PutChat(e.ctx, &chat.Chat{
+		ID:                     chatID,
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                append([]*commonpb.UserId{e.userID}, others...),
+		Title:                  "Whales",
+		IsStaffOnly:            rules.IsStaffOnly,
+		MinimumListenerBalance: rules.MinimumListenerBalance,
+		IsCreatorOnlySpeaker:   rules.IsCreatorOnlySpeaker,
+		MinimumSpeakerBalance:  rules.MinimumSpeakerBalance,
+		CreatorID:              e.userID,
+		LastActivity:           at(1),
+	}))
+	return chatID
+}
+
+// usdMinimum builds a stored USD minimum balance in the given mints, or any
+// mint when none are given.
+func usdMinimum(amount float64, mints ...*commonpb.PublicKey) *chat.MinimumBalance {
+	return &chat.MinimumBalance{Currency: "usd", NativeAmount: amount, Mints: mints}
+}
+
+// balanceRules builds the rules of a public group with a USD minimum
+// listener balance and, when speaker is positive, a USD minimum speaker
+// balance, both in any mint, as Chat.Rules projects them.
+func balanceRules(listener, speaker float64) *chatpb.Rules {
+	rules := &chatpb.Rules{Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", listener)}}
+	if speaker > 0 {
+		rules.Speaker = []*chatpb.SpeakerRules{speakerBalanceRule("usd", speaker)}
+	}
+	return rules
+}
+
+// mintBalanceRequirement builds a minimum balance requirement in one mint.
+func mintBalanceRequirement(currency string, amount float64, mint *commonpb.PublicKey) *chatpb.MinimumBalanceRequirement {
+	return &chatpb.MinimumBalanceRequirement{
+		Amount: &commonpb.FiatPaymentAmount{Currency: currency, NativeAmount: amount},
+		Mints:  []*commonpb.PublicKey{mint},
+	}
+}
+
+func (e *serverEnv) mustEditRules(keys model.KeyPair, chatID *commonpb.ChatId, rules *chatpb.Rules) *chatpb.EditChatResponse {
+	return e.mustSendEditChat(keys, &chatpb.EditChatRequest{ChatId: chatID, Rules: rules})
+}
+
+// fundUser gives userID an owner account, keys, holding the given USD
+// amount, as fundEnvUser does for the env user.
+func (e *serverEnv) fundUser(userID *commonpb.UserId, keys model.KeyPair, amount uint64) {
+	e.bindKey(userID, keys)
+	e.ocpBalance.setBalance(keys.Proto(), ocp_common.ToCoreMintQuarks(amount))
+}
+
+// requireStoredRules requires that chatID's record carries exactly want.
+func (e *serverEnv) requireStoredRules(chatID *commonpb.ChatId, want *chatpb.Rules) {
+	e.t.Helper()
+	stored, err := e.store.GetChatByID(e.ctx, chatID)
+	require.NoError(e.t, err)
+	require.NoError(e.t, protoutil.ProtoEqualError(want, stored.Rules()))
+}
+
+// requireNoMetadataUpdates requires that, after giving the bus a moment,
+// nothing was published about chatID's metadata.
+func (e *serverEnv) requireNoMetadataUpdates(chatID *commonpb.ChatId) {
+	e.t.Helper()
+	time.Sleep(100 * time.Millisecond)
+	updates, _ := e.metadataUpdatesOnChatTopic(chatID)
+	require.Empty(e.t, updates)
+}
+
+// testServer_EditChat_Rules pins each change an edit may make to a public
+// group's minimum balances: each lands in the record, comes back on the
+// response and on another member's read, and is announced as one
+// RulesChanged carrying the rules in full.
+func testServer_EditChat_Rules(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(300)
+
+	other, otherKeys := e.addUser()
+	chatID := e.putOwnedRuledGroup(chat.StoredRules{MinimumListenerBalance: usdMinimum(100)}, other)
+
+	for i, step := range []struct {
+		name  string
+		rules *chatpb.Rules
+	}{
+		{"raise the listener balance", balanceRules(150, 0)},
+		{"lower the listener balance", balanceRules(50, 0)},
+		{"add a speaker balance", balanceRules(50, 200)},
+		{"change the speaker balance", balanceRules(50, 250)},
+		{"remove the speaker balance", balanceRules(50, 0)},
+	} {
+		resp := e.mustEditRules(e.keys, chatID, step.rules)
+		require.Equal(t, chatpb.EditChatResponse_OK, resp.Result, step.name)
+		require.NoError(t, protoutil.ProtoEqualError(step.rules, resp.Chat.GetRules()), step.name)
+		e.requireStoredRules(chatID, step.rules)
+		require.NoError(t, protoutil.ProtoEqualError(step.rules, e.getChat(otherKeys, chatID).Metadata.GetRules()), step.name)
+
+		updates := e.waitForMetadataUpdates(chatID, i+1)
+		require.Len(t, updates[i], 1, step.name)
+		require.NoError(t, protoutil.ProtoEqualError(step.rules, updates[i][0].GetRulesChanged().GetNewRules()), step.name)
+	}
+
+	// Nothing but the rules was judged.
+	require.Empty(t, e.moderator.classifiedTitle)
+	require.Empty(t, e.media.chatPictures)
+}
+
+// testServer_EditChat_RulesWithOtherFields pins that rules ride an edit
+// beside other fields as one write and one event, the rules' update last,
+// in the order the proto declares them.
+func testServer_EditChat_RulesWithOtherFields(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(200)
+
+	chatID := e.putOwnedRuledGroup(chat.StoredRules{MinimumListenerBalance: usdMinimum(100)})
+	rules := balanceRules(100, 200)
+	resp := e.mustSendEditChat(e.keys, &chatpb.EditChatRequest{
+		ChatId:      chatID,
+		Title:       &chatpb.EditChatRequest_Title{Value: "After"},
+		Description: &chatpb.EditChatRequest_Description{Value: "Described"},
+		Rules:       rules,
+	})
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.Equal(t, "After", resp.Chat.Title)
+	require.Equal(t, "Described", resp.Chat.Description)
+	require.NoError(t, protoutil.ProtoEqualError(rules, resp.Chat.GetRules()))
+	require.Equal(t, "After", e.moderator.classifiedTitle)
+
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, "After", stored.Title)
+	require.Equal(t, "Described", stored.Description)
+	require.NoError(t, protoutil.ProtoEqualError(rules, stored.Rules()))
+
+	updates := e.waitForMetadataUpdates(chatID, 1)
+	require.Len(t, updates[0], 3)
+	require.Equal(t, "After", updates[0][0].GetTitleChanged().GetNewTitle())
+	require.Equal(t, "Described", updates[0][1].GetDescriptionChanged().GetNewDescription())
+	require.NoError(t, protoutil.ProtoEqualError(rules, updates[0][2].GetRulesChanged().GetNewRules()))
+}
+
+// testServer_EditChat_Rules_Fixed pins that the rules an edit cannot change
+// — a staff requirement and a creator requirement — must be named exactly
+// when the group carries them, in any order, and are kept as they were.
+func testServer_EditChat_Rules_Fixed(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.accounts.setStaff(e.userID, true)
+	e.fundEnvUser(300)
+
+	staffRule := &chatpb.ListenerRules{Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}}}
+	creatorRule := &chatpb.SpeakerRules{Kind: &chatpb.SpeakerRules_Creator{Creator: &chatpb.CreatorRequirement{}}}
+
+	// A staff-only group's creator, who is staff, echoes the requirement,
+	// after the balance, with a new amount: OK, shown in the record's order.
+	staffOnly := e.putOwnedRuledGroup(chat.StoredRules{IsStaffOnly: true, MinimumListenerBalance: usdMinimum(100)})
+	want := &chatpb.Rules{Listener: []*chatpb.ListenerRules{staffRule, minimumBalanceRule("usd", 150)}}
+	resp := e.mustEditRules(e.keys, staffOnly, &chatpb.Rules{Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 150), staffRule}})
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(want, resp.Chat.GetRules()))
+	e.requireStoredRules(staffOnly, want)
+	updates := e.waitForMetadataUpdates(staffOnly, 1)
+	require.NoError(t, protoutil.ProtoEqualError(want, updates[0][0].GetRulesChanged().GetNewRules()))
+
+	// Dropping it, or naming it twice, is refused.
+	for _, rules := range []*chatpb.Rules{
+		balanceRules(200, 0),
+		{Listener: []*chatpb.ListenerRules{staffRule, staffRule, minimumBalanceRule("usd", 200)}},
+	} {
+		resp = e.mustEditRules(e.keys, staffOnly, rules)
+		require.Equal(t, chatpb.EditChatResponse_INVALID_RULES, resp.Result)
+		require.Nil(t, resp.Chat)
+	}
+	e.requireStoredRules(staffOnly, want)
+
+	// Adding one to a group without it is refused.
+	open := e.putOwnedRuledGroup(chat.StoredRules{MinimumListenerBalance: usdMinimum(100)})
+	resp = e.mustEditRules(e.keys, open, &chatpb.Rules{Listener: []*chatpb.ListenerRules{staffRule, minimumBalanceRule("usd", 150)}})
+	require.Equal(t, chatpb.EditChatResponse_INVALID_RULES, resp.Result)
+	e.requireStoredRules(open, balanceRules(100, 0))
+
+	// A creator-only group keeps its creator requirement through an edit
+	// that names it, and cannot lose it; nor can another group gain one.
+	creatorOnly := e.putOwnedRuledGroup(chat.StoredRules{MinimumListenerBalance: usdMinimum(100), IsCreatorOnlySpeaker: true})
+	want = &chatpb.Rules{
+		Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 100)},
+		Speaker:  []*chatpb.SpeakerRules{creatorRule, speakerBalanceRule("usd", 200)},
+	}
+	resp = e.mustEditRules(e.keys, creatorOnly, &chatpb.Rules{
+		Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 100)},
+		Speaker:  []*chatpb.SpeakerRules{speakerBalanceRule("usd", 200), creatorRule},
+	})
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(want, resp.Chat.GetRules()))
+	e.requireStoredRules(creatorOnly, want)
+
+	resp = e.mustEditRules(e.keys, creatorOnly, balanceRules(100, 300))
+	require.Equal(t, chatpb.EditChatResponse_INVALID_RULES, resp.Result)
+	e.requireStoredRules(creatorOnly, want)
+
+	resp = e.mustEditRules(e.keys, open, &chatpb.Rules{
+		Listener: []*chatpb.ListenerRules{minimumBalanceRule("usd", 100)},
+		Speaker:  []*chatpb.SpeakerRules{creatorRule},
+	})
+	require.Equal(t, chatpb.EditChatResponse_INVALID_RULES, resp.Result)
+	e.requireStoredRules(open, balanceRules(100, 0))
+	e.requireNoMetadataUpdates(open)
+}
+
+// testServer_EditChat_Rules_Invalid pins the rules an edit refuses as
+// INVALID_RULES, and who may not edit them at all, with the record left as
+// it was and nothing published.
+func testServer_EditChat_Rules_Invalid(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(1000)
+
+	member, memberKeys := e.addUser()
+	e.fundUser(member, memberKeys, 1000)
+
+	mint := model.MustGenerateKeyPair().Proto()
+	otherMint := model.MustGenerateKeyPair().Proto()
+	chatID := e.putOwnedRuledGroup(chat.StoredRules{
+		MinimumListenerBalance: usdMinimum(100, mint),
+		MinimumSpeakerBalance:  usdMinimum(200, mint),
+	}, member)
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	original := stored.Rules()
+
+	listener := func(currency string, amount float64, mint *commonpb.PublicKey) *chatpb.ListenerRules {
+		return &chatpb.ListenerRules{Kind: &chatpb.ListenerRules_MinimumBalance{MinimumBalance: mintBalanceRequirement(currency, amount, mint)}}
+	}
+	speaker := func(currency string, amount float64, mint *commonpb.PublicKey) *chatpb.SpeakerRules {
+		return &chatpb.SpeakerRules{Kind: &chatpb.SpeakerRules_MinimumBalance{MinimumBalance: mintBalanceRequirement(currency, amount, mint)}}
+	}
+	for _, tc := range []struct {
+		name  string
+		rules *chatpb.Rules
+	}{
+		{"another currency", &chatpb.Rules{
+			Listener: []*chatpb.ListenerRules{listener("eur", 100, mint)},
+			Speaker:  []*chatpb.SpeakerRules{speaker("eur", 200, mint)},
+		}},
+		{"another mint", &chatpb.Rules{
+			Listener: []*chatpb.ListenerRules{listener("usd", 150, otherMint)},
+			Speaker:  []*chatpb.SpeakerRules{speaker("usd", 200, otherMint)},
+		}},
+		{"any mint", balanceRules(150, 200)},
+		{"speaker in another mint", &chatpb.Rules{
+			Listener: []*chatpb.ListenerRules{listener("usd", 100, mint)},
+			Speaker:  []*chatpb.SpeakerRules{speaker("usd", 200, otherMint)},
+		}},
+		{"speaker not above the listener by a minor unit", &chatpb.Rules{
+			Listener: []*chatpb.ListenerRules{listener("usd", 100, mint)},
+			Speaker:  []*chatpb.SpeakerRules{speaker("usd", 100.005, mint)},
+		}},
+		{"listener below the minimum transfer value", &chatpb.Rules{
+			Listener: []*chatpb.ListenerRules{listener("usd", 0.001, mint)},
+		}},
+		{"no listener balance", &chatpb.Rules{
+			Speaker: []*chatpb.SpeakerRules{speaker("usd", 200, mint)},
+		}},
+		{"no rules", &chatpb.Rules{}},
+	} {
+		resp := e.mustEditRules(e.keys, chatID, tc.rules)
+		require.Equal(t, chatpb.EditChatResponse_INVALID_RULES, resp.Result, tc.name)
+		require.Nil(t, resp.Chat, tc.name)
+	}
+
+	// A member who did not create the group is DENIED, as for any edit, even
+	// with rules that would pass.
+	valid := &chatpb.Rules{
+		Listener: []*chatpb.ListenerRules{listener("usd", 150, mint)},
+		Speaker:  []*chatpb.SpeakerRules{speaker("usd", 200, mint)},
+	}
+	resp := e.mustEditRules(memberKeys, chatID, valid)
+	require.Equal(t, chatpb.EditChatResponse_DENIED, resp.Result)
+
+	e.requireStoredRules(chatID, original)
+	e.requireNoMetadataUpdates(chatID)
+
+	// A public group created without a listener balance has no rules to
+	// edit.
+	unruled := e.putOwnedGroup("Open", nil)
+	resp = e.mustEditRules(e.keys, unruled, balanceRules(100, 0))
+	require.Equal(t, chatpb.EditChatResponse_INVALID_RULES, resp.Result)
+	e.requireStoredRules(unruled, nil)
+
+	// A private group is governed by no rules: naming any is DENIED, while
+	// the same creator's edit of another field passes.
+	private := e.putKeyedPrivateGroup("Private")
+	resp = e.mustEditRules(e.keys, private, balanceRules(100, 0))
+	require.Equal(t, chatpb.EditChatResponse_DENIED, resp.Result)
+	e.requireStoredRules(private, nil)
+	e.requireNoMetadataUpdates(unruled)
+	e.requireNoMetadataUpdates(private)
+	title := "Renamed"
+	require.Equal(t, chatpb.EditChatResponse_OK, e.mustEditChat(e.keys, private, &title, nil).Result)
+}
+
+// testServer_EditChat_Rules_NotSatisfied pins that the creator must satisfy
+// the new rules in full, judged before anything else in the request, and
+// that a valuation that fails is an error rather than a verdict.
+func testServer_EditChat_Rules_NotSatisfied(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(100)
+
+	chatID := e.putOwnedRuledGroup(chat.StoredRules{MinimumListenerBalance: usdMinimum(100)})
+
+	// A listener balance above what the creator holds is refused, before the
+	// title beside it is judged.
+	resp := e.mustSendEditChat(e.keys, &chatpb.EditChatRequest{
+		ChatId: chatID,
+		Title:  &chatpb.EditChatRequest_Title{Value: "After"},
+		Rules:  balanceRules(150, 0),
+	})
+	require.Equal(t, chatpb.EditChatResponse_RULES_NOT_SATISFIED, resp.Result)
+	require.Nil(t, resp.Chat)
+	require.Empty(t, e.moderator.classifiedTitle)
+
+	// So is a speaker balance above it, though they meet the listener's.
+	resp = e.mustEditRules(e.keys, chatID, balanceRules(100, 150))
+	require.Equal(t, chatpb.EditChatResponse_RULES_NOT_SATISFIED, resp.Result)
+
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, "Whales", stored.Title)
+	e.requireStoredRules(chatID, balanceRules(100, 0))
+	e.requireNoMetadataUpdates(chatID)
+
+	// Topped up, the same edit lands.
+	e.fundEnvUser(150)
+	resp = e.mustEditRules(e.keys, chatID, balanceRules(100, 150))
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	e.requireStoredRules(chatID, balanceRules(100, 150))
+	e.waitForMetadataUpdates(chatID, 1)
+
+	// A currency OCP does not price now was priced when the group was
+	// created and cannot change, so a valuation failing is transient:
+	// Internal, not INVALID_RULES.
+	euro := &chatpb.Rules{Listener: []*chatpb.ListenerRules{minimumBalanceRule("eur", 90)}}
+	euroGroup := e.putOwnedRuledGroup(chat.StoredRules{MinimumListenerBalance: &chat.MinimumBalance{Currency: "eur", NativeAmount: 90}})
+	_, err = e.sendEditChat(e.keys, &chatpb.EditChatRequest{
+		ChatId: euroGroup,
+		Rules:  &chatpb.Rules{Listener: []*chatpb.ListenerRules{minimumBalanceRule("eur", 100)}},
+	})
+	require.Equal(t, codes.Internal, status.Code(err))
+	e.requireStoredRules(euroGroup, euro)
+	e.requireNoMetadataUpdates(euroGroup)
+}
+
+// testServer_EditChat_Rules_NoOp pins that rules equal to the record's are
+// dropped before anything is checked: OK from the record, with the creator
+// never evaluated (they hold nothing here), nothing written or published.
+func testServer_EditChat_Rules_NoOp(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	mint := model.MustGenerateKeyPair().Proto()
+	chatID := e.putOwnedRuledGroup(chat.StoredRules{
+		MinimumListenerBalance: usdMinimum(100, mint),
+		MinimumSpeakerBalance:  usdMinimum(200, mint),
+	})
+	stored, err := s.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	rules := stored.Rules()
+
+	resp := e.mustEditRules(e.keys, chatID, rules)
+	require.Equal(t, chatpb.EditChatResponse_OK, resp.Result)
+	require.NoError(t, protoutil.ProtoEqualError(rules, resp.Chat.GetRules()))
+	e.requireStoredRules(chatID, rules)
+	e.requireNoMetadataUpdates(chatID)
+}
+
+// testServer_EditChat_Rules_Grandfathered pins that an edit removes no one:
+// a member who met the old listener balance but not the raised one stays a
+// member and keeps reading, cannot speak, and must meet the new rules to
+// rejoin once they leave.
+func testServer_EditChat_Rules_Grandfathered(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.fundEnvUser(200)
+
+	chatID := e.putOwnedRuledGroup(chat.StoredRules{MinimumListenerBalance: usdMinimum(100)})
+	member, memberKeys := e.addUser()
+	e.fundUser(member, memberKeys, 100)
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(memberKeys, chatID).Result)
+
+	raised := balanceRules(150, 0)
+	require.Equal(t, chatpb.EditChatResponse_OK, e.mustEditRules(e.keys, chatID, raised).Result)
+
+	// Still a member, on the roster, reading in full.
+	isMember, err := s.IsMember(e.ctx, chatID, member)
+	require.NoError(t, err)
+	require.True(t, isMember)
+	roster := e.mustGetRoster(memberKeys, chatID, &commonpb.QueryOptions{})
+	require.Equal(t, chatpb.GetRosterResponse_OK, roster.Result)
+	require.Contains(t, memberUserIDs(roster.Members), member.Value)
+	got := e.getChat(memberKeys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, got.Result)
+	require.NotNil(t, got.Metadata.ViewerState)
+	require.NoError(t, protoutil.ProtoEqualError(raised, got.Metadata.GetRules()))
+
+	// But not speaking, since speech evaluates the listener rules.
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, e.getMentionSuggestions(memberKeys, chatID).Result)
+
+	// Once they leave, the new rules keep them out.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(memberKeys, chatID).Result)
+	require.Equal(t, chatpb.JoinChatResponse_RULES_NOT_SATISFIED, e.mustJoinChat(memberKeys, chatID).Result)
+	isMember, err = s.IsMember(e.ctx, chatID, member)
+	require.NoError(t, err)
+	require.False(t, isMember)
+
+	// Meeting them, they rejoin and speak.
+	e.fundUser(member, memberKeys, 150)
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(memberKeys, chatID).Result)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_OK, e.getMentionSuggestions(memberKeys, chatID).Result)
 }
 
 func testServer_EditChat_TitleModerated(t *testing.T, s chat.Store) {

@@ -1101,6 +1101,21 @@ func (s *store) EditGroup(ctx context.Context, chatID *commonpb.ChatId, edit cha
 		sets = append(sets, fmt.Sprintf("%s = :cover_picture", attrCoverPictureBlobID))
 		values[":cover_picture"] = avB(edit.CoverPictureBlobID.Value)
 	}
+	// The minimum balances are written as a pair, the speaker balance's
+	// absence removing it, so the stored pair is always one the edit
+	// validated, whichever of two racing edits lands last.
+	condition := fmt.Sprintf("attribute_exists(%s)", attrPK)
+	if balances := edit.MinimumBalances; balances != nil {
+		sets = append(sets, fmt.Sprintf("%s = :min_listener_balance", attrMinListenerBalance))
+		values[":min_listener_balance"] = minimumBalanceAttr(balances.Listener)
+		if balances.Speaker != nil {
+			sets = append(sets, fmt.Sprintf("%s = :min_speaker_balance", attrMinSpeakerBalance))
+			values[":min_speaker_balance"] = minimumBalanceAttr(balances.Speaker)
+		} else {
+			removes = append(removes, attrMinSpeakerBalance)
+		}
+		condition += fmt.Sprintf(" AND attribute_exists(%s) AND attribute_not_exists(%s)", attrMinListenerBalance, attrIsPrivate)
+	}
 
 	var clauses []string
 	if len(sets) > 0 {
@@ -1113,7 +1128,10 @@ func (s *store) EditGroup(ctx context.Context, chatID *commonpb.ChatId, edit cha
 		TableName:           aws.String(s.chatsTable),
 		Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
 		UpdateExpression:    aws.String(strings.Join(clauses, " ")),
-		ConditionExpression: aws.String(fmt.Sprintf("attribute_exists(%s)", attrPK)),
+		ConditionExpression: aws.String(condition),
+		// A failed condition returns the item, which tells a missing group
+		// from one that cannot carry minimum balances.
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 	}
 	// An edit that only removes binds no values, and DynamoDB refuses an empty
 	// value map.
@@ -1122,8 +1140,12 @@ func (s *store) EditGroup(ctx context.Context, chatID *commonpb.ChatId, edit cha
 	}
 	_, err := s.client.UpdateItem(ctx, input)
 	if err != nil {
-		if isConditionalCheckFailed(err) {
-			return chat.ErrChatNotFound
+		var ccf *types.ConditionalCheckFailedException
+		if errors.As(err, &ccf) {
+			if len(ccf.Item) == 0 {
+				return chat.ErrChatNotFound
+			}
+			return fmt.Errorf("group cannot carry minimum balances")
 		}
 		return err
 	}

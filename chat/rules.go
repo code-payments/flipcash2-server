@@ -83,16 +83,18 @@ func (c *Chat) Rules() *chatpb.Rules {
 // ChatRules is what a chat's rules are evaluated against: the rules, the
 // creator a CreatorRequirement names, since the rule itself names no one, and
 // whether the group is private, which decides who speaks in it before any
-// rule does (see Access.CanSpeak). All are fixed at creation and read
-// together (see Store.GetGroupRules), so a store that caches one caches the
-// others with it, and evaluating a creator-only group, or refusing a send in
-// a private one, costs no read beyond its rules.
+// rule does (see Access.CanSpeak). All are read together (see
+// Store.GetGroupRules), so a store that caches one caches the others with
+// it, and evaluating a creator-only group, or refusing a send in a private
+// one, costs no read beyond its rules. All are fixed at creation but a public
+// group's minimum balances, which an edit may change (see
+// RulesEditFromProto), so only a private group's may be cached.
 //
 // Everything beside Rules is metadata carried only so that evaluation is
 // efficient: it is what a rule is relative to, read with the rules rather
 // than looked up per evaluation. It is not part of what a client is shown
-// (Metadata.rules is Rules alone), and a field belongs here only if it is
-// fixed at creation like the rules, since it is cached with them forever.
+// (Metadata.rules is Rules alone), and a field belongs here only if it never
+// changes on a private group, whose read is cached forever with it.
 //
 // Every chat has one, DMs included: a DM's is built rather than read (see
 // RuleEvaluator.rulesFor, Chat.ChatRules), and carries no rules but the
@@ -193,11 +195,14 @@ func isCreator(creatorID, userID *commonpb.UserId) bool {
 // carry (see RulesFromProto for what one can).
 var ErrInvalidRules = errors.New("invalid chat rules")
 
-// CreationRules are the stored fields a new group's rules project onto (see
-// RulesFromProto), which Chat.Rules projects back from.
-type CreationRules struct {
+// StoredRules are the stored fields a group's rules project onto (see
+// RulesFromProto and RulesEditFromProto), which Chat.Rules projects back
+// from. IsCreatorOnlySpeaker is never set by RulesFromProto, which refuses
+// the rule (see Chat.IsCreatorOnlySpeaker).
+type StoredRules struct {
 	IsStaffOnly            bool
 	MinimumListenerBalance *MinimumBalance
+	IsCreatorOnlySpeaker   bool
 	// MinimumSpeakerBalance is nil when the group asks for none.
 	MinimumSpeakerBalance *MinimumBalance
 }
@@ -210,8 +215,9 @@ type CreationRules struct {
 // that a rule is never accepted and then silently dropped: listener rules of
 // a staff requirement and a minimum balance, and a single speaker rule of a
 // minimum balance (a creator-only group is made by writing its record, see
-// Chat.IsCreatorOnlySpeaker); each kind at most once, since the record holds
-// one of each; and a minimum balance, listener or speaker, of at least the
+// Chat.IsCreatorOnlySpeaker, and an edit names one only to keep it, see
+// RulesEditFromProto); each kind at most once, since the record holds one of
+// each; and a minimum balance, listener or speaker, of at least the
 // currency's minimum transfer value — one unit at its last decimal place, a
 // penny for USD, a yen for JPY, the smallest amount OCP lets anyone hold or
 // move in that currency (see send.MinimumTransferValue). A requirement below it
@@ -241,63 +247,145 @@ type CreationRules struct {
 // A pair that passes is one the speaker requirement covers (see
 // coversBalance), so every speak check in a group created this way values
 // the user's balance once.
-func RulesFromProto(rules *chatpb.Rules) (CreationRules, error) {
-	var out CreationRules
+func RulesFromProto(rules *chatpb.Rules) (StoredRules, error) {
+	return parseRules(rules, false)
+}
+
+// parseRules validates rules and projects them onto the stored fields, as
+// RulesFromProto describes. allowCreator admits a CreatorRequirement speaker
+// rule, which no new group may ask for (see RulesFromProto) but an edit must
+// name to keep (see RulesEditFromProto); without it, one is ErrInvalidRules
+// like any rule a group cannot carry.
+func parseRules(rules *chatpb.Rules, allowCreator bool) (StoredRules, error) {
+	var out StoredRules
 	for _, rule := range rules.GetListener() {
 		switch k := rule.GetKind().(type) {
 		case *chatpb.ListenerRules_Staff:
 			if out.IsStaffOnly {
-				return CreationRules{}, fmt.Errorf("%w: duplicate staff requirement", ErrInvalidRules)
+				return StoredRules{}, fmt.Errorf("%w: duplicate staff requirement", ErrInvalidRules)
 			}
 			out.IsStaffOnly = true
 		case *chatpb.ListenerRules_MinimumBalance:
 			if out.MinimumListenerBalance != nil {
-				return CreationRules{}, fmt.Errorf("%w: duplicate minimum listener balance requirement", ErrInvalidRules)
+				return StoredRules{}, fmt.Errorf("%w: duplicate minimum listener balance requirement", ErrInvalidRules)
 			}
 			minimum, err := minimumBalanceFromProto(k.MinimumBalance)
 			if err != nil {
-				return CreationRules{}, err
+				return StoredRules{}, err
 			}
 			out.MinimumListenerBalance = minimum
 		default:
-			return CreationRules{}, fmt.Errorf("%w: unsupported listener rule %T", ErrInvalidRules, k)
+			return StoredRules{}, fmt.Errorf("%w: unsupported listener rule %T", ErrInvalidRules, k)
 		}
 	}
 	for _, rule := range rules.GetSpeaker() {
 		switch k := rule.GetKind().(type) {
 		case *chatpb.SpeakerRules_MinimumBalance:
 			if out.MinimumSpeakerBalance != nil {
-				return CreationRules{}, fmt.Errorf("%w: duplicate minimum speaker balance requirement", ErrInvalidRules)
+				return StoredRules{}, fmt.Errorf("%w: duplicate minimum speaker balance requirement", ErrInvalidRules)
 			}
 			minimum, err := minimumBalanceFromProto(k.MinimumBalance)
 			if err != nil {
-				return CreationRules{}, err
+				return StoredRules{}, err
 			}
 			out.MinimumSpeakerBalance = minimum
+		case *chatpb.SpeakerRules_Creator:
+			if !allowCreator {
+				return StoredRules{}, fmt.Errorf("%w: unsupported speaker rule %T", ErrInvalidRules, k)
+			}
+			if out.IsCreatorOnlySpeaker {
+				return StoredRules{}, fmt.Errorf("%w: duplicate creator requirement", ErrInvalidRules)
+			}
+			out.IsCreatorOnlySpeaker = true
 		default:
-			return CreationRules{}, fmt.Errorf("%w: unsupported speaker rule %T", ErrInvalidRules, k)
+			return StoredRules{}, fmt.Errorf("%w: unsupported speaker rule %T", ErrInvalidRules, k)
 		}
 	}
 	if out.MinimumListenerBalance == nil {
-		return CreationRules{}, fmt.Errorf("%w: a minimum listener balance is required", ErrInvalidRules)
+		return StoredRules{}, fmt.Errorf("%w: a minimum listener balance is required", ErrInvalidRules)
 	}
 	if speaker, listener := out.MinimumSpeakerBalance, out.MinimumListenerBalance; speaker != nil {
 		switch {
 		case speaker.Currency != listener.Currency:
-			return CreationRules{}, fmt.Errorf("%w: minimum speaker balance must be in the listener balance's currency", ErrInvalidRules)
+			return StoredRules{}, fmt.Errorf("%w: minimum speaker balance must be in the listener balance's currency", ErrInvalidRules)
 		case !sameMints(speaker.Mints, listener.Mints):
-			return CreationRules{}, fmt.Errorf("%w: minimum speaker balance must be in the listener balance's mints", ErrInvalidRules)
+			return StoredRules{}, fmt.Errorf("%w: minimum speaker balance must be in the listener balance's mints", ErrInvalidRules)
 		case !exceedsByMinimumTransferValue(speaker.NativeAmount, listener.NativeAmount, currency_lib.Code(speaker.Currency)):
 			minimum := send.MinimumTransferValue(currency_lib.Code(speaker.Currency))
-			return CreationRules{}, fmt.Errorf("%w: minimum speaker balance must exceed the listener balance by at least %s %s", ErrInvalidRules, strconv.FormatFloat(minimum, 'f', -1, 64), strings.ToUpper(speaker.Currency))
+			return StoredRules{}, fmt.Errorf("%w: minimum speaker balance must exceed the listener balance by at least %s %s", ErrInvalidRules, strconv.FormatFloat(minimum, 'f', -1, 64), strings.ToUpper(speaker.Currency))
 		}
 	}
 	return out, nil
 }
 
+// RulesEditFromProto validates the rules an edit asks the group c to carry
+// (see Server.EditChat) against c's record, and returns the minimum balances
+// they set, or nil when they are the ones c already carries.
+//
+// The rules are the group's in full, as Metadata.rules shows them, not a
+// change, and what may change is narrow: the amount of the minimum listener
+// balance, and a minimum speaker balance added, removed or set to another
+// amount. Every other rule must be in the set exactly when c carries it, in
+// any order: the StaffRequirement of a staff-only group, and the
+// CreatorRequirement of a creator-only one (see Chat.IsCreatorOnlySpeaker),
+// which no new group may ask for but an edit must name to keep. The listener
+// balance must stay, in c's currency and mints, which never change: they are
+// what the group is gated on, and what its holdings are counted in (see
+// GatedMint). The speaker balance, if set, is held to RulesFromProto's rule
+// against the new listener balance, so it is in c's currency and mints too,
+// and every balance to the same floor as at creation.
+//
+// Anything else is ErrInvalidRules, as is a c that is not a public group
+// carrying a minimum listener balance: a private group is governed by no
+// rules, so it has none to edit (Server.EditChat refuses one before asking),
+// and a group created without a listener balance, which only an older or
+// operator-written record can be, has no currency to keep.
+//
+// Whether the editor satisfies the new rules is not checked here: that is an
+// evaluation (see RuleEvaluator.CanSpeakWithRules), and Server.EditChat makes
+// it.
+func RulesEditFromProto(c *Chat, rules *chatpb.Rules) (*GroupMinimumBalances, error) {
+	if c.Type != chatpb.ChatType_GROUP || c.IsPrivate || c.MinimumListenerBalance == nil {
+		return nil, fmt.Errorf("%w: only a public group with a minimum listener balance can have its rules edited", ErrInvalidRules)
+	}
+	parsed, err := parseRules(rules, true)
+	if err != nil {
+		return nil, err
+	}
+	switch listener := parsed.MinimumListenerBalance; {
+	case parsed.IsStaffOnly != c.IsStaffOnly:
+		return nil, fmt.Errorf("%w: the staff requirement cannot be added or removed", ErrInvalidRules)
+	case parsed.IsCreatorOnlySpeaker != c.IsCreatorOnlySpeaker:
+		return nil, fmt.Errorf("%w: the creator requirement cannot be added or removed", ErrInvalidRules)
+	case listener.Currency != c.MinimumListenerBalance.Currency:
+		return nil, fmt.Errorf("%w: the minimum listener balance's currency cannot change", ErrInvalidRules)
+	case !sameMints(listener.Mints, c.MinimumListenerBalance.Mints):
+		return nil, fmt.Errorf("%w: the minimum listener balance's mints cannot change", ErrInvalidRules)
+	}
+	if sameMinimumBalance(parsed.MinimumListenerBalance, c.MinimumListenerBalance) &&
+		sameMinimumBalance(parsed.MinimumSpeakerBalance, c.MinimumSpeakerBalance) {
+		return nil, nil
+	}
+	return &GroupMinimumBalances{
+		Listener: parsed.MinimumListenerBalance,
+		Speaker:  parsed.MinimumSpeakerBalance,
+	}, nil
+}
+
+// sameMinimumBalance reports whether a and b are the same requirement: both
+// nil, or the same currency, the same set of mints and exactly the same
+// amount, so an edit to an amount a hair away from the stored one is a
+// change, not a no-op.
+func sameMinimumBalance(a, b *MinimumBalance) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Currency == b.Currency && a.NativeAmount == b.NativeAmount && sameMints(a.Mints, b.Mints)
+}
+
 // minimumBalanceFromProto validates one minimum balance requirement a new
-// group asked for, listener or speaker, and copies it into a MinimumBalance
-// (see RulesFromProto for what is valid).
+// group or an edit asked for, listener or speaker, and copies it into a
+// MinimumBalance (see RulesFromProto for what is valid).
 func minimumBalanceFromProto(req *chatpb.MinimumBalanceRequirement) (*MinimumBalance, error) {
 	currency := currency_lib.Code(req.GetAmount().GetCurrency())
 	if currency == "" {
@@ -354,26 +442,33 @@ func exceedsByMinimumTransferValue(amount, base float64, code currency_lib.Code)
 // decided on membership and its key, by Access.
 //
 // Rules are read through Store.GetGroupRules — in production the caching
-// store, which holds every group's rules after its first read. A
+// store, which holds a private group's read forever and reads a public
+// group's every time (see chat/cache), so an edit of its minimum balances is
+// evaluated everywhere from the next read. A
 // StaffRequirement is answered by the account store's staff flag, a
 // MinimumBalanceRequirement by the balance client's valuation of the user's
 // holdings (see satisfiesMinimumBalance), and a CreatorRequirement by the
 // creator read and cached with the rules (see ChatRules), so it costs no
 // read of its own.
 //
-// Rules are evaluated against the current state of their subject, not the
-// state at join time: a member who no longer satisfies a listener rule (a
-// staff member whose flag was revoked, a holder whose balance dropped) keeps
+// Rules are evaluated against the current state of their subject and the
+// current rules, not the state at join time: a member who no longer satisfies
+// a listener rule (a staff member whose flag was revoked, a holder whose
+// balance dropped, or one whose group raised its minimum balance) keeps
 // their membership record but is denied on every path that evaluates the
 // rules until they satisfy it again. Not every path does: a member's read is
 // gated on membership alone, so that it never pays for an evaluation; rules
 // are evaluated on sends, and on a non-member's read of a group, each verdict
 // remembered for a short window when it admits (see Access).
-// The intended design is for membership itself to track the listener rules — a
-// member who stops satisfying one is removed — at which point the membership
-// record is the rules' answer everywhere. Enforcing rules on membership
-// changes, a join gated by listener rules included, is the job of whatever
-// path mutates membership.
+//
+// Membership does not track the rules, by decision: a member is admitted
+// once, by the rules as they stood at their join, and is grandfathered from
+// then on — nothing removes a member who stops satisfying a listener rule,
+// whatever changed, so they keep reading and stay a member, and lose only
+// speech until they satisfy it again. Leaving ends it: a rejoin is judged on
+// the rules as they stand. Enforcing rules on membership changes, a join
+// gated by listener rules included, is the job of whatever path mutates
+// membership.
 type RuleEvaluator struct {
 	accounts account.Store
 	balances *balance.Client

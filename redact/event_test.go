@@ -58,6 +58,16 @@ func chatUpdateFixture() *eventpb.ChatUpdate {
 			{Kind: &chatpb.MetadataUpdate_CoverPictureChanged_{CoverPictureChanged: &chatpb.MetadataUpdate_CoverPictureChanged{
 				NewCoverPicture: &blobpb.Media{Renditions: []*blobpb.Rendition{{Role: blobpb.Rendition_ORIGINAL, BlobId: &blobpb.BlobId{Value: bytes.Repeat([]byte{8}, 16)}}}},
 			}}},
+			{Kind: &chatpb.MetadataUpdate_RulesChanged_{RulesChanged: &chatpb.MetadataUpdate_RulesChanged{
+				NewRules: &chatpb.Rules{
+					Listener: []*chatpb.ListenerRules{{Kind: &chatpb.ListenerRules_MinimumBalance{MinimumBalance: &chatpb.MinimumBalanceRequirement{
+						Amount: &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: 5},
+					}}}},
+					Speaker: []*chatpb.SpeakerRules{{Kind: &chatpb.SpeakerRules_MinimumBalance{MinimumBalance: &chatpb.MinimumBalanceRequirement{
+						Amount: &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: 10},
+					}}}},
+				},
+			}}},
 		},
 		Events: &messagingpb.EventBatch{Events: []*messagingpb.Event{{
 			Sequence: 3,
@@ -125,15 +135,16 @@ func TestChatUpdate(t *testing.T) {
 	}
 
 	// A metadata refresh keeps its record with the last message redacted; a
-	// last-activity change, a viewer-state change, and a title, profile
-	// picture, description or cover picture change are as they were.
-	require.Len(t, out.MetadataUpdates, 7)
+	// last-activity change, a viewer-state change, a title, profile picture,
+	// description or cover picture change, and a rules change are as they
+	// were.
+	require.Len(t, out.MetadataUpdates, 8)
 	refreshed := out.MetadataUpdates[0].GetFullRefresh().GetMetadata()
 	assert.Equal(t, "Title", refreshed.Title)
 	expected, err := Message(chatID, in.MetadataUpdates[0].GetFullRefresh().GetMetadata().LastMessage)
 	require.NoError(t, err)
 	assert.True(t, proto.Equal(expected, refreshed.LastMessage))
-	for i := 1; i < 7; i++ {
+	for i := 1; i < 8; i++ {
 		assert.True(t, proto.Equal(in.MetadataUpdates[i], out.MetadataUpdates[i]), "metadata update %d", i)
 		assert.NotSame(t, in.MetadataUpdates[i], out.MetadataUpdates[i])
 	}

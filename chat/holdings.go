@@ -195,7 +195,8 @@ func HoldingsLess(a, b GroupHoldings) bool {
 }
 
 // HoldingsRefresh is a gated group on the refresh queue: its mint, as the
-// queue recorded it from the group's rules (which never change), when it is
+// queue recorded it from the group's rules (whose mints never change, though
+// an edit may change their amounts; see RulesEditFromProto), when it is
 // next due, and how many refreshes in a row have failed since the last that
 // succeeded.
 type HoldingsRefresh struct {

@@ -529,7 +529,8 @@ func (s *Server) GetPaymentRequest(ctx context.Context, req *paymentrequestpb.Ge
 // to another chat or section is InvalidArgument, a group that does not exist
 // is NOT_FOUND, and the caller must be able to read it in full (DENIED). The
 // group's existence is told apart by reading its rules (Store.GetGroupRules,
-// which a store caches) and then asking Access with them, since Access alone
+// which a store caches for the private groups requests live in) and then
+// asking Access with them, since Access alone
 // admits no one to a missing chat without saying so.
 //
 // The open section is by stored status, so it can hold a request past its

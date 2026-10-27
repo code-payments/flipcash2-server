@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -1173,4 +1174,339 @@ func (c *Chat) ruleSet(t *testing.T) RuleSet {
 	set, ok := c.ChatRules().RuleSet()
 	require.True(t, ok)
 	return set
+}
+
+// TestRulesEditFromProto pins what an edit may change of a public group's
+// rules: the minimum balances' amounts, and a speaker balance added or
+// removed, in the group's currency and mints; every other rule is named
+// exactly as the group carries it.
+func TestRulesEditFromProto(t *testing.T) {
+	mint := model.MustGenerateKeyPair().Proto()
+	other := model.MustGenerateKeyPair().Proto()
+	requirement := func(currency string, amount float64, mints ...*commonpb.PublicKey) *chatpb.MinimumBalanceRequirement {
+		return &chatpb.MinimumBalanceRequirement{
+			Amount: &commonpb.FiatPaymentAmount{Currency: currency, NativeAmount: amount},
+			Mints:  mints,
+		}
+	}
+	balance := func(currency string, amount float64, mints ...*commonpb.PublicKey) *MinimumBalance {
+		return &MinimumBalance{Currency: currency, NativeAmount: amount, Mints: mints}
+	}
+	listener := func(req *chatpb.MinimumBalanceRequirement) *chatpb.ListenerRules {
+		return &chatpb.ListenerRules{Kind: &chatpb.ListenerRules_MinimumBalance{MinimumBalance: req}}
+	}
+	speaker := func(req *chatpb.MinimumBalanceRequirement) *chatpb.SpeakerRules {
+		return &chatpb.SpeakerRules{Kind: &chatpb.SpeakerRules_MinimumBalance{MinimumBalance: req}}
+	}
+	staff := &chatpb.ListenerRules{Kind: &chatpb.ListenerRules_Staff{Staff: &chatpb.StaffRequirement{}}}
+	creator := &chatpb.SpeakerRules{Kind: &chatpb.SpeakerRules_Creator{Creator: &chatpb.CreatorRequirement{}}}
+
+	// group is a public group gated on 10 USD in mint, with a 20 USD speaker
+	// balance, and whatever else edit says.
+	group := func(edit func(c *Chat)) *Chat {
+		c := &Chat{
+			ID:                     &commonpb.ChatId{Value: make([]byte, 16)},
+			Type:                   chatpb.ChatType_GROUP,
+			MinimumListenerBalance: balance("usd", 10, mint),
+			MinimumSpeakerBalance:  balance("usd", 20, mint),
+		}
+		if edit != nil {
+			edit(c)
+		}
+		return c
+	}
+	withoutSpeaker := func(c *Chat) { c.MinimumSpeakerBalance = nil }
+	staffOnly := func(c *Chat) { c.IsStaffOnly = true }
+	creatorOnly := func(c *Chat) { c.IsCreatorOnlySpeaker = true }
+
+	for name, tc := range map[string]struct {
+		group *Chat
+		rules *chatpb.Rules
+		want  *GroupMinimumBalances
+	}{
+		"raise the listener balance": {
+			group: group(nil),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 15, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 20, mint))},
+			},
+			want: &GroupMinimumBalances{Listener: balance("usd", 15, mint), Speaker: balance("usd", 20, mint)},
+		},
+		"lower the listener balance": {
+			group: group(withoutSpeaker),
+			rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{listener(requirement("usd", 0.01, mint))}},
+			want:  &GroupMinimumBalances{Listener: balance("usd", 0.01, mint)},
+		},
+		"add a speaker balance": {
+			group: group(withoutSpeaker),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 10.01, mint))},
+			},
+			want: &GroupMinimumBalances{Listener: balance("usd", 10, mint), Speaker: balance("usd", 10.01, mint)},
+		},
+		"remove the speaker balance": {
+			group: group(nil),
+			rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))}},
+			want:  &GroupMinimumBalances{Listener: balance("usd", 10, mint)},
+		},
+		"change the speaker balance": {
+			group: group(nil),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 50, mint))},
+			},
+			want: &GroupMinimumBalances{Listener: balance("usd", 10, mint), Speaker: balance("usd", 50, mint)},
+		},
+		"any mint": {
+			group: group(func(c *Chat) {
+				c.MinimumListenerBalance = balance("jpy", 1000)
+				c.MinimumSpeakerBalance = nil
+			}),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("jpy", 2000))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("jpy", 2001))},
+			},
+			want: &GroupMinimumBalances{Listener: balance("jpy", 2000), Speaker: balance("jpy", 2001)},
+		},
+		"staff kept, in any order": {
+			group: group(staffOnly),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 15, mint)), staff},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 20, mint))},
+			},
+			want: &GroupMinimumBalances{Listener: balance("usd", 15, mint), Speaker: balance("usd", 20, mint)},
+		},
+		"creator kept, in any order": {
+			group: group(creatorOnly),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 30, mint)), creator},
+			},
+			want: &GroupMinimumBalances{Listener: balance("usd", 10, mint), Speaker: balance("usd", 30, mint)},
+		},
+		"unchanged": {
+			group: group(nil),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 20, mint))},
+			},
+		},
+		"unchanged, with every rule": {
+			group: group(func(c *Chat) { staffOnly(c); creatorOnly(c) }),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{staff, listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{creator, speaker(requirement("usd", 20, mint))},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := RulesEditFromProto(tc.group, tc.rules)
+			require.NoError(t, err)
+			if tc.want == nil {
+				require.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			require.NoError(t, protoutil.ProtoEqualError(tc.want.Listener.ToProto(), got.Listener.ToProto()))
+			if tc.want.Speaker == nil {
+				require.Nil(t, got.Speaker)
+			} else {
+				require.NotNil(t, got.Speaker)
+				require.NoError(t, protoutil.ProtoEqualError(tc.want.Speaker.ToProto(), got.Speaker.ToProto()))
+			}
+
+			// What is stored shows back exactly as asked, in the order Rules
+			// lists rules.
+			edited := tc.group.Clone()
+			edited.MinimumListenerBalance = got.Listener
+			edited.MinimumSpeakerBalance = got.Speaker
+			require.True(t, sameRules(tc.rules, edited.Rules()))
+		})
+	}
+
+	for name, tc := range map[string]struct {
+		group *Chat
+		rules *chatpb.Rules
+	}{
+		"staff added": {
+			group: group(nil),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{staff, listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 20, mint))},
+			},
+		},
+		"staff dropped": {
+			group: group(staffOnly),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 15, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 20, mint))},
+			},
+		},
+		"creator added": {
+			group: group(nil),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{creator, speaker(requirement("usd", 20, mint))},
+			},
+		},
+		"creator dropped": {
+			group: group(creatorOnly),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 20, mint))},
+			},
+		},
+		"duplicate creator": {
+			group: group(creatorOnly),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{creator, creator},
+			},
+		},
+		"duplicate staff": {
+			group: group(staffOnly),
+			rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{staff, staff, listener(requirement("usd", 10, mint))}},
+		},
+		"other currency": {
+			group: group(withoutSpeaker),
+			rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{listener(requirement("eur", 10, mint))}},
+		},
+		"other mint": {
+			group: group(withoutSpeaker),
+			rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, other))}},
+		},
+		"mint dropped": {
+			group: group(withoutSpeaker),
+			rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10))}},
+		},
+		"mint added": {
+			group: group(func(c *Chat) {
+				c.MinimumListenerBalance = balance("usd", 10)
+				c.MinimumSpeakerBalance = nil
+			}),
+			rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))}},
+		},
+		"speaker in another currency": {
+			group: group(nil),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("eur", 20, mint))},
+			},
+		},
+		"speaker in another mint": {
+			group: group(nil),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 20, other))},
+			},
+		},
+		"speaker not above the listener": {
+			group: group(nil),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 20, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 20.009, mint))},
+			},
+		},
+		"listener balance dropped": {
+			group: group(staffOnly),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{staff},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 20, mint))},
+			},
+		},
+		"no rules": {
+			group: group(withoutSpeaker),
+			rules: &chatpb.Rules{},
+		},
+		"below the floor": {
+			group: group(withoutSpeaker),
+			rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{listener(requirement("usd", 0.009, mint))}},
+		},
+		"not a number": {
+			group: group(withoutSpeaker),
+			rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{listener(requirement("usd", math.NaN(), mint))}},
+		},
+		"never": {
+			group: group(nil),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{{Kind: &chatpb.SpeakerRules_Never{Never: &chatpb.Never{}}}},
+			},
+		},
+		"speaker staff": {
+			group: group(nil),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{{Kind: &chatpb.SpeakerRules_Staff{Staff: &chatpb.StaffRequirement{}}}},
+			},
+		},
+		"group without a listener balance": {
+			group: group(func(c *Chat) {
+				c.MinimumListenerBalance = nil
+				c.MinimumSpeakerBalance = nil
+			}),
+			rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))}},
+		},
+		"private group": {
+			group: group(func(c *Chat) { c.IsPrivate = true }),
+			rules: &chatpb.Rules{
+				Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+				Speaker:  []*chatpb.SpeakerRules{speaker(requirement("usd", 20, mint))},
+			},
+		},
+		"dm": {
+			group: &Chat{ID: &commonpb.ChatId{Value: make([]byte, 32)}, Type: chatpb.ChatType_DM},
+			rules: &chatpb.Rules{Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := RulesEditFromProto(tc.group, tc.rules)
+			require.ErrorIs(t, err, ErrInvalidRules)
+		})
+	}
+
+	// A new group still cannot ask for a creator requirement: only an edit
+	// keeping one may name it.
+	_, err := RulesFromProto(&chatpb.Rules{
+		Listener: []*chatpb.ListenerRules{listener(requirement("usd", 10, mint))},
+		Speaker:  []*chatpb.SpeakerRules{creator},
+	})
+	require.ErrorIs(t, err, ErrInvalidRules)
+}
+
+// sameRules reports whether a and b hold the same rules of each class, in any
+// order.
+func sameRules(a, b *chatpb.Rules) bool {
+	sameAsSet := func(x, y []proto.Message) bool {
+		if len(x) != len(y) {
+			return false
+		}
+		used := make([]bool, len(y))
+	outer:
+		for _, m := range x {
+			for i, n := range y {
+				if !used[i] && proto.Equal(m, n) {
+					used[i] = true
+					continue outer
+				}
+			}
+			return false
+		}
+		return true
+	}
+	var al, bl, as, bs []proto.Message
+	for _, r := range a.GetListener() {
+		al = append(al, r)
+	}
+	for _, r := range b.GetListener() {
+		bl = append(bl, r)
+	}
+	for _, r := range a.GetSpeaker() {
+		as = append(as, r)
+	}
+	for _, r := range b.GetSpeaker() {
+		bs = append(bs, r)
+	}
+	return sameAsSet(al, bl) && sameAsSet(as, bs)
 }

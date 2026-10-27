@@ -47,6 +47,7 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_GroupChat_Creator,
 		testStore_GroupChat_Picture,
 		testStore_GroupChat_Edit,
+		testStore_GroupChat_EditMinimumBalances,
 		testStore_GroupChat_DescriptionAndCover,
 		testStore_GroupChat_Membership,
 		testStore_GroupChat_MembersPage,
@@ -1144,6 +1145,159 @@ func testStore_GroupChat_Edit(t *testing.T, s chat.Store) {
 	require.NoError(t, err)
 	require.Empty(t, got.Title)
 	require.Nil(t, got.ProfilePictureBlobID)
+}
+
+func testStore_GroupChat_EditMinimumBalances(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	creator := model.MustGenerateUserID()
+	mint := &commonpb.PublicKey{Value: randomBytes(32)}
+	picture := &blobpb.BlobId{Value: []byte("picture-blob-0001")}
+	group := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{creator},
+		Title:                  "Gated",
+		IsStaffOnly:            true,
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: 10, Mints: []*commonpb.PublicKey{mint}},
+		IsCreatorOnlySpeaker:   true,
+		MinimumSpeakerBalance:  &chat.MinimumBalance{Currency: "usd", NativeAmount: 20, Mints: []*commonpb.PublicKey{mint}},
+		CreatorID:              creator,
+		Description:            "Described",
+		ProfilePictureBlobID:   picture,
+		LastActivity:           at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, group))
+
+	// requireBalances checks the record and the rules read both carry
+	// listener and speaker (nil for none), and that nothing else of the
+	// record moved.
+	requireBalances := func(listener, speaker *chat.MinimumBalance, title string) {
+		t.Helper()
+		got, err := s.GetChatByID(ctx, group.ID)
+		require.NoError(t, err)
+		require.True(t, proto.Equal(listener.ToProto(), got.MinimumListenerBalance.ToProto()))
+		if speaker == nil {
+			require.Nil(t, got.MinimumSpeakerBalance)
+		} else {
+			require.NotNil(t, got.MinimumSpeakerBalance)
+			require.True(t, proto.Equal(speaker.ToProto(), got.MinimumSpeakerBalance.ToProto()))
+		}
+		require.True(t, got.IsStaffOnly)
+		require.True(t, got.IsCreatorOnlySpeaker)
+		require.Equal(t, creator.Value, got.CreatorID.GetValue())
+		require.Equal(t, title, got.Title)
+		require.Equal(t, "Described", got.Description)
+		require.Equal(t, picture.Value, got.ProfilePictureBlobID.GetValue())
+		require.True(t, got.LastActivity.Equal(at(100)))
+
+		rules, err := s.GetGroupRules(ctx, group.ID)
+		require.NoError(t, err)
+		require.True(t, proto.Equal(got.Rules(), rules.Rules))
+		require.Equal(t, creator.Value, rules.CreatorID.GetValue())
+		require.False(t, rules.IsPrivate)
+	}
+
+	// Both amounts at once.
+	listener := &chat.MinimumBalance{Currency: "usd", NativeAmount: 15, Mints: []*commonpb.PublicKey{mint}}
+	speaker := &chat.MinimumBalance{Currency: "usd", NativeAmount: 0.1 + 0.2 + 30, Mints: []*commonpb.PublicKey{mint}}
+	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{
+		MinimumBalances: &chat.GroupMinimumBalances{Listener: listener, Speaker: speaker},
+	}))
+	requireBalances(listener, speaker, "Gated")
+
+	// No speaker balance removes the group's, leaving the creator rule.
+	lowered := &chat.MinimumBalance{Currency: "usd", NativeAmount: 0.01, Mints: []*commonpb.PublicKey{mint}}
+	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{
+		MinimumBalances: &chat.GroupMinimumBalances{Listener: lowered},
+	}))
+	requireBalances(lowered, nil, "Gated")
+	rules, err := s.GetGroupRules(ctx, group.ID)
+	require.NoError(t, err)
+	require.Len(t, rules.Rules.GetSpeaker(), 1)
+	require.NotNil(t, rules.Rules.GetSpeaker()[0].GetCreator())
+
+	// Removing it again is harmless.
+	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{
+		MinimumBalances: &chat.GroupMinimumBalances{Listener: lowered},
+	}))
+	requireBalances(lowered, nil, "Gated")
+
+	// Adding one back, beside another field, in one write.
+	title := "Regated"
+	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{
+		Title:           &title,
+		MinimumBalances: &chat.GroupMinimumBalances{Listener: listener, Speaker: speaker},
+	}))
+	requireBalances(listener, speaker, "Regated")
+
+	// An edit of another field leaves the balances as they are.
+	description := "Described"
+	require.NoError(t, s.EditGroup(ctx, group.ID, chat.GroupEdit{Description: &description}))
+	requireBalances(listener, speaker, "Regated")
+
+	// A requirement on any mint reads back with none.
+	anyMint := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{creator},
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "jpy", NativeAmount: 100},
+		CreatorID:              creator,
+		LastActivity:           at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, anyMint))
+	require.NoError(t, s.EditGroup(ctx, anyMint.ID, chat.GroupEdit{
+		MinimumBalances: &chat.GroupMinimumBalances{
+			Listener: &chat.MinimumBalance{Currency: "jpy", NativeAmount: 200},
+			Speaker:  &chat.MinimumBalance{Currency: "jpy", NativeAmount: 201},
+		},
+	}))
+	got, err := s.GetChatByID(ctx, anyMint.ID)
+	require.NoError(t, err)
+	require.Equal(t, float64(200), got.MinimumListenerBalance.NativeAmount)
+	require.Empty(t, got.MinimumListenerBalance.Mints)
+	require.Equal(t, float64(201), got.MinimumSpeakerBalance.NativeAmount)
+	require.Empty(t, got.MinimumSpeakerBalance.Mints)
+
+	balances := &chat.GroupMinimumBalances{Listener: &chat.MinimumBalance{Currency: "usd", NativeAmount: 1}}
+
+	// A group that cannot carry them is refused, as something other than
+	// missing, and left as it was, whatever else the edit names: one with no
+	// listener balance, and a private one, even with one on its record.
+	plain := putGroupChat(t, s, "Plain", at(100), creator)
+	err = s.EditGroup(ctx, plain.ID, chat.GroupEdit{Title: &title, MinimumBalances: balances})
+	require.Error(t, err)
+	require.NotErrorIs(t, err, chat.ErrChatNotFound)
+	got, err = s.GetChatByID(ctx, plain.ID)
+	require.NoError(t, err)
+	require.Equal(t, "Plain", got.Title)
+	require.Nil(t, got.MinimumListenerBalance)
+	require.Nil(t, got.MinimumSpeakerBalance)
+
+	private := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{creator},
+		Title:                  "Private",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: 5},
+		IsPrivate:              true,
+		CreatorID:              creator,
+		LastActivity:           at(100),
+	}
+	require.NoError(t, s.PutChat(ctx, private))
+	err = s.EditGroup(ctx, private.ID, chat.GroupEdit{Title: &title, MinimumBalances: balances})
+	require.Error(t, err)
+	require.NotErrorIs(t, err, chat.ErrChatNotFound)
+	got, err = s.GetChatByID(ctx, private.ID)
+	require.NoError(t, err)
+	require.Equal(t, "Private", got.Title)
+	require.Equal(t, float64(5), got.MinimumListenerBalance.NativeAmount)
+
+	// A group that does not exist is missing, and no phantom is left behind.
+	unknown := chat.MustGenerateGroupChatID()
+	require.ErrorIs(t, s.EditGroup(ctx, unknown, chat.GroupEdit{MinimumBalances: balances}), chat.ErrChatNotFound)
+	_, err = s.GetChatByID(ctx, unknown)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
 }
 
 func testStore_GroupChat_Membership(t *testing.T, s chat.Store) {

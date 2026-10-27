@@ -258,12 +258,19 @@ type Store interface {
 
 	// EditGroup applies edit to a group chat's canonical record (see
 	// GroupEdit): each field the edit names is set (an empty description
-	// clears it), and every other field is left as it is, in one write. Like
+	// clears it, and minimum balances with no speaker balance remove the
+	// group's), and every other field is left as it is, in one write. Like
 	// SetGroupPicture it touches only the canonical record and validates
-	// nothing — the title and description are validated and moderated, and the
-	// pictures attached, before this is called (see Server.EditChat). It returns
-	// ErrChatNotFound if the chat does not exist, and an error if chatID is
-	// not a group chat ID or the edit names nothing.
+	// nothing — the title and description are validated and moderated, the
+	// pictures attached, and the minimum balances validated against the
+	// record (see RulesEditFromProto), before this is called (see
+	// Server.EditChat). It returns ErrChatNotFound if the chat does not exist,
+	// and an error if chatID is not a group chat ID, the edit names nothing,
+	// or it names minimum balances for a group that cannot carry them: a
+	// private group, or one with no minimum listener balance. Neither can
+	// become editable after a validation that passed, since privacy is fixed
+	// at creation and no write removes a listener balance, so the last is a
+	// backstop, not a race to handle.
 	EditGroup(ctx context.Context, chatID *commonpb.ChatId, edit GroupEdit) error
 
 	// GetChatByID returns the canonical record for the chat with the given ID,
@@ -401,9 +408,11 @@ type Store interface {
 	// GetGroupRules returns a group chat's participation rules, its recorded
 	// creator and whether it is private (see ChatRules), with a nil Rules
 	// when it has none. It reads only what they are projected from, never the
-	// full canonical record — and all are fixed at creation, so an
-	// implementation is free to cache them indefinitely. It returns ErrChatNotFound if the chat does not exist,
-	// and an error if chatID is not a group chat ID.
+	// full canonical record. All are fixed at creation but a public group's
+	// minimum balances, which EditGroup may change, so an implementation may
+	// cache a private group's alone (see chat/cache). It returns
+	// ErrChatNotFound if the chat does not exist, and an error if chatID is
+	// not a group chat ID.
 	GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (ChatRules, error)
 
 	// IsMember reports whether userID is a member of chatID. It returns false

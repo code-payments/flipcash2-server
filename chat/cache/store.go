@@ -15,8 +15,10 @@ import (
 )
 
 // Cache wraps a chat.Store, caching what is fixed at a chat's creation and so
-// can never go stale: DM membership checks, a DM's member list, and a group's
-// participation rules with its creator. A DM's membership never changes, so a confirmed DM
+// can never go stale: DM membership checks, a DM's member list, and a private
+// group's rules read (its creator and privacy; see GetGroupRules). A public
+// group's rules are not held, since an edit may change them. A DM's
+// membership never changes, so a confirmed DM
 // member, and the DM's member pair, are safe to cache. Group membership is
 // mutable — and can be mutated by other processes, which this cache can never
 // observe — so group membership checks and member lists always defer to the
@@ -145,16 +147,16 @@ func (c *Cache) GetGroupRosterSummaries(ctx context.Context, chatIDs []*commonpb
 	return c.db.GetGroupRosterSummaries(ctx, chatIDs)
 }
 
-// GetGroupRules is cached, including the absence of rules (a nil Rules), so a
-// group without any is read once too. Rules, the creator and whether the
-// group is private are fixed at creation (see chat.Store), so a cached entry
-// is never stale: if any ever becomes mutable, this needs invalidation on
-// write. That holds only while all are written with the group: a creator
-// backfilled onto a legacy group, or IsCreatorOnlySpeaker,
-// MinimumSpeakerBalance or IsPrivate set on a group that already exists,
-// reaches a process that has read the group only when it restarts. A cached
-// entry is shared by every caller and must be treated as read-only. Errors — including
-// ErrChatNotFound, since the group may be created later — are not cached.
+// GetGroupRules is cached for a private group, forever, and never for a
+// public one. A private group's read is its creator and its privacy, with no
+// rules (see chat.RuleSet), all fixed at creation, so a cached entry is never
+// stale. A public group's minimum balances may be changed by an edit (see
+// chat.GroupEdit) made by any process, which this cache could never observe,
+// so its read always reaches the store: every edit is evaluated everywhere
+// from the next read, and Access's admission windows are the only staleness
+// left (see chat.Access). A cached entry is shared by every caller and must
+// be treated as read-only. Errors — including ErrChatNotFound, since the
+// group may be created later — are not cached.
 func (c *Cache) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (chat.ChatRules, error) {
 	key := string(chatID.Value)
 	if cached, ok := c.rulesCache.Get(key); ok {
@@ -165,7 +167,9 @@ func (c *Cache) GetGroupRules(ctx context.Context, chatID *commonpb.ChatId) (cha
 	if err != nil {
 		return chat.ChatRules{}, err
 	}
-	c.rulesCache.Set(key, rules)
+	if rules.IsPrivate {
+		c.rulesCache.Set(key, rules)
+	}
 	return rules, nil
 }
 

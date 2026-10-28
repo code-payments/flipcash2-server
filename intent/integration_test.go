@@ -1722,7 +1722,7 @@ func TestIntegration_AllowCreation_RequestedPayment(t *testing.T) {
 			},
 		} {
 			r := newRequest()
-			_, changed, err := e.requests.PayShare(e.ctx, r.ID, payerUserID, how(r), time.Now())
+			_, changed, _, err := e.requests.PayShare(e.ctx, r.ID, payerUserID, how(r), time.Now())
 			require.NoError(t, err)
 			require.True(t, changed)
 			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay(groupID, r, payerKeys, creatorKeys, "usd", 1.0), nil, nil), "share is already paid")
@@ -1746,7 +1746,7 @@ func TestIntegration_AllowCreation_RequestedPayment(t *testing.T) {
 		// Every share paid: the payer's own is paid, so the payment fails on
 		// the request's status first.
 		completed := e.putRequest(t, groupID, creatorUserID, "usd", endsAt, requestShare{payerUserID, 1.0})
-		completedNow, changed, err := e.requests.PayShare(e.ctx, completed.ID, payerUserID, &paymentrequestpb.PaidShare{
+		completedNow, changed, _, err := e.requests.PayShare(e.ctx, completed.ID, payerUserID, &paymentrequestpb.PaidShare{
 			PaidAt: timestamppb.Now(),
 			How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
 		}, time.Now())

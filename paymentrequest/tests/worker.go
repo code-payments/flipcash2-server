@@ -46,7 +46,7 @@ func testWorker_ExpiresDueRequest(t *testing.T, s paymentrequest.Store) {
 	chatID := chat.MustGenerateGroupChatID()
 	r, debtors := newRequest(chatID, dueEndsAt(), 2)
 	require.NoError(t, s.Create(ctx, r))
-	_, _, err := s.PayShare(ctx, r.ID, debtors[0], intentPaid(r, debtors[0], now), now)
+	_, _, _, err := s.PayShare(ctx, r.ID, debtors[0], intentPaid(r, debtors[0], now), now)
 	require.NoError(t, err)
 
 	before, err := s.Get(ctx, r.ID)
@@ -92,7 +92,7 @@ func testWorker_LeavesFinalRequests(t *testing.T, s paymentrequest.Store) {
 
 	completed, debtors := newRequest(chatID, dueEndsAt(), 1)
 	require.NoError(t, s.Create(ctx, completed))
-	_, changed, err := s.PayShare(ctx, completed.ID, debtors[0], intentPaid(completed, debtors[0], now), now)
+	_, changed, _, err := s.PayShare(ctx, completed.ID, debtors[0], intentPaid(completed, debtors[0], now), now)
 	require.NoError(t, err)
 	require.True(t, changed)
 
@@ -212,7 +212,7 @@ func testWorker_PaymentRacesExpiry(t *testing.T, s paymentrequest.Store) {
 	// The hook runs on the worker's goroutine, so it asserts rather than
 	// requires.
 	hooked := &hookStore{Store: s, beforeExpire: func() {
-		_, changed, err := s.PayShare(ctx, paidFirst.ID, debtors[0], intentPaid(paidFirst, debtors[0], paidAt), paidAt)
+		_, changed, _, err := s.PayShare(ctx, paidFirst.ID, debtors[0], intentPaid(paidFirst, debtors[0], paidAt), paidAt)
 		assert.NoError(t, err)
 		assert.True(t, changed)
 	}}
@@ -234,7 +234,7 @@ func testWorker_PaymentRacesExpiry(t *testing.T, s paymentrequest.Store) {
 	processed, err = newTestWorker(t, s).Process(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 1, processed)
-	_, changed, err := s.PayShare(ctx, expiredFirst.ID, debtors[0], intentPaid(expiredFirst, debtors[0], time.Now()), time.Now())
+	_, changed, _, err := s.PayShare(ctx, expiredFirst.ID, debtors[0], intentPaid(expiredFirst, debtors[0], time.Now()), time.Now())
 	require.NoError(t, err)
 	require.True(t, changed)
 
@@ -262,7 +262,7 @@ func testWorker_PaymentRacesExpiry(t *testing.T, s paymentrequest.Store) {
 	})
 	for i, r := range raced {
 		wg.Go(func() {
-			_, changed, err := s.PayShare(ctx, r.ID, racedDebtors[i].UserId, intentPaid(r, racedDebtors[i].UserId, time.Now()), time.Now())
+			_, changed, _, err := s.PayShare(ctx, r.ID, racedDebtors[i].UserId, intentPaid(r, racedDebtors[i].UserId, time.Now()), time.Now())
 			assert.NoError(t, err)
 			assert.True(t, changed)
 		})

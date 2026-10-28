@@ -20,6 +20,7 @@ import (
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/intent"
 	"github.com/code-payments/flipcash2-server/messaging"
+	"github.com/code-payments/flipcash2-server/paymentrequest"
 	ocp_intent "github.com/code-payments/ocp-server/ocp/data/intent"
 	ocp_task "github.com/code-payments/ocp-server/ocp/data/task"
 )
@@ -206,6 +207,13 @@ func (e *Executor) recordReactionBoost(ctx context.Context, record *ocp_task.Rec
 // still sent: the money moved either way, and the message records that it
 // did.
 //
+// A mark that changed the share is announced on the group's topic
+// (paymentrequest.PublishSharePaid) before the message is sent; a no-op is
+// not, since a change is announced at the version it produced and a repeat
+// does not know which version that was. A mark whose run stopped before
+// announcing it is therefore never announced, and clients reconcile it from
+// the cash message, which is durable and names the request.
+//
 // The share is marked before the message is sent, so a failure between the
 // two is retried as a no-op mark and then the one message; the reverse order
 // could post a message for a share never marked. Idempotency under
@@ -246,16 +254,21 @@ func (e *Executor) recordRequestedPayment(ctx context.Context, record *ocp_task.
 	// request's closed_at) later, past an ends_at the payment was validated
 	// before.
 	requestID := requested.GetPaymentRequestId()
-	if _, _, err := e.requests.PayShare(ctx, requestID, payment.senderUserID, &paymentrequestpb.PaidShare{
+	now := time.Now()
+	r, changed, completed, err := e.requests.PayShare(ctx, requestID, payment.senderUserID, &paymentrequestpb.PaidShare{
 		PaidAt: timestamppb.New(payment.intentRecord.CreatedAt),
 		How: &paymentrequestpb.PaidShare_Intent{
 			Intent: &commonpb.IntentId{Value: payment.rawIntentID},
 		},
-	}, time.Now()); err != nil {
+	}, now)
+	if err != nil {
 		// paymentrequest.ErrNotFound, ErrNotAShare and ErrWrongIntent
 		// included: a validated payment never produces them, so they are
 		// surfaced, not dropped.
 		return fmt.Errorf("failed to mark share paid: %w", err)
+	}
+	if changed {
+		paymentrequest.PublishSharePaid(e.chatEventBus, r, payment.senderUserID, completed, now)
 	}
 
 	payment.paymentRequestID = requestID

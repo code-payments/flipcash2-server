@@ -24,11 +24,15 @@ import (
 // metadata refresh, and the last_message of the metadata a MemberJoined hands
 // its recipient. Pointer, typing, reaction and roster overlays pass through
 // as they are — they describe the conversation's movement, which a redacted
-// view shows, not its words. Like Message, the copy is built field by field
-// so that every field carried is an allowlist decision: a field added to
-// ChatUpdate later, or a new kind of mutation, metadata update or roster
-// update, is refused with an error until one is made for it, rather than
-// passed through to a viewer who may not read it.
+// view shows, not its words. Payment request updates are left out: a viewer
+// who may only preview a chat sees a request's widget but not the request
+// (see paymentrequest/event.go), so an update carrying nothing else
+// redacts to a bare one. Like Message, the copy is built field by field so
+// that every field carried is an allowlist decision: a field added to
+// ChatUpdate later is left out of the copy, and a new kind of mutation,
+// metadata update or roster update is refused with an error, until a
+// decision is made for it, rather than passed through to a viewer who may
+// not read it.
 //
 // The chat ID seeds every placeholder (see Message), so a message redacted on
 // the stream renders exactly as the same message redacted by GetMessages or

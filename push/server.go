@@ -17,15 +17,17 @@ type Server struct {
 	log    *zap.Logger
 	authz  auth.Authorizer
 	tokens TokenStore
+	pusher Pusher
 
 	pushpb.UnimplementedPushServer
 }
 
-func NewServer(log *zap.Logger, authz auth.Authorizer, tokens TokenStore) *Server {
+func NewServer(log *zap.Logger, authz auth.Authorizer, tokens TokenStore, pusher Pusher) *Server {
 	return &Server{
 		log:    log,
 		authz:  authz,
 		tokens: tokens,
+		pusher: pusher,
 	}
 }
 
@@ -71,4 +73,20 @@ func (s *Server) DeleteTokens(ctx context.Context, req *pushpb.DeleteTokensReque
 	}
 
 	return &pushpb.DeleteTokensResponse{}, nil
+}
+
+// SendTestPush sends the test notification to the caller's own devices. Any
+// authenticated user may call it; it reaches no one else.
+func (s *Server) SendTestPush(ctx context.Context, req *pushpb.SendTestPushRequest) (*pushpb.SendTestPushResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = SendTestPush(ctx, s.pusher, userID); err != nil {
+		s.log.Warn("Failed to send test push", zap.String("user_id", model.UserIDString(userID)), zap.Error(err))
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	return &pushpb.SendTestPushResponse{}, nil
 }

@@ -78,10 +78,8 @@ github.com/cockroachdb/cockroach-go/v2 v2.2.0 h1:/5znzg5n373N/3ESjHF5SMLxiW4RKB0
 github.com/cockroachdb/cockroach-go/v2 v2.2.0/go.mod h1:u3MiKYGupPPjkn3ozknpMUpxPaNLTFWAya419/zv6eI=
 github.com/code-payments/code-vm-indexer v1.2.0 h1:rSHpBMiT9BKgmKcXg/VIoi/h0t7jNxGx07Qz59m+6Q0=
 github.com/code-payments/code-vm-indexer v1.2.0/go.mod h1:vn91YN2qNqb+gGJeZe2+l+TNxVmEEiRHXXnIn2Y40h8=
-github.com/code-payments/flipcash2-protobuf-api v1.30.1-0.20261026192314-b655df1770f1 h1:rFKHMwujz7xkEhiMbdw9vmGzVxsZefz5YGHlljzbfns=
-github.com/code-payments/flipcash2-protobuf-api v1.30.1-0.20261026192314-b655df1770f1/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
-github.com/code-payments/flipcash2-protobuf-api v1.31.1-0.20261027220701-28b039661c35 h1:Z5Ryi0Bhg+0jRV0VCWi9xBPOi8m232hjHkrU3G3vsAc=
-github.com/code-payments/flipcash2-protobuf-api v1.31.1-0.20261027220701-28b039661c35/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
+github.com/code-payments/flipcash2-protobuf-api v1.31.1-0.20261028161846-14f05bb0521e h1:1fM6uhPIfj57ss2BGoCVf1cARx9y0spvaPw4TtnO+rw=
+github.com/code-payments/flipcash2-protobuf-api v1.31.1-0.20261028161846-14f05bb0521e/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
 github.com/code-payments/ocp-protobuf-api v1.17.1-0.20261016120110-6f70c0d8e832 h1:HFY6mGBaZm8C3tJDK2PvaVQjfUS91NFDDWQSzla80hA=
 github.com/code-payments/ocp-protobuf-api v1.17.1-0.20261016120110-6f70c0d8e832/go.mod h1:tw6BooY5a8l6CtSZnKOruyKII0W04n89pcM4BizrgG8=
 github.com/code-payments/ocp-server v1.27.1-0.20261016133142-d1b9b228d45d h1:tliC1IE+4TYInxfv3zzd+iGLRq7QQkFaeebIZTdP/os=
@@ -322,8 +320,6 @@ github.com/smartystreets/assertions v1.13.1 h1:Ef7KhSmjZcK6AVf9YbJdvPYG9avaF0Zxu
 github.com/smartystreets/assertions v1.13.1/go.mod h1:cXr/IwVfSo/RbCSPhoAPv73p3hlSdrBH/b3SdnW/LMY=
 github.com/smartystreets/goconvey v1.8.0 h1:Oi49ha/2MURE0WexF052Z0m+BNSGirfjg5RL+JXWq3w=
 github.com/smartystreets/goconvey v1.8.0/go.mod h1:EdX8jtrTIj26jmjCOVNMVSIYAtgexqXKHOXW2Dx9JLg=
-github.com/steebchen/prisma-client-go v0.47.0 h1:mKelgkcGPcIardjTP5diGq6hvnueQc/DYEyQ+6uZ0/E=
-github.com/steebchen/prisma-client-go v0.47.0/go.mod h1:i1B0PEaE+BUcBUiwvd9drWpyMG/zNYMRrD5MancMf2I=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/objx v0.1.1/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/objx v0.2.0/go.mod h1:qt09Ya8vawLte6SNmTgCsAVtYtaKzEcn8ATUoHMkEqE=

@@ -1,6 +1,7 @@
 package task_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"testing"
@@ -62,7 +63,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, nil)
 	requests := paymentrequestmemory.NewInMemory()
-	executor := task.NewExecutor(accounts, chats, requests, sender, ocpData)
+	executor := task.NewExecutor(accounts, chats, requests, sender, ocpData, chatBus)
 	integration := intent.NewIntegration(accounts, chats, messages, profiles, requests, nil, nil, nil)
 
 	senderUserID := model.MustGenerateUserID()
@@ -226,7 +227,7 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	chats := chatmemory.NewInMemory([]*commonpb.UserId{teamUserID})
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, teamUserID)
 	requests := paymentrequestmemory.NewInMemory()
-	executor := task.NewExecutor(accounts, chats, requests, sender, ocpData)
+	executor := task.NewExecutor(accounts, chats, requests, sender, ocpData, chatBus)
 	integration := intent.NewIntegration(accounts, chats, messages, profiles, requests, nil, nil, nil)
 
 	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
@@ -342,6 +343,9 @@ type groupPaymentEnv struct {
 	ocpData     ocp_data.Provider
 	executor    ocp_integration.TaskExecutor
 	integration ocp_integration.SubmitIntent
+
+	// chatObserver sees every event published on the chat-keyed bus.
+	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
 }
 
 func newGroupPaymentEnv(t *testing.T) *groupPaymentEnv {
@@ -355,6 +359,8 @@ func newGroupPaymentEnv(t *testing.T) *groupPaymentEnv {
 	ocpData := ocp_data.NewTestDataProvider()
 	bus := event.NewBus[*commonpb.UserId, *eventpb.Event]()
 	chatBus := event.NewBus[*commonpb.ChatId, *eventpb.ChatEvent]()
+	chatObserver := event.NewTestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]()
+	chatBus.AddHandler(chatObserver)
 
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
 	sender := messaging.NewSender(log, badgememory.NewInMemory(), chats, messages, profiles, blocklistmemory.NewInMemory(), media, ocpData, push.NewNoOpPusher(), bus, chatBus, nil)
@@ -368,8 +374,68 @@ func newGroupPaymentEnv(t *testing.T) *groupPaymentEnv {
 		messages:    messages,
 		requests:    requests,
 		ocpData:     ocpData,
-		executor:    task.NewExecutor(accounts, chats, requests, sender, ocpData),
+		executor:    task.NewExecutor(accounts, chats, requests, sender, ocpData, chatBus),
 		integration: intent.NewIntegration(accounts, chats, messages, profiles, requests, access, nil, nil),
+
+		chatObserver: chatObserver,
+	}
+}
+
+// requestUpdates waits for r's PaymentRequestUpdates on its chat's topic to
+// number n, then gives the bus a moment more and asserts no more arrived,
+// returning them in publish order. Each is checked to be on r's chat topic,
+// for r's chat, excluding no one.
+func (e *groupPaymentEnv) requestUpdates(t *testing.T, r *paymentrequest.PaymentRequest, n int) []*paymentrequestpb.PaymentRequestUpdate {
+	collect := func() []*paymentrequestpb.PaymentRequestUpdate {
+		var updates []*paymentrequestpb.PaymentRequestUpdate
+		for _, ev := range e.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, r.ChatID.Value) }) {
+			for _, u := range ev.Event.Event.GetChatUpdate().GetPaymentRequestUpdates().GetPaymentRequestUpdates() {
+				if !bytes.Equal(u.PaymentRequestId.Value, r.ID.Value) {
+					continue
+				}
+				require.Equal(t, r.ChatID.Value, ev.Event.ChatId.Value)
+				require.Equal(t, r.ChatID.Value, ev.Event.Event.GetChatUpdate().GetChat().GetValue())
+				require.Empty(t, ev.Event.ExcludeUserIds)
+				require.NoError(t, ev.Event.Event.ValidateAll())
+				updates = append(updates, u)
+			}
+		}
+		return updates
+	}
+	if n > 0 {
+		e.chatObserver.WaitFor(t, func([]*event.KeyAndEvent[*commonpb.ChatId, *eventpb.ChatEvent]) bool {
+			return len(collect()) >= n
+		})
+	}
+	time.Sleep(100 * time.Millisecond)
+	updates := collect()
+	require.Len(t, updates, n)
+	return updates
+}
+
+// sharePaymentOf is the share an update's first change pays.
+func sharePaymentOf(u *paymentrequestpb.PaymentRequestUpdate) *paymentrequestpb.Share {
+	return u.GetUpdates().GetUpdates()[0].GetSharePaymentUpdate().GetShare()
+}
+
+// requireSharePaymentUpdate asserts that u is the change of r's share of userID being
+// paid, at version, as stored names it, and, when completed, the request's
+// completion after it at stored's ClosedAt; and nothing else.
+func requireSharePaymentUpdate(t *testing.T, u *paymentrequestpb.PaymentRequestUpdate, stored *paymentrequest.PaymentRequest, userID *commonpb.UserId, completed bool) {
+	changes := u.GetUpdates()
+	require.NotNil(t, changes)
+	assert.Equal(t, stored.Version, changes.Version)
+	want := 1
+	if completed {
+		want = 2
+	}
+	require.Len(t, changes.Updates, want)
+	assert.True(t, proto.Equal(stored.Share(userID), changes.Updates[0].GetSharePaymentUpdate().GetShare()))
+	if completed {
+		status := changes.Updates[1].GetStatusUpdate()
+		require.NotNil(t, status)
+		assert.Equal(t, paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_COMPLETED, status.Status)
+		assert.True(t, stored.ClosedAt.Equal(status.ClosedAt.AsTime()))
 	}
 }
 
@@ -1107,9 +1173,16 @@ func TestExecutor_RecordRequestedPayment(t *testing.T) {
 	require.Len(t, msgs, 1)
 	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
 
+	// The mark is announced on the group's topic: the share as paid, at the
+	// request's new version.
+	updates := e.requestUpdates(t, r, 1)
+	requireSharePaymentUpdate(t, updates[0], stored, payerUserID, false)
+
 	// Tasks are delivered at least once, so re-execution changes neither the
-	// share nor the message.
+	// share nor the message, and announces nothing: a change is announced
+	// only by the write that made it.
 	require.NoError(t, e.executor.Execute(e.ctx, task))
+	e.requestUpdates(t, r, 1)
 	again, err := e.requests.Get(e.ctx, r.ID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 2, again.Version)
@@ -1137,6 +1210,10 @@ func TestExecutor_RecordRequestedPayment(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
 	requireRequestedCash(t, msgs[1], r, otherUserID, otherIntentID)
+
+	// Announced with the completion it made, after it.
+	updates = e.requestUpdates(t, r, 2)
+	requireSharePaymentUpdate(t, updates[1], stored, otherUserID, true)
 }
 
 // A second payment of a share made before the first's task has marked it
@@ -1191,7 +1268,7 @@ func TestExecutor_RecordRequestedPayment_PaidByHand(t *testing.T) {
 		PaidAt: timestamppb.Now(),
 		How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
 	}
-	marked, changed, err := e.requests.PayShare(e.ctx, r.ID, payerUserID, manual, time.Now())
+	marked, changed, _, err := e.requests.PayShare(e.ctx, r.ID, payerUserID, manual, time.Now())
 	require.NoError(t, err)
 	require.True(t, changed)
 
@@ -1210,6 +1287,13 @@ func TestExecutor_RecordRequestedPayment_PaidByHand(t *testing.T) {
 	paid := stored.Share(payerUserID).GetPaid()
 	assert.Equal(t, rawIntentID, paid.GetIntent().GetValue())
 	assert.True(t, intentRecord.CreatedAt.Equal(paid.PaidAt.AsTime()))
+
+	// The replacement is announced at its version, as the share alone: the
+	// request was already complete. The hand mark, made on the store
+	// directly here, announced nothing.
+	updates := e.requestUpdates(t, r, 1)
+	requireSharePaymentUpdate(t, updates[0], stored, payerUserID, false)
+	assert.NotNil(t, sharePaymentOf(updates[0]).GetPaid().GetIntent())
 
 	// A repeat of the task changes nothing.
 	require.NoError(t, e.executor.Execute(e.ctx, task))
@@ -1251,6 +1335,10 @@ func TestExecutor_RecordRequestedPayment_ClosedSinceValidation(t *testing.T) {
 	assert.Equal(t, paymentrequest.StatusClosed, stored.Status)
 	assert.Equal(t, closed.Version+1, stored.Version)
 	assert.Equal(t, rawIntentID, stored.Share(payerUserID).GetPaid().GetIntent().GetValue())
+
+	// Announced as the share alone: a payment after a close moves no status.
+	updates := e.requestUpdates(t, r, 1)
+	requireSharePaymentUpdate(t, updates[0], stored, payerUserID, false)
 
 	msgs, err := e.messages.GetMessages(e.ctx, groupID)
 	require.NoError(t, err)
@@ -1330,6 +1418,10 @@ func TestExecutor_RecordRequestedPayment_WrongIntentOnPaidShare(t *testing.T) {
 	for range 2 {
 		require.ErrorIs(t, e.executor.Execute(e.ctx, task), paymentrequest.ErrWrongIntent)
 	}
+
+	// Only the validated payment's mark was announced; a refused one
+	// announces nothing.
+	e.requestUpdates(t, r, 1)
 
 	stored, err := e.requests.Get(e.ctx, r.ID)
 	require.NoError(t, err)

@@ -14,6 +14,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
 )
 
 // chatUpdateFixture is an update carrying a message in each place one rides
@@ -170,6 +171,37 @@ func TestChatUpdate(t *testing.T) {
 	bare, err := ChatUpdate(chatID, &eventpb.ChatUpdate{Chat: chatID})
 	require.NoError(t, err)
 	assert.True(t, proto.Equal(&eventpb.ChatUpdate{Chat: chatID}, bare))
+
+	// Payment request updates are left out, alongside everything else and
+	// alone: a redacted viewer sees a request's widget, not the request.
+	requestID := &paymentrequestpb.PaymentRequestId{Value: bytes.Repeat([]byte{7}, 16)}
+	requests := &paymentrequestpb.PaymentRequestUpdateBatch{PaymentRequestUpdates: []*paymentrequestpb.PaymentRequestUpdate{
+		{
+			PaymentRequestId: requestID,
+			Kind:             &paymentrequestpb.PaymentRequestUpdate_Created{Created: &paymentrequestpb.PaymentRequestMetadata{PaymentRequestId: requestID, Version: 1}},
+		},
+		{
+			PaymentRequestId: requestID,
+			Kind: &paymentrequestpb.PaymentRequestUpdate_Updates_{Updates: &paymentrequestpb.PaymentRequestUpdate_Updates{
+				Version: 2,
+				Updates: []*paymentrequestpb.PaymentRequestUpdate_Update{{
+					Kind: &paymentrequestpb.PaymentRequestUpdate_Update_StatusUpdate{StatusUpdate: &paymentrequestpb.PaymentRequestUpdate_StatusUpdate{
+						Status:   paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_CLOSED,
+						ClosedAt: timestamppb.Now(),
+					}},
+				}},
+			}},
+		},
+	}}
+	withRequests := proto.Clone(in).(*eventpb.ChatUpdate)
+	withRequests.PaymentRequestUpdates = requests
+	redacted, err := ChatUpdate(chatID, withRequests)
+	require.NoError(t, err)
+	assert.Nil(t, redacted.PaymentRequestUpdates)
+	assert.True(t, proto.Equal(out, redacted))
+	alone, err := ChatUpdate(chatID, &eventpb.ChatUpdate{Chat: chatID, PaymentRequestUpdates: requests})
+	require.NoError(t, err)
+	assert.True(t, proto.Equal(&eventpb.ChatUpdate{Chat: chatID}, alone))
 
 	// A join without metadata carries none.
 	noMetadata, err := ChatUpdate(chatID, &eventpb.ChatUpdate{Chat: chatID, RosterUpdates: &chatpb.RosterUpdateBatch{RosterUpdates: []*chatpb.RosterUpdate{{

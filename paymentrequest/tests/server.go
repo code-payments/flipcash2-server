@@ -20,6 +20,7 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
 	ocp_balancepb "github.com/code-payments/ocp-protobuf-api/generated/go/balance/v1"
@@ -32,9 +33,11 @@ import (
 	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/chat"
 	chatmemory "github.com/code-payments/flipcash2-server/chat/memory"
+	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/moderation"
 	"github.com/code-payments/flipcash2-server/paymentrequest"
+	"github.com/code-payments/flipcash2-server/protoutil"
 	"github.com/code-payments/flipcash2-server/testutil"
 )
 
@@ -58,6 +61,7 @@ func RunServerTests(t *testing.T, s paymentrequest.Store, teardown func()) {
 		testServer_List_ClockExpired,
 		testServer_Close,
 		testServer_MarkPaid,
+		testServer_Updates,
 	} {
 		tf(t, s)
 		teardown()
@@ -741,6 +745,101 @@ func testServer_Close(t *testing.T, s paymentrequest.Store) {
 	require.Equal(t, paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_CLOSED, resp.PaymentRequest.Status)
 }
 
+// testServer_Updates pins what the service announces: the request whole on
+// creation, then each real change as what it did, a share marked paid by hand
+// (the last one also completing the request) and a close, so that applying
+// them in order as a client does yields the request exactly as the RPC
+// answered it; and nothing else: not a retry, a no-op or a refusal.
+func testServer_Updates(t *testing.T, s paymentrequest.Store) {
+	e := newServerEnv(t, s)
+	alice := e.addUser()
+	bob := e.addUser()
+	chatID := e.putPrivateGroup(true, alice, bob)
+
+	key := newKey()
+	split := e.encryptedSplit(e.clock.Now().Add(time.Hour), share(e.creator, 1), share(alice, 2), share(bob, 3))
+	created := e.create(e.creator, chatID, split, key)
+	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, created.Result)
+	id := created.PaymentRequest.PaymentRequestId
+	updates := e.requireUpdates(chatID, id, 1)
+	require.NoError(t, protoutil.ProtoEqualError(created.PaymentRequest, updates[0].GetCreated()))
+
+	// A retry is answered from the store and announces nothing.
+	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, e.create(e.creator, chatID, split, key).Result)
+	e.requireUpdates(chatID, id, 1)
+
+	// Refusals and no-ops announce nothing: marking someone else's request,
+	// a user with no share, and the creator's own share, paid from creation.
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_DENIED, e.markPaid(alice, id, alice).Result)
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_NOT_A_SHARE, e.markPaid(e.creator, id, e.addUser()).Result)
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, e.creator).Result)
+	require.Equal(t, paymentrequestpb.ClosePaymentRequestResponse_DENIED, e.close(alice, id).Result)
+	e.requireUpdates(chatID, id, 1)
+
+	// A share marked paid is announced once, as the share alone at the next
+	// version.
+	e.clock.advance(time.Minute)
+	marked := e.markPaid(e.creator, id, alice)
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, marked.Result)
+	updates = e.requireUpdates(chatID, id, 2)
+	require.EqualValues(t, 2, updates[1].GetUpdates().GetVersion())
+	require.NoError(t, protoutil.ProtoEqualError(shareOf(marked.PaymentRequest, alice), sharePaymentUpdate(t, updates[1])))
+	require.NotNil(t, sharePaymentUpdate(t, updates[1]).Paid.GetManual())
+	e.requireApplied(updates, marked.PaymentRequest)
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, alice).Result)
+	e.requireUpdates(chatID, id, 2)
+
+	// The last share is announced with the completion it made, after it.
+	e.clock.advance(time.Minute)
+	completed := e.markPaid(e.creator, id, bob)
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, completed.Result)
+	updates = e.requireUpdates(chatID, id, 3)
+	changes := updates[2].GetUpdates().GetUpdates()
+	require.Len(t, changes, 2)
+	require.NoError(t, protoutil.ProtoEqualError(shareOf(completed.PaymentRequest, bob), changes[0].GetSharePaymentUpdate().GetShare()))
+	status := statusUpdate(t, updates[2])
+	require.Equal(t, paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_COMPLETED, status.Status)
+	require.True(t, status.ClosedAt.AsTime().Equal(shareOf(completed.PaymentRequest, bob).Paid.PaidAt.AsTime()))
+	e.requireApplied(updates, completed.PaymentRequest)
+
+	// Closing a completed request is the no-op.
+	require.Equal(t, paymentrequestpb.ClosePaymentRequestResponse_OK, e.close(e.creator, id).Result)
+	e.requireUpdates(chatID, id, 3)
+
+	// A close is announced once, as the status change alone.
+	closing := e.mustCreate(e.creator, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour), share(alice, 2)))
+	e.clock.advance(time.Minute)
+	closed := e.close(e.creator, closing.PaymentRequestId)
+	require.Equal(t, paymentrequestpb.ClosePaymentRequestResponse_OK, closed.Result)
+	updates = e.requireUpdates(chatID, closing.PaymentRequestId, 2)
+	require.Len(t, updates[1].GetUpdates().GetUpdates(), 1)
+	status = statusUpdate(t, updates[1])
+	require.Equal(t, paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_CLOSED, status.Status)
+	require.True(t, status.ClosedAt.AsTime().Equal(e.clock.Now()))
+	e.requireApplied(updates, closed.PaymentRequest)
+	require.Equal(t, paymentrequestpb.ClosePaymentRequestResponse_OK, e.close(e.creator, closing.PaymentRequestId).Result)
+	e.requireUpdates(chatID, closing.PaymentRequestId, 2)
+
+	// Expiry is the clock's and is never announced, nor is closing or
+	// marking a request the clock has expired.
+	expiring := e.mustCreate(e.creator, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour), share(alice, 2)))
+	e.clock.set(expiring.GetGroupChat().GetSplit().EndsAt.AsTime().Add(time.Second))
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_NOT_OPEN, e.markPaid(e.creator, expiring.PaymentRequestId, alice).Result)
+	require.Equal(t, paymentrequestpb.ClosePaymentRequestResponse_OK, e.close(e.creator, expiring.PaymentRequestId).Result)
+	e.requireUpdates(chatID, expiring.PaymentRequestId, 1)
+
+	// A retry that loses the race to its twin is answered with the twin's
+	// request and announces nothing: the twin's write was the creation.
+	key = newKey()
+	split = e.encryptedSplit(e.clock.Now().Add(time.Hour), share(alice, 5))
+	twin, err := paymentrequest.NewSplitRequest(paymentrequest.MustDeriveID(e.creator.id, key), e.creator.id, chatID, split, e.clock.Now())
+	require.NoError(t, err)
+	racing := &racingStore{Store: s, beforeCreate: func() { assert.NoError(t, s.Create(e.ctx, twin)) }}
+	re := newServerEnvWith(t, racing, e)
+	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, re.create(e.creator, chatID, split, key).Result)
+	re.requireUpdates(chatID, twin.ID, 0)
+}
+
 func testServer_MarkPaid(t *testing.T, s paymentrequest.Store) {
 	e := newServerEnv(t, s)
 	alice := e.addUser()
@@ -825,6 +924,10 @@ type serverEnv struct {
 	moderator  *fakeModerator
 	clock      *fakeClock
 
+	// chatObserver sees every event published on the chat-keyed bus of the
+	// server last started.
+	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
+
 	// creator is the staff user who creates every group the env puts.
 	creator user
 }
@@ -875,6 +978,9 @@ func newServerEnvWith(t *testing.T, requests paymentrequest.Store, base *serverE
 func (e *serverEnv) start(requests paymentrequest.Store, opts ...paymentrequest.ServerOption) {
 	log := zaptest.NewLogger(e.t)
 	e.requests = requests
+	chatEventBus := event.NewBus[*commonpb.ChatId, *eventpb.ChatEvent]()
+	e.chatObserver = event.NewTestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]()
+	chatEventBus.AddHandler(e.chatObserver)
 	server := paymentrequest.NewServer(
 		log,
 		e.authz,
@@ -883,6 +989,7 @@ func (e *serverEnv) start(requests paymentrequest.Store, opts ...paymentrequest.
 		e.chats,
 		e.access,
 		e.moderator,
+		chatEventBus,
 		append([]paymentrequest.ServerOption{paymentrequest.WithClock(e.clock.Now)}, opts...)...,
 	)
 	cc := testutil.RunGRPCServer(e.t, log, testutil.WithService(func(s *grpc.Server) {
@@ -1134,6 +1241,113 @@ func requireRequestIDs(t *testing.T, want, got []*paymentrequestpb.PaymentReques
 // racingStore is a paymentrequest.Store that runs beforeCreate ahead of every
 // Create, so a test can land a twin's write between the server's read and its
 // own write.
+// updates returns every PaymentRequestUpdate for id published on chatID's
+// topic, in publish order, checking each publish's shape on the way: on the
+// chat's topic, for that chat, excluding no one, one update per event, and
+// valid by the proto's rules.
+func (e *serverEnv) updates(chatID *commonpb.ChatId, id *paymentrequestpb.PaymentRequestId) []*paymentrequestpb.PaymentRequestUpdate {
+	var updates []*paymentrequestpb.PaymentRequestUpdate
+	for _, ev := range e.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, chatID.Value) }) {
+		require.Equal(e.t, chatID.Value, ev.Event.ChatId.Value)
+		require.Empty(e.t, ev.Event.ExcludeUserIds)
+		require.NoError(e.t, ev.Event.Event.ValidateAll())
+		update := ev.Event.Event.GetChatUpdate()
+		require.Equal(e.t, chatID.Value, update.GetChat().GetValue())
+		batch := update.GetPaymentRequestUpdates().GetPaymentRequestUpdates()
+		require.Len(e.t, batch, 1)
+		if bytes.Equal(batch[0].PaymentRequestId.Value, id.Value) {
+			updates = append(updates, batch[0])
+		}
+	}
+	return updates
+}
+
+// requireUpdates waits for id's updates on chatID's topic to number n, then
+// gives the bus a moment more and asserts no more arrived. The bus hands
+// events to observers on their own goroutines, so a test asserts on them only
+// after waiting.
+func (e *serverEnv) requireUpdates(chatID *commonpb.ChatId, id *paymentrequestpb.PaymentRequestId, n int) []*paymentrequestpb.PaymentRequestUpdate {
+	if n > 0 {
+		e.chatObserver.WaitFor(e.t, func([]*event.KeyAndEvent[*commonpb.ChatId, *eventpb.ChatEvent]) bool {
+			return len(e.updates(chatID, id)) >= n
+		})
+	}
+	time.Sleep(100 * time.Millisecond)
+	updates := e.updates(chatID, id)
+	require.Len(e.t, updates, n)
+	return updates
+}
+
+// requireApplied asserts that applying updates, in order, as a client would
+// (see ApplyUpdates), yields want, the request as an RPC last returned it.
+func (e *serverEnv) requireApplied(updates []*paymentrequestpb.PaymentRequestUpdate, want *paymentrequestpb.PaymentRequestMetadata) {
+	require.NoError(e.t, protoutil.ProtoEqualError(want, ApplyUpdates(e.t, updates)))
+}
+
+// ApplyUpdates applies all, in order and none missing, to a request held
+// by no one before, the way the proto tells a client to (see
+// paymentrequestpb.PaymentRequestUpdate), and returns the result. The first
+// must be the request's creation; each after it must be the change at the
+// next version, and must apply cleanly to the copy so far.
+func ApplyUpdates(t *testing.T, all []*paymentrequestpb.PaymentRequestUpdate) *paymentrequestpb.PaymentRequestMetadata {
+	require.NotEmpty(t, all)
+	created := all[0].GetCreated()
+	require.NotNil(t, created, "first update is not the creation")
+	require.Equal(t, all[0].PaymentRequestId.Value, created.PaymentRequestId.Value)
+	local := proto.Clone(created).(*paymentrequestpb.PaymentRequestMetadata)
+
+	for _, u := range all[1:] {
+		require.Equal(t, local.PaymentRequestId.Value, u.PaymentRequestId.Value)
+		updates := u.GetUpdates()
+		require.NotNil(t, updates, "a later update is not a change")
+		require.Equal(t, local.Version+1, updates.Version, "a change is not at the next version")
+		for i, c := range updates.Updates {
+			switch kind := c.Kind.(type) {
+			case *paymentrequestpb.PaymentRequestUpdate_Update_SharePaymentUpdate:
+				share := kind.SharePaymentUpdate.Share
+				require.NotNil(t, share.Paid, "a paid share without paid")
+				shares := local.GetGroupChat().GetSplit().GetShares()
+				found := false
+				for j, held := range shares {
+					if bytes.Equal(held.UserId.Value, share.UserId.Value) {
+						shares[j] = proto.Clone(share).(*paymentrequestpb.Share)
+						found = true
+					}
+				}
+				require.True(t, found, "a paid share the request does not have")
+			case *paymentrequestpb.PaymentRequestUpdate_Update_StatusUpdate:
+				require.Equal(t, len(updates.Updates)-1, i, "a status change that is not last")
+				require.Equal(t, paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_OPEN, local.Status, "a status change of a request not open")
+				local.Status = kind.StatusUpdate.Status
+				local.ClosedAt = proto.Clone(kind.StatusUpdate.ClosedAt).(*timestamppb.Timestamp)
+			default:
+				require.Fail(t, "unknown change kind")
+			}
+		}
+		local.Version = updates.Version
+	}
+	return local
+}
+
+// sharePaymentUpdate returns the share an update pays when a share payment
+// is all it carries, and fails otherwise.
+func sharePaymentUpdate(t *testing.T, u *paymentrequestpb.PaymentRequestUpdate) *paymentrequestpb.Share {
+	changes := u.GetUpdates().GetUpdates()
+	require.Len(t, changes, 1)
+	require.NotNil(t, changes[0].GetSharePaymentUpdate())
+	return changes[0].GetSharePaymentUpdate().Share
+}
+
+// statusUpdate returns the status update that is an update's last, and
+// fails when it carries none.
+func statusUpdate(t *testing.T, u *paymentrequestpb.PaymentRequestUpdate) *paymentrequestpb.PaymentRequestUpdate_StatusUpdate {
+	changes := u.GetUpdates().GetUpdates()
+	require.NotEmpty(t, changes)
+	status := changes[len(changes)-1].GetStatusUpdate()
+	require.NotNil(t, status)
+	return status
+}
+
 type racingStore struct {
 	paymentrequest.Store
 	beforeCreate func()

@@ -1,6 +1,7 @@
 package activity
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -34,6 +35,11 @@ type counterpartyEnv struct {
 
 	// boostChatID is the group reactionBoost was paid in.
 	boostChatID *commonpb.ChatId
+
+	// requestChatID and requestID name the payment request requestedPayment
+	// paid a share of, and its group.
+	requestChatID *commonpb.ChatId
+	requestID     *paymentrequestpb.PaymentRequestId
 }
 
 func newCounterpartyEnv(t *testing.T) *counterpartyEnv {
@@ -64,11 +70,13 @@ func newCounterpartyEnv(t *testing.T) *counterpartyEnv {
 			GroupPayment: &intentpb.ChatMetadata_GroupPayment{Action: intentpb.PaymentAction_SEND},
 		},
 	})
+	e.requestChatID = chat.MustGenerateGroupChatID()
+	e.requestID = &paymentrequestpb.PaymentRequestId{Value: bytes.Repeat([]byte{7}, 16)}
 	e.requestedPayment = chatAppMetadata(t, &intentpb.ChatMetadata{
-		ChatId: chat.MustGenerateGroupChatID(),
+		ChatId: e.requestChatID,
 		Type: &intentpb.ChatMetadata_RequestedPayment_{
 			RequestedPayment: &intentpb.ChatMetadata_RequestedPayment{
-				PaymentRequestId: &paymentrequestpb.PaymentRequestId{Value: make([]byte, 16)},
+				PaymentRequestId: e.requestID,
 			},
 		},
 	})
@@ -112,7 +120,7 @@ func chatAppMetadata(t *testing.T, chatMetadata *intentpb.ChatMetadata) []byte {
 // TestHistoryCounterparties: a group payment names the other party by user
 // ID from both sides, and reads Sent and Received, exactly as a DM payment
 // does, and so does a requested payment, from its payer to the request's
-// creator. A reaction boost paying one person names the other party the same
+// creator, whose entries on both sides also name the request. A reaction boost paying one person names the other party the same
 // way, and the payer's side reads Boosted. A payment carrying no chat
 // metadata, like one handed off in person, names no one, and the payer's side
 // reads Gave.
@@ -127,13 +135,14 @@ func TestHistoryCounterparties(t *testing.T) {
 		appMetadata []byte
 		named       bool
 		boosted     bool
+		requested   bool
 		sentText    string
 	}{
-		{"group_payment", e.groupPayment, true, false, "Sent"},
-		{"requested_payment", e.requestedPayment, true, false, "Sent"},
-		{"dm_payment", e.dmPayment, true, false, "Sent"},
-		{"reaction_boost", e.reactionBoost, true, true, "Boosted"},
-		{"no_chat_metadata", nil, false, false, "Gave"},
+		{"group_payment", e.groupPayment, true, false, false, "Sent"},
+		{"requested_payment", e.requestedPayment, true, false, true, "Sent"},
+		{"dm_payment", e.dmPayment, true, false, false, "Sent"},
+		{"reaction_boost", e.reactionBoost, true, true, false, "Boosted"},
+		{"no_chat_metadata", nil, false, false, false, "Gave"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			records := []*history.Record{
@@ -158,6 +167,13 @@ func TestHistoryCounterparties(t *testing.T) {
 			} else {
 				require.Nil(t, sent.GetDirectlySentCrypto().GetBoostedReaction())
 				require.Nil(t, received.GetReceivedCrypto().GetBoostedReaction())
+			}
+			if tc.requested {
+				e.requireRequestedPayment(t, sent.GetDirectlySentCrypto().GetRequestedPayment())
+				e.requireRequestedPayment(t, received.GetReceivedCrypto().GetRequestedPayment())
+			} else {
+				require.Nil(t, sent.GetDirectlySentCrypto().GetRequestedPayment())
+				require.Nil(t, received.GetReceivedCrypto().GetRequestedPayment())
 			}
 			if tc.named {
 				require.True(t, proto.Equal(e.recipient, sent.GetDirectlySentCrypto().GetUserId()))
@@ -277,10 +293,12 @@ func TestHistoryCounterparties_GroupMultiPayment(t *testing.T) {
 	require.NotNil(t, notifications[0].GetDirectlySentCrypto())
 	require.Nil(t, notifications[0].GetDirectlySentCrypto().GetDestinationIdentifier())
 	require.Nil(t, notifications[0].GetDirectlySentCrypto().GetBoostedReaction())
+	require.Nil(t, notifications[0].GetDirectlySentCrypto().GetRequestedPayment())
 
 	require.Equal(t, "Received", notifications[1].LocalizedText)
 	require.True(t, proto.Equal(e.payer, notifications[1].GetReceivedCrypto().GetUserId()))
 	require.Nil(t, notifications[1].GetReceivedCrypto().GetBoostedReaction())
+	require.Nil(t, notifications[1].GetReceivedCrypto().GetRequestedPayment())
 }
 
 // requireBoostedReaction checks that a notification names the reaction
@@ -291,4 +309,14 @@ func (e *counterpartyEnv) requireBoostedReaction(t *testing.T, boosted *activity
 	require.True(t, proto.Equal(e.boostChatID, boosted.GetChatId()))
 	require.EqualValues(t, 1, boosted.GetMessageId().GetValue())
 	require.Equal(t, "🔥", boosted.GetEmoji().GetValue())
+}
+
+// requireRequestedPayment checks that a notification names the payment
+// request e.requestedPayment paid a share of, and that it is valid as the
+// proto defines it.
+func (e *counterpartyEnv) requireRequestedPayment(t *testing.T, requested *activitypb.RequestedPayment) {
+	require.NotNil(t, requested)
+	require.NoError(t, requested.Validate())
+	require.True(t, proto.Equal(e.requestChatID, requested.GetChatId()))
+	require.True(t, proto.Equal(e.requestID, requested.GetPaymentRequestId()))
 }

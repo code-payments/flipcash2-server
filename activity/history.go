@@ -124,7 +124,13 @@ func toNotification(
 				UserId: userID,
 			}
 		}
-		metadata.BoostedReaction = toBoostedReaction(record.AppMetadata)
+		// A payment carries at most one chat metadata type, so at most one
+		// context applies.
+		if boosted := toBoostedReaction(record.AppMetadata); boosted != nil {
+			metadata.Context = &activitypb.DirectlySentCryptoNotificationMetadata_BoostedReaction{BoostedReaction: boosted}
+		} else if requested := toRequestedPayment(record.AppMetadata); requested != nil {
+			metadata.Context = &activitypb.DirectlySentCryptoNotificationMetadata_RequestedPayment{RequestedPayment: requested}
+		}
 		notification.AdditionalMetadata = &activitypb.Notification_DirectlySentCrypto{DirectlySentCrypto: metadata}
 
 	case history.DirectlyReceived, history.IndirectlyReceived:
@@ -138,7 +144,11 @@ func toNotification(
 				UserId: userID,
 			}
 		}
-		metadata.BoostedReaction = toBoostedReaction(record.AppMetadata)
+		if boosted := toBoostedReaction(record.AppMetadata); boosted != nil {
+			metadata.Context = &activitypb.ReceivedCryptoNotificationMetadata_BoostedReaction{BoostedReaction: boosted}
+		} else if requested := toRequestedPayment(record.AppMetadata); requested != nil {
+			metadata.Context = &activitypb.ReceivedCryptoNotificationMetadata_RequestedPayment{RequestedPayment: requested}
+		}
 		notification.AdditionalMetadata = &activitypb.Notification_ReceivedCrypto{ReceivedCrypto: metadata}
 
 	case history.IndirectlySent:
@@ -210,6 +220,23 @@ func toBoostedReaction(appMetadata []byte) *activitypb.BoostedReaction {
 		ChatId:    intent.GetChatMetadata(appMetadata).GetChatId(),
 		MessageId: boost.GetMessageId(),
 		Emoji:     boost.GetEmoji(),
+	}
+}
+
+// toRequestedPayment names the payment request a payment paid a share of,
+// read off the app metadata its intent carried, or nil for a payment that was
+// not a requested payment. A requested payment was validated when it was
+// paid, so its metadata names the request and the request's group; it is what
+// the payment was for then, and is not checked against the request now, which
+// may since have closed or expired.
+func toRequestedPayment(appMetadata []byte) *activitypb.RequestedPayment {
+	requested := intent.GetRequestedPayment(appMetadata)
+	if requested == nil {
+		return nil
+	}
+	return &activitypb.RequestedPayment{
+		ChatId:           intent.GetChatMetadata(appMetadata).GetChatId(),
+		PaymentRequestId: requested.GetPaymentRequestId(),
 	}
 }
 

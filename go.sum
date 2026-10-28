@@ -80,6 +80,8 @@ github.com/code-payments/code-vm-indexer v1.2.0 h1:rSHpBMiT9BKgmKcXg/VIoi/h0t7jN
 github.com/code-payments/code-vm-indexer v1.2.0/go.mod h1:vn91YN2qNqb+gGJeZe2+l+TNxVmEEiRHXXnIn2Y40h8=
 github.com/code-payments/flipcash2-protobuf-api v1.31.1-0.20261028161846-14f05bb0521e h1:1fM6uhPIfj57ss2BGoCVf1cARx9y0spvaPw4TtnO+rw=
 github.com/code-payments/flipcash2-protobuf-api v1.31.1-0.20261028161846-14f05bb0521e/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
+github.com/code-payments/flipcash2-protobuf-api v1.31.1-0.20261028181054-6de4f9adfd11 h1:8MngNyf4Arcqd++sNSSiKCt7HCDDPNODYQZcwMcmYVs=
+github.com/code-payments/flipcash2-protobuf-api v1.31.1-0.20261028181054-6de4f9adfd11/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
 github.com/code-payments/ocp-protobuf-api v1.17.1-0.20261016120110-6f70c0d8e832 h1:HFY6mGBaZm8C3tJDK2PvaVQjfUS91NFDDWQSzla80hA=
 github.com/code-payments/ocp-protobuf-api v1.17.1-0.20261016120110-6f70c0d8e832/go.mod h1:tw6BooY5a8l6CtSZnKOruyKII0W04n89pcM4BizrgG8=
 github.com/code-payments/ocp-server v1.27.1-0.20261016133142-d1b9b228d45d h1:tliC1IE+4TYInxfv3zzd+iGLRq7QQkFaeebIZTdP/os=

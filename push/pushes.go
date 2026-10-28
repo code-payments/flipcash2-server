@@ -672,6 +672,15 @@ func SendFlipcashCurrencyGainPush(ctx context.Context, pusher Pusher, user *comm
 	return pusher.SendPushes(ctx, title, body, customPayload, user)
 }
 
+// SendTestPush sends the fixed test notification to every device the user has
+// registered, so they can check that notifications reach them. It navigates
+// nowhere and leaves the badge alone.
+func SendTestPush(ctx context.Context, pusher Pusher, user *commonpb.UserId) error {
+	title := "Test Notification"
+	body := "If you can see this, notifications are working."
+	return pusher.SendPushes(ctx, title, body, &pushpb.Payload{}, user)
+}
+
 // todo: refactor push more broadly to use this with caching
 func resolveCurrencyName(ctx context.Context, ocpData ocp_data.Provider, mint *commonpb.PublicKey) (string, error) {
 	mintAccount, err := ocp_common.NewAccountFromPublicKeyBytes(mint.Value)

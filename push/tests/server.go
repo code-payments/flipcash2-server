@@ -21,6 +21,7 @@ func RunServerTests(t *testing.T, s push.TokenStore, teardown func()) {
 	for _, tf := range []func(t *testing.T, s push.TokenStore){
 		testServer_AddToken,
 		testServer_DeleteTokens,
+		testServer_SendTestPush,
 	} {
 		tf(t, s)
 		teardown()
@@ -32,7 +33,7 @@ func testServer_AddToken(t *testing.T, store push.TokenStore) {
 	log := zaptest.NewLogger(t)
 
 	authz := auth.NewStaticAuthorizer(log)
-	server := push.NewServer(log, authz, store)
+	server := push.NewServer(log, authz, store, push.NewNoOpPusher())
 
 	userID := &commonpb.UserId{Value: []byte("test-user")}
 	keyPair := model.MustGenerateKeyPair()
@@ -101,7 +102,7 @@ func testServer_DeleteTokens(t *testing.T, store push.TokenStore) {
 	log := zaptest.NewLogger(t)
 
 	authz := auth.NewStaticAuthorizer(log)
-	server := push.NewServer(log, authz, store)
+	server := push.NewServer(log, authz, store, push.NewNoOpPusher())
 
 	userID := &commonpb.UserId{Value: []byte("test-user")}
 	keyPair := model.MustGenerateKeyPair()
@@ -177,4 +178,67 @@ func testServer_DeleteTokens(t *testing.T, store push.TokenStore) {
 			}
 		})
 	}
+}
+
+func testServer_SendTestPush(t *testing.T, store push.TokenStore) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	fcmClient := &testFCMClient{}
+	authz := auth.NewStaticAuthorizer(log)
+	server := push.NewServer(log, authz, store, push.NewFCMPusher(log, store, fcmClient))
+
+	userID := &commonpb.UserId{Value: []byte("test-user")}
+	keyPair := model.MustGenerateKeyPair()
+	authz.Add(userID, keyPair)
+
+	otherUserID := &commonpb.UserId{Value: []byte("other-user")}
+
+	require.NoError(t, store.AddToken(ctx, userID, &commonpb.AppInstallId{Value: "install-ios"}, pushpb.TokenType_FCM_APNS, "token-ios"))
+	require.NoError(t, store.AddToken(ctx, userID, &commonpb.AppInstallId{Value: "install-android"}, pushpb.TokenType_FCM_ANDROID, "token-android"))
+	require.NoError(t, store.AddToken(ctx, otherUserID, &commonpb.AppInstallId{Value: "install-other"}, pushpb.TokenType_FCM_APNS, "token-other"))
+
+	t.Run("unauthorized", func(t *testing.T) {
+		req := &pushpb.SendTestPushRequest{}
+		require.NoError(t, model.MustGenerateKeyPair().Auth(req, &req.Auth))
+
+		_, err := server.SendTestPush(ctx, req)
+		require.Equal(t, codes.PermissionDenied, status.Code(err))
+		require.Empty(t, fcmClient.sentMessages)
+	})
+
+	t.Run("success", func(t *testing.T) {
+		req := &pushpb.SendTestPushRequest{}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+
+		resp, err := server.SendTestPush(ctx, req)
+		require.NoError(t, err)
+		require.Equal(t, pushpb.SendTestPushResponse_OK, resp.Result)
+
+		// Every one of the caller's devices, and no one else's.
+		require.ElementsMatch(t, []string{"token-ios", "token-android"}, fcmClient.tokens())
+		for _, m := range fcmClient.sentMessages {
+			require.Equal(t, "Test Notification", m.Android.Data["push_notification_title"])
+			require.Equal(t, "If you can see this, notifications are working.", m.Android.Data["push_notification_body"])
+			require.Empty(t, m.Android.Data["target_url"])
+			require.Equal(t, "Test Notification", m.APNS.Payload.Aps.Alert.Title)
+			require.Equal(t, "If you can see this, notifications are working.", m.APNS.Payload.Aps.Alert.Body)
+			require.Nil(t, m.APNS.Payload.Aps.Badge)
+		}
+	})
+
+	t.Run("no tokens", func(t *testing.T) {
+		noTokensUserID := &commonpb.UserId{Value: []byte("no-tokens-user")}
+		noTokensKeyPair := model.MustGenerateKeyPair()
+		authz.Add(noTokensUserID, noTokensKeyPair)
+
+		req := &pushpb.SendTestPushRequest{}
+		require.NoError(t, noTokensKeyPair.Auth(req, &req.Auth))
+
+		sent := len(fcmClient.sentMessages)
+		resp, err := server.SendTestPush(ctx, req)
+		require.NoError(t, err)
+		require.Equal(t, pushpb.SendTestPushResponse_OK, resp.Result)
+		require.Len(t, fcmClient.sentMessages, sent)
+	})
 }

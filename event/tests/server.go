@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"maps"
@@ -24,6 +25,7 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
+	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
 	profilepb "github.com/code-payments/flipcash2-protobuf-api/generated/go/profile/v1"
 	ocp_balancepb "github.com/code-payments/ocp-protobuf-api/generated/go/balance/v1"
 
@@ -1235,6 +1237,28 @@ func testChatPreview(t *testing.T, accounts account.Store) {
 		receiveFull(streamer, left)
 	}
 
+	// Payment request updates, a creation and a change, reach a full preview
+	// as they are, and never a redacted one, which may see a request's widget
+	// but not the request: they carry nothing else, so a redacted preview
+	// gets nothing at all, and its next event is the message that follows.
+	created := publish(testEnv.server1, paymentRequestCreatedEvent(group, member))
+	paid := publish(testEnv.server1, paymentRequestSharePaymentEvent(group, member))
+	for _, streamer := range fullStreams {
+		var got []*eventpb.Event
+		for len(got) < 2 {
+			got = append(got, receiveNextEvents(t, streamer)...)
+		}
+		// Each publish is handed on on its own goroutine, so the two may
+		// arrive in either order.
+		require.Len(t, got, 2)
+		if bytes.Equal(got[0].Id.Id, paid.Id.Id) {
+			got[0], got[1] = got[1], got[0]
+		}
+		require.NoError(t, protoutil.ProtoEqualError(created, got[0]))
+		require.NoError(t, protoutil.ProtoEqualError(paid, got[1]))
+	}
+	receiveAll(publish(testEnv.server1, newMessageSentEvent(group, member, 5, "after the request")), fullStreams, redactedStreams)
+
 	// The standing is the open's: staff who lose their flag mid-window keep
 	// their full previews until the window closes, and are refused a new
 	// one; other, who joins mid-window, keeps their redacted previews too,
@@ -1243,7 +1267,7 @@ func testChatPreview(t *testing.T, accounts account.Store) {
 	changed, _, err := testEnv.chats.AddGroupMembers(ctx, group, []*commonpb.UserId{other})
 	require.NoError(t, err)
 	require.True(t, changed)
-	receiveAll(publish(testEnv.server2, newMessageSentEvent(group, other, 5, "after the changes")), fullStreams, redactedStreams)
+	receiveAll(publish(testEnv.server2, newMessageSentEvent(group, other, 6, "after the changes")), fullStreams, redactedStreams)
 	expectChatStreamError(t, testEnv.client1.openChatPreview(t, staffKeys, group, messagingpb.ViewMode_FULL), eventpb.StreamEventsResponse_StreamError_DENIED)
 	expectChatStreamError(t, testEnv.client1.openChatPreview(t, otherKeys, group, messagingpb.ViewMode_REDACTED), eventpb.StreamEventsResponse_StreamError_DENIED)
 }
@@ -1440,6 +1464,76 @@ func rosterLeftEvent(chatID *commonpb.ChatId, subject *commonpb.UserId, version 
 		}},
 	}
 	if err := e.Validate(); err != nil {
+		panic(err)
+	}
+	return e
+}
+
+// fixturePaymentRequestID names the request every payment request fixture
+// event is about.
+var fixturePaymentRequestID = &paymentrequestpb.PaymentRequestId{Value: bytes.Repeat([]byte{7}, 16)}
+
+// paymentRequestCreatedEvent builds an event carrying the creation of a
+// request in chatID by creator, and nothing else.
+func paymentRequestCreatedEvent(chatID *commonpb.ChatId, creator *commonpb.UserId) *eventpb.Event {
+	return paymentRequestEvent(chatID, &paymentrequestpb.PaymentRequestUpdate{
+		PaymentRequestId: fixturePaymentRequestID,
+		Kind: &paymentrequestpb.PaymentRequestUpdate_Created{Created: &paymentrequestpb.PaymentRequestMetadata{
+			PaymentRequestId: fixturePaymentRequestID,
+			Creator:          creator,
+			CreatedAt:        timestamppb.Now(),
+			Status:           paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_OPEN,
+			Version:          1,
+			Kind: &paymentrequestpb.PaymentRequestMetadata_GroupChat{GroupChat: &paymentrequestpb.GroupChatPaymentRequest{
+				ChatId: chatID,
+				Type: &paymentrequestpb.GroupChatPaymentRequest_Split{Split: &paymentrequestpb.Split{
+					Text:     &paymentrequestpb.Split_Plaintext{Plaintext: &paymentrequestpb.PaymentRequestText{Title: "Dinner"}},
+					Currency: "usd",
+					EndsAt:   timestamppb.New(time.Now().Add(time.Hour)),
+					Shares:   []*paymentrequestpb.Share{{UserId: creator, NativeAmount: 1}},
+				}},
+			}},
+		}},
+	})
+}
+
+// paymentRequestSharePaymentEvent builds an event carrying debtor's share of the
+// fixture request paid by hand, completing it, and nothing else.
+func paymentRequestSharePaymentEvent(chatID *commonpb.ChatId, debtor *commonpb.UserId) *eventpb.Event {
+	paidAt := timestamppb.Now()
+	return paymentRequestEvent(chatID, &paymentrequestpb.PaymentRequestUpdate{
+		PaymentRequestId: fixturePaymentRequestID,
+		Kind: &paymentrequestpb.PaymentRequestUpdate_Updates_{Updates: &paymentrequestpb.PaymentRequestUpdate_Updates{
+			Version: 2,
+			Updates: []*paymentrequestpb.PaymentRequestUpdate_Update{
+				{Kind: &paymentrequestpb.PaymentRequestUpdate_Update_SharePaymentUpdate{SharePaymentUpdate: &paymentrequestpb.PaymentRequestUpdate_SharePaymentUpdate{
+					Share: &paymentrequestpb.Share{UserId: debtor, NativeAmount: 1, Paid: &paymentrequestpb.PaidShare{
+						PaidAt: paidAt,
+						How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
+					}},
+				}}},
+				{Kind: &paymentrequestpb.PaymentRequestUpdate_Update_StatusUpdate{StatusUpdate: &paymentrequestpb.PaymentRequestUpdate_StatusUpdate{
+					Status:   paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_COMPLETED,
+					ClosedAt: paidAt,
+				}}},
+			},
+		}},
+	})
+}
+
+// paymentRequestEvent builds an event carrying update alone, for chatID.
+func paymentRequestEvent(chatID *commonpb.ChatId, update *paymentrequestpb.PaymentRequestUpdate) *eventpb.Event {
+	e := &eventpb.Event{
+		Id: model.MustGenerateEventID(),
+		Ts: timestamppb.Now(),
+		Type: &eventpb.Event_ChatUpdate{ChatUpdate: &eventpb.ChatUpdate{
+			Chat: chatID,
+			PaymentRequestUpdates: &paymentrequestpb.PaymentRequestUpdateBatch{
+				PaymentRequestUpdates: []*paymentrequestpb.PaymentRequestUpdate{update},
+			},
+		}},
+	}
+	if err := e.ValidateAll(); err != nil {
 		panic(err)
 	}
 	return e

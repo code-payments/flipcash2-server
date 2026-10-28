@@ -4,8 +4,12 @@ import (
 	"context"
 	"fmt"
 
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
+
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/chat"
+	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/intent"
 	"github.com/code-payments/flipcash2-server/messaging"
 	"github.com/code-payments/flipcash2-server/paymentrequest"
@@ -23,10 +27,13 @@ type Executor struct {
 	requests paymentrequest.Store
 	sender   *messaging.Sender
 	ocpData  ocp_data.Provider
+
+	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent]
 }
 
 // NewExecutor constructs the task executor. requests is the payment request
-// store, written to mark a share paid by a requested payment (see
+// store, written to mark a share paid by a requested payment, and
+// chatEventBus the chat-keyed event bus the mark is announced on (see
 // recordRequestedPayment).
 func NewExecutor(
 	accounts account.Store,
@@ -34,13 +41,15 @@ func NewExecutor(
 	requests paymentrequest.Store,
 	sender *messaging.Sender,
 	ocpData ocp_data.Provider,
+	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent],
 ) ocp_integration.TaskExecutor {
 	return &Executor{
-		accounts: accounts,
-		chats:    chats,
-		requests: requests,
-		sender:   sender,
-		ocpData:  ocpData,
+		accounts:     accounts,
+		chats:        chats,
+		requests:     requests,
+		sender:       sender,
+		ocpData:      ocpData,
+		chatEventBus: chatEventBus,
 	}
 }
 

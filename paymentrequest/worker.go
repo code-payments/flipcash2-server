@@ -254,6 +254,10 @@ func (w *Worker) processOne(ctx context.Context, task *ExpiryTask) bool {
 // still be queued. A failed read is a failed attempt like any other: the claim
 // is held, so the request is rescheduled under backoff rather than left until
 // its lease ends.
+//
+// Nothing is announced (see event.go): expiry moves no version, and every
+// reader has judged the request EXPIRED off its ends_at since before the
+// worker took it up.
 func (w *Worker) expire(ctx context.Context, id *paymentrequestpb.PaymentRequestId) error {
 	expireCtx, cancel := context.WithTimeout(ctx, w.expireTimeout)
 	defer cancel()

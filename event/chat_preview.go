@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
@@ -86,7 +87,10 @@ type chatPreview struct {
 // shape is what the stream delivers of an event it was notified: the event
 // as published, if it is a ChatUpdate for the stream's chat and the stream
 // reads in full; its redaction (see redact.ChatUpdate) if the stream reads
-// redacted; and nothing — nil, no error — for any other event. An update the
+// redacted, unless the redaction leaves nothing but the chat (an update of
+// payment requests alone, which a redacted reader may not see), which is
+// dropped rather than delivered empty; and nothing — nil, no error — for any
+// other event. An update the
 // stream cannot redact is an error, and ends the stream: a message that
 // cannot be redacted is not delivered to a viewer who may only see it
 // redacted, as it fails the read on every other path.
@@ -105,6 +109,9 @@ func (p *chatPreview) shape(e *eventpb.Event) (*eventpb.Event, error) {
 	redacted, err := redact.ChatUpdate(p.chatID, update)
 	if err != nil {
 		return nil, err
+	}
+	if proto.Equal(redacted, &eventpb.ChatUpdate{Chat: redacted.Chat}) {
+		return nil, nil
 	}
 	return &eventpb.Event{
 		Id:   e.GetId(),

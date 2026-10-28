@@ -127,9 +127,9 @@ func (m *memory) GetChatPage(_ context.Context, chatID *commonpb.ChatId, section
 	return page, nil
 }
 
-func (m *memory) PayShare(_ context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.PaidShare, now time.Time) (*paymentrequest.PaymentRequest, bool, error) {
+func (m *memory) PayShare(_ context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.PaidShare, now time.Time) (*paymentrequest.PaymentRequest, bool, bool, error) {
 	if err := paymentrequest.ValidatePaidShare(paid); err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 
 	m.Lock()
@@ -138,31 +138,32 @@ func (m *memory) PayShare(_ context.Context, id *paymentrequestpb.PaymentRequest
 	key := string(id.Value)
 	r, ok := m.requests[key]
 	if !ok {
-		return nil, false, paymentrequest.ErrNotFound
+		return nil, false, false, paymentrequest.ErrNotFound
 	}
 	share := r.Share(userID)
 	if share == nil {
-		return nil, false, paymentrequest.ErrNotAShare
+		return nil, false, false, paymentrequest.ErrNotAShare
 	}
 	if err := paymentrequest.ValidatePaymentIntent(r, userID, paid); err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	if !paymentrequest.PaidShareSupersedes(share.Paid, paid) {
-		return r.Clone(), false, nil
+		return r.Clone(), false, false, nil
 	}
 	if paid.GetManual() != nil && !r.IsOpenAt(now) {
-		return nil, false, paymentrequest.ErrNotOpen
+		return nil, false, false, paymentrequest.ErrNotOpen
 	}
 
 	share.Paid = proto.Clone(paid).(*paymentrequestpb.PaidShare)
 	r.Version++
-	if r.Status == paymentrequest.StatusOpen && r.AllSharesPaid() {
+	completed := r.Status == paymentrequest.StatusOpen && r.AllSharesPaid()
+	if completed {
 		closedAt := paid.PaidAt.AsTime()
 		r.Status = paymentrequest.StatusCompleted
 		r.ClosedAt = &closedAt
 		delete(m.queue, key)
 	}
-	return r.Clone(), true, nil
+	return r.Clone(), true, completed, nil
 }
 
 func (m *memory) Close(_ context.Context, id *paymentrequestpb.PaymentRequestId, now time.Time) (*paymentrequest.PaymentRequest, bool, error) {

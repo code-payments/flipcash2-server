@@ -120,11 +120,14 @@ type Store interface {
 	// A real change sets the share's paid and advances the version by one. If
 	// it paid the last unpaid share of a request stored open, the request is
 	// completed in the same write, with ClosedAt paid.paid_at, and leaves the
-	// expiry queue; a request already final keeps its status and ClosedAt. A
-	// payment replacing a hand mark pays no share that was unpaid, so it never
-	// completes a request, and leaves the status and ClosedAt as they were,
-	// even when the hand mark completed it.
-	PayShare(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.PaidShare, now time.Time) (r *PaymentRequest, changed bool, err error)
+	// expiry queue, and completed is reported; a request already final keeps
+	// its status and ClosedAt. A payment replacing a hand mark pays no share
+	// that was unpaid, so it never completes a request, and leaves the status
+	// and ClosedAt as they were, even when the hand mark completed it. The
+	// request returned cannot tell those two apart (both are COMPLETED, the
+	// share paid by a payment), which is why completed is reported: it is what
+	// announcing the change needs (see PublishSharePaid).
+	PayShare(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.PaidShare, now time.Time) (r *PaymentRequest, changed, completed bool, err error)
 
 	// Close closes a request open as of now: status closed, ClosedAt now,
 	// version advanced by one, and off the expiry queue. A request that is not

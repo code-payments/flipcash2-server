@@ -17,6 +17,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 	moderationpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/moderation/v1"
 	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
@@ -26,6 +27,7 @@ import (
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/chat"
+	"github.com/code-payments/flipcash2-server/event"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/moderation"
 	"github.com/code-payments/flipcash2-server/send"
@@ -65,6 +67,10 @@ const (
 //
 // Paying a share with a Flipcash payment is not this service's: it is an
 // intent, validated and recorded elsewhere (see Store.PayShare).
+//
+// Every change the service makes, a creation, a close or a share marked paid
+// by hand, is announced on the chat's topic (see PublishCreated); a no-op is
+// not.
 type Server struct {
 	log *zap.Logger
 
@@ -75,6 +81,8 @@ type Server struct {
 	chats     chat.Store
 	access    *chat.Access
 	moderator moderation.Client
+
+	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent]
 
 	now func() time.Time
 
@@ -111,7 +119,8 @@ func WithPublicGroupRequests() ServerOption {
 // chat.Access the chat and messaging servers share, so a request is gated by
 // exactly what gates the chat it belongs to; chats is read for what Access
 // does not answer (a group's existence, and whether a split's debtors are its
-// members), and accounts for the staff gate on creation.
+// members), and accounts for the staff gate on creation. chatEventBus is the
+// chat-keyed event bus every change is announced on (see PublishCreated).
 func NewServer(
 	log *zap.Logger,
 
@@ -122,6 +131,8 @@ func NewServer(
 	chats chat.Store,
 	access *chat.Access,
 	moderator moderation.Client,
+
+	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent],
 
 	opts ...ServerOption,
 ) *Server {
@@ -135,6 +146,8 @@ func NewServer(
 		chats:     chats,
 		access:    access,
 		moderator: moderator,
+
+		chatEventBus: chatEventBus,
 
 		now: time.Now,
 	}
@@ -178,6 +191,9 @@ func NewServer(
 // are facts about a new request, not this one. A retry that loses a race
 // with its twin is caught by the store's uniqueness condition and answered
 // the same way.
+//
+// Only the write that creates the request announces it (see PublishCreated);
+// a retry answered from the store announces nothing, its twin having done so.
 func (s *Server) CreatePaymentRequest(ctx context.Context, req *paymentrequestpb.CreatePaymentRequestRequest) (*paymentrequestpb.CreatePaymentRequestResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
@@ -308,6 +324,8 @@ func (s *Server) CreatePaymentRequest(ctx context.Context, req *paymentrequestpb
 		log.With(zap.Error(err)).Warn("Failure creating payment request")
 		return nil, status.Error(codes.Internal, "")
 	}
+
+	PublishCreated(s.chatEventBus, r, now)
 
 	return createdResponse(r, now), nil
 }
@@ -690,7 +708,8 @@ func decodePageToken(token *commonpb.PagingToken, chatID *commonpb.ChatId, secti
 // NOT_FOUND, and only its creator may close it (DENIED), whatever their
 // standing in its chat now. Closing a request that is not open, stored final
 // or past its ends_at, is the no-op OK (see Store.Close), answered with the
-// request as it is.
+// request as it is. A real close is announced on the chat's topic (see
+// PublishClosed).
 func (s *Server) ClosePaymentRequest(ctx context.Context, req *paymentrequestpb.ClosePaymentRequestRequest) (*paymentrequestpb.ClosePaymentRequestResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
@@ -715,13 +734,16 @@ func (s *Server) ClosePaymentRequest(ctx context.Context, req *paymentrequestpb.
 	}
 
 	now := s.now()
-	r, _, err = s.requests.Close(ctx, req.PaymentRequestId, now)
+	r, changed, err := s.requests.Close(ctx, req.PaymentRequestId, now)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return &paymentrequestpb.ClosePaymentRequestResponse{Result: paymentrequestpb.ClosePaymentRequestResponse_NOT_FOUND}, nil
 	case err != nil:
 		log.With(zap.Error(err)).Warn("Failure closing payment request")
 		return nil, status.Error(codes.Internal, "")
+	}
+	if changed {
+		PublishClosed(s.chatEventBus, r, now)
 	}
 
 	return &paymentrequestpb.ClosePaymentRequestResponse{
@@ -735,7 +757,8 @@ func (s *Server) ClosePaymentRequest(ctx context.Context, req *paymentrequestpb.
 // (DENIED), and the request must have a share for the user (NOT_A_SHARE). A
 // share already paid, by payment, by hand or from creation, is the no-op OK
 // whatever the request's status; an unpaid share of a request that is not
-// open is NOT_OPEN (see Store.PayShare). No message is posted.
+// open is NOT_OPEN (see Store.PayShare). No message is posted; a real change
+// is announced on the chat's topic (see PublishSharePaid).
 func (s *Server) MarkPaid(ctx context.Context, req *paymentrequestpb.MarkPaidRequest) (*paymentrequestpb.MarkPaidResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
@@ -768,7 +791,7 @@ func (s *Server) MarkPaid(ctx context.Context, req *paymentrequestpb.MarkPaidReq
 		PaidAt: timestamppb.New(now),
 		How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
 	}
-	r, _, err = s.requests.PayShare(ctx, req.PaymentRequestId, req.UserId, paid, now)
+	r, changed, completed, err := s.requests.PayShare(ctx, req.PaymentRequestId, req.UserId, paid, now)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return &paymentrequestpb.MarkPaidResponse{Result: paymentrequestpb.MarkPaidResponse_NOT_FOUND}, nil
@@ -779,6 +802,9 @@ func (s *Server) MarkPaid(ctx context.Context, req *paymentrequestpb.MarkPaidReq
 	case err != nil:
 		log.With(zap.Error(err)).Warn("Failure marking share paid")
 		return nil, status.Error(codes.Internal, "")
+	}
+	if changed {
+		PublishSharePaid(s.chatEventBus, r, req.UserId, completed, now)
 	}
 
 	return &paymentrequestpb.MarkPaidResponse{

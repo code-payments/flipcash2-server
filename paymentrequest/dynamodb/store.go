@@ -312,35 +312,35 @@ func (s *store) GetChatPage(ctx context.Context, chatID *commonpb.ChatId, sectio
 	}
 }
 
-func (s *store) PayShare(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.PaidShare, now time.Time) (*paymentrequest.PaymentRequest, bool, error) {
+func (s *store) PayShare(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.PaidShare, now time.Time) (*paymentrequest.PaymentRequest, bool, bool, error) {
 	if err := paymentrequest.ValidatePaidShare(paid); err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 
 	item, err := s.read(ctx, id)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	backoff := writeBackoffBase
 	for range maxWriteAttempts {
 		r, err := requestFromItem(item)
 		if err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 
 		// The rules are the memory store's, decided on the same helpers.
 		share := r.Share(userID)
 		if share == nil {
-			return nil, false, paymentrequest.ErrNotAShare
+			return nil, false, false, paymentrequest.ErrNotAShare
 		}
 		if err := paymentrequest.ValidatePaymentIntent(r, userID, paid); err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 		if !paymentrequest.PaidShareSupersedes(share.Paid, paid) {
-			return r, false, nil
+			return r, false, false, nil
 		}
 		if paid.GetManual() != nil && !r.IsOpenAt(now) {
-			return nil, false, paymentrequest.ErrNotOpen
+			return nil, false, false, paymentrequest.ErrNotOpen
 		}
 
 		readVersion, readStatus := r.Version, r.Status
@@ -348,13 +348,14 @@ func (s *store) PayShare(ctx context.Context, id *paymentrequestpb.PaymentReques
 		r.Version++
 		details, err := proto.Marshal(r.Split)
 		if err != nil {
-			return nil, false, fmt.Errorf("marshalling split: %w", err)
+			return nil, false, false, fmt.Errorf("marshalling split: %w", err)
 		}
 		ch := &change{set: map[string]types.AttributeValue{
 			attrDetails: avB(details),
 			attrVersion: avNInt(int64(r.Version)),
 		}}
-		if r.Status == paymentrequest.StatusOpen && r.AllSharesPaid() {
+		completed := r.Status == paymentrequest.StatusOpen && r.AllSharesPaid()
+		if completed {
 			closedAt := paid.PaidAt.AsTime()
 			r.Status = paymentrequest.StatusCompleted
 			r.ClosedAt = &closedAt
@@ -363,16 +364,16 @@ func (s *store) PayShare(ctx context.Context, id *paymentrequestpb.PaymentReques
 
 		item, err = s.casWrite(ctx, r.ID, readVersion, readStatus, ch)
 		if err == nil {
-			return r, true, nil
+			return r, true, completed, nil
 		}
 		if !errors.Is(err, errLostRace) {
-			return nil, false, err
+			return nil, false, false, err
 		}
 		if err := wait(ctx, &backoff); err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 	}
-	return nil, false, fmt.Errorf("pay share exhausted retries for payment request %s", hex.EncodeToString(id.GetValue()))
+	return nil, false, false, fmt.Errorf("pay share exhausted retries for payment request %s", hex.EncodeToString(id.GetValue()))
 }
 
 func (s *store) Close(ctx context.Context, id *paymentrequestpb.PaymentRequestId, now time.Time) (*paymentrequest.PaymentRequest, bool, error) {

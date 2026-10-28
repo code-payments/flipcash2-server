@@ -197,7 +197,7 @@ func testStore_GetChatPage_Resolved(t *testing.T, s paymentrequest.Store) {
 		_, _, err = s.Close(ctx, r.ID, now.Add(-10*time.Minute))
 		require.NoError(t, err)
 	}
-	_, _, err = s.PayShare(ctx, completed.ID, debtors[0], manualPaid(now), now)
+	_, _, _, err = s.PayShare(ctx, completed.ID, debtors[0], manualPaid(now), now)
 	require.NoError(t, err)
 
 	elsewhere, _ := newRequest(chat.MustGenerateGroupChatID(), now.Add(time.Hour), 1)
@@ -236,7 +236,7 @@ func testStore_PayShare_Manual(t *testing.T, s paymentrequest.Store) {
 	require.NoError(t, s.Create(ctx, r))
 
 	paid := manualPaid(now)
-	got, changed, err := s.PayShare(ctx, r.ID, debtors[0], paid, now)
+	got, changed, _, err := s.PayShare(ctx, r.ID, debtors[0], paid, now)
 	require.NoError(t, err)
 	require.True(t, changed)
 	require.EqualValues(t, 2, got.Version)
@@ -250,7 +250,7 @@ func testStore_PayShare_Manual(t *testing.T, s paymentrequest.Store) {
 	require.True(t, proto.Equal(paid, stored.Share(debtors[0]).Paid))
 
 	// Marking a share already marked is the no-op.
-	got, changed, err = s.PayShare(ctx, r.ID, debtors[0], manualPaid(now.Add(time.Minute)), now.Add(time.Minute))
+	got, changed, _, err = s.PayShare(ctx, r.ID, debtors[0], manualPaid(now.Add(time.Minute)), now.Add(time.Minute))
 	require.NoError(t, err)
 	require.False(t, changed)
 	require.EqualValues(t, 2, got.Version)
@@ -259,7 +259,7 @@ func testStore_PayShare_Manual(t *testing.T, s paymentrequest.Store) {
 	// A payment replaces the hand mark, at the next version, and then stands:
 	// neither a hand mark nor another payment replaces it.
 	payment := intentPaid(r, debtors[0], now.Add(-time.Second))
-	got, changed, err = s.PayShare(ctx, r.ID, debtors[0], payment, now.Add(time.Minute))
+	got, changed, _, err = s.PayShare(ctx, r.ID, debtors[0], payment, now.Add(time.Minute))
 	require.NoError(t, err)
 	require.True(t, changed)
 	require.EqualValues(t, 3, got.Version)
@@ -267,7 +267,7 @@ func testStore_PayShare_Manual(t *testing.T, s paymentrequest.Store) {
 	require.True(t, proto.Equal(payment, got.Share(debtors[0]).Paid))
 
 	for _, again := range []*paymentrequestpb.PaidShare{manualPaid(now.Add(2 * time.Minute)), intentPaid(r, debtors[0], now.Add(2*time.Minute))} {
-		got, changed, err = s.PayShare(ctx, r.ID, debtors[0], again, now.Add(2*time.Minute))
+		got, changed, _, err = s.PayShare(ctx, r.ID, debtors[0], again, now.Add(2*time.Minute))
 		require.NoError(t, err)
 		require.False(t, changed)
 		require.EqualValues(t, 3, got.Version)
@@ -281,10 +281,10 @@ func testStore_PayShare_Manual(t *testing.T, s paymentrequest.Store) {
 
 	// The creator's own share is paid from creation, so marking it is the
 	// no-op too, and no intent can pay it.
-	_, changed, err = s.PayShare(ctx, r.ID, r.Creator, manualPaid(now), now)
+	_, changed, _, err = s.PayShare(ctx, r.ID, r.Creator, manualPaid(now), now)
 	require.NoError(t, err)
 	require.False(t, changed)
-	_, _, err = s.PayShare(ctx, r.ID, r.Creator, otherIntentPaid(now), now)
+	_, _, _, err = s.PayShare(ctx, r.ID, r.Creator, otherIntentPaid(now), now)
 	require.ErrorIs(t, err, paymentrequest.ErrWrongIntent)
 
 	// A payment by any intent but the share's is refused, whether the share
@@ -298,14 +298,14 @@ func testStore_PayShare_Manual(t *testing.T, s paymentrequest.Store) {
 		{debtors[1], intentPaid(r, debtors[0], now)},
 		{debtors[0], intentPaid(r, debtors[1], now)},
 	} {
-		_, _, err = s.PayShare(ctx, r.ID, wrong.debtor, wrong.paid, now)
+		_, _, _, err = s.PayShare(ctx, r.ID, wrong.debtor, wrong.paid, now)
 		require.ErrorIs(t, err, paymentrequest.ErrWrongIntent)
 	}
 
-	_, _, err = s.PayShare(ctx, r.ID, model.MustGenerateUserID(), manualPaid(now), now)
+	_, _, _, err = s.PayShare(ctx, r.ID, model.MustGenerateUserID(), manualPaid(now), now)
 	require.ErrorIs(t, err, paymentrequest.ErrNotAShare)
 
-	_, _, err = s.PayShare(ctx, newID(), debtors[1], manualPaid(now), now)
+	_, _, _, err = s.PayShare(ctx, newID(), debtors[1], manualPaid(now), now)
 	require.ErrorIs(t, err, paymentrequest.ErrNotFound)
 
 	// A share is never paid as the creator's, nor without saying how or when.
@@ -316,7 +316,7 @@ func testStore_PayShare_Manual(t *testing.T, s paymentrequest.Store) {
 		{PaidAt: timestamppb.New(now), How: &paymentrequestpb.PaidShare_Intent{Intent: &commonpb.IntentId{}}},
 		nil,
 	} {
-		_, _, err = s.PayShare(ctx, r.ID, debtors[1], invalid, now)
+		_, _, _, err = s.PayShare(ctx, r.ID, debtors[1], invalid, now)
 		require.ErrorIs(t, err, paymentrequest.ErrInvalidPaidShare)
 	}
 
@@ -334,16 +334,16 @@ func testStore_PayShare_NotOpen(t *testing.T, s paymentrequest.Store) {
 	// A closed request takes no share marked by hand.
 	closed, debtors := newRequest(chat.MustGenerateGroupChatID(), now.Add(time.Hour), 2)
 	require.NoError(t, s.Create(ctx, closed))
-	_, _, err := s.PayShare(ctx, closed.ID, debtors[0], manualPaid(now), now)
+	_, _, _, err := s.PayShare(ctx, closed.ID, debtors[0], manualPaid(now), now)
 	require.NoError(t, err)
 	_, _, err = s.Close(ctx, closed.ID, now)
 	require.NoError(t, err)
 
-	_, _, err = s.PayShare(ctx, closed.ID, debtors[1], manualPaid(now), now)
+	_, _, _, err = s.PayShare(ctx, closed.ID, debtors[1], manualPaid(now), now)
 	require.ErrorIs(t, err, paymentrequest.ErrNotOpen)
 
 	// A share already paid is still the no-op, whatever the status.
-	got, changed, err := s.PayShare(ctx, closed.ID, debtors[0], manualPaid(now), now)
+	got, changed, _, err := s.PayShare(ctx, closed.ID, debtors[0], manualPaid(now), now)
 	require.NoError(t, err)
 	require.False(t, changed)
 	require.Equal(t, paymentrequest.StatusClosed, got.Status)
@@ -353,7 +353,7 @@ func testStore_PayShare_NotOpen(t *testing.T, s paymentrequest.Store) {
 	// on.
 	ending, debtors := newRequest(chat.MustGenerateGroupChatID(), now.Add(time.Hour), 1)
 	require.NoError(t, s.Create(ctx, ending))
-	_, _, err = s.PayShare(ctx, ending.ID, debtors[0], manualPaid(ending.EndsAt()), ending.EndsAt())
+	_, _, _, err = s.PayShare(ctx, ending.ID, debtors[0], manualPaid(ending.EndsAt()), ending.EndsAt())
 	require.ErrorIs(t, err, paymentrequest.ErrNotOpen)
 
 	stored, err := s.Get(ctx, ending.ID)
@@ -364,7 +364,7 @@ func testStore_PayShare_NotOpen(t *testing.T, s paymentrequest.Store) {
 
 	// Just before its end it does.
 	before := ending.EndsAt().Add(-time.Millisecond)
-	_, changed, err = s.PayShare(ctx, ending.ID, debtors[0], manualPaid(before), before)
+	_, changed, _, err = s.PayShare(ctx, ending.ID, debtors[0], manualPaid(before), before)
 	require.NoError(t, err)
 	require.True(t, changed)
 }
@@ -382,9 +382,10 @@ func testStore_PayShare_Intent(t *testing.T, s paymentrequest.Store) {
 	require.NoError(t, err)
 
 	paid := intentPaid(closed, debtors[0], now.Add(time.Second))
-	got, changed, err := s.PayShare(ctx, closed.ID, debtors[0], paid, now.Add(time.Second))
+	got, changed, completed, err := s.PayShare(ctx, closed.ID, debtors[0], paid, now.Add(time.Second))
 	require.NoError(t, err)
 	require.True(t, changed)
+	require.False(t, completed)
 	require.Equal(t, paymentrequest.StatusClosed, got.Status)
 	require.EqualValues(t, 3, got.Version)
 	require.True(t, now.Equal(*got.ClosedAt))
@@ -396,9 +397,10 @@ func testStore_PayShare_Intent(t *testing.T, s paymentrequest.Store) {
 	ended, debtors := newRequest(chat.MustGenerateGroupChatID(), now.Add(-time.Minute), 1)
 	require.NoError(t, s.Create(ctx, ended))
 	paid = intentPaid(ended, debtors[0], now)
-	got, changed, err = s.PayShare(ctx, ended.ID, debtors[0], paid, now)
+	got, changed, completed, err = s.PayShare(ctx, ended.ID, debtors[0], paid, now)
 	require.NoError(t, err)
 	require.True(t, changed)
+	require.True(t, completed)
 	require.Equal(t, paymentrequest.StatusCompleted, got.Status)
 	require.EqualValues(t, 2, got.Version)
 	require.True(t, now.Equal(*got.ClosedAt))
@@ -411,9 +413,10 @@ func testStore_PayShare_Intent(t *testing.T, s paymentrequest.Store) {
 	require.NoError(t, err)
 	require.True(t, changed)
 
-	got, changed, err = s.PayShare(ctx, expired.ID, debtors[0], intentPaid(expired, debtors[0], now), now)
+	got, changed, completed, err = s.PayShare(ctx, expired.ID, debtors[0], intentPaid(expired, debtors[0], now), now)
 	require.NoError(t, err)
 	require.True(t, changed)
+	require.False(t, completed)
 	require.Equal(t, paymentrequest.StatusExpired, got.Status)
 	require.EqualValues(t, 2, got.Version)
 	require.True(t, expired.EndsAt().Equal(*got.ClosedAt))
@@ -431,17 +434,19 @@ func testStore_PayShare_Completes(t *testing.T, s paymentrequest.Store) {
 	r, debtors := newRequest(chat.MustGenerateGroupChatID(), now.Add(time.Hour), 2)
 	require.NoError(t, s.Create(ctx, r))
 
-	got, _, err := s.PayShare(ctx, r.ID, debtors[0], intentPaid(r, debtors[0], now), now)
+	got, _, completed, err := s.PayShare(ctx, r.ID, debtors[0], intentPaid(r, debtors[0], now), now)
 	require.NoError(t, err)
+	require.False(t, completed)
 	require.Equal(t, paymentrequest.StatusOpen, got.Status)
 	require.Nil(t, got.ClosedAt)
 
 	// The last share completes the request, closed when it was paid, and takes
 	// it off the expiry queue.
 	paidAt := now.Add(time.Minute)
-	got, changed, err := s.PayShare(ctx, r.ID, debtors[1], manualPaid(paidAt), now.Add(2*time.Minute))
+	got, changed, completed, err := s.PayShare(ctx, r.ID, debtors[1], manualPaid(paidAt), now.Add(2*time.Minute))
 	require.NoError(t, err)
 	require.True(t, changed)
+	require.True(t, completed)
 	require.Equal(t, paymentrequest.StatusCompleted, got.Status)
 	require.EqualValues(t, 3, got.Version)
 	require.True(t, paidAt.Equal(*got.ClosedAt))
@@ -484,15 +489,19 @@ func testStore_PayShare_ReplacesManual(t *testing.T, s paymentrequest.Store) {
 	chatID := chat.MustGenerateGroupChatID()
 	completed, debtors := newRequest(chatID, now.Add(time.Hour), 1)
 	require.NoError(t, s.Create(ctx, completed))
-	marked, changed, err := s.PayShare(ctx, completed.ID, debtors[0], manualPaid(now), now)
+	marked, changed, completes, err := s.PayShare(ctx, completed.ID, debtors[0], manualPaid(now), now)
 	require.NoError(t, err)
 	require.True(t, changed)
+	require.True(t, completes)
 	require.Equal(t, paymentrequest.StatusCompleted, marked.Status)
 
+	// The request returned is COMPLETED either way, so only completed tells
+	// that this payment completed nothing.
 	payment := intentPaid(completed, debtors[0], now.Add(-time.Second))
-	got, changed, err := s.PayShare(ctx, completed.ID, debtors[0], payment, now.Add(time.Minute))
+	got, changed, completes, err := s.PayShare(ctx, completed.ID, debtors[0], payment, now.Add(time.Minute))
 	require.NoError(t, err)
 	require.True(t, changed)
+	require.False(t, completes)
 	require.Equal(t, paymentrequest.StatusCompleted, got.Status)
 	require.Equal(t, marked.Version+1, got.Version)
 	require.True(t, marked.ClosedAt.Equal(*got.ClosedAt))
@@ -509,16 +518,17 @@ func testStore_PayShare_ReplacesManual(t *testing.T, s paymentrequest.Store) {
 	// The hand mark was made, then the request closed with a share unpaid.
 	closed, debtors := newRequest(chat.MustGenerateGroupChatID(), now.Add(time.Hour), 2)
 	require.NoError(t, s.Create(ctx, closed))
-	_, _, err = s.PayShare(ctx, closed.ID, debtors[0], manualPaid(now), now)
+	_, _, _, err = s.PayShare(ctx, closed.ID, debtors[0], manualPaid(now), now)
 	require.NoError(t, err)
 	closedNow, changed, err := s.Close(ctx, closed.ID, now)
 	require.NoError(t, err)
 	require.True(t, changed)
 
 	payment = intentPaid(closed, debtors[0], now.Add(-time.Second))
-	got, changed, err = s.PayShare(ctx, closed.ID, debtors[0], payment, now.Add(time.Minute))
+	got, changed, completes, err = s.PayShare(ctx, closed.ID, debtors[0], payment, now.Add(time.Minute))
 	require.NoError(t, err)
 	require.True(t, changed)
+	require.False(t, completes)
 	require.Equal(t, paymentrequest.StatusClosed, got.Status)
 	require.Equal(t, closedNow.Version+1, got.Version)
 	require.True(t, closedNow.ClosedAt.Equal(*got.ClosedAt))
@@ -537,29 +547,35 @@ func testStore_PayShare_Concurrent(t *testing.T, s paymentrequest.Store) {
 	// Every share paid at once, each twice: each lands exactly once, and each
 	// landing advances the version by exactly one.
 	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		changes int
+		wg          sync.WaitGroup
+		mu          sync.Mutex
+		changes     int
+		completions int
 	)
 	for _, debtor := range debtors {
 		for range 2 {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, changed, err := s.PayShare(ctx, r.ID, debtor, intentPaid(r, debtor, now), now)
+				_, changed, completed, err := s.PayShare(ctx, r.ID, debtor, intentPaid(r, debtor, now), now)
 				if !assert.NoError(t, err) {
 					return
 				}
+				assert.False(t, completed && !changed)
+				mu.Lock()
 				if changed {
-					mu.Lock()
 					changes++
-					mu.Unlock()
 				}
+				if completed {
+					completions++
+				}
+				mu.Unlock()
 			}()
 		}
 	}
 	wg.Wait()
 	require.Equal(t, n, changes)
+	require.Equal(t, 1, completions)
 
 	stored, err := s.Get(ctx, r.ID)
 	require.NoError(t, err)
@@ -644,7 +660,7 @@ func testStore_ExpiryQueue(t *testing.T, s paymentrequest.Store) {
 	// Every write that makes a request final dequeues it.
 	_, _, err = s.Close(ctx, closed.ID, now)
 	require.NoError(t, err)
-	_, _, err = s.PayShare(ctx, completed.ID, debtors[0], intentPaid(completed, debtors[0], now), now)
+	_, _, _, err = s.PayShare(ctx, completed.ID, debtors[0], intentPaid(completed, debtors[0], now), now)
 	require.NoError(t, err)
 	_, err = s.Expire(ctx, expired.ID)
 	require.NoError(t, err)
@@ -815,7 +831,7 @@ func testStore_Expire(t *testing.T, s paymentrequest.Store) {
 	now := time.Now().Truncate(time.Millisecond)
 	r, debtors := newRequest(chat.MustGenerateGroupChatID(), now.Add(-time.Minute), 2)
 	require.NoError(t, s.Create(ctx, r))
-	_, _, err := s.PayShare(ctx, r.ID, debtors[0], intentPaid(r, debtors[0], now), now)
+	_, _, _, err := s.PayShare(ctx, r.ID, debtors[0], intentPaid(r, debtors[0], now), now)
 	require.NoError(t, err)
 
 	// Expiry closes the request at its end and moves no version: a reader saw
@@ -888,7 +904,7 @@ func testStore_PaymentIntentIDs(t *testing.T, s paymentrequest.Store) {
 	require.NoError(t, err)
 	requireIntentIDs(got)
 
-	got, _, err = s.PayShare(ctx, r.ID, debtors[0], intentPaid(r, debtors[0], now), now)
+	got, _, _, err = s.PayShare(ctx, r.ID, debtors[0], intentPaid(r, debtors[0], now), now)
 	require.NoError(t, err)
 	requireIntentIDs(got)
 
@@ -900,7 +916,7 @@ func testStore_PaymentIntentIDs(t *testing.T, s paymentrequest.Store) {
 	changed, err := s.Expire(ctx, r.ID)
 	require.NoError(t, err)
 	require.True(t, changed)
-	got, _, err = s.PayShare(ctx, r.ID, debtors[1], intentPaid(r, debtors[1], now), now)
+	got, _, _, err = s.PayShare(ctx, r.ID, debtors[1], intentPaid(r, debtors[1], now), now)
 	require.NoError(t, err)
 	requireIntentIDs(got)
 

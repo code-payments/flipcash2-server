@@ -186,9 +186,8 @@ func GetRequestedPayment(appMetadata []byte) *intentpb.ChatMetadata_RequestedPay
 // cash message names the payer and every recipient in the group, a reaction
 // boost, whose payer is shown on the reaction to the group and whose payees
 // are the group's creator and the message's sender, or a requested payment,
-// whose cash message names the payer and the request's creator in the group.
-// A contact DM
-// payment is not one, since its parties know each other by phone number; nor
+// whose activity entries name the payer and the request's creator. A contact
+// DM payment is not one, since its parties know each other by phone number; nor
 // is a payment carrying no chat metadata, such as one handed off in person,
 // where no identity was exchanged at all.
 func IsUserChatPayment(appMetadata []byte) bool {
@@ -544,11 +543,9 @@ func (i *Integration) validateGroupAppMetadata(ctx context.Context, intentRecord
 // validateRequestedPaymentAppMetadata enforces that a SendPublicPayment
 // carrying chat app metadata is a well-formed requested payment: a payment by
 // a debtor of a payment request of their own unpaid share, exactly, to the
-// request's creator. The task it schedules marks the share paid and posts one
-// cash message into the group as the payer, through the messaging Sender,
-// which no rule gates, so every gate is applied here, before any money moves,
-// rather than by the task, which could only drop the record of a payment
-// already made. A multi payment never carries one (see AllowCreation): a
+// request's creator. The task it schedules marks the share paid, rechecking
+// nothing, so every gate is applied here, before any money moves, rather than
+// by the task, which could only drop the record of a payment already made. A multi payment never carries one (see AllowCreation): a
 // share is paid to one person.
 //
 // The checks, in order:

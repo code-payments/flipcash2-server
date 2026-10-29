@@ -172,7 +172,7 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 // payment, made as either payment intent, the one injected into the group; a
 // reaction boost, made as either payment intent, schedules the task that
 // records the boost; and a requested payment, a SendPublicPayment alone, the
-// task that marks its share paid and posts its cash message. Execution is
+// task that marks its share paid. Execution is
 // handled by task.Executor.
 func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_intent.Record) ([]*ocp_task.Record, error) {
 	if intentRecord.IntentType == ocp_intent.SendPublicMultiPayment {

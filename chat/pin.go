@@ -249,7 +249,9 @@ func ValidatePinChatIDs(chatIDs ...*commonpb.ChatId) error {
 // version: every change up to it is in the page, and one landing between the
 // reads may be too, which a client applying the changes after that version
 // takes as the no-op it is (a pin of a message already shown, an unpin of
-// one already gone). The token binds the page to the chat (see
+// one already gone). A summary counting no pins (a chat never pinned
+// included) skips the page read and returns an empty page, which is the
+// page as of that version. The token binds the page to the chat (see
 // encodePinToken).
 //
 // Every Pin the service returns or publishes carries its message, which the
@@ -455,11 +457,17 @@ func (s *Server) GetPinnedMessages(ctx context.Context, req *chatpb.GetPinnedMes
 		log.With(zap.Error(err)).Warn("Failure reading pin summary")
 		return nil, status.Error(codes.Internal, "")
 	}
-	// One more than the page, for an exact has_more.
-	page, err := s.chats.GetPinsPage(ctx, c.ID, after, limit+1)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure reading pins")
-		return nil, status.Error(codes.Internal, "")
+	summary := summaries[string(c.ID.Value)]
+
+	// No pins as of the summary is an empty page, with no read of the pins.
+	var page []Pin
+	if summary.Count > 0 {
+		// One more than the page, for an exact has_more.
+		page, err = s.chats.GetPinsPage(ctx, c.ID, after, limit+1)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure reading pins")
+			return nil, status.Error(codes.Internal, "")
+		}
 	}
 
 	hasMore := len(page) > limit
@@ -467,7 +475,7 @@ func (s *Server) GetPinnedMessages(ctx context.Context, req *chatpb.GetPinnedMes
 		page = page[:limit]
 	}
 
-	pins, summary, err := s.pinsToProto(ctx, c.ID, reading, nil, page, summaries[string(c.ID.Value)])
+	pins, summaryProto, err := s.pinsToProto(ctx, c.ID, reading, nil, page, summary)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure reading pinned messages")
 		return nil, status.Error(codes.Internal, "")
@@ -476,7 +484,7 @@ func (s *Server) GetPinnedMessages(ctx context.Context, req *chatpb.GetPinnedMes
 	resp := &chatpb.GetPinnedMessagesResponse{
 		Result:     chatpb.GetPinnedMessagesResponse_OK,
 		Pins:       pins,
-		PinSummary: summary,
+		PinSummary: summaryProto,
 		HasMore:    hasMore,
 	}
 	if hasMore {

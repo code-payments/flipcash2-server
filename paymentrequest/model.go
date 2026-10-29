@@ -246,8 +246,8 @@ type PaymentRequest struct {
 	// It is a secret until used, so it is never projected (see ToProto): the
 	// GetPaymentRequest RPC gives a debtor their own while their share is
 	// unpaid, and no one else. Once the share is paid by it, the ID is
-	// public in PaidShare.intent and on the cash message, which costs
-	// nothing, since it can never be used again.
+	// public in PaidShare.intent, which costs nothing, since it can never be
+	// used again.
 	PaymentIntentIDs map[string][]byte
 
 	Status   Status

@@ -1120,23 +1120,6 @@ func (e *groupPaymentEnv) scheduled(t *testing.T, intentRecord *ocp_intent.Recor
 	return tasks[0]
 }
 
-// requireRequestedCash checks that msg is the cash message of a requested
-// payment of r's share by payer, paid by the intent rawIntentID.
-func requireRequestedCash(t *testing.T, msg *messaging.Message, r *paymentrequest.PaymentRequest, payer *commonpb.UserId, rawIntentID []byte) {
-	require.True(t, proto.Equal(payer, msg.SenderID))
-	require.Len(t, msg.Content, 1)
-	cash := msg.Content[0].GetCash()
-	require.NotNil(t, cash)
-	assert.Equal(t, rawIntentID, cash.IntentId.GetValue())
-	assert.EqualValues(t, 25_000, cash.TotalAmount.GetQuarks())
-	assert.Equal(t, "usd", cash.TotalAmount.GetCurrency())
-	assert.EqualValues(t, 2.5, cash.TotalAmount.GetNativeAmount())
-	assert.True(t, proto.Equal(r.Creator, cash.GetSingleReceiver()))
-	assert.True(t, proto.Equal(r.ID, cash.GetPaymentRequestId()))
-	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetVerb())
-	require.NoError(t, cash.ValidateAll())
-}
-
 func TestExecutor_RecordRequestedPayment(t *testing.T) {
 	e := newGroupPaymentEnv(t)
 
@@ -1148,9 +1131,8 @@ func TestExecutor_RecordRequestedPayment(t *testing.T) {
 	r := e.putRequest(t, groupID, creatorUserID, creatorUserID, payerUserID, otherUserID)
 
 	// A validated payment schedules the requested payment task, and executing
-	// it marks the payer's share paid with the payment's intent and posts the
-	// cash message into the group as the payer, to the creator, naming the
-	// request.
+	// it marks the payer's share paid with the payment's intent. No cash
+	// message is posted into the group.
 	intentRecord, rawIntentID := e.payShare(t, r, payerKeys, creatorKeys)
 	task := e.scheduled(t, intentRecord)
 	assert.Equal(t, intent.TaskTypeRecordRequestedPayment, task.Type)
@@ -1170,26 +1152,22 @@ func TestExecutor_RecordRequestedPayment(t *testing.T) {
 
 	msgs, err := e.messages.GetMessages(e.ctx, groupID)
 	require.NoError(t, err)
-	require.Len(t, msgs, 1)
-	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+	require.Empty(t, msgs)
 
 	// The mark is announced on the group's topic: the share as paid, at the
 	// request's new version.
 	updates := e.requestUpdates(t, r, 1)
 	requireSharePaymentUpdate(t, updates[0], stored, payerUserID, false)
 
-	// Tasks are delivered at least once, so re-execution changes neither the
-	// share nor the message, and announces nothing: a change is announced
-	// only by the write that made it.
+	// Tasks are delivered at least once, so re-execution changes nothing and
+	// announces nothing: a change is announced only by the write that made
+	// it.
 	require.NoError(t, e.executor.Execute(e.ctx, task))
 	e.requestUpdates(t, r, 1)
 	again, err := e.requests.Get(e.ctx, r.ID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 2, again.Version)
 	assert.True(t, proto.Equal(paid, again.Share(payerUserID).GetPaid()))
-	msgs, err = e.messages.GetMessages(e.ctx, groupID)
-	require.NoError(t, err)
-	require.Len(t, msgs, 1)
 
 	// The last share paid completes the request, closed when that payment
 	// was made, not when its task ran.
@@ -1208,8 +1186,7 @@ func TestExecutor_RecordRequestedPayment(t *testing.T) {
 
 	msgs, err = e.messages.GetMessages(e.ctx, groupID)
 	require.NoError(t, err)
-	require.Len(t, msgs, 2)
-	requireRequestedCash(t, msgs[1], r, otherUserID, otherIntentID)
+	require.Empty(t, msgs)
 
 	// Announced with the completion it made, after it.
 	updates = e.requestUpdates(t, r, 2)
@@ -1219,7 +1196,7 @@ func TestExecutor_RecordRequestedPayment(t *testing.T) {
 // A second payment of a share made before the first's task has marked it
 // passes validation, which reads the share unpaid, but cannot commit: it must
 // use the share's one payment intent ID, which OCP stores at most once. So
-// the share is paid, and its message posted, once.
+// the share is paid once.
 func TestExecutor_RecordRequestedPayment_OncePerShare(t *testing.T) {
 	e := newGroupPaymentEnv(t)
 
@@ -1246,13 +1223,12 @@ func TestExecutor_RecordRequestedPayment_OncePerShare(t *testing.T) {
 
 	msgs, err := e.messages.GetMessages(e.ctx, groupID)
 	require.NoError(t, err)
-	require.Len(t, msgs, 1)
-	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+	require.Empty(t, msgs)
 }
 
 // A share the creator marks paid by hand between the payment's validation
 // and its task is replaced by the payment, so the record shows the money that
-// arrived, and the payment's message is posted once.
+// arrived.
 func TestExecutor_RecordRequestedPayment_PaidByHand(t *testing.T) {
 	e := newGroupPaymentEnv(t)
 
@@ -1303,13 +1279,12 @@ func TestExecutor_RecordRequestedPayment_PaidByHand(t *testing.T) {
 
 	msgs, err := e.messages.GetMessages(e.ctx, groupID)
 	require.NoError(t, err)
-	require.Len(t, msgs, 1)
-	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+	require.Empty(t, msgs)
 }
 
 // A request closed between the payment's validation and its task still has
-// the share recorded, and stays closed; the message is posted, even if the
-// payer has left the group in between.
+// the share recorded, and stays closed, even if the payer has left the group
+// in between.
 func TestExecutor_RecordRequestedPayment_ClosedSinceValidation(t *testing.T) {
 	e := newGroupPaymentEnv(t)
 
@@ -1342,12 +1317,11 @@ func TestExecutor_RecordRequestedPayment_ClosedSinceValidation(t *testing.T) {
 
 	msgs, err := e.messages.GetMessages(e.ctx, groupID)
 	require.NoError(t, err)
-	require.Len(t, msgs, 1)
-	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+	require.Empty(t, msgs)
 }
 
-// A requested payment task fails, to be retried, rather than mark a share or
-// post a message it cannot make whole: for a payment that is not a requested
+// A requested payment task fails, to be retried, rather than mark a share it
+// cannot make whole: for a payment that is not a requested
 // payment, one to several people, one naming a request that does not exist,
 // or one by a payer with no share.
 func TestExecutor_RecordRequestedPayment_Mismatched(t *testing.T) {
@@ -1400,7 +1374,7 @@ func TestExecutor_RecordRequestedPayment_Mismatched(t *testing.T) {
 
 // A payment of a share already paid under an intent that is not the share's
 // can only come from a path that skipped validation. Its task fails, on every
-// retry, rather than passing as a no-op on the paid share, and posts nothing.
+// retry, rather than passing as a no-op on the paid share.
 func TestExecutor_RecordRequestedPayment_WrongIntentOnPaidShare(t *testing.T) {
 	e := newGroupPaymentEnv(t)
 
@@ -1430,6 +1404,5 @@ func TestExecutor_RecordRequestedPayment_WrongIntentOnPaidShare(t *testing.T) {
 
 	msgs, err := e.messages.GetMessages(e.ctx, groupID)
 	require.NoError(t, err)
-	require.Len(t, msgs, 1)
-	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+	require.Empty(t, msgs)
 }

@@ -47,6 +47,7 @@ import (
 	"github.com/code-payments/flipcash2-server/profile"
 	"github.com/code-payments/flipcash2-server/protoutil"
 	"github.com/code-payments/flipcash2-server/push"
+	"github.com/code-payments/flipcash2-server/redact"
 	"github.com/code-payments/flipcash2-server/testutil"
 )
 
@@ -202,6 +203,18 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_InviteJoin_Refused,
 		testServer_InviteJoin_PublicGroup,
 		testServer_InviteJoin_Creator,
+		testServer_Pin_Gates,
+		testServer_Pin_MessageNotFound,
+		testServer_Pin_ContentKinds,
+		testServer_Pin_Cap,
+		testServer_Pin_Group,
+		testServer_Pin_Dm,
+		testServer_GetPinnedMessages_Paging,
+		testServer_GetPinnedMessages_Reading,
+		testServer_Pin_MissingMessage,
+		testServer_PinSummary_Hydration,
+		testServer_PinSummary_Reading,
+		testServer_PinSummary_MissingMessage,
 	} {
 		tf(t, s)
 		teardown()
@@ -245,6 +258,9 @@ type serverConfig struct {
 
 	// maxActiveInvites, when set, overrides chat.MaxActiveInvites.
 	maxActiveInvites int
+
+	// maxPinnedMessages, when set, overrides chat.MaxPinnedMessages.
+	maxPinnedMessages int
 }
 
 func newServerEnv(t *testing.T, s chat.Store) *serverEnv {
@@ -286,6 +302,9 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	}
 	if cfg.maxActiveInvites > 0 {
 		opts = append(opts, chat.WithMaxActiveInvites(cfg.maxActiveInvites))
+	}
+	if cfg.maxPinnedMessages > 0 {
+		opts = append(opts, chat.WithMaxPinnedMessages(cfg.maxPinnedMessages))
 	}
 	hydrator := chat.NewHydrator(log, blocklist, s, media, messaging, profiles, access.Rules(), teamUserID)
 	server := chat.NewServer(log, authz, accounts, blocklist, s, media, messaging, moderator, profiles, systemMessages, pusher, access, hydrator, userBus, chatBus, cfg.disablePublicGroupRoster, opts...)
@@ -523,9 +542,11 @@ func (f *fakeMedia) ResolveRenditions(_ context.Context, ids []*blobpb.BlobId) (
 
 // fakeMessagingReader is a canned chat.MessagingReader for server tests: it
 // returns whatever last messages, pointers, and head event sequences a test
-// registers per chat.
+// registers per chat, and whatever messages it registers per message (see
+// Messages).
 type fakeMessagingReader struct {
 	lastMessages    map[string]*messagingpb.Message
+	messages        map[chat.MessageKey]*messagingpb.Message
 	pointers        map[string][]*messagingpb.Pointer
 	latestEventSeqs map[string]uint64
 	pointerLookups  map[string]int
@@ -538,6 +559,7 @@ type fakeMessagingReader struct {
 func newFakeMessagingReader() *fakeMessagingReader {
 	return &fakeMessagingReader{
 		lastMessages:    make(map[string]*messagingpb.Message),
+		messages:        make(map[chat.MessageKey]*messagingpb.Message),
 		pointers:        make(map[string][]*messagingpb.Pointer),
 		latestEventSeqs: make(map[string]uint64),
 		pointerLookups:  make(map[string]int),
@@ -555,6 +577,29 @@ func (f *fakeMessagingReader) LastMessages(ctx context.Context, refs []chat.Mess
 		if m, ok := f.lastMessages[string(ref.ChatID.Value)]; ok {
 			out[string(ref.ChatID.Value)] = m
 		}
+	}
+	return out, nil
+}
+
+// Messages returns the registered message for each ref, redacted under a
+// redacted reading as the real reader does (see redact.Message); refs with
+// none registered are absent.
+func (f *fakeMessagingReader) Messages(_ context.Context, refs []chat.MessageRef, reading chat.Reading) (map[chat.MessageKey]*messagingpb.Message, error) {
+	out := make(map[chat.MessageKey]*messagingpb.Message)
+	for _, ref := range refs {
+		key := chat.MessageKeyOf(ref.ChatID, ref.MessageID)
+		m, ok := f.messages[key]
+		if !ok {
+			continue
+		}
+		if reading == chat.ReadingRedacted {
+			redacted, err := redact.Message(ref.ChatID, m)
+			if err != nil {
+				return nil, err
+			}
+			m = redacted
+		}
+		out[key] = m
 	}
 	return out, nil
 }
@@ -4773,13 +4818,13 @@ func muteForever() *chatpb.MuteState {
 	return &chatpb.MuteState{Duration: &chatpb.MuteState_Forever_{Forever: &chatpb.MuteState_Forever{}}}
 }
 
-// viewerState is the ViewerState every carrier projects: the mute under
-// settings (nil for none), the permissions, and the version. isCreator is
-// whether the viewer is the group's creator while a member, which grants
-// can_edit and both moderation permissions together (see
-// chat.Chat.PermissionsFor).
+// viewerState is the ViewerState every carrier projects in a group: the
+// mute under settings (nil for none), the permissions, and the version.
+// isCreator is whether the viewer is the group's creator while a member,
+// which grants can_edit, can_pin and both moderation permissions together
+// (see chat.Chat.PermissionsFor).
 func viewerState(version uint64, mute *chatpb.MuteState, isCreator bool) *chatpb.ViewerState {
-	permissions := &chatpb.ViewerState_Permissions{CanEdit: isCreator}
+	permissions := &chatpb.ViewerState_Permissions{CanEdit: isCreator, CanPin: isCreator}
 	if isCreator {
 		permissions.Moderation = &chatpb.ViewerState_ModerationPermissions{CanSilence: true, CanBan: true}
 	}
@@ -4790,9 +4835,23 @@ func viewerState(version uint64, mute *chatpb.MuteState, isCreator bool) *chatpb
 	}
 }
 
-// memberViewerState is what a member who has never written a record, and
-// may not edit the chat, is shown: the zero record with no permissions.
+// memberViewerState is what a group member who has never written a record,
+// and may not edit the chat, is shown: the zero record with no permissions.
 var memberViewerState = viewerState(0, nil, false)
+
+// dmViewerState is the ViewerState a DM's member is shown: the mute under
+// settings (nil for none) and the version, with can_pin alone among the
+// permissions, since either member of a DM may pin and no one edits or
+// moderates one (see chat.Chat.PermissionsFor).
+func dmViewerState(version uint64, mute *chatpb.MuteState) *chatpb.ViewerState {
+	state := viewerState(version, mute, false)
+	state.Permissions.CanPin = true
+	return state
+}
+
+// dmMemberViewerState is what a DM's member who has never written a record
+// is shown (see dmViewerState).
+var dmMemberViewerState = dmViewerState(0, nil)
 
 // viewerStateUpdatesOnUserTopic returns every ViewerStateChanged for chatID
 // published on userID's topic, in publish order.
@@ -4838,10 +4897,10 @@ func testServer_MuteChat_Lifecycle(t *testing.T, s chat.Store) {
 	chatID := e.putDMWithPeer(chatpb.ChatType_CONTACT_DM, peer, at(1))
 
 	// A chat the viewer has never touched carries the zero state for a member:
-	// no mute, no permissions on a DM, version zero.
+	// no mute, can_pin alone among the permissions on a DM, version zero.
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
-	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, resp.Metadata.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(dmMemberViewerState, resp.Metadata.ViewerState))
 
 	// A timed mute, recorded at second precision, is a first transition. The
 	// end is chosen on a whole second so the sub-second variant below lands
@@ -4849,7 +4908,7 @@ func testServer_MuteChat_Lifecycle(t *testing.T, s chat.Store) {
 	until := time.Now().Add(time.Hour).Truncate(time.Second)
 	muted := e.mustMuteChat(e.keys, chatID, muteUntil(until))
 	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
-	want := viewerState(1, muteUntil(until), false)
+	want := dmViewerState(1, muteUntil(until))
 	require.NoError(t, protoutil.ProtoEqualError(want, muted.ViewerState))
 
 	// The same state is what a read hydrates onto the chat...
@@ -4870,7 +4929,7 @@ func testServer_MuteChat_Lifecycle(t *testing.T, s chat.Store) {
 	// Indefinite where timed was is a real change.
 	muted = e.mustMuteChat(e.keys, chatID, muteForever())
 	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
-	want = viewerState(2, muteForever(), false)
+	want = dmViewerState(2, muteForever())
 	require.NoError(t, protoutil.ProtoEqualError(want, muted.ViewerState))
 	states = e.waitForViewerStateUpdates(e.userID, chatID, 2)
 	require.NoError(t, protoutil.ProtoEqualError(want, states[1]))
@@ -4878,7 +4937,7 @@ func testServer_MuteChat_Lifecycle(t *testing.T, s chat.Store) {
 	// A clear keeps the record and its version, with no mute under settings.
 	unmuted := e.mustUnmuteChat(e.keys, chatID)
 	require.Equal(t, chatpb.UnmuteChatResponse_OK, unmuted.Result)
-	want = viewerState(3, nil, false)
+	want = dmViewerState(3, nil)
 	require.NoError(t, protoutil.ProtoEqualError(want, unmuted.ViewerState))
 	resp = e.getChat(e.keys, chatID)
 	require.NoError(t, protoutil.ProtoEqualError(want, resp.Metadata.ViewerState))
@@ -5014,7 +5073,7 @@ func testServer_MuteChat_Gates(t *testing.T, s chat.Store) {
 		require.Equal(t, codes.InvalidArgument, status.Code(err), "mute %v", mute)
 	}
 	got := e.getChat(e.keys, dm)
-	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, got.Metadata.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(dmMemberViewerState, got.Metadata.ViewerState))
 }
 
 func testServer_LeaveChat_ClearsMute(t *testing.T, s chat.Store) {
@@ -5074,13 +5133,15 @@ func testServer_GetChat_ViewerState_LapsedMuteReturned(t *testing.T, s chat.Stor
 
 	chatID := e.putDM(at(1))
 
-	until := time.Now().Add(time.Second).Truncate(time.Second)
+	// Whole seconds, as a mute is stored, and at least a second away, so the
+	// mute still ends in the future when the request arrives.
+	until := time.Now().Truncate(time.Second).Add(2 * time.Second)
 	muted := e.mustMuteChat(e.keys, chatID, muteUntil(until))
 	require.Equal(t, chatpb.MuteChatResponse_OK, muted.Result)
-	want := viewerState(1, muteUntil(until), false)
+	want := dmViewerState(1, muteUntil(until))
 	require.NoError(t, protoutil.ProtoEqualError(want, muted.ViewerState))
 
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(time.Until(until) + 500*time.Millisecond)
 
 	resp := e.getChat(e.keys, chatID)
 	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
@@ -5088,7 +5149,7 @@ func testServer_GetChat_ViewerState_LapsedMuteReturned(t *testing.T, s chat.Stor
 
 	// Lapsed is still recorded: clearing it is a real transition.
 	unmuted := e.mustUnmuteChat(e.keys, chatID)
-	require.NoError(t, protoutil.ProtoEqualError(viewerState(2, nil, false), unmuted.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(dmViewerState(2, nil), unmuted.ViewerState))
 }
 
 func testServer_GetDmChatFeed_ViewerState(t *testing.T, s chat.Store) {
@@ -5105,9 +5166,9 @@ func testServer_GetDmChatFeed_ViewerState(t *testing.T, s chat.Store) {
 	for _, md := range resp.Chats {
 		byID[string(md.ChatId.Value)] = md
 	}
-	want := viewerState(1, muteForever(), false)
+	want := dmViewerState(1, muteForever())
 	require.NoError(t, protoutil.ProtoEqualError(want, byID[string(mutedDM.Value)].ViewerState))
-	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, byID[string(quietDM.Value)].ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(dmMemberViewerState, byID[string(quietDM.Value)].ViewerState))
 }
 
 // putOwnedGroup persists a group the env user created and is a member of,
@@ -6329,13 +6390,14 @@ func testServer_ViewerState_Permissions(t *testing.T, s chat.Store) {
 
 	canEdit := viewerState(0, nil, true)
 
-	// GetChat: the creator may edit their group and nothing else; another
-	// member and a DM participant may do nothing; a stranger gets no state.
+	// GetChat: the creator may edit, moderate and pin in their group and
+	// nothing else; another member may do nothing; a DM participant may pin
+	// alone; a stranger gets no state.
 	require.NoError(t, protoutil.ProtoEqualError(canEdit, e.getChat(e.keys, owned).Metadata.ViewerState))
 	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, e.getChat(e.keys, plain).Metadata.ViewerState))
-	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, e.getChat(e.keys, dm).Metadata.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(dmMemberViewerState, e.getChat(e.keys, dm).Metadata.ViewerState))
 	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, e.getChat(memberKeys, owned).Metadata.ViewerState))
-	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, e.getChat(memberKeys, dm).Metadata.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(dmMemberViewerState, e.getChat(memberKeys, dm).Metadata.ViewerState))
 	require.Nil(t, e.getChat(strangerKeys, owned).Metadata.ViewerState)
 
 	// The feeds carry the same.
@@ -6350,7 +6412,7 @@ func testServer_ViewerState_Permissions(t *testing.T, s chat.Store) {
 	}
 	dmFeed := e.getDmFeed(&commonpb.QueryOptions{})
 	require.Len(t, dmFeed.Chats, 1)
-	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, dmFeed.Chats[0].ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(dmMemberViewerState, dmFeed.Chats[0].ViewerState))
 
 	// A mute carries the permissions with it, on the response and the update.
 	muted := e.mustMuteChat(e.keys, owned, muteForever())
@@ -9046,4 +9108,774 @@ func testServer_InviteJoin_Creator(t *testing.T, s chat.Store) {
 		requireUserJoinedCall(t, calls[1+i], e.userID, chat.JoinedDirectly(), joined.Chat.RosterSummary.Version)
 	}
 	e.requireInviteUseCount(invite.InviteId, 0)
+}
+
+func (e *serverEnv) pinMessage(keys model.KeyPair, chatID *commonpb.ChatId, messageID uint64) *chatpb.PinMessageResponse {
+	req := &chatpb.PinMessageRequest{ChatId: chatID, MessageId: &messagingpb.MessageId{Value: messageID}}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.PinMessage(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) unpinMessage(keys model.KeyPair, chatID *commonpb.ChatId, messageID uint64) *chatpb.UnpinMessageResponse {
+	resp, err := e.tryUnpinMessage(keys, chatID, messageID)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) tryUnpinMessage(keys model.KeyPair, chatID *commonpb.ChatId, messageID uint64) (*chatpb.UnpinMessageResponse, error) {
+	req := &chatpb.UnpinMessageRequest{ChatId: chatID, MessageId: &messagingpb.MessageId{Value: messageID}}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.UnpinMessage(e.ctx, req)
+}
+
+func (e *serverEnv) getPinnedMessages(keys model.KeyPair, chatID *commonpb.ChatId, mode messagingpb.ViewMode, opts *commonpb.QueryOptions) (*chatpb.GetPinnedMessagesResponse, error) {
+	req := &chatpb.GetPinnedMessagesRequest{ChatId: chatID, ViewMode: mode, QueryOptions: opts}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.GetPinnedMessages(e.ctx, req)
+}
+
+func (e *serverEnv) mustGetPinnedMessages(keys model.KeyPair, chatID *commonpb.ChatId, mode messagingpb.ViewMode, opts *commonpb.QueryOptions) *chatpb.GetPinnedMessagesResponse {
+	resp, err := e.getPinnedMessages(keys, chatID, mode, opts)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// putMessage registers a text message in chatID with the fake messaging
+// reader, as the Messages read returns it, and returns it.
+func (e *serverEnv) putMessage(chatID *commonpb.ChatId, id uint64, sender *commonpb.UserId, text string) *messagingpb.Message {
+	m := textMessage(id, sender, text)
+	e.messaging.messages[chat.MessageKeyOf(chatID, m.MessageId)] = m
+	return m
+}
+
+// putContentMessage registers a message carrying content in chatID with the
+// fake messaging reader, as the Messages read returns it, and returns it.
+func (e *serverEnv) putContentMessage(chatID *commonpb.ChatId, id uint64, sender *commonpb.UserId, content ...*messagingpb.Content) *messagingpb.Message {
+	m := &messagingpb.Message{
+		MessageId:     &messagingpb.MessageId{Value: id},
+		SenderId:      sender,
+		Content:       content,
+		Ts:            timestamppb.New(at(int64(id))),
+		EventSequence: id,
+	}
+	e.messaging.messages[chat.MessageKeyOf(chatID, m.MessageId)] = m
+	return m
+}
+
+// deleteMessage replaces a registered message with its tombstone, as the
+// Messages read returns a deleted message.
+func (e *serverEnv) deleteMessage(chatID *commonpb.ChatId, id uint64) {
+	key := chat.MessageKeyOf(chatID, &messagingpb.MessageId{Value: id})
+	m := e.messaging.messages[key]
+	require.NotNil(e.t, m)
+	e.messaging.messages[key] = &messagingpb.Message{
+		MessageId: m.MessageId,
+		SenderId:  m.SenderId,
+		Content: []*messagingpb.Content{{Type: &messagingpb.Content_Deleted{
+			Deleted: &messagingpb.DeletedContent{DeletedTs: timestamppb.Now()},
+		}}},
+		Ts:            m.Ts,
+		EventSequence: m.EventSequence,
+	}
+}
+
+// pinsChangedOnChatTopic returns every PinsChanged published on chatID's
+// topic, paired with the users each publish excluded, in publish order.
+func (e *serverEnv) pinsChangedOnChatTopic(chatID *commonpb.ChatId) (changes []*chatpb.MetadataUpdate_PinsChanged, excludes [][]*commonpb.UserId) {
+	for _, ev := range e.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, chatID.Value) }) {
+		require.Equal(e.t, chatID.Value, ev.Event.Event.GetChatUpdate().GetChat().GetValue())
+		for _, md := range ev.Event.Event.GetChatUpdate().GetMetadataUpdates() {
+			if change := md.GetPinsChanged(); change != nil {
+				changes = append(changes, change)
+				excludes = append(excludes, ev.Event.ExcludeUserIds)
+			}
+		}
+	}
+	return changes, excludes
+}
+
+// pinsChangedOnUserTopic returns every PinsChanged for chatID published on
+// userID's topic, in publish order.
+func (e *serverEnv) pinsChangedOnUserTopic(userID *commonpb.UserId, chatID *commonpb.ChatId) []*chatpb.MetadataUpdate_PinsChanged {
+	var changes []*chatpb.MetadataUpdate_PinsChanged
+	for _, ev := range e.userObserver.GetEvents(func(k *commonpb.UserId) bool { return bytes.Equal(k.Value, userID.Value) }) {
+		update := ev.Event.GetChatUpdate()
+		if !bytes.Equal(update.GetChat().GetValue(), chatID.Value) {
+			continue
+		}
+		for _, md := range update.GetMetadataUpdates() {
+			if change := md.GetPinsChanged(); change != nil {
+				changes = append(changes, change)
+			}
+		}
+	}
+	return changes
+}
+
+// waitForGroupPinsChanged waits for n PinsChanged on chatID's topic, gives
+// the bus a moment to deliver any more, and returns exactly n, none of them
+// excluding anyone, with none for the group on any user topic.
+func (e *serverEnv) waitForGroupPinsChanged(chatID *commonpb.ChatId, n int, users ...*commonpb.UserId) []*chatpb.MetadataUpdate_PinsChanged {
+	if n > 0 {
+		e.chatObserver.WaitFor(e.t, func([]*event.KeyAndEvent[*commonpb.ChatId, *eventpb.ChatEvent]) bool {
+			changes, _ := e.pinsChangedOnChatTopic(chatID)
+			return len(changes) >= n
+		})
+	}
+	time.Sleep(100 * time.Millisecond)
+	changes, excludes := e.pinsChangedOnChatTopic(chatID)
+	require.Len(e.t, changes, n)
+	for _, excluded := range excludes {
+		require.Empty(e.t, excluded)
+	}
+	for _, userID := range users {
+		require.Empty(e.t, e.pinsChangedOnUserTopic(userID, chatID))
+	}
+	return changes
+}
+
+// waitForDmPinsChanged waits for n PinsChanged for chatID on userID's topic,
+// gives the bus a moment to deliver any more, and returns exactly n, with
+// none on the chat's topic.
+func (e *serverEnv) waitForDmPinsChanged(userID *commonpb.UserId, chatID *commonpb.ChatId, n int) []*chatpb.MetadataUpdate_PinsChanged {
+	if n > 0 {
+		e.userObserver.WaitFor(e.t, func([]*event.KeyAndEvent[*commonpb.UserId, *eventpb.Event]) bool {
+			return len(e.pinsChangedOnUserTopic(userID, chatID)) >= n
+		})
+	}
+	time.Sleep(100 * time.Millisecond)
+	changes := e.pinsChangedOnUserTopic(userID, chatID)
+	require.Len(e.t, changes, n)
+	onChat, _ := e.pinsChangedOnChatTopic(chatID)
+	require.Empty(e.t, onChat)
+	return changes
+}
+
+// requirePinProto asserts a pin names messageID, was made by pinnedBy, and
+// carries want as its message.
+func requirePinProto(t *testing.T, pin *chatpb.Pin, want *messagingpb.Message, pinnedBy *commonpb.UserId) {
+	t.Helper()
+	require.NotNil(t, pin)
+	require.Equal(t, want.MessageId.Value, pin.MessageId.Value)
+	require.Equal(t, pinnedBy.Value, pin.PinnedBy.Value)
+	require.NotNil(t, pin.PinnedAt)
+	require.NoError(t, protoutil.ProtoEqualError(want, pin.Message))
+}
+
+// requirePinSummaryProto asserts a summary's count and version, and that its
+// latest pin carries latest as its message (nil for no latest pin).
+func requirePinSummaryProto(t *testing.T, summary *chatpb.PinSummary, count uint32, version uint64, latest *messagingpb.Message, pinnedBy *commonpb.UserId) {
+	t.Helper()
+	require.NotNil(t, summary)
+	require.Equal(t, count, summary.Count)
+	require.Equal(t, version, summary.Version)
+	if latest == nil {
+		require.Nil(t, summary.Latest)
+		return
+	}
+	requirePinProto(t, summary.Latest, latest, pinnedBy)
+}
+
+// testServer_Pin_Gates pins who may pin and unpin (see
+// ViewerState.Permissions.can_pin): either member of a DM, a group's creator
+// while a member, and no one else.
+func testServer_Pin_Gates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	peerID, peerKeys := e.addUser()
+	memberID, memberKeys := e.addUser()
+	_, strangerKeys := e.addUser()
+
+	dm := e.putDMWithPeer(chatpb.ChatType_DM, peerID, at(1))
+	e.putMessage(dm, 1, e.userID, "hi")
+	owned := e.putOwnedGroup("Owned", nil, memberID)
+	e.putMessage(owned, 1, memberID, "hello")
+
+	// can_pin says who may.
+	require.True(t, e.getChat(e.keys, dm).Metadata.ViewerState.Permissions.CanPin)
+	require.True(t, e.getChat(peerKeys, dm).Metadata.ViewerState.Permissions.CanPin)
+	require.True(t, e.getChat(e.keys, owned).Metadata.ViewerState.Permissions.CanPin)
+	require.False(t, e.getChat(memberKeys, owned).Metadata.ViewerState.Permissions.CanPin)
+
+	// Either member of a DM pins and unpins, whoever pinned.
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, dm, 1).Result)
+	require.Equal(t, chatpb.UnpinMessageResponse_OK, e.unpinMessage(peerKeys, dm, 1).Result)
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(peerKeys, dm, 1).Result)
+
+	// A group's creator pins; another member may not, nor unpin.
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, owned, 1).Result)
+	require.Equal(t, chatpb.PinMessageResponse_DENIED, e.pinMessage(memberKeys, owned, 1).Result)
+	require.Equal(t, chatpb.UnpinMessageResponse_DENIED, e.unpinMessage(memberKeys, owned, 1).Result)
+
+	// A non-member may not, a DM included, and is told so before the message
+	// is looked at.
+	require.Equal(t, chatpb.PinMessageResponse_DENIED, e.pinMessage(strangerKeys, dm, 1).Result)
+	require.Equal(t, chatpb.UnpinMessageResponse_DENIED, e.unpinMessage(strangerKeys, dm, 1).Result)
+	require.Equal(t, chatpb.PinMessageResponse_DENIED, e.pinMessage(strangerKeys, owned, 99).Result)
+	require.Equal(t, chatpb.UnpinMessageResponse_DENIED, e.unpinMessage(strangerKeys, owned, 1).Result)
+
+	// A legacy group with no recorded creator is pinned by no one.
+	plain := e.putGroup("Plain", at(1), memberID)
+	e.putMessage(plain, 1, memberID, "hey")
+	require.Equal(t, chatpb.PinMessageResponse_DENIED, e.pinMessage(e.keys, plain, 1).Result)
+	require.False(t, e.getChat(e.keys, plain).Metadata.ViewerState.Permissions.CanPin)
+
+	// A departed creator pins nothing until they rejoin.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, owned).Result)
+	require.Equal(t, chatpb.PinMessageResponse_DENIED, e.pinMessage(e.keys, owned, 1).Result)
+	require.Equal(t, chatpb.UnpinMessageResponse_DENIED, e.unpinMessage(e.keys, owned, 1).Result)
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, owned).Result)
+	require.Equal(t, chatpb.UnpinMessageResponse_OK, e.unpinMessage(e.keys, owned, 1).Result)
+
+	// A chat that does not exist is NOT_FOUND, a DM's ID or a group's.
+	for _, missing := range []*commonpb.ChatId{chat.MustGenerateGroupChatID(), generateDmChatID()} {
+		require.Equal(t, chatpb.PinMessageResponse_NOT_FOUND, e.pinMessage(e.keys, missing, 1).Result)
+		require.Equal(t, chatpb.UnpinMessageResponse_NOT_FOUND, e.unpinMessage(e.keys, missing, 1).Result)
+		require.Equal(t, chatpb.GetPinnedMessagesResponse_NOT_FOUND, e.mustGetPinnedMessages(e.keys, missing, messagingpb.ViewMode_FULL, nil).Result)
+	}
+}
+
+// testServer_Pin_MessageNotFound pins that only a message in the chat may be
+// pinned, that a deleted message, a system message or content of no known
+// kind may not, and that a refusal writes and publishes nothing.
+func testServer_Pin_MessageNotFound(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	memberID, _ := e.addUser()
+	owned := e.putOwnedGroup("Owned", nil, memberID)
+	other := e.putOwnedGroup("Other", nil, memberID)
+	e.putMessage(owned, 1, memberID, "hello")
+	e.putMessage(other, 2, memberID, "elsewhere")
+	e.putContentMessage(owned, 3, nil, &messagingpb.Content{Type: &messagingpb.Content_System{
+		System: &messagingpb.SystemContent{FallbackText: "A new member joined the group"},
+	}})
+	e.putContentMessage(owned, 4, memberID, &messagingpb.Content{})
+	e.putContentMessage(owned, 5, memberID)
+	e.putContentMessage(owned, 6, memberID,
+		&messagingpb.Content{Type: &messagingpb.Content_Text{Text: &messagingpb.TextContent{Text: "hi"}}},
+		&messagingpb.Content{Type: &messagingpb.Content_System{System: &messagingpb.SystemContent{FallbackText: "x"}}},
+	)
+
+	// Never sent, or sent in another chat.
+	require.Equal(t, chatpb.PinMessageResponse_MESSAGE_NOT_FOUND, e.pinMessage(e.keys, owned, 7).Result)
+	require.Equal(t, chatpb.PinMessageResponse_MESSAGE_NOT_FOUND, e.pinMessage(e.keys, owned, 2).Result)
+
+	// A system message, content of no known kind, no content, or a known kind
+	// alongside one that is not.
+	for _, id := range []uint64{3, 4, 5, 6} {
+		require.Equal(t, chatpb.PinMessageResponse_MESSAGE_NOT_ALLOWED, e.pinMessage(e.keys, owned, id).Result, id)
+	}
+
+	// Deleted.
+	e.deleteMessage(owned, 1)
+	require.Equal(t, chatpb.PinMessageResponse_MESSAGE_NOT_ALLOWED, e.pinMessage(e.keys, owned, 1).Result)
+
+	resp := e.mustGetPinnedMessages(e.keys, owned, messagingpb.ViewMode_FULL, nil)
+	require.Equal(t, chatpb.GetPinnedMessagesResponse_OK, resp.Result)
+	require.Empty(t, resp.Pins)
+	requirePinSummaryProto(t, resp.PinSummary, 0, 0, nil, nil)
+	e.waitForGroupPinsChanged(owned, 0)
+}
+
+// testServer_Pin_ContentKinds pins that a message of every kind on the
+// allowlist may be pinned, whatever its content.
+func testServer_Pin_ContentKinds(t *testing.T, s chat.Store) {
+	e := newServerEnvWithConfig(t, s, serverConfig{maxPinnedMessages: 10})
+	peerID, _ := e.addUser()
+	dm := e.putDMWithPeer(chatpb.ChatType_DM, peerID, at(1))
+
+	text := &messagingpb.Content{Type: &messagingpb.Content_Text{Text: &messagingpb.TextContent{Text: "hi"}}}
+	blobID := &blobpb.BlobId{Value: bytes.Repeat([]byte{7}, 16)}
+	kinds := []*messagingpb.Content{
+		text,
+		{Type: &messagingpb.Content_Cash{Cash: &messagingpb.CashContent{
+			IntentId: &commonpb.IntentId{Value: bytes.Repeat([]byte{1}, 32)},
+			TotalAmount: &commonpb.CryptoPaymentAmount{
+				Currency:     "usd",
+				NativeAmount: 1,
+				Quarks:       1_000_000,
+				Mint:         &commonpb.PublicKey{Value: bytes.Repeat([]byte{2}, 32)},
+			},
+			Recipient: &messagingpb.CashContent_SingleReceiver{SingleReceiver: peerID},
+		}}},
+		{Type: &messagingpb.Content_Reply{Reply: &messagingpb.ReplyContent{
+			RepliedMessageId: &messagingpb.MessageId{Value: 1},
+			Content:          []*messagingpb.Content{text},
+		}}},
+		{Type: &messagingpb.Content_Media{Media: &messagingpb.MediaContent{
+			Items: []*blobpb.Media{{Renditions: []*blobpb.Rendition{{
+				Role:   blobpb.Rendition_ORIGINAL,
+				BlobId: blobID,
+				Blob: &blobpb.BlobMetadata{
+					MimeType:  "image/jpeg",
+					SizeBytes: 1024,
+					DownloadUrl: &blobpb.DownloadUrl{
+						Url:       "https://cdn.blobs.test/" + hex.EncodeToString(blobID.Value),
+						ExpiresAt: timestamppb.New(at(1).Add(time.Hour)),
+					},
+				},
+			}}}},
+		}}},
+		{Type: &messagingpb.Content_Encrypted{Encrypted: &messagingpb.EncryptedContent{
+			Scheme:     messagingpb.EncryptedContent_X25519_XCHACHA20POLY1305,
+			Nonce:      bytes.Repeat([]byte{3}, 24),
+			Ciphertext: bytes.Repeat([]byte{4}, 32),
+		}}},
+		{Type: &messagingpb.Content_Widget{Widget: &messagingpb.WidgetContent{
+			Type: &messagingpb.WidgetContent_ShareProfile{ShareProfile: &messagingpb.ShareProfileWidget{
+				Username: &commonpb.Username{Value: "someone"},
+			}},
+		}}},
+	}
+	for i, c := range kinds {
+		id := uint64(i + 1)
+		e.putContentMessage(dm, id, e.userID, c)
+		require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, dm, id).Result, c)
+	}
+
+	resp := e.mustGetPinnedMessages(e.keys, dm, messagingpb.ViewMode_FULL, nil)
+	require.Equal(t, chatpb.GetPinnedMessagesResponse_OK, resp.Result)
+	require.Len(t, resp.Pins, len(kinds))
+}
+
+// testServer_Pin_Cap pins the cap on a chat's pins: a pin past it is
+// TOO_MANY_PINS, and unpinning one makes room.
+func testServer_Pin_Cap(t *testing.T, s chat.Store) {
+	e := newServerEnvWithConfig(t, s, serverConfig{maxPinnedMessages: 2})
+	peerID, _ := e.addUser()
+	dm := e.putDMWithPeer(chatpb.ChatType_DM, peerID, at(1))
+	for id := uint64(1); id <= 3; id++ {
+		e.putMessage(dm, id, e.userID, "hi")
+	}
+
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, dm, 1).Result)
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, dm, 2).Result)
+	require.Equal(t, chatpb.PinMessageResponse_TOO_MANY_PINS, e.pinMessage(e.keys, dm, 3).Result)
+
+	// A message already pinned is the no-op at the cap, not a refusal.
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, dm, 2).Result)
+
+	require.Equal(t, chatpb.UnpinMessageResponse_OK, e.unpinMessage(e.keys, dm, 1).Result)
+	resp := e.pinMessage(e.keys, dm, 3)
+	require.Equal(t, chatpb.PinMessageResponse_OK, resp.Result)
+	require.Equal(t, uint32(2), resp.PinSummary.Count)
+	e.waitForDmPinsChanged(e.userID, dm, 4)
+}
+
+// testServer_Pin_Group follows a group's pins through pins, unpins and their
+// no-ops: each response carries the summary with its latest pin's message,
+// and each real change, and nothing else, is published once on the chat
+// topic, excluding no one.
+func testServer_Pin_Group(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	memberID, _ := e.addUser()
+	owned := e.putOwnedGroup("Owned", nil, memberID)
+	first := e.putMessage(owned, 1, memberID, "first")
+	second := e.putMessage(owned, 2, e.userID, "second")
+
+	pinned := e.pinMessage(e.keys, owned, 1)
+	require.Equal(t, chatpb.PinMessageResponse_OK, pinned.Result)
+	requirePinSummaryProto(t, pinned.PinSummary, 1, 1, first, e.userID)
+	changes := e.waitForGroupPinsChanged(owned, 1, e.userID, memberID)
+	requirePinProto(t, changes[0].GetPinned(), first, e.userID)
+	require.NoError(t, protoutil.ProtoEqualError(pinned.PinSummary, changes[0].Summary))
+
+	// Pinning it again is the no-op: same summary, nothing published.
+	again := e.pinMessage(e.keys, owned, 1)
+	require.Equal(t, chatpb.PinMessageResponse_OK, again.Result)
+	require.NoError(t, protoutil.ProtoEqualError(pinned.PinSummary, again.PinSummary))
+	e.waitForGroupPinsChanged(owned, 1)
+
+	pinned = e.pinMessage(e.keys, owned, 2)
+	require.Equal(t, chatpb.PinMessageResponse_OK, pinned.Result)
+	requirePinSummaryProto(t, pinned.PinSummary, 2, 2, second, e.userID)
+	changes = e.waitForGroupPinsChanged(owned, 2)
+	requirePinProto(t, changes[1].GetPinned(), second, e.userID)
+	require.NoError(t, protoutil.ProtoEqualError(pinned.PinSummary, changes[1].Summary))
+
+	// Unpinning the latest makes the one before it the latest, carrying its
+	// message.
+	unpinned := e.unpinMessage(e.keys, owned, 2)
+	require.Equal(t, chatpb.UnpinMessageResponse_OK, unpinned.Result)
+	requirePinSummaryProto(t, unpinned.PinSummary, 1, 3, first, e.userID)
+	changes = e.waitForGroupPinsChanged(owned, 3)
+	require.Equal(t, uint64(2), changes[2].GetUnpinned().GetValue())
+	require.NoError(t, protoutil.ProtoEqualError(unpinned.PinSummary, changes[2].Summary))
+
+	// Unpinning a message that is not pinned, or was never sent, is the
+	// no-op, with nothing published.
+	for _, id := range []uint64{2, 99} {
+		resp := e.unpinMessage(e.keys, owned, id)
+		require.Equal(t, chatpb.UnpinMessageResponse_OK, resp.Result)
+		require.NoError(t, protoutil.ProtoEqualError(unpinned.PinSummary, resp.PinSummary))
+	}
+	e.waitForGroupPinsChanged(owned, 3)
+
+	// The last unpin leaves no latest.
+	unpinned = e.unpinMessage(e.keys, owned, 1)
+	require.Equal(t, chatpb.UnpinMessageResponse_OK, unpinned.Result)
+	requirePinSummaryProto(t, unpinned.PinSummary, 0, 4, nil, nil)
+	changes = e.waitForGroupPinsChanged(owned, 4)
+	require.Equal(t, uint64(1), changes[3].GetUnpinned().GetValue())
+	requirePinSummaryProto(t, changes[3].Summary, 0, 4, nil, nil)
+}
+
+// testServer_Pin_Dm pins a DM's events: each real change reaches both
+// members on their user topics, the caller included, and never the Flipcash
+// team account, which is never delivered to.
+func testServer_Pin_Dm(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	peerID, peerKeys := e.addUser()
+	dm := e.putDMWithPeer(chatpb.ChatType_DM, peerID, at(1))
+	msg := e.putMessage(dm, 1, peerID, "pin me")
+
+	pinned := e.pinMessage(peerKeys, dm, 1)
+	require.Equal(t, chatpb.PinMessageResponse_OK, pinned.Result)
+	requirePinSummaryProto(t, pinned.PinSummary, 1, 1, msg, peerID)
+	for _, userID := range []*commonpb.UserId{e.userID, peerID} {
+		changes := e.waitForDmPinsChanged(userID, dm, 1)
+		requirePinProto(t, changes[0].GetPinned(), msg, peerID)
+		require.NoError(t, protoutil.ProtoEqualError(pinned.PinSummary, changes[0].Summary))
+	}
+
+	require.Equal(t, chatpb.UnpinMessageResponse_OK, e.unpinMessage(e.keys, dm, 1).Result)
+	for _, userID := range []*commonpb.UserId{e.userID, peerID} {
+		changes := e.waitForDmPinsChanged(userID, dm, 2)
+		require.Equal(t, uint64(1), changes[1].GetUnpinned().GetValue())
+	}
+
+	// In a DM with the team account the user's devices hear of it and the
+	// team's do not.
+	teamDM := e.putDMWithPeer(chatpb.ChatType_DM, e.teamUserID, at(2))
+	e.putMessage(teamDM, 1, e.teamUserID, "welcome")
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, teamDM, 1).Result)
+	e.waitForDmPinsChanged(e.userID, teamDM, 1)
+	require.Empty(t, e.pinsChangedOnUserTopic(e.teamUserID, teamDM))
+}
+
+// testServer_GetPinnedMessages_Paging pages a chat's pins most recently
+// pinned first, each with its message, the summary on every page, and a
+// token bound to the chat.
+func testServer_GetPinnedMessages_Paging(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	memberID, memberKeys := e.addUser()
+	owned := e.putOwnedGroup("Owned", nil, memberID)
+	other := e.putOwnedGroup("Other", nil, memberID)
+	var messages []*messagingpb.Message
+	for id := uint64(1); id <= 5; id++ {
+		messages = append(messages, e.putMessage(owned, id, memberID, fmt.Sprintf("message %d", id)))
+		require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, owned, id).Result)
+	}
+
+	// Every member may read the pins, not only who may pin.
+	var (
+		got   []*chatpb.Pin
+		token *commonpb.PagingToken
+	)
+	for page := 0; ; page++ {
+		resp := e.mustGetPinnedMessages(memberKeys, owned, messagingpb.ViewMode_FULL, &commonpb.QueryOptions{PageSize: 2, PagingToken: token})
+		require.Equal(t, chatpb.GetPinnedMessagesResponse_OK, resp.Result)
+		requirePinSummaryProto(t, resp.PinSummary, 5, 5, messages[4], e.userID)
+		got = append(got, resp.Pins...)
+		if !resp.HasMore {
+			require.Nil(t, resp.PagingToken)
+			require.Len(t, resp.Pins, 1)
+			require.Equal(t, 2, page)
+			break
+		}
+		require.Len(t, resp.Pins, 2)
+		require.NotNil(t, resp.PagingToken)
+		token = resp.PagingToken
+	}
+	require.Len(t, got, 5)
+	for i, pin := range got {
+		requirePinProto(t, pin, messages[4-i], e.userID)
+	}
+
+	// With no page size the whole list fits one page.
+	resp := e.mustGetPinnedMessages(e.keys, owned, messagingpb.ViewMode_FULL, nil)
+	require.Len(t, resp.Pins, 5)
+	require.False(t, resp.HasMore)
+
+	// A token minted for one chat is refused for another.
+	first := e.mustGetPinnedMessages(e.keys, owned, messagingpb.ViewMode_FULL, &commonpb.QueryOptions{PageSize: 2})
+	require.True(t, first.HasMore)
+	_, err := e.getPinnedMessages(e.keys, other, messagingpb.ViewMode_FULL, &commonpb.QueryOptions{PagingToken: first.PagingToken})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = e.getPinnedMessages(e.keys, owned, messagingpb.ViewMode_FULL, &commonpb.QueryOptions{PagingToken: &commonpb.PagingToken{Value: []byte{1, 2, 3}}})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	// A pinned message deleted since is shown as its tombstone.
+	e.deleteMessage(owned, 5)
+	resp = e.mustGetPinnedMessages(e.keys, owned, messagingpb.ViewMode_FULL, &commonpb.QueryOptions{PageSize: 1})
+	require.Equal(t, chatpb.GetPinnedMessagesResponse_OK, resp.Result)
+	require.NotNil(t, resp.Pins[0].Message.Content[0].GetDeleted())
+	require.NotNil(t, resp.PinSummary.Latest.Message.Content[0].GetDeleted())
+
+	// A DM's pins page the same way, to its members alone.
+	peerID, peerKeys := e.addUser()
+	_, strangerKeys := e.addUser()
+	dm := e.putDMWithPeer(chatpb.ChatType_DM, peerID, at(1))
+	dmMessage := e.putMessage(dm, 1, peerID, "dm")
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(peerKeys, dm, 1).Result)
+	resp = e.mustGetPinnedMessages(e.keys, dm, messagingpb.ViewMode_FULL, nil)
+	require.Equal(t, chatpb.GetPinnedMessagesResponse_OK, resp.Result)
+	require.Len(t, resp.Pins, 1)
+	requirePinProto(t, resp.Pins[0], dmMessage, peerID)
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		require.Equal(t, chatpb.GetPinnedMessagesResponse_DENIED, e.mustGetPinnedMessages(strangerKeys, dm, mode, nil).Result)
+	}
+}
+
+// testServer_GetPinnedMessages_Reading pins that pins are read as the chat's
+// messages are (see messaging's GetMessages): a public group's non-member who
+// may not read it in full gets them redacted where the mode allows it and is
+// DENIED under FULL, and a private group's non-member is DENIED under every
+// mode.
+func testServer_GetPinnedMessages_Reading(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	founderID, founderKeys := e.addUser()
+	group := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{founderID},
+		CreatorID:              founderID,
+		Title:                  "Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: 100},
+		LastActivity:           at(1),
+	}
+	require.NoError(t, s.PutChat(e.ctx, group))
+	const secret = "meet at the old bank at six"
+	msg := e.putMessage(group.ID, 1, founderID, secret)
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(founderKeys, group.ID, 1).Result)
+
+	// The env user has no account and so fails the listener rules.
+	require.Equal(t, chatpb.GetPinnedMessagesResponse_DENIED, e.mustGetPinnedMessages(e.keys, group.ID, messagingpb.ViewMode_FULL, nil).Result)
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		resp := e.mustGetPinnedMessages(e.keys, group.ID, mode, nil)
+		require.Equal(t, chatpb.GetPinnedMessagesResponse_OK, resp.Result)
+		require.Len(t, resp.Pins, 1)
+		for _, m := range []*messagingpb.Message{resp.Pins[0].Message, resp.PinSummary.Latest.Message} {
+			require.True(t, m.Redacted)
+			require.Equal(t, msg.MessageId.Value, m.MessageId.Value)
+			require.NotEqual(t, secret, m.Content[0].GetText().GetText())
+		}
+	}
+
+	// A member reads them in full, and redacted only on request.
+	resp := e.mustGetPinnedMessages(founderKeys, group.ID, messagingpb.ViewMode_FULL, nil)
+	require.Equal(t, chatpb.GetPinnedMessagesResponse_OK, resp.Result)
+	requirePinProto(t, resp.Pins[0], msg, founderID)
+	resp = e.mustGetPinnedMessages(founderKeys, group.ID, messagingpb.ViewMode_REDACTED, nil)
+	require.True(t, resp.Pins[0].Message.Redacted)
+
+	// A private group's non-member is denied under every mode.
+	memberID, memberKeys := e.addUser()
+	private := e.putKeyedPrivateGroup("Private", memberID)
+	e.putMessage(private, 1, memberID, "ciphertext")
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, private, 1).Result)
+	_, strangerKeys := e.addUser()
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		require.Equal(t, chatpb.GetPinnedMessagesResponse_DENIED, e.mustGetPinnedMessages(strangerKeys, private, mode, nil).Result)
+	}
+	resp = e.mustGetPinnedMessages(memberKeys, private, messagingpb.ViewMode_FULL, nil)
+	require.Equal(t, chatpb.GetPinnedMessagesResponse_OK, resp.Result)
+	require.Len(t, resp.Pins, 1)
+}
+
+// testServer_Pin_MissingMessage pins the rule that every Pin carries its
+// message: a pinned message the read does not return fails the call that
+// would show it with Internal, and the calls that show it not are unaffected.
+func testServer_Pin_MissingMessage(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	memberID, _ := e.addUser()
+	owned := e.putOwnedGroup("Owned", nil, memberID)
+	e.putMessage(owned, 1, memberID, "first")
+	e.putMessage(owned, 2, memberID, "second")
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, owned, 1).Result)
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, owned, 2).Result)
+	e.waitForGroupPinsChanged(owned, 2)
+
+	// The latest pin's message goes missing from the read.
+	delete(e.messaging.messages, chat.MessageKeyOf(owned, &messagingpb.MessageId{Value: 2}))
+
+	_, err := e.getPinnedMessages(e.keys, owned, messagingpb.ViewMode_FULL, nil)
+	require.Equal(t, codes.Internal, status.Code(err))
+
+	// An unpin that leaves it the latest lands, but cannot show its summary,
+	// and so publishes nothing either.
+	_, err = e.tryUnpinMessage(e.keys, owned, 1)
+	require.Equal(t, codes.Internal, status.Code(err))
+	e.waitForGroupPinsChanged(owned, 2)
+
+	// Unpinning it leaves nothing missing to show.
+	resp := e.unpinMessage(e.keys, owned, 2)
+	require.Equal(t, chatpb.UnpinMessageResponse_OK, resp.Result)
+	requirePinSummaryProto(t, resp.PinSummary, 0, 4, nil, nil)
+	e.waitForGroupPinsChanged(owned, 3)
+}
+
+// testServer_PinSummary_Hydration pins Metadata.pin_summary on the chat's
+// full-detail carriers: the zero summary while nothing is pinned, then the
+// summary with its latest pin's message as pins and unpins move it, a deleted
+// latest as its tombstone, and never on a feed, which may omit it.
+func testServer_PinSummary_Hydration(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	memberID, memberKeys := e.addUser()
+	peerID, peerKeys := e.addUser()
+	owned := e.putOwnedGroup("Owned", nil, memberID)
+	dm := e.putDMWithPeer(chatpb.ChatType_DM, peerID, at(1))
+
+	// Nothing pinned: the zero summary, for a group and a DM alike.
+	requirePinSummaryProto(t, e.getChat(e.keys, owned).Metadata.PinSummary, 0, 0, nil, nil)
+	requirePinSummaryProto(t, e.getChat(memberKeys, owned).Metadata.PinSummary, 0, 0, nil, nil)
+	requirePinSummaryProto(t, e.getChat(e.keys, dm).Metadata.PinSummary, 0, 0, nil, nil)
+
+	first := e.putMessage(owned, 1, memberID, "first")
+	second := e.putMessage(owned, 2, e.userID, "second")
+	dmMessage := e.putMessage(dm, 1, peerID, "dm")
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, owned, 1).Result)
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, owned, 2).Result)
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(peerKeys, dm, 1).Result)
+
+	// GetChat carries the summary, its latest with its message, to every
+	// member.
+	for _, keys := range []model.KeyPair{e.keys, memberKeys} {
+		requirePinSummaryProto(t, e.getChat(keys, owned).Metadata.PinSummary, 2, 2, second, e.userID)
+	}
+	for _, keys := range []model.KeyPair{e.keys, peerKeys} {
+		requirePinSummaryProto(t, e.getChat(keys, dm).Metadata.PinSummary, 1, 1, dmMessage, peerID)
+	}
+
+	// So does every other full-detail carrier: an edit and a join.
+	title := "Renamed"
+	edited := e.mustEditChat(e.keys, owned, &title, nil)
+	require.Equal(t, chatpb.EditChatResponse_OK, edited.Result)
+	requirePinSummaryProto(t, edited.Chat.PinSummary, 2, 2, second, e.userID)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(memberKeys, owned).Result)
+	joined := e.mustJoinChat(memberKeys, owned)
+	require.Equal(t, chatpb.JoinChatResponse_OK, joined.Result)
+	requirePinSummaryProto(t, joined.Chat.PinSummary, 2, 2, second, e.userID)
+
+	// The feeds are list views, and carry none.
+	groups := e.mustGetGroupFeed(&commonpb.QueryOptions{})
+	require.Len(t, groups.Chats, 1)
+	require.Equal(t, owned.Value, groups.Chats[0].ChatId.Value)
+	require.Nil(t, groups.Chats[0].PinSummary)
+	dms, err := e.getDmFeedOfType(chatpb.ChatType_DM, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Len(t, dms.Chats, 1)
+	require.Equal(t, dm.Value, dms.Chats[0].ChatId.Value)
+	require.Nil(t, dms.Chats[0].PinSummary)
+
+	// Unpins move it: the one before becomes the latest, then none is left.
+	require.Equal(t, chatpb.UnpinMessageResponse_OK, e.unpinMessage(e.keys, owned, 2).Result)
+	requirePinSummaryProto(t, e.getChat(e.keys, owned).Metadata.PinSummary, 1, 3, first, e.userID)
+	require.Equal(t, chatpb.UnpinMessageResponse_OK, e.unpinMessage(e.keys, owned, 1).Result)
+	requirePinSummaryProto(t, e.getChat(e.keys, owned).Metadata.PinSummary, 0, 4, nil, nil)
+
+	// A latest pinned message deleted since is shown as its tombstone.
+	e.deleteMessage(dm, 1)
+	summary := e.getChat(e.keys, dm).Metadata.PinSummary
+	require.Equal(t, uint32(1), summary.Count)
+	require.NotNil(t, summary.Latest.Message.Content[0].GetDeleted())
+}
+
+// testServer_PinSummary_Reading pins that the pin summary is messaging state:
+// shown to whoever may read the chat's messages, its latest message redacted
+// under a redacted reading, the unauthenticated public view's included, and
+// withheld with the rest of the messaging state from a viewer whose reading
+// is denied.
+func testServer_PinSummary_Reading(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	founderID, founderKeys := e.addUser()
+	group := &chat.Chat{
+		ID:                     chat.MustGenerateGroupChatID(),
+		Type:                   chatpb.ChatType_GROUP,
+		Members:                []*commonpb.UserId{founderID},
+		CreatorID:              founderID,
+		Title:                  "Whales",
+		MinimumListenerBalance: &chat.MinimumBalance{Currency: "usd", NativeAmount: 100},
+		LastActivity:           at(1),
+	}
+	require.NoError(t, s.PutChat(e.ctx, group))
+	const secret = "meet at the old bank at six"
+	msg := e.putMessage(group.ID, 1, founderID, secret)
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(founderKeys, group.ID, 1).Result)
+
+	requireRedacted := func(summary *chatpb.PinSummary) {
+		t.Helper()
+		require.NotNil(t, summary)
+		require.Equal(t, uint32(1), summary.Count)
+		require.Equal(t, uint64(1), summary.Version)
+		require.Equal(t, msg.MessageId.Value, summary.Latest.MessageId.Value)
+		require.Equal(t, founderID.Value, summary.Latest.PinnedBy.Value)
+		require.True(t, summary.Latest.Message.Redacted)
+		require.Equal(t, msg.MessageId.Value, summary.Latest.Message.MessageId.Value)
+		require.NotEqual(t, secret, summary.Latest.Message.Content[0].GetText().GetText())
+	}
+
+	// The env user has no account and so fails the listener rules: under
+	// FULL their reading is denied, and the record comes with no summary.
+	resp := e.getChatWithMode(e.keys, group.ID, messagingpb.ViewMode_FULL)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Nil(t, resp.Metadata.PinSummary)
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		resp := e.getChatWithMode(e.keys, group.ID, mode)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+		requireRedacted(resp.Metadata.PinSummary)
+	}
+
+	// The public view is a redacted read.
+	resp = e.getPublicChat(group.ID, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	requireRedacted(resp.Metadata.PinSummary)
+
+	// A member reads it in full, and redacted only on request.
+	requirePinSummaryProto(t, e.getChat(founderKeys, group.ID).Metadata.PinSummary, 1, 1, msg, founderID)
+	requireRedacted(e.getChatWithMode(founderKeys, group.ID, messagingpb.ViewMode_REDACTED).Metadata.PinSummary)
+
+	// A private group's non-member, signed in or not, is shown the record
+	// alone; its members, the summary.
+	memberID, memberKeys := e.addUser()
+	private := e.putKeyedPrivateGroup("Private", memberID)
+	privateMessage := e.putMessage(private, 1, memberID, "ciphertext")
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, private, 1).Result)
+	_, strangerKeys := e.addUser()
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		resp := e.getChatWithMode(strangerKeys, private, mode)
+		require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+		require.Nil(t, resp.Metadata.PinSummary)
+	}
+	resp = e.getPublicChat(private, messagingpb.ViewMode_REDACTED)
+	require.Equal(t, chatpb.GetChatResponse_OK, resp.Result)
+	require.Nil(t, resp.Metadata.PinSummary)
+	requirePinSummaryProto(t, e.getChat(memberKeys, private).Metadata.PinSummary, 1, 1, privateMessage, e.userID)
+}
+
+// testServer_PinSummary_MissingMessage pins the rule that every Pin carries
+// its message on a chat's metadata too: a latest pinned message the read does
+// not return fails GetChat with Internal, and a feed, which shows no summary,
+// is unaffected.
+func testServer_PinSummary_MissingMessage(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	memberID, _ := e.addUser()
+	owned := e.putOwnedGroup("Owned", nil, memberID)
+	e.putMessage(owned, 1, memberID, "first")
+	require.Equal(t, chatpb.PinMessageResponse_OK, e.pinMessage(e.keys, owned, 1).Result)
+
+	delete(e.messaging.messages, chat.MessageKeyOf(owned, &messagingpb.MessageId{Value: 1}))
+
+	req := &chatpb.GetChatRequest{ChatId: owned}
+	require.NoError(t, e.keys.Auth(req, &req.Auth))
+	_, err := e.client.GetChat(e.ctx, req)
+	require.Equal(t, codes.Internal, status.Code(err))
+
+	feed := e.mustGetGroupFeed(&commonpb.QueryOptions{})
+	require.Len(t, feed.Chats, 1)
+	require.Nil(t, feed.Chats[0].PinSummary)
+
+	// Unpinning it leaves nothing missing to show.
+	require.Equal(t, chatpb.UnpinMessageResponse_OK, e.unpinMessage(e.keys, owned, 1).Result)
+	requirePinSummaryProto(t, e.getChat(e.keys, owned).Metadata.PinSummary, 0, 2, nil, nil)
 }

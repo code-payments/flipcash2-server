@@ -3,6 +3,8 @@ package messaging
 import (
 	"context"
 
+	"go.uber.org/zap"
+
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
@@ -10,17 +12,21 @@ import (
 )
 
 // chatMessagingReader adapts a messaging Store to chat.MessagingReader, the read
-// slice the Chat service uses to hydrate feed metadata. It lives here (rather
-// than in chat) because chat must not import messaging; messaging already
-// depends on chat, so the adapter sits on this side of the boundary.
+// slice the Chat service uses to hydrate feed metadata and to show the
+// messages it has chosen (see Messages). It lives here (rather than in chat)
+// because chat must not import messaging; messaging already depends on chat,
+// so the adapter sits on this side of the boundary.
 type chatMessagingReader struct {
+	log   *zap.Logger
 	store Store
+	media Media
 }
 
 // NewChatMessagingReader returns a chat.MessagingReader backed by the given
-// messaging store, for wiring the Chat service.
-func NewChatMessagingReader(store Store) chat.MessagingReader {
-	return &chatMessagingReader{store: store}
+// messaging store, resolving media through the given Media as the Messaging
+// service's reads do, for wiring the Chat service.
+func NewChatMessagingReader(log *zap.Logger, store Store, media Media) chat.MessagingReader {
+	return &chatMessagingReader{log: log, store: store, media: media}
 }
 
 func (r *chatMessagingReader) LastMessages(ctx context.Context, refs []chat.MessageRef) (map[string]*messagingpb.Message, error) {
@@ -41,6 +47,34 @@ func (r *chatMessagingReader) LastMessages(ctx context.Context, refs []chat.Mess
 	out := make(map[string]*messagingpb.Message, len(msgs))
 	for _, m := range msgs {
 		out[string(m.ChatID.Value)] = m.ToProto()
+	}
+	return out, nil
+}
+
+// Messages reads the refs in one batch and presents them exactly as the
+// Messaging service's reads do (see presentMessages).
+func (r *chatMessagingReader) Messages(ctx context.Context, refs []chat.MessageRef, reading chat.Reading) (map[chat.MessageKey]*messagingpb.Message, error) {
+	if len(refs) == 0 {
+		return map[chat.MessageKey]*messagingpb.Message{}, nil
+	}
+
+	storeRefs := make([]MessageRef, len(refs))
+	for i, ref := range refs {
+		storeRefs[i] = MessageRef{ChatID: ref.ChatID, MessageID: ref.MessageID}
+	}
+
+	msgs, err := r.store.GetMessagesByRefs(ctx, storeRefs)
+	if err != nil {
+		return nil, err
+	}
+	protos, err := presentMessages(ctx, r.log, r.media, reading, msgs)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[chat.MessageKey]*messagingpb.Message, len(protos))
+	for i, p := range protos {
+		out[chat.MessageKeyOf(msgs[i].ChatID, p.MessageId)] = p
 	}
 	return out, nil
 }

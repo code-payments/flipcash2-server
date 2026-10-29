@@ -30,6 +30,18 @@ type MessageRef struct {
 	MessageID *messagingpb.MessageId
 }
 
+// MessageKey is a message's identity across chats as a map key: its chat's
+// ID, as string(chatID.Value), and its ID within the chat.
+type MessageKey struct {
+	ChatID    string
+	MessageID uint64
+}
+
+// MessageKeyOf returns the key of a chat's message.
+func MessageKeyOf(chatID *commonpb.ChatId, messageID *messagingpb.MessageId) MessageKey {
+	return MessageKey{ChatID: string(chatID.GetValue()), MessageID: messageID.GetValue()}
+}
+
 // PointerRef names a chat and the members whose pointers to hydrate. The feed
 // builds one ref per chat — a DM's members, or the viewer alone in a group
 // (see hydrate) — to batch the pointer lookup across the page.
@@ -46,6 +58,17 @@ type MessagingReader interface {
 	// LastMessages returns the message for each ref that exists, keyed by
 	// string(chatID.Value). Refs without a message are absent from the map.
 	LastMessages(ctx context.Context, refs []MessageRef) (map[string]*messagingpb.Message, error)
+
+	// Messages returns the message for each ref that exists, across any
+	// number of chats and any number per chat, keyed by MessageKeyOf, as a
+	// read under reading returns it: media resolved and, for a redacted
+	// reading, every message redacted, exactly as the Messaging service's own
+	// reads (the caller has decided the reading from the viewer's standing).
+	// Refs without a message are absent from the map; a deleted message is
+	// returned as its tombstone. The read is eventually consistent, so a
+	// message sent a moment ago may be absent. It returns an error when a
+	// message cannot be redacted.
+	Messages(ctx context.Context, refs []MessageRef, reading Reading) (map[MessageKey]*messagingpb.Message, error)
 
 	// Pointers returns the delivered/read pointers for the members named in each
 	// ref, keyed by string(chatID.Value). Chats with no matching pointers are
@@ -268,6 +291,11 @@ type Server struct {
 	// WithMaxActiveInvites to exercise the refusal cheaply.
 	maxActiveInvites int
 
+	// maxPinnedMessages caps the messages one chat may have pinned (see
+	// pin.go). MaxPinnedMessages in production; tests lower it with
+	// WithMaxPinnedMessages to exercise the refusal cheaply.
+	maxPinnedMessages int
+
 	chatpb.UnimplementedChatServer
 }
 
@@ -287,6 +315,14 @@ func WithLobbyLimits(limits LobbyLimits) ServerOption {
 func WithMaxActiveInvites(n int) ServerOption {
 	return func(s *Server) {
 		s.maxActiveInvites = n
+	}
+}
+
+// WithMaxPinnedMessages overrides MaxPinnedMessages, the most messages one
+// chat may have pinned (see Store.PinMessage). n must be at least one.
+func WithMaxPinnedMessages(n int) ServerOption {
+	return func(s *Server) {
+		s.maxPinnedMessages = n
 	}
 }
 
@@ -344,6 +380,7 @@ func NewServer(
 		rosterWholeReadCap: rosterWholeReadCap,
 		lobbyLimits:        DefaultLobbyLimits,
 		maxActiveInvites:   MaxActiveInvites,
+		maxPinnedMessages:  MaxPinnedMessages,
 	}
 	for _, opt := range opts {
 		opt(s)

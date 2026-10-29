@@ -1259,6 +1259,34 @@ func testChatPreview(t *testing.T, accounts account.Store) {
 	}
 	receiveAll(publish(testEnv.server1, newMessageSentEvent(group, member, 5, "after the request")), fullStreams, redactedStreams)
 
+	// A pin reaches a full preview as it is, and a redacted one with the
+	// pinned message redacted, both where it is made and as the summary's
+	// latest, and everything else about the pin as it was.
+	pinned := publish(testEnv.server2, pinsChangedEvent(group, member, 1, "pin these words"))
+	for _, streamer := range fullStreams {
+		receiveFull(streamer, pinned)
+	}
+	sentChange := pinned.GetChatUpdate().GetMetadataUpdates()[0].GetPinsChanged()
+	for _, streamer := range redactedStreams {
+		got := receiveNextEvents(t, streamer)
+		require.Len(t, got, 1)
+		require.NoError(t, protoutil.ProtoEqualError(pinned.Id, got[0].Id))
+		updates := got[0].GetChatUpdate().GetMetadataUpdates()
+		require.Len(t, updates, 1)
+		gotChange := updates[0].GetPinsChanged()
+		require.NotNil(t, gotChange)
+		require.Equal(t, sentChange.Summary.Count, gotChange.Summary.Count)
+		require.Equal(t, sentChange.Summary.Version, gotChange.Summary.Version)
+		for _, pin := range []*chatpb.Pin{gotChange.GetPinned(), gotChange.Summary.Latest} {
+			require.NotNil(t, pin)
+			require.NoError(t, protoutil.ProtoEqualError(sentChange.GetPinned().MessageId, pin.MessageId))
+			require.NoError(t, protoutil.ProtoEqualError(sentChange.GetPinned().PinnedBy, pin.PinnedBy))
+			require.NoError(t, protoutil.ProtoEqualError(sentChange.GetPinned().PinnedAt, pin.PinnedAt))
+			require.True(t, pin.Message.GetRedacted())
+			require.NotEqual(t, "pin these words", pin.Message.GetContent()[0].GetText().GetText())
+		}
+	}
+
 	// The standing is the open's: staff who lose their flag mid-window keep
 	// their full previews until the window closes, and are refused a new
 	// one; other, who joins mid-window, keeps their redacted previews too,
@@ -1441,6 +1469,41 @@ func newMessageSentEvent(chatID *commonpb.ChatId, sender *commonpb.UserId, seq u
 					EventSequence: seq,
 				}}}},
 			}}},
+		}},
+	}
+	if err := e.Validate(); err != nil {
+		panic(err)
+	}
+	return e
+}
+
+// pinsChangedEvent builds a chat update carrying the pin of message seq, a
+// text message sent and pinned by member, as the chat's first and only pin.
+func pinsChangedEvent(chatID *commonpb.ChatId, member *commonpb.UserId, seq uint64, text string) *eventpb.Event {
+	pinnedAt, sentAt := time.Now(), time.Now()
+	pin := func() *chatpb.Pin {
+		return &chatpb.Pin{
+			MessageId: &messagingpb.MessageId{Value: seq},
+			PinnedBy:  member,
+			PinnedAt:  timestamppb.New(pinnedAt),
+			Message: &messagingpb.Message{
+				MessageId:     &messagingpb.MessageId{Value: seq},
+				SenderId:      member,
+				Content:       []*messagingpb.Content{{Type: &messagingpb.Content_Text{Text: &messagingpb.TextContent{Text: text}}}},
+				Ts:            timestamppb.New(sentAt),
+				EventSequence: seq,
+			},
+		}
+	}
+	e := &eventpb.Event{
+		Id: model.MustGenerateEventID(),
+		Ts: timestamppb.Now(),
+		Type: &eventpb.Event_ChatUpdate{ChatUpdate: &eventpb.ChatUpdate{
+			Chat: chatID,
+			MetadataUpdates: []*chatpb.MetadataUpdate{{Kind: &chatpb.MetadataUpdate_PinsChanged_{PinsChanged: &chatpb.MetadataUpdate_PinsChanged{
+				Change:  &chatpb.MetadataUpdate_PinsChanged_Pinned{Pinned: pin()},
+				Summary: &chatpb.PinSummary{Latest: pin(), Count: 1, Version: 1},
+			}}}},
 		}},
 	}
 	if err := e.Validate(); err != nil {

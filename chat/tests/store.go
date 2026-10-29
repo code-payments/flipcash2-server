@@ -138,6 +138,18 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_InviteJoin_Status,
 		testStore_InviteJoin_Banned,
 		testStore_InviteJoin_Lobby,
+		testStore_Pin_Empty,
+		testStore_Pin_PinAndGet,
+		testStore_Pin_RepinNoOp,
+		testStore_Pin_Order,
+		testStore_Pin_LatestByPosition,
+		testStore_Pin_Unpin,
+		testStore_Pin_UnpinThenRepin,
+		testStore_Pin_Cap,
+		testStore_Pin_Invalid,
+		testStore_Pin_ChatsIndependent,
+		testStore_Pin_ConcurrentCap,
+		testStore_Pin_ConcurrentSameMessage,
 		testStore_InviteJoin_Envelope,
 		testStore_InviteJoin_Revoke,
 		testStore_InviteJoin_Concurrent,
@@ -6535,4 +6547,575 @@ func testStore_InviteJoin_RaceBan(t *testing.T, s chat.Store) {
 		require.True(t, states[string(groupID.Value)].IsBanned())
 		requireLobbyFreed(t, s, groupID, user)
 	})
+}
+
+// RunPinStoreTests runs the shared tests of a chat.Store's pins (see
+// chat.Pin) against s, alone. They are part of RunStoreTests; this runs them
+// for a store with no wrapper of its own for the whole suite, such as the
+// cache over memory. teardown is called between tests to reset the store;
+// every test names chats of its own, so a store that shares storage with
+// another is safe.
+func RunPinStoreTests(t *testing.T, s chat.Store, teardown func()) {
+	for _, tf := range []func(t *testing.T, s chat.Store){
+		testStore_Pin_Empty,
+		testStore_Pin_PinAndGet,
+		testStore_Pin_RepinNoOp,
+		testStore_Pin_Order,
+		testStore_Pin_LatestByPosition,
+		testStore_Pin_Unpin,
+		testStore_Pin_UnpinThenRepin,
+		testStore_Pin_Cap,
+		testStore_Pin_Invalid,
+		testStore_Pin_ChatsIndependent,
+		testStore_Pin_ConcurrentCap,
+		testStore_Pin_ConcurrentSameMessage,
+	} {
+		tf(t, s)
+		teardown()
+	}
+}
+
+// pinAt is a pin time with nanoseconds, so a store that dropped precision
+// would be caught.
+func pinAt(seconds int64) time.Time {
+	return time.Unix(1_700_000_000+seconds, 123_456_789).UTC()
+}
+
+func messageID(v uint64) *messagingpb.MessageId {
+	return &messagingpb.MessageId{Value: v}
+}
+
+// requirePin checks that got is want exactly: its message, its pinner, and
+// its time to the nanosecond, in UTC.
+func requirePin(t *testing.T, want, got chat.Pin) {
+	t.Helper()
+	require.NotNil(t, got.MessageID)
+	require.Equal(t, want.MessageID.Value, got.MessageID.Value)
+	require.NotNil(t, got.PinnedBy)
+	require.Equal(t, want.PinnedBy.Value, got.PinnedBy.Value)
+	require.Equal(t, want.PinnedAt, got.PinnedAt)
+}
+
+// requirePinSummary checks a summary against the latest pin expected (nil
+// for none), the count and the version.
+func requirePinSummary(t *testing.T, got chat.PinSummary, latest *chat.Pin, count uint32, version uint64) {
+	t.Helper()
+	require.Equal(t, count, got.Count)
+	require.Equal(t, version, got.Version)
+	if latest == nil {
+		require.Nil(t, got.Latest)
+		return
+	}
+	require.NotNil(t, got.Latest)
+	requirePin(t, *latest, *got.Latest)
+}
+
+// requireStoredPinSummary checks the summary GetPinSummaries reads for the
+// chat, as requirePinSummary does.
+func requireStoredPinSummary(t *testing.T, s chat.Store, chatID *commonpb.ChatId, latest *chat.Pin, count uint32, version uint64) {
+	t.Helper()
+	summaries, err := s.GetPinSummaries(context.Background(), []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	got, ok := summaries[string(chatID.Value)]
+	require.True(t, ok)
+	requirePinSummary(t, got, latest, count, version)
+}
+
+// requirePins checks that the chat's pins, read whole, are want in order.
+func requirePins(t *testing.T, s chat.Store, chatID *commonpb.ChatId, want ...chat.Pin) {
+	t.Helper()
+	got, err := s.GetPinsPage(context.Background(), chatID, nil, 0)
+	require.NoError(t, err)
+	require.Len(t, got, len(want))
+	for i := range want {
+		requirePin(t, want[i], got[i])
+	}
+}
+
+// pinMessage pins pin in chatID under maxPins, requiring it to be a real
+// pin.
+func pinMessage(t *testing.T, s chat.Store, chatID *commonpb.ChatId, pin chat.Pin, maxPins int) chat.PinSummary {
+	t.Helper()
+	summary, changed, err := s.PinMessage(context.Background(), chatID, pin.MessageID, pin.PinnedBy, pin.PinnedAt, maxPins)
+	require.NoError(t, err)
+	require.True(t, changed)
+	return summary
+}
+
+func testStore_Pin_Empty(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	for _, chatID := range []*commonpb.ChatId{generateDmChatID(), chat.MustGenerateGroupChatID()} {
+		// A chat that has never had a pin is absent from the summaries.
+		summaries, err := s.GetPinSummaries(ctx, []*commonpb.ChatId{chatID})
+		require.NoError(t, err)
+		require.Empty(t, summaries)
+
+		page, err := s.GetPinsPage(ctx, chatID, nil, 10)
+		require.NoError(t, err)
+		require.Empty(t, page)
+
+		// Unpinning in it is a no-op that creates nothing.
+		summary, changed, err := s.UnpinMessage(ctx, chatID, messageID(1))
+		require.NoError(t, err)
+		require.False(t, changed)
+		requirePinSummary(t, summary, nil, 0, 0)
+		summaries, err = s.GetPinSummaries(ctx, []*commonpb.ChatId{chatID})
+		require.NoError(t, err)
+		require.Empty(t, summaries)
+	}
+
+	summaries, err := s.GetPinSummaries(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, summaries)
+}
+
+func testStore_Pin_PinAndGet(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	for _, chatID := range []*commonpb.ChatId{generateDmChatID(), chat.MustGenerateGroupChatID()} {
+		pin := chat.Pin{MessageID: messageID(7), PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(10)}
+		summary := pinMessage(t, s, chatID, pin, chat.MaxPinnedMessages)
+		requirePinSummary(t, summary, &pin, 1, 1)
+		requireStoredPinSummary(t, s, chatID, &pin, 1, 1)
+		requirePins(t, s, chatID, pin)
+	}
+
+	// A time in another zone, or with a monotonic reading, is recorded as
+	// the same instant in UTC.
+	chatID := chat.MustGenerateGroupChatID()
+	local := pinAt(20).In(time.FixedZone("x", 3600))
+	pinnedBy := model.MustGenerateUserID()
+	summary, changed, err := s.PinMessage(ctx, chatID, messageID(1), pinnedBy, local, chat.MaxPinnedMessages)
+	require.NoError(t, err)
+	require.True(t, changed)
+	want := chat.Pin{MessageID: messageID(1), PinnedBy: pinnedBy, PinnedAt: pinAt(20)}
+	requirePinSummary(t, summary, &want, 1, 1)
+
+	chatID = chat.MustGenerateGroupChatID()
+	now := time.Now()
+	_, changed, err = s.PinMessage(ctx, chatID, messageID(1), pinnedBy, now, chat.MaxPinnedMessages)
+	require.NoError(t, err)
+	require.True(t, changed)
+	requirePins(t, s, chatID, chat.Pin{MessageID: messageID(1), PinnedBy: pinnedBy, PinnedAt: chat.PinTime(now)})
+}
+
+func testStore_Pin_RepinNoOp(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	chatID := chat.MustGenerateGroupChatID()
+
+	a := chat.Pin{MessageID: messageID(1), PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(1)}
+	b := chat.Pin{MessageID: messageID(2), PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(2)}
+	pinMessage(t, s, chatID, a, 2)
+	pinMessage(t, s, chatID, b, 2)
+
+	// Pinning a again, by someone else and later, changes nothing: a keeps
+	// its time, its pinner and its place below b, and the version holds. The
+	// chat is at the cap, and a lower one, which the no-op is judged before.
+	for _, maxPins := range []int{chat.MaxPinnedMessages, 2, 1} {
+		summary, changed, err := s.PinMessage(ctx, chatID, a.MessageID, model.MustGenerateUserID(), pinAt(3), maxPins)
+		require.NoError(t, err)
+		require.False(t, changed)
+		requirePinSummary(t, summary, &b, 2, 2)
+	}
+	requireStoredPinSummary(t, s, chatID, &b, 2, 2)
+	requirePins(t, s, chatID, b, a)
+
+	// The latest pinned again is a no-op too.
+	summary, changed, err := s.PinMessage(ctx, chatID, b.MessageID, b.PinnedBy, pinAt(4), 2)
+	require.NoError(t, err)
+	require.False(t, changed)
+	requirePinSummary(t, summary, &b, 2, 2)
+	requirePins(t, s, chatID, b, a)
+}
+
+func testStore_Pin_Order(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	chatID := chat.MustGenerateGroupChatID()
+	pinnedBy := model.MustGenerateUserID()
+
+	// Pinned out of order, with three pins at one instant.
+	pins := []chat.Pin{
+		{MessageID: messageID(10), PinnedBy: pinnedBy, PinnedAt: pinAt(5)},
+		{MessageID: messageID(3), PinnedBy: pinnedBy, PinnedAt: pinAt(9)},
+		{MessageID: messageID(4), PinnedBy: pinnedBy, PinnedAt: pinAt(7)},
+		{MessageID: messageID(8), PinnedBy: pinnedBy, PinnedAt: pinAt(7)},
+		{MessageID: messageID(1), PinnedBy: pinnedBy, PinnedAt: pinAt(1)},
+		{MessageID: messageID(6), PinnedBy: pinnedBy, PinnedAt: pinAt(7)},
+	}
+	const maxPins = 10
+	for _, pin := range pins {
+		pinMessage(t, s, chatID, pin, maxPins)
+	}
+
+	// Most recently pinned first, the tie at 7 by message ID descending.
+	want := []chat.Pin{pins[1], pins[3], pins[5], pins[2], pins[0], pins[4]}
+	requirePins(t, s, chatID, want...)
+	requireStoredPinSummary(t, s, chatID, &want[0], uint32(len(want)), uint64(len(want)))
+
+	// Each page resumes strictly after the last pin of the one before,
+	// whatever its size.
+	for _, limit := range []int{1, 2, 4, len(want), len(want) + 5} {
+		var got []chat.Pin
+		var after *chat.PinPosition
+		for {
+			page, err := s.GetPinsPage(ctx, chatID, after, limit)
+			require.NoError(t, err)
+			require.LessOrEqual(t, len(page), limit)
+			if len(page) == 0 {
+				break
+			}
+			got = append(got, page...)
+			pos := page[len(page)-1].Position()
+			after = &pos
+		}
+		require.Len(t, got, len(want))
+		for i := range want {
+			requirePin(t, want[i], got[i])
+		}
+	}
+
+	// A cursor naming each pin returns exactly the pins after it, the last
+	// none.
+	for i := range want {
+		pos := want[i].Position()
+		page, err := s.GetPinsPage(ctx, chatID, &pos, 0)
+		require.NoError(t, err)
+		require.Len(t, page, len(want)-i-1)
+		for j, pin := range page {
+			requirePin(t, want[i+1+j], pin)
+		}
+	}
+
+	// A cursor naming no pin, inside the tie, still resumes in order: after
+	// (7, 7) come (7, 6) and the earlier times.
+	pos := chat.PinPosition{PinnedAt: pinAt(7), MessageID: messageID(7)}
+	page, err := s.GetPinsPage(ctx, chatID, &pos, 0)
+	require.NoError(t, err)
+	require.Len(t, page, 4)
+	for j, pin := range page {
+		requirePin(t, want[2+j], pin)
+	}
+
+	// The cursor resumes after a pin removed since it was handed out.
+	_, changed, err := s.UnpinMessage(ctx, chatID, want[1].MessageID)
+	require.NoError(t, err)
+	require.True(t, changed)
+	pos = want[1].Position()
+	page, err = s.GetPinsPage(ctx, chatID, &pos, 2)
+	require.NoError(t, err)
+	require.Len(t, page, 2)
+	requirePin(t, want[2], page[0])
+	requirePin(t, want[3], page[1])
+}
+
+func testStore_Pin_LatestByPosition(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	chatID := generateDmChatID()
+	pinnedBy := model.MustGenerateUserID()
+
+	// The latest is the first pin in order, not the last one made: a pin
+	// with an earlier time than the latest leaves it the latest.
+	latest := chat.Pin{MessageID: messageID(5), PinnedBy: pinnedBy, PinnedAt: pinAt(10)}
+	requirePinSummary(t, pinMessage(t, s, chatID, latest, chat.MaxPinnedMessages), &latest, 1, 1)
+	earlier := chat.Pin{MessageID: messageID(9), PinnedBy: pinnedBy, PinnedAt: pinAt(3)}
+	requirePinSummary(t, pinMessage(t, s, chatID, earlier, chat.MaxPinnedMessages), &latest, 2, 2)
+	requireStoredPinSummary(t, s, chatID, &latest, 2, 2)
+
+	// At the latest's instant, the smaller message ID comes after it and the
+	// greater before.
+	tieBelow := chat.Pin{MessageID: messageID(4), PinnedBy: pinnedBy, PinnedAt: pinAt(10)}
+	requirePinSummary(t, pinMessage(t, s, chatID, tieBelow, chat.MaxPinnedMessages), &latest, 3, 3)
+	tieAbove := chat.Pin{MessageID: messageID(6), PinnedBy: pinnedBy, PinnedAt: pinAt(10)}
+	requirePinSummary(t, pinMessage(t, s, chatID, tieAbove, chat.MaxPinnedMessages), &tieAbove, 4, 4)
+	requireStoredPinSummary(t, s, chatID, &tieAbove, 4, 4)
+	requirePins(t, s, chatID, tieAbove, latest, tieBelow, earlier)
+
+	// Unpinning the latest makes the next in order the latest, however
+	// they were pinned.
+	summary, changed, err := s.UnpinMessage(ctx, chatID, tieAbove.MessageID)
+	require.NoError(t, err)
+	require.True(t, changed)
+	requirePinSummary(t, summary, &latest, 3, 5)
+	summary, changed, err = s.UnpinMessage(ctx, chatID, latest.MessageID)
+	require.NoError(t, err)
+	require.True(t, changed)
+	requirePinSummary(t, summary, &tieBelow, 2, 6)
+	requireStoredPinSummary(t, s, chatID, &tieBelow, 2, 6)
+}
+
+func testStore_Pin_Unpin(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	chatID := generateDmChatID()
+
+	a := chat.Pin{MessageID: messageID(1), PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(1)}
+	b := chat.Pin{MessageID: messageID(2), PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(2)}
+	c := chat.Pin{MessageID: messageID(3), PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(3)}
+	for _, pin := range []chat.Pin{a, b, c} {
+		pinMessage(t, s, chatID, pin, chat.MaxPinnedMessages)
+	}
+	requireStoredPinSummary(t, s, chatID, &c, 3, 3)
+
+	// Unpinning the latest makes the next in order the latest.
+	summary, changed, err := s.UnpinMessage(ctx, chatID, c.MessageID)
+	require.NoError(t, err)
+	require.True(t, changed)
+	requirePinSummary(t, summary, &b, 2, 4)
+	requireStoredPinSummary(t, s, chatID, &b, 2, 4)
+	requirePins(t, s, chatID, b, a)
+
+	// A message not pinned, or no longer pinned, is a no-op.
+	for _, id := range []*messagingpb.MessageId{messageID(99), c.MessageID} {
+		summary, changed, err = s.UnpinMessage(ctx, chatID, id)
+		require.NoError(t, err)
+		require.False(t, changed)
+		requirePinSummary(t, summary, &b, 2, 4)
+	}
+
+	// Unpinning one below the latest leaves the latest.
+	summary, changed, err = s.UnpinMessage(ctx, chatID, a.MessageID)
+	require.NoError(t, err)
+	require.True(t, changed)
+	requirePinSummary(t, summary, &b, 1, 5)
+	requirePins(t, s, chatID, b)
+
+	// Unpinning the last leaves none, with the version kept: the chat has
+	// had pins, so it is no longer absent from the summaries.
+	summary, changed, err = s.UnpinMessage(ctx, chatID, b.MessageID)
+	require.NoError(t, err)
+	require.True(t, changed)
+	requirePinSummary(t, summary, nil, 0, 6)
+	requireStoredPinSummary(t, s, chatID, nil, 0, 6)
+	requirePins(t, s, chatID)
+
+	summary, changed, err = s.UnpinMessage(ctx, chatID, b.MessageID)
+	require.NoError(t, err)
+	require.False(t, changed)
+	requirePinSummary(t, summary, nil, 0, 6)
+}
+
+func testStore_Pin_UnpinThenRepin(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	chatID := chat.MustGenerateGroupChatID()
+
+	a := chat.Pin{MessageID: messageID(1), PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(1)}
+	b := chat.Pin{MessageID: messageID(2), PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(2)}
+	pinMessage(t, s, chatID, a, chat.MaxPinnedMessages)
+	pinMessage(t, s, chatID, b, chat.MaxPinnedMessages)
+
+	// Unpinned then pinned again, a is a fresh pin: its new time and pinner,
+	// at the top, two versions on.
+	_, changed, err := s.UnpinMessage(ctx, chatID, a.MessageID)
+	require.NoError(t, err)
+	require.True(t, changed)
+	again := chat.Pin{MessageID: a.MessageID, PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(3)}
+	summary := pinMessage(t, s, chatID, again, chat.MaxPinnedMessages)
+	requirePinSummary(t, summary, &again, 2, 4)
+	requireStoredPinSummary(t, s, chatID, &again, 2, 4)
+	requirePins(t, s, chatID, again, b)
+}
+
+func testStore_Pin_Cap(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	chatID := chat.MustGenerateGroupChatID()
+	pinnedBy := model.MustGenerateUserID()
+
+	var pins []chat.Pin
+	for i := range chat.MaxPinnedMessages {
+		pin := chat.Pin{MessageID: messageID(uint64(i + 1)), PinnedBy: pinnedBy, PinnedAt: pinAt(int64(i))}
+		pinMessage(t, s, chatID, pin, chat.MaxPinnedMessages)
+		pins = append(pins, pin)
+	}
+	latest := pins[len(pins)-1]
+
+	// One more is refused, with nothing written.
+	over := chat.Pin{MessageID: messageID(100), PinnedBy: pinnedBy, PinnedAt: pinAt(100)}
+	_, changed, err := s.PinMessage(ctx, chatID, over.MessageID, over.PinnedBy, over.PinnedAt, chat.MaxPinnedMessages)
+	require.ErrorIs(t, err, chat.ErrTooManyPins)
+	require.False(t, changed)
+	requireStoredPinSummary(t, s, chatID, &latest, chat.MaxPinnedMessages, chat.MaxPinnedMessages)
+	page, err := s.GetPinsPage(ctx, chatID, nil, 0)
+	require.NoError(t, err)
+	require.Len(t, page, chat.MaxPinnedMessages)
+	for _, pin := range page {
+		require.NotEqual(t, over.MessageID.Value, pin.MessageID.Value)
+	}
+
+	// A lower cap than the chat holds refuses too.
+	_, _, err = s.PinMessage(ctx, chatID, over.MessageID, over.PinnedBy, over.PinnedAt, 2)
+	require.ErrorIs(t, err, chat.ErrTooManyPins)
+
+	// After an unpin there is room again.
+	_, changed, err = s.UnpinMessage(ctx, chatID, pins[0].MessageID)
+	require.NoError(t, err)
+	require.True(t, changed)
+	summary := pinMessage(t, s, chatID, over, chat.MaxPinnedMessages)
+	requirePinSummary(t, summary, &over, chat.MaxPinnedMessages, chat.MaxPinnedMessages+2)
+
+	// A cap below one is a programming error, with nothing written.
+	other := chat.MustGenerateGroupChatID()
+	for _, maxPins := range []int{0, -1} {
+		_, changed, err = s.PinMessage(ctx, other, messageID(1), pinnedBy, pinAt(1), maxPins)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, chat.ErrTooManyPins)
+		require.False(t, changed)
+	}
+	summaries, err := s.GetPinSummaries(ctx, []*commonpb.ChatId{other})
+	require.NoError(t, err)
+	require.Empty(t, summaries)
+}
+
+func testStore_Pin_Invalid(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	chatID := chat.MustGenerateGroupChatID()
+	pinnedBy := model.MustGenerateUserID()
+	badChat := &commonpb.ChatId{Value: randomBytes(20)}
+
+	for _, tc := range []struct {
+		name      string
+		chatID    *commonpb.ChatId
+		messageID *messagingpb.MessageId
+		pinnedBy  *commonpb.UserId
+		pinnedAt  time.Time
+	}{
+		{"chat id length", badChat, messageID(1), pinnedBy, pinAt(1)},
+		{"nil chat id", nil, messageID(1), pinnedBy, pinAt(1)},
+		{"nil message id", chatID, nil, pinnedBy, pinAt(1)},
+		{"nil pinner", chatID, messageID(1), nil, pinAt(1)},
+		{"pinner length", chatID, messageID(1), &commonpb.UserId{Value: randomBytes(5)}, pinAt(1)},
+		{"before the epoch", chatID, messageID(1), pinnedBy, time.Unix(-1, 0)},
+		{"past unix nanos", chatID, messageID(1), pinnedBy, time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC)},
+	} {
+		_, changed, err := s.PinMessage(ctx, tc.chatID, tc.messageID, tc.pinnedBy, tc.pinnedAt, chat.MaxPinnedMessages)
+		require.Error(t, err, tc.name)
+		require.False(t, changed, tc.name)
+	}
+	summaries, err := s.GetPinSummaries(ctx, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	require.Empty(t, summaries)
+
+	_, _, err = s.UnpinMessage(ctx, badChat, messageID(1))
+	require.Error(t, err)
+	_, _, err = s.UnpinMessage(ctx, chatID, nil)
+	require.Error(t, err)
+
+	_, err = s.GetPinSummaries(ctx, []*commonpb.ChatId{chatID, badChat})
+	require.Error(t, err)
+
+	_, err = s.GetPinsPage(ctx, badChat, nil, 0)
+	require.Error(t, err)
+	for _, pos := range []chat.PinPosition{
+		{PinnedAt: pinAt(1)},
+		{PinnedAt: time.Unix(-1, 0), MessageID: messageID(1)},
+	} {
+		_, err = s.GetPinsPage(ctx, chatID, &pos, 0)
+		require.Error(t, err)
+	}
+}
+
+func testStore_Pin_ChatsIndependent(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	dmID := generateDmChatID()
+	groupID := chat.MustGenerateGroupChatID()
+	neverID := chat.MustGenerateGroupChatID()
+
+	// One message ID pinned in two chats is two pins.
+	dmPin := chat.Pin{MessageID: messageID(5), PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(1)}
+	groupPin := chat.Pin{MessageID: messageID(5), PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(2)}
+	groupPin2 := chat.Pin{MessageID: messageID(6), PinnedBy: model.MustGenerateUserID(), PinnedAt: pinAt(3)}
+	pinMessage(t, s, dmID, dmPin, 1)
+	pinMessage(t, s, groupID, groupPin, chat.MaxPinnedMessages)
+	pinMessage(t, s, groupID, groupPin2, chat.MaxPinnedMessages)
+
+	// The DM at its cap of one does not hold the group back, nor the reverse.
+	summaries, err := s.GetPinSummaries(ctx, []*commonpb.ChatId{dmID, groupID, neverID, dmID})
+	require.NoError(t, err)
+	require.Len(t, summaries, 2)
+	requirePinSummary(t, summaries[string(dmID.Value)], &dmPin, 1, 1)
+	requirePinSummary(t, summaries[string(groupID.Value)], &groupPin2, 2, 2)
+
+	// Unpinning in one leaves the other.
+	_, changed, err := s.UnpinMessage(ctx, groupID, groupPin.MessageID)
+	require.NoError(t, err)
+	require.True(t, changed)
+	requireStoredPinSummary(t, s, dmID, &dmPin, 1, 1)
+	requirePins(t, s, dmID, dmPin)
+	requireStoredPinSummary(t, s, groupID, &groupPin2, 1, 3)
+	requirePins(t, s, groupID, groupPin2)
+}
+
+func testStore_Pin_ConcurrentCap(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	chatID := chat.MustGenerateGroupChatID()
+	pinnedBy := model.MustGenerateUserID()
+
+	const pinners = 20
+	results := make([]error, pinners)
+	var wg sync.WaitGroup
+	for i := range pinners {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, results[i] = s.PinMessage(ctx, chatID, messageID(uint64(i+1)), pinnedBy, pinAt(int64(i)), chat.MaxPinnedMessages)
+		}()
+	}
+	wg.Wait()
+
+	var pinned, refused int
+	for _, err := range results {
+		switch {
+		case err == nil:
+			pinned++
+		case errors.Is(err, chat.ErrTooManyPins):
+			refused++
+		default:
+			require.NoError(t, err)
+		}
+	}
+	require.Equal(t, chat.MaxPinnedMessages, pinned)
+	require.Equal(t, pinners-chat.MaxPinnedMessages, refused)
+
+	summaries, err := s.GetPinSummaries(ctx, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	summary := summaries[string(chatID.Value)]
+	require.EqualValues(t, chat.MaxPinnedMessages, summary.Count)
+	require.EqualValues(t, chat.MaxPinnedMessages, summary.Version)
+	page, err := s.GetPinsPage(ctx, chatID, nil, 0)
+	require.NoError(t, err)
+	require.Len(t, page, chat.MaxPinnedMessages)
+	requirePin(t, page[0], *summary.Latest)
+}
+
+func testStore_Pin_ConcurrentSameMessage(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	chatID := generateDmChatID()
+
+	const pinners = 20
+	changes := make([]bool, pinners)
+	results := make([]error, pinners)
+	var wg sync.WaitGroup
+	for i := range pinners {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, changes[i], results[i] = s.PinMessage(ctx, chatID, messageID(1), model.MustGenerateUserID(), pinAt(int64(i)), chat.MaxPinnedMessages)
+		}()
+	}
+	wg.Wait()
+
+	var changed int
+	for i := range pinners {
+		require.NoError(t, results[i])
+		if changes[i] {
+			changed++
+		}
+	}
+	require.Equal(t, 1, changed)
+
+	summaries, err := s.GetPinSummaries(ctx, []*commonpb.ChatId{chatID})
+	require.NoError(t, err)
+	summary := summaries[string(chatID.Value)]
+	require.EqualValues(t, 1, summary.Count)
+	require.EqualValues(t, 1, summary.Version)
+	requirePins(t, s, chatID, *summary.Latest)
 }

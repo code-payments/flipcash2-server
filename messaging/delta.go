@@ -107,7 +107,7 @@ func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.M
 		// A page may carry no surviving messages (all superseded) yet still advance
 		// the checkpoint, so only attach a batch when there's something to apply.
 		if len(msgs) > 0 {
-			batch, err := s.present(ctx, log, req.ChatId, reading, msgs)
+			batch, err := s.present(ctx, log, reading, msgs)
 			if err != nil {
 				return err
 			}

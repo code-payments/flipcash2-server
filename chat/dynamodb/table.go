@@ -12,8 +12,8 @@ import (
 
 // CreateTables provisions the chats, dm_inbox, group_members,
 // chat_user_state, chat_activity, chat_key_envelopes, chat_lobbies,
-// chat_featured_groups, chat_holdings and chat_invites tables with on-demand
-// billing. The chats table is keyed by pk only; dm_inbox is keyed by (pk, sk) with a GSI ordering each user's DMs
+// chat_featured_groups, chat_holdings, chat_invites and chat_pins tables with
+// on-demand billing. The chats table is keyed by pk only; dm_inbox is keyed by (pk, sk) with a GSI ordering each user's DMs
 // by last_activity; group_members is keyed by (pk, sk) = (chat, user) — plus
 // one "#meta" aggregates item per group — with an inverted GSI for listing a
 // user's group chats, a sparse GSI of a group's joined members by join time
@@ -38,12 +38,15 @@ import (
 // invites by creation (gsiInvitesByChat), one creator's invites to a chat by
 // creation (gsiInvitesByChatCreator) and a chat's invites that are neither
 // revoked nor used up by expiry (gsiInvitesActive), and TTL on expires_at,
-// which only an invite's copy of the chat key carries. It is idempotent and
+// which only an invite's copy of the chat key carries; chat_pins is keyed by
+// (pk, sk) = (chat, message) — plus one "#meta" summary item per chat — with
+// an LSI of a chat's pins in pin order (see lsiByPinned), which, being an LSI,
+// exists only if the table was created with it. It is idempotent and
 // blocks until all tables are ACTIVE. It creates missing tables only: a table that
 // exists is left as it is, and so is never given an index added to its
 // definition here since it was created — gsiRestricted on a live
 // chat_user_state is added out of band (see the store's doc).
-func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable string) error {
+func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable, pinsTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
 			TableName:   aws.String(chatsTable),
@@ -386,6 +389,34 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				},
 			},
 		},
+		{
+			TableName:   aws.String(pinsTable),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrPinnedSort), AttributeType: types.ScalarAttributeTypeB},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
+			},
+			// An LSI, not a GSI: a caller that pins reads the chat's pins
+			// right after, and only a local index serves a strongly
+			// consistent read. It cannot be added to the table later, so
+			// it is created with it. Sparse on pinned_sort, which pins
+			// alone carry: the #meta item must omit it, or it leaks in.
+			LocalSecondaryIndexes: []types.LocalSecondaryIndex{
+				{
+					IndexName: aws.String(lsiByPinned),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrPinnedSort), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+			},
+		},
 	}
 
 	for _, input := range inputs {
@@ -470,6 +501,9 @@ func (s *store) reset() {
 		panic(err)
 	}
 	if err := clearTable(ctx, s.client, s.invitesTable, []string{attrPK, attrSK}); err != nil {
+		panic(err)
+	}
+	if err := clearTable(ctx, s.client, s.pinsTable, []string{attrPK, attrSK}); err != nil {
 		panic(err)
 	}
 }

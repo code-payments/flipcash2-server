@@ -26,19 +26,20 @@ const (
 	featuredGroupsTable = "chat_featured_groups_test"
 	holdingsTable       = "chat_holdings_test"
 	invitesTable        = "chat_invites_test"
+	pinsTable           = "chat_pins_test"
 	badgesTable         = "badges_test"
 )
 
 func TestMessaging_DynamoDBServer(t *testing.T) {
 	ctx := context.Background()
 
-	require.NoError(t, chat_dynamodb.CreateTables(ctx, testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable))
+	require.NoError(t, chat_dynamodb.CreateTables(ctx, testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable, pinsTable))
 	require.NoError(t, CreateTables(ctx, testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable, boostsTable))
 	require.NoError(t, badge_dynamodb.CreateTables(ctx, testEnv.Client, badgesTable))
 
 	badges := badge_dynamodb.NewInDynamoDB(testEnv.Client, badgesTable)
 	blocklists := blocklist_memory.NewInMemory()
-	chats := chat_dynamodb.NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable, nil)
+	chats := chat_dynamodb.NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable, pinsTable, nil)
 	profiles := profile_memory.NewInMemory()
 	messages := NewInDynamoDB(testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable, boostsTable)
 	teardown := func() {

@@ -28,7 +28,7 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 )
 
-// The chat store spans ten tables:
+// The chat store spans eleven tables:
 //
 //	chats     pk = "chat#<id>" (one item per chat). Canonical metadata: type,
 //	          members (the DM participants; absent for groups), title, creator
@@ -344,6 +344,40 @@ import (
 //	          fields it read, which is its compare-and-set, and on the
 //	          record existing. A version would be needed only if an invite
 //	          could ever be edited.
+//
+//	chat_pins  pk = "chat#<id>" (one partition per chat, a DM's or a
+//	          group's; see chat.Pin), holding the chat's pins and their
+//	          summary:
+//
+//	          sk = "msg#<padded message ID>" (see pinSK), one item per pinned
+//	          message: message_id, pinned_by (the raw user ID, B), pinned_at
+//	          (epoch nanos) and pinned_sort (see pinnedSort), which keys
+//	          lsiByPinned on (pk, pinned_sort). Read descending, the index is
+//	          chat.PinPosition order, so a page of pins is one strongly
+//	          consistent key range, resuming strictly below the position it
+//	          is given whether or not that pin still stands.
+//
+//	          sk = "#meta" (see skMeta), the chat's chat.PinSummary: version,
+//	          pin_count and the latest pin's message_id, pinned_by and
+//	          pinned_at, absent while nothing is pinned. It carries no
+//	          pinned_sort, which keeps it out of the index. It is written by
+//	          the chat's first pin and never deleted, so a chat that has had
+//	          pins keeps its version when it has none.
+//
+//	          A pin or an unpin is a transactional read of #meta and the
+//	          pin's item (see readPinForWrite), then one transaction: the
+//	          pin's put conditioned on its absence (or delete on its
+//	          presence) and #meta compare-and-set on the version read, with
+//	          a pin also conditioned on the count being under the cap, so the
+//	          cap holds under racing pins with no lock. The compare-and-set is what
+//	          lets the write decide from its read: which pin is the latest
+//	          after an unpin of the latest, found with a read of the top of
+//	          the index, and whether a pin is a no-op or over the cap. A lost
+//	          race reads again (see PinMessage).
+//
+//	          The index is an LSI, created with the table: CreateTables
+//	          cannot give one to a table that exists, so the infrastructure
+//	          creates the table with it.
 const (
 	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
 	// all of a user's DM types. Superseded by gsiByTypeActivity; retained until
@@ -403,6 +437,12 @@ const (
 	// items must omit it.
 	gsiLobbyByChat = "by_chat"
 
+	// lsiByPinned is the (chat, pinned_sort) LSI on chat_pins: a chat's
+	// pins in pin order when read descending (see GetPinsPage). It is
+	// sparse on pinned_sort, which only pins carry: the #meta item must omit
+	// it.
+	lsiByPinned = "by_pinned"
+
 	// gsiByMintRank is the (mint, rank) index on chat_holdings: one
 	// currency's groups in rank order (see GetTopGroupsByHoldings). Every
 	// item carries both keys, and the full item is projected, since a
@@ -448,6 +488,9 @@ const (
 
 	// skMeta is the sort key of a group's aggregates item in group_members.
 	skMeta = "#meta"
+
+	// pinSKPrefix prefixes a message ID in the chat_pins sk (see pinSK).
+	pinSKPrefix = "msg#"
 
 	// skInviteKey is the sort key of an invite's copy of the chat key. The
 	// invite's record is skMeta.
@@ -517,6 +560,11 @@ const (
 	attrActiveSort           = "active_sort"       // chat_invites #meta: see inviteActiveSort, present while neither revoked nor used up, keying gsiInvitesActive
 	attrSignature            = "signature"         // chat_key_envelopes copies: the copy's signature (B)
 	attrInviteID             = "invite_id"         // chat_key_envelopes: the raw invite ID (B) of a copy, absent on a wrapped envelope
+	attrMessageID            = "message_id"        // chat_pins: the pinned message's ID, on a pin and on #meta for the latest
+	attrPinnedBy             = "pinned_by"         // chat_pins: the raw ID of the user who pinned (B), on a pin and on #meta for the latest
+	attrPinnedAt             = "pinned_at"         // chat_pins: epoch nanos of the pin, on a pin and on #meta for the latest
+	attrPinnedSort           = "pinned_sort"       // chat_pins: see pinnedSort, on pins alone, keying lsiByPinned
+	attrPinCount             = "pin_count"         // chat_pins #meta: how many messages are pinned
 
 	// Keys of the min_listener_balance map.
 	attrBalanceCurrency     = "currency"
@@ -587,6 +635,7 @@ type store struct {
 	featuredGroupsTable string
 	holdingsTable       string
 	invitesTable        string
+	pinsTable           string
 
 	exclusions chat.FeedExclusions
 }
@@ -595,7 +644,7 @@ type store struct {
 // creating every DM with a user in excludedFromFeed excluding them from the
 // feed (see chat.FeedExclusions); nil excludes no one. Use CreateTables to
 // provision the tables.
-func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
+func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable, pinsTable string, excludedFromFeed []*commonpb.UserId) chat.Store {
 	return &store{
 		exclusions:          chat.NewFeedExclusions(excludedFromFeed),
 		client:              client,
@@ -609,6 +658,7 @@ func NewInDynamoDB(client *dynamodb.Client, chatsTable, dmInboxTable, groupMembe
 		featuredGroupsTable: featuredGroupsTable,
 		holdingsTable:       holdingsTable,
 		invitesTable:        invitesTable,
+		pinsTable:           pinsTable,
 	}
 }
 
@@ -4354,6 +4404,496 @@ func (s *store) SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, 
 // readers display the list (see chat.Store).
 func (s *store) GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (chat.FeaturedGroups, error) {
 	return s.readFeaturedGroups(ctx, userID, false)
+}
+
+// A pin or an unpin contends only with the chat's other pins and unpins, on
+// the #meta pattern (see maxMembershipAttempts): a lost compare-and-set reads
+// again and retries at once, and a TransactionConflict backs off. Both share
+// the budget.
+const maxPinAttempts = maxMembershipAttempts
+
+// A pin's message ID is written in 20 digits, the width of the largest
+// uint64, so every message ID fits and the sk order is message order.
+const pinSKFormat = pinSKPrefix + "%020d"
+
+// pinSK is the sk of messageID's pin in its chat's chat_pins partition.
+func pinSK(messageID *messagingpb.MessageId) string {
+	return fmt.Sprintf(pinSKFormat, messageID.Value)
+}
+
+// pinKey is the key of the item at sk in chatID's chat_pins partition: a
+// pin (see pinSK) or the chat's #meta.
+func pinKey(chatID *commonpb.ChatId, sk string) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		attrPK: avS(chatPK(chatID)),
+		attrSK: avS(sk),
+	}
+}
+
+// pinnedSort is the lsiByPinned range key of a pin at pos: its time's epoch
+// nanos, big-endian, then its message ID, big-endian. Read descending, the
+// index is then chat.PinPosition order — most recently pinned first, ties to
+// the greater message ID — and both fields are fixed width, so a page resumes
+// strictly below the key of any position with a key condition alone. The
+// pin's fields are kept as attributes of their own too, so nothing parses it.
+func pinnedSort(pos chat.PinPosition) []byte {
+	out := binary.BigEndian.AppendUint64(make([]byte, 0, 16), uint64(pos.PinnedAt.UnixNano()))
+	return binary.BigEndian.AppendUint64(out, pos.MessageID.Value)
+}
+
+// pinItem is pin as stored in chatID's partition, key and index key
+// included.
+func pinItem(chatID *commonpb.ChatId, pin chat.Pin) map[string]types.AttributeValue {
+	item := pinKey(chatID, pinSK(pin.MessageID))
+	item[attrMessageID] = avN(pin.MessageID.Value)
+	item[attrPinnedBy] = avB(pin.PinnedBy.Value)
+	item[attrPinnedAt] = avInt(pin.PinnedAt.UnixNano())
+	item[attrPinnedSort] = avB(pinnedSort(pin.Position()))
+	return item
+}
+
+// pinFromItem reads a pin's fields off item, a pin's own or #meta's for the
+// latest pin.
+func pinFromItem(item map[string]types.AttributeValue) (chat.Pin, error) {
+	messageID, err := parseN(item[attrMessageID])
+	if err != nil {
+		return chat.Pin{}, fmt.Errorf("parsing pin message id: %w", err)
+	}
+	pinnedBy := asB(item[attrPinnedBy])
+	if len(pinnedBy) != model.UserIDSize {
+		return chat.Pin{}, fmt.Errorf("pin of message %d has no pinner", messageID)
+	}
+	pinnedAt, err := parseInt(item[attrPinnedAt])
+	if err != nil {
+		return chat.Pin{}, fmt.Errorf("parsing pin time: %w", err)
+	}
+	if pinnedAt < 0 {
+		return chat.Pin{}, fmt.Errorf("pin of message %d is before the unix epoch", messageID)
+	}
+	return chat.Pin{
+		MessageID: &messagingpb.MessageId{Value: messageID},
+		PinnedBy:  &commonpb.UserId{Value: pinnedBy},
+		PinnedAt:  time.Unix(0, pinnedAt).UTC(),
+	}, nil
+}
+
+// pinSummaryFromItem reads a chat's #meta item in chat_pins. The latest
+// pin's fields are present exactly while something is pinned.
+func pinSummaryFromItem(item map[string]types.AttributeValue) (chat.PinSummary, error) {
+	version, err := parseN(item[attrVersion])
+	if err != nil {
+		return chat.PinSummary{}, fmt.Errorf("parsing pin version: %w", err)
+	}
+	count, err := parseN(item[attrPinCount])
+	if err != nil {
+		return chat.PinSummary{}, fmt.Errorf("parsing pin count: %w", err)
+	}
+	if count > math.MaxUint32 {
+		return chat.PinSummary{}, fmt.Errorf("pin count %d out of range", count)
+	}
+	summary := chat.PinSummary{Count: uint32(count), Version: version}
+	if _, ok := item[attrMessageID]; ok {
+		latest, err := pinFromItem(item)
+		if err != nil {
+			return chat.PinSummary{}, err
+		}
+		summary.Latest = &latest
+	}
+	if (summary.Latest == nil) != (summary.Count == 0) {
+		return chat.PinSummary{}, fmt.Errorf("pin summary of %d pins has latest %v", summary.Count, summary.Latest != nil)
+	}
+	return summary, nil
+}
+
+// errPinReadConflict is a readPinForWrite cancelled by a pin or unpin of the
+// chat in flight, which the caller backs off from and reads again.
+var errPinReadConflict = errors.New("pin read conflicted with a write")
+
+// readPinForWrite is the read a pin or an unpin of messageID in chatID starts
+// from: the chat's #meta and the pin's item, returning the summary (the zero
+// summary when the chat has never had a pin) and whether the message is
+// pinned. It is one TransactGetItems, not a batch read, because the two items
+// are written together and a batch read is consistent per item, not as a
+// set: it could see a racing pin's item and not the #meta it moved, and answer
+// the no-op with a summary that never was. A transactional read is
+// serializable with the writes, at twice a strongly consistent read's cost,
+// and is cancelled while one is in flight on either item, reported as
+// errPinReadConflict.
+func (s *store) readPinForWrite(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (chat.PinSummary, bool, error) {
+	out, err := s.client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+		TransactItems: []types.TransactGetItem{
+			{Get: &types.Get{TableName: aws.String(s.pinsTable), Key: pinKey(chatID, skMeta)}},
+			{Get: &types.Get{TableName: aws.String(s.pinsTable), Key: pinKey(chatID, pinSK(messageID))}},
+		},
+	})
+	if err != nil {
+		if reasons, ok := cancellationReasons(err); ok {
+			codes := make([]string, len(reasons))
+			for i, reason := range reasons {
+				codes[i] = aws.ToString(reason.Code)
+			}
+			if isTransactionConflict(codes) {
+				return chat.PinSummary{}, false, errPinReadConflict
+			}
+		}
+		return chat.PinSummary{}, false, err
+	}
+	if len(out.Responses) != 2 {
+		return chat.PinSummary{}, false, fmt.Errorf("pin read returned %d responses", len(out.Responses))
+	}
+
+	var summary chat.PinSummary
+	if meta := out.Responses[0].Item; len(meta) > 0 {
+		summary, err = pinSummaryFromItem(meta)
+		if err != nil {
+			return chat.PinSummary{}, false, err
+		}
+	}
+	pinned := len(out.Responses[1].Item) > 0
+	if pinned && summary.Count == 0 {
+		return chat.PinSummary{}, false, fmt.Errorf("chat %x has message %d pinned and a summary of no pins", chatID.Value, messageID.Value)
+	}
+	return summary, pinned, nil
+}
+
+// pinBackoff waits out *backoff, jittered, and doubles it up to
+// membershipBackoffMax, for a pin or unpin that lost to a concurrent write.
+func pinBackoff(ctx context.Context, backoff *time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(*backoff + rand.N(*backoff)):
+	}
+	*backoff = min(2**backoff, membershipBackoffMax)
+	return nil
+}
+
+// PinMessage reads the chat's #meta and the pin (see readPinForWrite), which
+// decides the no-op and then the cap, and otherwise writes one transaction:
+// #meta compare-and-set on the version read (on there being none, for the
+// chat's first pin) and on the count being under maxPins, moving the count
+// and the version by one and, when the pin comes first in pin order, setting
+// it as the latest; and the pin's put, conditioned on no pin of the message.
+// The cap condition repeats what the read checked, so the cap holds even if
+// the version check ever did not. A failed condition is a pin or unpin that
+// landed since the read, and is read again, which may find this pin made, or
+// the chat at the cap; a TransactionConflict backs off. The latest is judged
+// by position, not taken to be the new pin, since the store accepts any
+// pinnedAt.
+func (s *store) PinMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, pinnedBy *commonpb.UserId, pinnedAt time.Time, maxPins int) (chat.PinSummary, bool, error) {
+	pin := chat.Pin{MessageID: messageID, PinnedBy: pinnedBy, PinnedAt: pinnedAt}
+	if err := chat.ValidatePin(chatID, pin); err != nil {
+		return chat.PinSummary{}, false, err
+	}
+	pin.PinnedAt = chat.PinTime(pinnedAt)
+	if maxPins < 1 {
+		return chat.PinSummary{}, false, fmt.Errorf("max pins must be at least one")
+	}
+
+	backoff := membershipBackoffBase
+	for attempt := 0; attempt < maxPinAttempts; attempt++ {
+		current, pinned, err := s.readPinForWrite(ctx, chatID, messageID)
+		if errors.Is(err, errPinReadConflict) {
+			if err := pinBackoff(ctx, &backoff); err != nil {
+				return chat.PinSummary{}, false, err
+			}
+			continue
+		}
+		if err != nil {
+			return chat.PinSummary{}, false, err
+		}
+		// The no-op first, then the cap.
+		if pinned {
+			return current, false, nil
+		}
+		if int64(current.Count) >= int64(maxPins) {
+			return chat.PinSummary{}, false, chat.ErrTooManyPins
+		}
+
+		next := chat.PinSummary{Latest: current.Latest, Count: current.Count + 1, Version: current.Version + 1}
+		names := map[string]string{
+			"#version": attrVersion,
+			"#count":   attrPinCount,
+		}
+		values := map[string]types.AttributeValue{
+			":next":  avN(next.Version),
+			":count": avN(uint64(next.Count)),
+			":cap":   avN(uint64(maxPins)),
+		}
+		update := "SET #version = :next, #count = :count"
+		if current.Latest == nil || pin.Position().Compare(current.Latest.Position()) < 0 {
+			next.Latest = &pin
+			update += ", #message = :message, #by = :by, #at = :at"
+			names["#message"] = attrMessageID
+			names["#by"] = attrPinnedBy
+			names["#at"] = attrPinnedAt
+			values[":message"] = avN(pin.MessageID.Value)
+			values[":by"] = avB(pin.PinnedBy.Value)
+			values[":at"] = avInt(pin.PinnedAt.UnixNano())
+		}
+		condition := "#version = :version"
+		if current.Version == 0 {
+			// Version zero is a chat that has never had a pin, so no #meta
+			// item; the first pin must find none, or it lost to another.
+			condition = "attribute_not_exists(#version)"
+		} else {
+			values[":version"] = avN(current.Version)
+		}
+		condition += " AND (attribute_not_exists(#count) OR #count < :cap)"
+
+		transactItems := []types.TransactWriteItem{
+			{Update: &types.Update{
+				TableName:                 aws.String(s.pinsTable),
+				Key:                       pinKey(chatID, skMeta),
+				UpdateExpression:          aws.String(update),
+				ConditionExpression:       aws.String(condition),
+				ExpressionAttributeNames:  names,
+				ExpressionAttributeValues: values,
+			}},
+			{Put: &types.Put{
+				TableName:                aws.String(s.pinsTable),
+				Item:                     pinItem(chatID, pin),
+				ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
+				ExpressionAttributeNames: map[string]string{"#pk": attrPK},
+			}},
+		}
+		retry, err := s.writePins(ctx, transactItems, &backoff)
+		if err != nil {
+			return chat.PinSummary{}, false, err
+		}
+		if !retry {
+			return next.Clone(), true, nil
+		}
+	}
+	return chat.PinSummary{}, false, fmt.Errorf("pinning message %d in chat %x: attempts exhausted", messageID.Value, chatID.Value)
+}
+
+// UnpinMessage reads the chat's #meta and the pin (see readPinForWrite),
+// which decides the no-op, and otherwise writes one transaction: #meta
+// compare-and-set on the version read, moving the count down and the version
+// up by one, and the pin's delete, conditioned on the pin existing. When the
+// pin is the latest, the next latest is found first with a strongly
+// consistent read of the top two of lsiByPinned, one of them the pin being
+// removed, and is set as the latest, or the latest is removed when there is
+// none; a pin or unpin landing between the reads moves the version, so the
+// write never commits a latest it read stale. A failed condition reads again;
+// a TransactionConflict backs off.
+func (s *store) UnpinMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (chat.PinSummary, bool, error) {
+	if err := chat.ValidatePinChatIDs(chatID); err != nil {
+		return chat.PinSummary{}, false, err
+	}
+	if messageID == nil {
+		return chat.PinSummary{}, false, fmt.Errorf("message id is required")
+	}
+
+	backoff := membershipBackoffBase
+	for attempt := 0; attempt < maxPinAttempts; attempt++ {
+		current, pinned, err := s.readPinForWrite(ctx, chatID, messageID)
+		if errors.Is(err, errPinReadConflict) {
+			if err := pinBackoff(ctx, &backoff); err != nil {
+				return chat.PinSummary{}, false, err
+			}
+			continue
+		}
+		if err != nil {
+			return chat.PinSummary{}, false, err
+		}
+		if !pinned {
+			return current, false, nil
+		}
+
+		next := chat.PinSummary{Latest: current.Latest, Count: current.Count - 1, Version: current.Version + 1}
+		names := map[string]string{
+			"#version": attrVersion,
+			"#count":   attrPinCount,
+		}
+		values := map[string]types.AttributeValue{
+			":version": avN(current.Version),
+			":next":    avN(next.Version),
+			":count":   avN(uint64(next.Count)),
+		}
+		update := "SET #version = :next, #count = :count"
+		if current.Latest.MessageID.Value == messageID.Value {
+			top, err := s.queryPins(ctx, chatID, nil, 2)
+			if err != nil {
+				return chat.PinSummary{}, false, err
+			}
+			next.Latest = nil
+			for _, pin := range top {
+				if pin.MessageID.Value != messageID.Value {
+					next.Latest = &pin
+					break
+				}
+			}
+			names["#message"] = attrMessageID
+			names["#by"] = attrPinnedBy
+			names["#at"] = attrPinnedAt
+			if next.Latest != nil {
+				update += ", #message = :message, #by = :by, #at = :at"
+				values[":message"] = avN(next.Latest.MessageID.Value)
+				values[":by"] = avB(next.Latest.PinnedBy.Value)
+				values[":at"] = avInt(next.Latest.PinnedAt.UnixNano())
+			} else {
+				update += " REMOVE #message, #by, #at"
+			}
+		}
+
+		transactItems := []types.TransactWriteItem{
+			{Update: &types.Update{
+				TableName:                 aws.String(s.pinsTable),
+				Key:                       pinKey(chatID, skMeta),
+				UpdateExpression:          aws.String(update),
+				ConditionExpression:       aws.String("#version = :version"),
+				ExpressionAttributeNames:  names,
+				ExpressionAttributeValues: values,
+			}},
+			{Delete: &types.Delete{
+				TableName:                aws.String(s.pinsTable),
+				Key:                      pinKey(chatID, pinSK(messageID)),
+				ConditionExpression:      aws.String("attribute_exists(#pk)"),
+				ExpressionAttributeNames: map[string]string{"#pk": attrPK},
+			}},
+		}
+		retry, err := s.writePins(ctx, transactItems, &backoff)
+		if err != nil {
+			return chat.PinSummary{}, false, err
+		}
+		if !retry {
+			return next.Clone(), true, nil
+		}
+	}
+	return chat.PinSummary{}, false, fmt.Errorf("unpinning message %d in chat %x: attempts exhausted", messageID.Value, chatID.Value)
+}
+
+// writePins writes a pin's or an unpin's transaction, reporting retry true
+// when it was cancelled by a failed condition (a write that landed since the
+// read; the caller reads again at once) or by a TransactionConflict (after
+// backing off, see pinBackoff), and an error for any other failure.
+func (s *store) writePins(ctx context.Context, transactItems []types.TransactWriteItem, backoff *time.Duration) (bool, error) {
+	_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
+	if err == nil {
+		return false, nil
+	}
+	reasons, ok := cancellationReasons(err)
+	if !ok || len(reasons) != len(transactItems) {
+		return false, err
+	}
+	codes := make([]string, len(reasons))
+	for i, reason := range reasons {
+		codes[i] = aws.ToString(reason.Code)
+	}
+	switch {
+	case slices.Contains(codes, conditionalCheckFailedCode):
+		return true, nil
+	case isTransactionConflict(codes):
+		if err := pinBackoff(ctx, backoff); err != nil {
+			return false, err
+		}
+		return true, nil
+	default:
+		return false, err
+	}
+}
+
+// GetPinSummaries is one strongly consistent batch read of the chats' #meta
+// items, which a chat has from its first pin on.
+func (s *store) GetPinSummaries(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]chat.PinSummary, error) {
+	if err := chat.ValidatePinChatIDs(chatIDs...); err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{}, len(chatIDs))
+	var keys []map[string]types.AttributeValue
+	for _, chatID := range chatIDs {
+		if _, dup := seen[string(chatID.Value)]; dup {
+			continue
+		}
+		seen[string(chatID.Value)] = struct{}{}
+		keys = append(keys, pinKey(chatID, skMeta))
+	}
+
+	out := make(map[string]chat.PinSummary, len(keys))
+	err := s.batchGet(ctx, s.pinsTable, keys, "", nil, true, func(item map[string]types.AttributeValue) error {
+		chatID, err := chatIDFromPK(item)
+		if err != nil {
+			return err
+		}
+		summary, err := pinSummaryFromItem(item)
+		if err != nil {
+			return err
+		}
+		out[string(chatID.Value)] = summary
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetPinsPage is a strongly consistent descending range on lsiByPinned,
+// which holds exactly the chat's pins in pin order, resuming below the key
+// of the position it is given (see pinnedSort).
+func (s *store) GetPinsPage(ctx context.Context, chatID *commonpb.ChatId, after *chat.PinPosition, limit int) ([]chat.Pin, error) {
+	if err := chat.ValidatePinChatIDs(chatID); err != nil {
+		return nil, err
+	}
+	if after != nil {
+		if err := chat.ValidatePinPosition(*after); err != nil {
+			return nil, err
+		}
+	}
+	return s.queryPins(ctx, chatID, after, limit)
+}
+
+// queryPins reads up to limit of chatID's pins strictly after the given
+// position (from the start for nil) off lsiByPinned, strongly consistent; a
+// limit of zero or less reads them all.
+func (s *store) queryPins(ctx context.Context, chatID *commonpb.ChatId, after *chat.PinPosition, limit int) ([]chat.Pin, error) {
+	condition := "#pk = :pk"
+	names := map[string]string{"#pk": attrPK}
+	values := map[string]types.AttributeValue{":pk": avS(chatPK(chatID))}
+	if after != nil {
+		condition += " AND #sort < :after"
+		names["#sort"] = attrPinnedSort
+		values[":after"] = avB(pinnedSort(*after))
+	}
+
+	pins := make([]chat.Pin, 0)
+	var startKey map[string]types.AttributeValue
+	for {
+		input := &dynamodb.QueryInput{
+			TableName:                 aws.String(s.pinsTable),
+			IndexName:                 aws.String(lsiByPinned),
+			KeyConditionExpression:    aws.String(condition),
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
+			ScanIndexForward:          aws.Bool(false),
+			ConsistentRead:            aws.Bool(true),
+			ExclusiveStartKey:         startKey,
+		}
+		if limit > 0 {
+			input.Limit = aws.Int32(int32(min(limit-len(pins), math.MaxInt32)))
+		}
+		out, err := s.client.Query(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			pin, err := pinFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			pins = append(pins, pin)
+			if limit > 0 && len(pins) == limit {
+				return pins, nil
+			}
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			return pins, nil
+		}
+		startKey = out.LastEvaluatedKey
+	}
 }
 
 // readFeaturedGroups reads userID's featured groups: one query of their

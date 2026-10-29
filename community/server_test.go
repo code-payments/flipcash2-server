@@ -139,6 +139,10 @@ func (u unexpectedReaders) LastMessages(context.Context, []chat.MessageRef) (map
 	return nil, u.fail("LastMessages")
 }
 
+func (u unexpectedReaders) Messages(context.Context, []chat.MessageRef, chat.Reading) (map[chat.MessageKey]*messagingpb.Message, error) {
+	return nil, u.fail("Messages")
+}
+
 func (u unexpectedReaders) Pointers(context.Context, []chat.PointerRef) (map[string][]*messagingpb.Pointer, error) {
 	return nil, u.fail("Pointers")
 }

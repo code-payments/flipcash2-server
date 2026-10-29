@@ -23,8 +23,8 @@ import (
 // mutable — and can be mutated by other processes, which this cache can never
 // observe — so group membership checks and member lists always defer to the
 // backing store. The rest of the store is passed straight through, viewer
-// state (restrictions included), activity reads, key envelopes and invites
-// included: a user's state is theirs, or their group creator's, to change at any time, a group's recent senders change with every send, and
+// state (restrictions included), activity reads, key envelopes, invites and
+// pins included: a user's state is theirs, or their group creator's, to change at any time, a group's recent senders change with every send, and
 // both reads are already one strongly consistent query, so nothing of either
 // is held.
 //
@@ -360,6 +360,26 @@ func (c *Cache) SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, 
 
 func (c *Cache) GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (chat.FeaturedGroups, error) {
 	return c.db.GetFeaturedGroups(ctx, userID)
+}
+
+// The pin methods pass through: any member a chat permits may pin or unpin,
+// from any process, and the reads are what the caller is told of the pins it
+// just changed, so nothing of a chat's pins is held.
+
+func (c *Cache) PinMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, pinnedBy *commonpb.UserId, pinnedAt time.Time, maxPins int) (chat.PinSummary, bool, error) {
+	return c.db.PinMessage(ctx, chatID, messageID, pinnedBy, pinnedAt, maxPins)
+}
+
+func (c *Cache) UnpinMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (chat.PinSummary, bool, error) {
+	return c.db.UnpinMessage(ctx, chatID, messageID)
+}
+
+func (c *Cache) GetPinSummaries(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]chat.PinSummary, error) {
+	return c.db.GetPinSummaries(ctx, chatIDs)
+}
+
+func (c *Cache) GetPinsPage(ctx context.Context, chatID *commonpb.ChatId, after *chat.PinPosition, limit int) ([]chat.Pin, error) {
+	return c.db.GetPinsPage(ctx, chatID, after, limit)
 }
 
 // The invite methods pass through: an invite's use count and revoke change

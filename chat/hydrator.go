@@ -134,20 +134,23 @@ func (h *Hydrator) publicGroupsMetadata(ctx context.Context, log *zap.Logger, ch
 type metadataDetail int
 
 const (
-	// fullDetail is the whole record, for a caller showing one chat — GetChat,
-	// a creation, an edit, a join, a lobby — or carrying it to a client that
-	// may.
+	// fullDetail is the whole record, and the chat's pin summary beside it,
+	// for a caller showing one chat — GetChat, a creation, an edit, a join, a
+	// lobby — or carrying it to a client that may.
 	fullDetail metadataDetail = iota
 
 	// listDetail is the record as a list view shows it: everything but the
-	// group's cover picture, which only its profile view shows. A feed page
-	// is many chats a client renders as rows, and the cover's renditions cost
-	// the server a resolve and a download URL per group for a field no row
-	// renders. The description stays: a row may show it, and it is short text
-	// read with the record, costing nothing to carry. The proto allows a feed
-	// to omit the cover (see chat.v1.Metadata.cover_picture), and tells the
-	// client to fetch it with GetChat and never to let a feed result clear
-	// what it holds.
+	// group's cover picture, which only its profile view shows, and the
+	// chat's pin summary, which only the conversation shows. A feed page is
+	// many chats a client renders as rows, and the cover's renditions cost
+	// the server a resolve and a download URL per group, and the pin summary
+	// a read of the chat's pins and of its latest pinned message, for fields
+	// no row renders. The description stays: a row may show it, and it is
+	// short text read with the record, costing nothing to carry. The proto
+	// allows a list view to omit the cover and the pin summary (see
+	// chat.v1.Metadata.cover_picture and pin_summary), and tells the client to
+	// fetch them with GetChat and never to let a list result clear what it
+	// holds.
 	listDetail
 )
 
@@ -172,13 +175,16 @@ const (
 //     roster, and a pointer stored for them — a former member's — is not
 //     theirs to see. A DM's members are its record's, whoever the viewer is.
 //   - A viewer whose reading is denied gets no messaging state: no last
-//     message, no head event sequence, no pointers. The record's own fields —
-//     title, description, pictures, rules, roster summary, last activity —
-//     are hydrated for anyone the caller admits to the record at all.
+//     message, no head event sequence, no pointers, no pin summary. The
+//     record's own fields — title, description, pictures, rules, roster
+//     summary, last activity — are hydrated for anyone the caller admits to
+//     the record at all.
 //   - A viewer whose reading is redacted gets the messaging state with the
 //     last message redacted (see redact.Message), after its media is
-//     resolved, so the placeholder carries the blurhash a client renders. The
-//     read fails rather than returning a message that cannot be redacted.
+//     resolved, so the placeholder carries the blurhash a client renders, and
+//     the latest pinned message redacted by the read that returns it (see
+//     MessagingReader.Messages). The read fails rather than returning a
+//     message that cannot be redacted.
 //
 // A DM's members are its two participants, carried on the canonical record. A
 // group's roster lives in its own records and is not enumerated here: the
@@ -244,9 +250,20 @@ const (
 // to treat as unavailable, rather than failing the whole read.
 //
 // The detail is how much of the record is returned (see metadataDetail): a
-// feed asks for listDetail, and its chats carry no cover picture — its
-// renditions are never resolved, not resolved and dropped — while every other
-// caller asks for fullDetail.
+// feed asks for listDetail, and its chats carry no cover picture and no pin
+// summary — the renditions and the pins are never read, not read and dropped
+// — while every other caller asks for fullDetail.
+//
+// pin_summary is messaging state shown with one chat (see pin.go): read only
+// under fullDetail for a viewer whose reading is not denied, and then set on
+// every chat in the set, the zero summary (count 0, version 0, no latest) for
+// one that has never had a pin. Every chat's summary is read in one batch,
+// then every latest pinned message in one read under the reading, so a
+// redacted viewer gets it redacted; the two are sequential, one goroutine
+// beside the other reads. A latest pinned message the read does not return
+// fails the hydration, as every pin the service shows carries its message
+// (see pinsToProto); a deleted one is returned as its tombstone, which is not
+// missing.
 //
 // holdings_summary is the group's holdings snapshot (see holdings.go), read
 // for every group in the set gated on a currency (see GatedMint), one batched
@@ -270,6 +287,9 @@ func (h *Hydrator) hydrate(ctx context.Context, viewerID *commonpb.UserId, stand
 	var holdingsChatIDs []*commonpb.ChatId
 	gatedMints := make(map[string]*commonpb.PublicKey)
 	hydratedMembers := make([][]*commonpb.UserId, len(chats))
+	// The pin summary is messaging state (see above), and the same for every
+	// chat in the set, since the detail and the reading are.
+	showPins := detail == fullDetail && reading != ReadingDenied
 	for i, c := range chats {
 		if mint, ok := GatedMint(c); ok {
 			holdingsChatIDs = append(holdingsChatIDs, c.ID)
@@ -358,6 +378,8 @@ func (h *Hydrator) hydrate(ctx context.Context, viewerID *commonpb.UserId, stand
 		viewerStates           map[string]ViewerState
 		lobbyEntries           map[string]LobbyEntry
 		holdings               map[string]GroupHoldings
+		pinSummaries           map[string]PinSummary
+		pinnedMessages         map[MessageKey]*messagingpb.Message
 	)
 	chatIDs := make([]*commonpb.ChatId, len(chats))
 	for i, c := range chats {
@@ -426,6 +448,24 @@ func (h *Hydrator) hydrate(ctx context.Context, viewerID *commonpb.UserId, stand
 			return err
 		})
 	}
+	if showPins && len(chatIDs) > 0 {
+		// The latest pinned messages are named by the summaries, so the two
+		// reads are one after the other, together beside the rest.
+		g.Go(func() (err error) {
+			pinSummaries, err = h.chats.GetPinSummaries(gctx, chatIDs)
+			if err != nil {
+				return err
+			}
+			var refs []MessageRef
+			for _, chatID := range chatIDs {
+				if latest := pinSummaries[string(chatID.Value)].Latest; latest != nil {
+					refs = append(refs, MessageRef{ChatID: chatID, MessageID: latest.MessageID})
+				}
+			}
+			pinnedMessages, err = readPinnedMessages(gctx, h.messaging, reading, nil, refs)
+			return err
+		})
+	}
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
@@ -461,6 +501,13 @@ func (h *Hydrator) hydrate(ctx context.Context, viewerID *commonpb.UserId, stand
 			md.LastMessage = redacted
 		}
 		md.LatestEventSequence = latestEventSeqs[key]
+		if showPins {
+			summary, err := pinSummaryToProto(pinnedMessages, c.ID, pinSummaries[key])
+			if err != nil {
+				return nil, fmt.Errorf("pin summary of chat %s: %w", base64.StdEncoding.EncodeToString(c.ID.Value), err)
+			}
+			md.PinSummary = summary
+		}
 		if peer, ok := dmPeerByChat[key]; ok {
 			md.IsHidden = blockedPeers[string(peer.Value)]
 		}

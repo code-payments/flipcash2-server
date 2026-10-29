@@ -144,18 +144,15 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 
 	case ocp_intent.SendPublicMultiPayment:
 		// A multi payment is made for one of two things: a reaction boost
-		// that pays both the message's sender and the group's creator, open
-		// to everyone, or a group payment to several members at once, which
-		// is behind its staff gate. One carrying any other app metadata (a
-		// requested payment, which pays its request's creator alone,
-		// included), or none, is refused before anything is read.
+		// that pays both the message's sender and the group's creator, or a
+		// group payment to several members at once. One carrying any other
+		// app metadata (a requested payment, which pays its request's
+		// creator alone, included), or none, is refused before anything is
+		// read.
 		switch appMetadata.GetChat().GetType().(type) {
 		case *intentpb.ChatMetadata_ReactionBoost_:
 			return i.validateReactionBoostAppMetadata(ctx, intentRecord, &appMetadata)
 		case *intentpb.ChatMetadata_GroupPayment_:
-			if err := i.validateStaffOnlyMultiPayment(ctx, intentRecord); err != nil {
-				return err
-			}
 			return i.validateGroupAppMetadata(ctx, intentRecord, &appMetadata)
 		default:
 			return ocp_transaction.NewIntentDeniedError("multi payments are only supported for reaction boosts and group payments")

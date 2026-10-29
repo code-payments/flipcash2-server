@@ -1778,7 +1778,6 @@ func testServer_GetRoster_Gates(t *testing.T, s chat.Store) {
 func testServer_GetRoster_Invite(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	strangerID, strangerKeys := e.addBoundUser("Stranger")
 	joinerID, _ := e.addBoundUser("Joiner")
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers", model.MustGenerateUserID(), model.MustGenerateUserID())
@@ -8028,7 +8027,6 @@ func privateGroupViewerState(version uint64, mute *chatpb.MuteState, isCreator b
 func testServer_Invite_Create(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 
 	// Unlimited and never expiring.
@@ -8088,7 +8086,6 @@ func testServer_Invite_Create(t *testing.T, s chat.Store) {
 func testServer_Invite_Gates(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	memberID, memberKeys := e.addBoundUser("Member")
 	_, strangerKeys := e.addBoundUser("Stranger")
 
@@ -8139,18 +8136,9 @@ func testServer_Invite_Gates(t *testing.T, s chat.Store) {
 	e.waitForChatInvites(e.keys, keyed, again, invite)
 	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, keyed, invite.InviteId).Result)
 
-	// While invites are being rolled out, a creator who is not staff creates
-	// nothing, but still lists and revokes what they made.
-	e.accounts.setStaff(e.userID, false)
-	require.Equal(t, chatpb.CreateInviteResponse_DENIED, e.createInvite(e.keys, createInviteRequest(e.keys, keyed, newInviteToken())).Result)
-	e.waitForChatInvites(e.keys, keyed, again, withStatus(invite, chatpb.Invite_REVOKED))
-	require.Equal(t, chatpb.RevokeInviteResponse_OK, e.revokeInvite(e.keys, keyed, again.InviteId).Result)
-	e.accounts.setStaff(e.userID, true)
-
 	// A caller with no account key bound cannot have a copy checked: every
 	// registered user has one, so its absence is an internal failure.
 	noKeyID, noKeyKeys := e.addUser()
-	e.accounts.setStaff(noKeyID, true)
 	noKeyGroup := chat.MustGenerateGroupChatID()
 	require.NoError(t, e.store.PutChat(e.ctx, &chat.Chat{
 		ID:           noKeyGroup,
@@ -8172,7 +8160,6 @@ func testServer_Invite_Gates(t *testing.T, s chat.Store) {
 func testServer_Invite_ExpiresAt(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 
 	create := func(expiresAt time.Time) *chatpb.CreateInviteResponse {
@@ -8211,7 +8198,6 @@ func testServer_Invite_ExpiresAt(t *testing.T, s chat.Store) {
 func testServer_Invite_Signature(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 	other := e.putKeyedPrivateGroup("Other")
 
@@ -8250,7 +8236,6 @@ func testServer_Invite_Signature(t *testing.T, s chat.Store) {
 func testServer_Invite_Cap(t *testing.T, s chat.Store) {
 	e := newServerEnvWithConfig(t, s, serverConfig{maxActiveInvites: 2})
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 
 	firstToken, first := e.mustCreateInvite(e.keys, chatID)
@@ -8290,7 +8275,6 @@ func testServer_Invite_Cap(t *testing.T, s chat.Store) {
 func testServer_Invite_Retry(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 	other := e.putKeyedPrivateGroup("Other")
 	otherCreatorID, otherCreatorKeys := e.addBoundUser("Other Creator")
@@ -8325,13 +8309,6 @@ func testServer_Invite_Retry(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.CreateInviteResponse_OK, retried.Result)
 	require.NoError(t, protoutil.ProtoEqualError(first, retried.Invite))
 
-	// And whether or not the caller is still staff.
-	e.accounts.setStaff(e.userID, false)
-	retried = e.createInvite(e.keys, createInviteRequest(e.keys, chatID, token))
-	require.Equal(t, chatpb.CreateInviteResponse_OK, retried.Result)
-	require.NoError(t, protoutil.ProtoEqualError(first, retried.Invite))
-	e.accounts.setStaff(e.userID, true)
-
 	// The same token for another chat, by its creator or anyone else's.
 	require.Equal(t, chatpb.CreateInviteResponse_DENIED, e.createInvite(e.keys, createInviteRequest(e.keys, other, token)).Result)
 	require.Equal(t, chatpb.CreateInviteResponse_DENIED, e.createInvite(otherCreatorKeys, createInviteRequest(otherCreatorKeys, theirs, token)).Result)
@@ -8358,7 +8335,6 @@ func testServer_Invite_Retry(t *testing.T, s chat.Store) {
 func testServer_Invite_Get(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	_, strangerKeys := e.addBoundUser("Stranger")
 	bannedID, bannedKeys := e.addBoundUser("Banned")
 	joinerID, _ := e.addBoundUser("Joiner")
@@ -8443,7 +8419,6 @@ func testServer_Invite_Get(t *testing.T, s chat.Store) {
 func testServer_Invite_GetUnauthenticated(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	bannedID, _ := e.addBoundUser("Banned")
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 
@@ -8497,7 +8472,6 @@ func testServer_Invite_GetUnauthenticated(t *testing.T, s chat.Store) {
 func testServer_Invite_List(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	joinerID, _ := e.addBoundUser("Joiner")
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 	other := e.putKeyedPrivateGroup("Other")
@@ -8591,7 +8565,6 @@ func testServer_Invite_List(t *testing.T, s chat.Store) {
 func testServer_Invite_Revoke(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	_, strangerKeys := e.addBoundUser("Stranger")
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 	other := e.putKeyedPrivateGroup("Other")
@@ -8717,7 +8690,6 @@ func requireInviteKeyBundle(t *testing.T, resp *chatpb.GetKeyEnvelopeResponse, c
 func testServer_InviteJoin(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	joinerID, joinerKeys := e.addBoundUser("Joiner")
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 	token, keyCopy, invite := e.createInviteWithCopy(e.keys, chatID, 0)
@@ -8770,7 +8742,6 @@ func testServer_InviteJoin(t *testing.T, s chat.Store) {
 func testServer_InviteJoin_Announcements(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 	token, _, _ := e.createInviteWithCopy(e.keys, chatID, 0)
 
@@ -8849,7 +8820,6 @@ func testServer_InviteJoin_Announcements(t *testing.T, s chat.Store) {
 func testServer_InviteJoin_NoOps(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	joinerID, joinerKeys := e.addBoundUser("Joiner")
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 	other := e.putKeyedPrivateGroup("Other")
@@ -8900,7 +8870,6 @@ func testServer_InviteJoin_NoOps(t *testing.T, s chat.Store) {
 func testServer_InviteJoin_Rejoin(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	joinerID, joinerKeys := e.addBoundUser("Joiner")
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 	token, keyCopy, invite := e.createInviteWithCopy(e.keys, chatID, 0)
@@ -8938,7 +8907,6 @@ func testServer_InviteJoin_Rejoin(t *testing.T, s chat.Store) {
 func testServer_InviteJoin_Refused(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 	other := e.putKeyedPrivateGroup("Other")
 
@@ -9020,7 +8988,6 @@ func testServer_InviteJoin_Refused(t *testing.T, s chat.Store) {
 func testServer_InviteJoin_PublicGroup(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	private := e.putKeyedPrivateGroup("Private")
 	token, _, invite := e.createInviteWithCopy(e.keys, private, 0)
 	userID, userKeys := e.addBoundUser("User")
@@ -9080,7 +9047,6 @@ func testServer_InviteJoin_PublicGroup(t *testing.T, s chat.Store) {
 func testServer_InviteJoin_Creator(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	e.bindKey(e.userID, e.keys)
-	e.accounts.setStaff(e.userID, true)
 	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
 	token, _, invite := e.createInviteWithCopy(e.keys, chatID, 0)
 

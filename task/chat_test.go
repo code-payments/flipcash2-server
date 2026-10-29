@@ -321,22 +321,10 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	require.Len(t, msgs, 1)
 }
 
-// staffAccounts marks the users in staff as staff, which a group payment's
-// multi payment requires while it rolls out.
-type staffAccounts struct {
-	account.Store
-
-	staff map[string]bool
-}
-
-func (s *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (bool, error) {
-	return s.staff[string(userID.Value)], nil
-}
-
 // groupPaymentEnv executes group payment tasks against in-memory stores.
 type groupPaymentEnv struct {
 	ctx         context.Context
-	accounts    *staffAccounts
+	accounts    account.Store
 	chats       chat.Store
 	messages    messaging.Store
 	requests    paymentrequest.Store
@@ -352,7 +340,7 @@ func newGroupPaymentEnv(t *testing.T) *groupPaymentEnv {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
-	accounts := &staffAccounts{Store: accountmemory.NewInMemory(), staff: make(map[string]bool)}
+	accounts := accountmemory.NewInMemory()
 	chats := chatmemory.NewInMemory(nil)
 	messages := messagingmemory.NewInMemory()
 	profiles := profilememory.NewInMemory()
@@ -619,7 +607,6 @@ func TestExecutor_SendGroupPaymentMessage_MultiPayment(t *testing.T) {
 	e := newGroupPaymentEnv(t)
 
 	payerUserID, payerKeys := e.bindUser(t)
-	e.accounts.staff[string(payerUserID.Value)] = true
 	recipient1UserID, recipient1Keys := e.bindUser(t)
 	recipient2UserID, recipient2Keys := e.bindUser(t)
 	recipient3UserID, recipient3Keys := e.bindUser(t)

@@ -341,7 +341,7 @@ func TestGetCommunity_Capped(t *testing.T) {
 	resp := e.getCommunity(mint)
 	require.Equal(t, communitypb.GetCommunityResponse_OK, resp.Result)
 	chats := resp.Community.TopHolderChats
-	require.Len(t, chats, 5)
+	require.Len(t, chats, 10)
 	require.EqualValues(t, 1_000+groups-1, chats[0].HoldingsSummary.Quarks)
 	for i := 1; i < len(chats); i++ {
 		require.Greater(t, chats[i-1].HoldingsSummary.Quarks, chats[i].HoldingsSummary.Quarks)

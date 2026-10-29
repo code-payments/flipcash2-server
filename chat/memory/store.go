@@ -88,7 +88,19 @@ type memory struct {
 	// so this one keeps it.
 	inviteCopies map[string]*chatpb.InviteKeyEnvelope
 
+	// pins holds each chat's pins, keyed by chat ID, from its first pin on
+	// (see chat.Store.PinMessage). A chat whose pins were all removed keeps
+	// its entry, and so its version.
+	pins map[string]*chatPins
+
 	exclusions chat.FeedExclusions
+}
+
+// chatPins is one chat's pins, keyed by message ID, and their version: the
+// number of real pins and unpins the chat has seen.
+type chatPins struct {
+	byMessage map[uint64]chat.Pin
+	version   uint64
 }
 
 // memberRecord is one group membership record, as the persistent stores keep
@@ -121,6 +133,7 @@ func NewInMemory(excludedFromFeed []*commonpb.UserId) chat.Store {
 		holdingsQueue:    make(map[string]chat.HoldingsRefresh),
 		invites:          make(map[string]chat.Invite),
 		inviteCopies:     make(map[string]*chatpb.InviteKeyEnvelope),
+		pins:             make(map[string]*chatPins),
 	}
 }
 
@@ -142,6 +155,7 @@ func (m *memory) reset() {
 	m.holdingsQueue = make(map[string]chat.HoldingsRefresh)
 	m.invites = make(map[string]chat.Invite)
 	m.inviteCopies = make(map[string]*chatpb.InviteKeyEnvelope)
+	m.pins = make(map[string]*chatPins)
 }
 
 // isJoinedLocked reports whether the user's record on the group has them
@@ -1579,6 +1593,129 @@ func cloneFeaturedGroups(f chat.FeaturedGroups) chat.FeaturedGroups {
 		out.ChatIDs = append(out.ChatIDs, &commonpb.ChatId{Value: append([]byte(nil), chatID.Value...)})
 	}
 	return out
+}
+
+func (m *memory) PinMessage(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, pinnedBy *commonpb.UserId, pinnedAt time.Time, maxPins int) (chat.PinSummary, bool, error) {
+	pin := chat.Pin{MessageID: messageID, PinnedBy: pinnedBy, PinnedAt: pinnedAt}
+	if err := chat.ValidatePin(chatID, pin); err != nil {
+		return chat.PinSummary{}, false, err
+	}
+	pin.PinnedAt = chat.PinTime(pinnedAt)
+	if maxPins < 1 {
+		return chat.PinSummary{}, false, fmt.Errorf("max pins must be at least one")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	chatKey := string(chatID.Value)
+	// The no-op first, then the cap, as the persistent store judges them.
+	if pins := m.pins[chatKey]; pins != nil {
+		if _, ok := pins.byMessage[messageID.Value]; ok {
+			return pins.summary(), false, nil
+		}
+		if len(pins.byMessage) >= maxPins {
+			return chat.PinSummary{}, false, chat.ErrTooManyPins
+		}
+	}
+
+	pins := m.pins[chatKey]
+	if pins == nil {
+		pins = &chatPins{byMessage: make(map[uint64]chat.Pin)}
+		m.pins[chatKey] = pins
+	}
+	pins.byMessage[messageID.Value] = pin.Clone()
+	pins.version++
+	return pins.summary(), true, nil
+}
+
+func (m *memory) UnpinMessage(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (chat.PinSummary, bool, error) {
+	if err := chat.ValidatePinChatIDs(chatID); err != nil {
+		return chat.PinSummary{}, false, err
+	}
+	if messageID == nil {
+		return chat.PinSummary{}, false, fmt.Errorf("message id is required")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	pins := m.pins[string(chatID.Value)]
+	if pins == nil {
+		return chat.PinSummary{}, false, nil
+	}
+	if _, ok := pins.byMessage[messageID.Value]; !ok {
+		return pins.summary(), false, nil
+	}
+	delete(pins.byMessage, messageID.Value)
+	pins.version++
+	return pins.summary(), true, nil
+}
+
+func (m *memory) GetPinSummaries(_ context.Context, chatIDs []*commonpb.ChatId) (map[string]chat.PinSummary, error) {
+	if err := chat.ValidatePinChatIDs(chatIDs...); err != nil {
+		return nil, err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	out := make(map[string]chat.PinSummary)
+	for _, chatID := range chatIDs {
+		if pins := m.pins[string(chatID.Value)]; pins != nil {
+			out[string(chatID.Value)] = pins.summary()
+		}
+	}
+	return out, nil
+}
+
+func (m *memory) GetPinsPage(_ context.Context, chatID *commonpb.ChatId, after *chat.PinPosition, limit int) ([]chat.Pin, error) {
+	if err := chat.ValidatePinChatIDs(chatID); err != nil {
+		return nil, err
+	}
+	if after != nil {
+		if err := chat.ValidatePinPosition(*after); err != nil {
+			return nil, err
+		}
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	page := make([]chat.Pin, 0)
+	if pins := m.pins[string(chatID.Value)]; pins != nil {
+		for _, pin := range pins.sorted() {
+			if after != nil && pin.Position().Compare(*after) <= 0 {
+				continue
+			}
+			page = append(page, pin)
+		}
+	}
+	if limit > 0 && len(page) > limit {
+		page = page[:limit]
+	}
+	return page, nil
+}
+
+// sorted returns copies of the chat's pins in pin order (see
+// chat.PinPosition).
+func (p *chatPins) sorted() []chat.Pin {
+	out := make([]chat.Pin, 0, len(p.byMessage))
+	for _, pin := range p.byMessage {
+		out = append(out, pin.Clone())
+	}
+	slices.SortFunc(out, func(a, b chat.Pin) int { return a.Position().Compare(b.Position()) })
+	return out
+}
+
+// summary returns a copy of the chat's pin summary: its latest pin in pin
+// order, its count and its version.
+func (p *chatPins) summary() chat.PinSummary {
+	s := chat.PinSummary{Count: uint32(len(p.byMessage)), Version: p.version}
+	if sorted := p.sorted(); len(sorted) > 0 {
+		s.Latest = &sorted[0]
+	}
+	return s
 }
 
 func (m *memory) PutGroupHoldings(_ context.Context, h chat.GroupHoldings) (bool, error) {

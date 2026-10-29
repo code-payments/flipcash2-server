@@ -446,7 +446,9 @@ func (c *Chat) IsCreator(userID *commonpb.UserId) bool {
 // Public and private groups alike: a private group's creator moderates it on
 // the same footing as a public group's. Only a private group's creator, while
 // a member, may invite (see Invite): no one else, since anyone who may invite
-// can hand joiners a chat key, and a public group needs no invite.
+// can hand joiners a chat key, and a public group needs no invite. Either
+// member of a DM may pin its messages, and in a group only the creator while
+// a member, as for an edit (see pin.go).
 func (c *Chat) PermissionsFor(userID *commonpb.UserId, isMember bool) Permissions {
 	isCreatorMember := isMember && c.IsCreator(userID)
 	return Permissions{
@@ -456,6 +458,7 @@ func (c *Chat) PermissionsFor(userID *commonpb.UserId, isMember bool) Permission
 			CanBan:     isCreatorMember,
 		},
 		CanInvite: isCreatorMember && c.IsPrivate,
+		CanPin:    isCreatorMember || (isMember && !IsGroupChatID(c.ID)),
 	}
 }
 
@@ -1195,6 +1198,7 @@ type Permissions struct {
 	CanEdit    bool
 	Moderation ModerationPermissions
 	CanInvite  bool
+	CanPin     bool
 }
 
 // ModerationPermissions is how a user may moderate a chat's users (see
@@ -1216,7 +1220,7 @@ func (m ModerationPermissions) Any() bool {
 // ToProto projects the permissions onto a chatpb.ViewerState_Permissions,
 // leaving moderation unset when it grants nothing, as the proto describes.
 func (p Permissions) ToProto() *chatpb.ViewerState_Permissions {
-	out := &chatpb.ViewerState_Permissions{CanEdit: p.CanEdit, CanInvite: p.CanInvite}
+	out := &chatpb.ViewerState_Permissions{CanEdit: p.CanEdit, CanInvite: p.CanInvite, CanPin: p.CanPin}
 	if p.Moderation.Any() {
 		out.Moderation = &chatpb.ViewerState_ModerationPermissions{
 			CanSilence: p.Moderation.CanSilence,

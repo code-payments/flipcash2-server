@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -49,7 +50,7 @@ func (s *Server) GetMessage(ctx context.Context, req *messagingpb.GetMessageRequ
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	protos, err := s.present(ctx, log, req.ChatId, reading, []*Message{msg})
+	protos, err := s.present(ctx, log, reading, []*Message{msg})
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +96,7 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 	if len(msgs) == 0 {
 		return &messagingpb.GetMessagesResponse{Result: messagingpb.GetMessagesResponse_NOT_FOUND}, nil
 	}
-	protos, err := s.present(ctx, log, req.ChatId, reading, msgs)
+	protos, err := s.present(ctx, log, reading, msgs)
 	if err != nil {
 		return nil, err
 	}
@@ -106,35 +107,49 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 }
 
 // present projects stored messages into what a read returns for the given
-// reading: the protos with their media resolved (see hydrateMedia) and, for a
-// redacted reading, every message replaced by its placeholder (see
-// redact.Message). This is the one place a message read leaves the server, so
-// every read path — GetMessage, GetMessages, GetDelta — answers a redacted
-// viewer the same way, and a page is wholly full or wholly redacted.
+// reading (see presentMessages), failing the read with Internal when a message
+// cannot be redacted.
+func (s *Server) present(ctx context.Context, log *zap.Logger, reading chat.Reading, msgs []*Message) ([]*messagingpb.Message, error) {
+	protos, err := presentMessages(ctx, log, s.media, reading, msgs)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "")
+	}
+	return protos, nil
+}
+
+// presentMessages projects stored messages into what a read returns for the
+// given reading: the protos with their media resolved (see hydrateMedia) and,
+// for a redacted reading, every message replaced by its placeholder (see
+// redact.Message), each redacted as a message of its own chat. This is the
+// one place a message read leaves the server — every read path of the
+// Messaging service (GetMessage, GetMessages, GetDelta) and the Chat
+// service's reads of chosen messages (see chatMessagingReader.Messages) —
+// so all of them answer a redacted viewer the same way, and a page is wholly
+// full or wholly redacted.
 //
 // Media is resolved before redaction, not skipped for it: the placeholder
 // keeps each rendition's intrinsic metadata — dimensions, blurhash — and drops
 // only the download URL, and the metadata is what resolution supplies. A
 // resolution failure is logged and the messages returned with their stored
-// renditions, as before; a redaction failure fails the read with Internal,
-// since a message that cannot be redacted must not be returned to a viewer
-// who may only see it redacted.
-func (s *Server) present(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, reading chat.Reading, msgs []*Message) ([]*messagingpb.Message, error) {
+// renditions, as before; a redaction failure is logged and returned as an
+// error, since a message that cannot be redacted must not be returned to a
+// viewer who may only see it redacted.
+func presentMessages(ctx context.Context, log *zap.Logger, media Media, reading chat.Reading, msgs []*Message) ([]*messagingpb.Message, error) {
 	protos := make([]*messagingpb.Message, len(msgs))
 	for i, m := range msgs {
 		protos[i] = m.ToProto()
 	}
-	if err := hydrateMedia(ctx, s.media, protos); err != nil {
+	if err := hydrateMedia(ctx, media, protos); err != nil {
 		log.With(zap.Error(err)).Warn("Failure resolving media metadata")
 	}
 	if reading != chat.ReadingRedacted {
 		return protos, nil
 	}
 	for i, p := range protos {
-		redacted, err := redact.Message(chatID, p)
+		redacted, err := redact.Message(msgs[i].ChatID, p)
 		if err != nil {
 			log.With(zap.Error(err), zap.Uint64("message_id", p.GetMessageId().GetValue())).Warn("Failure redacting message")
-			return nil, status.Error(codes.Internal, "")
+			return nil, fmt.Errorf("redacting message %d: %w", p.GetMessageId().GetValue(), err)
 		}
 		protos[i] = redacted
 	}

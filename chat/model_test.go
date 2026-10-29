@@ -170,11 +170,18 @@ func TestPermissionsFor(t *testing.T) {
 	group := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, CreatorID: creatorID}
 	dm := &Chat{ID: MustDeriveDmChatID(chatpb.ChatType_DM, creatorID, memberID), Type: chatpb.ChatType_DM}
 
-	all := Permissions{CanEdit: true, Moderation: ModerationPermissions{CanSilence: true, CanBan: true}}
+	all := Permissions{CanEdit: true, Moderation: ModerationPermissions{CanSilence: true, CanBan: true}, CanPin: true}
 	require.Equal(t, all, group.PermissionsFor(creatorID, true))
 	require.Equal(t, Permissions{}, group.PermissionsFor(creatorID, false))
 	require.Equal(t, Permissions{}, group.PermissionsFor(memberID, true))
-	require.Equal(t, Permissions{}, dm.PermissionsFor(creatorID, true))
+
+	// Either member of a DM may pin, and do nothing else; a non-member may
+	// not even pin.
+	require.Equal(t, Permissions{CanPin: true}, dm.PermissionsFor(creatorID, true))
+	require.Equal(t, Permissions{CanPin: true}, dm.PermissionsFor(memberID, true))
+	require.Equal(t, Permissions{}, dm.PermissionsFor(creatorID, false))
+	require.True(t, dm.PermissionsFor(memberID, true).ToProto().CanPin)
+	require.False(t, group.PermissionsFor(memberID, true).ToProto().CanPin)
 
 	// A private group's creator, while a member, may also invite, and no one
 	// else may; a public group's creator has nothing to invite to.

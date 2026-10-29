@@ -16,6 +16,7 @@ import (
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/chat/cache"
 	"github.com/code-payments/flipcash2-server/chat/memory"
+	"github.com/code-payments/flipcash2-server/chat/tests"
 	"github.com/code-payments/flipcash2-server/model"
 )
 
@@ -627,4 +628,11 @@ func TestCache_Invites_PassThrough(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, page, 1)
 	require.Equal(t, chatpb.Invite_REVOKED, page[0].StatusAt(now))
+}
+
+// TestCache_Pins_PassThrough runs the shared pin tests through the cache: pins
+// pass straight through, so the cache behaves as its backing store. Every test
+// names chats of its own, so the store needs no reset between them.
+func TestCache_Pins_PassThrough(t *testing.T) {
+	tests.RunPinStoreTests(t, cache.NewInCache(memory.NewInMemory(nil)), func() {})
 }

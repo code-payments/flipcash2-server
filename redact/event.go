@@ -20,19 +20,20 @@ import (
 //
 // The mode a viewer reads a chat under decides only the messages (see
 // eventpb.StreamEventsRequest.ChatParams), and an update carries them in
-// three places: the mutations of its event-log events, the last_message of a
-// metadata refresh, and the last_message of the metadata a MemberJoined hands
-// its recipient. Pointer, typing, reaction and roster overlays pass through
-// as they are — they describe the conversation's movement, which a redacted
-// view shows, not its words. Payment request updates are left out: a viewer
-// who may only preview a chat sees a request's widget but not the request
-// (see paymentrequest/event.go), so an update carrying nothing else
-// redacts to a bare one. Like Message, the copy is built field by field so
-// that every field carried is an allowlist decision: a field added to
-// ChatUpdate later is left out of the copy, and a new kind of mutation,
-// metadata update or roster update is refused with an error, until a
-// decision is made for it, rather than passed through to a viewer who may
-// not read it.
+// these places: the mutations of its event-log events; the last_message and
+// the pin summary's latest pinned message of a metadata refresh's metadata,
+// and of the metadata a MemberJoined hands its recipient; and the pin made
+// and the summary's latest pinned message of a PinsChanged. Pointer, typing,
+// reaction and roster overlays pass through as they are — they describe the
+// conversation's movement, which a redacted view shows, not its words.
+// Payment request updates are left out: a viewer who may only preview a chat
+// sees a request's widget but not the request (see paymentrequest/event.go),
+// so an update carrying nothing else redacts to a bare one. Like Message, the
+// copy is built field by field so that every field carried is an allowlist
+// decision: a field added to ChatUpdate later is left out of the copy, and a
+// new kind of mutation, metadata update, pins change or roster update is
+// refused with an error, until a decision is made for it, rather than passed
+// through to a viewer who may not read it.
 //
 // The chat ID seeds every placeholder (see Message), so a message redacted on
 // the stream renders exactly as the same message redacted by GetMessages or
@@ -123,18 +124,21 @@ func event(chatID *commonpb.ChatId, e *messagingpb.Event) (*messagingpb.Event, e
 }
 
 // metadataUpdate redacts one metadata update: a full refresh carries the
-// chat's metadata, whose last_message is a message (see metadata); a
-// last-activity change carries only a time; a viewer-state change carries
-// the recipient's own state on the chat (a mute, their permissions and the
-// version), which is theirs whatever they may read of the chat and holds no
-// message, so it passes as it is; a title, description, profile picture or
-// cover picture change carries the record's own fields, which identify the
-// group to anyone who may read it in any form (see chat.v1.GetChat), so it
-// passes as it is too; and a rules change carries the group's rules, which
-// are no message's content and are shown to anyone who may see the group in
-// any form, the public view's Metadata.rules included, since they are what a
-// user weighs before joining, so it passes as it is as well. A kind this
-// version does not know is an error.
+// chat's metadata, whose last_message and pin summary carry messages (see
+// metadata); a pins change carries the pin made, when it is a pin, and the
+// summary after it, whose messages are redacted and nothing else (see pin),
+// while an unpin names only the message unpinned; a last-activity change
+// carries only a time; a viewer-state change carries the recipient's own
+// state on the chat (a mute, their permissions and the version), which is
+// theirs whatever they may read of the chat and holds no message, so it
+// passes as it is; a title, description, profile picture or cover picture
+// change carries the record's own fields, which identify the group to anyone
+// who may read it in any form (see chat.v1.GetChat), so it passes as it is
+// too; and a rules change carries the group's rules, which are no message's
+// content and are shown to anyone who may see the group in any form, the
+// public view's Metadata.rules included, since they are what a user weighs
+// before joining, so it passes as it is as well. A kind this version does
+// not know is an error.
 func metadataUpdate(chatID *commonpb.ChatId, md *chatpb.MetadataUpdate) (*chatpb.MetadataUpdate, error) {
 	switch kind := md.GetKind().(type) {
 	case *chatpb.MetadataUpdate_FullRefresh_:
@@ -145,6 +149,23 @@ func metadataUpdate(chatID *commonpb.ChatId, md *chatpb.MetadataUpdate) (*chatpb
 		return &chatpb.MetadataUpdate{Kind: &chatpb.MetadataUpdate_FullRefresh_{
 			FullRefresh: &chatpb.MetadataUpdate_FullRefresh{Metadata: redacted},
 		}}, nil
+	case *chatpb.MetadataUpdate_PinsChanged_:
+		out := proto.Clone(md).(*chatpb.MetadataUpdate)
+		change := out.GetPinsChanged()
+		switch c := change.GetChange().(type) {
+		case *chatpb.MetadataUpdate_PinsChanged_Pinned:
+			if err := pin(chatID, c.Pinned); err != nil {
+				return nil, err
+			}
+		case *chatpb.MetadataUpdate_PinsChanged_Unpinned:
+			// An ID alone, no message.
+		default:
+			return nil, fmt.Errorf("redact: unsupported pins change %T", c)
+		}
+		if err := pin(chatID, change.GetSummary().GetLatest()); err != nil {
+			return nil, err
+		}
+		return out, nil
 	case *chatpb.MetadataUpdate_LastActivityChanged_,
 		*chatpb.MetadataUpdate_ViewerStateChanged_,
 		*chatpb.MetadataUpdate_TitleChanged_,
@@ -183,8 +204,9 @@ func rosterUpdate(chatID *commonpb.ChatId, r *chatpb.RosterUpdate) (*chatpb.Rost
 }
 
 // metadata redacts a chat's metadata as chat.v1.GetChat does for a redacted
-// viewer: the record as it is, with last_message — the one message it
-// carries — redacted. A nil metadata is nil.
+// viewer: the record as it is, with the messages it carries — last_message,
+// and the pin summary's latest pinned message (see pin) — redacted. A nil
+// metadata is nil.
 func metadata(chatID *commonpb.ChatId, md *chatpb.Metadata) (*chatpb.Metadata, error) {
 	if md == nil {
 		return nil, nil
@@ -197,7 +219,28 @@ func metadata(chatID *commonpb.ChatId, md *chatpb.Metadata) (*chatpb.Metadata, e
 		}
 		out.LastMessage = redacted
 	}
+	if err := pin(chatID, out.GetPinSummary().GetLatest()); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// pin redacts, in place, the message a pin carries (see Message), so it is
+// called only on a copy. Which message is pinned, by whom and when are kept,
+// as are a summary's count and version around it: like a reaction, a pin is
+// the conversation's movement, not its words, and a redacted message keeps
+// its own ID and sender anyway. A nil pin, or one carrying no message, is
+// left as it is.
+func pin(chatID *commonpb.ChatId, p *chatpb.Pin) error {
+	if p.GetMessage() == nil {
+		return nil
+	}
+	redacted, err := Message(chatID, p.GetMessage())
+	if err != nil {
+		return err
+	}
+	p.Message = redacted
+	return nil
 }
 
 func cloneOrNil(chatID *commonpb.ChatId) *commonpb.ChatId {

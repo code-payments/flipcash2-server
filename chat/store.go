@@ -79,6 +79,11 @@ var (
 	// ErrTooManyInvites indicates that a private group holds as many ACTIVE
 	// invites as allowed (see MaxActiveInvites).
 	ErrTooManyInvites = errors.New("too many invites")
+
+	// ErrTooManyPins indicates that a chat has as many pinned messages as
+	// the cap the pin was made under allows (see Store.PinMessage and
+	// MaxPinnedMessages).
+	ErrTooManyPins = errors.New("too many pins")
 )
 
 // MaxGroupChatCreationMembers is the largest initial member set a group chat
@@ -181,6 +186,13 @@ type DmFeedCursor struct {
 // UseCount, which only grows, and RevokedAt, which is set once, so a write
 // conditioned on the fields it read is its own compare-and-set, and a
 // version would be needed only if an invite could ever be edited.
+//
+// A chat's pins (see Pin) are one record per pinned message, kept with the
+// chat's PinSummary, whose count and version move in the same write as the
+// pin (see PinMessage). Like the rest, they are written against the IDs
+// alone, a DM's or a group's: that the chat exists, that the message is in
+// it and not deleted, and that the caller may pin there are the caller's
+// gates.
 type Store interface {
 	// PutChat persists a new chat and its membership. It returns ErrChatExists
 	// if a chat with the same ID already exists, ErrNoMembers if the member set
@@ -884,6 +896,55 @@ type Store interface {
 	// of its own. A user who has never set any reads as no groups at version
 	// zero.
 	GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (FeaturedGroups, error)
+
+	// PinMessage pins messageID in chatID, by pinnedBy as of pinnedAt, and
+	// returns the chat's PinSummary after the call. A message already pinned
+	// is a no-op that writes nothing and returns the summary as it stands
+	// with changed false: the pin keeps its time, its pinner and its place
+	// in the order, and the version does not move. Otherwise a chat with
+	// maxPins or more pins is refused with ErrTooManyPins, judged against
+	// the count as of the write, with nothing written, so pins racing at the
+	// cap never leave the chat over it; the no-op is judged first, so a
+	// retried pin is answered at the cap like anywhere else. A real pin is
+	// one write that records it, makes it the summary's Latest, and moves
+	// the count up by one and the version by exactly one.
+	//
+	// pinnedAt is recorded at nanosecond precision in UTC (see PinTime). It
+	// returns an error if the arguments fail ValidatePin or maxPins is less
+	// than one. It does not check that the chat exists, that the message is
+	// in it, or who may pin: those are the caller's.
+	PinMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, pinnedBy *commonpb.UserId, pinnedAt time.Time, maxPins int) (summary PinSummary, changed bool, err error)
+
+	// UnpinMessage unpins messageID in chatID, whoever pinned it, and
+	// returns the chat's PinSummary after the call. A message not pinned is
+	// a no-op that writes nothing and returns the summary as it stands with
+	// changed false. A real unpin is one write that removes the pin, moves
+	// the count down by one and the version up by exactly one, and, when the
+	// pin was the Latest, makes the next pin in order (see PinPosition) the
+	// Latest, or leaves none when it was the last. It returns an error if
+	// chatID is neither a DM nor a group chat ID or messageID is nil.
+	UnpinMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (summary PinSummary, changed bool, err error)
+
+	// GetPinSummaries returns the PinSummary of each given chat that has ever
+	// had a pin, keyed by string(chatID.Value), its version above zero even
+	// when nothing is pinned now; a chat that never had one is absent, and
+	// reads as the zero summary. Duplicate IDs collapse. The read is strongly
+	// consistent: it reflects every pin and unpin that completed before it,
+	// so a caller that pins and then reads sees its pin. It returns an error
+	// if any ID is neither a DM nor a group chat ID, and an empty result (no
+	// error) when chatIDs is empty.
+	GetPinSummaries(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]PinSummary, error)
+
+	// GetPinsPage returns up to limit of chatID's pins in pin order (see
+	// PinPosition: most recently pinned first), strictly after the given
+	// position, or from the start when it is nil. A limit of zero or less
+	// means no limit. The read is strongly consistent, like
+	// GetPinSummaries, but each call is a read of its own: a pin made or
+	// removed between two pages is seen or missed as the proto describes
+	// (see Chat.GetPinnedMessages). A chat with no pins, or that does not
+	// exist, is an empty result. It returns an error if chatID is neither a
+	// DM nor a group chat ID, or after fails ValidatePinPosition.
+	GetPinsPage(ctx context.Context, chatID *commonpb.ChatId, after *PinPosition, limit int) ([]Pin, error)
 
 	// PutGroupHoldings records h as its group's holdings snapshot (see
 	// GroupHoldings), replacing the one stored, and reports whether it did.

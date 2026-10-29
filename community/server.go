@@ -37,8 +37,8 @@ import (
 
 // maxTopHolderChats is how many groups a community's top holder chats list.
 // The proto leaves the number to the server, up to its cap on
-// CommunityMetadata.top_holder_chats (25); five to start.
-const maxTopHolderChats = 5
+// CommunityMetadata.top_holder_chats (25).
+const maxTopHolderChats = 10
 
 type Server struct {
 	log *zap.Logger

@@ -24,7 +24,6 @@ import (
 
 	currency_lib "github.com/code-payments/ocp-server/currency"
 
-	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/event"
@@ -56,8 +55,8 @@ const (
 //   - Creating a request is speaking in the chat (Access.SpeakerStanding), and
 //     the standing also says whether the chat takes a split's text in
 //     plaintext (a public group) or encrypted under the chat key (a keyed
-//     private group). For now creation is also staff-only, and public groups
-//     are refused outright (see CreatePaymentRequest); both are transitional.
+//     private group). For now public groups are refused outright (see
+//     CreatePaymentRequest), a transitional gate.
 //   - Seeing a request, alone or in its chat's listing, is reading the chat in
 //     full (Access.CanListen): its members, and a non-member of a public
 //     group who satisfies its listener rules.
@@ -77,7 +76,6 @@ type Server struct {
 	authz auth.Authorizer
 
 	requests  Store
-	accounts  account.Store
 	chats     chat.Store
 	access    *chat.Access
 	moderator moderation.Client
@@ -119,15 +117,14 @@ func WithPublicGroupRequests() ServerOption {
 // chat.Access the chat and messaging servers share, so a request is gated by
 // exactly what gates the chat it belongs to; chats is read for what Access
 // does not answer (a group's existence, and whether a split's debtors are its
-// members), and accounts for the staff gate on creation. chatEventBus is the
-// chat-keyed event bus every change is announced on (see PublishCreated).
+// members). chatEventBus is the chat-keyed event bus every change is
+// announced on (see PublishCreated).
 func NewServer(
 	log *zap.Logger,
 
 	authz auth.Authorizer,
 
 	requests Store,
-	accounts account.Store,
 	chats chat.Store,
 	access *chat.Access,
 	moderator moderation.Client,
@@ -142,7 +139,6 @@ func NewServer(
 		authz: authz,
 
 		requests:  requests,
-		accounts:  accounts,
 		chats:     chats,
 		access:    access,
 		moderator: moderator,
@@ -162,16 +158,15 @@ func NewServer(
 //
 // The request is checked in the order a client can act on, local checks
 // first, the store and chat reads next, and moderation, a call out, last:
-// the caller must be staff (DENIED, see canCreate); the chat must be a group
-// (CHAT_NOT_SUPPORTED); the caller must be able to speak in it (DENIED); it
-// must not be a public group (CHAT_NOT_SUPPORTED, transitional, see below);
-// the text must be in the form the chat takes, plaintext in a public group
-// and encrypted under the chat key in a private one (ENCRYPTION_NOT_ALLOWED,
-// ENCRYPTION_REQUIRED); ends_at must be in the future and at most MaxDuration
-// away (INVALID_ENDS_AT); the
-// currency must be one the server values (INVALID_CURRENCY); the shares must
-// be valid (INVALID_SHARES, see validateShares); and plaintext must pass
-// moderation (TEXT_MODERATED, see moderate). Only then is anything written.
+// the chat must be a group (CHAT_NOT_SUPPORTED); the caller must be able to
+// speak in it (DENIED); it must not be a public group (CHAT_NOT_SUPPORTED,
+// transitional, see below); the text must be in the form the chat takes,
+// plaintext in a public group and encrypted under the chat key in a private
+// one (ENCRYPTION_NOT_ALLOWED, ENCRYPTION_REQUIRED); ends_at must be in the
+// future and at most MaxDuration away (INVALID_ENDS_AT); the currency must be
+// one the server values (INVALID_CURRENCY); the shares must be valid
+// (INVALID_SHARES, see validateShares); and plaintext must pass moderation
+// (TEXT_MODERATED, see moderate). Only then is anything written.
 //
 // A chat that does not exist is DENIED, not reported: the proto has no
 // NOT_FOUND for creation, and Access.SpeakerStanding admits no one to a chat
@@ -186,8 +181,7 @@ func NewServer(
 // The RPC is retry-safe. The request's ID is derived from the caller and the
 // request's idempotency key (see MustDeriveID), so a retry names the same
 // request, and one that already exists is answered from the store before any
-// check runs, whatever the retry carries: a staff flag since revoked, a
-// member since departed or a text the moderator has since learned to flag
+// check runs, whatever the retry carries: a member since departed or a text the moderator has since learned to flag
 // are facts about a new request, not this one. A retry that loses a race
 // with its twin is caught by the store's uniqueness condition and answered
 // the same way.
@@ -216,15 +210,6 @@ func (s *Server) CreatePaymentRequest(ctx context.Context, req *paymentrequestpb
 	case !errors.Is(err, ErrNotFound):
 		log.With(zap.Error(err)).Warn("Failure getting payment request")
 		return nil, status.Error(codes.Internal, "")
-	}
-
-	allowed, err := s.canCreate(ctx, userID)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure checking staff status")
-		return nil, status.Error(codes.Internal, "")
-	}
-	if !allowed {
-		return &paymentrequestpb.CreatePaymentRequestResponse{Result: paymentrequestpb.CreatePaymentRequestResponse_DENIED}, nil
 	}
 
 	var groupChat *paymentrequestpb.GroupChatPaymentRequest
@@ -337,14 +322,6 @@ func createdResponse(r *PaymentRequest, now time.Time) *paymentrequestpb.CreateP
 		Result:         paymentrequestpb.CreatePaymentRequestResponse_OK,
 		PaymentRequest: r.ToProto(now),
 	}
-}
-
-// canCreate reports whether userID may create a payment request: today, only a
-// staff user. It is a transitional gate, like chat.Server's on private group
-// creation: payment requests are being built in steps behind it, and clients
-// have not shipped them. Opening creation to everyone is removing this check.
-func (s *Server) canCreate(ctx context.Context, userID *commonpb.UserId) (bool, error) {
-	return s.accounts.IsStaff(ctx, userID)
 }
 
 // textVerdict judges a split's text against what the chat takes, as the

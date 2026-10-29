@@ -123,8 +123,7 @@ func testServer_Create_PrivateGroup(t *testing.T, s paymentrequest.Store) {
 	require.Len(t, resp.PaymentRequest.GetGroupChat().GetSplit().Shares, 1)
 	require.Nil(t, resp.PaymentRequest.GetGroupChat().GetSplit().Shares[0].Paid)
 
-	// Any staff member who can speak creates one, not just the group's creator.
-	e.accounts.setStaff(alice.id, true)
+	// Any member who can speak creates one, not just the group's creator.
 	resp = e.create(alice, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour), share(bob, 1), share(e.creator, 2)), newKey())
 	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, resp.Result)
 	require.Equal(t, alice.id.Value, resp.PaymentRequest.Creator.Value)
@@ -140,10 +139,9 @@ func testServer_Create_Idempotent(t *testing.T, s paymentrequest.Store) {
 	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, first.Result)
 
 	// A retry is answered with the original request whatever it carries, even
-	// a DM, an ends_at in the past and shares that would be refused, and
-	// after the caller has lost their staff flag: nothing is checked again.
+	// a DM, an ends_at in the past and shares that would be refused: nothing
+	// is checked again.
 	e.clock.advance(time.Minute)
-	e.accounts.setStaff(e.creator.id, false)
 	dmID := &commonpb.ChatId{Value: bytes.Repeat([]byte{1}, chat.DmChatIDSize)}
 	retried := e.encryptedSplit(e.clock.Now().Add(-time.Hour), share(e.creator, 5))
 	again := e.create(e.creator, dmID, retried, key)
@@ -151,7 +149,6 @@ func testServer_Create_Idempotent(t *testing.T, s paymentrequest.Store) {
 	require.True(t, proto.Equal(first.PaymentRequest, again.PaymentRequest))
 
 	// The same key from someone else is someone else's request.
-	e.accounts.setStaff(alice.id, true)
 	theirs := e.create(alice, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour), share(e.creator, 5)), key)
 	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, theirs.Result)
 	require.NotEqual(t, first.PaymentRequest.PaymentRequestId.Value, theirs.PaymentRequest.PaymentRequestId.Value)
@@ -164,7 +161,6 @@ func testServer_Create_Idempotent(t *testing.T, s paymentrequest.Store) {
 	split := e.encryptedSplit(e.clock.Now().Add(time.Hour), share(alice, 5))
 	twin, err := paymentrequest.NewSplitRequest(paymentrequest.MustDeriveID(e.creator.id, key), e.creator.id, chatID, split, e.clock.Now())
 	require.NoError(t, err)
-	e.accounts.setStaff(e.creator.id, true)
 	racing := &racingStore{Store: s, beforeCreate: func() { assert.NoError(t, s.Create(e.ctx, twin)) }}
 	re := newServerEnvWith(t, racing, e)
 	resp := re.create(e.creator, chatID, split, key)
@@ -177,8 +173,7 @@ func testServer_Create_Refused(t *testing.T, s paymentrequest.Store) {
 	member := e.addUser()
 	other := e.addUser()
 	outsider := e.addUser()
-	staffOutsider := e.addUser()
-	e.accounts.setStaff(staffOutsider.id, true)
+	nonMember := e.addUser()
 
 	keyed := e.putPrivateGroup(true, member, other)
 	keyless := e.putPrivateGroup(false, member, other)
@@ -202,9 +197,8 @@ func testServer_Create_Refused(t *testing.T, s paymentrequest.Store) {
 		split  *paymentrequestpb.Split
 		want   paymentrequestpb.CreatePaymentRequestResponse_Result
 	}{
-		{"not staff", member, keyed, with(func(s *paymentrequestpb.Split) { s.Shares = []*paymentrequestpb.Share{share(other, 1)} }), paymentrequestpb.CreatePaymentRequestResponse_DENIED},
 		{"dm", e.creator, dmID, valid(), paymentrequestpb.CreatePaymentRequestResponse_CHAT_NOT_SUPPORTED},
-		{"non-member", staffOutsider, keyed, valid(), paymentrequestpb.CreatePaymentRequestResponse_DENIED},
+		{"non-member", nonMember, keyed, valid(), paymentrequestpb.CreatePaymentRequestResponse_DENIED},
 		{"missing chat", e.creator, chat.MustGenerateGroupChatID(), valid(), paymentrequestpb.CreatePaymentRequestResponse_DENIED},
 		{"keyless private group", e.creator, keyless, valid(), paymentrequestpb.CreatePaymentRequestResponse_DENIED},
 		{"public group", e.creator, public, with(func(s *paymentrequestpb.Split) { s.Text = plaintext("Dinner", "") }), paymentrequestpb.CreatePaymentRequestResponse_CHAT_NOT_SUPPORTED},
@@ -250,7 +244,6 @@ func testServer_Create_Order(t *testing.T, s paymentrequest.Store) {
 	e := newServerEnv(t, s, paymentrequest.WithPublicGroupRequests())
 	member := e.addUser()
 	outsider := e.addUser()
-	e.accounts.setStaff(outsider.id, true)
 	keyed := e.putPrivateGroup(true, member)
 	dmID := &commonpb.ChatId{Value: bytes.Repeat([]byte{1}, chat.DmChatIDSize)}
 
@@ -267,8 +260,6 @@ func testServer_Create_Order(t *testing.T, s paymentrequest.Store) {
 		split  *paymentrequestpb.Split
 		want   paymentrequestpb.CreatePaymentRequestResponse_Result
 	}{
-		// Staff is judged before the chat is looked at at all.
-		{"not staff, dm", member, dmID, e.encryptedSplit(future, share(e.creator, 1)), paymentrequestpb.CreatePaymentRequestResponse_DENIED},
 		{"dm, everything else wrong", e.creator, dmID, plaintextSplit(past, "Bad", "", badShares...), paymentrequestpb.CreatePaymentRequestResponse_CHAT_NOT_SUPPORTED},
 		{"non-member, everything else wrong", outsider, keyed, plaintextSplit(past, "Bad", "", badShares...), paymentrequestpb.CreatePaymentRequestResponse_DENIED},
 		{"text, then ends_at", e.creator, keyed, plaintextSplit(past, "Bad", "", badShares...), paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_REQUIRED},
@@ -380,12 +371,11 @@ func testServer_Create_PublicGroup(t *testing.T, s paymentrequest.Store) {
 	encrypted := e.encryptedSplit(e.clock.Now().Add(time.Hour), share(member, 1))
 	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_NOT_ALLOWED, e.create(e.creator, chatID, encrypted, newKey()).Result)
 
-	// The staff gate still holds.
-	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_DENIED, e.create(member, chatID, plaintextSplit(e.clock.Now().Add(time.Hour), "Dinner", "", share(e.creator, 1)), newKey()).Result)
+	// Any member who can speak creates one, not just the group's creator.
+	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, e.create(member, chatID, plaintextSplit(e.clock.Now().Add(time.Hour), "Dinner", "", share(e.creator, 1)), newKey()).Result)
 
 	// A creator-only group lets nobody but its creator speak, so nobody but
 	// its creator creates a request in it.
-	e.accounts.setStaff(member.id, true)
 	creatorOnly := e.putPublicGroup(func(c *chat.Chat) { c.IsCreatorOnlySpeaker = true }, member)
 	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_DENIED, e.create(member, creatorOnly, plaintextSplit(e.clock.Now().Add(time.Hour), "Dinner", "", share(e.creator, 1)), newKey()).Result)
 	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, e.create(e.creator, creatorOnly, plaintextSplit(e.clock.Now().Add(time.Hour), "Dinner", "", share(member, 1)), newKey()).Result)
@@ -918,7 +908,7 @@ type serverEnv struct {
 
 	chats      chat.Store
 	requests   paymentrequest.Store
-	accounts   *staffAccounts
+	accounts   account.Store
 	access     *chat.Access
 	ocpBalance *fakeOcpBalance
 	moderator  *fakeModerator
@@ -928,7 +918,7 @@ type serverEnv struct {
 	// server last started.
 	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
 
-	// creator is the staff user who creates every group the env puts.
+	// creator is the user who creates every group the env puts.
 	creator user
 }
 
@@ -936,7 +926,7 @@ func newServerEnv(t *testing.T, requests paymentrequest.Store, opts ...paymentre
 	log := zaptest.NewLogger(t)
 
 	chats := chatmemory.NewInMemory(nil)
-	accounts := newStaffAccounts(accountmemory.NewInMemory())
+	accounts := accountmemory.NewInMemory()
 	ocpBalance := &fakeOcpBalance{byOwner: make(map[string]uint64)}
 	balances := balance.NewClient(log, accounts, ocpBalance)
 
@@ -962,7 +952,6 @@ func newServerEnv(t *testing.T, requests paymentrequest.Store, opts ...paymentre
 	}
 	e.start(requests, opts...)
 	e.creator = e.addUser()
-	e.accounts.setStaff(e.creator.id, true)
 	return e
 }
 
@@ -985,7 +974,6 @@ func (e *serverEnv) start(requests paymentrequest.Store, opts ...paymentrequest.
 		log,
 		e.authz,
 		requests,
-		e.accounts,
 		e.chats,
 		e.access,
 		e.moderator,
@@ -1356,31 +1344,6 @@ type racingStore struct {
 func (r *racingStore) Create(ctx context.Context, req *paymentrequest.PaymentRequest) error {
 	r.beforeCreate()
 	return r.Store.Create(ctx, req)
-}
-
-// staffAccounts is an account.Store whose staff flag a test can set: the
-// in-memory store answers IsStaff false for everyone, and has no setter.
-type staffAccounts struct {
-	account.Store
-
-	mu    sync.Mutex
-	staff map[string]bool
-}
-
-func newStaffAccounts(db account.Store) *staffAccounts {
-	return &staffAccounts{Store: db, staff: make(map[string]bool)}
-}
-
-func (a *staffAccounts) setStaff(userID *commonpb.UserId, isStaff bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.staff[string(userID.Value)] = isStaff
-}
-
-func (a *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (bool, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.staff[string(userID.Value)], nil
 }
 
 // fakeClock is the server's clock, which a test moves.

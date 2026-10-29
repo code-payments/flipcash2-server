@@ -67,31 +67,13 @@ type integrationEnv struct {
 	// teamKeys the key pair it is bound to.
 	team     *commonpb.UserId
 	teamKeys model.KeyPair
-
-	// staff is the set of staff users, keyed by user ID, that accounts
-	// answers IsStaff from
-	staff map[string]bool
-}
-
-// staffAccounts is an account.Store that answers IsStaff from a set, since
-// the in-memory store has no staff flag. Everything else is the embedded
-// store's.
-type staffAccounts struct {
-	account.Store
-
-	staff map[string]bool
-}
-
-func (s *staffAccounts) IsStaff(_ context.Context, userID *commonpb.UserId) (bool, error) {
-	return s.staff[string(userID.Value)], nil
 }
 
 func newIntegrationEnv(t *testing.T) *integrationEnv {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)
 
-	staff := make(map[string]bool)
-	accounts := &staffAccounts{Store: accountmemory.NewInMemory(), staff: staff}
+	accounts := accountmemory.NewInMemory()
 	profiles := profilememory.NewInMemory()
 	chats := chatmemory.NewInMemory(nil)
 	messages := messagingmemory.NewInMemory()
@@ -138,13 +120,7 @@ func newIntegrationEnv(t *testing.T) *integrationEnv {
 		integration: intent.NewIntegration(accounts, chats, messages, profiles, requests, access, mintDataProvider, team),
 		team:        team,
 		teamKeys:    teamKeys,
-		staff:       staff,
 	}
-}
-
-// setStaff flags the user as staff.
-func (e *integrationEnv) setStaff(userID *commonpb.UserId) {
-	e.staff[string(userID.Value)] = true
 }
 
 // bindUser creates a Flipcash user bound to a fresh key pair.
@@ -821,17 +797,15 @@ func TestIntegration_GetTasksToSchedule_GroupPayment(t *testing.T) {
 	require.NoError(t, tasks[0].Validate())
 }
 
-// A multi payment is made for a reaction boost or a group payment alone. A
-// group payment's is limited to staff while it rolls out, and a boost's is
-// open to everyone (covered by TestIntegration_AllowCreation_ReactionBoost).
+// A multi payment is made for a reaction boost or a group payment alone
+// (each covered by its own tests).
 func TestIntegration_AllowCreation_MultiPayment(t *testing.T) {
 	e := newIntegrationEnv(t)
 
-	staffUserID, staffKeys := e.bindUser(t)
-	e.setStaff(staffUserID)
-	nonStaffUserID, nonStaffKeys := e.bindUser(t)
-	recipient1UserID, recipient1Keys := e.bindUser(t)
-	recipient2UserID, recipient2Keys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+	otherUserID, _ := e.bindUser(t)
+	_, recipient1Keys := e.bindUser(t)
+	_, recipient2Keys := e.bindUser(t)
 
 	recipients := []string{base58.Encode(recipient1Keys.Public()), base58.Encode(recipient2Keys.Public())}
 
@@ -843,52 +817,27 @@ func TestIntegration_AllowCreation_MultiPayment(t *testing.T) {
 		record.AppMetadata = appMetadata
 		return record
 	}
-	groupPayment := func(payer model.KeyPair) *ocp_intent.Record {
-		record := multiPaymentIntentRecord(base58.Encode(payer.Public()), recipients...)
-		return withChatMetadata(record, groupChatMetadata(chat.MustGenerateGroupChatID(), intentpb.PaymentAction_SEND))
-	}
 
-	// Whoever pays, staff included.
 	t.Run("no app metadata", func(t *testing.T) {
-		for _, payer := range []model.KeyPair{staffKeys, nonStaffKeys} {
-			record := multiPaymentIntentRecord(base58.Encode(payer.Public()), recipients...)
-			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "only supported for reaction boosts")
-		}
-	})
-
-	t.Run("other app metadata", func(t *testing.T) {
-		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, staffUserID, nonStaffUserID)
-		record := withChatMetadata(multiPaymentIntentRecord(base58.Encode(staffKeys.Public()), recipients...), dmChatMetadata(dmChatID))
+		record := multiPaymentIntentRecord(base58.Encode(payerKeys.Public()), recipients...)
 		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "only supported for reaction boosts")
 	})
 
-	t.Run("non-staff payer", func(t *testing.T) {
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, groupPayment(nonStaffKeys), nil, nil), "multi payments are limited to staff")
-	})
-
-	t.Run("payer is not a flipcash user", func(t *testing.T) {
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, groupPayment(model.MustGenerateKeyPair()), nil, nil), "payer is not a flipcash user")
-	})
-
-	// Staff recipients don't make a non-staff payer's multi payment allowed
-	t.Run("staff recipients", func(t *testing.T) {
-		e.setStaff(recipient1UserID)
-		e.setStaff(recipient2UserID)
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, groupPayment(nonStaffKeys), nil, nil), "multi payments are limited to staff")
+	t.Run("other app metadata", func(t *testing.T) {
+		dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, payerUserID, otherUserID)
+		record := withChatMetadata(multiPaymentIntentRecord(base58.Encode(payerKeys.Public()), recipients...), dmChatMetadata(dmChatID))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "only supported for reaction boosts")
 	})
 }
 
 // A group payment made as a multi payment pays several members at once,
-// under the same gates as a payment to one, plus the multi payment's staff
-// gate.
+// under the same gates as a payment to one.
 func TestIntegration_AllowCreation_GroupMultiPayment(t *testing.T) {
 	e := newIntegrationEnv(t)
 
 	payerUserID, payerKeys := e.bindUser(t)
-	e.setStaff(payerUserID)
-	nonStaffUserID, nonStaffKeys := e.bindUser(t)
+	memberUserID, memberKeys := e.bindUser(t)
 	outsiderUserID, outsiderKeys := e.bindUser(t)
-	e.setStaff(outsiderUserID)
 
 	recipientUserIDs := make([]*commonpb.UserId, intent.MaxGroupPaymentReceivers+1)
 	recipientKeys := make([]model.KeyPair, intent.MaxGroupPaymentReceivers+1)
@@ -898,7 +847,7 @@ func TestIntegration_AllowCreation_GroupMultiPayment(t *testing.T) {
 
 	// Every recipient but the last is a member, so the last can stand in for
 	// an eleventh.
-	groupID := e.putGroup(t, payerUserID, append([]*commonpb.UserId{nonStaffUserID}, recipientUserIDs[:intent.MaxGroupPaymentReceivers]...)...)
+	groupID := e.putGroup(t, payerUserID, append([]*commonpb.UserId{memberUserID}, recipientUserIDs[:intent.MaxGroupPaymentReceivers]...)...)
 
 	payment := func(chatID *commonpb.ChatId, action intentpb.PaymentAction, from model.KeyPair, to ...model.KeyPair) *ocp_intent.Record {
 		owners := make([]string, len(to))
@@ -922,10 +871,13 @@ func TestIntegration_AllowCreation_GroupMultiPayment(t *testing.T) {
 			require.NoError(t, e.integration.AllowCreation(e.ctx, payment(groupID, action, payerKeys, recipientKeys[:2]...), nil, nil), action)
 		}
 		require.NoError(t, e.integration.AllowCreation(e.ctx, send(payerKeys, recipientKeys[:intent.MaxGroupPaymentReceivers]...), nil, nil))
+
+		// Any member who can speak pays, not just the group's creator.
+		require.NoError(t, e.integration.AllowCreation(e.ctx, send(memberKeys, recipientKeys[:2]...), nil, nil))
 	})
 
-	t.Run("denied_non_staff_payer", func(t *testing.T) {
-		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, send(nonStaffKeys, recipientKeys[:2]...), nil, nil), "multi payments are limited to staff")
+	t.Run("denied_payer_not_flipcash_user", func(t *testing.T) {
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, send(model.MustGenerateKeyPair(), recipientKeys[:2]...), nil, nil), "not a flipcash user")
 	})
 
 	t.Run("denied_tip", func(t *testing.T) {
@@ -1015,12 +967,11 @@ func TestIntegration_AllowCreation_GroupMultiPayment(t *testing.T) {
 func TestIntegration_GetTasksToSchedule_MultiPayment(t *testing.T) {
 	e := newIntegrationEnv(t)
 
-	staffUserID, staffKeys := e.bindUser(t)
-	e.setStaff(staffUserID)
+	_, payerKeys := e.bindUser(t)
 	_, recipient1Keys := e.bindUser(t)
 	_, recipient2Keys := e.bindUser(t)
 
-	record := multiPaymentIntentRecord(base58.Encode(staffKeys.Public()), base58.Encode(recipient1Keys.Public()), base58.Encode(recipient2Keys.Public()))
+	record := multiPaymentIntentRecord(base58.Encode(payerKeys.Public()), base58.Encode(recipient1Keys.Public()), base58.Encode(recipient2Keys.Public()))
 	tasks, err := e.integration.GetTasksToSchedule(e.ctx, record)
 	require.NoError(t, err)
 	assert.Empty(t, tasks)
@@ -1245,8 +1196,8 @@ func TestIntegration_AllowCreation_ReactionBoost(t *testing.T) {
 			}
 		}
 
-		// A boost's multi payment is open to everyone, unlike a group
-		// payment's: neither the payer nor the creator is staff here.
+		// A boost that pays both the sender and the creator is a multi
+		// payment.
 		record := multiBoost(byMember.ID, payerKeys, pay{memberKeys, 0.80}, pay{creatorKeys, 0.20})
 		require.NoError(t, e.integration.AllowCreation(e.ctx, record, nil, nil))
 	})
@@ -1813,11 +1764,8 @@ func TestIntegration_AllowCreation_RequestedPayment(t *testing.T) {
 	})
 
 	// A share is paid to one person, so a multi payment never carries a
-	// requested payment, staff or not.
+	// requested payment.
 	t.Run("denied_multi_payment", func(t *testing.T) {
-		e.setStaff(payerUserID)
-		defer delete(e.staff, string(payerUserID.Value))
-
 		record := multiPaymentIntentRecord(base58.Encode(payerKeys.Public()), base58.Encode(creatorKeys.Public()), base58.Encode(otherKeys.Public()))
 		appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
 			Domain: &intentpb.AppMetadata_Chat{Chat: requestedPaymentMetadata(groupID, request.ID)},

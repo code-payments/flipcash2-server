@@ -11,6 +11,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	activitypb "github.com/code-payments/flipcash2-protobuf-api/generated/go/activity/v1"
+	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	intentpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/intent/v1"
 	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
@@ -31,7 +32,7 @@ type counterpartyEnv struct {
 	payer, recipient         *commonpb.UserId
 	payerKeys, recipientKeys model.KeyPair
 
-	dmPayment, groupPayment, reactionBoost, requestedPayment []byte
+	dmPayment, groupPayment, reactionBoost, requestedPayment, returnPayment []byte
 
 	// boostChatID is the group reactionBoost was paid in.
 	boostChatID *commonpb.ChatId
@@ -40,6 +41,11 @@ type counterpartyEnv struct {
 	// paid a share of, and its group.
 	requestChatID *commonpb.ChatId
 	requestID     *paymentrequestpb.PaymentRequestId
+
+	// returnChatID and returnedMessageID name the cash message whose payment
+	// returnPayment returned, and its DM.
+	returnChatID      *commonpb.ChatId
+	returnedMessageID *messagingpb.MessageId
 }
 
 func newCounterpartyEnv(t *testing.T) *counterpartyEnv {
@@ -62,6 +68,14 @@ func newCounterpartyEnv(t *testing.T) *counterpartyEnv {
 		ChatId: &commonpb.ChatId{Value: make([]byte, 32)},
 		Type: &intentpb.ChatMetadata_DmPayment_{
 			DmPayment: &intentpb.ChatMetadata_DmPayment{Action: intentpb.PaymentAction_SEND},
+		},
+	})
+	e.returnChatID = chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.payer, e.recipient)
+	e.returnedMessageID = &messagingpb.MessageId{Value: 1}
+	e.returnPayment = chatAppMetadata(t, &intentpb.ChatMetadata{
+		ChatId: e.returnChatID,
+		Type: &intentpb.ChatMetadata_ReturnPayment_{
+			ReturnPayment: &intentpb.ChatMetadata_ReturnPayment{MessageId: e.returnedMessageID},
 		},
 	})
 	e.groupPayment = chatAppMetadata(t, &intentpb.ChatMetadata{
@@ -120,7 +134,8 @@ func chatAppMetadata(t *testing.T, chatMetadata *intentpb.ChatMetadata) []byte {
 // TestHistoryCounterparties: a group payment names the other party by user
 // ID from both sides, and reads Sent and Received, exactly as a DM payment
 // does, and so does a requested payment, from its payer to the request's
-// creator, whose entries on both sides also name the request. A reaction boost paying one person names the other party the same
+// creator, whose entries on both sides also name the request, and a return
+// payment, whose entries on both sides also name the returned message. A reaction boost paying one person names the other party the same
 // way, and the payer's side reads Boosted. A payment carrying no chat
 // metadata, like one handed off in person, names no one, and the payer's side
 // reads Gave.
@@ -136,13 +151,15 @@ func TestHistoryCounterparties(t *testing.T) {
 		named       bool
 		boosted     bool
 		requested   bool
+		returned    bool
 		sentText    string
 	}{
-		{"group_payment", e.groupPayment, true, false, false, "Sent"},
-		{"requested_payment", e.requestedPayment, true, false, true, "Sent"},
-		{"dm_payment", e.dmPayment, true, false, false, "Sent"},
-		{"reaction_boost", e.reactionBoost, true, true, false, "Boosted"},
-		{"no_chat_metadata", nil, false, false, false, "Gave"},
+		{"group_payment", e.groupPayment, true, false, false, false, "Sent"},
+		{"requested_payment", e.requestedPayment, true, false, true, false, "Sent"},
+		{"dm_payment", e.dmPayment, true, false, false, false, "Sent"},
+		{"return_payment", e.returnPayment, true, false, false, true, "Sent"},
+		{"reaction_boost", e.reactionBoost, true, true, false, false, "Boosted"},
+		{"no_chat_metadata", nil, false, false, false, false, "Gave"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			records := []*history.Record{
@@ -174,6 +191,13 @@ func TestHistoryCounterparties(t *testing.T) {
 			} else {
 				require.Nil(t, sent.GetDirectlySentCrypto().GetRequestedPayment())
 				require.Nil(t, received.GetReceivedCrypto().GetRequestedPayment())
+			}
+			if tc.returned {
+				e.requireReturnedPayment(t, sent.GetDirectlySentCrypto().GetReturnedPayment())
+				e.requireReturnedPayment(t, received.GetReceivedCrypto().GetReturnedPayment())
+			} else {
+				require.Nil(t, sent.GetDirectlySentCrypto().GetReturnedPayment())
+				require.Nil(t, received.GetReceivedCrypto().GetReturnedPayment())
 			}
 			if tc.named {
 				require.True(t, proto.Equal(e.recipient, sent.GetDirectlySentCrypto().GetUserId()))
@@ -319,4 +343,13 @@ func (e *counterpartyEnv) requireRequestedPayment(t *testing.T, requested *activ
 	require.NoError(t, requested.Validate())
 	require.True(t, proto.Equal(e.requestChatID, requested.GetChatId()))
 	require.True(t, proto.Equal(e.requestID, requested.GetPaymentRequestId()))
+}
+
+// requireReturnedPayment checks that a notification names the cash message
+// whose payment the env's return payment returned, and its DM.
+func (e *counterpartyEnv) requireReturnedPayment(t *testing.T, returned *activitypb.ReturnedPayment) {
+	require.NotNil(t, returned)
+	require.NoError(t, returned.Validate())
+	require.True(t, proto.Equal(e.returnChatID, returned.GetChatId()))
+	require.True(t, proto.Equal(e.returnedMessageID, returned.GetMessageId()))
 }

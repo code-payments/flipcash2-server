@@ -185,6 +185,13 @@ type OutgoingMessage struct {
 	Content            []*messagingpb.Content
 	ClientMessageID    *messagingpb.ClientMessageId
 	CountsTowardUnread bool
+
+	// ReturnIntentID, when set, is stored as the message's return offer
+	// (MessageInput.ReturnIntentID, see CashMessageReturn) and appears in
+	// nothing the send returns or broadcasts. Send has no way to carry it: a
+	// sender offering a return sends a batch of one through SendBatch. On a
+	// retried send the ID the first send stored stands.
+	ReturnIntentID *commonpb.IntentId
 }
 
 // Send persists content as a message in the chat and performs every side effect
@@ -269,6 +276,7 @@ func (s *Sender) SendBatch(
 			Timestamp:          now,
 			ClientMessageID:    out.ClientMessageID,
 			CountsTowardUnread: out.CountsTowardUnread,
+			ReturnIntentID:     out.ReturnIntentID,
 		}
 	}
 

@@ -63,7 +63,7 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	media := blob.NewIntegration(blobmemory.NewInMemory(), blobmemory.NewInMemoryStorage(), blobmemory.NewInMemoryAccessStore())
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, nil)
 	requests := paymentrequestmemory.NewInMemory()
-	executor := task.NewExecutor(accounts, chats, requests, sender, ocpData, chatBus)
+	executor := task.NewExecutor(accounts, chats, messages, requests, sender, ocpData, chatBus)
 	integration := intent.NewIntegration(accounts, chats, messages, profiles, requests, nil, nil, nil)
 
 	senderUserID := model.MustGenerateUserID()
@@ -147,6 +147,15 @@ func TestExecutor_SendContactDmPaymentMessage(t *testing.T) {
 	assert.True(t, proto.Equal(recipientUserID, cash.GetSingleReceiver()))
 	assert.Equal(t, messagingpb.CashContent_SENT, cash.GetVerb())
 
+	// A contact DM records no opening payment and offers no return.
+	assert.Nil(t, cash.GetPaymentReturn())
+	_, state, err := messages.GetCashMessageReturn(ctx, chatID, msgs[0].ID)
+	require.NoError(t, err)
+	assert.Nil(t, state)
+	openingIntentID, err := chats.GetDmOpeningIntentID(ctx, chatID)
+	require.NoError(t, err)
+	assert.Nil(t, openingIntentID)
+
 	// Tasks are delivered at least once, so re-execution must not duplicate
 	// the message.
 	require.NoError(t, executor.Execute(ctx, tasks[0]))
@@ -227,7 +236,7 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	chats := chatmemory.NewInMemory([]*commonpb.UserId{teamUserID})
 	sender := messaging.NewSender(log, badges, chats, messages, profiles, blocklists, media, ocpData, push.NewNoOpPusher(), bus, chatBus, teamUserID)
 	requests := paymentrequestmemory.NewInMemory()
-	executor := task.NewExecutor(accounts, chats, requests, sender, ocpData, chatBus)
+	executor := task.NewExecutor(accounts, chats, messages, requests, sender, ocpData, chatBus)
 	integration := intent.NewIntegration(accounts, chats, messages, profiles, requests, nil, nil, nil)
 
 	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, recipientUserID)
@@ -312,6 +321,9 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	assert.True(t, proto.Equal(recipientUserID, cash.GetSingleReceiver()))
 	assert.Equal(t, expectedVerb, cash.GetVerb())
 
+	// The payment that opened the DM offers its receiver a return.
+	assert.NotNil(t, cash.GetPaymentReturn().GetOffer())
+
 	// Tasks are delivered at least once, so re-execution must not duplicate
 	// the message.
 	require.NoError(t, executor.Execute(ctx, tasks[0]))
@@ -319,6 +331,205 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 	msgs, err = messages.GetMessages(ctx, chatID)
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
+}
+
+func dmPaymentMetadata(chatID *commonpb.ChatId) *intentpb.ChatMetadata {
+	return &intentpb.ChatMetadata{
+		ChatId: chatID,
+		Type: &intentpb.ChatMetadata_DmPayment_{
+			DmPayment: &intentpb.ChatMetadata_DmPayment{Action: intentpb.PaymentAction_SEND},
+		},
+	}
+}
+
+// requireReturnOffer asserts that msg is a cash message offering a return of
+// its payment, and returns the return intent ID stored beside it, which is
+// not yet returned.
+func (e *groupPaymentEnv) requireReturnOffer(t *testing.T, msg *messaging.Message) []byte {
+	cash := msg.Content[0].GetCash()
+	require.NotNil(t, cash)
+	require.NotNil(t, cash.GetPaymentReturn().GetOffer())
+	assert.Nil(t, cash.GetPaymentReturn().GetReturnOf())
+
+	_, state, err := e.messages.GetCashMessageReturn(e.ctx, msg.ChatID, msg.ID)
+	require.NoError(t, err)
+	require.NotNil(t, state)
+	require.NotNil(t, state.IntentID)
+	require.NoError(t, state.IntentID.Validate())
+	assert.False(t, state.Returned)
+	return state.IntentID.Value
+}
+
+// requireNoReturnOffer asserts that msg is a cash message offering no return,
+// with none stored beside it.
+func (e *groupPaymentEnv) requireNoReturnOffer(t *testing.T, msg *messaging.Message) {
+	cash := msg.Content[0].GetCash()
+	require.NotNil(t, cash)
+	assert.Nil(t, cash.GetPaymentReturn())
+
+	_, state, err := e.messages.GetCashMessageReturn(e.ctx, msg.ChatID, msg.ID)
+	require.NoError(t, err)
+	assert.Nil(t, state)
+}
+
+// The payment that opens a DM is recorded on it, and its cash message offers
+// the receiver a return; later payments in the DM, either way, offer none.
+func TestExecutor_SendDmPaymentMessage_ReturnOffer(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	aliceUserID, aliceKeys := e.bindUser(t)
+	bobUserID, bobKeys := e.bindUser(t)
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, aliceUserID, bobUserID)
+
+	opening, rawOpeningID := e.pay(t, dmPaymentMetadata(dmChatID), aliceKeys, bobKeys)
+	openingTask := intent.NewSendDmPaymentMessageTask(opening)
+	require.NoError(t, e.executor.Execute(e.ctx, openingTask))
+
+	recorded, err := e.chats.GetDmOpeningIntentID(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.NotNil(t, recorded)
+	assert.Equal(t, rawOpeningID, recorded.Value)
+
+	msgs, err := e.messages.GetMessages(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, rawOpeningID, msgs[0].Content[0].GetCash().GetIntentId().GetValue())
+	returnID := e.requireReturnOffer(t, msgs[0])
+
+	// Running the task again sends nothing new, and the return ID the first
+	// run stored stands, though the retry drew another.
+	require.NoError(t, e.executor.Execute(e.ctx, openingTask))
+	msgs, err = e.messages.GetMessages(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, returnID, e.requireReturnOffer(t, msgs[0]))
+
+	// A second payment in the DM, from either member, offers nothing.
+	again, _ := e.pay(t, dmPaymentMetadata(dmChatID), aliceKeys, bobKeys)
+	require.NoError(t, e.executor.Execute(e.ctx, intent.NewSendDmPaymentMessageTask(again)))
+	back, _ := e.pay(t, dmPaymentMetadata(dmChatID), bobKeys, aliceKeys)
+	require.NoError(t, e.executor.Execute(e.ctx, intent.NewSendDmPaymentMessageTask(back)))
+
+	msgs, err = e.messages.GetMessages(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 3)
+	e.requireNoReturnOffer(t, msgs[1])
+	e.requireNoReturnOffer(t, msgs[2])
+
+	// The opening intent is fixed at creation.
+	recorded, err = e.chats.GetDmOpeningIntentID(e.ctx, dmChatID)
+	require.NoError(t, err)
+	assert.Equal(t, rawOpeningID, recorded.Value)
+}
+
+// A retry of the opening payment's task, after an earlier attempt created
+// the DM but sent no message, still offers the return: the opener is decided
+// off the recorded opening intent, not off whether this attempt created the
+// chat.
+func TestExecutor_SendDmPaymentMessage_ReturnOfferAfterCreate(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	aliceUserID, aliceKeys := e.bindUser(t)
+	bobUserID, bobKeys := e.bindUser(t)
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, aliceUserID, bobUserID)
+
+	opening, rawOpeningID := e.pay(t, dmPaymentMetadata(dmChatID), aliceKeys, bobKeys)
+	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+		ID:              dmChatID,
+		Type:            chatpb.ChatType_DM,
+		Members:         []*commonpb.UserId{aliceUserID, bobUserID},
+		OpeningIntentID: &commonpb.IntentId{Value: rawOpeningID},
+		LastActivity:    time.Now(),
+	}))
+
+	require.NoError(t, e.executor.Execute(e.ctx, intent.NewSendDmPaymentMessageTask(opening)))
+
+	msgs, err := e.messages.GetMessages(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	e.requireReturnOffer(t, msgs[0])
+}
+
+// Of two payments racing to open a DM, only the one whose create landed is
+// recorded, and only its message offers a return, whichever task runs first.
+func TestExecutor_SendDmPaymentMessage_RacingOpeners(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	aliceUserID, aliceKeys := e.bindUser(t)
+	bobUserID, bobKeys := e.bindUser(t)
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, aliceUserID, bobUserID)
+
+	winner, rawWinnerID := e.pay(t, dmPaymentMetadata(dmChatID), aliceKeys, bobKeys)
+	loser, rawLoserID := e.pay(t, dmPaymentMetadata(dmChatID), bobKeys, aliceKeys)
+
+	// The winner's create landed, but the loser's task sends first.
+	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+		ID:              dmChatID,
+		Type:            chatpb.ChatType_DM,
+		Members:         []*commonpb.UserId{aliceUserID, bobUserID},
+		OpeningIntentID: &commonpb.IntentId{Value: rawWinnerID},
+		LastActivity:    time.Now(),
+	}))
+	require.NoError(t, e.executor.Execute(e.ctx, intent.NewSendDmPaymentMessageTask(loser)))
+	require.NoError(t, e.executor.Execute(e.ctx, intent.NewSendDmPaymentMessageTask(winner)))
+
+	msgs, err := e.messages.GetMessages(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, rawLoserID, msgs[0].Content[0].GetCash().GetIntentId().GetValue())
+	e.requireNoReturnOffer(t, msgs[0])
+	assert.Equal(t, rawWinnerID, msgs[1].Content[0].GetCash().GetIntentId().GetValue())
+	e.requireReturnOffer(t, msgs[1])
+
+	recorded, err := e.chats.GetDmOpeningIntentID(e.ctx, dmChatID)
+	require.NoError(t, err)
+	assert.Equal(t, rawWinnerID, recorded.Value)
+}
+
+// A DM created with no opening intent recorded, as every DM from before
+// they were recorded, offers a return on no payment's message.
+func TestExecutor_SendDmPaymentMessage_NoRecordedOpener(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	aliceUserID, aliceKeys := e.bindUser(t)
+	bobUserID, bobKeys := e.bindUser(t)
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, aliceUserID, bobUserID)
+
+	require.NoError(t, e.chats.PutChat(e.ctx, &chat.Chat{
+		ID:           dmChatID,
+		Type:         chatpb.ChatType_DM,
+		Members:      []*commonpb.UserId{aliceUserID, bobUserID},
+		LastActivity: time.Now(),
+	}))
+
+	payment, _ := e.pay(t, dmPaymentMetadata(dmChatID), aliceKeys, bobKeys)
+	require.NoError(t, e.executor.Execute(e.ctx, intent.NewSendDmPaymentMessageTask(payment)))
+
+	msgs, err := e.messages.GetMessages(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	e.requireNoReturnOffer(t, msgs[0])
+
+	recorded, err := e.chats.GetDmOpeningIntentID(e.ctx, dmChatID)
+	require.NoError(t, err)
+	assert.Nil(t, recorded)
+}
+
+// A group payment's cash message offers no return.
+func TestExecutor_SendGroupPaymentMessage_NoReturnOffer(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	payerUserID, payerKeys := e.bindUser(t)
+	recipientUserID, recipientKeys := e.bindUser(t)
+	groupID := e.putGroup(t, payerUserID, recipientUserID)
+
+	payment, _ := e.pay(t, groupPaymentMetadata(groupID), payerKeys, recipientKeys)
+	require.NoError(t, e.executor.Execute(e.ctx, intent.NewSendGroupPaymentMessageTask(payment)))
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	e.requireNoReturnOffer(t, msgs[0])
 }
 
 // groupPaymentEnv executes group payment tasks against in-memory stores.
@@ -362,7 +573,7 @@ func newGroupPaymentEnv(t *testing.T) *groupPaymentEnv {
 		messages:    messages,
 		requests:    requests,
 		ocpData:     ocpData,
-		executor:    task.NewExecutor(accounts, chats, requests, sender, ocpData, chatBus),
+		executor:    task.NewExecutor(accounts, chats, messages, requests, sender, ocpData, chatBus),
 		integration: intent.NewIntegration(accounts, chats, messages, profiles, requests, access, nil, nil),
 
 		chatObserver: chatObserver,
@@ -443,6 +654,11 @@ func (e *groupPaymentEnv) pay(t *testing.T, chatMetadata *intentpb.ChatMetadata,
 
 // payWithIntentID is pay under the intent ID rawIntentID.
 func (e *groupPaymentEnv) payWithIntentID(t *testing.T, chatMetadata *intentpb.ChatMetadata, from, to model.KeyPair, rawIntentID []byte) (*ocp_intent.Record, []byte) {
+	return e.payInMint(t, chatMetadata, from, to, rawIntentID, base58.Encode(model.MustGenerateKeyPair().Public()))
+}
+
+// payInMint is payWithIntentID in the mint account mint.
+func (e *groupPaymentEnv) payInMint(t *testing.T, chatMetadata *intentpb.ChatMetadata, from, to model.KeyPair, rawIntentID []byte, mint string) (*ocp_intent.Record, []byte) {
 	appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
 		Domain: &intentpb.AppMetadata_Chat{Chat: chatMetadata},
 	})
@@ -451,7 +667,7 @@ func (e *groupPaymentEnv) payWithIntentID(t *testing.T, chatMetadata *intentpb.C
 	intentRecord := &ocp_intent.Record{
 		IntentId:              base58.Encode(rawIntentID),
 		IntentType:            ocp_intent.SendPublicPayment,
-		MintAccount:           base58.Encode(model.MustGenerateKeyPair().Public()),
+		MintAccount:           mint,
 		InitiatorOwnerAccount: base58.Encode(from.Public()),
 		SendPublicPaymentMetadata: &ocp_intent.SendPublicPaymentMetadata{
 			DestinationOwnerAccount: base58.Encode(to.Public()),
@@ -1392,4 +1608,149 @@ func TestExecutor_RecordRequestedPayment_WrongIntentOnPaidShare(t *testing.T) {
 	msgs, err := e.messages.GetMessages(e.ctx, groupID)
 	require.NoError(t, err)
 	require.Empty(t, msgs)
+}
+
+func returnPaymentMetadata(chatID *commonpb.ChatId, messageID *messagingpb.MessageId) *intentpb.ChatMetadata {
+	return &intentpb.ChatMetadata{
+		ChatId: chatID,
+		Type: &intentpb.ChatMetadata_ReturnPayment_{
+			ReturnPayment: &intentpb.ChatMetadata_ReturnPayment{MessageId: messageID},
+		},
+	}
+}
+
+// openDm has from open the DM with to by a payment, returning the DM, the
+// opening payment's intent record and its cash message, which offers to a
+// return under the returned intent ID.
+func (e *groupPaymentEnv) openDm(t *testing.T, fromUserID, toUserID *commonpb.UserId, from, to model.KeyPair) (*commonpb.ChatId, *ocp_intent.Record, *messaging.Message, []byte) {
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, fromUserID, toUserID)
+	opening, _ := e.pay(t, dmPaymentMetadata(dmChatID), from, to)
+	require.NoError(t, e.executor.Execute(e.ctx, intent.NewSendDmPaymentMessageTask(opening)))
+
+	msgs, err := e.messages.GetMessages(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	return dmChatID, opening, msgs[0], e.requireReturnOffer(t, msgs[0])
+}
+
+// The receiver of a DM's opening payment returns it: the offer is marked
+// returned under the return's intent ID, and the return's cash message lands
+// in the DM as the returner's, naming the returned message, with the
+// returned message unchanged. A retry changes nothing, and no second return
+// validates.
+func TestExecutor_SendReturnPaymentMessage(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	aliceUserID, aliceKeys := e.bindUser(t)
+	bobUserID, bobKeys := e.bindUser(t)
+	dmChatID, opening, original, returnID := e.openDm(t, aliceUserID, bobUserID, aliceKeys, bobKeys)
+
+	returned, rawReturnedID := e.payInMint(t, returnPaymentMetadata(dmChatID, original.ID), bobKeys, aliceKeys, returnID, opening.MintAccount)
+	require.Equal(t, returnID, rawReturnedID)
+	require.NoError(t, e.integration.AllowCreation(e.ctx, returned, nil, nil))
+	task := e.scheduled(t, returned)
+	assert.Equal(t, intent.TaskTypeSendReturnPaymentMessage, task.Type)
+
+	for range 2 {
+		require.NoError(t, e.executor.Execute(e.ctx, task))
+
+		_, state, err := e.messages.GetCashMessageReturn(e.ctx, dmChatID, original.ID)
+		require.NoError(t, err)
+		require.NotNil(t, state)
+		assert.True(t, state.Returned)
+		assert.Equal(t, returnID, state.IntentID.Value)
+
+		msgs, err := e.messages.GetMessages(e.ctx, dmChatID)
+		require.NoError(t, err)
+		require.Len(t, msgs, 2)
+		assert.True(t, proto.Equal(original.Content[0], msgs[0].Content[0]))
+
+		returnMsg := msgs[1]
+		assert.Equal(t, bobUserID.Value, returnMsg.SenderID.Value)
+		require.Len(t, returnMsg.Content, 1)
+		cash := returnMsg.Content[0].GetCash()
+		require.NotNil(t, cash)
+		assert.Equal(t, returnID, cash.GetIntentId().GetValue())
+		assert.Equal(t, aliceUserID.Value, cash.GetSingleReceiver().GetValue())
+		assert.Equal(t, messagingpb.CashContent_SENT, cash.GetVerb())
+		assert.Equal(t, 2.5, cash.GetTotalAmount().GetNativeAmount())
+		assert.Equal(t, "usd", cash.GetTotalAmount().GetCurrency())
+		assert.True(t, proto.Equal(original.Content[0].GetCash().GetTotalAmount().GetMint(), cash.GetTotalAmount().GetMint()))
+		require.NotNil(t, cash.GetPaymentReturn())
+		assert.Nil(t, cash.GetPaymentReturn().GetOffer())
+		assert.True(t, proto.Equal(original.ID, cash.GetPaymentReturn().GetReturnOf().GetMessageId()))
+		require.NoError(t, returnMsg.Content[0].ValidateAll())
+
+		// The return itself offers nothing back.
+		_, returnState, err := e.messages.GetCashMessageReturn(e.ctx, dmChatID, returnMsg.ID)
+		require.NoError(t, err)
+		assert.Nil(t, returnState)
+	}
+
+	// The offer is used up: the same payment no longer validates (another
+	// under its intent ID could not be saved at all, OCP storing an intent ID
+	// once).
+	require.ErrorContains(t, e.integration.AllowCreation(e.ctx, returned, nil, nil), "already returned")
+}
+
+// A return task for a payment its validation would have refused fails, on
+// every retry, rather than passing as a no-op, and neither marks the offer
+// nor posts a message.
+func TestExecutor_SendReturnPaymentMessage_Mismatched(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	aliceUserID, aliceKeys := e.bindUser(t)
+	bobUserID, bobKeys := e.bindUser(t)
+	_, carolKeys := e.bindUser(t)
+	dmChatID, opening, original, returnID := e.openDm(t, aliceUserID, bobUserID, aliceKeys, bobKeys)
+
+	// A later payment in the DM, which offers no return.
+	later, _ := e.pay(t, dmPaymentMetadata(dmChatID), aliceKeys, bobKeys)
+	require.NoError(t, e.executor.Execute(e.ctx, intent.NewSendDmPaymentMessageTask(later)))
+	msgs, err := e.messages.GetMessages(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	laterMsg := msgs[1]
+
+	dmPayment, _ := e.pay(t, dmPaymentMetadata(dmChatID), bobKeys, aliceKeys)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewSendReturnPaymentMessageTask(dmPayment)), "not a return payment")
+
+	returned, _ := e.payInMint(t, returnPaymentMetadata(dmChatID, original.ID), bobKeys, aliceKeys, returnID, opening.MintAccount)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewSendDmPaymentMessageTask(returned)), "not a dm payment")
+
+	multi := e.multiPay(t, returnPaymentMetadata(dmChatID, original.ID), bobKeys,
+		multiPayment{to: aliceKeys, quarks: 10_000},
+		multiPayment{to: carolKeys, quarks: 10_000},
+	)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewSendReturnPaymentMessageTask(multi)), "return payment has 2 recipients")
+
+	toOther, _ := e.pay(t, returnPaymentMetadata(dmChatID, original.ID), bobKeys, carolKeys)
+	require.ErrorContains(t, e.executor.Execute(e.ctx, intent.NewSendReturnPaymentMessageTask(toOther)), "chat id does not match")
+
+	missing := &messagingpb.MessageId{Value: 1_000}
+	toMissing, _ := e.pay(t, returnPaymentMetadata(dmChatID, missing), bobKeys, aliceKeys)
+	for range 2 {
+		require.ErrorIs(t, e.executor.Execute(e.ctx, intent.NewSendReturnPaymentMessageTask(toMissing)), messaging.ErrMessageNotFound)
+	}
+
+	noOffer, _ := e.pay(t, returnPaymentMetadata(dmChatID, laterMsg.ID), bobKeys, aliceKeys)
+	for range 2 {
+		require.ErrorIs(t, e.executor.Execute(e.ctx, intent.NewSendReturnPaymentMessageTask(noOffer)), messaging.ErrNoCashMessageReturn)
+	}
+
+	// Any intent but the offer's is refused by the store.
+	wrongIntent, _ := e.pay(t, returnPaymentMetadata(dmChatID, original.ID), bobKeys, aliceKeys)
+	for range 2 {
+		require.ErrorIs(t, e.executor.Execute(e.ctx, intent.NewSendReturnPaymentMessageTask(wrongIntent)), messaging.ErrWrongReturnIntent)
+	}
+
+	_, state, err := e.messages.GetCashMessageReturn(e.ctx, dmChatID, original.ID)
+	require.NoError(t, err)
+	require.NotNil(t, state)
+	assert.False(t, state.Returned)
+	assert.Equal(t, returnID, state.IntentID.Value)
+
+	msgs, err = e.messages.GetMessages(e.ctx, dmChatID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
 }

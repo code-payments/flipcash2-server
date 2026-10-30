@@ -206,6 +206,7 @@ func (m *memory) PutChat(_ context.Context, c *chat.Chat) error {
 	if chat.IsGroupChatID(c.ID) {
 		stored.Members = nil
 		stored.RosterSummary = chat.RosterSummary{}
+		stored.OpeningIntentID = nil
 		m.chats[key] = stored
 		m.groupMembers[key] = groupMembers
 		if mint, ok := chat.GatedMint(c); ok {
@@ -363,6 +364,24 @@ func (m *memory) GetChatByID(_ context.Context, chatID *commonpb.ChatId) (*chat.
 	// and is stored with Members nil and a zero RosterSummary, so the clone is
 	// already member-free.
 	return c.Clone(), nil
+}
+
+func (m *memory) GetDmOpeningIntentID(_ context.Context, chatID *commonpb.ChatId) (*commonpb.IntentId, error) {
+	if len(chatID.GetValue()) != chat.DmChatIDSize {
+		return nil, fmt.Errorf("not a dm chat id")
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	c, ok := m.chats[string(chatID.Value)]
+	if !ok {
+		return nil, chat.ErrChatNotFound
+	}
+	if c.OpeningIntentID == nil {
+		return nil, nil
+	}
+	return &commonpb.IntentId{Value: append([]byte(nil), c.OpeningIntentID.Value...)}, nil
 }
 
 func (m *memory) GetGroupRosterSummary(_ context.Context, chatID *commonpb.ChatId) (chat.RosterSummary, error) {

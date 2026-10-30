@@ -32,6 +32,7 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 	for _, tf := range []func(t *testing.T, s chat.Store){
 		testStore_PutAndGet,
 		testStore_PutChat_Duplicate,
+		testStore_DmOpeningIntent,
 		testStore_PutChat_TypeIDMismatch,
 		testStore_PutChat_NoMembers,
 		testStore_GetChatByID_NotFound,
@@ -202,6 +203,81 @@ func testStore_PutChat_Duplicate(t *testing.T, s chat.Store) {
 	}
 	require.NoError(t, s.PutChat(ctx, c))
 	require.ErrorIs(t, s.PutChat(ctx, c), chat.ErrChatExists)
+}
+
+func testStore_DmOpeningIntent(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	newDm := func(opening *commonpb.IntentId) *chat.Chat {
+		return &chat.Chat{
+			ID:              generateDmChatID(),
+			Type:            chatpb.ChatType_DM,
+			Members:         []*commonpb.UserId{model.MustGenerateUserID(), model.MustGenerateUserID()},
+			OpeningIntentID: opening,
+			LastActivity:    at(1),
+		}
+	}
+
+	t.Run("recorded at creation", func(t *testing.T) {
+		first := &commonpb.IntentId{Value: randomBytes(32)}
+		dm := newDm(first)
+		require.NoError(t, s.PutChat(ctx, dm))
+
+		got, err := s.GetDmOpeningIntentID(ctx, dm.ID)
+		require.NoError(t, err)
+		require.Equal(t, first.Value, got.Value)
+
+		record, err := s.GetChatByID(ctx, dm.ID)
+		require.NoError(t, err)
+		require.Equal(t, first.Value, record.OpeningIntentID.Value)
+
+		// A racing payment's PutChat loses, and the first opener stands.
+		racer := dm.Clone()
+		racer.OpeningIntentID = &commonpb.IntentId{Value: randomBytes(32)}
+		require.ErrorIs(t, s.PutChat(ctx, racer), chat.ErrChatExists)
+
+		got, err = s.GetDmOpeningIntentID(ctx, dm.ID)
+		require.NoError(t, err)
+		require.Equal(t, first.Value, got.Value)
+	})
+
+	t.Run("none recorded", func(t *testing.T) {
+		dm := newDm(nil)
+		require.NoError(t, s.PutChat(ctx, dm))
+
+		got, err := s.GetDmOpeningIntentID(ctx, dm.ID)
+		require.NoError(t, err)
+		require.Nil(t, got)
+
+		record, err := s.GetChatByID(ctx, dm.ID)
+		require.NoError(t, err)
+		require.Nil(t, record.OpeningIntentID)
+	})
+
+	t.Run("dm not found", func(t *testing.T) {
+		_, err := s.GetDmOpeningIntentID(ctx, generateDmChatID())
+		require.ErrorIs(t, err, chat.ErrChatNotFound)
+	})
+
+	t.Run("groups carry none", func(t *testing.T) {
+		group := &chat.Chat{
+			ID:              chat.MustGenerateGroupChatID(),
+			Type:            chatpb.ChatType_GROUP,
+			Members:         []*commonpb.UserId{model.MustGenerateUserID()},
+			Title:           "Group",
+			OpeningIntentID: &commonpb.IntentId{Value: randomBytes(32)},
+			LastActivity:    at(1),
+		}
+		require.NoError(t, s.PutChat(ctx, group))
+
+		record, err := s.GetChatByID(ctx, group.ID)
+		require.NoError(t, err)
+		require.Nil(t, record.OpeningIntentID)
+
+		_, err = s.GetDmOpeningIntentID(ctx, group.ID)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, chat.ErrChatNotFound)
+	})
 }
 
 func testStore_GetChatByID_NotFound(t *testing.T, s chat.Store) {

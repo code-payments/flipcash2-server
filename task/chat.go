@@ -41,6 +41,19 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 // the canonical DM of the given type between the sender and recipient,
 // creating the DM if this is the payment that opens it. A returned error means
 // the task is retried with backoff.
+//
+// In a DM (never a contact DM, which is disabled), the payment that opens the
+// chat is recorded on it (chat.Chat.OpeningIntentID) and its cash message
+// offers the receiver a one-time return of the payment
+// (CashContent.payment_return.offer), with a fresh intent ID drawn for the
+// return and stored beside the message (messaging.CashMessageReturn). Whether
+// this payment opened the DM is decided off the recorded opening intent, not
+// off PutChat's result alone: of payments racing to open the DM only the one
+// whose PutChat created it is recorded, and every other one finds the chat
+// existing; but a retry of the opener's own task, after its first attempt
+// created the DM and failed before the message landed, finds it existing too,
+// and must still offer the return. A DM created before opening intents were
+// recorded has none, so no payment into it offers one.
 func (e *Executor) sendDmPaymentMessageOfType(ctx context.Context, record *ocp_task.Record, chatType chatpb.ChatType) error {
 	payment, err := e.loadChatPayment(ctx, record)
 	if err != nil {
@@ -81,17 +94,45 @@ func (e *Executor) sendDmPaymentMessageOfType(ctx context.Context, record *ocp_t
 	// already created it, so an existing chat is the expected steady state, not
 	// a failure. A DM with the team account excludes it from the feed, which
 	// the store does on its own (see chat.FeedExclusions).
+	intentID := &commonpb.IntentId{Value: payment.rawIntentID}
+	var openingIntentID *commonpb.IntentId
+	if chatType == chatpb.ChatType_DM {
+		openingIntentID = intentID
+	}
 	err = e.chats.PutChat(ctx, &chat.Chat{
-		ID:           chatID,
-		Type:         chatType,
-		Members:      []*commonpb.UserId{payment.senderUserID, recipientUserID},
-		LastActivity: time.Now().UTC(),
+		ID:              chatID,
+		Type:            chatType,
+		Members:         []*commonpb.UserId{payment.senderUserID, recipientUserID},
+		OpeningIntentID: openingIntentID,
+		LastActivity:    time.Now().UTC(),
 	})
 	if err != nil && !errors.Is(err, chat.ErrChatExists) {
 		return fmt.Errorf("failed to create dm chat: %w", err)
 	}
 
-	return e.sendCashMessage(ctx, chatID, payment)
+	if chatType != chatpb.ChatType_DM {
+		return e.sendCashMessage(ctx, chatID, payment, cashReturn{})
+	}
+
+	opened := err == nil
+	if !opened {
+		recorded, err := e.chats.GetDmOpeningIntentID(ctx, chatID)
+		if err != nil {
+			return fmt.Errorf("failed to get dm opening intent: %w", err)
+		}
+		opened = recorded != nil && bytes.Equal(recorded.Value, intentID.Value)
+	}
+	if !opened {
+		return e.sendCashMessage(ctx, chatID, payment, cashReturn{})
+	}
+
+	// A retried task draws a different ID, but the send replays on the task's
+	// UUID, so the ID the first send stored is the one that stands.
+	returnIntentID, err := messaging.NewReturnIntentID()
+	if err != nil {
+		return fmt.Errorf("failed to generate return intent id: %w", err)
+	}
+	return e.sendCashMessage(ctx, chatID, payment, cashReturn{offerIntentID: returnIntentID})
 }
 
 // sendGroupPaymentMessage injects the cash message for a group payment, to
@@ -118,7 +159,7 @@ func (e *Executor) sendGroupPaymentMessage(ctx context.Context, record *ocp_task
 		return errors.New("chat id is not a group")
 	}
 
-	return e.sendCashMessage(ctx, chatID, payment)
+	return e.sendCashMessage(ctx, chatID, payment, cashReturn{})
 }
 
 // recordReactionBoost records a reaction boost against the payer's reaction
@@ -265,6 +306,63 @@ func (e *Executor) recordRequestedPayment(ctx context.Context, record *ocp_task.
 	return nil
 }
 
+// sendReturnPaymentMessage records a return payment, a DM cash message's
+// receiver paying its sender back the payment it offered for returning:
+// marking the offer returned (messaging.Store.MarkCashMessageReturned), then
+// injecting the return's cash message into the DM as the payer, naming the
+// returned message (CashContent.payment_return.return_of). The returned
+// message itself is never changed; clients learn the offer is gone from
+// GetCashMessageReturnStatus and from the return's message. A returned error
+// means the task is retried with backoff.
+//
+// The mark comes first so that a return's message never lands while the
+// offer still reads as available. Both steps are idempotent, so a retry after
+// either fails repeats it safely: the store accepts a repeat mark under the
+// same intent ID, and the send dedupes on the task's UUID.
+//
+// Nothing about the DM or the message is checked again beyond what the
+// writes need: the payer, the payee, the offer and the amount were judged
+// when the payment was validated (see intent.Integration), and the payment has
+// happened since. The store marks the offer only under the intent ID it
+// holds for it, so a task for any other intent, which a validated payment
+// never produces, fails here on every retry (messaging.ErrWrongReturnIntent),
+// as does a message that is missing or offers no return, rather than passing
+// as a no-op.
+func (e *Executor) sendReturnPaymentMessage(ctx context.Context, record *ocp_task.Record) error {
+	payment, err := e.loadChatPayment(ctx, record)
+	if err != nil {
+		return err
+	}
+
+	returnPayment := payment.chatMetadata.GetReturnPayment()
+	if returnPayment == nil {
+		return errors.New("intent is not a return payment")
+	}
+
+	// A return pays the returned payment's sender alone, so it is never a
+	// multi payment.
+	if len(payment.recipients) != 1 {
+		return fmt.Errorf("return payment has %d recipients", len(payment.recipients))
+	}
+
+	// The message must land in the DM between the two users, which is the
+	// chat the client referenced in the validated app metadata.
+	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, payment.senderUserID, payment.recipients[0].userID)
+	if !bytes.Equal(payment.chatMetadata.GetChatId().GetValue(), chatID.Value) {
+		return errors.New("chat id does not match the dm between sender and recipient")
+	}
+
+	messageID := returnPayment.GetMessageId()
+	if err := e.messages.MarkCashMessageReturned(ctx, chatID, messageID, &commonpb.IntentId{Value: payment.rawIntentID}); err != nil {
+		// messaging.ErrMessageNotFound, ErrNoCashMessageReturn and
+		// ErrWrongReturnIntent included: a validated payment never produces
+		// them, so they are surfaced, not dropped.
+		return fmt.Errorf("failed to mark payment returned: %w", err)
+	}
+
+	return e.sendCashMessage(ctx, chatID, payment, cashReturn{of: messageID})
+}
+
 // chatPayment is a validated chat payment, reloaded for the task that injects
 // its cash message.
 type chatPayment struct {
@@ -350,15 +448,36 @@ func (e *Executor) loadChatPayment(ctx context.Context, record *ocp_task.Record)
 	}, nil
 }
 
+// cashReturn is how a cash message takes part in a return of a payment
+// (CashContent.payment_return), each part independent of the other.
+type cashReturn struct {
+	// offerIntentID, when set, makes the message offer its receiver a return
+	// of the payment (payment_return.offer), the ID being the one the return
+	// must use; the messaging store refuses an offer on anything but a cash
+	// message to one receiver.
+	offerIntentID *commonpb.IntentId
+
+	// of, when set, marks the message as the return of the payment in the
+	// message it names (payment_return.return_of).
+	of *messagingpb.MessageId
+}
+
 // sendCashMessage sends the payment's cash message into chatID as the
 // payer: carrying the whole payment as its total, and naming its recipient as
 // its single receiver, or, for a payment to several, listing each recipient
 // with their part, in the payment's order, as its multi receiver.
 //
+// ret says how the message takes part in a return (see cashReturn); its zero
+// value is a message that does neither. An offer's intent ID is stored beside
+// the message rather than carried in it, which only a batch send can do, so
+// every cash message goes through SendBatch with a batch of one, whose side
+// effects are Send's.
+//
 // Idempotency under at-least-once delivery comes from the messaging layer:
 // sends dedupe on (chatID, clientMessageID), and the client message ID is the
-// task's UUID, which is stable across retries.
-func (e *Executor) sendCashMessage(ctx context.Context, chatID *commonpb.ChatId, payment *chatPayment) error {
+// task's UUID, which is stable across retries. A replayed send keeps the
+// message and return ID the first send stored.
+func (e *Executor) sendCashMessage(ctx context.Context, chatID *commonpb.ChatId, payment *chatPayment, ret cashReturn) error {
 	cash := &messagingpb.CashContent{
 		IntentId:    &commonpb.IntentId{Value: payment.rawIntentID},
 		TotalAmount: payment.amount,
@@ -382,18 +501,27 @@ func (e *Executor) sendCashMessage(ctx context.Context, chatID *commonpb.ChatId,
 		cash.Recipient = &messagingpb.CashContent_MultiReceiver{MultiReceiver: &messagingpb.CashContent_Payments{Items: items}}
 	}
 
+	if ret.offerIntentID != nil || ret.of != nil {
+		cash.PaymentReturn = &messagingpb.CashContent_Return{}
+		if ret.offerIntentID != nil {
+			cash.PaymentReturn.Offer = &messagingpb.CashContent_Return_Offer{}
+		}
+		if ret.of != nil {
+			cash.PaymentReturn.ReturnOf = &messagingpb.CashContent_Return_ReturnOf{MessageId: ret.of}
+		}
+	}
+
 	content := []*messagingpb.Content{{
 		Type: &messagingpb.Content_Cash{Cash: cash},
 	}}
 
-	if _, err := e.sender.Send(
-		ctx,
-		chatID,
-		payment.senderUserID,
-		content,
-		&messagingpb.ClientMessageId{Value: payment.taskID[:]},
-		true,
-	); err != nil {
+	if _, err := e.sender.SendBatch(ctx, chatID, []messaging.OutgoingMessage{{
+		SenderID:           payment.senderUserID,
+		Content:            content,
+		ClientMessageID:    &messagingpb.ClientMessageId{Value: payment.taskID[:]},
+		CountsTowardUnread: true,
+		ReturnIntentID:     ret.offerIntentID,
+	}}); err != nil {
 		return fmt.Errorf("failed to send payment message: %w", err)
 	}
 

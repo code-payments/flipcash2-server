@@ -36,6 +36,11 @@ func injectLocalizedTextForHistory(record *history.Record, notification *activit
 			// A requested payment is always a send, of the payer's share to
 			// the request's creator, who is named beside it.
 			localizedText = "Sent"
+		case intent.GetReturnPayment(record.AppMetadata) != nil:
+			// A return payment is always a send, of a DM payment back to the
+			// person who made it, who is named beside it. It reads like any
+			// other send; nothing in the feed says it was a return.
+			localizedText = "Sent"
 		case notification.GetDirectlySentCrypto().GetDestinationIdentifier() == nil:
 			localizedText = "Gave"
 		case intent.GetChatPaymentVerb(record.AppMetadata, record.CreatedAt) == messagingpb.CashContent_TIPPED:

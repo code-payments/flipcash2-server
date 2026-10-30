@@ -24,6 +24,7 @@ import (
 type Executor struct {
 	accounts account.Store
 	chats    chat.Store
+	messages messaging.Store
 	requests paymentrequest.Store
 	sender   *messaging.Sender
 	ocpData  ocp_data.Provider
@@ -31,13 +32,15 @@ type Executor struct {
 	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent]
 }
 
-// NewExecutor constructs the task executor. requests is the payment request
-// store, written to mark a share paid by a requested payment, and
+// NewExecutor constructs the task executor. messages is the messaging store,
+// written to mark a payment's return offer returned (see
+// sendReturnPaymentMessage); requests is the payment request store, written to mark a share paid by a requested payment, and
 // chatEventBus the chat-keyed event bus the mark is announced on (see
 // recordRequestedPayment).
 func NewExecutor(
 	accounts account.Store,
 	chats chat.Store,
+	messages messaging.Store,
 	requests paymentrequest.Store,
 	sender *messaging.Sender,
 	ocpData ocp_data.Provider,
@@ -46,6 +49,7 @@ func NewExecutor(
 	return &Executor{
 		accounts:     accounts,
 		chats:        chats,
+		messages:     messages,
 		requests:     requests,
 		sender:       sender,
 		ocpData:      ocpData,
@@ -65,6 +69,8 @@ func (e *Executor) Execute(ctx context.Context, record *ocp_task.Record) error {
 		return e.recordReactionBoost(ctx, record)
 	case intent.TaskTypeRecordRequestedPayment:
 		return e.recordRequestedPayment(ctx, record)
+	case intent.TaskTypeSendReturnPaymentMessage:
+		return e.sendReturnPaymentMessage(ctx, record)
 	default:
 		return fmt.Errorf("unknown task type %d", record.Type)
 	}

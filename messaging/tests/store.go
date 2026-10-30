@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -70,6 +71,12 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_Reactions_BoostDm,
 		testStore_Reactions_BoostOrder,
 		testStore_Reactions_BoostPastTypeCap,
+		testStore_CashMessageReturn_Read,
+		testStore_CashMessageReturn_Hidden,
+		testStore_CashMessageReturn_Replay,
+		testStore_CashMessageReturn_NotFound,
+		testStore_CashMessageReturn_Mark,
+		testStore_CashMessageReturn_Shape,
 	} {
 		tf(t, s)
 		teardown()
@@ -2957,4 +2964,358 @@ func boostInput(usdMicros uint64, ts time.Time) messaging.BoostInput {
 		UsdMicros: usdMicros,
 		Ts:        ts,
 	}
+}
+
+// testStore_CashMessageReturn_Read pins what GetCashMessageReturn reads: the
+// message as GetMessage reads it, beside the offer's intent ID, not yet
+// returned; nil beside a message sent with no offer; and each message of a
+// batch with its own offer.
+func testStore_CashMessageReturn_Read(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+	receiver := model.MustGenerateUserID()
+
+	offerA, offerB := generateReturnIntentID(), generateReturnIntentID()
+	msgs, created, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{
+		{SenderID: sender, Content: offeringCashContent(receiver), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true, ReturnIntentID: offerA},
+		{SenderID: sender, Content: textContent("no offer"), Timestamp: at(2), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+		{SenderID: sender, Content: offeringCashContent(receiver), Timestamp: at(3), ClientMessageID: generateClientID(), CountsTowardUnread: true, ReturnIntentID: offerB},
+	})
+	require.NoError(t, err)
+	require.True(t, created)
+
+	for i, want := range []*commonpb.IntentId{offerA, nil, offerB} {
+		msg, ret, err := s.GetCashMessageReturn(ctx, chatID, msgs[i].ID)
+		require.NoError(t, err)
+		got, err := s.GetMessage(ctx, chatID, msgs[i].ID)
+		require.NoError(t, err)
+		require.True(t, proto.Equal(got.ToProto(), msg.ToProto()))
+		if want == nil {
+			require.Nil(t, ret)
+			continue
+		}
+		require.NotNil(t, ret)
+		require.Equal(t, want.Value, ret.IntentID.Value)
+		require.False(t, ret.Returned)
+	}
+
+	// A single send (PutMessage) has no way to carry an ID, so it cannot
+	// send an offer.
+	_, _, err = s.PutMessage(ctx, chatID, sender, offeringCashContent(receiver), at(4), generateClientID(), true)
+	require.ErrorIs(t, err, messaging.ErrInvalidReturnOffer)
+}
+
+// testStore_CashMessageReturn_Hidden pins that the offer's intent ID reaches
+// no read but GetCashMessageReturn: no message, page, batch or delta read,
+// nor the proto any of them projects to, carries its bytes, and the message
+// reads exactly as an identical one sent with no offer.
+func testStore_CashMessageReturn_Hidden(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+	receiver := model.MustGenerateUserID()
+
+	content := offeringCashContent(receiver)
+	// The twin is the same payment with no offer: an offer cannot be sent
+	// without an ID (ErrInvalidReturnOffer).
+	twinContent := []*messagingpb.Content{proto.Clone(content[0]).(*messagingpb.Content)}
+	twinContent[0].GetCash().PaymentReturn = nil
+	offer := generateReturnIntentID()
+	offeredInput := messaging.MessageInput{SenderID: sender, Content: content, Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true, ReturnIntentID: offer}
+	msgs, _, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{
+		offeredInput,
+		{SenderID: sender, Content: twinContent, Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	})
+	require.NoError(t, err)
+	offered, plain := msgs[0], msgs[1]
+
+	requireHidden := func(read string, msg *messaging.Message) {
+		t.Helper()
+		b, err := proto.Marshal(msg.ToProto())
+		require.NoError(t, err)
+		require.False(t, bytes.Contains(b, offer.Value), "%s carries the return intent id", read)
+		// Beside its twin sent with no offer, only the offer the client sees,
+		// the ID and the sequences differ.
+		want := plain.ToProto()
+		want.Content[0].GetCash().PaymentReturn = &messagingpb.CashContent_Return{Offer: &messagingpb.CashContent_Return_Offer{}}
+		want.MessageId = msg.ToProto().MessageId
+		want.UnreadSeq = msg.ToProto().UnreadSeq
+		want.EventSequence = msg.ToProto().EventSequence
+		require.True(t, proto.Equal(want, msg.ToProto()), "%s differs from a message with no offer", read)
+	}
+
+	requireHidden("PutMessages", offered)
+
+	got, err := s.GetMessage(ctx, chatID, offered.ID)
+	require.NoError(t, err)
+	requireHidden("GetMessage", got)
+
+	page, err := s.GetMessages(ctx, chatID, database.WithAscending())
+	require.NoError(t, err)
+	require.Equal(t, []uint64{offered.ID.Value, plain.ID.Value}, messageIDs(page))
+	requireHidden("GetMessages", page[0])
+
+	byRefs, err := s.GetMessagesByRefs(ctx, refs(chatID, offered.ID.Value))
+	require.NoError(t, err)
+	require.Len(t, byRefs, 1)
+	requireHidden("GetMessagesByRefs", byRefs[0])
+
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	delta, _, err := s.GetEventDelta(ctx, chatID, 0, head, 100)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{offered.ID.Value, plain.ID.Value}, messageIDs(delta))
+	requireHidden("GetEventDelta", delta[0])
+
+	// A replay answers with the original message, and no more of its offer.
+	replayed, created, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{offeredInput})
+	require.NoError(t, err)
+	require.False(t, created)
+	requireHidden("PutMessages (replay)", replayed[0])
+}
+
+// testStore_CashMessageReturn_Replay pins that a replayed send keeps the offer
+// the first send stored: a retry draws a fresh random intent ID, and the one
+// written first is the one the return must use. A retry carrying an offer for
+// a message first sent without one adds none.
+func testStore_CashMessageReturn_Replay(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+	receiver := model.MustGenerateUserID()
+
+	first := generateReturnIntentID()
+	offered := messaging.MessageInput{SenderID: sender, Content: offeringCashContent(receiver), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true, ReturnIntentID: first}
+	unoffered := messaging.MessageInput{SenderID: sender, Content: cashContent(receiver), Timestamp: at(2), ClientMessageID: generateClientID(), CountsTowardUnread: true}
+	msgs, created, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{offered, unoffered})
+	require.NoError(t, err)
+	require.True(t, created)
+
+	retryOffered := offered
+	retryOffered.ReturnIntentID = generateReturnIntentID()
+	retryUnoffered := unoffered
+	retryUnoffered.Content = offeringCashContent(receiver)
+	retryUnoffered.ReturnIntentID = generateReturnIntentID()
+	again, created, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{retryOffered, retryUnoffered})
+	require.NoError(t, err)
+	require.False(t, created)
+	require.Equal(t, messageIDs(msgs), messageIDs(again))
+
+	// A retry with no offer at all leaves the stored one too.
+	retryOffered.Content = cashContent(receiver)
+	retryOffered.ReturnIntentID = nil
+	_, created, err = s.PutMessages(ctx, chatID, []messaging.MessageInput{retryOffered})
+	require.NoError(t, err)
+	require.False(t, created)
+
+	_, ret, err := s.GetCashMessageReturn(ctx, chatID, msgs[0].ID)
+	require.NoError(t, err)
+	require.NotNil(t, ret)
+	require.Equal(t, first.Value, ret.IntentID.Value)
+	_, ret, err = s.GetCashMessageReturn(ctx, chatID, msgs[1].ID)
+	require.NoError(t, err)
+	require.Nil(t, ret)
+}
+
+// testStore_CashMessageReturn_NotFound pins ErrMessageNotFound from both
+// methods for an unknown chat and for an unknown message in a known chat.
+func testStore_CashMessageReturn_NotFound(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+
+	unknown := generateChatID()
+	_, _, err := s.GetCashMessageReturn(ctx, unknown, &messagingpb.MessageId{Value: 1})
+	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
+	require.ErrorIs(t, s.MarkCashMessageReturned(ctx, unknown, &messagingpb.MessageId{Value: 1}, generateReturnIntentID()), messaging.ErrMessageNotFound)
+
+	chatID := generateChatID()
+	_, _, err = s.PutMessages(ctx, chatID, []messaging.MessageInput{
+		{SenderID: model.MustGenerateUserID(), Content: offeringCashContent(model.MustGenerateUserID()), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true, ReturnIntentID: generateReturnIntentID()},
+	})
+	require.NoError(t, err)
+	_, _, err = s.GetCashMessageReturn(ctx, chatID, &messagingpb.MessageId{Value: 2})
+	require.ErrorIs(t, err, messaging.ErrMessageNotFound)
+	require.ErrorIs(t, s.MarkCashMessageReturned(ctx, chatID, &messagingpb.MessageId{Value: 2}, generateReturnIntentID()), messaging.ErrMessageNotFound)
+}
+
+// testStore_CashMessageReturn_Mark pins MarkCashMessageReturned: only the
+// offer's own intent sets Returned (any other is ErrWrongReturnIntent, marked
+// or not), a repeat is the OK no-op, a message with no offer is
+// ErrNoCashMessageReturn and stays without one, and none of it is a change to
+// the message a client could see: no event is logged, the head and the
+// message's event sequence stay, and its content is as sent. An edit or a
+// delete after the mark leaves the offer's state as it was.
+func testStore_CashMessageReturn_Mark(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+	receiver := model.MustGenerateUserID()
+
+	offer := generateReturnIntentID()
+	msgs, _, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{
+		{SenderID: sender, Content: offeringCashContent(receiver), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true, ReturnIntentID: offer},
+		{SenderID: sender, Content: textContent("no offer"), Timestamp: at(2), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	})
+	require.NoError(t, err)
+	offered, plain := msgs[0], msgs[1]
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), head)
+
+	requireUnchanged := func() {
+		t.Helper()
+		gotHead, err := s.GetLatestEventSequence(ctx, chatID)
+		require.NoError(t, err)
+		require.Equal(t, head, gotHead)
+		delta, cursor, err := s.GetEventDelta(ctx, chatID, head, head, 100)
+		require.NoError(t, err)
+		require.Empty(t, delta)
+		require.Equal(t, head, cursor)
+		for _, want := range msgs {
+			got, err := s.GetMessage(ctx, chatID, want.ID)
+			require.NoError(t, err)
+			require.Equal(t, want.EventSequence, got.EventSequence)
+			require.True(t, proto.Equal(want.ToProto(), got.ToProto()))
+		}
+	}
+
+	// Any intent but the offer's own is refused, and marks nothing.
+	require.ErrorIs(t, s.MarkCashMessageReturned(ctx, chatID, offered.ID, generateReturnIntentID()), messaging.ErrWrongReturnIntent)
+	require.ErrorIs(t, s.MarkCashMessageReturned(ctx, chatID, offered.ID, &commonpb.IntentId{Value: offer.Value[:16]}), messaging.ErrWrongReturnIntent)
+	require.ErrorIs(t, s.MarkCashMessageReturned(ctx, chatID, offered.ID, nil), messaging.ErrWrongReturnIntent)
+	_, ret, err := s.GetCashMessageReturn(ctx, chatID, offered.ID)
+	require.NoError(t, err)
+	require.False(t, ret.Returned)
+	requireUnchanged()
+
+	require.NoError(t, s.MarkCashMessageReturned(ctx, chatID, offered.ID, offer))
+	msg, ret, err := s.GetCashMessageReturn(ctx, chatID, offered.ID)
+	require.NoError(t, err)
+	require.Equal(t, offered.EventSequence, msg.EventSequence)
+	require.NotNil(t, ret)
+	require.True(t, ret.Returned)
+	require.Equal(t, offer.Value, ret.IntentID.Value)
+	requireUnchanged()
+
+	// A repeat is the OK no-op, and another intent is still refused.
+	require.NoError(t, s.MarkCashMessageReturned(ctx, chatID, offered.ID, offer))
+	require.ErrorIs(t, s.MarkCashMessageReturned(ctx, chatID, offered.ID, generateReturnIntentID()), messaging.ErrWrongReturnIntent)
+	_, ret, err = s.GetCashMessageReturn(ctx, chatID, offered.ID)
+	require.NoError(t, err)
+	require.True(t, ret.Returned)
+	requireUnchanged()
+
+	// A message with no offer has nothing to mark, and gains no offer.
+	require.ErrorIs(t, s.MarkCashMessageReturned(ctx, chatID, plain.ID, generateReturnIntentID()), messaging.ErrNoCashMessageReturn)
+	_, ret, err = s.GetCashMessageReturn(ctx, chatID, plain.ID)
+	require.NoError(t, err)
+	require.Nil(t, ret)
+	requireUnchanged()
+
+	// A delete moves the message's sequence as usual and leaves the offer's
+	// state beside its tombstone.
+	tombstone, err := s.DeleteMessage(ctx, chatID, offered.ID, sender, at(9), offered.EventSequence)
+	require.NoError(t, err)
+	msg, ret, err = s.GetCashMessageReturn(ctx, chatID, offered.ID)
+	require.NoError(t, err)
+	require.Equal(t, tombstone.EventSequence, msg.EventSequence)
+	requireDeleted(t, msg, sender, at(9))
+	require.NotNil(t, ret)
+	require.True(t, ret.Returned)
+	require.Equal(t, offer.Value, ret.IntentID.Value)
+}
+
+// testStore_CashMessageReturn_Shape pins that a return intent ID of the wrong
+// length is refused before anything is written, in a batch as alone.
+func testStore_CashMessageReturn_Shape(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+	receiver := model.MustGenerateUserID()
+
+	for _, size := range []int{0, 31, 33} {
+		bad := &commonpb.IntentId{Value: make([]byte, size)}
+		_, _, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{
+			{SenderID: sender, Content: offeringCashContent(receiver), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true, ReturnIntentID: bad},
+		})
+		require.ErrorIs(t, err, messaging.ErrInvalidReturnIntentID, "size %d", size)
+		_, _, err = s.PutMessages(ctx, chatID, []messaging.MessageInput{
+			{SenderID: sender, Content: textContent("fine"), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+			{SenderID: sender, Content: offeringCashContent(receiver), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true, ReturnIntentID: bad},
+		})
+		require.ErrorIs(t, err, messaging.ErrInvalidReturnIntentID, "size %d", size)
+	}
+
+	// The offer clients see and the ID the server keeps must agree: an ID
+	// goes only on a single cash message to one receiver carrying an offer,
+	// and an offer only with an ID.
+	noReceiver := offeringCashContent(receiver)
+	noReceiver[0].GetCash().Recipient = nil
+	multiReceiver := offeringCashContent(receiver)
+	multiReceiver[0].GetCash().Recipient = &messagingpb.CashContent_MultiReceiver{MultiReceiver: &messagingpb.CashContent_Payments{Items: []*messagingpb.CashContent_Payment{
+		{Receiver: receiver, NativeAmount: 1, Quarks: 1},
+		{Receiver: model.MustGenerateUserID(), NativeAmount: 1.5, Quarks: 1},
+	}}}
+	twoContents := append(offeringCashContent(receiver), textContent("extra")...)
+	for name, in := range map[string]messaging.MessageInput{
+		"id on text":               {Content: textContent("text"), ReturnIntentID: generateReturnIntentID()},
+		"id on cash with no offer": {Content: cashContent(receiver), ReturnIntentID: generateReturnIntentID()},
+		"id with no receiver":      {Content: noReceiver, ReturnIntentID: generateReturnIntentID()},
+		"id with many receivers":   {Content: multiReceiver, ReturnIntentID: generateReturnIntentID()},
+		"id with extra content":    {Content: twoContents, ReturnIntentID: generateReturnIntentID()},
+		"offer with no id":         {Content: offeringCashContent(receiver)},
+	} {
+		in.SenderID = sender
+		in.Timestamp = at(1)
+		in.ClientMessageID = generateClientID()
+		in.CountsTowardUnread = true
+		_, _, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{in})
+		require.ErrorIs(t, err, messaging.ErrInvalidReturnOffer, name)
+
+		// Refused inside a batch too, with nothing written.
+		in.ClientMessageID = generateClientID()
+		_, _, err = s.PutMessages(ctx, chatID, []messaging.MessageInput{
+			{SenderID: sender, Content: offeringCashContent(receiver), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true, ReturnIntentID: generateReturnIntentID()},
+			in,
+		})
+		require.ErrorIs(t, err, messaging.ErrInvalidReturnOffer, name)
+	}
+
+	head, err := s.GetLatestEventSequence(ctx, chatID)
+	require.NoError(t, err)
+	require.Zero(t, head)
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending())
+	require.NoError(t, err)
+	require.Empty(t, all)
+}
+
+// offeringCashContent is a DM cash message paying receiver that offers its
+// payment for returning, as the message whose offer a store keeps.
+func offeringCashContent(receiver *commonpb.UserId) []*messagingpb.Content {
+	content := cashContent(receiver)
+	content[0].GetCash().PaymentReturn = &messagingpb.CashContent_Return{Offer: &messagingpb.CashContent_Return_Offer{}}
+	return content
+}
+
+// cashContent is a DM cash message paying receiver that offers no return.
+func cashContent(receiver *commonpb.UserId) []*messagingpb.Content {
+	return []*messagingpb.Content{{Type: &messagingpb.Content_Cash{Cash: &messagingpb.CashContent{
+		IntentId: &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()},
+		TotalAmount: &commonpb.CryptoPaymentAmount{
+			Currency:     "usd",
+			NativeAmount: 2.5,
+			Quarks:       2_500_000,
+			Mint:         &commonpb.PublicKey{Value: model.MustGenerateKeyPair().Public()},
+		},
+		Recipient: &messagingpb.CashContent_SingleReceiver{SingleReceiver: receiver},
+	}}}}
+}
+
+// generateReturnIntentID returns a random return intent ID of the right size.
+func generateReturnIntentID() *commonpb.IntentId {
+	intentID, err := messaging.NewReturnIntentID()
+	if err != nil {
+		panic(err)
+	}
+	return intentID
 }

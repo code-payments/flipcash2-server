@@ -210,6 +210,17 @@ const (
 	attrFirstEventSeq = "first_event_seq" // evt# row: the first event_seq of the run of sends the row covers, the sk being its last (absent = the sk, a run of one; see runItem)
 	attrExpiresAt     = "expires_at"      // DynamoDB TTL attribute (epoch seconds)
 
+	// A cash message's return offer (messaging.CashMessageReturn) rides its
+	// own msg# row: return_intent is written by the send that offers it and
+	// never changed, returned is set by MarkCashMessageReturned. The row is
+	// the only place the offer is read from, and it is one point read with
+	// the message, so the offer needs no table, key or index of its own. No
+	// read but GetCashMessageReturn decodes either attribute (messageFromItem
+	// ignores them), and an edit or delete SETs only the attributes it names,
+	// so both survive every later change to the message.
+	attrReturnIntent = "return_intent" // msg# row: the intent ID the return must use, raw bytes; present only on a message sent with a return offer
+	attrReturned     = "returned"      // msg# row: BOOL true once the payment has been returned; absent until then
+
 	// message_pointers table, group items. The member is carried by the sk
 	// alone (see pointerSK / userIDFromPointerSK), as the chat is by the pk.
 	ptrPrefix = "ptr#"
@@ -506,7 +517,7 @@ func (s *store) PutMessages(
 			items = append(items,
 				types.TransactWriteItem{Put: &types.Put{
 					TableName:           aws.String(s.messagesTable),
-					Item:                s.messageItem(msg, contentBlobs[i]),
+					Item:                s.messageItem(msg, contentBlobs[i], in.ReturnIntentID),
 					ConditionExpression: aws.String(fmt.Sprintf("attribute_not_exists(%s)", attrPK)),
 				}},
 				types.TransactWriteItem{Put: &types.Put{
@@ -1106,6 +1117,100 @@ func (s *store) getMessage(ctx context.Context, chatID *commonpb.ChatId, message
 	return messageFromItem(chatID, out.Item)
 }
 
+func (s *store) GetCashMessageReturn(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, *messaging.CashMessageReturn, error) {
+	// The whole row, strongly consistent: the message and its offer's state
+	// are one snapshot, and a return being validated sees every mark that
+	// completed before it (see the Store contract).
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(s.messagesTable),
+		Key: map[string]types.AttributeValue{
+			attrPK: avS(chatPK(chatID)),
+			attrSK: avS(msgSK(messageID.Value)),
+		},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(out.Item) == 0 {
+		return nil, nil, messaging.ErrMessageNotFound
+	}
+	msg, err := messageFromItem(chatID, out.Item)
+	if err != nil {
+		return nil, nil, err
+	}
+	ret, err := cashMessageReturnFromItem(out.Item)
+	if err != nil {
+		return nil, nil, err
+	}
+	return msg, ret, nil
+}
+
+func (s *store) MarkCashMessageReturned(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, intentID *commonpb.IntentId) error {
+	// An invalid ID can match no offer (see ValidateMessageInputs).
+	if intentID == nil || intentID.Validate() != nil {
+		return messaging.ErrWrongReturnIntent
+	}
+
+	// One conditional update of the message's row, touching returned alone:
+	// it moves no event-log head and no event_seq, so it needs no counter
+	// lock and contends with no send, edit or delete. The condition is the
+	// offer's own intent ID (a missing row, or one with no offer, has no
+	// return_intent to equal it); ALL_OLD tells the three failures apart with
+	// no second read. Setting true over true is the idempotent repeat.
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.messagesTable),
+		Key: map[string]types.AttributeValue{
+			attrPK: avS(chatPK(chatID)),
+			attrSK: avS(msgSK(messageID.Value)),
+		},
+		UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :returned", attrReturned)),
+		ConditionExpression: aws.String(fmt.Sprintf("%s = :intent", attrReturnIntent)),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":returned": &types.AttributeValueMemberBOOL{Value: true},
+			":intent":   avB(intentID.Value),
+		},
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	})
+	if err == nil {
+		return nil
+	}
+	var ccf *types.ConditionalCheckFailedException
+	if !errors.As(err, &ccf) {
+		return err
+	}
+	if len(ccf.Item) == 0 {
+		return messaging.ErrMessageNotFound
+	}
+	if _, ok := ccf.Item[attrReturnIntent]; !ok {
+		return messaging.ErrNoCashMessageReturn
+	}
+	return messaging.ErrWrongReturnIntent
+}
+
+// cashMessageReturnFromItem decodes a msg# row's return offer (see
+// attrReturnIntent), nil when the row carries none.
+func cashMessageReturnFromItem(item map[string]types.AttributeValue) (*messaging.CashMessageReturn, error) {
+	av, ok := item[attrReturnIntent]
+	if !ok {
+		return nil, nil
+	}
+	ret := &messaging.CashMessageReturn{
+		IntentID: &commonpb.IntentId{Value: append([]byte(nil), asB(av)...)},
+	}
+	if err := ret.IntentID.Validate(); err != nil {
+		return nil, fmt.Errorf("message row holds a malformed return intent id: %w", err)
+	}
+	if returned, ok := item[attrReturned]; ok {
+		b, ok := returned.(*types.AttributeValueMemberBOOL)
+		if !ok {
+			return nil, fmt.Errorf("expected bool attribute, got %T", returned)
+		}
+		ret.Returned = b.Value
+	}
+	return ret, nil
+}
+
 func (s *store) MessageExists(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (bool, error) {
 	// Project to pk only so the content blobs are never read or decoded. The
 	// read is strong: the message being asked about was, as often as not, just
@@ -1499,7 +1604,7 @@ func (s *store) readMarkersIsolated(ctx context.Context, chatID *commonpb.ChatId
 	return markers, nil
 }
 
-func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.AttributeValue) map[string]types.AttributeValue {
+func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.AttributeValue, returnIntentID *commonpb.IntentId) map[string]types.AttributeValue {
 	// The message ID is encoded in the sk (msg#<padded seq>, see seqFromMsgSK),
 	// the chat ID is recovered from the pk (see chatIDFromPK), and the client
 	// message ID lives on the separate cmid# idempotency marker — so none of the
@@ -1518,6 +1623,12 @@ func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.Attribu
 	}
 	if msg.SenderID != nil {
 		item[attrSenderID] = avB(msg.SenderID.Value)
+	}
+	// The return offer's intent ID rides the row it offers (see
+	// attrReturnIntent), written in the send's own transaction, so a message
+	// is never visible without the offer it was sent with.
+	if returnIntentID != nil {
+		item[attrReturnIntent] = avB(returnIntentID.Value)
 	}
 	return item
 }

@@ -2,8 +2,10 @@ package messaging
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"time"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -61,6 +63,35 @@ var ErrReactionBoosted = errors.New("reaction is boosted and cannot be removed")
 // rather than recorded as a boost that looks plain.
 var ErrBoostEmpty = errors.New("boost is worth nothing")
 
+// ErrInvalidReturnIntentID is Store.PutMessages' refusal of a batch in which a
+// message's ReturnIntentID is set but is not a valid intent ID
+// (commonpb.IntentId's validation; see ValidateMessageInputs). An offer stored with an ID no intent can carry
+// could never be returned, so it is refused before anything is written.
+var ErrInvalidReturnIntentID = errors.New("return intent id has the wrong length")
+
+// ErrInvalidReturnOffer is Store.PutMessages' refusal of a batch in which a
+// message's return offer and its ReturnIntentID disagree (see
+// ValidateMessageInputs): an ID on anything but a single cash message to one
+// receiver carrying CashContent.payment_return.offer, or such an offer with
+// no ID. Either would leave clients and the server disagreeing about whether
+// the payment can be returned, so it is refused before anything is written.
+var ErrInvalidReturnOffer = errors.New("return offer does not match its return intent id")
+
+// ErrNoCashMessageReturn is returned by Store.MarkCashMessageReturned for a
+// message that exists but was sent with no return offer (no
+// MessageInput.ReturnIntentID): there is nothing to mark, and nothing is
+// written. It is told apart from ErrMessageNotFound so that a caller marking
+// a return it validated against an offer learns which assumption failed.
+var ErrNoCashMessageReturn = errors.New("message carries no return offer")
+
+// ErrWrongReturnIntent is returned by Store.MarkCashMessageReturned when the
+// intent named is not the one the message's offer holds
+// (CashMessageReturn.IntentID), whether or not the message is marked already:
+// only the payment made with the offer's own intent ID returns it, so a path
+// that skipped validating the payment against the offer fails loudly rather
+// than marking an offer some other payment did not return. Nothing is written.
+var ErrWrongReturnIntent = errors.New("intent is not the message's return intent")
+
 // MessageRef identifies a single message within a chat. It is the unit of a
 // cross-chat batch read (see Store.GetMessagesByRefs) — e.g. one ref per chat to
 // fetch every chat's last message for the feed.
@@ -77,6 +108,58 @@ type MessageInput struct {
 	Timestamp          time.Time
 	ClientMessageID    *messagingpb.ClientMessageId
 	CountsTowardUnread bool
+
+	// ReturnIntentID, when set, makes the message a cash message offering
+	// its payment for returning: it is the intent ID the return must use
+	// (see CashMessageReturn), stored on the message's own record in the
+	// send's write and read back only by Store.GetCashMessageReturn, never
+	// onto Message. It must be a valid intent ID (ErrInvalidReturnIntentID;
+	// see NewReturnIntentID), and it is set exactly when the content is
+	// a single cash message to one receiver carrying
+	// CashContent.payment_return.offer (ErrInvalidReturnOffer). nil for
+	// every other message.
+	ReturnIntentID *commonpb.IntentId
+}
+
+// NewReturnIntentID draws a cash message's return intent ID
+// (MessageInput.ReturnIntentID): random bytes of an intent ID's length,
+// checked by commonpb.IntentId's own validation, which is the one definition
+// of that length every check of an ID defers to. Random rather than derived,
+// since an ID anyone could compute could be used up first, blocking the
+// return (see CashMessageReturn).
+func NewReturnIntentID() (*commonpb.IntentId, error) {
+	intentID := &commonpb.IntentId{Value: make([]byte, 32)}
+	if _, err := rand.Read(intentID.Value); err != nil {
+		return nil, err
+	}
+	if err := intentID.Validate(); err != nil {
+		return nil, err
+	}
+	return intentID, nil
+}
+
+// CashMessageReturn is the server's half of a cash message's return offer
+// (CashContent.payment_return.offer), what Store.GetCashMessageReturn reads
+// beside the message. The offer clients see is fixed when the message is
+// sent and never changes; what can change, and what must not be shown to
+// every reader, lives here:
+//
+//   - IntentID is the intent ID the return payment must use, drawn at random
+//     by the sender when the message is sent (MessageInput.ReturnIntentID)
+//     and never changed. An intent ID is used at most once, so a return with
+//     this ID is the only one that can go through, however often it is
+//     retried; the same property means anyone who learned it could use it up
+//     first and block the return, so it is handed only to the message's
+//     single_receiver, never carried on Message, and so never in any message
+//     read, delta or event.
+//   - Returned is whether the payment has been returned
+//     (Store.MarkCashMessageReturned). It only ever goes from false to true,
+//     and moving it is not a change to the message: no event is logged and
+//     the message's EventSequence stays as it was, so clients learn of it by
+//     asking, or from the return's own cash message.
+type CashMessageReturn struct {
+	IntentID *commonpb.IntentId
+	Returned bool
 }
 
 // MaxMessagesPerPut bounds a Store.PutMessages batch. It is set by the
@@ -93,8 +176,12 @@ const MaxMessagesPerPut = 49
 // it is the idempotency marker's key, so a nil one cannot be keyed and an empty
 // one would be a marker every such send shares), and no client message ID used
 // twice (ErrDuplicateClientMessageID — two messages cannot share an idempotency
-// marker, and a DynamoDB transaction refuses two writes to one item anyway).
-// Stores call it before any read or write.
+// marker, and a DynamoDB transaction refuses two writes to one item anyway),
+// every ReturnIntentID that is set a valid intent ID
+// (ErrInvalidReturnIntentID), and every message's return offer matching its
+// ReturnIntentID (ErrInvalidReturnOffer, see returnOfferMatches). Stores call
+// it before any read or write, so a replay carrying a malformed ID or a
+// mismatched offer is refused too rather than answered.
 func ValidateMessageInputs(inputs []MessageInput) error {
 	if len(inputs) == 0 {
 		return ErrEmptyBatch
@@ -112,8 +199,35 @@ func ValidateMessageInputs(inputs []MessageInput) error {
 			return ErrDuplicateClientMessageID
 		}
 		seen[key] = struct{}{}
+		if in.ReturnIntentID != nil {
+			if err := in.ReturnIntentID.Validate(); err != nil {
+				return fmt.Errorf("%w: %w", ErrInvalidReturnIntentID, err)
+			}
+		}
+		if !returnOfferMatches(in) {
+			return ErrInvalidReturnOffer
+		}
 	}
 	return nil
+}
+
+// returnOfferMatches reports whether a message's return offer as clients see
+// it (CashContent.payment_return.offer) and as the server keeps it
+// (ReturnIntentID) agree: a message with a ReturnIntentID is a single cash
+// message to one receiver carrying an offer, and a message carrying an offer
+// has a ReturnIntentID. So no message shows an offer the server holds no
+// intent ID for, and no intent ID sits on a message that offers nothing.
+func returnOfferMatches(in MessageInput) bool {
+	offers := 0
+	for _, content := range in.Content {
+		if content.GetCash().GetPaymentReturn().GetOffer() != nil {
+			offers++
+		}
+	}
+	if in.ReturnIntentID == nil {
+		return offers == 0
+	}
+	return len(in.Content) == 1 && offers == 1 && in.Content[0].GetCash().GetSingleReceiver() != nil
 }
 
 // PointerRef requests a chat's stored pointers (StoredPointerTypes) for the
@@ -206,7 +320,11 @@ type Store interface {
 	//
 	// Idempotency is the batch's, on its client message IDs: a retry whose
 	// every ID already names a message returns those messages (in batch order)
-	// with created false, exactly as PutMessage answers a retried send. The
+	// with created false, exactly as PutMessage answers a retried send. A
+	// replay writes nothing, so what the retry carries is ignored, its
+	// ReturnIntentIDs included: a retried send draws a fresh random ID, and
+	// the one the first send stored is the one that stands (see
+	// CashMessageReturn). The
 	// replay is judged per ID, not per original batch: the IDs may have been
 	// spent by several earlier sends, so a replay's messages need not be
 	// consecutive, nor in ID order when the retry lists its IDs in another
@@ -277,6 +395,37 @@ type Store interface {
 	// is strongly consistent: it reflects every send, edit and delete that
 	// completed before it.
 	GetMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*Message, error)
+
+	// GetCashMessageReturn returns a message, exactly as GetMessage would,
+	// beside its return offer's server-side state (see CashMessageReturn),
+	// nil when the message was sent with none. It is ErrMessageNotFound when
+	// no such message exists. It is one strongly consistent read of the
+	// message's record, so the message and its state are one snapshot, and
+	// it reflects every send and MarkCashMessageReturned that completed
+	// before it: a return validated against it cannot miss one already
+	// marked. This is the only read that carries the state.
+	//
+	// An edit or a delete leaves the state as it was, so a deleted message
+	// still answers with it beside its tombstone; whether that still offers
+	// a return is the caller's call.
+	GetCashMessageReturn(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*Message, *CashMessageReturn, error)
+
+	// MarkCashMessageReturned records that a message's payment has been
+	// returned by the payment with intentID (CashMessageReturn.Returned),
+	// which must be the offer's own intent ID. It is idempotent: marking a
+	// message already marked, with that ID, succeeds and changes nothing, so
+	// the task that records a return can be delivered more than once. It is
+	// ErrMessageNotFound when no such message exists,
+	// ErrNoCashMessageReturn when the message carries no return offer, and
+	// ErrWrongReturnIntent when intentID is not the offer's, marked or not;
+	// in every case nothing is written.
+	//
+	// It changes nothing a client reads: it logs no event, moves neither the
+	// event-log head nor the message's EventSequence, and leaves the
+	// message's content (and so its CashContent.payment_return) as sent, so
+	// it races with no edit, delete or send. A client learns of it through
+	// GetCashMessageReturn's reader, or from the return's own message.
+	MarkCashMessageReturned(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, intentID *commonpb.IntentId) error
 
 	// MessageExists reports whether a message exists in the chat. It is a
 	// lightweight existence check that does not read or decode the message body,

@@ -199,6 +199,11 @@ type Store interface {
 	// is empty, and an error when the chat ID's length does not match the chat's
 	// type family.
 	//
+	// A DM's OpeningIntentID, when set, is written with it; a group's is
+	// ignored. Since only the write that creates the chat succeeds, a DM keeps
+	// the opening intent of whichever PutChat created it (see
+	// GetDmOpeningIntentID).
+	//
 	// For a group chat (16-byte ID, type GROUP), Members become group membership
 	// records, equivalent to AddGroupMembers, and are written atomically with the
 	// canonical record: creation either fully succeeds or leaves nothing behind.
@@ -294,6 +299,14 @@ type Store interface {
 	// is a DM's inline summary and zero for a group, whose summary is its own
 	// read (GetGroupRosterSummary).
 	GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*Chat, error)
+
+	// GetDmOpeningIntentID returns the intent recorded as having opened the DM
+	// (see Chat.OpeningIntentID), or nil when it has none, or ErrChatNotFound.
+	// It is a strongly consistent read, unlike GetChatByID, so a caller whose
+	// PutChat just lost to the write that created the DM, possibly its own
+	// earlier attempt, reads what that write recorded. It returns an error if
+	// chatID is not a DM chat ID.
+	GetDmOpeningIntentID(ctx context.Context, chatID *commonpb.ChatId) (*commonpb.IntentId, error)
 
 	// GetDmFeedPage returns one page of userID's DM feed for a single chat type,
 	// pinned to a snapshot: the DMs of chatType userID is a member of (never

@@ -316,6 +316,15 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // make the creator a member, and whether they are is answered by the membership
 // records, never by this field.
 //
+// OpeningIntentID is the payment that opened a DM: the intent whose cash
+// message task created the chat (see task.Executor), or nil when unknown (a
+// group has none, and neither does a DM created any other way or before the
+// field existed). It is written with the DM, by the one PutChat that creates
+// it, and never changed, so of several payments racing to open a DM exactly
+// one is recorded, and a retry of that payment's task can tell it was the
+// one. Only that payment's cash message offers a return (see
+// messagingpb.CashContent_Return).
+//
 // Description is the group's free-form description, written by its creator,
 // or empty when it has none. It is stored exactly as written (see
 // ValidateDescription for what may be written).
@@ -341,6 +350,7 @@ type Chat struct {
 	MinimumSpeakerBalance  *MinimumBalance
 	IsPrivate              bool
 	CreatorID              *commonpb.UserId
+	OpeningIntentID        *commonpb.IntentId
 	Description            string
 	ProfilePictureBlobID   *blobpb.BlobId
 	CoverPictureBlobID     *blobpb.BlobId
@@ -519,6 +529,10 @@ func (c *Chat) Clone() *Chat {
 	if c.CreatorID != nil {
 		creatorID = &commonpb.UserId{Value: append([]byte(nil), c.CreatorID.Value...)}
 	}
+	var openingIntentID *commonpb.IntentId
+	if c.OpeningIntentID != nil {
+		openingIntentID = &commonpb.IntentId{Value: append([]byte(nil), c.OpeningIntentID.Value...)}
+	}
 	var profilePictureBlobID, coverPictureBlobID *blobpb.BlobId
 	if c.ProfilePictureBlobID != nil {
 		profilePictureBlobID = &blobpb.BlobId{Value: append([]byte(nil), c.ProfilePictureBlobID.Value...)}
@@ -542,6 +556,7 @@ func (c *Chat) Clone() *Chat {
 		MinimumSpeakerBalance:  minimumSpeakerBalance,
 		IsPrivate:              c.IsPrivate,
 		CreatorID:              creatorID,
+		OpeningIntentID:        openingIntentID,
 		Description:            c.Description,
 		ProfilePictureBlobID:   profilePictureBlobID,
 		CoverPictureBlobID:     coverPictureBlobID,

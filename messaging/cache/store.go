@@ -169,6 +169,23 @@ func (c *Cache) GetMessage(ctx context.Context, chatID *commonpb.ChatId, message
 	return msg, err
 }
 
+// GetCashMessageReturn passes through: the offer's state changes when a
+// return lands, and its readers validate a payment against it, so it is never
+// held. A returned message still raises the largest-ID bound, as GetMessage's
+// does.
+func (c *Cache) GetCashMessageReturn(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, *messaging.CashMessageReturn, error) {
+	msg, ret, err := c.db.GetCashMessageReturn(ctx, chatID, messageID)
+	if err == nil {
+		c.observe(chatID, msg.ID.Value)
+	}
+	return msg, ret, err
+}
+
+// MarkCashMessageReturned passes through.
+func (c *Cache) MarkCashMessageReturned(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, intentID *commonpb.IntentId) error {
+	return c.db.MarkCashMessageReturned(ctx, chatID, messageID, intentID)
+}
+
 func (c *Cache) GetMessages(ctx context.Context, chatID *commonpb.ChatId, opts ...database.QueryOption) ([]*messaging.Message, error) {
 	msgs, err := c.db.GetMessages(ctx, chatID, opts...)
 	if err == nil {

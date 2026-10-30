@@ -1013,6 +1013,7 @@ func TestIsUserChatPayment(t *testing.T) {
 	assert.True(t, intent.IsUserChatPayment(marshal(groupChatMetadata(chat.MustGenerateGroupChatID(), intentpb.PaymentAction_SEND))))
 	assert.True(t, intent.IsUserChatPayment(marshal(reactionBoostMetadata(chat.MustGenerateGroupChatID(), &messagingpb.MessageId{Value: 1}, "🔥"))))
 	assert.True(t, intent.IsUserChatPayment(marshal(requestedPaymentMetadata(chat.MustGenerateGroupChatID(), &paymentrequestpb.PaymentRequestId{Value: make([]byte, paymentrequest.IDSize)}))))
+	assert.True(t, intent.IsUserChatPayment(marshal(returnPaymentMetadata(dmChatID, &messagingpb.MessageId{Value: 1}))))
 	assert.False(t, intent.IsUserChatPayment(marshal(contactDmChatMetadata(dmChatID, "+12223334444", "+13334445555"))))
 	assert.False(t, intent.IsUserChatPayment(nil))
 	assert.False(t, intent.IsUserChatPayment([]byte{0xff, 0xff}))
@@ -1804,6 +1805,306 @@ func TestIntegration_GetTasksToSchedule_RequestedPayment(t *testing.T) {
 	requested := intent.GetRequestedPayment(record.AppMetadata)
 	require.NotNil(t, requested)
 	assert.True(t, proto.Equal(r.ID, requested.GetPaymentRequestId()))
+	assert.True(t, intent.IsUserChatPayment(record.AppMetadata))
+	assert.Equal(t, messagingpb.CashContent_SENT, intent.GetChatPaymentVerb(record.AppMetadata, time.Now()))
+	assert.Equal(t, messagingpb.CashContent_SENT, intent.GetChatPaymentVerb(record.AppMetadata, time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)))
+}
+
+func returnPaymentMetadata(chatID *commonpb.ChatId, messageID *messagingpb.MessageId) *intentpb.ChatMetadata {
+	return &intentpb.ChatMetadata{
+		ChatId: chatID,
+		Type: &intentpb.ChatMetadata_ReturnPayment_{
+			ReturnPayment: &intentpb.ChatMetadata_ReturnPayment{MessageId: messageID},
+		},
+	}
+}
+
+// putCashMessage sends a cash message into chatID from senderID paying
+// receiverID amount. When offered, it carries a return offer under a fresh
+// return intent ID, which is returned; otherwise the ID is nil.
+func (e *integrationEnv) putCashMessage(t *testing.T, chatID *commonpb.ChatId, senderID, receiverID *commonpb.UserId, amount *commonpb.CryptoPaymentAmount, offered bool) (*messaging.Message, *commonpb.IntentId) {
+	cash := &messagingpb.CashContent{
+		IntentId:    &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()},
+		TotalAmount: amount,
+		Recipient:   &messagingpb.CashContent_SingleReceiver{SingleReceiver: receiverID},
+	}
+	var returnIntentID *commonpb.IntentId
+	if offered {
+		cash.PaymentReturn = &messagingpb.CashContent_Return{Offer: &messagingpb.CashContent_Return_Offer{}}
+		var err error
+		returnIntentID, err = messaging.NewReturnIntentID()
+		require.NoError(t, err)
+	}
+	msgs, created, err := e.messages.PutMessages(e.ctx, chatID, []messaging.MessageInput{{
+		SenderID:           senderID,
+		Content:            []*messagingpb.Content{{Type: &messagingpb.Content_Cash{Cash: cash}}},
+		Timestamp:          time.Now(),
+		ClientMessageID:    &messagingpb.ClientMessageId{Value: model.MustGenerateUserID().Value},
+		CountsTowardUnread: true,
+		ReturnIntentID:     returnIntentID,
+	}})
+	require.NoError(t, err)
+	require.True(t, created)
+	return msgs[0], returnIntentID
+}
+
+// A return payment is the offered payment's receiver paying it back, exactly,
+// to its sender, with the offer's own intent ID.
+func TestIntegration_AllowCreation_ReturnPayment(t *testing.T) {
+	e := newIntegrationEnv(t)
+
+	senderUserID, senderKeys := e.bindUser(t)
+	receiverUserID, receiverKeys := e.bindUser(t)
+	_, otherKeys := e.bindUser(t)
+
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, receiverUserID)
+	mint := model.MustGenerateKeyPair().Public()
+	usdAmount := func(nativeAmount float64) *commonpb.CryptoPaymentAmount {
+		return &commonpb.CryptoPaymentAmount{Currency: "usd", NativeAmount: nativeAmount, Quarks: 2_500_000, Mint: &commonpb.PublicKey{Value: mint}}
+	}
+	offered, offerID := e.putCashMessage(t, dmChatID, senderUserID, receiverUserID, usdAmount(2.5), true)
+
+	// pay is a SendPublicPayment of amount in currency and mint from one key
+	// to another, returning the message in chatID under intentID.
+	pay := func(chatID *commonpb.ChatId, messageID *messagingpb.MessageId, intentID *commonpb.IntentId, from, to model.KeyPair, currency string, mint []byte, amount float64) *ocp_intent.Record {
+		record := dmPaymentIntentRecord(t, returnPaymentMetadata(chatID, messageID), base58.Encode(from.Public()), base58.Encode(to.Public()))
+		record.IntentId = base58.Encode(intentID.Value)
+		record.MintAccount = base58.Encode(mint)
+		record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.Code(currency)
+		record.SendPublicPaymentMetadata.NativeAmount = amount
+		return record
+	}
+	validRecord := func() *ocp_intent.Record {
+		return pay(dmChatID, offered.ID, offerID, receiverKeys, senderKeys, "usd", mint, 2.5)
+	}
+	allow := func(record *ocp_intent.Record) error {
+		return e.integration.AllowCreation(e.ctx, record, nil, nil)
+	}
+
+	t.Run("valid", func(t *testing.T) {
+		require.NoError(t, allow(validRecord()))
+	})
+
+	// The amount is the payment's to within half the currency's minor unit,
+	// either way, so a payment is returned all at once.
+	t.Run("amount", func(t *testing.T) {
+		for _, tc := range []struct {
+			amount      float64
+			expectedErr string
+		}{
+			{2.5, ""},
+			{2.504, ""},
+			{2.496, ""},
+			{2.506, "payment must return the payment exactly"},
+			{2.494, "payment must return the payment exactly"},
+			{1.0, "payment must return the payment exactly"},
+			{5.0, "payment must return the payment exactly"},
+			{math.NaN(), "payment must return the payment exactly"},
+		} {
+			err := allow(pay(dmChatID, offered.ID, offerID, receiverKeys, senderKeys, "usd", mint, tc.amount))
+			if tc.expectedErr == "" {
+				require.NoError(t, err, tc.amount)
+			} else {
+				require.ErrorContains(t, err, tc.expectedErr, tc.amount)
+			}
+		}
+
+		// The tolerance is the payment currency's: half a yen for a currency
+		// with no minor unit.
+		jpy, jpyOfferID := e.putCashMessage(t, dmChatID, senderUserID, receiverUserID, &commonpb.CryptoPaymentAmount{Currency: "jpy", NativeAmount: 300, Quarks: 2_000_000, Mint: &commonpb.PublicKey{Value: mint}}, true)
+		require.NoError(t, allow(pay(dmChatID, jpy.ID, jpyOfferID, receiverKeys, senderKeys, "jpy", mint, 300.4)))
+		require.NoError(t, allow(pay(dmChatID, jpy.ID, jpyOfferID, receiverKeys, senderKeys, "jpy", mint, 299.6)))
+		require.ErrorContains(t, allow(pay(dmChatID, jpy.ID, jpyOfferID, receiverKeys, senderKeys, "jpy", mint, 300.6)), "payment must return the payment exactly")
+		require.ErrorContains(t, allow(pay(dmChatID, jpy.ID, jpyOfferID, receiverKeys, senderKeys, "jpy", mint, 299)), "payment must return the payment exactly")
+	})
+
+	t.Run("denied_not_dm_chat_id", func(t *testing.T) {
+		groupID := e.putGroup(t, senderUserID, receiverUserID)
+		require.ErrorContains(t, allow(pay(groupID, offered.ID, offerID, receiverKeys, senderKeys, "usd", mint, 2.5)), "chat id is not a dm")
+		require.ErrorContains(t, allow(pay(&commonpb.ChatId{Value: make([]byte, 20)}, offered.ID, offerID, receiverKeys, senderKeys, "usd", mint, 2.5)), "chat id is not a dm")
+	})
+
+	t.Run("denied_indirect_payment_flags", func(t *testing.T) {
+		for _, mutate := range []func(*ocp_intent.SendPublicPaymentMetadata){
+			func(m *ocp_intent.SendPublicPaymentMetadata) { m.IsWithdrawal = true },
+			func(m *ocp_intent.SendPublicPaymentMetadata) { m.IsIndirectSend = true },
+			func(m *ocp_intent.SendPublicPaymentMetadata) { m.IsSwapSell = true },
+		} {
+			record := validRecord()
+			mutate(record.SendPublicPaymentMetadata)
+			require.ErrorContains(t, allow(record), "direct payment")
+		}
+	})
+
+	// A return pays one person, so a multi payment never carries one.
+	t.Run("denied_multi_payment", func(t *testing.T) {
+		record := multiPaymentIntentRecord(base58.Encode(receiverKeys.Public()), base58.Encode(senderKeys.Public()), base58.Encode(otherKeys.Public()))
+		appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
+			Domain: &intentpb.AppMetadata_Chat{Chat: returnPaymentMetadata(dmChatID, offered.ID)},
+		})
+		require.NoError(t, err)
+		record.AppMetadata = appMetadata
+		record.IntentId = base58.Encode(offerID.Value)
+		require.ErrorContains(t, allow(record), "only supported for reaction boosts and group payments")
+
+		tasks, err := e.integration.GetTasksToSchedule(e.ctx, record)
+		require.NoError(t, err)
+		assert.Empty(t, tasks)
+	})
+
+	t.Run("denied_not_flipcash_users", func(t *testing.T) {
+		require.ErrorContains(t, allow(pay(dmChatID, offered.ID, offerID, model.MustGenerateKeyPair(), senderKeys, "usd", mint, 2.5)), "payer is not a flipcash user")
+		require.ErrorContains(t, allow(pay(dmChatID, offered.ID, offerID, receiverKeys, model.MustGenerateKeyPair(), "usd", mint, 2.5)), "recipient is not a flipcash user")
+	})
+
+	// No return is allowed to or from the Flipcash team account, whatever the
+	// message says.
+	t.Run("denied_team_account", func(t *testing.T) {
+		toTeamChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, receiverUserID, e.team)
+		fromTeam, fromTeamOfferID := e.putCashMessage(t, toTeamChatID, e.team, receiverUserID, usdAmount(2.5), true)
+		require.ErrorContains(t, allow(pay(toTeamChatID, fromTeam.ID, fromTeamOfferID, receiverKeys, e.teamKeys, "usd", mint, 2.5)), "flipcash team")
+
+		toTeam, toTeamOfferID := e.putCashMessage(t, toTeamChatID, receiverUserID, e.team, usdAmount(2.5), true)
+		require.ErrorContains(t, allow(pay(toTeamChatID, toTeam.ID, toTeamOfferID, e.teamKeys, receiverKeys, "usd", mint, 2.5)), "flipcash team")
+	})
+
+	// The chat must be the DM between the payer and the payee, judged off
+	// their IDs before any message is read, so naming a DM the payer is not
+	// in is refused the same way whatever it holds: one with an offer to
+	// return, one with no messages, and the pair's contact DM alike. Paying
+	// anyone but the other member of the named DM, or paying from anyone
+	// else, is refused the same way.
+	t.Run("denied_not_the_payers_dm", func(t *testing.T) {
+		otherUserID, err := e.accounts.GetUserId(e.ctx, &commonpb.PublicKey{Value: otherKeys.Public()})
+		require.NoError(t, err)
+		const want = "chat id is not the dm between payer and recipient"
+
+		// A DM between two other users, one with an offered payment in it
+		// and one with no messages at all.
+		offeringDmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, otherUserID)
+		elsewhere, elsewhereOfferID := e.putCashMessage(t, offeringDmChatID, senderUserID, otherUserID, usdAmount(2.5), true)
+		emptyDmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, otherUserID, model.MustGenerateUserID())
+		for _, tc := range []struct {
+			name     string
+			chatID   *commonpb.ChatId
+			intentID *commonpb.IntentId
+		}{
+			{"a dm with an offer", offeringDmChatID, elsewhereOfferID},
+			{"a dm with no messages", emptyDmChatID, offerID},
+			{"the contact dm", chat.MustDeriveDmChatID(chatpb.ChatType_CONTACT_DM, senderUserID, receiverUserID), offerID},
+		} {
+			require.ErrorContains(t, allow(pay(tc.chatID, elsewhere.ID, tc.intentID, receiverKeys, senderKeys, "usd", mint, 2.5)), want, tc.name)
+		}
+
+		// The DM named is the pair's, but the payment is from or to someone
+		// else, or to the payer themself.
+		require.ErrorContains(t, allow(pay(dmChatID, offered.ID, offerID, otherKeys, senderKeys, "usd", mint, 2.5)), want)
+		require.ErrorContains(t, allow(pay(dmChatID, offered.ID, offerID, receiverKeys, otherKeys, "usd", mint, 2.5)), want)
+		require.ErrorContains(t, allow(pay(dmChatID, offered.ID, offerID, receiverKeys, receiverKeys, "usd", mint, 2.5)), want)
+	})
+
+	// A message never sent in the DM is not found.
+	t.Run("denied_message_not_found", func(t *testing.T) {
+		require.ErrorContains(t, allow(pay(dmChatID, &messagingpb.MessageId{Value: 1_000_000}, offerID, receiverKeys, senderKeys, "usd", mint, 2.5)), "message not found")
+	})
+
+	// A cash message sent with no offer, or any other message, is not
+	// returnable.
+	t.Run("denied_no_offer", func(t *testing.T) {
+		plain, _ := e.putCashMessage(t, dmChatID, senderUserID, receiverUserID, usdAmount(2.5), false)
+		require.ErrorContains(t, allow(pay(dmChatID, plain.ID, offerID, receiverKeys, senderKeys, "usd", mint, 2.5)), "message offers no return")
+
+		text := e.putMessage(t, dmChatID, senderUserID)
+		require.ErrorContains(t, allow(pay(dmChatID, text.ID, offerID, receiverKeys, senderKeys, "usd", mint, 2.5)), "message offers no return")
+	})
+
+	// An offer is returned once: after it is marked, even its own intent ID
+	// is refused.
+	t.Run("denied_already_returned", func(t *testing.T) {
+		returned, returnedOfferID := e.putCashMessage(t, dmChatID, senderUserID, receiverUserID, usdAmount(2.5), true)
+		require.NoError(t, allow(pay(dmChatID, returned.ID, returnedOfferID, receiverKeys, senderKeys, "usd", mint, 2.5)))
+		require.NoError(t, e.messages.MarkCashMessageReturned(e.ctx, dmChatID, returned.ID, returnedOfferID))
+		require.ErrorContains(t, allow(pay(dmChatID, returned.ID, returnedOfferID, receiverKeys, senderKeys, "usd", mint, 2.5)), "payment already returned")
+	})
+
+	// The payment's intent ID must be the offer's: not a fresh one, nor
+	// another offer's.
+	t.Run("denied_wrong_intent_id", func(t *testing.T) {
+		_, otherOfferID := e.putCashMessage(t, dmChatID, senderUserID, receiverUserID, usdAmount(2.5), true)
+		for name, intentID := range map[string]*commonpb.IntentId{
+			"a fresh id":      {Value: model.MustGenerateKeyPair().Public()},
+			"another offer's": otherOfferID,
+		} {
+			require.ErrorContains(t, allow(pay(dmChatID, offered.ID, intentID, receiverKeys, senderKeys, "usd", mint, 2.5)), "offer's payment intent id", name)
+		}
+	})
+
+	// Only the message's single_receiver returns it, not its sender paying
+	// it again in the same DM (anyone else is refused on the DM, above).
+	t.Run("denied_payer_not_receiver", func(t *testing.T) {
+		require.ErrorContains(t, allow(pay(dmChatID, offered.ID, offerID, senderKeys, receiverKeys, "usd", mint, 2.5)), "payer is not the payment's receiver")
+	})
+
+	// A deleted message's tombstone is not a cash message, so it is not
+	// returnable, though its offer's state survives the delete.
+	t.Run("denied_deleted", func(t *testing.T) {
+		deleted, deletedOfferID := e.putCashMessage(t, dmChatID, senderUserID, receiverUserID, usdAmount(2.5), true)
+		_, err := e.messages.DeleteMessage(e.ctx, dmChatID, deleted.ID, nil, time.Now(), deleted.EventSequence)
+		require.NoError(t, err)
+		require.ErrorContains(t, allow(pay(dmChatID, deleted.ID, deletedOfferID, receiverKeys, senderKeys, "usd", mint, 2.5)), "payer is not the payment's receiver")
+	})
+
+	// The one destination is the message sender's owner account. Paying
+	// anyone outside the DM is refused on the DM (above), so only a message
+	// the payer both sent and received, which no flow writes, reaches this.
+	t.Run("denied_destination_not_sender", func(t *testing.T) {
+		toSelf, toSelfOfferID := e.putCashMessage(t, dmChatID, receiverUserID, receiverUserID, usdAmount(2.5), true)
+		require.ErrorContains(t, allow(pay(dmChatID, toSelf.ID, toSelfOfferID, receiverKeys, senderKeys, "usd", mint, 2.5)), "payment must be to the payment's sender")
+	})
+
+	// The payment is in the returned payment's currency and mint, whatever
+	// it is worth.
+	t.Run("denied_wrong_currency", func(t *testing.T) {
+		require.ErrorContains(t, allow(pay(dmChatID, offered.ID, offerID, receiverKeys, senderKeys, "eur", mint, 2.5)), "returned payment's currency")
+		require.ErrorContains(t, allow(pay(dmChatID, offered.ID, offerID, receiverKeys, senderKeys, "eur", mint, 2.25)), "returned payment's currency")
+	})
+
+	t.Run("denied_wrong_mint", func(t *testing.T) {
+		require.ErrorContains(t, allow(pay(dmChatID, offered.ID, offerID, receiverKeys, senderKeys, "usd", model.MustGenerateKeyPair().Public(), 2.5)), "returned payment's mint")
+	})
+
+	// The offer was not used up by any of the refusals.
+	t.Run("valid_after_refusals", func(t *testing.T) {
+		require.NoError(t, allow(validRecord()))
+	})
+}
+
+// A return payment schedules the task that marks the offer returned and posts
+// the return's cash message, and is a chat payment whose parties know each
+// other by user ID, rendered as a send.
+func TestIntegration_GetTasksToSchedule_ReturnPayment(t *testing.T) {
+	e := newIntegrationEnv(t)
+
+	senderUserID, senderKeys := e.bindUser(t)
+	receiverUserID, receiverKeys := e.bindUser(t)
+
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, senderUserID, receiverUserID)
+	messageID := &messagingpb.MessageId{Value: 7}
+	record := dmPaymentIntentRecord(t, returnPaymentMetadata(dmChatID, messageID), base58.Encode(receiverKeys.Public()), base58.Encode(senderKeys.Public()))
+
+	tasks, err := e.integration.GetTasksToSchedule(e.ctx, record)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, intent.TaskTypeSendReturnPaymentMessage, tasks[0].Type)
+	assert.Equal(t, uint32(6), tasks[0].Type)
+	require.NotNil(t, tasks[0].ReferenceId)
+	assert.Equal(t, record.IntentId, *tasks[0].ReferenceId)
+	require.NoError(t, tasks[0].Validate())
+
+	returnPayment := intent.GetReturnPayment(record.AppMetadata)
+	require.NotNil(t, returnPayment)
+	assert.True(t, proto.Equal(messageID, returnPayment.GetMessageId()))
+	assert.Nil(t, intent.GetRequestedPayment(record.AppMetadata))
 	assert.True(t, intent.IsUserChatPayment(record.AppMetadata))
 	assert.Equal(t, messagingpb.CashContent_SENT, intent.GetChatPaymentVerb(record.AppMetadata, time.Now()))
 	assert.Equal(t, messagingpb.CashContent_SENT, intent.GetChatPaymentVerb(record.AppMetadata, time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)))

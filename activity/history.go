@@ -130,6 +130,8 @@ func toNotification(
 			metadata.Context = &activitypb.DirectlySentCryptoNotificationMetadata_BoostedReaction{BoostedReaction: boosted}
 		} else if requested := toRequestedPayment(record.AppMetadata); requested != nil {
 			metadata.Context = &activitypb.DirectlySentCryptoNotificationMetadata_RequestedPayment{RequestedPayment: requested}
+		} else if returned := toReturnedPayment(record.AppMetadata); returned != nil {
+			metadata.Context = &activitypb.DirectlySentCryptoNotificationMetadata_ReturnedPayment{ReturnedPayment: returned}
 		}
 		notification.AdditionalMetadata = &activitypb.Notification_DirectlySentCrypto{DirectlySentCrypto: metadata}
 
@@ -148,6 +150,8 @@ func toNotification(
 			metadata.Context = &activitypb.ReceivedCryptoNotificationMetadata_BoostedReaction{BoostedReaction: boosted}
 		} else if requested := toRequestedPayment(record.AppMetadata); requested != nil {
 			metadata.Context = &activitypb.ReceivedCryptoNotificationMetadata_RequestedPayment{RequestedPayment: requested}
+		} else if returned := toReturnedPayment(record.AppMetadata); returned != nil {
+			metadata.Context = &activitypb.ReceivedCryptoNotificationMetadata_ReturnedPayment{ReturnedPayment: returned}
 		}
 		notification.AdditionalMetadata = &activitypb.Notification_ReceivedCrypto{ReceivedCrypto: metadata}
 
@@ -237,6 +241,23 @@ func toRequestedPayment(appMetadata []byte) *activitypb.RequestedPayment {
 	return &activitypb.RequestedPayment{
 		ChatId:           intent.GetChatMetadata(appMetadata).GetChatId(),
 		PaymentRequestId: requested.GetPaymentRequestId(),
+	}
+}
+
+// toReturnedPayment names the payment a return payment returned, read off the
+// app metadata its intent carried, or nil for a payment that was not a return
+// payment. A return was validated when it was paid, so its metadata names the
+// DM between its two parties and the cash message whose payment it returned;
+// it is what the payment was for then, and is not checked against the DM now,
+// where the message may since have been deleted.
+func toReturnedPayment(appMetadata []byte) *activitypb.ReturnedPayment {
+	returned := intent.GetReturnPayment(appMetadata)
+	if returned == nil {
+		return nil
+	}
+	return &activitypb.ReturnedPayment{
+		ChatId:    intent.GetChatMetadata(appMetadata).GetChatId(),
+		MessageId: returned.GetMessageId(),
 	}
 }
 
@@ -333,7 +354,7 @@ func toSwapState(record *history.Record) activitypb.SwapState {
 }
 
 // resolveHistoryCounterparties returns the user ID of the other party to each
-// DM, group or requested payment, or reaction boost, in records, keyed by
+// DM, group, requested or return payment, or reaction boost, in records, keyed by
 // that party's owner account, resolved for the whole page in one lookup rather
 // than once per record.
 //

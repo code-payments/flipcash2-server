@@ -89,6 +89,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_GetDelta,
 		testServer_GetDelta_ResetRequired,
 		testServer_GetDelta_Batches,
+		testServer_GetCashMessageReturnStatus,
 		// Pointers
 		testServer_AdvancePointer,
 		testServer_AdvancePointer_PointerTypes,
@@ -2013,6 +2014,92 @@ func testServer_TeamAccount_Refused(t *testing.T, badges badge.Store, blocklists
 	sent, err := e.sendEncrypted(e.keysA, generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+}
+
+func (e *serverEnv) getCashMessageReturnStatus(keys model.KeyPair, chatID *commonpb.ChatId, msgID *messagingpb.MessageId) *messagingpb.GetCashMessageReturnStatusResponse {
+	req := &messagingpb.GetCashMessageReturnStatusRequest{ChatId: chatID, MessageId: msgID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.GetCashMessageReturnStatus(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// testServer_GetCashMessageReturnStatus pins the return status read: the
+// chat's members see whether an offered payment can still be returned, only
+// the message's single receiver is given the return's intent ID, whatever the
+// status, and anything that offers no return, a deleted offer's tombstone
+// included, is NOT_FOUND.
+func testServer_GetCashMessageReturnStatus(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	_, strangerKeys := e.addUser()
+
+	dmChatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.userA, e.userB)
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           dmChatID,
+		Type:         chatpb.ChatType_DM,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+
+	returnIntentID := generateReturnIntentID()
+	sent, err := e.sender.SendBatch(e.ctx, dmChatID, []messaging.OutgoingMessage{
+		{SenderID: e.userA, Content: offeringCashContent(e.userB), ClientMessageID: generateClientID(), CountsTowardUnread: true, ReturnIntentID: returnIntentID},
+		{SenderID: e.userA, Content: cashContent(e.userB), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	})
+	require.NoError(t, err)
+	require.Len(t, sent, 2)
+	offered, plain := sent[0], sent[1]
+
+	requireStatus := func(keys model.KeyPair, want messagingpb.GetCashMessageReturnStatusResponse_Status, wantIntentID *commonpb.IntentId) {
+		resp := e.getCashMessageReturnStatus(keys, dmChatID, offered.MessageId)
+		require.Equal(t, messagingpb.GetCashMessageReturnStatusResponse_OK, resp.Result)
+		require.Equal(t, want, resp.Status)
+		if wantIntentID == nil {
+			require.Nil(t, resp.PaymentIntentId)
+		} else {
+			require.True(t, proto.Equal(wantIntentID, resp.PaymentIntentId))
+		}
+	}
+
+	// The receiver gets the ID; the payer, though a member, does not.
+	requireStatus(e.keysB, messagingpb.GetCashMessageReturnStatusResponse_AVAILABLE, returnIntentID)
+	requireStatus(e.keysA, messagingpb.GetCashMessageReturnStatusResponse_AVAILABLE, nil)
+
+	// A non-member is denied, whatever the message.
+	for _, msgID := range []*messagingpb.MessageId{offered.MessageId, {Value: 99}} {
+		resp := e.getCashMessageReturnStatus(strangerKeys, dmChatID, msgID)
+		require.Equal(t, messagingpb.GetCashMessageReturnStatusResponse_DENIED, resp.Result)
+		require.Nil(t, resp.PaymentIntentId)
+	}
+
+	// A missing message, and a cash message sent with no offer, are not
+	// found.
+	for _, msgID := range []*messagingpb.MessageId{plain.MessageId, {Value: 99}} {
+		for _, keys := range []model.KeyPair{e.keysA, e.keysB} {
+			resp := e.getCashMessageReturnStatus(keys, dmChatID, msgID)
+			require.Equal(t, messagingpb.GetCashMessageReturnStatusResponse_NOT_FOUND, resp.Result)
+			require.Nil(t, resp.PaymentIntentId)
+		}
+	}
+
+	// Once returned, both members read RETURNED, and the receiver still gets
+	// the ID.
+	require.NoError(t, messages.MarkCashMessageReturned(e.ctx, dmChatID, offered.MessageId, returnIntentID))
+	requireStatus(e.keysB, messagingpb.GetCashMessageReturnStatusResponse_RETURNED, returnIntentID)
+	requireStatus(e.keysA, messagingpb.GetCashMessageReturnStatusResponse_RETURNED, nil)
+
+	// A deleted offer's tombstone offers nothing, though the store keeps its
+	// state.
+	_, err = messages.DeleteMessage(e.ctx, dmChatID, offered.MessageId, e.userA, at(2), offered.EventSequence)
+	require.NoError(t, err)
+	_, state, err := messages.GetCashMessageReturn(e.ctx, dmChatID, offered.MessageId)
+	require.NoError(t, err)
+	require.NotNil(t, state)
+	for _, keys := range []model.KeyPair{e.keysA, e.keysB} {
+		resp := e.getCashMessageReturnStatus(keys, dmChatID, offered.MessageId)
+		require.Equal(t, messagingpb.GetCashMessageReturnStatusResponse_NOT_FOUND, resp.Result)
+		require.Nil(t, resp.PaymentIntentId)
+	}
 }
 
 func testServer_GetMessage_NotFound(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {

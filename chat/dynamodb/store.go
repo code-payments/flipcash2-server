@@ -509,9 +509,10 @@ const (
 	attrMinSpeakerBalance    = "min_speaker_balance" // map: see minimumBalanceAttr
 	attrIsPrivate            = "is_private"
 	attrCreator              = "creator"
-	attrDescription          = "description"   // group chats item: absent when the group has none
-	attrProfilePictureBlobID = "picture"       // group chats item: the profile picture's ORIGINAL, named before cover pictures existed
-	attrCoverPictureBlobID   = "cover_picture" // group chats item: the cover picture's ORIGINAL
+	attrOpeningIntent        = "opening_intent" // DM chats item: the intent that opened the DM (see chat.Chat.OpeningIntentID), absent when unknown
+	attrDescription          = "description"    // group chats item: absent when the group has none
+	attrProfilePictureBlobID = "picture"        // group chats item: the profile picture's ORIGINAL, named before cover pictures existed
+	attrCoverPictureBlobID   = "cover_picture"  // group chats item: the cover picture's ORIGINAL
 	attrState                = "state"
 	attrUser                 = "user" // member id, bare hex — see userIndexKey
 	attrJoinedAt             = "joined_at"
@@ -1218,6 +1219,37 @@ func (s *store) GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*chat
 		return nil, chat.ErrChatNotFound
 	}
 	return chatFromItem(chatID, out.Item)
+}
+
+// GetDmOpeningIntentID is a strongly consistent point read of the canonical
+// chats item, projected to its key, which tells a missing DM from one with no
+// opening intent, and the opening intent.
+func (s *store) GetDmOpeningIntentID(ctx context.Context, chatID *commonpb.ChatId) (*commonpb.IntentId, error) {
+	if len(chatID.GetValue()) != chat.DmChatIDSize {
+		return nil, fmt.Errorf("not a dm chat id")
+	}
+
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:            aws.String(s.chatsTable),
+		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
+		ConsistentRead:       aws.Bool(true),
+		ProjectionExpression: aws.String("#pk, #opening"),
+		ExpressionAttributeNames: map[string]string{
+			"#pk":      attrPK,
+			"#opening": attrOpeningIntent,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(out.Item) == 0 {
+		return nil, chat.ErrChatNotFound
+	}
+	opening := asB(out.Item[attrOpeningIntent])
+	if len(opening) == 0 {
+		return nil, nil
+	}
+	return &commonpb.IntentId{Value: append([]byte(nil), opening...)}, nil
 }
 
 func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
@@ -2228,6 +2260,9 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 		}
 	} else {
 		item[attrMembers] = membersAttr(c.Members)
+		if c.OpeningIntentID != nil {
+			item[attrOpeningIntent] = avB(c.OpeningIntentID.Value)
+		}
 	}
 	if c.LastMessageID != nil {
 		item[attrLastMessageID] = avN(c.LastMessageID.Value)
@@ -2327,6 +2362,11 @@ func chatFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeValue)
 	// creator is absent for DMs and for groups written before it was recorded.
 	if creator := asB(item[attrCreator]); len(creator) > 0 {
 		c.CreatorID = &commonpb.UserId{Value: append([]byte(nil), creator...)}
+	}
+	// opening_intent is absent for groups and for DMs not opened by a recorded
+	// payment.
+	if opening := asB(item[attrOpeningIntent]); len(opening) > 0 {
+		c.OpeningIntentID = &commonpb.IntentId{Value: append([]byte(nil), opening...)}
 	}
 	// picture and cover_picture are absent for DMs and for groups without one.
 	if picture := asB(item[attrProfilePictureBlobID]); len(picture) > 0 {

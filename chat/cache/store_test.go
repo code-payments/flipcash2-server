@@ -194,6 +194,88 @@ func TestCache_GetMembers_DoesNotCacheErrors(t *testing.T) {
 	require.Equal(t, 3, backing.callCount())
 }
 
+// countingOpeningStore is a chat.Store whose GetDmOpeningIntentID result is
+// configurable and whose calls are counted.
+type countingOpeningStore struct {
+	chat.Store
+
+	mu       sync.Mutex
+	calls    int
+	intentID *commonpb.IntentId
+	err      error
+}
+
+func (s *countingOpeningStore) GetDmOpeningIntentID(_ context.Context, _ *commonpb.ChatId) (*commonpb.IntentId, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return s.intentID, s.err
+}
+
+func (s *countingOpeningStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// A DM's opening intent, recorded or none, is held once read, per DM, and
+// every result is the caller's own copy.
+func TestCache_GetDmOpeningIntentID_Cached(t *testing.T) {
+	ctx := context.Background()
+	recorded := &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()}
+	backing := &countingOpeningStore{intentID: recorded}
+	c := cache.NewInCache(backing)
+
+	opened := generateDmChatID()
+	first, err := c.GetDmOpeningIntentID(ctx, opened)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(recorded, first))
+
+	// Mutating a result leaks into neither the held ID nor a later result.
+	first.Value[0] ^= 0xff
+	for i := 0; i < 2; i++ {
+		got, err := c.GetDmOpeningIntentID(ctx, opened)
+		require.NoError(t, err)
+		require.True(t, proto.Equal(recorded, got))
+	}
+	require.Equal(t, 1, backing.callCount())
+
+	// None is an answer too, held like a recorded intent, for its own DM.
+	backing.intentID = nil
+	legacy := generateDmChatID()
+	for i := 0; i < 2; i++ {
+		got, err := c.GetDmOpeningIntentID(ctx, legacy)
+		require.NoError(t, err)
+		require.Nil(t, got)
+	}
+	require.Equal(t, 2, backing.callCount())
+}
+
+// An error, a DM not yet created included, is not held: the DM may be
+// created, and its opener recorded, a moment later.
+func TestCache_GetDmOpeningIntentID_DoesNotCacheErrors(t *testing.T) {
+	ctx := context.Background()
+	backing := &countingOpeningStore{err: chat.ErrChatNotFound}
+	c := cache.NewInCache(backing)
+
+	chatID := generateDmChatID()
+	for i := 0; i < 2; i++ {
+		_, err := c.GetDmOpeningIntentID(ctx, chatID)
+		require.ErrorIs(t, err, chat.ErrChatNotFound)
+	}
+	require.Equal(t, 2, backing.callCount())
+
+	recorded := &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()}
+	backing.err = nil
+	backing.intentID = recorded
+	for i := 0; i < 2; i++ {
+		got, err := c.GetDmOpeningIntentID(ctx, chatID)
+		require.NoError(t, err)
+		require.True(t, proto.Equal(recorded, got))
+	}
+	require.Equal(t, 3, backing.callCount())
+}
+
 func TestCache_GetMembers_GroupNeverCached(t *testing.T) {
 	ctx := context.Background()
 	backing := &countingMembersStore{members: []*commonpb.UserId{model.MustGenerateUserID()}}

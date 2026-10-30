@@ -85,7 +85,7 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 
 	// A SendPublicPayment carries any chat payment; a SendPublicMultiPayment
 	// carries a reaction boost or a group payment alone (see below), never a
-	// requested payment, which pays one person.
+	// requested or return payment, each of which pays one person.
 	if hasAppMetadata && intentRecord.IntentType != intent.SendPublicPayment && intentRecord.IntentType != intent.SendPublicMultiPayment {
 		return ocp_transaction.NewIntentDeniedError("flipcash app metadata only supported for public payment intents")
 	}
@@ -132,6 +132,8 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 				return i.validateReactionBoostAppMetadata(ctx, intentRecord, &appMetadata)
 			case *intentpb.ChatMetadata_RequestedPayment_:
 				return i.validateRequestedPaymentAppMetadata(ctx, intentRecord, &appMetadata)
+			case *intentpb.ChatMetadata_ReturnPayment_:
+				return i.validateReturnPaymentAppMetadata(ctx, intentRecord, &appMetadata)
 			default:
 				return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
 			}
@@ -147,8 +149,9 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 		// that pays both the message's sender and the group's creator, or a
 		// group payment to several members at once. One carrying any other
 		// app metadata (a requested payment, which pays its request's
-		// creator alone, included), or none, is refused before anything is
-		// read.
+		// creator alone, and a return payment, which pays the returned
+		// payment's sender alone, included), or none, is refused before
+		// anything is read.
 		switch appMetadata.GetChat().GetType().(type) {
 		case *intentpb.ChatMetadata_ReactionBoost_:
 			return i.validateReactionBoostAppMetadata(ctx, intentRecord, &appMetadata)
@@ -168,9 +171,11 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 // message injected into the DM between the sender and recipient, and a group
 // payment, made as either payment intent, the one injected into the group; a
 // reaction boost, made as either payment intent, schedules the task that
-// records the boost; and a requested payment, a SendPublicPayment alone, the
-// task that marks its share paid. Execution is
-// handled by task.Executor.
+// records the boost; a requested payment, a SendPublicPayment alone, the
+// task that marks its share paid; and a return payment, a SendPublicPayment
+// alone, the task that marks the returned payment's offer returned and
+// injects the return's cash message into the DM. Execution is handled by
+// task.Executor.
 func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_intent.Record) ([]*ocp_task.Record, error) {
 	if intentRecord.IntentType == ocp_intent.SendPublicMultiPayment {
 		if GetReactionBoost(intentRecord.AppMetadata) != nil {
@@ -196,6 +201,9 @@ func (i *Integration) GetTasksToSchedule(ctx context.Context, intentRecord *ocp_
 		}
 		if GetRequestedPayment(intentRecord.AppMetadata) != nil {
 			return []*ocp_task.Record{NewRecordRequestedPaymentTask(intentRecord)}, nil
+		}
+		if GetReturnPayment(intentRecord.AppMetadata) != nil {
+			return []*ocp_task.Record{NewSendReturnPaymentMessageTask(intentRecord)}, nil
 		}
 	}
 

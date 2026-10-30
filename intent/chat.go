@@ -58,6 +58,11 @@ const (
 	// request's share paid by a requested payment and injects its cash
 	// message into the group.
 	TaskTypeRecordRequestedPayment uint32 = 5
+
+	// TaskTypeSendReturnPaymentMessage is the task that marks the returned
+	// payment's offer returned (messaging.Store.MarkCashMessageReturned) and
+	// injects the return's cash message into the DM.
+	TaskTypeSendReturnPaymentMessage uint32 = 6
 )
 
 // NewSendContactDmPaymentMessageTask creates the task that injects the cash
@@ -124,6 +129,19 @@ func NewRecordRequestedPaymentTask(intentRecord *ocp_intent.Record) *ocp_task.Re
 	}
 }
 
+// NewSendReturnPaymentMessageTask creates the task that marks the returned
+// payment's offer returned after a return payment, and injects the return's
+// cash message into the DM. Only the intent ID is carried, via the reference
+// ID; the executor reloads the authoritative intent record at execution time.
+func NewSendReturnPaymentMessageTask(intentRecord *ocp_intent.Record) *ocp_task.Record {
+	intentID := intentRecord.IntentId
+	return &ocp_task.Record{
+		TaskId:      uuid.NewString(),
+		Type:        TaskTypeSendReturnPaymentMessage,
+		ReferenceId: &intentID,
+	}
+}
+
 // GetChatMetadata extracts the chat metadata from an intent's additional app
 // metadata, if present. It returns nil when there is no app metadata, the
 // metadata fails to decode, or it is not chat metadata.
@@ -181,12 +199,22 @@ func GetRequestedPayment(appMetadata []byte) *intentpb.ChatMetadata_RequestedPay
 	return GetChatMetadata(appMetadata).GetRequestedPayment()
 }
 
+// GetReturnPayment extracts the return payment, a payment returning one
+// offered for returning in a DM's cash message, from app metadata, if
+// present. It returns nil when there is no app metadata, the metadata fails
+// to decode, or it is not a return payment.
+func GetReturnPayment(appMetadata []byte) *intentpb.ChatMetadata_ReturnPayment {
+	return GetChatMetadata(appMetadata).GetReturnPayment()
+}
+
 // IsUserChatPayment reports whether app metadata is a chat payment whose
 // parties know each other by user ID: a DM payment, a group payment, whose
 // cash message names the payer and every recipient in the group, a reaction
 // boost, whose payer is shown on the reaction to the group and whose payees
-// are the group's creator and the message's sender, or a requested payment,
-// whose activity entries name the payer and the request's creator. A contact
+// are the group's creator and the message's sender, a requested payment,
+// whose activity entries name the payer and the request's creator, or a
+// return payment, whose payer is the returned payment's receiver and whose
+// payee is its sender, both members of the DM it was made in. A contact
 // DM payment is not one, since its parties know each other by phone number; nor
 // is a payment carrying no chat metadata, such as one handed off in person,
 // where no identity was exchanged at all.
@@ -195,7 +223,8 @@ func IsUserChatPayment(appMetadata []byte) bool {
 	return chatMetadata.GetDmPayment() != nil ||
 		chatMetadata.GetGroupPayment() != nil ||
 		chatMetadata.GetReactionBoost() != nil ||
-		chatMetadata.GetRequestedPayment() != nil
+		chatMetadata.GetRequestedPayment() != nil ||
+		chatMetadata.GetReturnPayment() != nil
 }
 
 // sendByDefaultCutoff is when an unset DM payment action came to mean SEND.
@@ -211,10 +240,10 @@ var sendByDefaultCutoff = time.Date(2026, time.September, 30, 0, 0, 0, 0, time.U
 // GetChatPaymentVerb reports how a chat payment created at createdAt should be
 // rendered. A DM payment is a tip only when its action is TIP; SEND and the
 // unset DEFAULT are plain sends, from either location, except for payments
-// created before sendByDefaultCutoff. Everything else, contact DM, group and
-// requested payments included, is a plain send: a group payment's TIP is
-// denied at validation (see validateGroupAppMetadata), and a requested payment
-// carries no action.
+// created before sendByDefaultCutoff. Everything else, contact DM, group,
+// requested and return payments included, is a plain send: a group payment's
+// TIP is denied at validation (see validateGroupAppMetadata), and a requested
+// or return payment carries no action.
 //
 // Both the cash message injected into the chat and the sender's activity feed
 // entry render off this, so they cannot disagree about what a payment was.
@@ -660,10 +689,163 @@ func (i *Integration) validateRequestedPaymentAppMetadata(ctx context.Context, i
 	}
 
 	expected := share.GetNativeAmount()
-	slack := 0.5*send.MinimumTransferValue(currency) + 4*(math.Nextafter(expected, math.Inf(1))-expected)
-	if math.IsNaN(destination.NativeAmount) || math.Abs(destination.NativeAmount-expected) > slack {
+	if !paysExactly(currency, destination.NativeAmount, expected) {
 		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf(
 			"payment must pay the share exactly: paid %s, share is %s %s",
+			strconv.FormatFloat(destination.NativeAmount, 'f', -1, 64),
+			strconv.FormatFloat(expected, 'f', -1, 64),
+			strings.ToUpper(string(currency)),
+		))
+	}
+
+	return nil
+}
+
+// paysExactly reports whether paid, a payment's native amount in currency, is
+// expected to within half the currency's minor unit
+// (send.MinimumTransferValue), the slack OCP allows between a payment's
+// amount and its quarks, with a few ulps of float error forgiven. A NaN is
+// never exact. It is how a payment that must pay an amount all at once (a
+// share of a payment request, a returned payment) is judged, so a partial
+// payment or an overpayment is refused.
+func paysExactly(currency currency_lib.Code, paid, expected float64) bool {
+	slack := 0.5*send.MinimumTransferValue(currency) + 4*(math.Nextafter(expected, math.Inf(1))-expected)
+	return !math.IsNaN(paid) && math.Abs(paid-expected) <= slack
+}
+
+// validateReturnPaymentAppMetadata enforces that a SendPublicPayment carrying
+// chat app metadata is a well-formed return payment: a payment by the
+// single_receiver of a DM cash message offered for returning
+// (CashContent.payment_return.offer) back to its sender, of exactly what it
+// paid. The task it schedules marks the offer returned and posts the return's
+// cash message into the DM, rechecking nothing, so every gate is applied here,
+// before any money moves, rather than by the task, which could only drop the
+// record of a payment already made. A multi payment never carries one (see
+// AllowCreation): a return pays one person.
+//
+// The checks, in order:
+//   - the chat ID is a DM's (a validation error otherwise);
+//   - the payment is a direct payment to a single destination;
+//   - the payer and the destination's owner are Flipcash users;
+//   - neither is the Flipcash team account;
+//   - the chat ID is the DM between the payer and the destination's owner,
+//     derived from their IDs with no read, so the message is only ever read
+//     in a DM the payer is in (anyone could derive another pair's DM ID, and
+//     the refusals below would tell them about its messages), and the chat
+//     is the one the task posts the return into;
+//   - the message exists in the DM and carries a return offer
+//     (messaging.Store.GetCashMessageReturn, one strongly consistent read of
+//     the message and its offer's state);
+//   - the message is a cash message whose single_receiver is the payer, sent
+//     by the destination's owner (a deleted message's tombstone is not a cash
+//     message, so it is refused here), judged before the offer's state so no
+//     one but the receiver learns whether it was returned;
+//   - the offer has not been returned (CashMessageReturn.Returned);
+//   - the intent's ID is the one the offer holds (CashMessageReturn.IntentID).
+//     OCP stores an intent ID at most once, in the transaction that moves the
+//     money, so this is what makes a payment returnable at most once: two
+//     returns of it, however close together, cannot both commit, which the
+//     returned check alone, read before either commits and before either's
+//     task marks the offer, cannot promise;
+//   - the payment is in total_amount's currency (off the payment's exchange
+//     currency, as a requested payment's is) and mint (the intent's mint); and
+//   - the payment's native amount (its one destination's) is total_amount's
+//     native_amount to within half the currency's minor unit (paysExactly), so
+//     a partial return or an overpayment is refused.
+//
+// No DM fee is charged (the DM exists, so its gate has been paid), and there
+// is no block check, as for every other DM payment, nor a membership check: a
+// DM's members never change, and its ID names both parties.
+func (i *Integration) validateReturnPaymentAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
+	chatMetadata := appMetadata.GetChat()
+	returnPayment := chatMetadata.GetReturnPayment()
+	if returnPayment == nil {
+		return ocp_transaction.NewIntentDeniedError("unsupported chat metadata type")
+	}
+
+	chatID := chatMetadata.GetChatId()
+	if len(chatID.GetValue()) != chat.DmChatIDSize {
+		return ocp_transaction.NewIntentValidationError("chat id is not a dm")
+	}
+
+	payment, err := GetDirectPayment(intentRecord)
+	if errors.Is(err, ErrNotDirectPayment) {
+		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf("return payment must be a direct payment: %v", err))
+	} else if err != nil {
+		return err
+	}
+	if len(payment.Destinations) != 1 {
+		return ocp_transaction.NewIntentDeniedError("return payment must be a single payment")
+	}
+	destination := payment.Destinations[0]
+
+	payerUserID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: payment.Payer.PublicKey().ToBytes()})
+	if errors.Is(err, account.ErrNotFound) {
+		return ocp_transaction.NewIntentDeniedError("payer is not a flipcash user")
+	} else if err != nil {
+		return err
+	}
+
+	payeeUserID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: destination.Owner.PublicKey().ToBytes()})
+	if errors.Is(err, account.ErrNotFound) {
+		return ocp_transaction.NewIntentDeniedError("recipient is not a flipcash user")
+	} else if err != nil {
+		return err
+	}
+
+	if i.isTeamAccount(payerUserID) || i.isTeamAccount(payeeUserID) {
+		return ocp_transaction.NewIntentDeniedError("return payments with the flipcash team are not allowed")
+	}
+
+	// The DM must be the payer's with the payee, decided off the IDs alone,
+	// before any message is read: a DM ID is derivable by anyone who knows
+	// its members, so reading a DM the payer is not in would tell them
+	// whether its members had messaged, and whether its opener offered a
+	// return. It is also exactly the chat the task posts the return into.
+	if !bytes.Equal(chatID.Value, chat.MustDeriveDmChatID(chatpb.ChatType_DM, payerUserID, payeeUserID).Value) {
+		return ocp_transaction.NewIntentDeniedError("chat id is not the dm between payer and recipient")
+	}
+
+	message, offer, err := i.messages.GetCashMessageReturn(ctx, chatID, returnPayment.GetMessageId())
+	if errors.Is(err, messaging.ErrMessageNotFound) {
+		return ocp_transaction.NewIntentDeniedError("message not found")
+	} else if err != nil {
+		return err
+	}
+	if offer == nil {
+		return ocp_transaction.NewIntentDeniedError("message offers no return")
+	}
+
+	var cash *messagingpb.CashContent
+	if len(message.Content) == 1 {
+		cash = message.Content[0].GetCash()
+	}
+	if cash == nil || !bytes.Equal(cash.GetSingleReceiver().GetValue(), payerUserID.Value) {
+		return ocp_transaction.NewIntentDeniedError("payer is not the payment's receiver")
+	}
+	if !bytes.Equal(message.SenderID.GetValue(), payeeUserID.Value) {
+		return ocp_transaction.NewIntentDeniedError("payment must be to the payment's sender")
+	}
+
+	if offer.Returned {
+		return ocp_transaction.NewIntentDeniedError("payment already returned")
+	}
+	if intentRecord.IntentId != base58.Encode(offer.IntentID.GetValue()) {
+		return ocp_transaction.NewIntentDeniedError("payment must use the offer's payment intent id")
+	}
+
+	currency := currency_lib.Code(payment.Amount.Currency)
+	if string(currency) != cash.GetTotalAmount().GetCurrency() {
+		return ocp_transaction.NewIntentDeniedError("payment must be in the returned payment's currency")
+	}
+	if !bytes.Equal(payment.Amount.GetMint().GetValue(), cash.GetTotalAmount().GetMint().GetValue()) {
+		return ocp_transaction.NewIntentDeniedError("payment must be in the returned payment's mint")
+	}
+
+	expected := cash.GetTotalAmount().GetNativeAmount()
+	if !paysExactly(currency, destination.NativeAmount, expected) {
+		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf(
+			"payment must return the payment exactly: paid %s, payment was %s %s",
 			strconv.FormatFloat(destination.NativeAmount, 'f', -1, 64),
 			strconv.FormatFloat(expected, 'f', -1, 64),
 			strings.ToUpper(string(currency)),

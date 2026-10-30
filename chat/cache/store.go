@@ -15,8 +15,8 @@ import (
 )
 
 // Cache wraps a chat.Store, caching what is fixed at a chat's creation and so
-// can never go stale: DM membership checks, a DM's member list, and a private
-// group's rules read (its creator and privacy; see GetGroupRules). A public
+// can never go stale: DM membership checks, a DM's member list, a DM's opening
+// intent (see GetDmOpeningIntentID), and a private group's rules read (its creator and privacy; see GetGroupRules). A public
 // group's rules are not held, since an edit may change them. A DM's
 // membership never changes, so a confirmed DM
 // member, and the DM's member pair, are safe to cache. Group membership is
@@ -37,6 +37,7 @@ type Cache struct {
 	db                chat.Store
 	memberCache       *ttlcache.Cache
 	dmMembersCache    *ttlcache.Cache
+	openingCache      *ttlcache.Cache
 	rulesCache        *ttlcache.Cache
 	sendActivityCache *ttlcache.Cache
 }
@@ -51,6 +52,7 @@ func NewInCache(db chat.Store) chat.Store {
 		db:                db,
 		memberCache:       ttlcache.NewCache(),
 		dmMembersCache:    ttlcache.NewCache(),
+		openingCache:      ttlcache.NewCache(),
 		rulesCache:        ttlcache.NewCache(),
 		sendActivityCache: sendActivityCache,
 	}
@@ -82,6 +84,42 @@ func (c *Cache) EditGroup(ctx context.Context, chatID *commonpb.ChatId, edit cha
 
 func (c *Cache) GetChatByID(ctx context.Context, chatID *commonpb.ChatId) (*chat.Chat, error) {
 	return c.db.GetChatByID(ctx, chatID)
+}
+
+// GetDmOpeningIntentID holds a DM's opening intent once read. It is read by
+// the task of every DM payment but the one that creates the DM, and it never
+// changes once the DM exists: only the put that creates a DM writes it, and a
+// DM is never deleted. So both answers are held, a recorded intent and none
+// (a DM created before opening intents were recorded never gains one).
+// Errors, ErrChatNotFound included, since the DM may be created later, are not
+// held. The caller gets its own copy, so the held ID is never mutated through
+// a result.
+func (c *Cache) GetDmOpeningIntentID(ctx context.Context, chatID *commonpb.ChatId) (*commonpb.IntentId, error) {
+	key := string(chatID.Value)
+	if cached, ok := c.openingCache.Get(key); ok {
+		return copyIntentID(cached.(openingIntent).id), nil
+	}
+
+	intentID, err := c.db.GetDmOpeningIntentID(ctx, chatID)
+	if err != nil {
+		return nil, err
+	}
+	c.openingCache.Set(key, openingIntent{id: copyIntentID(intentID)})
+	return copyIntentID(intentID), nil
+}
+
+// openingIntent is a DM's held opening intent, id nil when the DM has none,
+// so that none is held as an answer rather than read as a miss.
+type openingIntent struct {
+	id *commonpb.IntentId
+}
+
+// copyIntentID deep-copies an intent ID, nil for nil.
+func copyIntentID(intentID *commonpb.IntentId) *commonpb.IntentId {
+	if intentID == nil {
+		return nil
+	}
+	return &commonpb.IntentId{Value: append([]byte(nil), intentID.Value...)}
 }
 
 func (c *Cache) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {

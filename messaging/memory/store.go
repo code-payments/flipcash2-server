@@ -34,11 +34,12 @@ type chatState struct {
 	lastUnread   uint64
 	lastEventSeq uint64 // event-log head; tracked independently of lastSeq so edits/deletes can advance it without minting a message ID
 	messages     map[uint64]*messaging.Message
-	events       []eventLogEntry                    // append-only event log: one descriptor per event, ascending by event_sequence
-	byClient     map[string]uint64                  // client message ID -> seq
-	pointers     map[string]*messagingpb.Pointer    // pointerKey -> pointer
-	reactions    map[uint64]map[string]*reactionAgg // message seq -> emoji -> aggregate
-	boostIntents map[uint64]map[string]struct{}     // message seq -> string(intentID.Value) of every boost recorded on the message, for the replay check (see messaging.Store.AddBoost)
+	events       []eventLogEntry                         // append-only event log: one descriptor per event, ascending by event_sequence
+	byClient     map[string]uint64                       // client message ID -> seq
+	pointers     map[string]*messagingpb.Pointer         // pointerKey -> pointer
+	reactions    map[uint64]map[string]*reactionAgg      // message seq -> emoji -> aggregate
+	boostIntents map[uint64]map[string]struct{}          // message seq -> string(intentID.Value) of every boost recorded on the message, for the replay check (see messaging.Store.AddBoost)
+	returns      map[uint64]*messaging.CashMessageReturn // message seq -> its return offer's state (see messaging.CashMessageReturn), present only for a message sent with one; kept off the stored Message so no read can carry it
 }
 
 // reactionAgg is a single emoji's aggregate on a message. The entry is retained
@@ -90,6 +91,7 @@ func newChatState() *chatState {
 		pointers:     make(map[string]*messagingpb.Pointer),
 		reactions:    make(map[uint64]map[string]*reactionAgg),
 		boostIntents: make(map[uint64]map[string]struct{}),
+		returns:      make(map[uint64]*messaging.CashMessageReturn),
 	}
 }
 
@@ -219,6 +221,11 @@ func (m *memory) PutMessages(
 			ts:        msg.Timestamp,
 		})
 		cs.byClient[string(inputs[i].ClientMessageID.Value)] = msg.ID.Value
+		if intentID := inputs[i].ReturnIntentID; intentID != nil {
+			cs.returns[msg.ID.Value] = &messaging.CashMessageReturn{
+				IntentID: &commonpb.IntentId{Value: append([]byte(nil), intentID.Value...)},
+			}
+		}
 	}
 	cs.lastSeq = seq
 	cs.lastUnread = unreadSeq
@@ -270,6 +277,58 @@ func (m *memory) GetMessage(_ context.Context, chatID *commonpb.ChatId, messageI
 		return nil, messaging.ErrMessageNotFound
 	}
 	return msg.Clone(), nil
+}
+
+func (m *memory) GetCashMessageReturn(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (*messaging.Message, *messaging.CashMessageReturn, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	cs := m.chats[string(chatID.Value)]
+	if cs == nil {
+		return nil, nil, messaging.ErrMessageNotFound
+	}
+	msg, ok := cs.messages[messageID.Value]
+	if !ok {
+		return nil, nil, messaging.ErrMessageNotFound
+	}
+	ret, ok := cs.returns[messageID.Value]
+	if !ok {
+		return msg.Clone(), nil, nil
+	}
+	return msg.Clone(), &messaging.CashMessageReturn{
+		IntentID: &commonpb.IntentId{Value: append([]byte(nil), ret.IntentID.Value...)},
+		Returned: ret.Returned,
+	}, nil
+}
+
+func (m *memory) MarkCashMessageReturned(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, intentID *commonpb.IntentId) error {
+	// An invalid ID can match no offer, judged first as the DynamoDB store
+	// judges it.
+	if intentID == nil || intentID.Validate() != nil {
+		return messaging.ErrWrongReturnIntent
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	cs := m.chats[string(chatID.Value)]
+	if cs == nil {
+		return messaging.ErrMessageNotFound
+	}
+	if _, ok := cs.messages[messageID.Value]; !ok {
+		return messaging.ErrMessageNotFound
+	}
+	ret, ok := cs.returns[messageID.Value]
+	if !ok {
+		return messaging.ErrNoCashMessageReturn
+	}
+	if !bytes.Equal(ret.IntentID.Value, intentID.Value) {
+		return messaging.ErrWrongReturnIntent
+	}
+	// The mark is the offer's state alone: no event is logged and neither the
+	// head nor the message's event sequence moves (see the Store contract).
+	ret.Returned = true
+	return nil
 }
 
 func (m *memory) EditMessage(

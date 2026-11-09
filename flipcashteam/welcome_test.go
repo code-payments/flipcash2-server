@@ -12,47 +12,32 @@ import (
 
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/flipcashteam"
-	"github.com/code-payments/flipcash2-server/profile"
 	ocp_client "github.com/code-payments/ocp-server/grpc/client"
 	ocp_headers "github.com/code-payments/ocp-server/grpc/headers"
 )
 
-func TestSendWelcomeV2(t *testing.T) {
+func TestSendWelcomeV3(t *testing.T) {
 	e := newChatEnv(t)
 
-	chatID, sent, err := flipcashteam.SendWelcomeV2(e.ctx, e.chats, e.sender, e.user, "alice_1")
+	const expected = "Welcome to Flipcash, the group money app. If someone sent you an invite link to a Flipcash group, tap it again to join."
+
+	chatID, sent, err := flipcashteam.SendWelcomeV3(e.ctx, e.chats, e.sender, e.user)
 	require.NoError(t, err)
 	require.Equal(t, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user).Value, chatID.Value)
+	require.Len(t, sent, 1)
+	require.Equal(t, uint64(1), sent[0].MessageId.Value)
+	require.Equal(t, e.team.Value, sent[0].SenderId.Value)
+	require.Equal(t, expected, sent[0].Content[0].GetText().Text)
 
-	// Every line is text but the third, a widget sharing the user's profile
-	// (empty here).
-	expected := []string{
-		"Welcome to Flipcash, the group money app",
-		"Tell people your Flipcash username is alice_1 so they can find you, or share your profile with them",
-		"",
-		"Enjoy!",
-	}
-	require.Len(t, sent, len(expected))
-	for i, text := range expected {
-		require.Equal(t, uint64(i+1), sent[i].MessageId.Value)
-		require.Equal(t, e.team.Value, sent[i].SenderId.Value)
-		if i == 2 {
-			require.Equal(t, "alice_1", sent[i].Content[0].GetWidget().GetShareProfile().GetUsername().GetValue())
-			continue
-		}
-		require.Equal(t, text, sent[i].Content[0].GetText().Text)
-	}
-
-	// A retry, even with another handle, returns the first welcome and sends
-	// nothing new.
-	_, replayed, err := flipcashteam.SendWelcomeV2(e.ctx, e.chats, e.sender, e.user, "bob")
+	// A retry returns the first welcome and sends nothing new.
+	_, replayed, err := flipcashteam.SendWelcomeV3(e.ctx, e.chats, e.sender, e.user)
 	require.NoError(t, err)
-	require.Len(t, replayed, len(expected))
-	require.Equal(t, expected[1], replayed[1].Content[0].GetText().Text)
-	require.Equal(t, "alice_1", replayed[2].Content[0].GetWidget().GetShareProfile().GetUsername().GetValue())
+	require.Len(t, replayed, 1)
+	require.Equal(t, sent[0].MessageId.Value, replayed[0].MessageId.Value)
+	require.Equal(t, expected, replayed[0].Content[0].GetText().Text)
 	stored, err := e.messages.GetMessages(e.ctx, chatID)
 	require.NoError(t, err)
-	require.Len(t, stored, len(expected))
+	require.Len(t, stored, 1)
 }
 
 func TestWelcomer(t *testing.T) {
@@ -73,8 +58,8 @@ func TestWelcomer(t *testing.T) {
 		require.NoError(t, err)
 		return len(msgs)
 	}
-	require.Eventually(t, func() bool { return stored() == 4 }, time.Second, 10*time.Millisecond)
-	require.Never(t, func() bool { return stored() != 4 }, 200*time.Millisecond, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return stored() == 1 }, time.Second, 10*time.Millisecond)
+	require.Never(t, func() bool { return stored() != 1 }, 200*time.Millisecond, 10*time.Millisecond)
 }
 
 // TestWelcomer_MinClientVersion: a welcome goes only to a user whose handle
@@ -111,7 +96,7 @@ func TestWelcomer_MinClientVersion(t *testing.T) {
 				return len(msgs)
 			}
 			if tc.welcomed {
-				require.Eventually(t, func() bool { return stored() == 4 }, time.Second, 10*time.Millisecond)
+				require.Eventually(t, func() bool { return stored() == 1 }, time.Second, 10*time.Millisecond)
 			} else {
 				require.Never(t, func() bool { return stored() != 0 }, 200*time.Millisecond, 10*time.Millisecond)
 			}
@@ -126,19 +111,4 @@ func withUserAgent(t *testing.T, ctx context.Context, userAgent string) context.
 	require.NoError(t, err)
 	require.NoError(t, ocp_headers.SetASCIIHeader(ctx, ocp_client.UserAgentHeaderName, userAgent))
 	return ctx
-}
-
-func TestSendWelcomeV2_InvalidUsername(t *testing.T) {
-	e := newChatEnv(t)
-
-	// A handle not in canonical form is refused, never repaired: it did not
-	// come from the store.
-	for _, username := range []string{"", "a", "Alice_1", "has space", "has/slash", "a_handle_of_thirty_one_chars_xx"} {
-		_, _, err := flipcashteam.SendWelcomeV2(e.ctx, e.chats, e.sender, e.user, username)
-		require.ErrorIs(t, err, profile.ErrInvalidUsername, "username: %q", username)
-	}
-
-	// Nothing was created.
-	_, err := e.chats.GetChatByID(e.ctx, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user))
-	require.ErrorIs(t, err, chat.ErrChatNotFound)
 }

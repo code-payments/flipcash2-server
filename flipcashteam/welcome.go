@@ -3,7 +3,6 @@ package flipcashteam
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -19,34 +18,25 @@ import (
 	ocp_client "github.com/code-payments/ocp-server/grpc/client"
 )
 
-// welcomeV2IdempotencyKey is the key SendWelcomeV2 sends under. Each version
-// of the welcome takes a key of its own (the first was "welcome_v1"), so a
-// later one is sent even to a user who already has this one.
-const welcomeV2IdempotencyKey = "welcome_v2"
+// welcomeV3IdempotencyKey is the key SendWelcomeV3 sends under. Each version
+// of the welcome takes a key of its own (the earlier were "welcome_v1" and
+// "welcome_v2"), so a later one is sent even to a user who already has an
+// earlier one.
+const welcomeV3IdempotencyKey = "welcome_v3"
 
-// SendWelcomeV2 sends the second version of the team's welcome to userID, whose
-// handle is username, as one batch (see SendMessages): each line of the
-// welcome is its own message. username must be a valid handle as held, in
-// canonical form (see profile.ValidateUsername), since it is shown to the user
-// and shared as their profile (messagingpb.ShareProfileWidget): anything else
-// did not come from the store and is refused rather than repaired. It is the
-// caller's to know that userID holds it.
+// SendWelcomeV3 sends the third version of the team's welcome to userID: one
+// text message (see SendMessages).
 //
 // It is idempotent on the user: every call for them sends under the same key,
-// so a retry returns what the first call sent, the username it was sent with
-// included, without sending again (for as long as SendMessages' idempotency
-// lasts).
-func SendWelcomeV2(
+// so a retry returns what the first call sent without sending again (for as
+// long as SendMessages' idempotency lasts).
+func SendWelcomeV3(
 	ctx context.Context,
 	chats chat.Store,
 	sender *messaging.Sender,
 	userID *commonpb.UserId,
-	username string,
 ) (*commonpb.ChatId, []*messagingpb.Message, error) {
-	if err := profile.ValidateUsername(username); err != nil {
-		return nil, nil, fmt.Errorf("invalid username %q: %w", username, err)
-	}
-	return SendMessages(ctx, chats, sender, userID, welcomeV2IdempotencyKey, welcomeV2Messages(username))
+	return SendMessages(ctx, chats, sender, userID, welcomeV3IdempotencyKey, welcomeV3Messages())
 }
 
 // welcomeTimeout bounds one welcome sent by a Welcomer: creating the chat
@@ -54,7 +44,7 @@ func SendWelcomeV2(
 // Sender's own budgets.
 const welcomeTimeout = 30 * time.Second
 
-// Welcomer sends the welcome (see SendWelcomeV2) to every user given their
+// Welcomer sends the welcome (see SendWelcomeV3) to every user given their
 // first handle. It is the profile.FirstUsernameHandler the parent builds the
 // profile server with (see profile.WithFirstUsernameHandler), from the chat
 // store and the Sender built with the team account.
@@ -69,7 +59,7 @@ const welcomeTimeout = 30 * time.Second
 // request that assigned the handle, and a failure is logged, never retried.
 // Nothing records a welcome that was never sent, so a process that stops
 // before sending one loses it. A second call for a user, as when two of their
-// claims race, sends nothing new (see SendWelcomeV2).
+// claims race, sends nothing new (see SendWelcomeV3).
 type Welcomer struct {
 	log    *zap.Logger
 	chats  chat.Store
@@ -83,11 +73,13 @@ func NewWelcomer(log *zap.Logger, chats chat.Store, sender *messaging.Sender) *W
 }
 
 // minWelcomeClientVersion is the first client release, on iOS and Android
-// alike, that renders the welcome (its ShareProfileWidget).
+// alike, that rendered the second version of the welcome (its
+// ShareProfileWidget). The third is text alone, which any client renders, but
+// the gate is kept as it stands.
 var minWelcomeClientVersion = &ocp_client.Version{Major: 2026, Minor: 9, Patch: 5}
 
-// OnFirstUsername sends userID the welcome for username in the background,
-// if the client that assigned it can render it.
+// OnFirstUsername sends userID the welcome in the background, if the client
+// that assigned username is at or above minWelcomeClientVersion.
 func (w *Welcomer) OnFirstUsername(ctx context.Context, userID *commonpb.UserId, username string) {
 	log := w.log.With(zap.String("user_id", model.UserIDString(userID)), zap.String("username", username))
 
@@ -101,7 +93,7 @@ func (w *Welcomer) OnFirstUsername(ctx context.Context, userID *commonpb.UserId,
 	go func() {
 		defer cancel()
 
-		_, _, err := SendWelcomeV2(ctx, w.chats, w.sender, userID, username)
+		_, _, err := SendWelcomeV3(ctx, w.chats, w.sender, userID)
 		switch {
 		case err == nil:
 		case errors.Is(err, ErrNoTeamAccount):
@@ -113,19 +105,11 @@ func (w *Welcomer) OnFirstUsername(ctx context.Context, userID *commonpb.UserId,
 	}()
 }
 
-// welcomeV2Messages is the content of the second version of the welcome to
-// the holder of username, one message per line: text, but for a widget
-// sharing their profile after the line that names their handle.
-func welcomeV2Messages(username string) []*messagingpb.Content {
+// welcomeV3Messages is the content of the third version of the welcome: one
+// text message.
+func welcomeV3Messages() []*messagingpb.Content {
 	return []*messagingpb.Content{
-		textContent("Welcome to Flipcash, the group money app"),
-		textContent(fmt.Sprintf("Tell people your Flipcash username is %s so they can find you, or share your profile with them", username)),
-		{Type: &messagingpb.Content_Widget{Widget: &messagingpb.WidgetContent{
-			Type: &messagingpb.WidgetContent_ShareProfile{ShareProfile: &messagingpb.ShareProfileWidget{
-				Username: &commonpb.Username{Value: username},
-			}},
-		}}},
-		textContent("Enjoy!"),
+		textContent("Welcome to Flipcash, the group money app. If someone sent you an invite link to a Flipcash group, tap it again to join."),
 	}
 }
 

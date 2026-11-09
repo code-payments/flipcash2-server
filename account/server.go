@@ -41,13 +41,15 @@ const (
 )
 
 var (
-	DefaultNewCurrencyPurchaseAmount = ocp_common.ToCoreMintQuarks(10)
-	DefaultNewCurrencyFeeAmount      = ocp_common.ToCoreMintQuarks(10)
-	DefaulWithdrawalFeeAmount        = ocp_common.ToCoreMintQuarks(5) / 10
-	MinHolderValue                   = ocp_common.ToCoreMintQuarks(10)
-	MinUsernameTotalBalance          = ocp_common.ToCoreMintQuarks(100)
-	DefaultMessageEditWindow         = 15 * time.Minute
-	DefaultMessageDeleteWindow       = 2 * 24 * time.Hour
+	DefaultNewCurrencyPurchaseAmount   = ocp_common.ToCoreMintQuarks(10)
+	DefaultNewCurrencyFeeAmount        = ocp_common.ToCoreMintQuarks(10)
+	DefaultNewCurrencyV2PurchaseAmount = ocp_common.ToCoreMintQuarks(20)
+	DefaultNewCurrencyV2FeeAmount      = ocp_common.ToCoreMintQuarks(0)
+	DefaulWithdrawalFeeAmount          = ocp_common.ToCoreMintQuarks(5) / 10
+	MinHolderValue                     = ocp_common.ToCoreMintQuarks(10)
+	MinUsernameTotalBalance            = ocp_common.ToCoreMintQuarks(100)
+	DefaultMessageEditWindow           = 15 * time.Minute
+	DefaultMessageDeleteWindow         = 2 * 24 * time.Hour
 )
 
 type onRampProviderConfig struct {
@@ -287,6 +289,8 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 			BillExchangeDataTimeout:          durationpb.New(defaultBillExchangeDataTimeout),
 			NewCurrencyPurchaseAmount:        DefaultNewCurrencyPurchaseAmount,
 			NewCurrencyFeeAmount:             DefaultNewCurrencyFeeAmount,
+			NewCurrencyV2PurchaseAmount:      DefaultNewCurrencyV2PurchaseAmount,
+			NewCurrencyV2FeeAmount:           DefaultNewCurrencyV2FeeAmount,
 			WithdrawalFeeAmount:              DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 			MinimumHolderValue:               MinHolderValue,
@@ -327,6 +331,8 @@ func (s *Server) GetUnauthenticatedUserFlags(ctx context.Context, req *accountpb
 			MinBuildNumber:                   uint32(minBuildNumber),
 			NewCurrencyPurchaseAmount:        DefaultNewCurrencyPurchaseAmount,
 			NewCurrencyFeeAmount:             DefaultNewCurrencyFeeAmount,
+			NewCurrencyV2PurchaseAmount:      DefaultNewCurrencyV2PurchaseAmount,
+			NewCurrencyV2FeeAmount:           DefaultNewCurrencyV2FeeAmount,
 			WithdrawalFeeAmount:              DefaulWithdrawalFeeAmount,
 			PreferredOnRampUsdcLiquidityPool: accountpb.UserFlags_COINBASE_STABLE_SWAPPER,
 			MinimumHolderValue:               MinHolderValue,

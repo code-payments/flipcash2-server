@@ -3,6 +3,8 @@ package moderation
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
+	"fmt"
 	"strings"
 
 	"go.uber.org/zap"
@@ -46,45 +48,49 @@ func NewServer(log *zap.Logger, authz auth.Authorizer, client Client, attestor m
 	}
 }
 
+// ModerateText moderates text under the checks of the kind the request names
+// (req.Kind) and signs that kind into the attestation, so the attestation is
+// valid only where content of that kind is used (see ValidateAttestation).
+//
+// A request naming no kind comes from a legacy client and gets the checks every
+// kind once shared (moderateLegacyText).
 func (s *Server) ModerateText(ctx context.Context, req *moderationpb.ModerateTextRequest) (*moderationpb.ModerateTextResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
 		return nil, err
 	}
 
-	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.Stringer("kind", req.Kind),
+	)
 
-	result, err := s.client.ClassifyText(ctx, req.Text)
-	switch err {
-	case nil:
-	case ErrUnsupportedLanguage:
+	var result *Result
+	switch req.Kind {
+	case moderationpb.ContentKind_UNKNOWN_CONTENT_KIND:
+		result, err = s.moderateLegacyText(ctx, req.Text)
+	case moderationpb.ContentKind_CURRENCY_NAME:
+		if len(req.Text) > currencycreator.MaxCurrencyConfigAccountNameLength {
+			return nil, status.Error(codes.InvalidArgument, "text exceeds the maximum currency name length")
+		}
+		result, err = s.moderateCurrencyName(ctx, req.Text)
+	case moderationpb.ContentKind_CURRENCY_SYMBOL:
+		if len(req.Text) > currencycreator.MaxCurrencyConfigAccountSymbolLength {
+			return nil, status.Error(codes.InvalidArgument, "text exceeds the maximum currency symbol length")
+		}
+		result, err = s.moderateCurrencySymbol(ctx, req.Text)
+	case moderationpb.ContentKind_CURRENCY_DESCRIPTION:
+		result, err = s.moderateCurrencyDescription(ctx, req.Text)
+	default:
+		return nil, status.Error(codes.InvalidArgument, "unsupported content kind for text")
+	}
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrUnsupportedLanguage):
 		return &moderationpb.ModerateTextResponse{Result: moderationpb.ModerateTextResponse_UNSUPPORTED_LANGUAGE}, nil
 	default:
-		log.Warn("Failed to classify text", zap.Error(err))
+		log.Warn("Failed to moderate text", zap.Error(err))
 		return nil, status.Error(codes.Internal, "")
-	}
-
-	if !result.Flagged && len(req.Text) <= currencycreator.MaxCurrencyConfigAccountNameLength {
-		currencyNameResult, err := s.client.ClassifyCurrencyName(ctx, req.Text)
-		switch err {
-		case nil:
-		case ErrUnsupportedLanguage:
-			return &moderationpb.ModerateTextResponse{Result: moderationpb.ModerateTextResponse_UNSUPPORTED_LANGUAGE}, nil
-		default:
-			log.Warn("Failed to classify currency name", zap.Error(err))
-			return nil, status.Error(codes.Internal, "")
-		}
-		if currencyNameResult.Flagged {
-			result = currencyNameResult
-		}
-	}
-
-	if !result.Flagged && len(req.Text) <= currencycreator.MaxCurrencyConfigAccountNameLength && isBlockedCurrencyName(req.Text) {
-		result = &Result{
-			Flagged:           true,
-			FlaggedCategories: []string{"platform_impersonation"},
-			CategoryScores:    map[string]float64{"platform_impersonation": 1.0},
-		}
 	}
 
 	isAllowed := !result.Flagged
@@ -95,7 +101,7 @@ func (s *Server) ModerateText(ctx context.Context, req *moderationpb.ModerateTex
 	}
 
 	if isAllowed {
-		resp.Attestation = s.signAttestation(log, req.Text, userID)
+		resp.Attestation = s.signAttestation(log, req.Kind, req.Text, userID)
 	} else {
 		log.Info("Text is flagged", zap.Strings("categories", result.FlaggedCategories))
 		resp.FlaggedCategory = HighestFlaggedCategory(result)
@@ -104,13 +110,94 @@ func (s *Server) ModerateText(ctx context.Context, req *moderationpb.ModerateTex
 	return resp, nil
 }
 
+// moderateLegacyText applies the checks every kind of text shared before
+// requests named one: any text short enough to be a currency name gets a
+// currency name's checks, and anything longer the generic ones. Its attestation
+// carries no kind, so it is accepted for every kind while legacy attestations
+// are (see ValidateAttestation), and the length rule is what keeps that safe:
+// text that could be used as a name was checked as one.
+func (s *Server) moderateLegacyText(ctx context.Context, text string) (*Result, error) {
+	if len(text) <= currencycreator.MaxCurrencyConfigAccountNameLength {
+		return s.moderateCurrencyName(ctx, text)
+	}
+	return s.moderateCurrencyDescription(ctx, text)
+}
+
+// moderateCurrencyName checks a currency's name: the generic classifier, then
+// the currency name classifier (trademarks, brands, impersonation, misleading
+// claims), then the names reserved for the platform. The first to flag decides.
+//
+// The generic classifier's ErrUnsupportedLanguage stays fatal: the currency
+// name classifier does not score harmful content, so the generic classifier is
+// the only one that would see it.
+func (s *Server) moderateCurrencyName(ctx context.Context, name string) (*Result, error) {
+	result, err := s.client.ClassifyText(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("classify text: %w", err)
+	}
+	if result.Flagged {
+		return result, nil
+	}
+
+	result, err = s.client.ClassifyCurrencyName(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("classify currency name: %w", err)
+	}
+	if result.Flagged {
+		return result, nil
+	}
+
+	if isBlockedCurrencyName(name) {
+		return &Result{
+			Flagged:           true,
+			FlaggedCategories: []string{"platform_impersonation"},
+			CategoryScores:    map[string]float64{"platform_impersonation": 1.0},
+		}, nil
+	}
+
+	return result, nil
+}
+
+// moderateCurrencySymbol checks a currency's symbol under a name's checks: a
+// symbol is a short name for the currency (a ticker), and squatting another
+// token's or a platform's ticker is the same harm as squatting its name. The
+// currency name classifier judges it as a name, which a ticker like BTC or USDF
+// still matches.
+func (s *Server) moderateCurrencySymbol(ctx context.Context, symbol string) (*Result, error) {
+	return s.moderateCurrencyName(ctx, symbol)
+}
+
+// moderateCurrencyDescription checks a currency's description with the generic
+// classifier alone. A description is prose about the currency, and may name
+// other brands, tokens or the platform without claiming to be them, so it gets
+// none of a name's impersonation checks, whatever its length.
+func (s *Server) moderateCurrencyDescription(ctx context.Context, description string) (*Result, error) {
+	result, err := s.client.ClassifyText(ctx, description)
+	if err != nil {
+		return nil, fmt.Errorf("classify text: %w", err)
+	}
+	return result, nil
+}
+
 func (s *Server) ModerateImage(ctx context.Context, req *moderationpb.ModerateImageRequest) (*moderationpb.ModerateImageResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
 		return nil, err
 	}
 
-	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.Stringer("kind", req.Kind),
+	)
+
+	// Every image kind (today a currency's icon, or none named by a legacy
+	// client) gets the same checks; the kind is still signed into the
+	// attestation so it is valid only where that kind is used.
+	switch req.Kind {
+	case moderationpb.ContentKind_UNKNOWN_CONTENT_KIND, moderationpb.ContentKind_CURRENCY_ICON:
+	default:
+		return nil, status.Error(codes.InvalidArgument, "unsupported content kind for image")
+	}
 
 	if !isJPEG(req.ImageData) && !isPNG(req.ImageData) {
 		return &moderationpb.ModerateImageResponse{
@@ -132,7 +219,7 @@ func (s *Server) ModerateImage(ctx context.Context, req *moderationpb.ModerateIm
 	}
 
 	if isAllowed {
-		resp.Attestation = s.signAttestation(log, req.ImageData, userID)
+		resp.Attestation = s.signAttestation(log, req.Kind, req.ImageData, userID)
 	} else {
 		log.Info("Image is flagged", zap.Strings("categories", result.FlaggedCategories))
 		resp.FlaggedCategory = HighestFlaggedCategory(result)
@@ -141,7 +228,9 @@ func (s *Server) ModerateImage(ctx context.Context, req *moderationpb.ModerateIm
 	return resp, nil
 }
 
-func (s *Server) signAttestation(log *zap.Logger, content any, userID *commonpb.UserId) *moderationpb.ModerationAttestation {
+// signAttestation signs an attestation that content was moderated as kind, for
+// userID. Callers sign only after applying that kind's checks.
+func (s *Server) signAttestation(log *zap.Logger, kind moderationpb.ContentKind, content any, userID *commonpb.UserId) *moderationpb.ModerationAttestation {
 	var hash [sha256.Size]byte
 	switch v := content.(type) {
 	case string:
@@ -155,6 +244,7 @@ func (s *Server) signAttestation(log *zap.Logger, content any, userID *commonpb.
 		Timestamp:   timestamppb.Now(),
 		UserId:      userID,
 		Attestor:    s.attestor.Proto(),
+		Kind:        kind,
 	}
 
 	if err := s.attestor.Sign(attestation, &attestation.Signature); err != nil {

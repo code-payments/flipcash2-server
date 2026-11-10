@@ -18,18 +18,36 @@ const (
 )
 
 var (
-	ErrInvalidAttestation = errors.New("invalid attestation")
-	ErrInvalidSignature   = errors.New("invalid attestation signature")
-	ErrInvalidAttestor    = errors.New("attestor public key mismatch")
-	ErrInvalidContentHash = errors.New("content hash mismatch")
-	ErrExpiredAttestation = errors.New("attestation is expired")
+	ErrInvalidAttestation  = errors.New("invalid attestation")
+	ErrInvalidSignature    = errors.New("invalid attestation signature")
+	ErrInvalidAttestor     = errors.New("attestor public key mismatch")
+	ErrInvalidContentHash  = errors.New("content hash mismatch")
+	ErrExpiredAttestation  = errors.New("attestation is expired")
+	ErrContentKindMismatch = errors.New("content was moderated as a different kind")
 )
 
 // ValidateAttestation validates a moderation attestation against the expected
-// attestor public key and content. Content must be a string (for text) or
-// []byte (for images).
-func ValidateAttestation(attestation *moderationpb.ModerationAttestation, attestor *commonpb.PublicKey, content any) error {
+// attestor public key and content, used as kind. Content must be a string (for
+// text) or []byte (for images).
+//
+// The attestation must name kind: each kind is moderated under its own checks,
+// so content moderated as one kind (e.g. a currency description, which skips a
+// name's impersonation checks) must not pass where another is used (e.g. as the
+// currency's name). kind is the caller's, decided by where the content is used,
+// never by the client; it must not be UNKNOWN_CONTENT_KIND.
+//
+// acceptUnknownKind admits an attestation naming no kind, from a legacy client's
+// request, for any kind. That is safe because a legacy request gets the checks
+// every kind once shared, under which any text short enough to be a currency
+// name was checked as one. It exists for the transition only: once legacy
+// clients are gone, pass false, and after maxAttestationAge no legacy
+// attestation remains valid anyway.
+func ValidateAttestation(attestation *moderationpb.ModerationAttestation, attestor *commonpb.PublicKey, kind moderationpb.ContentKind, content any, acceptUnknownKind bool) error {
 	if attestation == nil {
+		return ErrInvalidAttestation
+	}
+
+	if kind == moderationpb.ContentKind_UNKNOWN_CONTENT_KIND {
 		return ErrInvalidAttestation
 	}
 
@@ -51,6 +69,14 @@ func ValidateAttestation(attestation *moderationpb.ModerationAttestation, attest
 
 	if !bytes.Equal(attestation.ContentHash, expectedHash[:]) {
 		return ErrInvalidContentHash
+	}
+
+	// Verify the content was moderated as the kind it is used as
+	switch {
+	case attestation.Kind == kind:
+	case attestation.Kind == moderationpb.ContentKind_UNKNOWN_CONTENT_KIND && acceptUnknownKind:
+	default:
+		return ErrContentKindMismatch
 	}
 
 	if time.Since(attestation.Timestamp.AsTime()) > maxAttestationAge {

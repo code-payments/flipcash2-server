@@ -1,13 +1,16 @@
 package moderation
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
+	"image"
 	"strings"
 	"testing"
 
+	"github.com/gen2brain/webp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
@@ -288,30 +291,87 @@ func TestModerateImage_Flagged(t *testing.T) {
 	assert.Nil(t, resp.Attestation)
 }
 
-func TestModerateImage_InvalidFormat(t *testing.T) {
-	ctx := context.Background()
-	log := zaptest.NewLogger(t)
-
-	authz := auth.NewStaticAuthorizer(log)
-	attestor := model.MustGenerateKeyPair()
-	client := &mockClient{imageResult: &Result{Flagged: false}}
-	server := NewServer(log, authz, client, attestor)
-
-	userID := model.MustGenerateUserID()
-	keyPair := model.MustGenerateKeyPair()
-	authz.Add(userID, keyPair)
-
-	req := &moderationpb.ModerateImageRequest{
-		ImageData: []byte("not-an-image"),
+// TestModerateImage_WebP runs real encoder output through the format check,
+// one file for each chunk a WebP file can open with.
+func TestModerateImage_WebP(t *testing.T) {
+	opaque := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+	translucent := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+	for i := 0; i < len(opaque.Pix); i += 4 {
+		copy(opaque.Pix[i:], []byte{0x20, 0x80, 0xE0, 0xFF})
+		copy(translucent.Pix[i:], []byte{0x20, 0x80, 0xE0, 0x40})
 	}
-	require.NoError(t, keyPair.Auth(req, &req.Auth))
 
-	resp, err := server.ModerateImage(ctx, req)
-	require.NoError(t, err)
+	for _, tc := range []struct {
+		name       string
+		img        image.Image
+		opts       webp.Options
+		firstChunk string
+	}{
+		{"lossy", opaque, webp.Options{Quality: 90}, "VP8 "},
+		{"lossless", opaque, webp.Options{Lossless: true}, "VP8L"},
+		{"extended", translucent, webp.Options{Quality: 90}, "VP8X"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			require.NoError(t, webp.Encode(&buf, tc.img, tc.opts))
+			imageData := buf.Bytes()
+			require.Equal(t, tc.firstChunk, string(imageData[12:16]))
 
-	assert.Equal(t, moderationpb.ModerateImageResponse_UNSUPPORTED_FORMAT, resp.Result)
-	assert.False(t, resp.IsAllowed)
-	assert.Nil(t, resp.Attestation)
+			client := &mockClient{imageResult: &Result{Flagged: false}}
+			server, attestor, keyPair := newKindTestServer(t, client)
+
+			req := &moderationpb.ModerateImageRequest{
+				ImageData: imageData,
+				Kind:      moderationpb.ContentKind_CURRENCY_ICON,
+			}
+			require.NoError(t, keyPair.Auth(req, &req.Auth))
+
+			resp, err := server.ModerateImage(context.Background(), req)
+			require.NoError(t, err)
+
+			assert.Equal(t, moderationpb.ModerateImageResponse_OK, resp.Result)
+			assert.True(t, resp.IsAllowed)
+			require.NotNil(t, resp.Attestation)
+			assert.Equal(t, []string{"ClassifyImage"}, client.calls)
+
+			expectedHash := sha256.Sum256(imageData)
+			assert.Equal(t, expectedHash[:], resp.Attestation.ContentHash)
+			assert.Equal(t, moderationpb.ContentKind_CURRENCY_ICON, resp.Attestation.Kind)
+			verifyAttestation(t, resp.Attestation, attestor)
+		})
+	}
+}
+
+func TestModerateImage_InvalidFormat(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		imageData []byte
+	}{
+		{"not an image", []byte("not-an-image")},
+		{"gif", []byte("GIF89a-fake-image-data")},
+		{"riff container that is not webp", []byte("RIFF\x24\x00\x00\x00WAVEfmt fake-audio-data")},
+		{"webp form with no image chunk first", []byte("RIFF\x24\x00\x00\x00WEBPJUNKfake-image-data")},
+		{"webp header cut short", []byte("RIFF\x24\x00\x00\x00WEBPVP")},
+		{"webp without riff", []byte("XXXX\x24\x00\x00\x00WEBPVP8 fake-image-data")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &mockClient{imageResult: &Result{Flagged: false}}
+			server, _, keyPair := newKindTestServer(t, client)
+
+			req := &moderationpb.ModerateImageRequest{
+				ImageData: tc.imageData,
+			}
+			require.NoError(t, keyPair.Auth(req, &req.Auth))
+
+			resp, err := server.ModerateImage(context.Background(), req)
+			require.NoError(t, err)
+
+			assert.Equal(t, moderationpb.ModerateImageResponse_UNSUPPORTED_FORMAT, resp.Result)
+			assert.False(t, resp.IsAllowed)
+			assert.Nil(t, resp.Attestation)
+			assert.Empty(t, client.calls)
+		})
+	}
 }
 
 func TestModerateImage_Unauthorized(t *testing.T) {

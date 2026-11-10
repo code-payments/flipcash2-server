@@ -30,6 +30,15 @@ var (
 	pngMagic  = []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
 )
 
+// A WebP file opens "RIFF", four bytes of file size, then "WEBP" and the first
+// chunk's name, which starts "VP8".
+const (
+	riffMagic      = "RIFF"
+	webpMagic      = "WEBPVP8"
+	webpFormOffset = len(riffMagic) + 4
+	webpHeaderSize = webpFormOffset + len(webpMagic)
+)
+
 type Server struct {
 	log      *zap.Logger
 	authz    auth.Authorizer
@@ -199,7 +208,11 @@ func (s *Server) ModerateImage(ctx context.Context, req *moderationpb.ModerateIm
 		return nil, status.Error(codes.InvalidArgument, "unsupported content kind for image")
 	}
 
-	if !isJPEG(req.ImageData) && !isPNG(req.ImageData) {
+	// JPEG, PNG and WebP are taken, told apart by the file's signature alone.
+	// Nothing here decodes the image, so passing this check does not make a
+	// file well formed or a still; whoever stores it decodes it (OCP, for a
+	// currency's icon, which keeps a re-encoding of what its decoder read).
+	if !isJPEG(req.ImageData) && !isPNG(req.ImageData) && !isWebP(req.ImageData) {
 		return &moderationpb.ModerateImageResponse{
 			Result: moderationpb.ModerateImageResponse_UNSUPPORTED_FORMAT,
 		}, nil
@@ -261,6 +274,18 @@ func isJPEG(data []byte) bool {
 
 func isPNG(data []byte) bool {
 	return len(data) >= len(pngMagic) && string(data[:len(pngMagic)]) == string(pngMagic)
+}
+
+// isWebP reports whether data opens as a WebP file does: a RIFF container of
+// form WEBP whose first chunk is one of the three a WebP file starts with (VP8
+// for lossy, VP8L for lossless, VP8X for the extended format). The four bytes
+// between are the file's size, which is not checked. This is the signature
+// Go's WebP decoders register, so what is taken here is what a decoder
+// recognizes.
+func isWebP(data []byte) bool {
+	return len(data) >= webpHeaderSize &&
+		string(data[:len(riffMagic)]) == riffMagic &&
+		string(data[webpFormOffset:webpHeaderSize]) == webpMagic
 }
 
 func isBlockedCurrencyName(name string) bool {

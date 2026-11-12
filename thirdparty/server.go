@@ -12,6 +12,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/cdp"
 	"github.com/code-payments/flipcash2-server/model"
 	"github.com/code-payments/flipcash2-server/profile"
 )
@@ -51,6 +52,16 @@ func NewServer(
 	}
 }
 
+// GetJwt signs a token for a request the app makes to a third party itself,
+// with the server's key for that provider.
+//
+// For Coinbase, the only provider, the caller must be registered (DENIED),
+// name the server's key (INVALID_API_KEY), ask for one of the requests the
+// apps make (DENIED; see isAllowedCoinbaseRequest, judged before anything of
+// the caller's profile is read) and have a verified phone number
+// (PHONE_VERIFICATION_REQUIRED), and a verified email address too while
+// account.RequireCoinbaseEmailVerification is set
+// (EMAIL_VERIFICATION_REQUIRED).
 func (s *Server) GetJwt(ctx context.Context, req *thirdpartypb.GetJwtRequest) (*thirdpartypb.GetJwtResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
@@ -81,6 +92,11 @@ func (s *Server) GetJwt(ctx context.Context, req *thirdpartypb.GetJwtRequest) (*
 			return &thirdpartypb.GetJwtResponse{Result: thirdpartypb.GetJwtResponse_INVALID_API_KEY}, nil
 		}
 
+		if !isAllowedCoinbaseRequest(req.Method, req.Host, req.Path) {
+			log.Info("Denying a jwt for a coinbase request the apps do not make")
+			return &thirdpartypb.GetJwtResponse{Result: thirdpartypb.GetJwtResponse_DENIED}, nil
+		}
+
 		userProfile, err := s.profiles.GetFullProfile(ctx, userID, true)
 		if err == profile.ErrNotFound {
 			return &thirdpartypb.GetJwtResponse{Result: thirdpartypb.GetJwtResponse_PHONE_VERIFICATION_REQUIRED}, nil
@@ -98,7 +114,7 @@ func (s *Server) GetJwt(ctx context.Context, req *thirdpartypb.GetJwtRequest) (*
 			}
 		}
 
-		jwt, err = getCoinbaseJwt(
+		jwt, err = cdp.NewJWT(
 			req.Method,
 			req.Host,
 			req.Path,

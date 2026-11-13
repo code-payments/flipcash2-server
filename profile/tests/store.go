@@ -123,14 +123,15 @@ func testPhoneEmailTransfer(t *testing.T, s profile.Store) {
 	require.Equal(t, phone, p.PhoneNumber.Value)
 	require.Equal(t, email, p.EmailAddress.Value)
 
-	// Re-claim both on user2; user1 should lose them.
+	// Re-claim both on user2; user1 loses the phone number but keeps the email
+	// address, which is not unique to a user.
 	require.NoError(t, s.LinkPhoneNumber(ctx, userID2, phone, phoneHash))
 	require.NoError(t, s.LinkEmailAddress(ctx, userID2, email))
 
 	p, err = s.GetFullProfile(ctx, userID1, true)
 	require.NoError(t, err)
 	require.Nil(t, p.PhoneNumber)
-	require.Nil(t, p.EmailAddress)
+	require.Equal(t, email, p.EmailAddress.Value)
 
 	p, err = s.GetFullProfile(ctx, userID2, true)
 	require.NoError(t, err)

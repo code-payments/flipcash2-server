@@ -555,18 +555,7 @@ func (m *InMemoryStore) LinkEmailAddress(_ context.Context, id *commonpb.UserId,
 	m.Lock()
 	defer m.Unlock()
 
-	targetKey := userIDCacheKey(id)
-	for key, p := range m.profiles {
-		if key == targetKey {
-			continue
-		}
-		if p.EmailAddress != nil && p.EmailAddress.Value == emailAddress {
-			p.EmailAddress = nil
-		}
-	}
-
-	profile := m.ensureProfile(targetKey)
-
+	profile := m.ensureProfile(userIDCacheKey(id))
 	profile.EmailAddress = &commonpb.EmailAddress{Value: emailAddress}
 
 	return nil

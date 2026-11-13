@@ -102,7 +102,7 @@ model User {
   minDmChatInitFeeNativeAmount  Float?             // the minimum DM chat initialization fee in major units of minDmChatInitFeeCurrency
   phoneNumber                   String?            @unique
   phoneNumberHash               String?            @unique
-  emailAddress                  String?            @unique
+  emailAddress                  String?            // not unique: several users may link the same address
   isStaff                       Boolean            @default(false)
   isRegistered                  Boolean            @default(false)
   isPhoneNumberLinkedForPayment Boolean            @default(false)

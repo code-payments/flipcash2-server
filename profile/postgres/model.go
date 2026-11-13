@@ -505,16 +505,9 @@ func dbIsPhoneNumberLinkedForPayment(ctx context.Context, pool *pgxpool.Pool, us
 }
 
 func dbLinkEmailAddress(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, emailAddress string) error {
-	return pg.ExecuteInTx(ctx, pool, func(tx pgx.Tx) error {
-		clearQuery := `UPDATE ` + usersTableName + ` SET "emailAddress" = NULL WHERE "emailAddress" = $1 AND "id" != $2`
-		if _, err := tx.Exec(ctx, clearQuery, emailAddress, pg.Encode(userID.Value)); err != nil {
-			return err
-		}
-
-		setQuery := `UPDATE ` + usersTableName + ` SET "emailAddress" = $2 WHERE "id" = $1`
-		_, err := tx.Exec(ctx, setQuery, pg.Encode(userID.Value), emailAddress)
-		return err
-	})
+	query := `UPDATE ` + usersTableName + ` SET "emailAddress" = $2 WHERE "id" = $1`
+	_, err := pool.Exec(ctx, query, pg.Encode(userID.Value), emailAddress)
+	return err
 }
 
 func dbGetPhonesByHashes(ctx context.Context, pool *pgxpool.Pool, hashes []*commonpb.Hash) ([]*commonpb.PhoneNumber, error) {

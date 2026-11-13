@@ -186,8 +186,8 @@ type Store interface {
 	// not enabled for payment.
 	GetUserIdByPhoneNumberForPayment(ctx context.Context, phoneNumber string) (*commonpb.UserId, error)
 
-	// LinkEmailAddress links the email address to a user, provided they exist. Any other
-	// user previously holding the same email address has it cleared.
+	// LinkEmailAddress links the email address to a user, provided they exist. An email
+	// address is not unique to a user: other users holding the same address keep it.
 	LinkEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string) error
 
 	// UnlinkPhoneNumber removes the link for the email address

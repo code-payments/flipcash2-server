@@ -120,6 +120,7 @@ func (m *InMemoryStore) GetFullProfile(_ context.Context, id *commonpb.UserId, i
 	} else {
 		clonedBaseProfile.PhoneNumber = nil
 		clonedBaseProfile.EmailAddress = nil
+		clonedBaseProfile.IsEmailAddressVerified = false
 	}
 
 	return clonedBaseProfile, nil
@@ -551,22 +552,13 @@ func (m *InMemoryStore) GetUserIdByPhoneNumberForPayment(_ context.Context, phon
 	return nil, profile.ErrNotFound
 }
 
-func (m *InMemoryStore) LinkEmailAddress(_ context.Context, id *commonpb.UserId, emailAddress string) error {
+func (m *InMemoryStore) LinkEmailAddress(_ context.Context, id *commonpb.UserId, emailAddress string, verified bool) error {
 	m.Lock()
 	defer m.Unlock()
 
-	targetKey := userIDCacheKey(id)
-	for key, p := range m.profiles {
-		if key == targetKey {
-			continue
-		}
-		if p.EmailAddress != nil && p.EmailAddress.Value == emailAddress {
-			p.EmailAddress = nil
-		}
-	}
-
-	profile := m.ensureProfile(targetKey)
-
+	profile := m.ensureProfile(userIDCacheKey(id))
+	relinked := profile.EmailAddress != nil && profile.EmailAddress.Value == emailAddress
+	profile.IsEmailAddressVerified = verified || (relinked && profile.IsEmailAddressVerified)
 	profile.EmailAddress = &commonpb.EmailAddress{Value: emailAddress}
 
 	return nil
@@ -583,6 +575,7 @@ func (m *InMemoryStore) UnlinkEmailAddress(ctx context.Context, userID *commonpb
 
 	if profile.EmailAddress != nil && profile.EmailAddress.Value == emailAddress {
 		profile.EmailAddress = nil
+		profile.IsEmailAddressVerified = false
 	}
 
 	return nil

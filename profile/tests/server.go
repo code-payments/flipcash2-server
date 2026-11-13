@@ -241,7 +241,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 
 		t.Run("Private profile", func(t *testing.T) {
 			require.NoError(t, profiles.LinkPhoneNumber(ctx, userID, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
-			require.NoError(t, profiles.LinkEmailAddress(ctx, userID, "someone@gmail.com"))
+			require.NoError(t, profiles.LinkEmailAddress(ctx, userID, "someone@gmail.com", true))
 
 			get := &profilepb.GetProfileRequest{
 				Identifier: &profilepb.GetProfileRequest_UserId{UserId: userID},
@@ -268,6 +268,7 @@ func testServer(t *testing.T, accounts account.Store, profiles profile.Store) {
 			// handle was the default one assigned with their display name.
 			expected.PhoneNumber = &commonpb.PhoneNumber{Value: "+12223334444"}
 			expected.EmailAddress = &commonpb.EmailAddress{Value: "someone@gmail.com"}
+			expected.IsEmailAddressVerified = true
 			expected.IsUsernameAutoAssigned = true
 			require.NoError(t, keyPair.Auth(get, &get.Auth))
 

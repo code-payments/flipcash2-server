@@ -110,7 +110,7 @@ func (s *Server) CheckVerificationCode(ctx context.Context, req *emailpb.CheckVe
 	case nil:
 		result = emailpb.CheckVerificationCodeResponse_OK
 
-		err = s.profiles.LinkEmailAddress(ctx, userID, req.EmailAddress.Value)
+		err = s.profiles.LinkEmailAddress(ctx, userID, req.EmailAddress.Value, true)
 		if err != nil {
 			log.With(zap.Error(err)).Warn("Failure linking email address")
 			return nil, status.Error(codes.Internal, "failure linking email address")
@@ -127,6 +127,39 @@ func (s *Server) CheckVerificationCode(ctx context.Context, req *emailpb.CheckVe
 	return &emailpb.CheckVerificationCodeResponse{
 		Result: result,
 	}, nil
+}
+
+// LinkUnverified links an email address to the user without verifying it, and
+// sends no email. It is open to any registered user. The address is linked as
+// unverified unless it is the one already linked and verified, which stays
+// verified (see profile.Store.LinkEmailAddress).
+func (s *Server) LinkUnverified(ctx context.Context, req *emailpb.LinkUnverifiedRequest) (*emailpb.LinkUnverifiedResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.String("email_address", req.EmailAddress.Value),
+	)
+
+	isRegistered, err := s.accounts.IsRegistered(ctx, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure getting user registration status")
+		return nil, status.Error(codes.Internal, "failure getting user registration status")
+	}
+	if !isRegistered {
+		return &emailpb.LinkUnverifiedResponse{Result: emailpb.LinkUnverifiedResponse_DENIED}, nil
+	}
+
+	err = s.profiles.LinkEmailAddress(ctx, userID, req.EmailAddress.Value, false)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure linking unverified email address")
+		return nil, status.Error(codes.Internal, "failure linking unverified email address")
+	}
+
+	return &emailpb.LinkUnverifiedResponse{}, nil
 }
 
 func (s *Server) Unlink(ctx context.Context, req *emailpb.UnlinkRequest) (*emailpb.UnlinkResponse, error) {

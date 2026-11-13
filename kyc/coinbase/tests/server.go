@@ -509,9 +509,11 @@ type linkedProfiles struct {
 }
 
 // linkedContact is what one user's profile has linked, each empty for none.
+// emailUnverified marks emailAddress as linked unverified.
 type linkedContact struct {
-	phoneNumber  string
-	emailAddress string
+	phoneNumber     string
+	emailAddress    string
+	emailUnverified bool
 }
 
 func newLinkedProfiles() *linkedProfiles {
@@ -529,13 +531,24 @@ func (p *linkedProfiles) link(userID *commonpb.UserId, phoneNumber string) {
 }
 
 // linkEmail gives the user a profile whose linked email address is
-// emailAddress, or one with no address linked when it is empty. A linked
-// number is kept.
+// emailAddress, verified, or one with no address linked when it is empty. A
+// linked number is kept.
 func (p *linkedProfiles) linkEmail(userID *commonpb.UserId, emailAddress string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	contact := p.contacts[string(userID.Value)]
 	contact.emailAddress = emailAddress
+	contact.emailUnverified = false
+	p.contacts[string(userID.Value)] = contact
+}
+
+// linkUnverifiedEmail is linkEmail for an address linked unverified.
+func (p *linkedProfiles) linkUnverifiedEmail(userID *commonpb.UserId, emailAddress string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	contact := p.contacts[string(userID.Value)]
+	contact.emailAddress = emailAddress
+	contact.emailUnverified = true
 	p.contacts[string(userID.Value)] = contact
 }
 
@@ -579,6 +592,7 @@ func (p *linkedProfiles) GetFullProfile(_ context.Context, id *commonpb.UserId, 
 	}
 	if includePrivateProfile && contact.emailAddress != "" {
 		userProfile.EmailAddress = &commonpb.EmailAddress{Value: contact.emailAddress}
+		userProfile.IsEmailAddressVerified = !contact.emailUnverified
 	}
 	return userProfile, nil
 }
@@ -1229,6 +1243,12 @@ func testServer_SubmitEmail(t *testing.T, accounts account.Store, store coinbase
 
 		t.Run("no address linked", func(t *testing.T) {
 			env.profiles.linkEmail(u.id, "")
+			defer env.profiles.linkEmail(u.id, testEmail)
+			requireNotVerified(t, emailOnly(testEmail))
+		})
+
+		t.Run("the linked address, unverified", func(t *testing.T) {
+			env.profiles.linkUnverifiedEmail(u.id, testEmail)
 			defer env.profiles.linkEmail(u.id, testEmail)
 			requireNotVerified(t, emailOnly(testEmail))
 		})

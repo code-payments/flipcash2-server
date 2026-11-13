@@ -186,9 +186,16 @@ type Store interface {
 	// not enabled for payment.
 	GetUserIdByPhoneNumberForPayment(ctx context.Context, phoneNumber string) (*commonpb.UserId, error)
 
-	// LinkEmailAddress links the email address to a user, provided they exist. Any other
-	// user previously holding the same email address has it cleared.
-	LinkEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string) error
+	// LinkEmailAddress links the email address to a user, provided they exist. An email
+	// address is not unique to a user: other users holding the same address keep it.
+	//
+	// verified says whether the user proved they hold the address. A verified link
+	// always leaves the address verified. An unverified link of a different address
+	// replaces the one linked before, verified or not, and leaves it unverified; an
+	// unverified link of the address already linked leaves it as it was, so it never
+	// downgrades a verified address. GetFullProfile reports the result as
+	// UserProfile.is_email_address_verified.
+	LinkEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string, verified bool) error
 
 	// UnlinkPhoneNumber removes the link for the email address
 	UnlinkEmailAddress(ctx context.Context, userID *commonpb.UserId, emailAddress string) error

@@ -85,8 +85,9 @@
 // to require it (WithVerifiedEmailRequired, off unless set): it must then be
 // the address linked to the user's profile by email verification, compared
 // exactly as written, no case folded, and any other address, and any address
-// from a user with none linked or no profile, is refused NOT_VERIFIED too,
-// the field telling the two apart. While it is off, an address is taken as
+// from a user with none linked, with one linked unverified (EmailVerification
+// LinkUnverified) or with no profile, is refused NOT_VERIFIED too, the field
+// telling the two apart. While it is off, an address is taken as
 // given, linked or not. An address checkEmail refuses is MALFORMED either way
 // and is not judged against the profile, a field being listed once, so a user
 // whose linked address Coinbase would not take must link another.
@@ -568,7 +569,7 @@ func (s *Server) checkVerifiedContact(
 		return nil, status.Error(codes.Internal, "failed to get user profile")
 	}
 
-	if judgeEmail && !isLinked(userProfile.GetEmailAddress().GetValue(), email.GetValue()) {
+	if judgeEmail && !(userProfile.GetIsEmailAddressVerified() && isLinked(userProfile.GetEmailAddress().GetValue(), email.GetValue())) {
 		invalid = append(invalid, &kyccoinbasepb.SubmitKycResponse_InvalidField{
 			Field:  kyccoinbasepb.Field_FIELD_EMAIL,
 			Reason: kyccoinbasepb.SubmitKycResponse_InvalidField_NOT_VERIFIED,

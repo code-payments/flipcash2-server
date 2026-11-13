@@ -103,6 +103,7 @@ model User {
   phoneNumber                   String?            @unique
   phoneNumberHash               String?            @unique
   emailAddress                  String?            // not unique: several users may link the same address
+  isEmailAddressVerified        Boolean            @default(true) // whether emailAddress was verified with a code, rather than linked unverified; meaningful only while emailAddress is set. Defaults to true because every address linked before this column existed was verified
   isStaff                       Boolean            @default(false)
   isRegistered                  Boolean            @default(false)
   isPhoneNumberLinkedForPayment Boolean            @default(false)

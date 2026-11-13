@@ -61,7 +61,7 @@ func NewServer(
 // the caller's profile is read) and have a verified phone number
 // (PHONE_VERIFICATION_REQUIRED), and a verified email address too while
 // account.RequireCoinbaseEmailVerification is set
-// (EMAIL_VERIFICATION_REQUIRED).
+// (EMAIL_VERIFICATION_REQUIRED; an address linked unverified is not enough).
 func (s *Server) GetJwt(ctx context.Context, req *thirdpartypb.GetJwtRequest) (*thirdpartypb.GetJwtResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
@@ -109,7 +109,9 @@ func (s *Server) GetJwt(ctx context.Context, req *thirdpartypb.GetJwtRequest) (*
 			return &thirdpartypb.GetJwtResponse{Result: thirdpartypb.GetJwtResponse_PHONE_VERIFICATION_REQUIRED}, nil
 		}
 		if account.RequireCoinbaseEmailVerification {
-			if userProfile.EmailAddress == nil {
+			// An address linked unverified (EmailVerification LinkUnverified)
+			// counts as none.
+			if !userProfile.IsEmailAddressVerified {
 				return &thirdpartypb.GetJwtResponse{Result: thirdpartypb.GetJwtResponse_EMAIL_VERIFICATION_REQUIRED}, nil
 			}
 		}

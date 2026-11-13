@@ -24,6 +24,7 @@ func RunStoreTests(t *testing.T, s profile.Store, teardown func()) {
 		testStore,
 		testXProfiles,
 		testPhoneEmailTransfer,
+		testEmailVerification,
 		testGetPhonesByHashes,
 		testGetPhoneNumbersForPayment,
 		testGetLimitedPublicProfilesForRow,
@@ -57,7 +58,7 @@ func testStore(t *testing.T, s profile.Store) {
 
 	require.NoError(t, s.SetDisplayName(ctx, userID, "my name"))
 	require.NoError(t, s.LinkPhoneNumber(ctx, userID, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
-	require.NoError(t, s.LinkEmailAddress(ctx, userID, "someone@gmail.com"))
+	require.NoError(t, s.LinkEmailAddress(ctx, userID, "someone@gmail.com", true))
 
 	profile, err := s.GetFullProfile(ctx, userID, false)
 	require.NoError(t, err)
@@ -116,7 +117,7 @@ func testPhoneEmailTransfer(t *testing.T, s profile.Store) {
 	require.NoError(t, s.SetDisplayName(ctx, userID2, "user2"))
 
 	require.NoError(t, s.LinkPhoneNumber(ctx, userID1, phone, phoneHash))
-	require.NoError(t, s.LinkEmailAddress(ctx, userID1, email))
+	require.NoError(t, s.LinkEmailAddress(ctx, userID1, email, true))
 
 	p, err := s.GetFullProfile(ctx, userID1, true)
 	require.NoError(t, err)
@@ -126,7 +127,7 @@ func testPhoneEmailTransfer(t *testing.T, s profile.Store) {
 	// Re-claim both on user2; user1 loses the phone number but keeps the email
 	// address, which is not unique to a user.
 	require.NoError(t, s.LinkPhoneNumber(ctx, userID2, phone, phoneHash))
-	require.NoError(t, s.LinkEmailAddress(ctx, userID2, email))
+	require.NoError(t, s.LinkEmailAddress(ctx, userID2, email, true))
 
 	p, err = s.GetFullProfile(ctx, userID1, true)
 	require.NoError(t, err)
@@ -140,12 +141,81 @@ func testPhoneEmailTransfer(t *testing.T, s profile.Store) {
 
 	// Setting the same value on the same user is a no-op (no spurious clear).
 	require.NoError(t, s.LinkPhoneNumber(ctx, userID2, phone, phoneHash))
-	require.NoError(t, s.LinkEmailAddress(ctx, userID2, email))
+	require.NoError(t, s.LinkEmailAddress(ctx, userID2, email, true))
 
 	p, err = s.GetFullProfile(ctx, userID2, true)
 	require.NoError(t, err)
 	require.Equal(t, phone, p.PhoneNumber.Value)
 	require.Equal(t, email, p.EmailAddress.Value)
+}
+
+func testEmailVerification(t *testing.T, s profile.Store) {
+	ctx := context.Background()
+
+	userID := model.MustGenerateUserID()
+	require.NoError(t, s.SetDisplayName(ctx, userID, "user"))
+
+	requireEmail := func(t *testing.T, email string, verified bool) {
+		t.Helper()
+
+		p, err := s.GetFullProfile(ctx, userID, true)
+		require.NoError(t, err)
+		if email == "" {
+			require.Nil(t, p.EmailAddress)
+		} else {
+			require.Equal(t, email, p.EmailAddress.GetValue())
+		}
+		require.Equal(t, verified, p.IsEmailAddressVerified)
+
+		// Neither is on a public read.
+		p, err = s.GetFullProfile(ctx, userID, false)
+		require.NoError(t, err)
+		require.Nil(t, p.EmailAddress)
+		require.False(t, p.IsEmailAddressVerified)
+	}
+
+	// Nothing linked is not verified.
+	requireEmail(t, "", false)
+
+	// An unverified link, repeated, stays unverified.
+	require.NoError(t, s.LinkEmailAddress(ctx, userID, "a@gmail.com", false))
+	requireEmail(t, "a@gmail.com", false)
+	require.NoError(t, s.LinkEmailAddress(ctx, userID, "a@gmail.com", false))
+	requireEmail(t, "a@gmail.com", false)
+
+	// Verifying the linked address upgrades it.
+	require.NoError(t, s.LinkEmailAddress(ctx, userID, "a@gmail.com", true))
+	requireEmail(t, "a@gmail.com", true)
+
+	// Relinking it unverified never downgrades it.
+	require.NoError(t, s.LinkEmailAddress(ctx, userID, "a@gmail.com", false))
+	requireEmail(t, "a@gmail.com", true)
+
+	// A different address linked unverified replaces the verified one.
+	require.NoError(t, s.LinkEmailAddress(ctx, userID, "b@gmail.com", false))
+	requireEmail(t, "b@gmail.com", false)
+
+	// A different address linked verified is verified.
+	require.NoError(t, s.LinkEmailAddress(ctx, userID, "c@gmail.com", true))
+	requireEmail(t, "c@gmail.com", true)
+
+	// Another user linking the same address unverified leaves this one as it
+	// was, and has theirs unverified.
+	otherID := model.MustGenerateUserID()
+	require.NoError(t, s.SetDisplayName(ctx, otherID, "other"))
+	require.NoError(t, s.LinkEmailAddress(ctx, otherID, "c@gmail.com", false))
+	requireEmail(t, "c@gmail.com", true)
+	p, err := s.GetFullProfile(ctx, otherID, true)
+	require.NoError(t, err)
+	require.Equal(t, "c@gmail.com", p.EmailAddress.GetValue())
+	require.False(t, p.IsEmailAddressVerified)
+
+	// Unlinking leaves nothing linked, and nothing verified, and a later
+	// unverified link of the same address is unverified.
+	require.NoError(t, s.UnlinkEmailAddress(ctx, userID, "c@gmail.com"))
+	requireEmail(t, "", false)
+	require.NoError(t, s.LinkEmailAddress(ctx, userID, "c@gmail.com", false))
+	requireEmail(t, "c@gmail.com", false)
 }
 
 func testXProfiles(t *testing.T, s profile.Store) {
@@ -793,7 +863,7 @@ func testGetLimitedPublicProfilesForRow(t *testing.T, s profile.Store) {
 
 	// Private fields are never part of a public profile.
 	require.NoError(t, s.LinkPhoneNumber(ctx, user1, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
-	require.NoError(t, s.LinkEmailAddress(ctx, user1, "someone@gmail.com"))
+	require.NoError(t, s.LinkEmailAddress(ctx, user1, "someone@gmail.com", true))
 
 	got, err = s.GetLimitedPublicProfilesForRow(ctx, []*commonpb.UserId{user1})
 	require.NoError(t, err)
@@ -1080,7 +1150,7 @@ func testJoinTs(t *testing.T, s profile.Store) {
 	// Later edits to the profile do not move the join timestamp.
 	require.NoError(t, s.SetDisplayName(ctx, userID, "my other name"))
 	require.NoError(t, s.LinkPhoneNumber(ctx, userID, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
-	require.NoError(t, s.LinkEmailAddress(ctx, userID, "someone@gmail.com"))
+	require.NoError(t, s.LinkEmailAddress(ctx, userID, "someone@gmail.com", true))
 
 	p, err = s.GetFullProfile(ctx, userID, true)
 	require.NoError(t, err)

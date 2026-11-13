@@ -38,6 +38,7 @@ func (s *store) GetFullProfile(ctx context.Context, id *commonpb.UserId, include
 		}
 		if privateProfile.EmailAddress != nil {
 			userProfile.EmailAddress = &commonpb.EmailAddress{Value: *privateProfile.EmailAddress}
+			userProfile.IsEmailAddressVerified = privateProfile.IsEmailAddressVerified
 		}
 		userProfile.IsUsernameAutoAssigned = privateProfile.IsUsernameAutoAssigned
 	}
@@ -141,8 +142,8 @@ func (s *store) GetUserIdByPhoneNumberForPayment(ctx context.Context, phoneNumbe
 	return dbGetUserIdByPhoneNumberForPayment(ctx, s.pool, phoneNumber)
 }
 
-func (s *store) LinkEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string) error {
-	return dbLinkEmailAddress(ctx, s.pool, id, emailAddress)
+func (s *store) LinkEmailAddress(ctx context.Context, id *commonpb.UserId, emailAddress string, verified bool) error {
+	return dbLinkEmailAddress(ctx, s.pool, id, emailAddress, verified)
 }
 
 func (s *store) UnlinkEmailAddress(ctx context.Context, userID *commonpb.UserId, emailAddress string) error {

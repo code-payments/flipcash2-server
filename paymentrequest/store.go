@@ -32,7 +32,7 @@ var (
 	// ErrInvalidPaidShare is returned by PayShare for a PaidShare it cannot
 	// record: one without paid_at, or one paid other than by a payment or by
 	// hand. A creator's share is paid from creation (see NewSplitRequest), so
-	// PaidShare.Creator never reaches PayShare.
+	// Paid.Creator never reaches PayShare.
 	ErrInvalidPaidShare = errors.New("invalid paid share")
 
 	// ErrWrongIntent is returned by PayShare for a payment naming an intent
@@ -110,9 +110,9 @@ type Store interface {
 	// paid, changes nothing. A share has one intent that can pay it, so the
 	// only payment it records is that intent's, once. Otherwise the rule
 	// depends on how it is paid:
-	//   - by hand (PaidShare.Manual): only while the request is open as of now
+	//   - by hand (Paid.Manual): only while the request is open as of now
 	//     (see PaymentRequest.IsOpenAt); ErrNotOpen otherwise.
-	//   - by a payment (PaidShare.Intent): whatever the status. The money has
+	//   - by a payment (Paid.Intent): whatever the status. The money has
 	//     moved, and the payment was validated while the request was open, so
 	//     a close or an expiry, or a hand mark, that lands between the
 	//     validation and this write must not lose it.
@@ -127,7 +127,7 @@ type Store interface {
 	// request returned cannot tell those two apart (both are COMPLETED, the
 	// share paid by a payment), which is why completed is reported: it is what
 	// announcing the change needs (see PublishSharePaid).
-	PayShare(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.PaidShare, now time.Time) (r *PaymentRequest, changed, completed bool, err error)
+	PayShare(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.Paid, now time.Time) (r *PaymentRequest, changed, completed bool, err error)
 
 	// Close closes a request open as of now: status closed, ClosedAt now,
 	// version advanced by one, and off the expiry queue. A request that is not
@@ -189,7 +189,7 @@ type Store interface {
 // recorded by its task), so a payment landing after a hand mark replaces it,
 // and the record shows what was paid. Nothing replaces a payment, nor the
 // creator's own share, and a hand mark never replaces anything.
-func PaidShareSupersedes(current, next *paymentrequestpb.PaidShare) bool {
+func PaidShareSupersedes(current, next *paymentrequestpb.Paid) bool {
 	if current == nil {
 		return true
 	}
@@ -210,7 +210,7 @@ func PaidShareSupersedes(current, next *paymentrequestpb.PaidShare) bool {
 // as paid by its own intent, and it makes any path that reaches the store
 // without that validation fail loudly instead of passing as a no-op on a share
 // already paid.
-func ValidatePaymentIntent(r *PaymentRequest, userID *commonpb.UserId, paid *paymentrequestpb.PaidShare) error {
+func ValidatePaymentIntent(r *PaymentRequest, userID *commonpb.UserId, paid *paymentrequestpb.Paid) error {
 	intent := paid.GetIntent()
 	if intent == nil {
 		return nil
@@ -225,17 +225,17 @@ func ValidatePaymentIntent(r *PaymentRequest, userID *commonpb.UserId, paid *pay
 // paid_at, and it is paid by a payment naming its intent or marked paid by
 // hand. It returns an error wrapping ErrInvalidPaidShare otherwise. Every
 // store checks it before reading anything.
-func ValidatePaidShare(paid *paymentrequestpb.PaidShare) error {
+func ValidatePaidShare(paid *paymentrequestpb.Paid) error {
 	if paid.GetPaidAt() == nil {
 		return fmt.Errorf("%w: paid_at is unset", ErrInvalidPaidShare)
 	}
 	switch how := paid.GetHow().(type) {
-	case *paymentrequestpb.PaidShare_Intent:
+	case *paymentrequestpb.Paid_Intent:
 		if len(how.Intent.GetValue()) == 0 {
 			return fmt.Errorf("%w: intent is unset", ErrInvalidPaidShare)
 		}
-	case *paymentrequestpb.PaidShare_Manual_:
-	case *paymentrequestpb.PaidShare_Creator_:
+	case *paymentrequestpb.Paid_Manual_:
+	case *paymentrequestpb.Paid_Creator_:
 		return fmt.Errorf("%w: a creator's share is paid only at creation", ErrInvalidPaidShare)
 	default:
 		return fmt.Errorf("%w: how it was paid is unset", ErrInvalidPaidShare)

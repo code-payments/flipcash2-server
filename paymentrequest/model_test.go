@@ -81,9 +81,9 @@ func TestNewSplitRequest(t *testing.T) {
 		"a repeated user":  newSplit(createdAt.Add(time.Hour), creator, debtor, debtor),
 		"paid set": func() *paymentrequestpb.Split {
 			split := newSplit(createdAt.Add(time.Hour), debtor)
-			split.Shares[0].Paid = &paymentrequestpb.PaidShare{
+			split.Shares[0].Paid = &paymentrequestpb.Paid{
 				PaidAt: timestamppb.New(createdAt),
-				How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
+				How:    &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}},
 			}
 			return split
 		}(),
@@ -109,7 +109,7 @@ func TestValidate_CreatorPaidOnlyOnCreatorsShare(t *testing.T) {
 
 	// A debtor's share is never paid as the creator's.
 	bad := r.Clone()
-	bad.Share(debtor).Paid = proto.Clone(bad.CreatorShare().Paid).(*paymentrequestpb.PaidShare)
+	bad.Share(debtor).Paid = proto.Clone(bad.CreatorShare().Paid).(*paymentrequestpb.Paid)
 	require.ErrorIs(t, bad.Validate(), ErrInvalidShares)
 
 	// The creator's share is paid from creation, and at it.

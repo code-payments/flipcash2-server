@@ -127,7 +127,7 @@ func (m *memory) GetChatPage(_ context.Context, chatID *commonpb.ChatId, section
 	return page, nil
 }
 
-func (m *memory) PayShare(_ context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.PaidShare, now time.Time) (*paymentrequest.PaymentRequest, bool, bool, error) {
+func (m *memory) PayShare(_ context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.Paid, now time.Time) (*paymentrequest.PaymentRequest, bool, bool, error) {
 	if err := paymentrequest.ValidatePaidShare(paid); err != nil {
 		return nil, false, false, err
 	}
@@ -154,7 +154,7 @@ func (m *memory) PayShare(_ context.Context, id *paymentrequestpb.PaymentRequest
 		return nil, false, false, paymentrequest.ErrNotOpen
 	}
 
-	share.Paid = proto.Clone(paid).(*paymentrequestpb.PaidShare)
+	share.Paid = proto.Clone(paid).(*paymentrequestpb.Paid)
 	r.Version++
 	completed := r.Status == paymentrequest.StatusOpen && r.AllSharesPaid()
 	if completed {

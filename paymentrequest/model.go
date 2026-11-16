@@ -13,9 +13,10 @@
 // there as a message carrying a messagingpb.PaymentRequestWidget, which names
 // the request by ID alone: the shares and state come from this package's RPCs.
 // It is live from creation, sent or not, and may be sent any number of times.
-// A split's title and description are plaintext, and moderated, in a group
-// that is not private, and encrypted with the chat key in a private group
-// (see paymentrequestpb.EncryptedPaymentRequestText); everything else (the
+// A split's title and description are optional (its text may be unset); when
+// set, they are plaintext, and moderated, in a group that is not private, and
+// encrypted with the chat key in a private group (see
+// paymentrequestpb.EncryptedPaymentRequestText); everything else (the
 // currency, ends_at, the shares and how each was paid) is plaintext on the
 // server in either, since the server checks every payment against its share
 // and decides when the request is complete.
@@ -23,10 +24,10 @@
 // A request is OPEN until one of three things ends it, each final:
 //   - every share is paid (COMPLETED). A share is paid all at once, for
 //     exactly its amount, either by a Flipcash payment
-//     (paymentrequestpb.PaidShare.Intent), at most once (see
+//     (paymentrequestpb.Paid.Intent), at most once (see
 //     PaymentRequest.PaymentIntentIDs), or by the creator marking it paid
-//     by hand (PaidShare.Manual); the creator's own share is paid from
-//     creation (PaidShare.Creator). A paid share stays paid, and only a hand
+//     by hand (Paid.Manual); the creator's own share is paid from
+//     creation (Paid.Creator). A paid share stays paid, and only a hand
 //     mark is ever replaced: by a payment that was in flight when it was
 //     made (see PaidShareSupersedes).
 //   - the creator closes it (CLOSED).
@@ -36,9 +37,14 @@
 //     (see PaymentRequest.StatusAt), and recorded later by a worker only so
 //     that listings can file the request as resolved (see ExpireDelay).
 //
+// Who has paid is shown per share as a paymentrequestpb.Payer, and totalled
+// as a paymentrequestpb.PayerSummary, both computed from the shares on every
+// read rather than stored (see PaymentRequest.Payer and payer.go).
+//
 // Nothing about a request is editable after creation: not its text, currency,
-// deadline nor shares. No event announces a change to a request; clients
-// refetch it, ordering copies by PaymentRequest.Version.
+// deadline nor shares. Every change is announced, best effort, on the chat's
+// event stream (see PublishCreated); clients order copies by
+// PaymentRequest.Version and refetch to reconcile one they missed.
 package paymentrequest
 
 import (
@@ -208,9 +214,10 @@ func (s Status) ToProto() paymentrequestpb.PaymentRequestStatus {
 // is addressed by its user ID (see Share), and once paid stays paid, changing
 // only from a hand mark to a payment (see PaidShareSupersedes). The
 // creator's own share, when they listed one, is paid from creation
-// (paymentrequestpb.PaidShare.Creator with paid_at = CreatedAt; see
-// NewSplitRequest). Its text is plaintext in a group that is not private and
-// encrypted in a private group; the store holds either as given.
+// (paymentrequestpb.Paid.Creator with paid_at = CreatedAt; see
+// NewSplitRequest). Its text is optional, and when set is plaintext in a
+// group that is not private and encrypted in a private group; the store holds
+// whichever it is given, or none.
 //
 // Version starts at 1 on creation and advances by exactly one on every change
 // (a share paid, by payment or by hand, a completion, a close); an idempotent
@@ -243,10 +250,12 @@ type PaymentRequest struct {
 	// anything a client sees: an ID anyone could compute could be used up by
 	// someone else first, leaving the share unpayable.
 	//
-	// It is a secret until used, so it is never projected (see ToProto): the
-	// GetPaymentRequest RPC gives a debtor their own while their share is
-	// unpaid, and no one else. Once the share is paid by it, the ID is
-	// public in PaidShare.intent and on the cash message, which costs
+	// It is a secret until used, so it is never projected (see ToProto), nor
+	// logged: the GetPaymentIntentId RPC gives a debtor their own while their
+	// share is unpaid and the request open, and GetPaymentRequest, for
+	// clients that predate that RPC, while their share is unpaid; no one else
+	// is given it. Once the share is paid by it, the ID is
+	// public in Paid.intent and on the cash message, which costs
 	// nothing, since it can never be used again.
 	PaymentIntentIDs map[string][]byte
 
@@ -258,7 +267,7 @@ type PaymentRequest struct {
 // NewSplitRequest returns the split request that creator, in the group chat
 // chatID, asks for with split at createdAt: stored open at version 1, with the
 // creator's own share, if they listed one, paid from creation
-// (paymentrequestpb.PaidShare.Creator at createdAt), and a random payment
+// (paymentrequestpb.Paid.Creator at createdAt), and a random payment
 // intent ID for every other share (see PaymentRequest.PaymentIntentIDs).
 //
 // split is as a client sends it, which it does not modify: an error wrapping
@@ -291,9 +300,9 @@ func NewSplitRequest(
 		Version:   1,
 	}
 	if own := r.Share(creator); own != nil {
-		own.Paid = &paymentrequestpb.PaidShare{
+		own.Paid = &paymentrequestpb.Paid{
 			PaidAt: timestamppb.New(createdAt),
-			How:    &paymentrequestpb.PaidShare_Creator_{Creator: &paymentrequestpb.PaidShare_Creator{}},
+			How:    &paymentrequestpb.Paid_Creator_{Creator: &paymentrequestpb.Paid_Creator{}},
 		}
 	}
 	r.PaymentIntentIDs = make(map[string][]byte, len(r.Shares()))
@@ -493,9 +502,10 @@ func (r *PaymentRequest) AllSharesPaid() bool {
 // as a reader sees it at now: a request stored open past its ends_at is
 // EXPIRED, closed at its ends_at, at the version it was stored with (see
 // StatusAt and ClosedAtAt), which is exactly what the expiry worker will
-// store, so what a reader is shown never changes when it does. It never
-// carries PaymentIntentIDs, which only their debtor is given (see
-// PaymentIntentIDs).
+// store, so what a reader is shown never changes when it does. It carries the
+// request's PayerSummary, computed from its shares (see PaymentRequest.Payer),
+// on every read. It never carries PaymentIntentIDs, which only their debtor is
+// given (see PaymentIntentIDs).
 func (r *PaymentRequest) ToProto(now time.Time) *paymentrequestpb.PaymentRequestMetadata {
 	metadata := &paymentrequestpb.PaymentRequestMetadata{
 		PaymentRequestId: proto.Clone(r.ID).(*paymentrequestpb.PaymentRequestId),
@@ -503,6 +513,7 @@ func (r *PaymentRequest) ToProto(now time.Time) *paymentrequestpb.PaymentRequest
 		CreatedAt:        timestamppb.New(r.CreatedAt),
 		Status:           r.StatusAt(now).ToProto(),
 		Version:          r.Version,
+		PayerSummary:     r.PayerSummary(),
 	}
 	if closedAt, ok := r.ClosedAtAt(now); ok {
 		metadata.ClosedAt = timestamppb.New(closedAt)

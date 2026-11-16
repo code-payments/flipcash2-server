@@ -54,8 +54,15 @@ func RunServerTests(t *testing.T, s paymentrequest.Store, teardown func()) {
 		testServer_Create_EndsAt,
 		testServer_Create_PublicGroup,
 		testServer_Create_Moderation,
+		testServer_Create_NoText,
+		testServer_Create_EmptyText,
+		testServer_Create_Collection,
 		testServer_Get,
 		testServer_Get_PaymentIntentID,
+		testServer_Get_Payers,
+		testServer_GetPaymentIntentId,
+		testServer_GetPayers,
+		testServer_GetPayers_Order,
 		testServer_List_Gates,
 		testServer_List_Paging,
 		testServer_List_ClockExpired,
@@ -207,15 +214,15 @@ func testServer_Create_Refused(t *testing.T, s paymentrequest.Store) {
 		{"ended", e.creator, keyed, with(func(s *paymentrequestpb.Split) { s.EndsAt = timestamppb.New(e.clock.Now().Add(-time.Second)) }), paymentrequestpb.CreatePaymentRequestResponse_INVALID_ENDS_AT},
 		{"unsupported currency", e.creator, keyed, with(func(s *paymentrequestpb.Split) { s.Currency = "xyz" }), paymentrequestpb.CreatePaymentRequestResponse_INVALID_CURRENCY},
 		{"share paid", e.creator, keyed, with(func(s *paymentrequestpb.Split) {
-			s.Shares[1].Paid = &paymentrequestpb.PaidShare{
+			s.Shares[1].Paid = &paymentrequestpb.Paid{
 				PaidAt: timestamppb.New(e.clock.Now()),
-				How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
+				How:    &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}},
 			}
 		}), paymentrequestpb.CreatePaymentRequestResponse_INVALID_SHARES},
 		{"creator's share paid", e.creator, keyed, with(func(s *paymentrequestpb.Split) {
-			s.Shares[0].Paid = &paymentrequestpb.PaidShare{
+			s.Shares[0].Paid = &paymentrequestpb.Paid{
 				PaidAt: timestamppb.New(e.clock.Now()),
-				How:    &paymentrequestpb.PaidShare_Creator_{Creator: &paymentrequestpb.PaidShare_Creator{}},
+				How:    &paymentrequestpb.Paid_Creator_{Creator: &paymentrequestpb.Paid_Creator{}},
 			}
 		}), paymentrequestpb.CreatePaymentRequestResponse_INVALID_SHARES},
 		{"repeated user", e.creator, keyed, with(func(s *paymentrequestpb.Split) { s.Shares = append(s.Shares, share(member, 3)) }), paymentrequestpb.CreatePaymentRequestResponse_INVALID_SHARES},
@@ -438,6 +445,370 @@ func testServer_Create_Moderation(t *testing.T, s paymentrequest.Store) {
 	require.Equal(t, codes.Internal, status.Code(err))
 	_, err = s.Get(e.ctx, paymentrequest.MustDeriveID(e.creator.id, key))
 	require.ErrorIs(t, err, paymentrequest.ErrNotFound)
+}
+
+// testServer_Create_NoText pins a split with no text: taken in a keyed private
+// group and, under the option that lifts their refusal, a public group, never
+// moderated, and read back with its text unset.
+func testServer_Create_NoText(t *testing.T, s paymentrequest.Store) {
+	e := newServerEnv(t, s, paymentrequest.WithPublicGroupRequests())
+	member := e.addUser()
+	private := e.putPrivateGroup(true, member)
+	public := e.putPublicGroup(nil, member)
+
+	for name, chatID := range map[string]*commonpb.ChatId{"private": private, "public": public} {
+		split := noTextSplit(e.clock.Now().Add(time.Hour), share(e.creator, 1), share(member, 2))
+		resp := e.create(e.creator, chatID, split, newKey())
+		require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, resp.Result, name)
+		requireOpen(t, resp.PaymentRequest, 1)
+		require.Nil(t, resp.PaymentRequest.GetGroupChat().GetSplit().GetText(), name)
+
+		got := e.get(member, resp.PaymentRequest.PaymentRequestId)
+		require.Equal(t, paymentrequestpb.GetPaymentRequestResponse_OK, got.Result, name)
+		require.NoError(t, protoutil.ProtoEqualError(resp.PaymentRequest, got.PaymentRequest), name)
+		require.Nil(t, got.PaymentRequest.GetGroupChat().GetSplit().GetText(), name)
+	}
+	require.Zero(t, e.moderator.classifiedCount())
+}
+
+// testServer_Create_EmptyText pins a plaintext set with neither a title nor a
+// description: refused as invalid, in any chat, rather than taken as no text;
+// and either alone is moderated as itself.
+func testServer_Create_EmptyText(t *testing.T, s paymentrequest.Store) {
+	e := newServerEnv(t, s, paymentrequest.WithPublicGroupRequests())
+	member := e.addUser()
+	public := e.putPublicGroup(nil, member)
+	private := e.putPrivateGroup(true, member)
+
+	for name, chatID := range map[string]*commonpb.ChatId{"private": private, "public": public} {
+		key := newKey()
+		req := &paymentrequestpb.CreatePaymentRequestRequest{
+			IdempotencyKey: key,
+			Kind:           groupChatKind(chatID, plaintextSplit(e.clock.Now().Add(time.Hour), "", "", share(member, 1))),
+		}
+		require.NoError(t, e.creator.keys.Auth(req, &req.Auth))
+		_, err := e.client.CreatePaymentRequest(e.ctx, req)
+		require.Equal(t, codes.InvalidArgument, status.Code(err), name)
+		_, err = s.Get(e.ctx, paymentrequest.MustDeriveID(e.creator.id, key))
+		require.ErrorIs(t, err, paymentrequest.ErrNotFound, name)
+	}
+	require.Zero(t, e.moderator.classifiedCount())
+
+	// A title is not required: a description alone is taken, and moderated
+	// alone.
+	resp := e.create(e.creator, public, plaintextSplit(e.clock.Now().Add(time.Hour), "", "Friday night", share(member, 1)), newKey())
+	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, resp.Result)
+	require.Equal(t, "", resp.PaymentRequest.GetGroupChat().GetSplit().GetPlaintext().GetTitle())
+	resp = e.create(e.creator, public, plaintextSplit(e.clock.Now().Add(time.Hour), "Dinner", "", share(member, 1)), newKey())
+	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, resp.Result)
+	require.Equal(t, []string{"Friday night", "Dinner"}, e.moderator.classifiedTexts())
+}
+
+// testServer_Create_Collection pins a collection: not built yet, so refused as
+// invalid and nothing stored.
+func testServer_Create_Collection(t *testing.T, s paymentrequest.Store) {
+	e := newServerEnv(t, s)
+	member := e.addUser()
+	chatID := e.putPrivateGroup(true, member)
+
+	key := newKey()
+	req := &paymentrequestpb.CreatePaymentRequestRequest{
+		IdempotencyKey: key,
+		Kind: &paymentrequestpb.CreatePaymentRequestRequest_GroupChat{GroupChat: &paymentrequestpb.GroupChatPaymentRequest{
+			ChatId: chatID,
+			Type: &paymentrequestpb.GroupChatPaymentRequest_Collection{Collection: &paymentrequestpb.Collection{
+				Currency: "usd",
+				EndsAt:   timestamppb.New(e.clock.Now().Add(time.Hour)),
+				PaymentAmount: &paymentrequestpb.Collection_Fixed{Fixed: &paymentrequestpb.Collection_FixedAmount{
+					NativeAmount: 5,
+				}},
+			}},
+		}},
+	}
+	require.NoError(t, e.creator.keys.Auth(req, &req.Auth))
+	_, err := e.client.CreatePaymentRequest(e.ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = s.Get(e.ctx, paymentrequest.MustDeriveID(e.creator.id, key))
+	require.ErrorIs(t, err, paymentrequest.ErrNotFound)
+}
+
+// testServer_Get_Payers pins the Payers a read carries: the request's
+// PayerSummary on every read, the creator's own share counted as paid, and
+// the caller's own Payer when they hold a share, the creator's included.
+func testServer_Get_Payers(t *testing.T, s paymentrequest.Store) {
+	e := newServerEnv(t, s)
+	debtor := e.addUser()
+	other := e.addUser()
+	member := e.addUser()
+	chatID := e.putPrivateGroup(true, debtor, other, member)
+
+	created := e.create(e.creator, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour),
+		share(e.creator, 0.1),
+		share(debtor, 0.2),
+		share(other, 0.3),
+	), newKey())
+	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, created.Result)
+	id := created.PaymentRequest.PaymentRequestId
+
+	wantSummary := &paymentrequestpb.PayerSummary{
+		PayerCount:       3,
+		PaidCount:        1,
+		NativeAmountDue:  0.6,
+		NativeAmountPaid: 0.1,
+	}
+	require.NoError(t, protoutil.ProtoEqualError(wantSummary, created.PaymentRequest.PayerSummary))
+	require.NoError(t, protoutil.ProtoEqualError(wantSummary, e.requireUpdates(chatID, id, 1)[0].GetCreated().GetPayerSummary()))
+	list := e.list(member, chatID, paymentrequestpb.GetChatPaymentRequestsRequest_OPEN, 0, nil)
+	require.Len(t, list.PaymentRequests, 1)
+	require.NoError(t, protoutil.ProtoEqualError(wantSummary, list.PaymentRequests[0].PayerSummary))
+
+	// A debtor is given their unpaid Payer, the creator their own share's,
+	// paid from creation, and a member with no share none.
+	got := e.get(debtor, id)
+	require.NoError(t, protoutil.ProtoEqualError(wantSummary, got.PaymentRequest.PayerSummary))
+	require.NoError(t, protoutil.ProtoEqualError(PayerOfShare(shareOf(got.PaymentRequest, debtor)), got.CallerPayer))
+	require.NotNil(t, got.CallerPayer.GetUnpaid())
+	require.Equal(t, 0.2, got.CallerPayer.NativeAmountDue)
+
+	got = e.get(e.creator, id)
+	require.NotNil(t, got.CallerPayer.GetPaid().GetCreator())
+	require.Equal(t, 0.1, got.CallerPayer.NativeAmountPaid)
+
+	require.Nil(t, e.get(member, id).CallerPayer)
+
+	// Once paid, the debtor's Payer and the summary say so, and the legacy
+	// intent ID is no longer given.
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, debtor).Result)
+	got = e.get(debtor, id)
+	require.NotNil(t, got.CallerPayer.GetPaid().GetManual())
+	require.Equal(t, 0.2, got.CallerPayer.NativeAmountPaid)
+	require.Nil(t, got.PaymentIntentId)
+	require.NoError(t, protoutil.ProtoEqualError(&paymentrequestpb.PayerSummary{
+		PayerCount:       3,
+		PaidCount:        2,
+		NativeAmountDue:  0.6,
+		NativeAmountPaid: 0.3,
+	}, got.PaymentRequest.PayerSummary))
+}
+
+// testServer_GetPaymentIntentId pins every result, in the order they are
+// decided, and that the ID given is the share's stored one.
+func testServer_GetPaymentIntentId(t *testing.T, s paymentrequest.Store) {
+	e := newServerEnv(t, s)
+	debtor := e.addUser()
+	other := e.addUser()
+	member := e.addUser()
+	outsider := e.addUser()
+	chatID := e.putPrivateGroup(true, debtor, other, member)
+
+	created := e.mustCreate(e.creator, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour),
+		share(e.creator, 1),
+		share(debtor, 2),
+		share(other, 3),
+	))
+	id := created.PaymentRequestId
+	stored, err := s.Get(e.ctx, id)
+	require.NoError(t, err)
+
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_NOT_FOUND, e.getIntentID(debtor, newID()).Result)
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_DENIED, e.getIntentID(outsider, id).Result)
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_NOT_A_PAYER, e.getIntentID(e.creator, id).Result)
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_NOT_A_PAYER, e.getIntentID(member, id).Result)
+
+	resp := e.getIntentID(debtor, id)
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_OK, resp.Result)
+	require.Equal(t, stored.PaymentIntentID(debtor.id), resp.PaymentIntentId.GetValue())
+	require.True(t, proto.Equal(resp.PaymentIntentId, e.getIntentID(debtor, id).PaymentIntentId))
+	require.True(t, proto.Equal(resp.PaymentIntentId, e.get(debtor, id).PaymentIntentId))
+	require.Equal(t, stored.PaymentIntentID(other.id), e.getIntentID(other, id).PaymentIntentId.GetValue())
+
+	// The creator is NOT_A_PAYER even with no share of their own.
+	noOwn := e.mustCreate(e.creator, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour), share(debtor, 2)))
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_NOT_A_PAYER, e.getIntentID(e.creator, noOwn.PaymentRequestId).Result)
+
+	// A paid share is ALREADY_PAID whatever the status, and is judged before
+	// it: after the close, the paid debtor is ALREADY_PAID, the unpaid one
+	// NOT_OPEN.
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, debtor).Result)
+	resp = e.getIntentID(debtor, id)
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_ALREADY_PAID, resp.Result)
+	require.Nil(t, resp.PaymentIntentId)
+	require.Equal(t, paymentrequestpb.ClosePaymentRequestResponse_OK, e.close(e.creator, id).Result)
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_ALREADY_PAID, e.getIntentID(debtor, id).Result)
+	resp = e.getIntentID(other, id)
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_NOT_OPEN, resp.Result)
+	require.Nil(t, resp.PaymentIntentId)
+
+	// Past its ends_at, before the worker stores it expired, it is NOT_OPEN.
+	expiring := e.mustCreate(e.creator, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour), share(debtor, 2)))
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_OK, e.getIntentID(debtor, expiring.PaymentRequestId).Result)
+	e.clock.set(expiring.GetGroupChat().GetSplit().EndsAt.AsTime())
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_NOT_OPEN, e.getIntentID(debtor, expiring.PaymentRequestId).Result)
+
+	// A debtor who has left the chat can no longer read it: DENIED.
+	_, _, err = e.chats.RemoveGroupMember(e.ctx, chatID, debtor.id, false)
+	require.NoError(t, err)
+	require.Equal(t, paymentrequestpb.GetPaymentIntentIdResponse_DENIED, e.getIntentID(debtor, noOwn.PaymentRequestId).Result)
+}
+
+// testServer_GetPayers pins the GetPayers gates, sections, paging, tokens and
+// version.
+func testServer_GetPayers(t *testing.T, s paymentrequest.Store) {
+	e := newServerEnv(t, s)
+	member := e.addUser()
+	outsider := e.addUser()
+	debtors := make([]user, 5)
+	for i := range debtors {
+		debtors[i] = e.addUser()
+	}
+	chatID := e.putPrivateGroup(true, append([]user{member}, debtors...)...)
+
+	shares := []*paymentrequestpb.Share{share(e.creator, 1)}
+	for i, d := range debtors {
+		shares = append(shares, share(d, float64(i+2)))
+	}
+	created := e.mustCreate(e.creator, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour), shares...))
+	id := created.PaymentRequestId
+	other := e.mustCreate(e.creator, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour), share(member, 1)))
+
+	unpaid := paymentrequestpb.GetPayersRequest_UNPAID
+	paid := paymentrequestpb.GetPayersRequest_PAID
+
+	for _, section := range []paymentrequestpb.GetPayersRequest_Section{unpaid, paid} {
+		require.Equal(t, paymentrequestpb.GetPayersResponse_NOT_FOUND, e.payers(member, newID(), section, 0, nil).Result)
+		require.Equal(t, paymentrequestpb.GetPayersResponse_DENIED, e.payers(outsider, id, section, 0, nil).Result)
+	}
+
+	// UNPAID is the debtors in the order listed, PAID the creator alone; each
+	// Payer is its share's, and every page carries the version read.
+	gotUnpaid := e.walkPayers(member, id, unpaid, 2, 1)
+	requirePayerIDs(t, debtors, gotUnpaid)
+	for i, p := range gotUnpaid {
+		require.NoError(t, protoutil.ProtoEqualError(PayerOfShare(shareOf(created, debtors[i])), p))
+	}
+	gotPaid := e.walkPayers(member, id, paid, 2, 1)
+	requirePayerIDs(t, []user{e.creator}, gotPaid)
+	require.NotNil(t, gotPaid[0].GetPaid().GetCreator())
+
+	// A page size of zero is the cap, which holds a whole split.
+	resp := e.payers(member, id, unpaid, 0, nil)
+	require.Len(t, resp.Payers, 5)
+	require.False(t, resp.HasMore)
+	require.Nil(t, resp.PagingToken)
+
+	// Pay two, at different times: they leave UNPAID for PAID, newest first,
+	// and the version moves with them.
+	e.clock.advance(time.Minute)
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, debtors[3]).Result)
+	e.clock.advance(time.Minute)
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, debtors[0]).Result)
+	requirePayerIDs(t, []user{debtors[1], debtors[2], debtors[4]}, e.walkPayers(member, id, unpaid, 2, 3))
+	requirePayerIDs(t, []user{debtors[0], debtors[3], e.creator}, e.walkPayers(member, id, paid, 2, 3))
+
+	// A cursor resumes strictly after its Payer while others are paid.
+	first := e.payers(member, id, unpaid, 1, nil)
+	requirePayerIDs(t, []user{debtors[1]}, first.Payers)
+	require.True(t, first.HasMore)
+	e.clock.advance(time.Minute)
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, debtors[1]).Result)
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, debtors[2]).Result)
+	second := e.payers(member, id, unpaid, 1, first.PagingToken)
+	require.Equal(t, paymentrequestpb.GetPayersResponse_OK, second.Result)
+	requirePayerIDs(t, []user{debtors[4]}, second.Payers)
+	require.False(t, second.HasMore)
+	require.EqualValues(t, 5, second.Version)
+
+	// The last share completes the request: UNPAID is an empty page, OK.
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, debtors[4]).Result)
+	resp = e.payers(member, id, unpaid, 0, nil)
+	require.Equal(t, paymentrequestpb.GetPayersResponse_OK, resp.Result)
+	require.Empty(t, resp.Payers)
+	require.False(t, resp.HasMore)
+	require.Nil(t, resp.PagingToken)
+	require.EqualValues(t, 6, resp.Version)
+	got := e.get(member, id)
+	require.Equal(t, paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_COMPLETED, got.PaymentRequest.Status)
+	require.Equal(t, got.PaymentRequest.Version, resp.Version)
+	require.Len(t, e.walkPayers(member, id, paid, 4, 6), 6)
+
+	// A token is bound to its request and section, and refused with another
+	// or when malformed.
+	first = e.payers(member, id, paid, 1, nil)
+	require.True(t, first.HasMore)
+	for _, tc := range []struct {
+		name    string
+		id      *paymentrequestpb.PaymentRequestId
+		section paymentrequestpb.GetPayersRequest_Section
+		token   *commonpb.PagingToken
+	}{
+		{"other request", other.PaymentRequestId, paid, first.PagingToken},
+		{"other section", id, unpaid, first.PagingToken},
+		{"truncated", id, paid, &commonpb.PagingToken{Value: first.PagingToken.Value[:10]}},
+		{"garbage", id, paid, &commonpb.PagingToken{Value: bytes.Repeat([]byte{0xff}, len(first.PagingToken.Value))}},
+	} {
+		req := &paymentrequestpb.GetPayersRequest{
+			PaymentRequestId: tc.id,
+			Section:          tc.section,
+			QueryOptions:     &commonpb.QueryOptions{PagingToken: tc.token},
+		}
+		require.NoError(t, member.keys.Auth(req, &req.Auth))
+		_, err := e.client.GetPayers(e.ctx, req)
+		require.Equal(t, codes.InvalidArgument, status.Code(err), tc.name)
+	}
+
+	// An unknown section is refused.
+	req := &paymentrequestpb.GetPayersRequest{PaymentRequestId: id}
+	require.NoError(t, member.keys.Auth(req, &req.Auth))
+	_, err := e.client.GetPayers(e.ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+// testServer_GetPayers_Order pins the PAID section's order: newest paid_at
+// first, ties by user ID, and a hand mark replaced by a payment moving to the
+// payment's paid_at.
+func testServer_GetPayers_Order(t *testing.T, s paymentrequest.Store) {
+	e := newServerEnv(t, s)
+	a := e.addUser()
+	b := e.addUser()
+	c := e.addUser()
+	chatID := e.putPrivateGroup(true, a, b, c)
+	created := e.mustCreate(e.creator, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour),
+		share(a, 1), share(b, 1), share(c, 1),
+	))
+	id := created.PaymentRequestId
+	paid := paymentrequestpb.GetPayersRequest_PAID
+
+	// a and b are marked at the same time; c later.
+	e.clock.advance(time.Minute)
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, a).Result)
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, b).Result)
+	tied := []user{a, b}
+	if bytes.Compare(a.id.Value, b.id.Value) > 0 {
+		tied = []user{b, a}
+	}
+	e.clock.advance(time.Minute)
+	paymentAt := e.clock.Now()
+	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, c).Result)
+	requirePayerIDs(t, []user{c, tied[0], tied[1]}, e.walkPayers(a, id, paid, 1, 4))
+	requirePayerIDs(t, []user{c, tied[0], tied[1]}, e.walkPayers(a, id, paid, 2, 4))
+
+	// The payment tied[1] made before being marked lands later, replacing the
+	// mark: tied[1] moves ahead of c, to the payment's paid_at.
+	stored, err := s.Get(e.ctx, id)
+	require.NoError(t, err)
+	e.clock.advance(time.Minute)
+	paymentAt = e.clock.Now()
+	_, changed, completed, err := s.PayShare(e.ctx, id, tied[1].id, &paymentrequestpb.Paid{
+		PaidAt: timestamppb.New(paymentAt),
+		How:    &paymentrequestpb.Paid_Intent{Intent: &commonpb.IntentId{Value: stored.PaymentIntentID(tied[1].id)}},
+	}, paymentAt)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.False(t, completed)
+	got := e.walkPayers(a, id, paid, 1, 5)
+	requirePayerIDs(t, []user{tied[1], c, tied[0]}, got)
+	require.NotNil(t, got[0].GetPaid().GetIntent())
+	require.True(t, paymentAt.Equal(got[0].GetPaid().PaidAt.AsTime()))
 }
 
 // testServer_Get pins who sees a request: whoever may read its chat in full,
@@ -766,8 +1137,8 @@ func testServer_Updates(t *testing.T, s paymentrequest.Store) {
 	require.Equal(t, paymentrequestpb.ClosePaymentRequestResponse_DENIED, e.close(alice, id).Result)
 	e.requireUpdates(chatID, id, 1)
 
-	// A share marked paid is announced once, as the share alone at the next
-	// version.
+	// A share marked paid is announced once, at the next version, as the
+	// share, its Payer and the summary as they now stand.
 	e.clock.advance(time.Minute)
 	marked := e.markPaid(e.creator, id, alice)
 	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, marked.Result)
@@ -775,18 +1146,25 @@ func testServer_Updates(t *testing.T, s paymentrequest.Store) {
 	require.EqualValues(t, 2, updates[1].GetUpdates().GetVersion())
 	require.NoError(t, protoutil.ProtoEqualError(shareOf(marked.PaymentRequest, alice), sharePaymentUpdate(t, updates[1])))
 	require.NotNil(t, sharePaymentUpdate(t, updates[1]).Paid.GetManual())
+	changes := updates[1].GetUpdates().GetUpdates()
+	require.NoError(t, protoutil.ProtoEqualError(PayerOfShare(shareOf(marked.PaymentRequest, alice)), changes[1].GetPayerUpdate().GetPayer()))
+	require.NoError(t, protoutil.ProtoEqualError(marked.PaymentRequest.PayerSummary, changes[2].GetPayerSummaryUpdate().GetPayerSummary()))
+	require.EqualValues(t, 2, changes[2].GetPayerSummaryUpdate().GetPayerSummary().PaidCount)
 	e.requireApplied(updates, marked.PaymentRequest)
 	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, e.markPaid(e.creator, id, alice).Result)
 	e.requireUpdates(chatID, id, 2)
 
-	// The last share is announced with the completion it made, after it.
+	// The last share is announced with the completion it made, after the
+	// share, its Payer and the summary.
 	e.clock.advance(time.Minute)
 	completed := e.markPaid(e.creator, id, bob)
 	require.Equal(t, paymentrequestpb.MarkPaidResponse_OK, completed.Result)
 	updates = e.requireUpdates(chatID, id, 3)
-	changes := updates[2].GetUpdates().GetUpdates()
-	require.Len(t, changes, 2)
+	changes = updates[2].GetUpdates().GetUpdates()
+	require.Len(t, changes, 4)
 	require.NoError(t, protoutil.ProtoEqualError(shareOf(completed.PaymentRequest, bob), changes[0].GetSharePaymentUpdate().GetShare()))
+	require.NoError(t, protoutil.ProtoEqualError(PayerOfShare(shareOf(completed.PaymentRequest, bob)), changes[1].GetPayerUpdate().GetPayer()))
+	require.NoError(t, protoutil.ProtoEqualError(completed.PaymentRequest.PayerSummary, changes[2].GetPayerSummaryUpdate().GetPayerSummary()))
 	status := statusUpdate(t, updates[2])
 	require.Equal(t, paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_COMPLETED, status.Status)
 	require.True(t, status.ClosedAt.AsTime().Equal(shareOf(completed.PaymentRequest, bob).Paid.PaidAt.AsTime()))
@@ -796,7 +1174,8 @@ func testServer_Updates(t *testing.T, s paymentrequest.Store) {
 	require.Equal(t, paymentrequestpb.ClosePaymentRequestResponse_OK, e.close(e.creator, id).Result)
 	e.requireUpdates(chatID, id, 3)
 
-	// A close is announced once, as the status change alone.
+	// A close is announced once, as the status change alone: it records no
+	// payment, so no Payer or summary.
 	closing := e.mustCreate(e.creator, chatID, e.encryptedSplit(e.clock.Now().Add(time.Hour), share(alice, 2)))
 	e.clock.advance(time.Minute)
 	closed := e.close(e.creator, closing.PaymentRequestId)
@@ -1083,6 +1462,15 @@ func plaintextSplit(endsAt time.Time, title, description string, shares ...*paym
 	}
 }
 
+// noTextSplit is a USD split ending at endsAt with no text.
+func noTextSplit(endsAt time.Time, shares ...*paymentrequestpb.Share) *paymentrequestpb.Split {
+	return &paymentrequestpb.Split{
+		Currency: "usd",
+		EndsAt:   timestamppb.New(endsAt),
+		Shares:   shares,
+	}
+}
+
 func plaintext(title, description string) *paymentrequestpb.Split_Plaintext {
 	return &paymentrequestpb.Split_Plaintext{Plaintext: &paymentrequestpb.PaymentRequestText{
 		Title:       title,
@@ -1198,6 +1586,67 @@ func (e *serverEnv) markPaid(u user, id *paymentrequestpb.PaymentRequestId, debt
 	return resp
 }
 
+func (e *serverEnv) getIntentID(u user, id *paymentrequestpb.PaymentRequestId) *paymentrequestpb.GetPaymentIntentIdResponse {
+	req := &paymentrequestpb.GetPaymentIntentIdRequest{PaymentRequestId: id}
+	require.NoError(e.t, u.keys.Auth(req, &req.Auth))
+	resp, err := e.client.GetPaymentIntentId(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) payers(u user, id *paymentrequestpb.PaymentRequestId, section paymentrequestpb.GetPayersRequest_Section, pageSize int32, token *commonpb.PagingToken) *paymentrequestpb.GetPayersResponse {
+	req := &paymentrequestpb.GetPayersRequest{
+		PaymentRequestId: id,
+		Section:          section,
+		QueryOptions:     &commonpb.QueryOptions{PageSize: pageSize, PagingToken: token},
+	}
+	require.NoError(e.t, u.keys.Auth(req, &req.Auth))
+	resp, err := e.client.GetPayers(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// walkPayers reads a whole section of id's Payers in pages of pageSize,
+// checking every page but the last is full and carries a token, and every
+// page carries version.
+func (e *serverEnv) walkPayers(u user, id *paymentrequestpb.PaymentRequestId, section paymentrequestpb.GetPayersRequest_Section, pageSize int32, version uint64) []*paymentrequestpb.Payer {
+	e.t.Helper()
+
+	var (
+		all   []*paymentrequestpb.Payer
+		token *commonpb.PagingToken
+	)
+	for range 100 {
+		resp := e.payers(u, id, section, pageSize, token)
+		require.Equal(e.t, paymentrequestpb.GetPayersResponse_OK, resp.Result)
+		require.Equal(e.t, version, resp.Version)
+		require.LessOrEqual(e.t, len(resp.Payers), int(pageSize))
+		all = append(all, resp.Payers...)
+		if !resp.HasMore {
+			require.Nil(e.t, resp.PagingToken)
+			return all
+		}
+		require.Len(e.t, resp.Payers, int(pageSize))
+		require.NotNil(e.t, resp.PagingToken)
+		token = resp.PagingToken
+	}
+	e.t.Fatal("walk did not finish")
+	return nil
+}
+
+func requirePayerIDs(t *testing.T, want []user, got []*paymentrequestpb.Payer) {
+	t.Helper()
+	wantIDs := make([][]byte, len(want))
+	for i, u := range want {
+		wantIDs[i] = u.id.Value
+	}
+	gotIDs := make([][]byte, len(got))
+	for i, p := range got {
+		gotIDs[i] = p.UserId.Value
+	}
+	require.Equal(t, wantIDs, gotIDs)
+}
+
 func requireOpen(t *testing.T, r *paymentrequestpb.PaymentRequestMetadata, version uint64) {
 	t.Helper()
 	require.Equal(t, paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_OPEN, r.Status)
@@ -1289,9 +1738,13 @@ func ApplyUpdates(t *testing.T, all []*paymentrequestpb.PaymentRequestUpdate) *p
 		updates := u.GetUpdates()
 		require.NotNil(t, updates, "a later update is not a change")
 		require.Equal(t, local.Version+1, updates.Version, "a change is not at the next version")
+		// A change that records a payment is, in order, the share, its
+		// Payer and the summary; a status change is at most one, and last.
+		var paidShare *paymentrequestpb.Share
 		for i, c := range updates.Updates {
 			switch kind := c.Kind.(type) {
 			case *paymentrequestpb.PaymentRequestUpdate_Update_SharePaymentUpdate:
+				require.Equal(t, 0, i, "a share payment that is not first")
 				share := kind.SharePaymentUpdate.Share
 				require.NotNil(t, share.Paid, "a paid share without paid")
 				shares := local.GetGroupChat().GetSplit().GetShares()
@@ -1303,6 +1756,14 @@ func ApplyUpdates(t *testing.T, all []*paymentrequestpb.PaymentRequestUpdate) *p
 					}
 				}
 				require.True(t, found, "a paid share the request does not have")
+				paidShare = share
+			case *paymentrequestpb.PaymentRequestUpdate_Update_PayerUpdate:
+				require.Equal(t, 1, i, "a payer update that does not follow its share")
+				require.NotNil(t, paidShare)
+				require.NoError(t, protoutil.ProtoEqualError(PayerOfShare(paidShare), kind.PayerUpdate.Payer))
+			case *paymentrequestpb.PaymentRequestUpdate_Update_PayerSummaryUpdate:
+				require.Equal(t, 2, i, "a summary update that does not follow its payer")
+				local.PayerSummary = proto.Clone(kind.PayerSummaryUpdate.PayerSummary).(*paymentrequestpb.PayerSummary)
 			case *paymentrequestpb.PaymentRequestUpdate_Update_StatusUpdate:
 				require.Equal(t, len(updates.Updates)-1, i, "a status change that is not last")
 				require.Equal(t, paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_OPEN, local.Status, "a status change of a request not open")
@@ -1318,12 +1779,30 @@ func ApplyUpdates(t *testing.T, all []*paymentrequestpb.PaymentRequestUpdate) *p
 }
 
 // sharePaymentUpdate returns the share an update pays when a share payment
-// is all it carries, and fails otherwise.
+// is all it records (the share, its Payer and the summary, with no status
+// change), and fails otherwise.
 func sharePaymentUpdate(t *testing.T, u *paymentrequestpb.PaymentRequestUpdate) *paymentrequestpb.Share {
 	changes := u.GetUpdates().GetUpdates()
-	require.Len(t, changes, 1)
+	require.Len(t, changes, 3)
 	require.NotNil(t, changes[0].GetSharePaymentUpdate())
+	require.NotNil(t, changes[1].GetPayerUpdate())
+	require.NotNil(t, changes[2].GetPayerSummaryUpdate())
 	return changes[0].GetSharePaymentUpdate().Share
+}
+
+// PayerOfShare is the Payer a split's share is, as the proto defines it (see
+// paymentrequestpb.Payer), computed here independently of the server.
+func PayerOfShare(share *paymentrequestpb.Share) *paymentrequestpb.Payer {
+	payer := &paymentrequestpb.Payer{
+		UserId:          share.UserId,
+		NativeAmountDue: share.NativeAmount,
+		Status:          &paymentrequestpb.Payer_Unpaid_{Unpaid: &paymentrequestpb.Payer_Unpaid{}},
+	}
+	if share.Paid != nil {
+		payer.NativeAmountPaid = share.NativeAmount
+		payer.Status = &paymentrequestpb.Payer_Paid{Paid: share.Paid}
+	}
+	return payer
 }
 
 // statusUpdate returns the status update that is an update's last, and

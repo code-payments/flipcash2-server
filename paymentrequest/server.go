@@ -33,9 +33,10 @@ import (
 )
 
 const (
-	// maxPageSize bounds a single GetChatPaymentRequests page and is its
-	// default. It matches the max_items on
-	// GetChatPaymentRequestsResponse.payment_requests.
+	// maxPageSize bounds a single GetChatPaymentRequests or GetPayers page and
+	// is its default. It matches the max_items on
+	// GetChatPaymentRequestsResponse.payment_requests and
+	// GetPayersResponse.payers.
 	maxPageSize = 100
 
 	pageTokenVersion = 1
@@ -45,6 +46,17 @@ const (
 	// to, then the position it resumes after (see PageCursor): the sort time
 	// as nanoseconds and the request ID.
 	pageTokenLen = 1 + 1 + groupChatIDSize + 8 + IDSize
+
+	payerPageTokenVersion = 1
+
+	// payerPageTokenUnpaidLen and payerPageTokenPaidLen are the fixed sizes of
+	// a GetPayers paging token in each section: the version byte, the section
+	// byte and the request ID the token is bound to, then the position it
+	// resumes after (see PayerCursor): in the unpaid section the share's
+	// position, and in the paid section paid_at as seconds and nanoseconds and
+	// the user ID.
+	payerPageTokenUnpaidLen = 1 + 1 + IDSize + 4
+	payerPageTokenPaidLen   = 1 + 1 + IDSize + 8 + 4 + model.UserIDSize
 )
 
 // Server implements paymentrequestpb.PaymentRequestServer.
@@ -57,19 +69,28 @@ const (
 //     plaintext (a public group) or encrypted under the chat key (a keyed
 //     private group). For now public groups are refused outright (see
 //     CreatePaymentRequest), a transitional gate.
-//   - Seeing a request, alone or in its chat's listing, is reading the chat in
-//     full (Access.CanListen): its members, and a non-member of a public
-//     group who satisfies its listener rules.
+//   - Seeing a request, alone or in its chat's listing, its Payers
+//     (GetPayers) or, as a debtor, the intent ID to pay a share with
+//     (GetPaymentIntentId), is reading the chat in full (Access.CanListen):
+//     its members, and a non-member of a public group who satisfies its
+//     listener rules.
 //   - Closing a request and marking a share paid by hand are its creator's
 //     alone, whatever their standing in the chat now: the request is theirs,
 //     and they are the one who is paid.
 //
 // Paying a share with a Flipcash payment is not this service's: it is an
-// intent, validated and recorded elsewhere (see Store.PayShare).
+// intent, validated and recorded elsewhere (see Store.PayShare). This service
+// only hands a debtor the intent ID that payment must use (GetPaymentIntentId,
+// and GetPaymentRequest for older clients), never logging it.
+//
+// A request's Payers and PayerSummary are computed from its shares on every
+// read (see PaymentRequest.Payer), so every read of a request carries its
+// summary, and GetPayers pages them from one read of the request, at its
+// version.
 //
 // Every change the service makes, a creation, a close or a share marked paid
-// by hand, is announced on the chat's topic (see PublishCreated); a no-op is
-// not.
+// by hand, is announced on the chat's topic (see PublishCreated,
+// PublishSharePaid and PublishClosed); a no-op is not.
 type Server struct {
 	log *zap.Logger
 
@@ -154,19 +175,25 @@ func NewServer(
 }
 
 // CreatePaymentRequest creates a payment request. Today the only kind is a
-// split in a group chat.
+// split in a group chat; a collection is refused as InvalidArgument until it
+// is built.
+//
+// A split's text is optional. A request with none leaves it unset, so a
+// plaintext with neither a title nor a description is refused as
+// InvalidArgument: it is validated, never normalized to none.
 //
 // The request is checked in the order a client can act on, local checks
 // first, the store and chat reads next, and moderation, a call out, last:
 // the chat must be a group (CHAT_NOT_SUPPORTED); the caller must be able to
 // speak in it (DENIED); it must not be a public group (CHAT_NOT_SUPPORTED,
-// transitional, see below); the text must be in the form the chat takes,
-// plaintext in a public group and encrypted under the chat key in a private
-// one (ENCRYPTION_NOT_ALLOWED, ENCRYPTION_REQUIRED); ends_at must be in the
-// future and at most MaxDuration away (INVALID_ENDS_AT); the currency must be
-// one the server values (INVALID_CURRENCY); the shares must be valid
-// (INVALID_SHARES, see validateShares); and plaintext must pass moderation
-// (TEXT_MODERATED, see moderate). Only then is anything written.
+// transitional, see below); the text, when set, must be in the form the chat
+// takes, plaintext in a public group and encrypted under the chat key in a
+// private one (ENCRYPTION_NOT_ALLOWED, ENCRYPTION_REQUIRED), and a request
+// with no text fits either; ends_at must be in the future and at most
+// MaxDuration away (INVALID_ENDS_AT); the currency must be one the server
+// values (INVALID_CURRENCY); the shares must be valid
+// (INVALID_SHARES, see validateShares); and plaintext, when set, must pass
+// moderation (TEXT_MODERATED, see moderate). Only then is anything written.
 //
 // A chat that does not exist is DENIED, not reported: the proto has no
 // NOT_FOUND for creation, and Access.SpeakerStanding admits no one to a chat
@@ -227,7 +254,15 @@ func (s *Server) CreatePaymentRequest(ctx context.Context, req *paymentrequestpb
 	case *paymentrequestpb.GroupChatPaymentRequest_Split:
 		split = typ.Split
 	default:
+		// A collection is not built yet.
 		return nil, status.Error(codes.InvalidArgument, "unsupported payment request type")
+	}
+
+	// Text is optional, and a request with none leaves it unset: a set
+	// plaintext with neither a title nor a description is refused, not taken
+	// as none.
+	if text := split.GetPlaintext(); text != nil && text.Title == "" && text.Description == "" {
+		return nil, status.Error(codes.InvalidArgument, "plaintext text is empty")
 	}
 
 	// A DM is told apart by its ID's length, before anything is read.
@@ -327,16 +362,24 @@ func createdResponse(r *PaymentRequest, now time.Time) *paymentrequestpb.CreateP
 // textVerdict judges a split's text against what the chat takes, as the
 // speaker's standing says (see chat.SpeakerStanding): a public group takes
 // plaintext alone, and a keyed private group text encrypted under its scheme
-// alone. ok is false, with the result to answer, when the chat does not take
+// alone. A split with no text fits either, so it is never refused for its
+// form. ok is false, with the result to answer, when the chat does not take
 // the text.
 func textVerdict(speaker chat.SpeakerStanding, split *paymentrequestpb.Split) (result paymentrequestpb.CreatePaymentRequestResponse_Result, ok bool) {
+	noText := split.GetText() == nil
 	switch speaker.Encryption {
 	case chat.EncryptionNone:
+		if noText {
+			return paymentrequestpb.CreatePaymentRequestResponse_OK, true
+		}
 		if split.GetPlaintext() == nil {
 			return paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_NOT_ALLOWED, false
 		}
 		return paymentrequestpb.CreatePaymentRequestResponse_OK, true
 	case chat.EncryptionRequired:
+		if noText {
+			return paymentrequestpb.CreatePaymentRequestResponse_OK, true
+		}
 		encrypted := split.GetEncrypted()
 		if encrypted == nil {
 			return paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_REQUIRED, false
@@ -456,9 +499,14 @@ func (s *Server) moderate(ctx context.Context, log *zap.Logger, text *paymentreq
 }
 
 // moderationText is the one text a split's plaintext is moderated as: the
-// title, then the description on its own line when there is one.
+// title, then the description on its own line, each when there is one. A
+// plaintext with neither is refused before moderation (see
+// CreatePaymentRequest).
 func moderationText(text *paymentrequestpb.PaymentRequestText) string {
-	lines := []string{text.Title}
+	var lines []string
+	if text.Title != "" {
+		lines = append(lines, text.Title)
+	}
 	if text.Description != "" {
 		lines = append(lines, text.Description)
 	}
@@ -472,10 +520,15 @@ func moderationText(text *paymentrequestpb.PaymentRequestText) string {
 // hold, so the distinction leaks nothing. Otherwise the caller must be able to
 // read the request's chat in full (DENIED).
 //
+// A caller holding a share of the request, the creator's own included, is
+// given it as their Payer (caller_payer, see PaymentRequest.Payer), so a
+// client knows whether to offer to pay without walking GetPayers.
+//
 // A caller holding an unpaid share of the request is also given the intent ID
 // their payment of it must use (PaymentRequest.PaymentIntentIDs), whatever
-// the request's status: a payment's validation judges that. No one else is
-// ever given it, the creator included.
+// the request's status: a payment's validation judges that. It is kept for
+// clients that predate GetPaymentIntentId, which new clients call instead. No
+// one else is ever given it, the creator included.
 func (s *Server) GetPaymentRequest(ctx context.Context, req *paymentrequestpb.GetPaymentRequestRequest) (*paymentrequestpb.GetPaymentRequestResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
@@ -508,6 +561,7 @@ func (s *Server) GetPaymentRequest(ctx context.Context, req *paymentrequestpb.Ge
 	resp := &paymentrequestpb.GetPaymentRequestResponse{
 		Result:         paymentrequestpb.GetPaymentRequestResponse_OK,
 		PaymentRequest: r.ToProto(s.now()),
+		CallerPayer:    r.Payer(userID),
 	}
 	if share := r.Share(userID); share != nil && share.GetPaid() == nil {
 		if intentID := r.PaymentIntentID(userID); intentID != nil {
@@ -681,6 +735,211 @@ func decodePageToken(token *commonpb.PagingToken, chatID *commonpb.ChatId, secti
 	}, true
 }
 
+// GetPaymentIntentId gives the caller the intent ID their payment of their
+// share must use (see PaymentRequest.PaymentIntentIDs): the one drawn for the
+// share when the request was created, the same on every call.
+//
+// The result is decided in this order: a request that does not exist is
+// NOT_FOUND, as for GetPaymentRequest; the caller must be able to read its
+// chat in full (DENIED); the caller must hold a share a payment pays, which
+// neither the creator nor a member with no share does (NOT_A_PAYER); the
+// share must be unpaid, by payment or by hand (ALREADY_PAID), whatever the
+// request's status; and the request must be open as of now (NOT_OPEN, see
+// PaymentRequest.IsOpenAt), since a payment's validation refuses one into a
+// request that is not.
+//
+// The ID is a secret until used and is never logged.
+func (s *Server) GetPaymentIntentId(ctx context.Context, req *paymentrequestpb.GetPaymentIntentIdRequest) (*paymentrequestpb.GetPaymentIntentIdResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.String("payment_request_id", hex.EncodeToString(req.GetPaymentRequestId().GetValue())),
+	)
+
+	r, err := s.requests.Get(ctx, req.PaymentRequestId)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_NOT_FOUND}, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure getting payment request")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	canListen, err := s.access.CanListen(ctx, r.ChatID, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure determining listener standing")
+		return nil, status.Error(codes.Internal, "")
+	}
+	if !canListen {
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_DENIED}, nil
+	}
+
+	share := r.Share(userID)
+	if share == nil || proto.Equal(userID, r.Creator) {
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_NOT_A_PAYER}, nil
+	}
+	if share.GetPaid() != nil {
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_ALREADY_PAID}, nil
+	}
+	if !r.IsOpenAt(s.now()) {
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_NOT_OPEN}, nil
+	}
+
+	intentID := r.PaymentIntentID(userID)
+	if intentID == nil {
+		// Validate guarantees every debtor's share one.
+		log.Warn("Debtor's share has no payment intent id")
+		return nil, status.Error(codes.Internal, "")
+	}
+	return &paymentrequestpb.GetPaymentIntentIdResponse{
+		Result:          paymentrequestpb.GetPaymentIntentIdResponse_OK,
+		PaymentIntentId: &commonpb.IntentId{Value: append([]byte(nil), intentID...)},
+	}, nil
+}
+
+// GetPayers pages one section of a request's Payers (see
+// PaymentRequest.PayersPage for each section's order), computed from the
+// request as one read of it, whose version the page carries.
+//
+// A token that is malformed or bound to another request or section is
+// InvalidArgument, checked before anything is read. Then, as for
+// GetPaymentRequest, a request that does not exist is NOT_FOUND and the caller
+// must be able to read its chat in full (DENIED).
+func (s *Server) GetPayers(ctx context.Context, req *paymentrequestpb.GetPayersRequest) (*paymentrequestpb.GetPayersResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.String("payment_request_id", hex.EncodeToString(req.GetPaymentRequestId().GetValue())),
+	)
+
+	section, ok := payerSectionFromProto(req.Section)
+	if !ok {
+		return nil, status.Error(codes.InvalidArgument, "invalid section")
+	}
+
+	limit := maxPageSize
+	if pageSize := req.GetQueryOptions().GetPageSize(); pageSize > 0 && int(pageSize) < limit {
+		limit = int(pageSize)
+	}
+
+	// A token names the request and section it was minted for: one replayed
+	// into another would be a valid position there, so it is refused rather
+	// than resumed.
+	var after *PayerCursor
+	if token := req.GetQueryOptions().GetPagingToken(); token != nil {
+		cursor, ok := decodePayerPageToken(token, req.PaymentRequestId, section)
+		if !ok {
+			return nil, status.Error(codes.InvalidArgument, "invalid paging token")
+		}
+		after = cursor
+	}
+
+	r, err := s.requests.Get(ctx, req.PaymentRequestId)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return &paymentrequestpb.GetPayersResponse{Result: paymentrequestpb.GetPayersResponse_NOT_FOUND}, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure getting payment request")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	canListen, err := s.access.CanListen(ctx, r.ChatID, userID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure determining listener standing")
+		return nil, status.Error(codes.Internal, "")
+	}
+	if !canListen {
+		return &paymentrequestpb.GetPayersResponse{Result: paymentrequestpb.GetPayersResponse_DENIED}, nil
+	}
+
+	page, next := r.PayersPage(section, after, limit)
+	resp := &paymentrequestpb.GetPayersResponse{
+		Result:  paymentrequestpb.GetPayersResponse_OK,
+		Payers:  page,
+		HasMore: next != nil,
+		Version: r.Version,
+	}
+	if next != nil {
+		resp.PagingToken = encodePayerPageToken(req.PaymentRequestId, section, next)
+	}
+	return resp, nil
+}
+
+// payerSectionFromProto maps a request's Payer section onto PayerSection.
+func payerSectionFromProto(section paymentrequestpb.GetPayersRequest_Section) (PayerSection, bool) {
+	switch section {
+	case paymentrequestpb.GetPayersRequest_UNPAID:
+		return PayerSectionUnpaid, true
+	case paymentrequestpb.GetPayersRequest_PAID:
+		return PayerSectionPaid, true
+	default:
+		return 0, false
+	}
+}
+
+// encodePayerPageToken serializes a GetPayers page's resume position, bound to
+// the request and section it pages: the version byte, the section and the
+// request ID, then the cursor (see PayerCursor): in the unpaid section the
+// share's position as a big-endian uint32, and in the paid section paid_at as
+// big-endian Unix seconds and nanoseconds, then the user ID.
+func encodePayerPageToken(id *paymentrequestpb.PaymentRequestId, section PayerSection, cursor *PayerCursor) *commonpb.PagingToken {
+	buf := make([]byte, 0, payerPageTokenPaidLen)
+	buf = append(buf, payerPageTokenVersion, byte(section))
+	buf = append(buf, id.Value...)
+	switch section {
+	case PayerSectionUnpaid:
+		buf = binary.BigEndian.AppendUint32(buf, cursor.Position)
+	case PayerSectionPaid:
+		buf = binary.BigEndian.AppendUint64(buf, uint64(cursor.PaidAt.Unix()))
+		buf = binary.BigEndian.AppendUint32(buf, uint32(cursor.PaidAt.Nanosecond()))
+		buf = append(buf, cursor.UserID...)
+	}
+	return &commonpb.PagingToken{Value: buf}
+}
+
+// decodePayerPageToken parses a token minted for id and section; a malformed
+// token, or one bound to another request or section, is refused.
+func decodePayerPageToken(token *commonpb.PagingToken, id *paymentrequestpb.PaymentRequestId, section PayerSection) (*PayerCursor, bool) {
+	b := token.GetValue()
+	const header = 2 + IDSize
+	if len(b) < header || b[0] != payerPageTokenVersion || b[1] != byte(section) {
+		return nil, false
+	}
+	if !bytes.Equal(b[2:header], id.GetValue()) {
+		return nil, false
+	}
+	rest := b[header:]
+	switch section {
+	case PayerSectionUnpaid:
+		if len(b) != payerPageTokenUnpaidLen {
+			return nil, false
+		}
+		return &PayerCursor{Position: binary.BigEndian.Uint32(rest)}, true
+	case PayerSectionPaid:
+		if len(b) != payerPageTokenPaidLen {
+			return nil, false
+		}
+		nanos := binary.BigEndian.Uint32(rest[8:12])
+		if nanos >= uint32(time.Second) {
+			return nil, false
+		}
+		return &PayerCursor{
+			PaidAt: time.Unix(int64(binary.BigEndian.Uint64(rest[:8])), int64(nanos)).UTC(),
+			UserID: append([]byte(nil), rest[12:]...),
+		}, true
+	default:
+		return nil, false
+	}
+}
+
 // ClosePaymentRequest closes an open request. A request that does not exist is
 // NOT_FOUND, and only its creator may close it (DENIED), whatever their
 // standing in its chat now. Closing a request that is not open, stored final
@@ -729,7 +988,7 @@ func (s *Server) ClosePaymentRequest(ctx context.Context, req *paymentrequestpb.
 	}, nil
 }
 
-// MarkPaid marks a debtor's share paid by hand (PaidShare.Manual). A request
+// MarkPaid marks a debtor's share paid by hand (Paid.Manual). A request
 // that does not exist is NOT_FOUND, only its creator may mark a share
 // (DENIED), and the request must have a share for the user (NOT_A_SHARE). A
 // share already paid, by payment, by hand or from creation, is the no-op OK
@@ -764,9 +1023,9 @@ func (s *Server) MarkPaid(ctx context.Context, req *paymentrequestpb.MarkPaidReq
 	}
 
 	now := s.now()
-	paid := &paymentrequestpb.PaidShare{
+	paid := &paymentrequestpb.Paid{
 		PaidAt: timestamppb.New(now),
-		How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
+		How:    &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}},
 	}
 	r, changed, completed, err := s.requests.PayShare(ctx, req.PaymentRequestId, req.UserId, paid, now)
 	switch {

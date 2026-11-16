@@ -296,9 +296,9 @@ func (e *Executor) recordRequestedPayment(ctx context.Context, record *ocp_task.
 	// before.
 	requestID := requested.GetPaymentRequestId()
 	now := time.Now()
-	r, changed, completed, err := e.requests.PayShare(ctx, requestID, payment.senderUserID, &paymentrequestpb.PaidShare{
+	r, changed, completed, err := e.requests.PayShare(ctx, requestID, payment.senderUserID, &paymentrequestpb.Paid{
 		PaidAt: timestamppb.New(payment.intentRecord.CreatedAt),
-		How: &paymentrequestpb.PaidShare_Intent{
+		How: &paymentrequestpb.Paid_Intent{
 			Intent: &commonpb.IntentId{Value: payment.rawIntentID},
 		},
 	}, now)

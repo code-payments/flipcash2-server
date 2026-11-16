@@ -11,9 +11,10 @@ import (
 	"github.com/code-payments/flipcash2-server/chat"
 )
 
-// TestTextVerdict pins the text a chat takes, including a scheme other than
-// the chat's, which the request's validation keeps from reaching the server
-// today (the proto admits CHAT_KEY_XCHACHA20POLY1305 alone).
+// TestTextVerdict pins the text a chat takes, no text fitting any, including a
+// scheme other than the chat's, which the request's validation keeps from
+// reaching the server today (the proto admits CHAT_KEY_XCHACHA20POLY1305
+// alone).
 func TestTextVerdict(t *testing.T) {
 	plaintext := &paymentrequestpb.Split{Text: &paymentrequestpb.Split_Plaintext{Plaintext: &paymentrequestpb.PaymentRequestText{Title: "Dinner"}}}
 	encrypted := func(scheme paymentrequestpb.EncryptedPaymentRequestText_Scheme) *paymentrequestpb.Split {
@@ -36,6 +37,9 @@ func TestTextVerdict(t *testing.T) {
 		{"private wrong scheme", private, encrypted(paymentrequestpb.EncryptedPaymentRequestText_UNKNOWN), paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_NOT_ALLOWED},
 		{"chat scheme with no request scheme", chat.SpeakerStanding{CanSpeak: true, Encryption: chat.EncryptionRequired}, encrypted(paymentrequestpb.EncryptedPaymentRequestText_CHAT_KEY_XCHACHA20POLY1305), paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_NOT_ALLOWED},
 		{"dm", dm, encrypted(paymentrequestpb.EncryptedPaymentRequestText_CHAT_KEY_XCHACHA20POLY1305), paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_NOT_ALLOWED},
+		// No text fits either kind of group.
+		{"public no text", public, &paymentrequestpb.Split{}, paymentrequestpb.CreatePaymentRequestResponse_OK},
+		{"private no text", private, &paymentrequestpb.Split{}, paymentrequestpb.CreatePaymentRequestResponse_OK},
 	} {
 		result, ok := textVerdict(tc.speaker, tc.split)
 		require.Equal(t, tc.want, result, tc.name)

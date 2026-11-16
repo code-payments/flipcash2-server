@@ -617,21 +617,25 @@ func sharePaymentOf(u *paymentrequestpb.PaymentRequestUpdate) *paymentrequestpb.
 	return u.GetUpdates().GetUpdates()[0].GetSharePaymentUpdate().GetShare()
 }
 
-// requireSharePaymentUpdate asserts that u is the change of r's share of userID being
-// paid, at version, as stored names it, and, when completed, the request's
-// completion after it at stored's ClosedAt; and nothing else.
+// requireSharePaymentUpdate asserts that u is the change of r's share of
+// userID being paid, at version, as stored names it: the share, userID's Payer
+// and the request's PayerSummary as they now stand and, when completed, the
+// request's completion after them at stored's ClosedAt; and nothing else.
 func requireSharePaymentUpdate(t *testing.T, u *paymentrequestpb.PaymentRequestUpdate, stored *paymentrequest.PaymentRequest, userID *commonpb.UserId, completed bool) {
 	changes := u.GetUpdates()
 	require.NotNil(t, changes)
 	assert.Equal(t, stored.Version, changes.Version)
-	want := 1
+	want := 3
 	if completed {
-		want = 2
+		want = 4
 	}
 	require.Len(t, changes.Updates, want)
 	assert.True(t, proto.Equal(stored.Share(userID), changes.Updates[0].GetSharePaymentUpdate().GetShare()))
+	assert.True(t, proto.Equal(stored.Payer(userID), changes.Updates[1].GetPayerUpdate().GetPayer()))
+	assert.NotNil(t, changes.Updates[1].GetPayerUpdate().GetPayer().GetPaid())
+	assert.True(t, proto.Equal(stored.PayerSummary(), changes.Updates[2].GetPayerSummaryUpdate().GetPayerSummary()))
 	if completed {
-		status := changes.Updates[1].GetStatusUpdate()
+		status := changes.Updates[3].GetStatusUpdate()
 		require.NotNil(t, status)
 		assert.Equal(t, paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_COMPLETED, status.Status)
 		assert.True(t, stored.ClosedAt.Equal(status.ClosedAt.AsTime()))
@@ -1467,9 +1471,9 @@ func TestExecutor_RecordRequestedPayment_PaidByHand(t *testing.T) {
 
 	intentRecord, rawIntentID := e.payShare(t, r, payerKeys, creatorKeys)
 
-	manual := &paymentrequestpb.PaidShare{
+	manual := &paymentrequestpb.Paid{
 		PaidAt: timestamppb.Now(),
-		How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
+		How:    &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}},
 	}
 	marked, changed, _, err := e.requests.PayShare(e.ctx, r.ID, payerUserID, manual, time.Now())
 	require.NoError(t, err)

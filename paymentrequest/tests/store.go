@@ -26,6 +26,7 @@ func RunStoreTests(t *testing.T, s paymentrequest.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, s paymentrequest.Store){
 		testStore_CreateAndGet,
 		testStore_Create_Exists,
+		testStore_Create_NoText,
 		testStore_PaymentIntentIDs,
 		testStore_GetChatPage_Open,
 		testStore_GetChatPage_Resolved,
@@ -112,6 +113,31 @@ func testStore_Create_Exists(t *testing.T, s paymentrequest.Store) {
 	got, err := s.Get(ctx, r.ID)
 	require.NoError(t, err)
 	requireRequestEqual(t, r, got)
+}
+
+// testStore_Create_NoText pins a split with no text, which the proto allows:
+// stored and read back with its text still unset, and paid like any other.
+func testStore_Create_NoText(t *testing.T, s paymentrequest.Store) {
+	ctx := context.Background()
+
+	r, debtors := newRequest(chat.MustGenerateGroupChatID(), time.Now().Add(time.Hour), 1)
+	r.Split.Text = nil
+	require.NoError(t, s.Create(ctx, r))
+
+	got, err := s.Get(ctx, r.ID)
+	require.NoError(t, err)
+	requireRequestEqual(t, r, got)
+	require.Nil(t, got.Split.Text)
+
+	paid, changed, completed, err := s.PayShare(ctx, r.ID, debtors[0], manualPaid(time.Now()), time.Now())
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.True(t, completed)
+	require.Nil(t, paid.Split.Text)
+	got, err = s.Get(ctx, r.ID)
+	require.NoError(t, err)
+	require.Nil(t, got.Split.Text)
+	require.EqualValues(t, 2, got.Version)
 }
 
 func testStore_GetChatPage_Open(t *testing.T, s paymentrequest.Store) {
@@ -266,7 +292,7 @@ func testStore_PayShare_Manual(t *testing.T, s paymentrequest.Store) {
 	require.Equal(t, paymentrequest.StatusOpen, got.Status)
 	require.True(t, proto.Equal(payment, got.Share(debtors[0]).Paid))
 
-	for _, again := range []*paymentrequestpb.PaidShare{manualPaid(now.Add(2 * time.Minute)), intentPaid(r, debtors[0], now.Add(2*time.Minute))} {
+	for _, again := range []*paymentrequestpb.Paid{manualPaid(now.Add(2 * time.Minute)), intentPaid(r, debtors[0], now.Add(2*time.Minute))} {
 		got, changed, _, err = s.PayShare(ctx, r.ID, debtors[0], again, now.Add(2*time.Minute))
 		require.NoError(t, err)
 		require.False(t, changed)
@@ -291,7 +317,7 @@ func testStore_PayShare_Manual(t *testing.T, s paymentrequest.Store) {
 	// is paid or not: one no share's, and one another share's.
 	for _, wrong := range []struct {
 		debtor *commonpb.UserId
-		paid   *paymentrequestpb.PaidShare
+		paid   *paymentrequestpb.Paid
 	}{
 		{debtors[0], otherIntentPaid(now)},
 		{debtors[1], otherIntentPaid(now)},
@@ -309,11 +335,11 @@ func testStore_PayShare_Manual(t *testing.T, s paymentrequest.Store) {
 	require.ErrorIs(t, err, paymentrequest.ErrNotFound)
 
 	// A share is never paid as the creator's, nor without saying how or when.
-	for _, invalid := range []*paymentrequestpb.PaidShare{
-		{PaidAt: timestamppb.New(now), How: &paymentrequestpb.PaidShare_Creator_{Creator: &paymentrequestpb.PaidShare_Creator{}}},
+	for _, invalid := range []*paymentrequestpb.Paid{
+		{PaidAt: timestamppb.New(now), How: &paymentrequestpb.Paid_Creator_{Creator: &paymentrequestpb.Paid_Creator{}}},
 		{PaidAt: timestamppb.New(now)},
-		{How: &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}}},
-		{PaidAt: timestamppb.New(now), How: &paymentrequestpb.PaidShare_Intent{Intent: &commonpb.IntentId{}}},
+		{How: &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}}},
+		{PaidAt: timestamppb.New(now), How: &paymentrequestpb.Paid_Intent{Intent: &commonpb.IntentId{}}},
 		nil,
 	} {
 		_, _, _, err = s.PayShare(ctx, r.ID, debtors[1], invalid, now)
@@ -994,28 +1020,28 @@ func newID() *paymentrequestpb.PaymentRequestId {
 	return paymentrequest.MustDeriveID(model.MustGenerateUserID(), &paymentrequestpb.IdempotencyKey{Value: model.MustGenerateUserID().Value})
 }
 
-func manualPaid(at time.Time) *paymentrequestpb.PaidShare {
-	return &paymentrequestpb.PaidShare{
+func manualPaid(at time.Time) *paymentrequestpb.Paid {
+	return &paymentrequestpb.Paid{
 		PaidAt: timestamppb.New(at),
-		How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
+		How:    &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}},
 	}
 }
 
 // intentPaid is debtor's share of r paid at at by the intent that share's
 // payment must use (see paymentrequest.ValidatePaymentIntent).
-func intentPaid(r *paymentrequest.PaymentRequest, debtor *commonpb.UserId, at time.Time) *paymentrequestpb.PaidShare {
+func intentPaid(r *paymentrequest.PaymentRequest, debtor *commonpb.UserId, at time.Time) *paymentrequestpb.Paid {
 	return paidByIntent(r.PaymentIntentID(debtor), at)
 }
 
 // otherIntentPaid is a share paid at at by an intent that is no share's.
-func otherIntentPaid(at time.Time) *paymentrequestpb.PaidShare {
+func otherIntentPaid(at time.Time) *paymentrequestpb.Paid {
 	return paidByIntent(model.MustGenerateKeyPair().Public(), at)
 }
 
-func paidByIntent(intentID []byte, at time.Time) *paymentrequestpb.PaidShare {
-	return &paymentrequestpb.PaidShare{
+func paidByIntent(intentID []byte, at time.Time) *paymentrequestpb.Paid {
+	return &paymentrequestpb.Paid{
 		PaidAt: timestamppb.New(at),
-		How:    &paymentrequestpb.PaidShare_Intent{Intent: &commonpb.IntentId{Value: append([]byte(nil), intentID...)}},
+		How:    &paymentrequestpb.Paid_Intent{Intent: &commonpb.IntentId{Value: append([]byte(nil), intentID...)}},
 	}
 }
 

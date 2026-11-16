@@ -312,7 +312,7 @@ func (s *store) GetChatPage(ctx context.Context, chatID *commonpb.ChatId, sectio
 	}
 }
 
-func (s *store) PayShare(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.PaidShare, now time.Time) (*paymentrequest.PaymentRequest, bool, bool, error) {
+func (s *store) PayShare(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.Paid, now time.Time) (*paymentrequest.PaymentRequest, bool, bool, error) {
 	if err := paymentrequest.ValidatePaidShare(paid); err != nil {
 		return nil, false, false, err
 	}
@@ -344,7 +344,7 @@ func (s *store) PayShare(ctx context.Context, id *paymentrequestpb.PaymentReques
 		}
 
 		readVersion, readStatus := r.Version, r.Status
-		share.Paid = proto.Clone(paid).(*paymentrequestpb.PaidShare)
+		share.Paid = proto.Clone(paid).(*paymentrequestpb.Paid)
 		r.Version++
 		details, err := proto.Marshal(r.Split)
 		if err != nil {

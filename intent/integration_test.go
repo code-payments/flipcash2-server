@@ -1664,13 +1664,13 @@ func TestIntegration_AllowCreation_RequestedPayment(t *testing.T) {
 	})
 
 	t.Run("denied_share_already_paid", func(t *testing.T) {
-		for _, how := range []func(r *paymentrequest.PaymentRequest) *paymentrequestpb.PaidShare{
-			func(*paymentrequest.PaymentRequest) *paymentrequestpb.PaidShare {
-				return &paymentrequestpb.PaidShare{PaidAt: timestamppb.Now(), How: &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}}}
+		for _, how := range []func(r *paymentrequest.PaymentRequest) *paymentrequestpb.Paid{
+			func(*paymentrequest.PaymentRequest) *paymentrequestpb.Paid {
+				return &paymentrequestpb.Paid{PaidAt: timestamppb.Now(), How: &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}}}
 			},
 			// The store records a payment by the share's own intent alone.
-			func(r *paymentrequest.PaymentRequest) *paymentrequestpb.PaidShare {
-				return &paymentrequestpb.PaidShare{PaidAt: timestamppb.Now(), How: &paymentrequestpb.PaidShare_Intent{Intent: &commonpb.IntentId{Value: r.PaymentIntentID(payerUserID)}}}
+			func(r *paymentrequest.PaymentRequest) *paymentrequestpb.Paid {
+				return &paymentrequestpb.Paid{PaidAt: timestamppb.Now(), How: &paymentrequestpb.Paid_Intent{Intent: &commonpb.IntentId{Value: r.PaymentIntentID(payerUserID)}}}
 			},
 		} {
 			r := newRequest()
@@ -1698,9 +1698,9 @@ func TestIntegration_AllowCreation_RequestedPayment(t *testing.T) {
 		// Every share paid: the payer's own is paid, so the payment fails on
 		// the request's status first.
 		completed := e.putRequest(t, groupID, creatorUserID, "usd", endsAt, requestShare{payerUserID, 1.0})
-		completedNow, changed, _, err := e.requests.PayShare(e.ctx, completed.ID, payerUserID, &paymentrequestpb.PaidShare{
+		completedNow, changed, _, err := e.requests.PayShare(e.ctx, completed.ID, payerUserID, &paymentrequestpb.Paid{
 			PaidAt: timestamppb.Now(),
-			How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
+			How:    &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}},
 		}, time.Now())
 		require.NoError(t, err)
 		require.True(t, changed)

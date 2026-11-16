@@ -44,12 +44,15 @@ type ObjectStorage interface {
 	UploadExists(ctx context.Context, key string) (bool, error)
 
 	// CopyToOrigin copies a validated object from the UPLOAD store to the ORIGIN
-	// store under the same key, making it servable through the CDN. It overwrites
-	// any object already served under the key, so it is safe to call more than
-	// once. The upload copy is intentionally left in place — the caller removes it
-	// with DeleteUpload only after the blob's terminal state is durably recorded,
-	// so an interrupted finalization is always replayable from the upload bytes.
-	CopyToOrigin(ctx context.Context, key string) error
+	// store under the same key, making it servable through the CDN. Like
+	// PutOrigin, it pins the content type (the blob's declared, immutable type)
+	// and the origin caching headers on the copy, rather than inheriting whatever
+	// the upload carried. It overwrites any object already served under the key,
+	// so it is safe to call more than once. The upload copy is intentionally left
+	// in place — the caller removes it with DeleteUpload only after the blob's
+	// terminal state is durably recorded, so an interrupted finalization is always
+	// replayable from the upload bytes.
+	CopyToOrigin(ctx context.Context, key, mimeType string) error
 
 	// PutOrigin writes server-derived bytes directly into the ORIGIN store under
 	// the given key, pinning the content type so the CDN serves them correctly. It

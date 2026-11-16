@@ -73,7 +73,7 @@ func (s *Storage) UploadExists(_ context.Context, key string) (bool, error) {
 	return ok, nil
 }
 
-func (s *Storage) CopyToOrigin(_ context.Context, key string) error {
+func (s *Storage) CopyToOrigin(_ context.Context, key, _ string) error {
 	s.Lock()
 	defer s.Unlock()
 

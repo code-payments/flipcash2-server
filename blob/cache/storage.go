@@ -98,8 +98,8 @@ func (c *StorageCache) UploadExists(ctx context.Context, key string) (bool, erro
 	return c.storage.UploadExists(ctx, key)
 }
 
-func (c *StorageCache) CopyToOrigin(ctx context.Context, key string) error {
-	return c.storage.CopyToOrigin(ctx, key)
+func (c *StorageCache) CopyToOrigin(ctx context.Context, key, mimeType string) error {
+	return c.storage.CopyToOrigin(ctx, key, mimeType)
 }
 
 func (c *StorageCache) PutOrigin(ctx context.Context, key, mimeType string, data []byte) error {

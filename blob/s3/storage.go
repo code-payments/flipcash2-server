@@ -41,6 +41,16 @@ import (
 const (
 	sigV4Algorithm = "AWS4-HMAC-SHA256"
 	s3Service      = "s3"
+
+	// originCacheControl is the Cache-Control every object in the origin bucket
+	// is written with. Origin objects are immutable: a key names one blob (or one
+	// of its renditions) by id, is only ever rewritten with the same bytes by a
+	// replayed finalization, and is never deleted. So both CloudFront and clients
+	// may cache them for a year without revalidating. "public" is what lets
+	// CloudFront's shared cache keep them (it does not cache "private"); access
+	// control stays with the signed URL, which CloudFront checks on every request,
+	// cache hit or not.
+	originCacheControl = "public, max-age=31536000, immutable"
 )
 
 // Config configures the two-bucket S3 + CloudFront backend.
@@ -272,15 +282,20 @@ func (s *Storage) UploadExists(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
-func (s *Storage) CopyToOrigin(ctx context.Context, key string) error {
+func (s *Storage) CopyToOrigin(ctx context.Context, key, mimeType string) error {
 	// Copy the validated bytes from the upload bucket into the origin bucket
 	// under the same key. CopySource is "<bucket>/<key>"; blob keys are hex, so
 	// no escaping is required. CopyObject overwrites the destination, so it is
-	// safe to repeat.
+	// safe to repeat. The REPLACE directive sets the origin object's headers
+	// here rather than copying the upload's; it drops every header not named, so
+	// the content type is restated alongside the caching header.
 	_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:     aws.String(s.cfg.OriginBucket),
-		Key:        aws.String(key),
-		CopySource: aws.String(s.cfg.UploadBucket + "/" + key),
+		Bucket:            aws.String(s.cfg.OriginBucket),
+		Key:               aws.String(key),
+		CopySource:        aws.String(s.cfg.UploadBucket + "/" + key),
+		MetadataDirective: s3types.MetadataDirectiveReplace,
+		ContentType:       aws.String(mimeType),
+		CacheControl:      aws.String(originCacheControl),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to copy object to origin bucket: %w", err)
@@ -294,10 +309,11 @@ func (s *Storage) PutOrigin(ctx context.Context, key, mimeType string, data []by
 	// original, so there is nothing to quarantine. PutObject overwrites, so a
 	// replayed finalization re-putting the same rendition is a no-op.
 	if _, err := s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(s.cfg.OriginBucket),
-		Key:         aws.String(key),
-		Body:        bytes.NewReader(data),
-		ContentType: aws.String(mimeType),
+		Bucket:       aws.String(s.cfg.OriginBucket),
+		Key:          aws.String(key),
+		Body:         bytes.NewReader(data),
+		ContentType:  aws.String(mimeType),
+		CacheControl: aws.String(originCacheControl),
 	}); err != nil {
 		return fmt.Errorf("failed to put object to origin bucket: %w", err)
 	}

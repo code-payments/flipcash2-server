@@ -122,7 +122,7 @@ func (f *Finalizer) finalizeEncrypted(ctx context.Context, record *Blob) (blobpb
 		if uint64(len(data)) != record.SizeBytes {
 			return f.reject(ctx, record, &RejectionMetadata{Reason: RejectionReasonTooLarge})
 		}
-		if err := f.storage.CopyToOrigin(ctx, record.StorageKey); err != nil {
+		if err := f.storage.CopyToOrigin(ctx, record.StorageKey, record.MimeType); err != nil {
 			return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
 		}
 		advanced, err := f.blobs.Advance(ctx, record.ID, StatePromoted, nil)
@@ -262,7 +262,7 @@ func (f *Finalizer) finalizeImage(ctx context.Context, record *Blob) (blobpb.Blo
 	// Copy the original's bytes into the origin store, then checkpoint
 	// StatePromoted. This is the durable source renditions will be derived from.
 	if state < StatePromoted {
-		if err := f.storage.CopyToOrigin(ctx, record.StorageKey); err != nil {
+		if err := f.storage.CopyToOrigin(ctx, record.StorageKey, record.MimeType); err != nil {
 			return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
 		}
 		advanced, err := f.blobs.Advance(ctx, record.ID, StatePromoted, nil)

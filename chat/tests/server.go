@@ -6597,8 +6597,10 @@ func (e *serverEnv) putTeamPrivateGroup(title string) *commonpb.ChatId {
 // testServer_TeamPrivateGroup pins a private group the team account created
 // for a user: it has its key from its creation, though the team stores no
 // envelope, so the user speaks in it as a member of any keyed group, silence
-// included; it has no lobby, so a non-member is DENIED entry; and every
-// creator-only RPC stays refused to the user, who is not its creator.
+// included; it has no lobby, so a non-member is DENIED entry; every
+// creator-only RPC stays refused to the user, who is not its creator; and the
+// user may leave it like any private group, for good, since nothing lets them
+// back in.
 func testServer_TeamPrivateGroup(t *testing.T, s chat.Store) {
 	e := newServerEnv(t, s)
 	strangerID, strangerKeys := e.addBoundUser("Stranger")
@@ -6639,21 +6641,44 @@ func testServer_TeamPrivateGroup(t *testing.T, s chat.Store) {
 	joined := e.mustJoinChat(strangerKeys, chatID)
 	require.Equal(t, chatpb.JoinChatResponse_DENIED, joined.Result)
 
-	// Nor is it left: the user stays a member, with their envelope, and a
-	// non-member is refused too rather than answered with the no-op.
-	require.Equal(t, chatpb.LeaveChatResponse_DENIED, e.mustLeaveChat(e.keys, chatID).Result)
-	isMember, err := s.IsMember(e.ctx, chatID, e.userID)
-	require.NoError(t, err)
-	require.True(t, isMember)
-	_, err = s.GetKeyEnvelope(e.ctx, chatID, e.userID)
-	require.NoError(t, err)
-	require.Equal(t, chatpb.LeaveChatResponse_DENIED, e.mustLeaveChat(strangerKeys, chatID).Result)
-
 	// A silence, set as the creator would set it, still takes speech.
 	_, _, err = s.SetSilence(e.ctx, chatID, e.userID, chat.Silence{Forever: true}, time.Now())
 	require.NoError(t, err)
 	resp = e.getMentionSuggestions(e.keys, chatID)
 	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, resp.Result)
+
+	// A non-member's leave is the ordinary no-op.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(strangerKeys, chatID).Result)
+	e.requireNoRosterUpdates(strangerID, chatID)
+
+	// The user may leave it, as any member but the creator leaves a private
+	// group: they are no longer a member, their envelope goes with them, the
+	// departure is announced, and the group leaves their feed.
+	require.Len(t, e.mustGetGroupFeed(nil).Chats, 1)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	e.waitForRosterUpdates(e.userID, chatID, 1)
+	isMember, err := s.IsMember(e.ctx, chatID, e.userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	_, err = s.GetKeyEnvelope(e.ctx, chatID, e.userID)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_DENIED, e.mustGetKeyEnvelope(e.keys, chatID).Result)
+	left := e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, left.Result)
+	require.Nil(t, left.Metadata.ViewerState)
+	require.Empty(t, e.mustGetGroupFeed(nil).Chats)
+
+	// Leaving again is the no-op, announcing nothing more.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	time.Sleep(100 * time.Millisecond)
+	require.Len(t, e.rosterUpdatesOnUserTopic(e.userID, chatID), 1)
+
+	// And it is for good: with no lobby and no invite, there is no way back.
+	require.Equal(t, chatpb.EnterLobbyResponse_DENIED, e.enterLobby(e.keys, chatID).Result)
+	require.Equal(t, chatpb.JoinChatResponse_DENIED, e.mustJoinChat(e.keys, chatID).Result)
+	isMember, err = s.IsMember(e.ctx, chatID, e.userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
 
 	// The exception is the team's alone. The store refuses the same group
 	// created by anyone else, who must store an envelope of their own with

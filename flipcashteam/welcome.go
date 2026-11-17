@@ -249,7 +249,13 @@ func (w *GroupWelcomer) OnFirstUsername(ctx context.Context, userID *commonpb.Us
 	go func() {
 		defer cancel()
 
-		if _, _, err := SendWelcomeGroupV4(ctx, w.chats, w.accounts, w.sender, w.cfg, userID); err != nil {
+		_, _, err := SendWelcomeGroupV4(ctx, w.chats, w.accounts, w.sender, w.cfg, userID)
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrLeftWelcomeGroup):
+			// A user who has left their welcome group is sent nothing more.
+			log.Debug("User has left their welcome group")
+		default:
 			log.Warn("Failed to send welcome group", zap.Error(err))
 		}
 	}()

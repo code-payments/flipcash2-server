@@ -284,6 +284,43 @@ func TestSendWelcomeGroupMessages_ExistingGroup(t *testing.T) {
 	require.True(t, stillEnvelope.Equal(envelope))
 }
 
+// TestSendWelcomeGroupMessages_UserLeft: once the user has left their welcome
+// group, which they can never rejoin, nothing more is sent there: a new send,
+// a replay of the welcome, and a send whose lookup misses the group and falls
+// through to a create that finds it all return ErrLeftWelcomeGroup, with
+// nothing stored or pushed.
+func TestSendWelcomeGroupMessages_UserLeft(t *testing.T) {
+	e := newGroupEnv(t)
+
+	chatID, sent, err := e.sendWelcome()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return e.pusher.pushedTo(e.user) == len(sent) }, time.Second, 10*time.Millisecond)
+
+	// The user leaves, as chat.Server.LeaveChat makes the departure.
+	changed, _, err := e.chats.RemoveGroupMember(e.ctx, chatID, e.user, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	_, _, err = flipcashteam.SendWelcomeGroupMessages(e.ctx, e.chats, e.accounts, e.sender, e.cfg, e.user, "follow-up", []*messagingpb.Content{text("again")})
+	require.ErrorIs(t, err, flipcashteam.ErrLeftWelcomeGroup)
+	_, _, err = e.sendWelcome()
+	require.ErrorIs(t, err, flipcashteam.ErrLeftWelcomeGroup)
+	stale := &createCountingStore{Store: e.chats, staleReads: true}
+	_, _, err = flipcashteam.SendWelcomeGroupMessages(e.ctx, stale, e.accounts, e.sender, e.cfg, e.user, "stale", []*messagingpb.Content{text("still")})
+	require.ErrorIs(t, err, flipcashteam.ErrLeftWelcomeGroup)
+
+	// Nothing new was stored or pushed, and the user was not put back.
+	stored, err := e.messages.GetMessages(e.ctx, chatID)
+	require.NoError(t, err)
+	require.Len(t, stored, len(sent))
+	require.Never(t, func() bool { return len(e.pusher.snapshot()) > len(sent) }, 200*time.Millisecond, 10*time.Millisecond)
+	isMember, err := e.chats.IsMember(e.ctx, chatID, e.user)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	_, err = e.chats.GetKeyEnvelope(e.ctx, chatID, e.user)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+}
+
 // TestSendWelcomeGroupV4_CreatedElsewhere: a group already written under the
 // welcome group's ID is sent into as it stands, never rewritten, and is not an
 // error.

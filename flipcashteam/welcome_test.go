@@ -8,7 +8,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest"
+	"go.uber.org/zap/zaptest/observer"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
@@ -332,6 +334,29 @@ func TestGroupWelcomer(t *testing.T) {
 	// The DM welcome is not sent.
 	_, err = e.chats.GetChatByID(e.ctx, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user))
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
+}
+
+// TestGroupWelcomer_UserLeft: a user who has already left their welcome group
+// is sent nothing, and that is expected, logged at Debug rather than as a
+// failure.
+func TestGroupWelcomer_UserLeft(t *testing.T) {
+	e := newWelcomerEnv(t)
+	core, logs := observer.New(zapcore.DebugLevel)
+	welcomer, err := flipcashteam.NewGroupWelcomer(e.ctx, zap.New(core), e.chats, e.accounts, e.profiles, e.integration, e.sender, e.cfg)
+	require.NoError(t, err)
+
+	chatID, _, err := flipcashteam.SendWelcomeGroupMessages(e.ctx, e.chats, e.accounts, e.sender, e.cfg, e.user, "earlier", []*messagingpb.Content{text("hi")})
+	require.NoError(t, err)
+	_, _, err = e.chats.RemoveGroupMember(e.ctx, chatID, e.user, true)
+	require.NoError(t, err)
+
+	welcomer.OnFirstUsername(withUserAgent(t, e.ctx, "Flipcash/iOS/2026.10.3"), e.user, "alice_1")
+
+	require.Eventually(t, func() bool {
+		return logs.FilterMessage("User has left their welcome group").FilterLevelExact(zapcore.DebugLevel).Len() == 1
+	}, time.Second, 10*time.Millisecond)
+	require.Zero(t, logs.FilterLevelExact(zapcore.WarnLevel).Len())
+	require.Equal(t, 1, e.welcomeGroupMessages(t))
 }
 
 // TestGroupWelcomer_MinClientVersion: a welcome goes only to a user whose

@@ -39,10 +39,12 @@ import (
 // Every user has exactly one welcome group, ever: its ID is derived from the
 // team and the user alone (see welcomeGroupID), so every send into it, whatever
 // it is for, finds the same group, and the first creates it (see
-// ensureWelcomeGroup). A group the team creates is keyed and fixed from its
-// creation (see chat.Access): the user speaks there under the chat key like a
-// member of any keyed private group, but cannot leave it, and it has no lobby,
-// so no one else joins it.
+// ensureWelcomeGroup). A group the team creates is keyed from its creation
+// (see chat.Access): the user speaks there under the chat key like a member of
+// any keyed private group, and it has no lobby, so no one else joins it. The
+// user may leave it, as any member who is not the creator may leave a private
+// group, and that is final: with no lobby and no invite, they can never
+// return, so nothing more is sent there (see ErrLeftWelcomeGroup).
 //
 // This is the one place the server writes encrypted content and holds a
 // group's chat key, an exception to the rule that the server never reads
@@ -66,6 +68,11 @@ import (
 // stream's next membership reconcile, or when the client next fetches its
 // feed. The push for each message (see messaging.Sender.SendBatch) is what
 // tells the user at once.
+
+// ErrLeftWelcomeGroup is returned by SendWelcomeGroupMessages when the user
+// has left their welcome group, which they can never rejoin, so nothing more
+// is sent there.
+var ErrLeftWelcomeGroup = errors.New("user has left their welcome group")
 
 // WelcomeGroupTitle is the title of every welcome group.
 const WelcomeGroupTitle = "Welcome Party"
@@ -235,6 +242,15 @@ func welcomeGroupID(teamUserID, userID *commonpb.UserId) *commonpb.ChatId {
 // key to wrap their copy of the chat key to, the last only when the group is
 // still to be created.
 //
+// A user who has left the group (see chat.Server.LeaveChat) is sent nothing:
+// it returns ErrLeftWelcomeGroup, since they can never return to read it.
+// Membership is read, strongly consistent (see chat.Store.IsMember), whenever
+// the group already existed, and not when this call has just created it, with
+// the user as a member. A leave racing a send, landing between that read and
+// the write, can still put the messages in a group the user can no longer
+// read, which is harmless: their copy of the chat key left with them, and
+// they never see the messages.
+//
 // It is idempotent on (the group, idempotencyKey) exactly as SendDmMessages is
 // on (the chat, idempotencyKey): the client message IDs are derived from the
 // pair and each message's position (see clientMessageID), so a retry returns
@@ -242,7 +258,8 @@ func welcomeGroupID(teamUserID, userID *commonpb.UserId) *commonpb.ChatId {
 // under a fresh nonce, but what it would send is never written: the store
 // answers a replay with the messages it holds and ignores what the retry
 // carries (see messaging.Store.PutMessages). The key is the messages' own,
-// not the group's, which is the same for every send.
+// not the group's, which is the same for every send. A retry after the user
+// has left returns ErrLeftWelcomeGroup rather than what the first call sent.
 func SendWelcomeGroupMessages(
 	ctx context.Context,
 	chats chat.Store,
@@ -280,8 +297,18 @@ func SendWelcomeGroupMessages(
 		return nil, nil, err
 	}
 
-	if err := ensureWelcomeGroup(ctx, chats, accounts, cfg, chatID, groupKey, teamUserID, userID); err != nil {
+	created, err := ensureWelcomeGroup(ctx, chats, accounts, cfg, chatID, groupKey, teamUserID, userID)
+	if err != nil {
 		return nil, nil, err
+	}
+	if !created {
+		isMember, err := chats.IsMember(ctx, chatID, userID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to check membership: %w", err)
+		}
+		if !isMember {
+			return nil, nil, ErrLeftWelcomeGroup
+		}
 	}
 
 	outgoing := make([]messaging.OutgoingMessage, len(messages))
@@ -323,9 +350,12 @@ func SendWelcomeGroupV4(
 }
 
 // ensureWelcomeGroup creates userID's welcome group chatID, with groupKey as
-// its chat key, unless it already exists. An earlier send into it, or a prior
-// attempt of this one, may have created it, so an existing group is expected,
-// not a failure.
+// its chat key, unless it already exists, and reports whether this call
+// created it. An earlier send into it, or a prior attempt of this one, may
+// have created it, so an existing group is expected, not a failure; whether
+// the user is still in it is the caller's to ask (see
+// SendWelcomeGroupMessages), since only a group this call created is known
+// to have them.
 //
 // The group is looked up before it is created, as ensureDm looks up a DM and
 // for the same reason: a create that finds the group there is a cancelled
@@ -349,25 +379,25 @@ func ensureWelcomeGroup(
 	chatID *commonpb.ChatId,
 	groupKey []byte,
 	teamUserID, userID *commonpb.UserId,
-) error {
+) (bool, error) {
 	_, err := chats.GetChatByID(ctx, chatID)
 	if err == nil {
-		return nil
+		return false, nil
 	}
 	if !errors.Is(err, chat.ErrChatNotFound) {
-		return fmt.Errorf("failed to get chat: %w", err)
+		return false, fmt.Errorf("failed to get chat: %w", err)
 	}
 
 	keys, err := accounts.GetPubKeys(ctx, userID)
 	if err != nil {
-		return fmt.Errorf("failed to get user's public keys: %w", err)
+		return false, fmt.Errorf("failed to get user's public keys: %w", err)
 	}
 	if len(keys) == 0 {
-		return fmt.Errorf("user %s has no public key", model.UserIDString(userID))
+		return false, fmt.Errorf("user %s has no public key", model.UserIDString(userID))
 	}
 	envelope, err := wrapGroupKey(cfg.TeamKeyPair, teamUserID, keys[0], chatID, groupKey)
 	if err != nil {
-		return fmt.Errorf("failed to wrap chat key: %w", err)
+		return false, fmt.Errorf("failed to wrap chat key: %w", err)
 	}
 
 	err = chats.PutPrivateGroup(ctx, &chat.Chat{
@@ -380,8 +410,11 @@ func ensureWelcomeGroup(
 		ProfilePictureBlobID: cfg.ProfilePictureBlobID,
 		LastActivity:         time.Now().UTC(),
 	}, []chat.MemberKeyEnvelope{{UserID: userID, Envelope: envelope}})
-	if err != nil && !errors.Is(err, chat.ErrChatExists) {
-		return fmt.Errorf("failed to create chat: %w", err)
+	switch {
+	case errors.Is(err, chat.ErrChatExists):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("failed to create chat: %w", err)
 	}
-	return nil
+	return true, nil
 }

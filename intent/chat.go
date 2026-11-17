@@ -54,9 +54,9 @@ const (
 	// messaging.Sender.RecordBoost).
 	TaskTypeRecordReactionBoost uint32 = 4
 
-	// TaskTypeRecordRequestedPayment is the task that marks a payment
-	// request's share paid by a requested payment and injects its cash
-	// message into the group.
+	// TaskTypeRecordRequestedPayment is the task that records a requested
+	// payment against its payment request (a split's share paid, or a
+	// collection's contribution) and injects its cash message into the group.
 	TaskTypeRecordRequestedPayment uint32 = 5
 
 	// TaskTypeSendReturnPaymentMessage is the task that marks the returned
@@ -116,9 +116,9 @@ func NewRecordReactionBoostTask(intentRecord *ocp_intent.Record) *ocp_task.Recor
 	}
 }
 
-// NewRecordRequestedPaymentTask creates the task that marks a payment
-// request's share paid after a requested payment, and injects its cash
-// message into the group. Only the intent ID is carried, via the reference ID;
+// NewRecordRequestedPaymentTask creates the task that records a requested
+// payment against its payment request (a split's share paid, or a
+// collection's contribution), and injects its cash message into the group. Only the intent ID is carried, via the reference ID;
 // the executor reloads the authoritative intent record at execution time.
 func NewRecordRequestedPaymentTask(intentRecord *ocp_intent.Record) *ocp_task.Record {
 	intentID := intentRecord.IntentId
@@ -191,8 +191,9 @@ func GetReactionBoost(appMetadata []byte) *intentpb.ChatMetadata_ReactionBoost {
 	return GetChatMetadata(appMetadata).GetReactionBoost()
 }
 
-// GetRequestedPayment extracts the requested payment, a payment of the payer's
-// share of a payment request, from app metadata, if present. It returns nil
+// GetRequestedPayment extracts the requested payment, a payment into a payment
+// request (a split's share, or a collection's contribution), from app
+// metadata, if present. It returns nil
 // when there is no app metadata, the metadata fails to decode, or it is not a
 // requested payment.
 func GetRequestedPayment(appMetadata []byte) *intentpb.ChatMetadata_RequestedPayment {
@@ -569,14 +570,15 @@ func (i *Integration) validateGroupAppMetadata(ctx context.Context, intentRecord
 }
 
 // validateRequestedPaymentAppMetadata enforces that a SendPublicPayment
-// carrying chat app metadata is a well-formed requested payment: a payment by
-// a debtor of a payment request of their own unpaid share, exactly, to the
-// request's creator. The task it schedules marks the share paid and posts one
-// cash message into the group as the payer, through the messaging Sender,
-// which no rule gates, so every gate is applied here, before any money moves,
-// rather than by the task, which could only drop the record of a payment
-// already made. A multi payment never carries one (see AllowCreation): a
-// share is paid to one person.
+// carrying chat app metadata is a well-formed requested payment: a payment
+// into a payment request, exactly what it asks, to the request's creator. For
+// a split, that is a debtor paying their own unpaid share; for a collection,
+// a payer contributing its fixed amount, once. The task it schedules records
+// the payment against the request and posts one cash message into the group
+// as the payer, through the messaging Sender, which no rule gates, so every
+// gate is applied here, before any money moves, rather than by the task,
+// which could only drop the record of a payment already made. A multi payment
+// never carries one (see AllowCreation): a request pays one person.
 //
 // The checks, in order:
 //   - the chat ID is a group's (a validation error otherwise);
@@ -584,39 +586,47 @@ func (i *Integration) validateGroupAppMetadata(ctx context.Context, intentRecord
 //   - the payer is a Flipcash user;
 //   - the request exists and was made in that group;
 //   - the request is open as of now (paymentrequest.PaymentRequest.IsOpenAt:
-//     not completed, closed, or past its ends_at);
-//   - the payer holds a share of the request, and it is unpaid (the creator's
-//     own share is paid from creation, so the creator never passes);
-//   - the intent's ID is the one the request holds for the payer's share
-//     (paymentrequest.PaymentRequest.PaymentIntentIDs). OCP stores an intent
-//     ID at most once, in the transaction that moves the money, so this is
-//     what makes a share payable at most once: two payments of it, however
-//     close together, cannot both commit, which the unpaid check alone,
-//     read before either commits and before either's task marks the share,
-//     cannot promise;
+//     not completed, closed, or past its ends_at, if it has one; a collection
+//     with no ends_at never expires);
+//   - for a split, the payer holds a share of the request, and it is unpaid
+//     (the creator's own share is paid from creation, so the creator never
+//     passes), and the intent's ID is the one the request holds for the
+//     payer's share (paymentrequest.PaymentRequest.PaymentIntentIDs);
+//   - for a collection, the payer is not the request's creator, has been
+//     issued an intent ID for it (paymentrequest.Store.GetPayerIntent, which
+//     the GetPaymentIntentId RPC issues), has not contributed with it, and
+//     the intent's ID is that one. OCP stores an intent ID at most once, in
+//     the transaction that moves the money, so the intent ID check is what
+//     makes a share payable, and a member able to contribute, at most once:
+//     two payments, however close together, cannot both commit, which the
+//     unpaid or not-contributed check alone, read before either commits and
+//     before either's task records it, cannot promise;
 //   - the destination's owner is the request's creator;
 //   - neither the payer nor the creator is the Flipcash team account;
 //   - the payment is in the request's currency, read as a boost's is, off the
 //     payment's exchange currency (any mint may pay); and
 //   - the payment's native amount (its one destination's, as a boost's
-//     payouts are read) is the share's native_amount to within half the
-//     currency's minor unit (send.MinimumTransferValue), the slack OCP allows
-//     between a payment's amount and its quarks, with a few ulps of float
-//     error forgiven. A share is paid all at once, so a partial payment or an
-//     overpayment is refused.
+//     payouts are read) is what the request asks (the share's native_amount
+//     for a split, the fixed native_amount for a collection) to within half
+//     the currency's minor unit (send.MinimumTransferValue), the slack OCP
+//     allows between a payment's amount and its quarks, with a few ulps of
+//     float error forgiven. What is asked is paid all at once, so a partial
+//     payment or an overpayment is refused.
 //
-// Membership is not checked beyond the share: a share names a member of the
-// group as of the request's creation, and the contract does not require the
-// payer or the creator to be one now, so a debtor who has since left may still
-// pay what they owe and a creator who has left is still paid. Nor is there a
-// floor beyond the share itself (a share is at least the currency's minimum
-// transfer value when the request is created), nor a block check, as for
-// group payments. The payment is always shown as SENT (see
+// Membership is not checked beyond that, for either type: a share names a
+// member of the group as of the request's creation, and a collection's payer
+// was a member when the GetPaymentIntentId RPC issued them an ID, and the
+// contract does not require the payer or the creator to be one now, so a
+// payer who has since left may still pay and a creator who has left is still
+// paid. Nor is there a floor beyond what is asked (at least the currency's
+// minimum transfer value when the request is created), nor a block check, as
+// for group payments. The payment is always shown as SENT (see
 // GetChatPaymentVerb).
 //
 // Standing is judged now, not when the task runs: a request closed or expired
-// between this check and the task still has the share recorded (see
-// paymentrequest.Store.PayShare), since the money has moved by then.
+// between this check and the task still has the payment recorded (see
+// paymentrequest.Store.PayShare and RecordContribution), since the money has
+// moved by then.
 func (i *Integration) validateRequestedPaymentAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
 	chatMetadata := appMetadata.GetChat()
 	requested := chatMetadata.GetRequestedPayment()
@@ -660,15 +670,16 @@ func (i *Integration) validateRequestedPaymentAppMetadata(ctx context.Context, i
 		return ocp_transaction.NewIntentDeniedError("payment request is not open")
 	}
 
-	share := request.Share(payerUserID)
-	if share == nil {
-		return ocp_transaction.NewIntentDeniedError("payer has no share")
+	// What is asked, and that the payer is the one to pay it under this
+	// intent, is each type's.
+	var expected float64
+	if request.IsCollection() {
+		expected, err = i.validateContribution(ctx, intentRecord, request, payerUserID)
+	} else {
+		expected, err = validateSharePayment(intentRecord, request, payerUserID)
 	}
-	if share.GetPaid() != nil {
-		return ocp_transaction.NewIntentDeniedError("share is already paid")
-	}
-	if intentRecord.IntentId != base58.Encode(request.PaymentIntentID(payerUserID)) {
-		return ocp_transaction.NewIntentDeniedError("payment must use the share's payment intent id")
+	if err != nil {
+		return err
 	}
 
 	payeeUserID, err := i.accounts.GetUserId(ctx, &commonpb.PublicKey{Value: destination.Owner.PublicKey().ToBytes()})
@@ -686,15 +697,20 @@ func (i *Integration) validateRequestedPaymentAppMetadata(ctx context.Context, i
 	}
 
 	currency := currency_lib.Code(payment.Amount.Currency)
-	if string(currency) != request.Split.GetCurrency() {
+	if string(currency) != request.Currency() {
 		return ocp_transaction.NewIntentDeniedError("payment must be in the request's currency")
 	}
 
-	expected := share.GetNativeAmount()
 	if !paysExactly(currency, destination.NativeAmount, expected) {
+		what := "the share"
+		if request.IsCollection() {
+			what = "the collection's amount"
+		}
 		return ocp_transaction.NewIntentDeniedError(fmt.Sprintf(
-			"payment must pay the share exactly: paid %s, share is %s %s",
+			"payment must pay %s exactly: paid %s, %s is %s %s",
+			what,
 			strconv.FormatFloat(destination.NativeAmount, 'f', -1, 64),
+			strings.TrimPrefix(what, "the "),
 			strconv.FormatFloat(expected, 'f', -1, 64),
 			strings.ToUpper(string(currency)),
 		))
@@ -703,13 +719,60 @@ func (i *Integration) validateRequestedPaymentAppMetadata(ctx context.Context, i
 	return nil
 }
 
+// validateSharePayment checks that the payer of a requested payment into the
+// split request holds an unpaid share of it and pays under the intent ID the
+// request holds for that share (see validateRequestedPaymentAppMetadata), and
+// returns the share's native amount, what the payment must pay.
+func validateSharePayment(intentRecord *ocp_intent.Record, request *paymentrequest.PaymentRequest, payerUserID *commonpb.UserId) (float64, error) {
+	share := request.Share(payerUserID)
+	if share == nil {
+		return 0, ocp_transaction.NewIntentDeniedError("payer has no share")
+	}
+	if share.GetPaid() != nil {
+		return 0, ocp_transaction.NewIntentDeniedError("share is already paid")
+	}
+	if intentRecord.IntentId != base58.Encode(request.PaymentIntentID(payerUserID)) {
+		return 0, ocp_transaction.NewIntentDeniedError("payment must use the share's payment intent id")
+	}
+	return share.GetNativeAmount(), nil
+}
+
+// validateContribution checks that the payer of a requested payment into the
+// collection request may contribute to it under this intent (see
+// validateRequestedPaymentAppMetadata): they are not its creator, were issued
+// an intent ID for it, have not contributed with it, and pay under it. It
+// returns the collection's fixed amount, what the payment must pay.
+//
+// The payer's record is one strongly consistent read
+// (paymentrequest.Store.GetPayerIntent). The ID is a secret until used, so
+// neither it nor the intent's is put in an error.
+func (i *Integration) validateContribution(ctx context.Context, intentRecord *ocp_intent.Record, request *paymentrequest.PaymentRequest, payerUserID *commonpb.UserId) (float64, error) {
+	if bytes.Equal(payerUserID.GetValue(), request.Creator.GetValue()) {
+		return 0, ocp_transaction.NewIntentDeniedError("payer is the request's creator")
+	}
+
+	held, err := i.requests.GetPayerIntent(ctx, request.ID, payerUserID)
+	if errors.Is(err, paymentrequest.ErrNotFound) {
+		return 0, ocp_transaction.NewIntentDeniedError("payer was issued no payment intent id")
+	} else if err != nil {
+		return 0, err
+	}
+	if held.Paid != nil {
+		return 0, ocp_transaction.NewIntentDeniedError("payer has already contributed")
+	}
+	if intentRecord.IntentId != base58.Encode(held.IntentID) {
+		return 0, ocp_transaction.NewIntentDeniedError("payment must use the payer's payment intent id")
+	}
+	return request.Collection.GetFixed().GetNativeAmount(), nil
+}
+
 // paysExactly reports whether paid, a payment's native amount in currency, is
 // expected to within half the currency's minor unit
 // (send.MinimumTransferValue), the slack OCP allows between a payment's
 // amount and its quarks, with a few ulps of float error forgiven. A NaN is
 // never exact. It is how a payment that must pay an amount all at once (a
-// share of a payment request, a returned payment) is judged, so a partial
-// payment or an overpayment is refused.
+// split's share, a collection's contribution, a returned payment) is judged,
+// so a partial payment or an overpayment is refused.
 func paysExactly(currency currency_lib.Code, paid, expected float64) bool {
 	slack := 0.5*send.MinimumTransferValue(currency) + 4*(math.Nextafter(expected, math.Inf(1))-expected)
 	return !math.IsNaN(paid) && math.Abs(paid-expected) <= slack

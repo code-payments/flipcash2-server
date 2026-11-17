@@ -31,7 +31,8 @@ type Integration struct {
 	profiles profile.Store
 
 	// requests holds payment requests, read to validate a requested payment
-	// against the share it pays (see validateRequestedPaymentAppMetadata).
+	// against the share it pays or the contribution it makes (see
+	// validateRequestedPaymentAppMetadata).
 	requests paymentrequest.Store
 
 	// access gates group payments on the payer's standing to speak and the
@@ -172,7 +173,8 @@ func (i *Integration) AllowCreation(ctx context.Context, intentRecord *ocp_inten
 // payment, made as either payment intent, the one injected into the group; a
 // reaction boost, made as either payment intent, schedules the task that
 // records the boost; a requested payment, a SendPublicPayment alone, the
-// task that marks its share paid and posts its cash message; and a return
+// task that records it against its request (a split's share paid, or a
+// collection's contribution) and posts its cash message; and a return
 // payment, a SendPublicPayment alone, the task that marks the returned
 // payment's offer returned and injects the return's cash message into the DM.
 // Execution is handled by task.Executor.

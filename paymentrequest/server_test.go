@@ -16,9 +16,9 @@ import (
 // reaching the server today (the proto admits CHAT_KEY_XCHACHA20POLY1305
 // alone).
 func TestTextVerdict(t *testing.T) {
-	plaintext := &paymentrequestpb.Split{Text: &paymentrequestpb.Split_Plaintext{Plaintext: &paymentrequestpb.PaymentRequestText{Title: "Dinner"}}}
-	encrypted := func(scheme paymentrequestpb.EncryptedPaymentRequestText_Scheme) *paymentrequestpb.Split {
-		return &paymentrequestpb.Split{Text: &paymentrequestpb.Split_Encrypted{Encrypted: &paymentrequestpb.EncryptedPaymentRequestText{Scheme: scheme}}}
+	plaintext := requestText{plaintext: &paymentrequestpb.PaymentRequestText{Title: "Dinner"}}
+	encrypted := func(scheme paymentrequestpb.EncryptedPaymentRequestText_Scheme) requestText {
+		return requestText{encrypted: &paymentrequestpb.EncryptedPaymentRequestText{Scheme: scheme}}
 	}
 	public := chat.SpeakerStanding{CanSpeak: true, Encryption: chat.EncryptionNone}
 	private := chat.SpeakerStanding{CanSpeak: true, Encryption: chat.EncryptionRequired, Scheme: messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305}
@@ -27,7 +27,7 @@ func TestTextVerdict(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		speaker chat.SpeakerStanding
-		split   *paymentrequestpb.Split
+		text    requestText
 		want    paymentrequestpb.CreatePaymentRequestResponse_Result
 	}{
 		{"public plaintext", public, plaintext, paymentrequestpb.CreatePaymentRequestResponse_OK},
@@ -38,10 +38,10 @@ func TestTextVerdict(t *testing.T) {
 		{"chat scheme with no request scheme", chat.SpeakerStanding{CanSpeak: true, Encryption: chat.EncryptionRequired}, encrypted(paymentrequestpb.EncryptedPaymentRequestText_CHAT_KEY_XCHACHA20POLY1305), paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_NOT_ALLOWED},
 		{"dm", dm, encrypted(paymentrequestpb.EncryptedPaymentRequestText_CHAT_KEY_XCHACHA20POLY1305), paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_NOT_ALLOWED},
 		// No text fits either kind of group.
-		{"public no text", public, &paymentrequestpb.Split{}, paymentrequestpb.CreatePaymentRequestResponse_OK},
-		{"private no text", private, &paymentrequestpb.Split{}, paymentrequestpb.CreatePaymentRequestResponse_OK},
+		{"public no text", public, requestText{}, paymentrequestpb.CreatePaymentRequestResponse_OK},
+		{"private no text", private, requestText{}, paymentrequestpb.CreatePaymentRequestResponse_OK},
 	} {
-		result, ok := textVerdict(tc.speaker, tc.split)
+		result, ok := textVerdict(tc.speaker, tc.text)
 		require.Equal(t, tc.want, result, tc.name)
 		require.Equal(t, tc.want == paymentrequestpb.CreatePaymentRequestResponse_OK, ok, tc.name)
 	}

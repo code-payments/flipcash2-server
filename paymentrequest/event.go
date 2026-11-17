@@ -22,11 +22,12 @@ import (
 //
 // A request is announced whole when it is created (PublishCreated), its
 // PayerSummary included, and every change after that as what it did at the
-// version it produced (PublishSharePaid, PublishClosed): clients apply a
-// change to a copy at the version before it and refetch on a gap, so each
-// change must be announced at most once and only by the write that made it,
-// never on a no-op, whose version may be some other change's. Publishing is best effort: it queues
-// the event and cannot fail, and a client reconciles a lost one by a refetch.
+// version it produced (PublishSharePaid, PublishContribution, PublishClosed):
+// clients apply a change to a copy at the version before it and refetch on a
+// gap, so each change must be announced at most once and only by the write
+// that made it, never on a no-op, whose version may be some other change's.
+// Publishing is best effort: it queues the event and cannot fail, and a client
+// reconciles a lost one by a refetch.
 //
 // Expiry is never announced: it is the clock's, moves no version, and every
 // reader derives it from ends_at.
@@ -63,6 +64,25 @@ func PublishSharePaid(chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEve
 		updates = append(updates, statusUpdate(paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_COMPLETED, r))
 	}
 	publishUpdates(chatEventBus, r, now, updates)
+}
+
+// PublishContribution announces userID's contribution to the collection r,
+// paid by paid, as Store.RecordContribution returned it from a write that
+// changed it (never a repeat, which is a no-op), as the updates the proto lays
+// down for a recorded contribution, in order: userID's Payer as it now stands
+// (PayerUpdate, see PaymentRequest.ContributionPayer, which is what the write
+// stored) and the request's PayerSummary as it now stands
+// (PayerSummaryUpdate). A contribution never ends a collection, so no
+// StatusUpdate comes with it.
+func PublishContribution(chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent], r *PaymentRequest, userID *commonpb.UserId, paid *paymentrequestpb.Paid, now time.Time) {
+	publishUpdates(chatEventBus, r, now, []*paymentrequestpb.PaymentRequestUpdate_Update{
+		{Kind: &paymentrequestpb.PaymentRequestUpdate_Update_PayerUpdate{PayerUpdate: &paymentrequestpb.PaymentRequestUpdate_PayerUpdate{
+			Payer: r.ContributionPayer(userID, paid),
+		}}},
+		{Kind: &paymentrequestpb.PaymentRequestUpdate_Update_PayerSummaryUpdate{PayerSummaryUpdate: &paymentrequestpb.PaymentRequestUpdate_PayerSummaryUpdate{
+			PayerSummary: r.PayerSummary(),
+		}}},
+	})
 }
 
 // PublishClosed announces the close of r, as Store.Close returned it from a

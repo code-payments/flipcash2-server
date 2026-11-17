@@ -63,7 +63,7 @@ func testWorker_ExpiresDueRequest(t *testing.T, s paymentrequest.Store) {
 	require.Equal(t, paymentrequest.StatusExpired, got.Status)
 	require.Equal(t, before.Version, got.Version)
 	require.NotNil(t, got.ClosedAt)
-	require.True(t, r.EndsAt().Equal(*got.ClosedAt))
+	require.True(t, mustEndsAt(r).Equal(*got.ClosedAt))
 	require.NotNil(t, got.Share(debtors[0]).Paid.GetIntent())
 	require.True(t, proto.Equal(before.ToProto(now), got.ToProto(now)))
 
@@ -98,7 +98,7 @@ func testWorker_LeavesFinalRequests(t *testing.T, s paymentrequest.Store) {
 
 	closed, _ := newRequest(chatID, dueEndsAt(), 1)
 	require.NoError(t, s.Create(ctx, closed))
-	_, changed, err = s.Close(ctx, closed.ID, closed.EndsAt().Add(-time.Second))
+	_, changed, err = s.Close(ctx, closed.ID, mustEndsAt(closed).Add(-time.Second))
 	require.NoError(t, err)
 	require.True(t, changed)
 
@@ -242,7 +242,7 @@ func testWorker_PaymentRacesExpiry(t *testing.T, s paymentrequest.Store) {
 	require.NoError(t, err)
 	require.Equal(t, paymentrequest.StatusExpired, got.Status)
 	require.EqualValues(t, 2, got.Version)
-	require.True(t, expiredFirst.EndsAt().Equal(*got.ClosedAt))
+	require.True(t, mustEndsAt(expiredFirst).Equal(*got.ClosedAt))
 	require.NotNil(t, got.Share(debtors[0]).Paid.GetIntent())
 
 	// Truly concurrent: either outcome, never a lost share.
@@ -279,7 +279,7 @@ func testWorker_PaymentRacesExpiry(t *testing.T, s paymentrequest.Store) {
 		switch got.Status {
 		case paymentrequest.StatusCompleted:
 		case paymentrequest.StatusExpired:
-			require.True(t, r.EndsAt().Equal(*got.ClosedAt))
+			require.True(t, mustEndsAt(r).Equal(*got.ClosedAt))
 		default:
 			require.Failf(t, "unexpected status", "request %d is %s", i, got.Status)
 		}
@@ -330,7 +330,7 @@ func testWorker_RetriesFailedExpire(t *testing.T, s paymentrequest.Store) {
 	require.NoError(t, err)
 	require.Equal(t, paymentrequest.StatusExpired, stored.Status)
 	require.EqualValues(t, 1, stored.Version)
-	require.True(t, r.EndsAt().Equal(*stored.ClosedAt))
+	require.True(t, mustEndsAt(r).Equal(*stored.ClosedAt))
 }
 
 // newTestWorker returns a worker over s whose failed attempts come due again

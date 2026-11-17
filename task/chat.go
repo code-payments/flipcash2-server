@@ -228,46 +228,58 @@ func (e *Executor) recordReactionBoost(ctx context.Context, record *ocp_task.Rec
 	return nil
 }
 
-// recordRequestedPayment records a requested payment: it marks the payer's
-// share of the payment request paid by the payment's intent, as of when the
-// intent was created (paymentrequest.Store.PayShare, which completes the
-// request if it was the last unpaid share), then injects one cash message into the group as the
-// payer, naming the request's creator as its single receiver and carrying the
-// request's ID. A returned error means the task is retried with backoff.
+// recordRequestedPayment records a requested payment against its payment
+// request, as paid by the payment's intent as of when the intent was created,
+// then injects one cash message into the group as the payer, naming the
+// request's creator as its single receiver and carrying the request's ID. A
+// returned error means the task is retried with backoff.
+//
+// The request is read first, for its type, which never changes: for a split,
+// the payment marks the payer's share paid (paymentrequest.Store.PayShare,
+// which completes the request if it was the last unpaid share); for a
+// collection, it records the payer's contribution
+// (paymentrequest.Store.RecordContribution, which never ends a collection).
 //
 // Nothing about the request or the group is checked again: the request being
-// open, the payer's unpaid share, the amount, the currency and the payee were
-// judged when the payment was validated (see intent.Integration), and the
-// payment has happened since. So the share is recorded whatever the request's
-// status now (a close or an expiry in between must not lose a payment; the
-// store records a payment's share whatever the status), and the message lands
-// whoever has left the group. A share the creator marked paid by hand in
-// between is replaced by this payment (see paymentrequest.PaidShareSupersedes),
-// so the record shows the money that arrived. A share already paid by a
-// payment (a repeat of this task) is the store's no-op, and the message is
-// still sent: the money moved either way, and the message records that it
-// did.
+// open, the payer's unpaid share or their not having contributed, the amount,
+// the currency and the payee were judged when the payment was validated (see
+// intent.Integration), and the payment has happened since. So the payment is
+// recorded whatever the request's status now (a close or an expiry in between
+// must not lose a payment; the store records a payment whatever the status),
+// and the message lands whoever has left the group. A share the creator
+// marked paid by hand in between is replaced by this payment (see
+// paymentrequest.PaidShareSupersedes), so the record shows the money that
+// arrived. A share already paid by this payment, or a contribution already
+// recorded by it (a repeat of this task), is the store's no-op, and the
+// message is still sent: the money moved either way, and the message records
+// that it did.
 //
-// A mark that changed the share is announced on the group's topic
-// (paymentrequest.PublishSharePaid) before the message is sent; a no-op is
-// not, since a change is announced at the version it produced and a repeat
-// does not know which version that was. A mark whose run stopped before
-// announcing it is therefore never announced, and clients reconcile it from
-// the cash message, which is durable and names the request.
+// A record that changed the request is announced on the group's topic
+// (paymentrequest.PublishSharePaid, or PublishContribution) before the
+// message is sent; a no-op is not, since a change is announced at the version
+// it produced and a repeat does not know which version that was. A record
+// whose run stopped before announcing it is therefore never announced, and
+// clients reconcile it from the cash message, which is durable and names the
+// request.
 //
-// The share is marked before the message is sent, so a failure between the
-// two is retried as a no-op mark and then the one message; the reverse order
-// could post a message for a share never marked. Idempotency under
-// at-least-once delivery comes from the store for the share (its first
-// payment stands) and, for the message, from the task's UUID as its client
-// message ID (see sendCashMessage). Refusals that a validated payment never
-// produces (a request that does not exist, a payer with no share, a payment
-// to several people) are returned like any failure, so they are retried and
-// surfaced rather than dropping the record of a payment that was made. That
-// includes a payment whose intent is not the share's (the store refuses it,
-// see paymentrequest.ValidatePaymentIntent): only a path that skipped intent
-// validation produces one, and it fails here on every retry rather than
-// passing as a no-op on a share already paid.
+// The payment is recorded before the message is sent, so a failure between
+// the two is retried as a no-op record and then the one message; the reverse
+// order could post a message for a payment never recorded. Idempotency under
+// at-least-once delivery comes from the store for the record (a share's first
+// payment stands, and a member contributes once, with their one intent) and,
+// for the message, from the task's UUID as its client message ID (see
+// sendCashMessage). Concurrent runs of the task are safe for the same
+// reasons: the store's writes are conditional, so one records and announces
+// and the other is a no-op, and the sends dedupe. Refusals that a validated
+// payment never produces (a request that does not exist, a payer with no
+// share, a payment to several people) are returned like any failure, so they
+// are retried and surfaced rather than dropping the record of a payment that
+// was made. That includes a payment whose intent is not the one the store
+// holds for the payer (the store refuses it, see
+// paymentrequest.ValidatePaymentIntent and Store.RecordContribution): only a
+// path that skipped intent validation produces one, and it fails here on
+// every retry rather than passing as a no-op on a share already paid or a
+// contribution already recorded.
 func (e *Executor) recordRequestedPayment(ctx context.Context, record *ocp_task.Record) error {
 	payment, err := e.loadChatPayment(ctx, record)
 	if err != nil {
@@ -279,8 +291,8 @@ func (e *Executor) recordRequestedPayment(ctx context.Context, record *ocp_task.
 		return errors.New("intent is not a requested payment")
 	}
 
-	// A share is paid to the request's creator alone, so a requested payment
-	// is never a multi payment.
+	// A request is paid to its creator alone, so a requested payment is never
+	// a multi payment.
 	if len(payment.recipients) != 1 {
 		return fmt.Errorf("requested payment has %d recipients", len(payment.recipients))
 	}
@@ -290,26 +302,47 @@ func (e *Executor) recordRequestedPayment(ctx context.Context, record *ocp_task.
 		return errors.New("chat id is not a group")
 	}
 
-	// The share was paid when the payment was made, not when this task runs:
-	// a retried task must not move paid_at (nor, for the last share, the
-	// request's closed_at) later, past an ends_at the payment was validated
-	// before.
 	requestID := requested.GetPaymentRequestId()
-	now := time.Now()
-	r, changed, completed, err := e.requests.PayShare(ctx, requestID, payment.senderUserID, &paymentrequestpb.Paid{
+	r, err := e.requests.Get(ctx, requestID)
+	if err != nil {
+		// paymentrequest.ErrNotFound included: a validated payment never
+		// produces it, so it is surfaced, not dropped.
+		return fmt.Errorf("failed to get payment request: %w", err)
+	}
+
+	// The payment was made when its intent was created, not when this task
+	// runs: a retried task must not move paid_at (nor, for a split's last
+	// share, the request's closed_at) later, past an ends_at the payment was
+	// validated before.
+	paid := &paymentrequestpb.Paid{
 		PaidAt: timestamppb.New(payment.intentRecord.CreatedAt),
 		How: &paymentrequestpb.Paid_Intent{
 			Intent: &commonpb.IntentId{Value: payment.rawIntentID},
 		},
-	}, now)
-	if err != nil {
-		// paymentrequest.ErrNotFound, ErrNotAShare and ErrWrongIntent
-		// included: a validated payment never produces them, so they are
-		// surfaced, not dropped.
-		return fmt.Errorf("failed to mark share paid: %w", err)
 	}
-	if changed {
-		paymentrequest.PublishSharePaid(e.chatEventBus, r, payment.senderUserID, completed, now)
+	now := time.Now()
+	if r.IsCollection() {
+		r, changed, err := e.requests.RecordContribution(ctx, requestID, payment.senderUserID, paid, now)
+		if err != nil {
+			// paymentrequest.ErrNotFound and ErrWrongIntent included: a
+			// validated payment never produces them, so they are surfaced,
+			// not dropped.
+			return fmt.Errorf("failed to record contribution: %w", err)
+		}
+		if changed {
+			paymentrequest.PublishContribution(e.chatEventBus, r, payment.senderUserID, paid, now)
+		}
+	} else {
+		r, changed, completed, err := e.requests.PayShare(ctx, requestID, payment.senderUserID, paid, now)
+		if err != nil {
+			// paymentrequest.ErrNotFound, ErrNotAShare and ErrWrongIntent
+			// included: a validated payment never produces them, so they are
+			// surfaced, not dropped.
+			return fmt.Errorf("failed to mark share paid: %w", err)
+		}
+		if changed {
+			paymentrequest.PublishSharePaid(e.chatEventBus, r, payment.senderUserID, completed, now)
+		}
 	}
 
 	payment.paymentRequestID = requestID
@@ -391,9 +424,10 @@ type chatPayment struct {
 	// amount is the whole payment, every recipient's part together.
 	amount *commonpb.CryptoPaymentAmount
 
-	// paymentRequestID is the payment request whose share the payment paid,
-	// set by recordRequestedPayment alone and carried on its cash message;
-	// nil for every other payment.
+	// paymentRequestID is the payment request the payment paid into (a
+	// split's share, or a collection's contribution), set by
+	// recordRequestedPayment alone and carried on its cash message; nil for
+	// every other payment.
 	paymentRequestID *paymentrequestpb.PaymentRequestId
 }
 

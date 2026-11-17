@@ -291,3 +291,78 @@ func intentPaidAt(r *PaymentRequest, userID *commonpb.UserId, at time.Time) *pay
 		How:    &paymentrequestpb.Paid_Intent{Intent: &commonpb.IntentId{Value: r.PaymentIntentID(userID)}},
 	}
 }
+
+// TestPayerSummary_Collection pins a collection's summary: every contribution
+// paid, nothing due, and the total summed exactly in minor units.
+func TestPayerSummary_Collection(t *testing.T) {
+	createdAt := time.Now()
+	creator := model.MustGenerateUserID()
+	r, err := NewCollectionRequest(newID(), creator, newChatID(), newCollection(nil, "usd", 0.1), createdAt)
+	require.NoError(t, err)
+
+	summary := r.PayerSummary()
+	require.NoError(t, summary.Validate())
+	require.True(t, proto.Equal(&paymentrequestpb.PayerSummary{}, summary))
+
+	// 0.1 three times is 0.3 exactly, not 0.30000000000000004.
+	r.PayerCount = 3
+	summary = r.PayerSummary()
+	require.EqualValues(t, 3, summary.PayerCount)
+	require.EqualValues(t, 3, summary.PaidCount)
+	require.Zero(t, summary.NativeAmountDue)
+	require.Equal(t, 0.3, summary.NativeAmountPaid)
+
+	r.PayerCount = 1_000_000
+	r.Collection.GetFixed().NativeAmount = 12.34
+	require.Equal(t, 12_340_000.0, r.PayerSummary().NativeAmountPaid)
+
+	jpy, err := NewCollectionRequest(newID(), creator, newChatID(), newCollection(nil, "jpy", 500), createdAt)
+	require.NoError(t, err)
+	jpy.PayerCount = 7
+	require.Equal(t, 3500.0, jpy.PayerSummary().NativeAmountPaid)
+}
+
+// TestContributionPayer pins a contribution's Payer, and that the share-based
+// Payer methods find none in a collection.
+func TestContributionPayer(t *testing.T) {
+	createdAt := time.Now()
+	creator := model.MustGenerateUserID()
+	contributor := model.MustGenerateUserID()
+	r, err := NewCollectionRequest(newID(), creator, newChatID(), newCollection(nil, "usd", 2.5), createdAt)
+	require.NoError(t, err)
+
+	paid := &paymentrequestpb.Paid{
+		PaidAt: timestamppb.New(createdAt.Add(time.Minute)),
+		How:    &paymentrequestpb.Paid_Intent{Intent: &commonpb.IntentId{Value: make([]byte, PaymentIntentIDSize)}},
+	}
+	payer := r.ContributionPayer(contributor, paid)
+	require.NoError(t, payer.Validate())
+	require.True(t, proto.Equal(contributor, payer.UserId))
+	require.Zero(t, payer.NativeAmountDue)
+	require.Equal(t, 2.5, payer.NativeAmountPaid)
+	require.True(t, proto.Equal(paid, payer.GetPaid()))
+	require.Nil(t, payer.GetUnpaid())
+
+	// The Payer holds its own copies.
+	paid.PaidAt = timestamppb.New(createdAt)
+	require.False(t, proto.Equal(paid, payer.GetPaid()))
+
+	require.True(t, proto.Equal(payer, r.ContributionPayer(contributor, payer.GetPaid())))
+	cursor := PaidPayerCursor(payer)
+	require.True(t, createdAt.Add(time.Minute).Equal(cursor.PaidAt))
+	require.Equal(t, contributor.Value, cursor.UserID)
+
+	require.Nil(t, r.Payer(contributor))
+	require.Nil(t, r.Payer(creator))
+	require.Empty(t, r.Payers())
+	for _, section := range []PayerSection{PayerSectionUnpaid, PayerSectionPaid} {
+		page, next := r.PayersPage(section, nil, 10)
+		require.Empty(t, page)
+		require.Nil(t, next)
+	}
+
+	// A split has no contributions.
+	split, err := NewSplitRequest(newID(), creator, newChatID(), newSplit(createdAt.Add(time.Hour), creator, contributor), createdAt)
+	require.NoError(t, err)
+	require.Nil(t, split.ContributionPayer(contributor, paid))
+}

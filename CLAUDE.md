@@ -83,7 +83,7 @@ DynamoDB hazards:
 - **Encryption:** DMs and keyed private groups take encrypted content only; public groups take plaintext only. The server never reads ciphertext. Server-written messages (`messaging.Sender`) are plaintext.
 - **Redaction** happens at one chokepoint per server (`messaging.Server.present`, `chat.Server.hydrate`'s last-message step, `redact.ChatUpdate` for streams), after media hydration. A message that cannot be redacted fails the read; it never leaks.
 - **Events:** DM updates fan out per member on the user topic; group updates publish once on the chat topic. Group sends never fan out to the roster; the group feed is assembled at read time and pushes walk the roster in pages.
-- **Credentials are random and stored, never derived:** payment request share intent IDs and return intent IDs are drawn at random so no one else can use them up, and are never on a read, event or push beyond what the proto names.
+- **Credentials are random and stored, never derived:** payment request intent IDs (a split share's, drawn at creation; a collection payer's, drawn on first `GetPaymentIntentId`) and return intent IDs are drawn at random so no one else can use them up, and are never on a read, event or push beyond what the proto names.
 - `chat/cache` caches only what is fixed at creation (DM membership, a private group's rules). Public group rules, group membership, viewer state, key envelopes, lobbies and invites are never cached.
 
 ### Security-sensitive spots

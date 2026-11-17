@@ -1641,6 +1641,254 @@ func TestExecutor_RecordRequestedPayment_WrongIntentOnPaidShare(t *testing.T) {
 	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
 }
 
+// putCollection creates an open USD collection by creator in chatID, with no
+// ends_at, asking $2.50 of each payer, what pay pays.
+func (e *groupPaymentEnv) putCollection(t *testing.T, chatID *commonpb.ChatId, creator *commonpb.UserId) *paymentrequest.PaymentRequest {
+	key := make([]byte, paymentrequest.IdempotencyKeySize)
+	_, err := rand.Read(key)
+	require.NoError(t, err)
+
+	collection := &paymentrequestpb.Collection{
+		Text: &paymentrequestpb.Collection_Plaintext{
+			Plaintext: &paymentrequestpb.PaymentRequestText{Title: "Gift"},
+		},
+		Currency: "usd",
+		PaymentAmount: &paymentrequestpb.Collection_Fixed{Fixed: &paymentrequestpb.Collection_FixedAmount{
+			NativeAmount: 2.5,
+		}},
+	}
+
+	id := paymentrequest.MustDeriveID(creator, &paymentrequestpb.IdempotencyKey{Value: key})
+	r, err := paymentrequest.NewCollectionRequest(id, creator, chatID, collection, time.Now())
+	require.NoError(t, err)
+	require.NoError(t, e.requests.Create(e.ctx, r))
+	return r
+}
+
+// contribute issues the payer an intent ID for the collection r, as the
+// GetPaymentIntentId RPC does, then saves and validates a $2.50 contribution
+// under it, returning the intent record and its raw ID.
+func (e *groupPaymentEnv) contribute(t *testing.T, r *paymentrequest.PaymentRequest, from, to model.KeyPair) (*ocp_intent.Record, []byte) {
+	payerUserID, err := e.accounts.GetUserId(e.ctx, &commonpb.PublicKey{Value: from.Public()})
+	require.NoError(t, err)
+	candidate, err := paymentrequest.NewPaymentIntentID()
+	require.NoError(t, err)
+	held, err := e.requests.GetOrCreatePayerIntent(e.ctx, r.ID, payerUserID, candidate)
+	require.NoError(t, err)
+
+	intentRecord, rawIntentID := e.payWithIntentID(t, requestedPaymentMetadata(r.ChatID, r.ID), from, to, held.IntentID)
+	require.NoError(t, e.integration.AllowCreation(e.ctx, intentRecord, nil, nil))
+	return intentRecord, rawIntentID
+}
+
+// requireContributionUpdate asserts that u is userID's contribution to the
+// collection r, at stored's version: userID's Payer as stored, then the
+// request's PayerSummary as it now stands, and nothing else (a contribution
+// never ends a collection).
+func (e *groupPaymentEnv) requireContributionUpdate(t *testing.T, u *paymentrequestpb.PaymentRequestUpdate, stored *paymentrequest.PaymentRequest, userID *commonpb.UserId) {
+	changes := u.GetUpdates()
+	require.NotNil(t, changes)
+	assert.Equal(t, stored.Version, changes.Version)
+	require.Len(t, changes.Updates, 2)
+	payer, err := e.requests.GetCollectionPayer(e.ctx, stored.ID, userID)
+	require.NoError(t, err)
+	assert.True(t, proto.Equal(payer, changes.Updates[0].GetPayerUpdate().GetPayer()))
+	assert.True(t, proto.Equal(stored.PayerSummary(), changes.Updates[1].GetPayerSummaryUpdate().GetPayerSummary()))
+}
+
+func TestExecutor_RecordRequestedPayment_Collection(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+	otherUserID, otherKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, creatorUserID, payerUserID, otherUserID)
+	r := e.putCollection(t, groupID, creatorUserID)
+
+	// A validated contribution schedules the requested payment task, and
+	// executing it records the contribution, paid by the payment's intent as
+	// of when it was made, and posts the cash message into the group as the
+	// payer, to the creator, naming the request.
+	intentRecord, rawIntentID := e.contribute(t, r, payerKeys, creatorKeys)
+	task := e.scheduled(t, intentRecord)
+	assert.Equal(t, intent.TaskTypeRecordRequestedPayment, task.Type)
+	require.NoError(t, e.executor.Execute(e.ctx, task))
+
+	stored, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, paymentrequest.StatusOpen, stored.Status)
+	assert.EqualValues(t, 2, stored.Version)
+	assert.EqualValues(t, 1, stored.PayerCount)
+	payer, err := e.requests.GetCollectionPayer(e.ctx, r.ID, payerUserID)
+	require.NoError(t, err)
+	paid := payer.GetPaid()
+	require.NotNil(t, paid)
+	assert.Equal(t, rawIntentID, paid.GetIntent().GetValue())
+	assert.True(t, intentRecord.CreatedAt.Equal(paid.PaidAt.AsTime()), "paid_at %s, intent created %s", paid.PaidAt.AsTime(), intentRecord.CreatedAt)
+	assert.EqualValues(t, 2.5, payer.NativeAmountPaid)
+	_, err = e.requests.GetCollectionPayer(e.ctx, r.ID, otherUserID)
+	require.ErrorIs(t, err, paymentrequest.ErrNotFound)
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+
+	// Announced on the group's topic as the Payer and the summary, at the
+	// request's new version.
+	updates := e.requestUpdates(t, r, 1)
+	e.requireContributionUpdate(t, updates[0], stored, payerUserID)
+
+	// Re-execution changes nothing, posts nothing and announces nothing.
+	require.NoError(t, e.executor.Execute(e.ctx, task))
+	e.requestUpdates(t, r, 1)
+	again, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, again.Version)
+	assert.EqualValues(t, 1, again.PayerCount)
+	msgs, err = e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+
+	// Another member's contribution is the next version; a collection is
+	// never completed.
+	intentRecord, otherIntentID := e.contribute(t, r, otherKeys, creatorKeys)
+	require.NoError(t, e.executor.Execute(e.ctx, e.scheduled(t, intentRecord)))
+
+	stored, err = e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, paymentrequest.StatusOpen, stored.Status)
+	assert.Nil(t, stored.ClosedAt)
+	assert.EqualValues(t, 3, stored.Version)
+	assert.EqualValues(t, 2, stored.PayerCount)
+
+	msgs, err = e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	requireRequestedCash(t, msgs[1], r, otherUserID, otherIntentID)
+
+	updates = e.requestUpdates(t, r, 2)
+	e.requireContributionUpdate(t, updates[1], stored, otherUserID)
+	assert.EqualValues(t, 2, updates[1].GetUpdates().GetUpdates()[1].GetPayerSummaryUpdate().GetPayerSummary().GetPaidCount())
+	assert.EqualValues(t, 5, updates[1].GetUpdates().GetUpdates()[1].GetPayerSummaryUpdate().GetPayerSummary().GetNativeAmountPaid())
+}
+
+// Tasks are delivered at least once and may run concurrently: two runs of
+// one contribution's task record it, announce it and post its message once.
+func TestExecutor_RecordRequestedPayment_Collection_Concurrent(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, creatorUserID, payerUserID)
+	r := e.putCollection(t, groupID, creatorUserID)
+
+	intentRecord, rawIntentID := e.contribute(t, r, payerKeys, creatorKeys)
+	task := e.scheduled(t, intentRecord)
+
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { errs <- e.executor.Execute(e.ctx, task) }()
+	}
+	for range 2 {
+		require.NoError(t, <-errs)
+	}
+
+	stored, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, stored.Version)
+	assert.EqualValues(t, 1, stored.PayerCount)
+	e.requestUpdates(t, r, 1)
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+}
+
+// A collection closed between the contribution's validation and its task
+// still has the contribution recorded, and stays closed; the message is
+// posted, even if the payer has left the group in between.
+func TestExecutor_RecordRequestedPayment_Collection_ClosedSinceValidation(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, creatorUserID, payerUserID)
+	r := e.putCollection(t, groupID, creatorUserID)
+
+	intentRecord, rawIntentID := e.contribute(t, r, payerKeys, creatorKeys)
+
+	closed, changed, err := e.requests.Close(e.ctx, r.ID, time.Now())
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, _, err = e.chats.RemoveGroupMember(e.ctx, groupID, payerUserID, false)
+	require.NoError(t, err)
+
+	require.NoError(t, e.executor.Execute(e.ctx, e.scheduled(t, intentRecord)))
+
+	stored, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, paymentrequest.StatusClosed, stored.Status)
+	assert.True(t, closed.ClosedAt.Equal(*stored.ClosedAt))
+	assert.Equal(t, closed.Version+1, stored.Version)
+	assert.EqualValues(t, 1, stored.PayerCount)
+
+	updates := e.requestUpdates(t, r, 1)
+	e.requireContributionUpdate(t, updates[0], stored, payerUserID)
+
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+}
+
+// A contribution task fails, to be retried, rather than record a
+// contribution or post a message it cannot make whole: one under an intent
+// that is not the one issued to the payer, or by a payer issued none, which
+// only a path that skipped validation produces, including after the payer has
+// contributed.
+func TestExecutor_RecordRequestedPayment_Collection_Mismatched(t *testing.T) {
+	e := newGroupPaymentEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+	_, otherKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, creatorUserID, payerUserID)
+	r := e.putCollection(t, groupID, creatorUserID)
+
+	noneIssued, _ := e.pay(t, requestedPaymentMetadata(groupID, r.ID), otherKeys, creatorKeys)
+	require.ErrorIs(t, e.executor.Execute(e.ctx, intent.NewRecordRequestedPaymentTask(noneIssued)), paymentrequest.ErrWrongIntent)
+
+	intentRecord, rawIntentID := e.contribute(t, r, payerKeys, creatorKeys)
+	unvalidated, _ := e.pay(t, requestedPaymentMetadata(groupID, r.ID), payerKeys, creatorKeys)
+	require.ErrorIs(t, e.executor.Execute(e.ctx, intent.NewRecordRequestedPaymentTask(unvalidated)), paymentrequest.ErrWrongIntent)
+
+	stored, err := e.requests.Get(e.ctx, r.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, stored.Version)
+	assert.Zero(t, stored.PayerCount)
+	msgs, err := e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+
+	// After the contribution is recorded, a payment under another intent
+	// still fails, on every retry, rather than pass as a no-op.
+	require.NoError(t, e.executor.Execute(e.ctx, e.scheduled(t, intentRecord)))
+	for range 2 {
+		require.ErrorIs(t, e.executor.Execute(e.ctx, intent.NewRecordRequestedPaymentTask(unvalidated)), paymentrequest.ErrWrongIntent)
+	}
+	e.requestUpdates(t, r, 1)
+	msgs, err = e.messages.GetMessages(e.ctx, groupID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	requireRequestedCash(t, msgs[0], r, payerUserID, rawIntentID)
+}
+
 func returnPaymentMetadata(chatID *commonpb.ChatId, messageID *messagingpb.MessageId) *intentpb.ChatMetadata {
 	return &intentpb.ChatMetadata{
 		ChatId: chatID,

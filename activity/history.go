@@ -227,12 +227,13 @@ func toBoostedReaction(appMetadata []byte) *activitypb.BoostedReaction {
 	}
 }
 
-// toRequestedPayment names the payment request a payment paid a share of,
-// read off the app metadata its intent carried, or nil for a payment that was
-// not a requested payment. A requested payment was validated when it was
-// paid, so its metadata names the request and the request's group; it is what
-// the payment was for then, and is not checked against the request now, which
-// may since have closed or expired.
+// toRequestedPayment names the payment request a payment paid into, a split's
+// share or a collection's contribution alike, read off the app metadata its
+// intent carried, or nil for a payment that was not a requested payment. A
+// requested payment was validated when it was paid, so its metadata names the
+// request and the request's group; it is what the payment was for then, and
+// is not checked against the request now, which may since have closed or
+// expired. Nothing here depends on the request's type.
 func toRequestedPayment(appMetadata []byte) *activitypb.RequestedPayment {
 	requested := intent.GetRequestedPayment(appMetadata)
 	if requested == nil {

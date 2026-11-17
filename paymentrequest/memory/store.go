@@ -29,6 +29,9 @@ type memory struct {
 	requests map[string]*paymentrequest.PaymentRequest
 	// queue maps a request ID to its place on the expiry queue.
 	queue map[string]*queued
+	// payers maps a collection's ID, then a member's user ID, to the intent
+	// ID issued to them and, once they have contributed, its Paid.
+	payers map[string]map[string]*paymentrequest.PayerIntent
 }
 
 // NewInMemory returns an in-memory paymentrequest.Store, for tests.
@@ -44,6 +47,7 @@ func (m *memory) reset() {
 
 	m.requests = make(map[string]*paymentrequest.PaymentRequest)
 	m.queue = make(map[string]*queued)
+	m.payers = make(map[string]map[string]*paymentrequest.PayerIntent)
 }
 
 func (m *memory) Create(_ context.Context, r *paymentrequest.PaymentRequest) error {
@@ -62,8 +66,11 @@ func (m *memory) Create(_ context.Context, r *paymentrequest.PaymentRequest) err
 	stored.Status = paymentrequest.StatusOpen
 	stored.Version = 1
 	stored.ClosedAt = nil
+	stored.PayerCount = 0
 	m.requests[key] = stored
-	m.queue[key] = &queued{dueAt: paymentrequest.ExpiryDueAt(stored)}
+	if _, ok := stored.EndsAt(); ok {
+		m.queue[key] = &queued{dueAt: paymentrequest.ExpiryDueAt(stored)}
+	}
 	return nil
 }
 
@@ -92,6 +99,10 @@ func (m *memory) GetChatPage(_ context.Context, chatID *commonpb.ChatId, section
 			continue
 		}
 		if (section == paymentrequest.SectionOpen) == r.Status.IsFinal() {
+			continue
+		}
+		if _, ok := r.EndsAt(); section == paymentrequest.SectionOpen && !ok {
+			// Undated: in neither section while open.
 			continue
 		}
 		entries = append(entries, entry{at: paymentrequest.CursorOf(r, section).At, r: r})
@@ -269,8 +280,138 @@ func (m *memory) Expire(_ context.Context, id *paymentrequestpb.PaymentRequestId
 	if r.Status.IsFinal() {
 		return false, nil
 	}
-	endsAt := r.EndsAt()
+	endsAt, ok := r.EndsAt()
+	if !ok {
+		// A request with no ends_at never expires.
+		return false, nil
+	}
 	r.Status = paymentrequest.StatusExpired
 	r.ClosedAt = &endsAt
 	return true, nil
+}
+
+func (m *memory) GetOrCreatePayerIntent(_ context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, candidate []byte) (*paymentrequest.PayerIntent, error) {
+	if err := paymentrequest.ValidatePayerIntentCandidate(candidate); err != nil {
+		return nil, err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	key := string(id.Value)
+	r, ok := m.requests[key]
+	switch {
+	case !ok:
+		return nil, paymentrequest.ErrNotFound
+	case !r.IsCollection():
+		return nil, paymentrequest.ErrNotACollection
+	case proto.Equal(r.Creator, userID):
+		return nil, paymentrequest.ErrNotAPayer
+	}
+
+	payers, ok := m.payers[key]
+	if !ok {
+		payers = make(map[string]*paymentrequest.PayerIntent)
+		m.payers[key] = payers
+	}
+	record, ok := payers[string(userID.Value)]
+	if !ok {
+		record = &paymentrequest.PayerIntent{IntentID: append([]byte(nil), candidate...)}
+		payers[string(userID.Value)] = record
+	}
+	return clonePayerIntent(record), nil
+}
+
+func (m *memory) GetPayerIntent(_ context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId) (*paymentrequest.PayerIntent, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	record, ok := m.payers[string(id.Value)][string(userID.GetValue())]
+	if !ok {
+		return nil, paymentrequest.ErrNotFound
+	}
+	return clonePayerIntent(record), nil
+}
+
+func (m *memory) GetCollectionPayer(_ context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId) (*paymentrequestpb.Payer, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	r, ok := m.requests[string(id.Value)]
+	if !ok {
+		return nil, paymentrequest.ErrNotFound
+	}
+	record, ok := m.payers[string(id.Value)][string(userID.GetValue())]
+	if !ok || record.Paid == nil {
+		return nil, paymentrequest.ErrNotFound
+	}
+	return r.ContributionPayer(userID, record.Paid), nil
+}
+
+func (m *memory) GetCollectionPayersPage(_ context.Context, id *paymentrequestpb.PaymentRequestId, cursor *paymentrequest.PayerCursor, limit int) ([]*paymentrequestpb.Payer, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	r, ok := m.requests[string(id.Value)]
+	if !ok {
+		return nil, nil
+	}
+
+	var payers []*paymentrequestpb.Payer
+	for userID, record := range m.payers[string(id.Value)] {
+		if record.Paid == nil {
+			continue
+		}
+		payer := r.ContributionPayer(&commonpb.UserId{Value: []byte(userID)}, record.Paid)
+		if cursor != nil && !paymentrequest.PaidBefore(cursor, paymentrequest.PaidPayerCursor(payer)) {
+			continue
+		}
+		payers = append(payers, payer)
+	}
+	sort.Slice(payers, func(i, j int) bool {
+		return paymentrequest.PaidBefore(paymentrequest.PaidPayerCursor(payers[i]), paymentrequest.PaidPayerCursor(payers[j]))
+	})
+	if limit > 0 && len(payers) > limit {
+		payers = payers[:limit]
+	}
+	return payers, nil
+}
+
+func (m *memory) RecordContribution(_ context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.Paid, _ time.Time) (*paymentrequest.PaymentRequest, bool, error) {
+	if err := paymentrequest.ValidateContribution(paid); err != nil {
+		return nil, false, err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	key := string(id.Value)
+	r, ok := m.requests[key]
+	switch {
+	case !ok:
+		return nil, false, paymentrequest.ErrNotFound
+	case !r.IsCollection():
+		return nil, false, paymentrequest.ErrNotACollection
+	}
+	record, ok := m.payers[key][string(userID.GetValue())]
+	if !ok || !bytes.Equal(record.IntentID, paid.GetIntent().GetValue()) {
+		return nil, false, paymentrequest.ErrWrongIntent
+	}
+	if record.Paid != nil {
+		// A member contributes once, with their one intent: a repeat.
+		return r.Clone(), false, nil
+	}
+
+	record.Paid = proto.Clone(paid).(*paymentrequestpb.Paid)
+	r.PayerCount++
+	r.Version++
+	return r.Clone(), true, nil
+}
+
+func clonePayerIntent(record *paymentrequest.PayerIntent) *paymentrequest.PayerIntent {
+	clone := &paymentrequest.PayerIntent{IntentID: append([]byte(nil), record.IntentID...)}
+	if record.Paid != nil {
+		clone.Paid = proto.Clone(record.Paid).(*paymentrequestpb.Paid)
+	}
+	return clone
 }

@@ -17,11 +17,10 @@ import (
 	"github.com/code-payments/flipcash2-server/send"
 )
 
-// A request's Payers (paymentrequestpb.Payer) and their totals
+// A split's Payers (paymentrequestpb.Payer) and their totals
 // (paymentrequestpb.PayerSummary) are not stored: they are computed on every
-// read from what the request already holds. For a split, the only type today,
-// that is its shares, of which there is one Payer each, the creator's own
-// included:
+// read from what the request already holds, its shares, of which there is one
+// Payer each, the creator's own included:
 //   - what is due is the share's native_amount;
 //   - a paid share, however it was paid (a payment, a hand mark, or the
 //     creator's own share, paid from creation), has paid its native_amount, and
@@ -36,9 +35,21 @@ import (
 // ordered by something a Payer keeps until it leaves the section, so a page
 // resumes from a keyset cursor (PayerCursor) strictly after the last Payer it
 // returned, which stays a valid position while other shares are paid.
+//
+// A collection's Payers are its contributions, one per member who has
+// contributed, and are stored, not computed: a collection may have any number,
+// so the request holds only their count (PaymentRequest.PayerCount) and each
+// is a record of its own, read from the store (Store.GetCollectionPayer and
+// Store.GetCollectionPayersPage, in the paid section's order; the unpaid
+// section of a collection is always empty). Each is paid
+// (ContributionPayer): nothing is due, and the fixed amount is paid. The
+// summary is computed from the count alone (see PayerSummary). The methods
+// below that compute Payers from shares (Payer, Payers, PayersPage) find none
+// in a collection.
 
-// Payer returns userID's Payer, or nil when they have none: for a split, when
-// they hold no share.
+// Payer returns userID's Payer in a split, or nil when they have none: when
+// they hold no share, and always for a collection, whose Payers are read from
+// the store (see Store.GetCollectionPayer).
 func (r *PaymentRequest) Payer(userID *commonpb.UserId) *paymentrequestpb.Payer {
 	share := r.Share(userID)
 	if share == nil {
@@ -73,17 +84,28 @@ func payerOf(share *paymentrequestpb.Share) *paymentrequestpb.Payer {
 	return payer
 }
 
-// PayerSummary totals the request's Payers (see paymentrequestpb.PayerSummary).
+// PayerSummary totals the request's Payers (see paymentrequestpb.PayerSummary):
+// for a split its shares, and for a collection its PayerCount contributions,
+// each paid, of the fixed amount, with nothing due.
 //
 // Amounts are summed exactly, in whole minor units of the request's currency:
-// every share is a whole number of them (see the CreatePaymentRequest RPC's
-// share validation), so each is rounded to its count of units, the counts are
-// summed as integers, and the sum is divided back into the currency once. A
-// float sum would drift (0.1 + 0.2 is 0.30000000000000004), where this gives
-// the double nearest the exact decimal total, as a client parsing it would.
+// every share, and a collection's fixed amount, is a whole number of them
+// (see the CreatePaymentRequest RPC's share validation, and
+// NewCollectionRequest), so each is rounded to its count of units, the counts
+// are summed (or multiplied) as integers, and the total is divided back into
+// the currency once. A float sum would drift (0.1 + 0.2 is
+// 0.30000000000000004), where this gives the double nearest the exact decimal
+// total, as a client parsing it would.
 func (r *PaymentRequest) PayerSummary() *paymentrequestpb.PayerSummary {
 	summary := &paymentrequestpb.PayerSummary{}
 	unitsPerWhole := minorUnitsPerWhole(r.Currency())
+	if r.Collection != nil {
+		units := int64(math.Round(r.Collection.GetFixed().GetNativeAmount() * unitsPerWhole))
+		summary.PayerCount = r.PayerCount
+		summary.PaidCount = r.PayerCount
+		summary.NativeAmountPaid = float64(int64(r.PayerCount)*units) / unitsPerWhole
+		return summary
+	}
 	var due, paid int64
 	for _, share := range r.Shares() {
 		units := int64(math.Round(share.NativeAmount * unitsPerWhole))
@@ -99,14 +121,33 @@ func (r *PaymentRequest) PayerSummary() *paymentrequestpb.PayerSummary {
 	return summary
 }
 
-// Currency is the request's currency: its type's (for a split,
-// Split.currency).
+// Currency is the request's currency: its type's (Split.currency, or
+// Collection.currency).
 func (r *PaymentRequest) Currency() string {
 	switch {
 	case r.Split != nil:
 		return r.Split.Currency
+	case r.Collection != nil:
+		return r.Collection.Currency
 	default:
 		return ""
+	}
+}
+
+// ContributionPayer is the Payer of userID's contribution to a collection, paid
+// by paid (see Store.RecordContribution): nothing due, the fixed amount paid,
+// and paid as its status. It is what a store records for a contribution and
+// returns from Store.GetCollectionPayer and Store.GetCollectionPayersPage. It
+// is nil for a request that is not a collection.
+func (r *PaymentRequest) ContributionPayer(userID *commonpb.UserId, paid *paymentrequestpb.Paid) *paymentrequestpb.Payer {
+	if r.Collection == nil {
+		return nil
+	}
+	return &paymentrequestpb.Payer{
+		UserId:           proto.Clone(userID).(*commonpb.UserId),
+		NativeAmountDue:  0,
+		NativeAmountPaid: r.Collection.GetFixed().GetNativeAmount(),
+		Status:           &paymentrequestpb.Payer_Paid{Paid: proto.Clone(paid).(*paymentrequestpb.Paid)},
 	}
 }
 
@@ -166,10 +207,11 @@ type PayerCursor struct {
 	UserID []byte
 }
 
-// PayersPage returns up to limit of the request's Payers in section, in that
+// PayersPage returns up to limit of a split's Payers in section, in that
 // section's order, strictly after cursor (from the start when nil). When more
 // follow the page, next is the cursor naming its last Payer, to resume from;
-// it is nil otherwise. limit must be positive.
+// it is nil otherwise. limit must be positive. A collection's are paged from
+// the store (see Store.GetCollectionPayersPage); here it has none.
 func (r *PaymentRequest) PayersPage(section PayerSection, cursor *PayerCursor, limit int) (page []*paymentrequestpb.Payer, next *PayerCursor) {
 	type entry struct {
 		share  *paymentrequestpb.Share
@@ -193,13 +235,13 @@ func (r *PaymentRequest) PayersPage(section PayerSection, cursor *PayerCursor, l
 				continue
 			}
 			at := paidCursorOf(share)
-			if cursor != nil && !paidBefore(cursor, at) {
+			if cursor != nil && !PaidBefore(cursor, at) {
 				continue
 			}
 			entries = append(entries, entry{share: share, cursor: at})
 		}
 		sort.Slice(entries, func(i, j int) bool {
-			return paidBefore(entries[i].cursor, entries[j].cursor)
+			return PaidBefore(entries[i].cursor, entries[j].cursor)
 		})
 	default:
 		return nil, nil
@@ -224,9 +266,19 @@ func paidCursorOf(share *paymentrequestpb.Share) *PayerCursor {
 	}
 }
 
-// paidBefore reports whether a sorts ahead of b in the paid section: paid
+// PaidPayerCursor is a paid Payer's position in the paid section: its
+// Paid.paid_at and user ID. It is how a page of a collection's Payers (see
+// Store.GetCollectionPayersPage) names its last Payer to resume from.
+func PaidPayerCursor(payer *paymentrequestpb.Payer) *PayerCursor {
+	return &PayerCursor{
+		PaidAt: payer.GetPaid().GetPaidAt().AsTime(),
+		UserID: append([]byte(nil), payer.GetUserId().GetValue()...),
+	}
+}
+
+// PaidBefore reports whether a sorts ahead of b in the paid section: paid
 // later, or paid at the same time with the lesser user ID.
-func paidBefore(a, b *PayerCursor) bool {
+func PaidBefore(a, b *PayerCursor) bool {
 	if !a.PaidAt.Equal(b.PaidAt) {
 		return a.PaidAt.After(b.PaidAt)
 	}

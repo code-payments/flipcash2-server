@@ -64,33 +64,39 @@ const (
 // Who may do what in a group chat request is the chat's to say, through the
 // shared chat.Access, except where the request itself names who:
 //
-//   - Creating a request is speaking in the chat (Access.SpeakerStanding), and
-//     the standing also says whether the chat takes a split's text in
-//     plaintext (a public group) or encrypted under the chat key (a keyed
-//     private group). For now public groups are refused outright (see
-//     CreatePaymentRequest), a transitional gate.
-//   - Seeing a request, alone or in its chat's listing, its Payers
-//     (GetPayers) or, as a debtor, the intent ID to pay a share with
-//     (GetPaymentIntentId), is reading the chat in full (Access.CanListen):
-//     its members, and a non-member of a public group who satisfies its
-//     listener rules.
-//   - Closing a request and marking a share paid by hand are its creator's
-//     alone, whatever their standing in the chat now: the request is theirs,
-//     and they are the one who is paid.
+//   - Creating a request, a split or a collection, is speaking in the chat
+//     (Access.SpeakerStanding), and the standing also says whether the chat
+//     takes the request's text in plaintext (a public group) or encrypted
+//     under the chat key (a keyed private group). For now public groups are
+//     refused outright (see CreatePaymentRequest), a transitional gate.
+//   - Seeing a request, alone or in its chat's listing, or its Payers
+//     (GetPayers), is reading the chat in full (Access.CanListen): its
+//     members, and a non-member of a public group who satisfies its listener
+//     rules. So is getting, as a split's debtor, the intent ID to pay a share
+//     with (GetPaymentIntentId); getting one to contribute to a collection
+//     also takes being a member of the chat, since a collection asks its
+//     members.
+//   - Closing a request and marking a split's share paid by hand are its
+//     creator's alone, whatever their standing in the chat now: the request
+//     is theirs, and they are the one who is paid.
 //
-// Paying a share with a Flipcash payment is not this service's: it is an
-// intent, validated and recorded elsewhere (see Store.PayShare). This service
-// only hands a debtor the intent ID that payment must use (GetPaymentIntentId,
-// and GetPaymentRequest for older clients), never logging it.
+// Paying into a request with a Flipcash payment, a share or a contribution,
+// is not this service's: it is an intent, validated and recorded elsewhere
+// (see Store.PayShare and Store.RecordContribution). This service only hands
+// a payer the intent ID that payment must use (GetPaymentIntentId, and
+// GetPaymentRequest for a split's debtor on older clients), never logging it.
 //
-// A request's Payers and PayerSummary are computed from its shares on every
-// read (see PaymentRequest.Payer), so every read of a request carries its
-// summary, and GetPayers pages them from one read of the request, at its
-// version.
+// A split's Payers and PayerSummary are computed from its shares on every read
+// (see PaymentRequest.Payer), so GetPayers pages them from one read of the
+// request, at its version. A collection's Payers are stored, one per
+// contribution, and read from the store; its summary is computed from the
+// count the request holds, so every read of a request of either type carries
+// its summary.
 //
 // Every change the service makes, a creation, a close or a share marked paid
 // by hand, is announced on the chat's topic (see PublishCreated,
-// PublishSharePaid and PublishClosed); a no-op is not.
+// PublishSharePaid and PublishClosed); a no-op is not, and nor is issuing a
+// collection payer's intent ID, which is not a change to the request.
 type Server struct {
 	log *zap.Logger
 
@@ -174,13 +180,12 @@ func NewServer(
 	return s
 }
 
-// CreatePaymentRequest creates a payment request. Today the only kind is a
-// split in a group chat; a collection is refused as InvalidArgument until it
-// is built.
+// CreatePaymentRequest creates a payment request: a split or a collection in
+// a group chat, the one kind there is today.
 //
-// A split's text is optional. A request with none leaves it unset, so a
-// plaintext with neither a title nor a description is refused as
-// InvalidArgument: it is validated, never normalized to none.
+// A request's text is optional, whatever its type. A request with none leaves
+// it unset, so a plaintext with neither a title nor a description is refused
+// as InvalidArgument: it is validated, never normalized to none.
 //
 // The request is checked in the order a client can act on, local checks
 // first, the store and chat reads next, and moderation, a call out, last:
@@ -189,11 +194,15 @@ func NewServer(
 // transitional, see below); the text, when set, must be in the form the chat
 // takes, plaintext in a public group and encrypted under the chat key in a
 // private one (ENCRYPTION_NOT_ALLOWED, ENCRYPTION_REQUIRED), and a request
-// with no text fits either; ends_at must be in the future and at most
-// MaxDuration away (INVALID_ENDS_AT); the currency must be one the server
-// values (INVALID_CURRENCY); the shares must be valid
-// (INVALID_SHARES, see validateShares); and plaintext, when set, must pass
-// moderation (TEXT_MODERATED, see moderate). Only then is anything written.
+// with no text fits either; ends_at, when set, must be in the future and at
+// most MaxDuration away (INVALID_ENDS_AT; a split's is always set, which the
+// proto's validation requires, and a collection's may be unset, leaving it
+// open until its creator closes it); the currency must be one the server
+// values (INVALID_CURRENCY); a split's shares must be valid (INVALID_SHARES,
+// see validateShares), and a collection's fixed amount a whole number, at
+// least one, of the currency's minimum transfer value (INVALID_AMOUNT, see
+// NewCollectionRequest); and plaintext, when set, must pass moderation
+// (TEXT_MODERATED, see moderate). Only then is anything written.
 //
 // A chat that does not exist is DENIED, not reported: the proto has no
 // NOT_FOUND for creation, and Access.SpeakerStanding admits no one to a chat
@@ -208,10 +217,11 @@ func NewServer(
 // The RPC is retry-safe. The request's ID is derived from the caller and the
 // request's idempotency key (see MustDeriveID), so a retry names the same
 // request, and one that already exists is answered from the store before any
-// check runs, whatever the retry carries: a member since departed or a text the moderator has since learned to flag
-// are facts about a new request, not this one. A retry that loses a race
-// with its twin is caught by the store's uniqueness condition and answered
-// the same way.
+// check runs, whatever the retry carries, a different type included: a
+// member since departed or a text the moderator has since learned to flag are
+// facts about a new request, not this one. A retry that loses a race with its
+// twin is caught by the store's uniqueness condition and answered the same
+// way.
 //
 // Only the write that creates the request announces it (see PublishCreated);
 // a retry answered from the store announces nothing, its twin having done so.
@@ -249,19 +259,34 @@ func (s *Server) CreatePaymentRequest(ctx context.Context, req *paymentrequestpb
 	chatID := groupChat.ChatId
 	log = log.With(zap.String("chat_id", hex.EncodeToString(chatID.GetValue())))
 
-	var split *paymentrequestpb.Split
+	// What every type shares is read off it once, so the checks below are the
+	// same for each.
+	var (
+		split      *paymentrequestpb.Split
+		collection *paymentrequestpb.Collection
+		text       requestText
+		endsAt     *timestamppb.Timestamp
+		currency   string
+	)
 	switch typ := groupChat.Type.(type) {
 	case *paymentrequestpb.GroupChatPaymentRequest_Split:
 		split = typ.Split
+		text = requestText{plaintext: split.GetPlaintext(), encrypted: split.GetEncrypted()}
+		endsAt = split.GetEndsAt()
+		currency = split.GetCurrency()
+	case *paymentrequestpb.GroupChatPaymentRequest_Collection:
+		collection = typ.Collection
+		text = requestText{plaintext: collection.GetPlaintext(), encrypted: collection.GetEncrypted()}
+		endsAt = collection.GetEndsAt()
+		currency = collection.GetCurrency()
 	default:
-		// A collection is not built yet.
 		return nil, status.Error(codes.InvalidArgument, "unsupported payment request type")
 	}
 
 	// Text is optional, and a request with none leaves it unset: a set
 	// plaintext with neither a title nor a description is refused, not taken
 	// as none.
-	if text := split.GetPlaintext(); text != nil && text.Title == "" && text.Description == "" {
+	if t := text.plaintext; t != nil && t.Title == "" && t.Description == "" {
 		return nil, status.Error(codes.InvalidArgument, "plaintext text is empty")
 	}
 
@@ -285,39 +310,55 @@ func (s *Server) CreatePaymentRequest(ctx context.Context, req *paymentrequestpb
 		return &paymentrequestpb.CreatePaymentRequestResponse{Result: paymentrequestpb.CreatePaymentRequestResponse_CHAT_NOT_SUPPORTED}, nil
 	}
 
-	if result, ok := textVerdict(speaker, split); !ok {
+	if result, ok := textVerdict(speaker, text); !ok {
 		return &paymentrequestpb.CreatePaymentRequestResponse{Result: result}, nil
 	}
 
+	// A split's ends_at is required by the proto's validation, so only a
+	// collection's is ever unset here.
 	now := s.now()
-	if untilEnd := split.EndsAt.AsTime().Sub(now); untilEnd <= 0 || untilEnd > MaxDuration {
-		return &paymentrequestpb.CreatePaymentRequestResponse{Result: paymentrequestpb.CreatePaymentRequestResponse_INVALID_ENDS_AT}, nil
+	if endsAt != nil {
+		if untilEnd := endsAt.AsTime().Sub(now); untilEnd <= 0 || untilEnd > MaxDuration {
+			return &paymentrequestpb.CreatePaymentRequestResponse{Result: paymentrequestpb.CreatePaymentRequestResponse_INVALID_ENDS_AT}, nil
+		}
 	}
 
-	if !isSupportedCurrency(split.Currency) {
+	if !isSupportedCurrency(currency) {
 		return &paymentrequestpb.CreatePaymentRequestResponse{Result: paymentrequestpb.CreatePaymentRequestResponse_INVALID_CURRENCY}, nil
 	}
 
-	r, err := NewSplitRequest(id, userID, chatID, split, now)
-	if errors.Is(err, ErrInvalidShares) {
-		return &paymentrequestpb.CreatePaymentRequestResponse{Result: paymentrequestpb.CreatePaymentRequestResponse_INVALID_SHARES}, nil
-	}
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure building payment request")
-		return nil, status.Error(codes.Internal, "")
+	var r *PaymentRequest
+	if split != nil {
+		r, err = NewSplitRequest(id, userID, chatID, split, now)
+		if errors.Is(err, ErrInvalidShares) {
+			return &paymentrequestpb.CreatePaymentRequestResponse{Result: paymentrequestpb.CreatePaymentRequestResponse_INVALID_SHARES}, nil
+		}
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure building payment request")
+			return nil, status.Error(codes.Internal, "")
+		}
+
+		validShares, err := s.validateShares(ctx, r)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure validating shares")
+			return nil, status.Error(codes.Internal, "")
+		}
+		if !validShares {
+			return &paymentrequestpb.CreatePaymentRequestResponse{Result: paymentrequestpb.CreatePaymentRequestResponse_INVALID_SHARES}, nil
+		}
+	} else {
+		r, err = NewCollectionRequest(id, userID, chatID, collection, now)
+		if errors.Is(err, ErrInvalidAmount) {
+			return &paymentrequestpb.CreatePaymentRequestResponse{Result: paymentrequestpb.CreatePaymentRequestResponse_INVALID_AMOUNT}, nil
+		}
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure building payment request")
+			return nil, status.Error(codes.Internal, "")
+		}
 	}
 
-	validShares, err := s.validateShares(ctx, r)
-	if err != nil {
-		log.With(zap.Error(err)).Warn("Failure validating shares")
-		return nil, status.Error(codes.Internal, "")
-	}
-	if !validShares {
-		return &paymentrequestpb.CreatePaymentRequestResponse{Result: paymentrequestpb.CreatePaymentRequestResponse_INVALID_SHARES}, nil
-	}
-
-	if text := split.GetPlaintext(); text != nil {
-		result, category, err := s.moderate(ctx, log, text)
+	if t := text.plaintext; t != nil {
+		result, category, err := s.moderate(ctx, log, t)
 		if err != nil {
 			return nil, status.Error(codes.Internal, "")
 		}
@@ -359,20 +400,28 @@ func createdResponse(r *PaymentRequest, now time.Time) *paymentrequestpb.CreateP
 	}
 }
 
-// textVerdict judges a split's text against what the chat takes, as the
+// requestText is a request's text as its type carries it (Split.text or
+// Collection.text, each its own oneof): at most one of the two is set, and
+// neither when the request has no text.
+type requestText struct {
+	plaintext *paymentrequestpb.PaymentRequestText
+	encrypted *paymentrequestpb.EncryptedPaymentRequestText
+}
+
+// textVerdict judges a request's text against what the chat takes, as the
 // speaker's standing says (see chat.SpeakerStanding): a public group takes
 // plaintext alone, and a keyed private group text encrypted under its scheme
-// alone. A split with no text fits either, so it is never refused for its
+// alone. A request with no text fits either, so it is never refused for its
 // form. ok is false, with the result to answer, when the chat does not take
 // the text.
-func textVerdict(speaker chat.SpeakerStanding, split *paymentrequestpb.Split) (result paymentrequestpb.CreatePaymentRequestResponse_Result, ok bool) {
-	noText := split.GetText() == nil
+func textVerdict(speaker chat.SpeakerStanding, text requestText) (result paymentrequestpb.CreatePaymentRequestResponse_Result, ok bool) {
+	noText := text.plaintext == nil && text.encrypted == nil
 	switch speaker.Encryption {
 	case chat.EncryptionNone:
 		if noText {
 			return paymentrequestpb.CreatePaymentRequestResponse_OK, true
 		}
-		if split.GetPlaintext() == nil {
+		if text.plaintext == nil {
 			return paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_NOT_ALLOWED, false
 		}
 		return paymentrequestpb.CreatePaymentRequestResponse_OK, true
@@ -380,7 +429,7 @@ func textVerdict(speaker chat.SpeakerStanding, split *paymentrequestpb.Split) (r
 		if noText {
 			return paymentrequestpb.CreatePaymentRequestResponse_OK, true
 		}
-		encrypted := split.GetEncrypted()
+		encrypted := text.encrypted
 		if encrypted == nil {
 			return paymentrequestpb.CreatePaymentRequestResponse_ENCRYPTION_REQUIRED, false
 		}
@@ -391,14 +440,14 @@ func textVerdict(speaker chat.SpeakerStanding, split *paymentrequestpb.Split) (r
 	default:
 		// No other mode exists. A DM is refused by its ID before any standing
 		// is asked for; were one to reach here, its pairwise scheme has no
-		// split text scheme, so it is ENCRYPTION_NOT_ALLOWED above.
+		// request text scheme, so it is ENCRYPTION_NOT_ALLOWED above.
 		return paymentrequestpb.CreatePaymentRequestResponse_CHAT_NOT_SUPPORTED, false
 	}
 }
 
 // textScheme is the EncryptedPaymentRequestText scheme that corresponds to a
-// chat's content scheme: a split's text in a private group is encrypted with
-// the same chat key as its messages.
+// chat's content scheme: a request's text in a private group is encrypted
+// with the same chat key as its messages.
 func textScheme(scheme messagingpb.EncryptedContent_Scheme) (paymentrequestpb.EncryptedPaymentRequestText_Scheme, bool) {
 	switch scheme {
 	case messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305:
@@ -410,8 +459,8 @@ func textScheme(scheme messagingpb.EncryptedContent_Scheme) (paymentrequestpb.En
 
 // isSupportedCurrency reports whether the server can value amounts in code:
 // when Flipcash offers it for payments (see send.PresetsFor). Those are the
-// currencies clients pay in, and so ones OCP prices; a debtor paying their
-// share pays in the request's currency. The list is deterministic, unlike
+// currencies clients pay in, and so ones OCP prices; a payment into a
+// request, a share or a contribution, is in the request's currency. The list is deterministic, unlike
 // asking OCP to value an amount. It repeats poll's check rather than import
 // it.
 func isSupportedCurrency(code string) bool {
@@ -477,8 +526,8 @@ func isWholeMinorUnits(amount, minimum float64) bool {
 	return math.Abs(amount-units*minimum) <= 4*(math.Nextafter(amount, math.Inf(1))-amount)
 }
 
-// moderate runs a split's plaintext through the general text classifier as one
-// text, the title and then the description on a line of its own, and returns
+// moderate runs a request's plaintext through the general text classifier as
+// one text, the title and then the description on a line of its own, and returns
 // the result to answer: OK, or TEXT_MODERATED and the best-fit category.
 //
 // Any failure to classify is an error, and nothing is created. That includes
@@ -498,7 +547,7 @@ func (s *Server) moderate(ctx context.Context, log *zap.Logger, text *paymentreq
 	return paymentrequestpb.CreatePaymentRequestResponse_TEXT_MODERATED, moderation.HighestFlaggedCategory(result), nil
 }
 
-// moderationText is the one text a split's plaintext is moderated as: the
+// moderationText is the one text a request's plaintext is moderated as: the
 // title, then the description on its own line, each when there is one. A
 // plaintext with neither is refused before moderation (see
 // CreatePaymentRequest).
@@ -520,15 +569,20 @@ func moderationText(text *paymentrequestpb.PaymentRequestText) string {
 // hold, so the distinction leaks nothing. Otherwise the caller must be able to
 // read the request's chat in full (DENIED).
 //
-// A caller holding a share of the request, the creator's own included, is
-// given it as their Payer (caller_payer, see PaymentRequest.Payer), so a
-// client knows whether to offer to pay without walking GetPayers.
+// A caller with a part in the request is given it as their Payer
+// (caller_payer), exactly as GetPayers lists it, so a client knows whether to
+// offer to pay without walking GetPayers: in a split, a caller holding a
+// share, the creator's own included (see PaymentRequest.Payer); in a
+// collection, a caller who has contributed (Store.GetCollectionPayer, a
+// second, strongly consistent read). A collection's caller who has not
+// contributed, holding an intent ID or not, has no Payer and none is set.
 //
-// A caller holding an unpaid share of the request is also given the intent ID
+// A caller holding an unpaid share of a split is also given the intent ID
 // their payment of it must use (PaymentRequest.PaymentIntentIDs), whatever
 // the request's status: a payment's validation judges that. It is kept for
 // clients that predate GetPaymentIntentId, which new clients call instead. No
-// one else is ever given it, the creator included.
+// one else is ever given it, the creator included, and it is never given for
+// a collection, whose payers get theirs from GetPaymentIntentId alone.
 func (s *Server) GetPaymentRequest(ctx context.Context, req *paymentrequestpb.GetPaymentRequestRequest) (*paymentrequestpb.GetPaymentRequestResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {
@@ -561,8 +615,20 @@ func (s *Server) GetPaymentRequest(ctx context.Context, req *paymentrequestpb.Ge
 	resp := &paymentrequestpb.GetPaymentRequestResponse{
 		Result:         paymentrequestpb.GetPaymentRequestResponse_OK,
 		PaymentRequest: r.ToProto(s.now()),
-		CallerPayer:    r.Payer(userID),
 	}
+	if r.IsCollection() {
+		payer, err := s.requests.GetCollectionPayer(ctx, r.ID, userID)
+		switch {
+		case err == nil:
+			resp.CallerPayer = payer
+		case !errors.Is(err, ErrNotFound):
+			log.With(zap.Error(err)).Warn("Failure getting caller's payer")
+			return nil, status.Error(codes.Internal, "")
+		}
+		return resp, nil
+	}
+
+	resp.CallerPayer = r.Payer(userID)
 	if share := r.Share(userID); share != nil && share.GetPaid() == nil {
 		if intentID := r.PaymentIntentID(userID); intentID != nil {
 			resp.PaymentIntentId = &commonpb.IntentId{Value: append([]byte(nil), intentID...)}
@@ -572,7 +638,9 @@ func (s *Server) GetPaymentRequest(ctx context.Context, req *paymentrequestpb.Ge
 }
 
 // GetChatPaymentRequests pages one section of a group chat's requests (see
-// Store.GetChatPage for each section's order).
+// Store.GetChatPage for each section's order). A collection with no ends_at
+// is in neither section while it is open, and in the resolved one once its
+// creator closes it, which is the only way it resolves.
 //
 // A DM is DENIED before anything is read, a token that is malformed or bound
 // to another chat or section is InvalidArgument, a group that does not exist
@@ -735,18 +803,29 @@ func decodePageToken(token *commonpb.PagingToken, chatID *commonpb.ChatId, secti
 	}, true
 }
 
-// GetPaymentIntentId gives the caller the intent ID their payment of their
-// share must use (see PaymentRequest.PaymentIntentIDs): the one drawn for the
-// share when the request was created, the same on every call.
+// GetPaymentIntentId gives the caller the intent ID their payment into a
+// request must use, the same on every call until a payment uses it: for a
+// split, the one drawn for the caller's share when the request was created
+// (see PaymentRequest.PaymentIntentIDs); for a collection, the one issued to
+// the caller by their first call (see Store.GetOrCreatePayerIntent).
 //
-// The result is decided in this order: a request that does not exist is
-// NOT_FOUND, as for GetPaymentRequest; the caller must be able to read its
-// chat in full (DENIED); the caller must hold a share a payment pays, which
-// neither the creator nor a member with no share does (NOT_A_PAYER); the
-// share must be unpaid, by payment or by hand (ALREADY_PAID), whatever the
-// request's status; and the request must be open as of now (NOT_OPEN, see
-// PaymentRequest.IsOpenAt), since a payment's validation refuses one into a
-// request that is not.
+// For a split, the result is decided in this order: a request that does not
+// exist is NOT_FOUND, as for GetPaymentRequest; the caller must be able to
+// read its chat in full (DENIED); the caller must hold a share a payment
+// pays, which neither the creator nor a member with no share does
+// (NOT_A_PAYER); the share must be unpaid, by payment or by hand
+// (ALREADY_PAID), whatever the request's status; and the request must be open
+// as of now (NOT_OPEN, see PaymentRequest.IsOpenAt), since a payment's
+// validation refuses one into a request that is not.
+//
+// For a collection (see collectionIntentID), in this order: NOT_FOUND; the
+// caller must be able to read the chat in full and be a member of it
+// (DENIED: a non-member who satisfies a public group's listener rules reads
+// it but does not pay into it); the creator never pays into their own request
+// (NOT_A_PAYER); a caller who has contributed has nothing left to pay
+// (ALREADY_PAID), whatever the request's status; and the request must be open
+// as of now (NOT_OPEN). Only then is an ID issued, so no ID is ever stored for
+// a request a caller cannot pay into.
 //
 // The ID is a secret until used and is never logged.
 func (s *Server) GetPaymentIntentId(ctx context.Context, req *paymentrequestpb.GetPaymentIntentIdRequest) (*paymentrequestpb.GetPaymentIntentIdResponse, error) {
@@ -767,6 +846,10 @@ func (s *Server) GetPaymentIntentId(ctx context.Context, req *paymentrequestpb.G
 	case err != nil:
 		log.With(zap.Error(err)).Warn("Failure getting payment request")
 		return nil, status.Error(codes.Internal, "")
+	}
+
+	if r.IsCollection() {
+		return s.collectionIntentID(ctx, log, r, userID)
 	}
 
 	canListen, err := s.access.CanListen(ctx, r.ChatID, userID)
@@ -801,9 +884,81 @@ func (s *Server) GetPaymentIntentId(ctx context.Context, req *paymentrequestpb.G
 	}, nil
 }
 
-// GetPayers pages one section of a request's Payers (see
-// PaymentRequest.PayersPage for each section's order), computed from the
-// request as one read of it, whose version the page carries.
+// collectionIntentID answers GetPaymentIntentId for the collection r, read
+// already (see GetPaymentIntentId for the order its results are decided in).
+//
+// Membership is asked for as well as full reading, in one standing: a
+// collection asks the members of its chat, and a non-member who satisfies a
+// public group's listener rules may see it but not pay into it. The caller's
+// record is read before anything is issued, so a caller who has contributed
+// is ALREADY_PAID whatever the request's status, and a request that is not
+// open issues nothing. The issue itself (Store.GetOrCreatePayerIntent) is
+// idempotent and agrees on one ID under concurrent first calls; a
+// contribution recorded between the read and the issue shows as Paid on what
+// it returns, and is ALREADY_PAID too. Issuing an ID moves no version and
+// announces nothing: it is not a change to the request.
+func (s *Server) collectionIntentID(ctx context.Context, log *zap.Logger, r *PaymentRequest, userID *commonpb.UserId) (*paymentrequestpb.GetPaymentIntentIdResponse, error) {
+	standing, err := s.access.ListenerStanding(ctx, r.ChatID, userID, messagingpb.ViewMode_FULL)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure determining listener standing")
+		return nil, status.Error(codes.Internal, "")
+	}
+	if !standing.CanListen || !standing.IsMember {
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_DENIED}, nil
+	}
+
+	if proto.Equal(userID, r.Creator) {
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_NOT_A_PAYER}, nil
+	}
+
+	held, err := s.requests.GetPayerIntent(ctx, r.ID, userID)
+	switch {
+	case errors.Is(err, ErrNotFound):
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure getting payer intent")
+		return nil, status.Error(codes.Internal, "")
+	case held.Paid != nil:
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_ALREADY_PAID}, nil
+	}
+
+	if !r.IsOpenAt(s.now()) {
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_NOT_OPEN}, nil
+	}
+
+	candidate, err := NewPaymentIntentID()
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure drawing payment intent id")
+		return nil, status.Error(codes.Internal, "")
+	}
+	issued, err := s.requests.GetOrCreatePayerIntent(ctx, r.ID, userID, candidate)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_NOT_FOUND}, nil
+	case errors.Is(err, ErrNotAPayer):
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_NOT_A_PAYER}, nil
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure issuing payment intent id")
+		return nil, status.Error(codes.Internal, "")
+	}
+	if issued.Paid != nil {
+		return &paymentrequestpb.GetPaymentIntentIdResponse{Result: paymentrequestpb.GetPaymentIntentIdResponse_ALREADY_PAID}, nil
+	}
+	return &paymentrequestpb.GetPaymentIntentIdResponse{
+		Result:          paymentrequestpb.GetPaymentIntentIdResponse_OK,
+		PaymentIntentId: &commonpb.IntentId{Value: append([]byte(nil), issued.IntentID...)},
+	}, nil
+}
+
+// GetPayers pages one section of a request's Payers, each section in the
+// order PayerSection gives it, and carries the request's version as of the
+// read.
+//
+// A split's Payers are computed from the request as one read of it (see
+// PaymentRequest.PayersPage), whose version the page carries. A collection's
+// are its contributions, all paid: its UNPAID section is always an empty page,
+// and its PAID section is read from the store (Store.GetCollectionPayersPage)
+// after the request, whose version the page carries (see collectionPayers).
+// Paging tokens are the same for both types.
 //
 // A token that is malformed or bound to another request or section is
 // InvalidArgument, checked before anything is read. Then, as for
@@ -860,7 +1015,19 @@ func (s *Server) GetPayers(ctx context.Context, req *paymentrequestpb.GetPayersR
 		return &paymentrequestpb.GetPayersResponse{Result: paymentrequestpb.GetPayersResponse_DENIED}, nil
 	}
 
-	page, next := r.PayersPage(section, after, limit)
+	var (
+		page []*paymentrequestpb.Payer
+		next *PayerCursor
+	)
+	if r.IsCollection() {
+		page, next, err = s.collectionPayers(ctx, r, section, after, limit)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure reading collection payers page")
+			return nil, status.Error(codes.Internal, "")
+		}
+	} else {
+		page, next = r.PayersPage(section, after, limit)
+	}
 	resp := &paymentrequestpb.GetPayersResponse{
 		Result:  paymentrequestpb.GetPayersResponse_OK,
 		Payers:  page,
@@ -871,6 +1038,36 @@ func (s *Server) GetPayers(ctx context.Context, req *paymentrequestpb.GetPayersR
 		resp.PagingToken = encodePayerPageToken(req.PaymentRequestId, section, next)
 	}
 	return resp, nil
+}
+
+// collectionPayers reads up to limit of the collection r's Payers in section,
+// strictly after the cursor, and the cursor to resume from when more follow
+// (nil otherwise). The unpaid section is always empty: nothing is owed a
+// collection, and a member who holds an intent ID they have not contributed
+// with is not a Payer. The paid section is read from the store, asking for
+// one more than it shows so has_more is exact.
+//
+// r was read before the page, and its version is the one the page carries.
+// A contribution recorded between the two reads may already be on the page
+// while the version predates it; that is harmless, since a client applies
+// every update past the page's version on top, replacing a Payer by user_id
+// (see the GetPayers RPC), so the contribution's update changes nothing the
+// page already shows. Reading the request after the page instead could carry
+// a version whose change the page lacks, and that update would then never be
+// applied.
+func (s *Server) collectionPayers(ctx context.Context, r *PaymentRequest, section PayerSection, after *PayerCursor, limit int) ([]*paymentrequestpb.Payer, *PayerCursor, error) {
+	if section != PayerSectionPaid {
+		return nil, nil, nil
+	}
+	page, err := s.requests.GetCollectionPayersPage(ctx, r.ID, after, limit+1)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(page) <= limit {
+		return page, nil, nil
+	}
+	page = page[:limit]
+	return page, PaidPayerCursor(page[limit-1]), nil
 }
 
 // payerSectionFromProto maps a request's Payer section onto PayerSection.
@@ -990,7 +1187,8 @@ func (s *Server) ClosePaymentRequest(ctx context.Context, req *paymentrequestpb.
 
 // MarkPaid marks a debtor's share paid by hand (Paid.Manual). A request
 // that does not exist is NOT_FOUND, only its creator may mark a share
-// (DENIED), and the request must have a share for the user (NOT_A_SHARE). A
+// (DENIED), and the request must have a share for the user (NOT_A_SHARE),
+// which a collection never does: nothing in one is marked paid by hand. A
 // share already paid, by payment, by hand or from creation, is the no-op OK
 // whatever the request's status; an unpaid share of a request that is not
 // open is NOT_OPEN (see Store.PayShare). No message is posted; a real change
@@ -1018,7 +1216,7 @@ func (s *Server) MarkPaid(ctx context.Context, req *paymentrequestpb.MarkPaidReq
 	if !proto.Equal(r.Creator, userID) {
 		return &paymentrequestpb.MarkPaidResponse{Result: paymentrequestpb.MarkPaidResponse_DENIED}, nil
 	}
-	if r.Share(req.UserId) == nil {
+	if r.IsCollection() || r.Share(req.UserId) == nil {
 		return &paymentrequestpb.MarkPaidResponse{Result: paymentrequestpb.MarkPaidResponse_NOT_A_SHARE}, nil
 	}
 

@@ -92,19 +92,19 @@ func SendDmMessages(
 	return chatID, sent, nil
 }
 
-// SendWelcomeDmV3 sends the third version of the team's welcome to userID: one
+// SendWelcomeDmV4 sends the fourth version of the team's welcome to userID: one
 // text message (see SendDmMessages).
 //
 // It is idempotent on the user: every call for them sends under the same key,
 // so a retry returns what the first call sent without sending again (for as
 // long as SendDmMessages' idempotency lasts).
-func SendWelcomeDmV3(
+func SendWelcomeDmV4(
 	ctx context.Context,
 	chats chat.Store,
 	sender *messaging.Sender,
 	userID *commonpb.UserId,
 ) (*commonpb.ChatId, []*messagingpb.Message, error) {
-	return SendDmMessages(ctx, chats, sender, userID, welcomeV3IdempotencyKey, welcomeV3Messages())
+	return SendDmMessages(ctx, chats, sender, userID, welcomeV4IdempotencyKey, welcomeV4Messages())
 }
 
 // ensureDm creates the DM chatID between the team account and userID

@@ -31,7 +31,7 @@ import (
 // which the team posts end-to-end encrypted messages, the welcome first.
 //
 // It is built but not yet used to welcome anyone: DmWelcomer sends the welcome
-// into the team's DM with the user (see SendWelcomeDmV3), and nothing in the
+// into the team's DM with the user (see SendWelcomeDmV4), and nothing in the
 // parent calls what is here. GroupWelcomer is what would: switching the
 // welcome to the group is the parent handing it to the profile server in
 // place of DmWelcomer.
@@ -304,14 +304,14 @@ func SendWelcomeGroupMessages(
 	return chatID, sent, nil
 }
 
-// SendWelcomeGroupV3 sends the third version of the team's welcome (see
-// SendWelcomeDmV3) to userID in their welcome group (see
+// SendWelcomeGroupV4 sends the fourth version of the team's welcome (see
+// SendWelcomeDmV4) to userID in their welcome group (see
 // SendWelcomeGroupMessages), under the same key as the DM welcome: the key is
 // scoped to the chat it is sent in, so the two never meet.
 //
 // It is idempotent on the user, for as long as SendWelcomeGroupMessages'
 // idempotency lasts.
-func SendWelcomeGroupV3(
+func SendWelcomeGroupV4(
 	ctx context.Context,
 	chats chat.Store,
 	accounts account.Store,
@@ -319,7 +319,7 @@ func SendWelcomeGroupV3(
 	cfg *WelcomeGroupConfig,
 	userID *commonpb.UserId,
 ) (*commonpb.ChatId, []*messagingpb.Message, error) {
-	return SendWelcomeGroupMessages(ctx, chats, accounts, sender, cfg, userID, welcomeV3IdempotencyKey, welcomeV3Messages())
+	return SendWelcomeGroupMessages(ctx, chats, accounts, sender, cfg, userID, welcomeV4IdempotencyKey, welcomeV4Messages())
 }
 
 // ensureWelcomeGroup creates userID's welcome group chatID, with groupKey as

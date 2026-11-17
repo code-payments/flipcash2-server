@@ -25,12 +25,12 @@ import (
 	ocp_headers "github.com/code-payments/ocp-server/grpc/headers"
 )
 
-func TestSendWelcomeDmV3(t *testing.T) {
+func TestSendWelcomeDmV4(t *testing.T) {
 	e := newChatEnv(t)
 
-	const expected = "Welcome to Flipcash, the group money app. If someone sent you an invite link to a Flipcash group, tap it again to join."
+	const expected = "Welcome to Flipcash, the group money app. If someone sent you a group link, tap or scan it again to join the group"
 
-	chatID, sent, err := flipcashteam.SendWelcomeDmV3(e.ctx, e.chats, e.sender, e.user)
+	chatID, sent, err := flipcashteam.SendWelcomeDmV4(e.ctx, e.chats, e.sender, e.user)
 	require.NoError(t, err)
 	require.Equal(t, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.team, e.user).Value, chatID.Value)
 	require.Len(t, sent, 1)
@@ -39,7 +39,7 @@ func TestSendWelcomeDmV3(t *testing.T) {
 	require.Equal(t, expected, sent[0].Content[0].GetText().Text)
 
 	// A retry returns the first welcome and sends nothing new.
-	_, replayed, err := flipcashteam.SendWelcomeDmV3(e.ctx, e.chats, e.sender, e.user)
+	_, replayed, err := flipcashteam.SendWelcomeDmV4(e.ctx, e.chats, e.sender, e.user)
 	require.NoError(t, err)
 	require.Len(t, replayed, 1)
 	require.Equal(t, sent[0].MessageId.Value, replayed[0].MessageId.Value)
@@ -307,8 +307,8 @@ func TestGroupWelcomer(t *testing.T) {
 	welcomer.OnFirstUsername(ctx, e.user, "alice_1")
 	welcomer.OnFirstUsername(ctx, e.user, "alice_1")
 
-	require.Eventually(t, func() bool { return e.welcomeGroupMessages(t) == len(welcomeV3Texts) }, time.Second, 10*time.Millisecond)
-	require.Never(t, func() bool { return e.welcomeGroupMessages(t) != len(welcomeV3Texts) }, 200*time.Millisecond, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return e.welcomeGroupMessages(t) == len(welcomeV4Texts) }, time.Second, 10*time.Millisecond)
+	require.Never(t, func() bool { return e.welcomeGroupMessages(t) != len(welcomeV4Texts) }, 200*time.Millisecond, 10*time.Millisecond)
 
 	// What was sent is the encrypted welcome, in the user's welcome group: a
 	// send under the secret the welcomer was built with replays it.
@@ -318,7 +318,7 @@ func TestGroupWelcomer(t *testing.T) {
 	require.Equal(t, expectedWelcomeGroupID(e.team, e.user).Value, chatID.Value)
 	groupKey := e.openGroupKey(t, chatID)
 	e.requireWelcome(t, chatID, groupKey, replayed)
-	require.Equal(t, len(welcomeV3Texts), e.welcomeGroupMessages(t))
+	require.Equal(t, len(welcomeV4Texts), e.welcomeGroupMessages(t))
 
 	// The group's key is the one derived from that secret, not from the
 	// caller's cleared copy: a new message sent under it decrypts with the
@@ -364,7 +364,7 @@ func TestGroupWelcomer_MinClientVersion(t *testing.T) {
 			welcomer.OnFirstUsername(ctx, e.user, "alice_1")
 
 			if tc.welcomed {
-				require.Eventually(t, func() bool { return e.welcomeGroupMessages(t) == len(welcomeV3Texts) }, time.Second, 10*time.Millisecond)
+				require.Eventually(t, func() bool { return e.welcomeGroupMessages(t) == len(welcomeV4Texts) }, time.Second, 10*time.Millisecond)
 				return
 			}
 			require.Never(t, func() bool {

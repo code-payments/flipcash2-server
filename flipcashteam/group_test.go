@@ -116,7 +116,7 @@ func newWelcomeGroupConfig(t *testing.T, teamKeys model.KeyPair) *flipcashteam.W
 }
 
 func (e *groupEnv) sendWelcome() (*commonpb.ChatId, []*messagingpb.Message, error) {
-	return flipcashteam.SendWelcomeGroupV3(e.ctx, e.chats, e.accounts, e.sender, e.cfg, e.user)
+	return flipcashteam.SendWelcomeGroupV4(e.ctx, e.chats, e.accounts, e.sender, e.cfg, e.user)
 }
 
 // expectedWelcomeGroupID derives the welcome group's ID from the formula
@@ -138,15 +138,15 @@ func (e *groupEnv) openGroupKey(t *testing.T, chatID *commonpb.ChatId) []byte {
 	return groupKey
 }
 
-// welcomeV3Texts is the third welcome's text, as TestSendWelcomeDmV3 pins it.
-var welcomeV3Texts = []string{
-	"Welcome to Flipcash, the group money app. If someone sent you an invite link to a Flipcash group, tap it again to join.",
+// welcomeV4Texts is the fourth welcome's text, as TestSendWelcomeDmV4 pins it.
+var welcomeV4Texts = []string{
+	"Welcome to Flipcash, the group money app. If someone sent you a group link, tap or scan it again to join the group",
 }
 
-// requireWelcome checks that msgs are the third welcome, encrypted under
+// requireWelcome checks that msgs are the fourth welcome, encrypted under
 // groupKey by the team.
 func (e *groupEnv) requireWelcome(t *testing.T, chatID *commonpb.ChatId, groupKey []byte, msgs []*messagingpb.Message) {
-	require.Len(t, msgs, len(welcomeV3Texts))
+	require.Len(t, msgs, len(welcomeV4Texts))
 	for i, msg := range msgs {
 		require.Equal(t, e.team.Value, msg.SenderId.Value)
 		require.Len(t, msg.Content, 1)
@@ -155,11 +155,11 @@ func (e *groupEnv) requireWelcome(t *testing.T, chatID *commonpb.ChatId, groupKe
 		require.Equal(t, messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305, encrypted.Scheme)
 		content, err := flipcashteam.DecryptGroupContent(groupKey, chatID, msg.SenderId, encrypted)
 		require.NoError(t, err)
-		require.True(t, proto.Equal(&messagingpb.Content{Type: &messagingpb.Content_Text{Text: &messagingpb.TextContent{Text: welcomeV3Texts[i]}}}, content))
+		require.True(t, proto.Equal(&messagingpb.Content{Type: &messagingpb.Content_Text{Text: &messagingpb.TextContent{Text: welcomeV4Texts[i]}}}, content))
 	}
 }
 
-func TestSendWelcomeGroupV3(t *testing.T) {
+func TestSendWelcomeGroupV4(t *testing.T) {
 	e := newGroupEnv(t)
 
 	chatID, sent, err := e.sendWelcome()
@@ -190,7 +190,7 @@ func TestSendWelcomeGroupV3(t *testing.T) {
 	_, err = e.chats.GetKeyEnvelope(e.ctx, chatID, e.team)
 	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
 
-	// The welcome is the third version's, encrypted, from the team, and is
+	// The welcome is the fourth version's, encrypted, from the team, and is
 	// what the store holds.
 	e.requireWelcome(t, chatID, groupKey, sent)
 	stored, err := e.messages.GetMessages(e.ctx, chatID)
@@ -223,7 +223,7 @@ func TestSendWelcomeGroupV3(t *testing.T) {
 	require.ErrorIs(t, err, chat.ErrChatNotFound)
 }
 
-func TestSendWelcomeGroupV3_Idempotent(t *testing.T) {
+func TestSendWelcomeGroupV4_Idempotent(t *testing.T) {
 	e := newGroupEnv(t)
 
 	chatID, sent, err := e.sendWelcome()
@@ -263,7 +263,7 @@ func TestSendWelcomeGroupMessages_ExistingGroup(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, chatID.Value, againID.Value)
 	require.Len(t, more, 1)
-	require.Equal(t, uint64(len(welcomeV3Texts)+1), more[0].MessageId.Value)
+	require.Equal(t, uint64(len(welcomeV4Texts)+1), more[0].MessageId.Value)
 
 	// The envelope is the first one, and the follow-up decrypts under it.
 	stillEnvelope, err := e.chats.GetKeyEnvelope(e.ctx, chatID, e.user)
@@ -278,16 +278,16 @@ func TestSendWelcomeGroupMessages_ExistingGroup(t *testing.T) {
 	stale := &createCountingStore{Store: e.chats, staleReads: true}
 	_, last, err := flipcashteam.SendWelcomeGroupMessages(e.ctx, stale, e.accounts, e.sender, e.cfg, e.user, "stale", []*messagingpb.Content{text("still")})
 	require.NoError(t, err)
-	require.Equal(t, uint64(len(welcomeV3Texts)+2), last[0].MessageId.Value)
+	require.Equal(t, uint64(len(welcomeV4Texts)+2), last[0].MessageId.Value)
 	stillEnvelope, err = e.chats.GetKeyEnvelope(e.ctx, chatID, e.user)
 	require.NoError(t, err)
 	require.True(t, stillEnvelope.Equal(envelope))
 }
 
-// TestSendWelcomeGroupV3_CreatedElsewhere: a group already written under the
+// TestSendWelcomeGroupV4_CreatedElsewhere: a group already written under the
 // welcome group's ID is sent into as it stands, never rewritten, and is not an
 // error.
-func TestSendWelcomeGroupV3_CreatedElsewhere(t *testing.T) {
+func TestSendWelcomeGroupV4_CreatedElsewhere(t *testing.T) {
 	e := newGroupEnv(t)
 	chatID := expectedWelcomeGroupID(e.team, e.user)
 	envelope := chat.KeyEnvelope{
@@ -309,7 +309,7 @@ func TestSendWelcomeGroupV3_CreatedElsewhere(t *testing.T) {
 	gotID, sent, err := e.sendWelcome()
 	require.NoError(t, err)
 	require.Equal(t, chatID.Value, gotID.Value)
-	require.Len(t, sent, len(welcomeV3Texts))
+	require.Len(t, sent, len(welcomeV4Texts))
 
 	record, err := e.chats.GetChatByID(e.ctx, chatID)
 	require.NoError(t, err)
@@ -319,7 +319,7 @@ func TestSendWelcomeGroupV3_CreatedElsewhere(t *testing.T) {
 	require.True(t, stored.Equal(envelope))
 }
 
-func TestSendWelcomeGroupV3_Refused(t *testing.T) {
+func TestSendWelcomeGroupV4_Refused(t *testing.T) {
 	e := newGroupEnv(t)
 	messages := []*messagingpb.Content{text("hi")}
 	send := func(cfg *flipcashteam.WelcomeGroupConfig, userID *commonpb.UserId, key string, msgs []*messagingpb.Content) error {
@@ -362,7 +362,7 @@ func TestSendWelcomeGroupV3_Refused(t *testing.T) {
 	require.Never(t, func() bool { return len(e.pusher.snapshot()) > 0 }, 100*time.Millisecond, 10*time.Millisecond)
 }
 
-func TestSendWelcomeGroupV3_NoTeamAccount(t *testing.T) {
+func TestSendWelcomeGroupV4_NoTeamAccount(t *testing.T) {
 	// A process started before the team account was set up has none.
 	e := newChatEnvWithTeam(t, false)
 	require.NoError(t, flipcashteam.AssignUsername(e.ctx, e.profiles, e.team))
@@ -371,7 +371,7 @@ func TestSendWelcomeGroupV3_NoTeamAccount(t *testing.T) {
 	_, err := accounts.Bind(e.ctx, e.user, userKeys.Proto())
 	require.NoError(t, err)
 
-	_, _, err = flipcashteam.SendWelcomeGroupV3(e.ctx, e.chats, accounts, e.sender, newWelcomeGroupConfig(t, model.MustGenerateKeyPair()), e.user)
+	_, _, err = flipcashteam.SendWelcomeGroupV4(e.ctx, e.chats, accounts, e.sender, newWelcomeGroupConfig(t, model.MustGenerateKeyPair()), e.user)
 	require.ErrorIs(t, err, flipcashteam.ErrNoTeamAccount)
 
 	_, err = e.chats.GetChatByID(e.ctx, expectedWelcomeGroupID(e.team, e.user))

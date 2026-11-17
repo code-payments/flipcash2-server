@@ -22,17 +22,17 @@ import (
 	ocp_client "github.com/code-payments/ocp-server/grpc/client"
 )
 
-// welcomeV3IdempotencyKey is the key SendWelcomeDmV3 sends under. Each version
-// of the welcome takes a key of its own (the earlier were "welcome_v1" and
-// "welcome_v2"), so a later one is sent even to a user who already has an
-// earlier one.
-const welcomeV3IdempotencyKey = "welcome_v3"
+// welcomeV4IdempotencyKey is the key SendWelcomeDmV4 sends under. Each version
+// of the welcome takes a key of its own (the earlier were "welcome_v1",
+// "welcome_v2" and "welcome_v3"), so a later one is sent even to a user who
+// already has an earlier one.
+const welcomeV4IdempotencyKey = "welcome_v4"
 
-// welcomeV3Messages is the content of the third version of the welcome: one
+// welcomeV4Messages is the content of the fourth version of the welcome: one
 // text message.
-func welcomeV3Messages() []*messagingpb.Content {
+func welcomeV4Messages() []*messagingpb.Content {
 	return []*messagingpb.Content{
-		textContent("Welcome to Flipcash, the group money app. If someone sent you an invite link to a Flipcash group, tap it again to join."),
+		textContent("Welcome to Flipcash, the group money app. If someone sent you a group link, tap or scan it again to join the group"),
 	}
 }
 
@@ -45,7 +45,7 @@ func textContent(text string) *messagingpb.Content {
 // Sender's own budgets.
 const welcomeTimeout = 30 * time.Second
 
-// DmWelcomer sends the welcome (see SendWelcomeDmV3) to every user given their
+// DmWelcomer sends the welcome (see SendWelcomeDmV4) to every user given their
 // first handle. It is the profile.FirstUsernameHandler the parent builds the
 // profile server with (see profile.WithFirstUsernameHandler), from the chat
 // store and the Sender built with the team account.
@@ -60,7 +60,7 @@ const welcomeTimeout = 30 * time.Second
 // request that assigned the handle, and a failure is logged, never retried.
 // Nothing records a welcome that was never sent, so a process that stops
 // before sending one loses it. A second call for a user, as when two of their
-// claims race, sends nothing new (see SendWelcomeDmV3).
+// claims race, sends nothing new (see SendWelcomeDmV4).
 //
 // GroupWelcomer is its counterpart that welcomes in a private group instead,
 // built but not yet used.
@@ -78,8 +78,8 @@ func NewDmWelcomer(log *zap.Logger, chats chat.Store, sender *messaging.Sender) 
 
 // minWelcomeClientVersion is the first client release, on iOS and Android
 // alike, that rendered the second version of the welcome (its
-// ShareProfileWidget). The third is text alone, which any client renders, but
-// the gate is kept as it stands.
+// ShareProfileWidget). The third and fourth are text alone, which any client
+// renders, but the gate is kept as it stands.
 var minWelcomeClientVersion = &ocp_client.Version{Major: 2026, Minor: 9, Patch: 5}
 
 // OnFirstUsername sends userID the welcome in the background, if the client
@@ -97,7 +97,7 @@ func (w *DmWelcomer) OnFirstUsername(ctx context.Context, userID *commonpb.UserI
 	go func() {
 		defer cancel()
 
-		_, _, err := SendWelcomeDmV3(ctx, w.chats, w.sender, userID)
+		_, _, err := SendWelcomeDmV4(ctx, w.chats, w.sender, userID)
 		switch {
 		case err == nil:
 		case errors.Is(err, ErrNoTeamAccount):
@@ -110,8 +110,8 @@ func (w *DmWelcomer) OnFirstUsername(ctx context.Context, userID *commonpb.UserI
 }
 
 // GroupWelcomer is the private-group counterpart of DmWelcomer: it sends the
-// welcome into each user's welcome group (see SendWelcomeGroupV3) rather than
-// into the team's DM with them (see SendWelcomeDmV3). It is built but not yet
+// welcome into each user's welcome group (see SendWelcomeGroupV4) rather than
+// into the team's DM with them (see SendWelcomeDmV4). It is built but not yet
 // used to welcome anyone. Switching the welcome to the group is the parent
 // passing a GroupWelcomer to profile.WithFirstUsernameHandler in place of the
 // DmWelcomer, and nothing else.
@@ -126,7 +126,7 @@ func (w *DmWelcomer) OnFirstUsername(ctx context.Context, userID *commonpb.UserI
 // assigned the handle, and a failure is logged, never retried. Nothing records
 // a welcome that was never sent, so a process that stops before sending one
 // loses it. A second call for a user, as when two of their claims race, sends
-// nothing new (see SendWelcomeGroupV3).
+// nothing new (see SendWelcomeGroupV4).
 type GroupWelcomer struct {
 	log      *zap.Logger
 	chats    chat.Store
@@ -249,7 +249,7 @@ func (w *GroupWelcomer) OnFirstUsername(ctx context.Context, userID *commonpb.Us
 	go func() {
 		defer cancel()
 
-		if _, _, err := SendWelcomeGroupV3(ctx, w.chats, w.accounts, w.sender, w.cfg, userID); err != nil {
+		if _, _, err := SendWelcomeGroupV4(ctx, w.chats, w.accounts, w.sender, w.cfg, userID); err != nil {
 			log.Warn("Failed to send welcome group", zap.Error(err))
 		}
 	}()

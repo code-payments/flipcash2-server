@@ -95,7 +95,9 @@ var (
 // the group's own records (the canonical record and its member count). The value
 // is held well under that ceiling so the membership records and the group's
 // records always commit together — there is no partial-creation state for a
-// caller to reconcile.
+// caller to reconcile. A private group created with key envelopes (see
+// Store.PutPrivateGroup) spends one item more per envelope, in the same
+// write, so its members and envelopes together are held to this bound.
 const MaxGroupChatCreationMembers = 50
 
 // GroupMembership is one of a user's group membership records: the chat,
@@ -160,10 +162,12 @@ type DmFeedCursor struct {
 // for a private group: the group's chat key as that user can open it. It is
 // written against the IDs alone, like viewer state, and knows nothing of the
 // group or its roster: that the chat is a private group, and that the user is
-// a member, are the caller's gates. The one tie to the roster is a departure,
+// a member, are the caller's gates. The ties to the roster are a departure,
 // which removes the envelope in the same write when the caller asks it to
-// (see RemoveGroupMember). A store of one is one conditional write of the one
-// record, so a retried or duplicated request is harmless.
+// (see RemoveGroupMember), and a private group's creation with its
+// envelopes, which writes them with the group (see PutPrivateGroup). A store
+// of one is one conditional write of the one record, so a retried or
+// duplicated request is harmless.
 //
 // A lobby entry (see LobbyEntry) is one record per (user, private group) too,
 // kept with two counts, the lobby's size and the user's lobbies, that move in
@@ -222,7 +226,49 @@ type Store interface {
 	// kept with the chat, internal to the store and not on the Chat it
 	// returns: a DM keeps it however the store is later configured, which is
 	// what makes an advance of it safe from any process.
+	//
+	// The same store writes every group membership record of one of those
+	// users unlisted: the record makes them a member as any other does — IsMember,
+	// the roster reads (GetMembers, GetGroupMembersPage, GetGroupRoster,
+	// GetGroupRosterPage, GetGroupMemberRecords, GetGroupMembersByID) and
+	// the RosterSummary all count them — but no listing of their own groups
+	// returns it (GetGroupMembershipsForUser, GetGroupChatsForUser,
+	// GetGroupChatsForUserByIDs). That is decided on every write of the
+	// record, the creation's here and each join and departure after (see
+	// AddGroupMembers, RemoveGroupMember), by the store making the write, so
+	// the record is unlisted for as long as every store writing it is built
+	// with the user excluded, which the required constructor argument makes
+	// the case.
 	PutChat(ctx context.Context, chat *Chat) error
+
+	// PutPrivateGroup creates the private group c together with envelopes,
+	// key envelopes the group's creator wrapped for some of its members, in
+	// one atomic write: the group is created exactly as PutChat creates it
+	// (canonical record, membership records, RosterSummary, and the
+	// exclusions above), and each envelope is stored as its member's key
+	// envelope for the group, so the group never exists without them nor
+	// they without it. A member with no envelope among them holds none, the
+	// creator included: whether a group the creator holds no envelope for
+	// has its key is the caller's concern, not the store's.
+	//
+	// Each envelope is stored exactly as AdmitFromLobby stores the one a
+	// creator wraps for the member it admits: an envelope wrapped by someone
+	// other than its member, so the member's own envelope replaces it, and
+	// stands from then on (see SetKeyEnvelope), and a departure that
+	// discards the member's envelope discards it (see RemoveGroupMember).
+	// An envelope for the creator themself is their own, which nothing
+	// replaces.
+	//
+	// It refuses, with nothing written, whatever ValidatePrivateGroupCreation
+	// refuses: a chat that is not a private group naming its creator, no
+	// members (ErrNoMembers), an envelope for a user who is not a member,
+	// more than one for a member, or one the creator did not wrap, and a
+	// creation whose distinct members and envelopes together number more
+	// than MaxGroupChatCreationMembers (ErrTooManyMembers). Duplicate members
+	// collapse, as for PutChat. If a chat with c's ID exists, nothing is
+	// written, envelopes included, and it returns ErrChatExists, so a retry
+	// of a creation that landed changes nothing.
+	PutPrivateGroup(ctx context.Context, c *Chat, envelopes []MemberKeyEnvelope) error
 
 	// AddGroupMembers adds users as joined members of a group chat. It is
 	// idempotent: adding an already-joined member is a no-op that preserves
@@ -456,7 +502,9 @@ type Store interface {
 	// error. It is the inverse of GetMembers over the membership records alone
 	// — no canonical chat metadata is read or returned; a caller that needs it
 	// follows up with GetChatByID, and one that wants only current memberships
-	// filters on Joined (see GetGroupChatsForUser).
+	// filters on Joined (see GetGroupChatsForUser). A user the store excludes
+	// from the feed has every record unlisted, so gets an empty result (see
+	// PutChat).
 	GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId) ([]GroupMembership, error)
 
 	// GetGroupChatsForUser returns the canonical record of every group chat
@@ -464,7 +512,8 @@ type Store interface {
 	// GetGroupMembershipsForUser, less the departed records, followed by the
 	// canonical read of each ID, and returns records exactly as GetChatByID
 	// does: Members empty and RosterSummary zero. A user with no group
-	// memberships gets an empty result, not an error.
+	// memberships gets an empty result, not an error, as does a user the
+	// store excludes from the feed, whose records are unlisted (see PutChat).
 	//
 	// It is the group feed's source: with no per-member activity index, a user's
 	// groups are ordered by reading every one of them and sorting — so this is
@@ -478,7 +527,8 @@ type Store interface {
 	// not a member of (never, or no longer) and IDs of chats that do not exist
 	// are omitted rather than reported; duplicate IDs collapse. It returns an
 	// error if any ID is not a group chat ID, and an empty result (no error) when
-	// chatIDs is empty.
+	// chatIDs is empty. Like GetGroupChatsForUser, it returns nothing for a
+	// user the store excludes from the feed (see PutChat).
 	//
 	// Membership is checked here, per ID, against the membership records — the
 	// IDs are a caller's hint of what to read, never its authority to read it.

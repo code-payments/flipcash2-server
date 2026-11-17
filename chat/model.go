@@ -622,7 +622,8 @@ func originalMedia(blobID *blobpb.BlobId) *blobpb.Media {
 // boundary's job (proto validation), not the record's.
 //
 // WrappedBy is who stored the envelope, as the server authenticated them: the
-// user it is for, or the group's creator admitting them. It is the server's
+// user it is for, or the group's creator admitting them, or creating the
+// group with it (see Store.PutPrivateGroup). It is the server's
 // record, never a client's claim, and it is what a client is told to open the
 // envelope against (GetKeyEnvelopeResponse.wrapped_by). It also decides
 // whether the envelope can be replaced: one a user wrapped for themself

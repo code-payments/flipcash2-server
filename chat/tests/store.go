@@ -40,6 +40,7 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_IsMember,
 		testStore_AdvanceLastMessage,
 		func(t *testing.T, _ chat.Store) { testStore_FeedExclusions(t, newStore) },
+		func(t *testing.T, _ chat.Store) { testStore_FeedExclusions_Groups(t, newStore) },
 		testStore_GroupChat_PutAndGet,
 		testStore_GroupChat_StaffOnly,
 		testStore_GroupChat_MinimumListenerBalance,
@@ -107,6 +108,10 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_KeyEnvelope_DiscardedOnLeave,
 		testStore_KeyEnvelope_Concurrent,
 		testStore_KeyEnvelope_InviteCopy,
+		testStore_PrivateGroup_Create,
+		testStore_PrivateGroup_Invalid,
+		testStore_PrivateGroup_Cap,
+		testStore_PrivateGroup_EnvelopeReplaced,
 		testStore_Lobby_EnterAndLeave,
 		testStore_Lobby_Limits,
 		testStore_Lobby_Page,
@@ -472,8 +477,8 @@ func testStore_FeedExclusions(t *testing.T, newStore func(excludedFromFeed []*co
 	require.Len(t, feed(s, a), 1)
 	require.Len(t, feed(s, b), 1)
 
-	// A group they are created in is created as for anyone: a group keeps no
-	// per-member feed copies to exclude them from.
+	// A group they are created in counts them a member, as for anyone; how
+	// its records are listed is testStore_FeedExclusions_Groups'.
 	group := &chat.Chat{
 		ID:           chat.MustGenerateGroupChatID(),
 		Type:         chatpb.ChatType_GROUP,
@@ -7194,4 +7199,395 @@ func testStore_Pin_ConcurrentSameMessage(t *testing.T, s chat.Store) {
 	require.EqualValues(t, 1, summary.Count)
 	require.EqualValues(t, 1, summary.Version)
 	requirePins(t, s, chatID, *summary.Latest)
+}
+
+// testStore_FeedExclusions_Groups pins what a store's feed exclusions mean
+// for groups (see chat.Store.PutChat): an excluded user's membership records
+// make them a member in every roster read, and are absent from every listing
+// of their own groups, on creation and after every transition, while another
+// member's are listed as ever.
+func testStore_FeedExclusions_Groups(t *testing.T, newStore func(excludedFromFeed []*commonpb.UserId) chat.Store) {
+	ctx := context.Background()
+
+	team := model.MustGenerateUserID()
+	s := newStore([]*commonpb.UserId{team})
+	user := model.MustGenerateUserID()
+
+	// requireMember checks that member is on chatID's roster in every roster
+	// read, the summary counting count members.
+	requireMember := func(chatID *commonpb.ChatId, member *commonpb.UserId, count uint64) {
+		t.Helper()
+		isMember, err := s.IsMember(ctx, chatID, member)
+		require.NoError(t, err)
+		require.True(t, isMember)
+
+		members, err := s.GetMembers(ctx, chatID)
+		require.NoError(t, err)
+		require.Contains(t, userIDValues(members), member.Value)
+		page, err := s.GetGroupMembersPage(ctx, chatID, nil, 0)
+		require.NoError(t, err)
+		require.Contains(t, userIDValues(page.Users), member.Value)
+		summary, roster, err := s.GetGroupRoster(ctx, chatID)
+		require.NoError(t, err)
+		require.Equal(t, count, summary.MemberCount)
+		require.Contains(t, userIDValues(rosterUserIDs(roster)), member.Value)
+		rosterPage, err := s.GetGroupRosterPage(ctx, chatID, nil, 0)
+		require.NoError(t, err)
+		require.Contains(t, userIDValues(rosterUserIDs(rosterPage)), member.Value)
+		records, err := s.GetGroupMemberRecords(ctx, member, []*commonpb.ChatId{chatID})
+		require.NoError(t, err)
+		require.Contains(t, records, string(chatID.Value))
+		byID, err := s.GetGroupMembersByID(ctx, chatID, []*commonpb.UserId{member})
+		require.NoError(t, err)
+		require.Contains(t, byID, string(member.Value))
+		summary, err = s.GetGroupRosterSummary(ctx, chatID)
+		require.NoError(t, err)
+		require.Equal(t, count, summary.MemberCount)
+	}
+
+	// listed returns the chats each listing of member's groups returns, the
+	// departed records included in the first.
+	listed := func(member *commonpb.UserId, chatIDs ...*commonpb.ChatId) (memberships, chats, byIDs [][]byte) {
+		t.Helper()
+		ms, err := s.GetGroupMembershipsForUser(ctx, member)
+		require.NoError(t, err)
+		for _, m := range ms {
+			memberships = append(memberships, m.ChatID.Value)
+		}
+		cs, err := s.GetGroupChatsForUser(ctx, member)
+		require.NoError(t, err)
+		for _, c := range cs {
+			chats = append(chats, c.ID.Value)
+		}
+		cs, err = s.GetGroupChatsForUserByIDs(ctx, member, chatIDs)
+		require.NoError(t, err)
+		for _, c := range cs {
+			byIDs = append(byIDs, c.ID.Value)
+		}
+		return memberships, chats, byIDs
+	}
+
+	// A group created with PutChat, and a private group created with its
+	// envelopes, each with the excluded user and another member.
+	public := putGroupChat(t, s, "Public", at(100), team, user)
+	private := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{team, user},
+		Title:        "Private",
+		IsPrivate:    true,
+		CreatorID:    team,
+		LastActivity: at(100),
+	}
+	require.NoError(t, s.PutPrivateGroup(ctx, private, []chat.MemberKeyEnvelope{
+		{UserID: user, Envelope: keyEnvelope(1, team)},
+	}))
+	both := []*commonpb.ChatId{public.ID, private.ID}
+
+	for _, chatID := range both {
+		requireMember(chatID, team, 2)
+		requireMember(chatID, user, 2)
+	}
+	memberships, chats, byIDs := listed(team, both...)
+	require.Empty(t, memberships)
+	require.Empty(t, chats)
+	require.Empty(t, byIDs)
+	memberships, chats, byIDs = listed(user, both...)
+	require.ElementsMatch(t, [][]byte{public.ID.Value, private.ID.Value}, memberships)
+	require.ElementsMatch(t, [][]byte{public.ID.Value, private.ID.Value}, chats)
+	require.ElementsMatch(t, [][]byte{public.ID.Value, private.ID.Value}, byIDs)
+
+	// A departure leaves them unlisted, tombstone included...
+	changed, _ := removeGroupMember(t, s, public.ID, team)
+	require.True(t, changed)
+	isMember, err := s.IsMember(ctx, public.ID, team)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	memberships, chats, byIDs = listed(team, both...)
+	require.Empty(t, memberships)
+	require.Empty(t, chats)
+	require.Empty(t, byIDs)
+
+	// ...and so does a rejoin, which makes them a member again.
+	changed, _ = addGroupMembers(t, s, public.ID, team)
+	require.True(t, changed)
+	requireMember(public.ID, team, 2)
+	memberships, chats, byIDs = listed(team, both...)
+	require.Empty(t, memberships)
+	require.Empty(t, chats)
+	require.Empty(t, byIDs)
+
+	// A group joined after creation is unlisted too, and the other member's
+	// transitions list them as ever.
+	later := putGroupChat(t, s, "Later", at(100), user)
+	changed, _ = addGroupMembers(t, s, later.ID, team)
+	require.True(t, changed)
+	requireMember(later.ID, team, 2)
+	removeGroupMember(t, s, public.ID, user)
+	addGroupMembers(t, s, public.ID, user)
+	all := []*commonpb.ChatId{public.ID, private.ID, later.ID}
+	memberships, chats, byIDs = listed(team, all...)
+	require.Empty(t, memberships)
+	require.Empty(t, chats)
+	require.Empty(t, byIDs)
+	memberships, chats, byIDs = listed(user, all...)
+	require.ElementsMatch(t, [][]byte{public.ID.Value, private.ID.Value, later.ID.Value}, memberships)
+	require.ElementsMatch(t, [][]byte{public.ID.Value, private.ID.Value, later.ID.Value}, chats)
+	require.ElementsMatch(t, [][]byte{public.ID.Value, private.ID.Value, later.ID.Value}, byIDs)
+}
+
+// newPrivateGroup is an uncreated private group of members, created by
+// creator.
+func newPrivateGroup(creator *commonpb.UserId, members ...*commonpb.UserId) *chat.Chat {
+	return &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      members,
+		Title:        "Private",
+		IsPrivate:    true,
+		CreatorID:    creator,
+		LastActivity: at(1),
+	}
+}
+
+// testStore_PrivateGroup_Create pins that a private group and the envelopes
+// it is created with are written together, and that a second creation
+// writes nothing (see chat.Store.PutPrivateGroup).
+func testStore_PrivateGroup_Create(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	creator := model.MustGenerateUserID()
+	member := model.MustGenerateUserID()
+	other := model.MustGenerateUserID()
+	c := newPrivateGroup(creator, creator, member, other, member)
+	envelope := keyEnvelope(1, creator)
+	require.NoError(t, s.PutPrivateGroup(ctx, c, []chat.MemberKeyEnvelope{
+		{UserID: member, Envelope: envelope},
+	}))
+
+	// The record, as PutChat writes a private group's.
+	got, err := s.GetChatByID(ctx, c.ID)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.ChatType_GROUP, got.Type)
+	require.True(t, got.IsPrivate)
+	require.Equal(t, creator.Value, got.CreatorID.Value)
+	require.Equal(t, "Private", got.Title)
+	require.Empty(t, got.Members)
+
+	// The members, duplicates collapsed, at version zero.
+	members, err := s.GetMembers(ctx, c.ID)
+	require.NoError(t, err)
+	require.ElementsMatch(t, userIDValues([]*commonpb.UserId{creator, member, other}), userIDValues(members))
+	summary, err := s.GetGroupRosterSummary(ctx, c.ID)
+	require.NoError(t, err)
+	require.Equal(t, chat.RosterSummary{MemberCount: 3}, summary)
+	for _, user := range []*commonpb.UserId{creator, member, other} {
+		isMember, err := s.IsMember(ctx, c.ID, user)
+		require.NoError(t, err)
+		require.True(t, isMember)
+	}
+
+	// The envelope, wrapped by the creator, and no one else's.
+	stored, err := s.GetKeyEnvelope(ctx, c.ID, member)
+	require.NoError(t, err)
+	require.True(t, envelope.Equal(stored))
+	require.Equal(t, creator.Value, stored.WrappedBy.Value)
+	for _, user := range []*commonpb.UserId{creator, other} {
+		_, err = s.GetKeyEnvelope(ctx, c.ID, user)
+		require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	}
+
+	// A second creation, with other envelopes and members, writes nothing.
+	again := c.Clone()
+	again.Members = []*commonpb.UserId{creator, member, other, model.MustGenerateUserID()}
+	again.Title = "Again"
+	err = s.PutPrivateGroup(ctx, again, []chat.MemberKeyEnvelope{
+		{UserID: member, Envelope: keyEnvelope(2, creator)},
+		{UserID: other, Envelope: keyEnvelope(3, creator)},
+		{UserID: creator, Envelope: keyEnvelope(4, creator)},
+	})
+	require.ErrorIs(t, err, chat.ErrChatExists)
+	got, err = s.GetChatByID(ctx, c.ID)
+	require.NoError(t, err)
+	require.Equal(t, "Private", got.Title)
+	summary, err = s.GetGroupRosterSummary(ctx, c.ID)
+	require.NoError(t, err)
+	require.Equal(t, chat.RosterSummary{MemberCount: 3}, summary)
+	stored, err = s.GetKeyEnvelope(ctx, c.ID, member)
+	require.NoError(t, err)
+	require.True(t, envelope.Equal(stored))
+	for _, user := range []*commonpb.UserId{creator, other} {
+		_, err = s.GetKeyEnvelope(ctx, c.ID, user)
+		require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	}
+
+	// So does PutChat of the same ID.
+	require.ErrorIs(t, s.PutChat(ctx, again), chat.ErrChatExists)
+
+	// A creation with no envelopes is PutChat's, and one with the creator's
+	// own envelope stores it as theirs.
+	plain := newPrivateGroup(creator, creator)
+	require.NoError(t, s.PutPrivateGroup(ctx, plain, nil))
+	_, err = s.GetKeyEnvelope(ctx, plain.ID, creator)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	own := newPrivateGroup(creator, creator)
+	ownEnvelope := keyEnvelope(5, creator)
+	require.NoError(t, s.PutPrivateGroup(ctx, own, []chat.MemberKeyEnvelope{{UserID: creator, Envelope: ownEnvelope}}))
+	stored, err = s.GetKeyEnvelope(ctx, own.ID, creator)
+	require.NoError(t, err)
+	require.True(t, ownEnvelope.Equal(stored))
+}
+
+// testStore_PrivateGroup_Invalid pins that every creation PutPrivateGroup
+// refuses writes nothing: no record, no members and no envelope.
+func testStore_PrivateGroup_Invalid(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	creator := model.MustGenerateUserID()
+	member := model.MustGenerateUserID()
+	stranger := model.MustGenerateUserID()
+	envelope := chat.MemberKeyEnvelope{UserID: member, Envelope: keyEnvelope(1, creator)}
+
+	public := newPrivateGroup(creator, creator, member)
+	public.IsPrivate = false
+	dm := newPrivateGroup(creator, creator, member)
+	dm.ID = generateDmChatID()
+	dmTyped := newPrivateGroup(creator, creator, member)
+	dmTyped.Type = chatpb.ChatType_DM
+	noCreator := newPrivateGroup(nil, creator, member)
+
+	for _, tc := range []struct {
+		name      string
+		c         *chat.Chat
+		envelopes []chat.MemberKeyEnvelope
+		want      error
+	}{
+		{"not private", public, []chat.MemberKeyEnvelope{envelope}, nil},
+		{"dm id", dm, []chat.MemberKeyEnvelope{envelope}, nil},
+		{"dm type", dmTyped, []chat.MemberKeyEnvelope{envelope}, nil},
+		{"no creator", noCreator, []chat.MemberKeyEnvelope{envelope}, nil},
+		{"no members", newPrivateGroup(creator), nil, chat.ErrNoMembers},
+		{"non-member", newPrivateGroup(creator, creator, member), []chat.MemberKeyEnvelope{
+			envelope,
+			{UserID: stranger, Envelope: keyEnvelope(2, creator)},
+		}, nil},
+		{"no user", newPrivateGroup(creator, creator, member), []chat.MemberKeyEnvelope{
+			{Envelope: keyEnvelope(2, creator)},
+		}, nil},
+		{"two for a member", newPrivateGroup(creator, creator, member), []chat.MemberKeyEnvelope{
+			envelope,
+			{UserID: member, Envelope: keyEnvelope(2, creator)},
+		}, nil},
+		{"not wrapped by the creator", newPrivateGroup(creator, creator, member), []chat.MemberKeyEnvelope{
+			{UserID: member, Envelope: keyEnvelope(2, member)},
+		}, nil},
+		{"no wrapper", newPrivateGroup(creator, creator, member), []chat.MemberKeyEnvelope{
+			{UserID: member, Envelope: keyEnvelope(2, nil)},
+		}, nil},
+		{"invite copy", newPrivateGroup(creator, creator, member), []chat.MemberKeyEnvelope{
+			{UserID: member, Envelope: chat.KeyEnvelope{WrappedBy: creator, InviteCopy: &chat.InviteKeyCopy{}}},
+		}, nil},
+	} {
+		err := s.PutPrivateGroup(ctx, tc.c, tc.envelopes)
+		require.Error(t, err, tc.name)
+		require.NotErrorIs(t, err, chat.ErrChatExists, tc.name)
+		if tc.want != nil {
+			require.ErrorIs(t, err, tc.want, tc.name)
+		}
+
+		_, err = s.GetChatByID(ctx, tc.c.ID)
+		require.ErrorIs(t, err, chat.ErrChatNotFound, tc.name)
+		for _, user := range []*commonpb.UserId{creator, member, stranger} {
+			isMember, err := s.IsMember(ctx, tc.c.ID, user)
+			require.NoError(t, err, tc.name)
+			require.False(t, isMember, tc.name)
+			if chat.IsGroupChatID(tc.c.ID) {
+				_, err = s.GetKeyEnvelope(ctx, tc.c.ID, user)
+				require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound, tc.name)
+			}
+		}
+	}
+}
+
+// testStore_PrivateGroup_Cap pins the creation cap with envelopes: a
+// private group's distinct members and envelopes together may number
+// chat.MaxGroupChatCreationMembers, and one more is ErrTooManyMembers with
+// nothing written.
+func testStore_PrivateGroup_Cap(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	creator := model.MustGenerateUserID()
+	half := chat.MaxGroupChatCreationMembers / 2
+	members := []*commonpb.UserId{creator}
+	for len(members) < half {
+		members = append(members, model.MustGenerateUserID())
+	}
+	envelopes := make([]chat.MemberKeyEnvelope, 0, half)
+	for i, member := range members {
+		envelopes = append(envelopes, chat.MemberKeyEnvelope{UserID: member, Envelope: keyEnvelope(byte(i+1), creator)})
+	}
+
+	// One past the cap: a further member with no envelope.
+	over := newPrivateGroup(creator, append(slices.Clone(members), model.MustGenerateUserID())...)
+	require.ErrorIs(t, s.PutPrivateGroup(ctx, over, envelopes[:chat.MaxGroupChatCreationMembers-half]), chat.ErrTooManyMembers)
+	_, err := s.GetChatByID(ctx, over.ID)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+	_, err = s.GetKeyEnvelope(ctx, over.ID, creator)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// At the cap, every member and envelope is written.
+	atCap := newPrivateGroup(creator, members...)
+	require.NoError(t, s.PutPrivateGroup(ctx, atCap, envelopes[:chat.MaxGroupChatCreationMembers-half]))
+	summary, err := s.GetGroupRosterSummary(ctx, atCap.ID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(half), summary.MemberCount)
+	for _, e := range envelopes[:chat.MaxGroupChatCreationMembers-half] {
+		stored, err := s.GetKeyEnvelope(ctx, atCap.ID, e.UserID)
+		require.NoError(t, err)
+		require.True(t, e.Envelope.Equal(stored))
+	}
+}
+
+// testStore_PrivateGroup_EnvelopeReplaced pins that an envelope a group was
+// created with is stored as an admission's: the member's own envelope
+// replaces it and then stands, and a departure that discards their envelope
+// discards it.
+func testStore_PrivateGroup_EnvelopeReplaced(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+
+	creator := model.MustGenerateUserID()
+	member := model.MustGenerateUserID()
+	leaver := model.MustGenerateUserID()
+	c := newPrivateGroup(creator, creator, member, leaver)
+	created := keyEnvelope(1, creator)
+	require.NoError(t, s.PutPrivateGroup(ctx, c, []chat.MemberKeyEnvelope{
+		{UserID: member, Envelope: created},
+		{UserID: leaver, Envelope: keyEnvelope(2, creator)},
+	}))
+
+	// The creator's later envelope replaces it, as it would an admission's...
+	rewrapped := keyEnvelope(3, creator)
+	stored, err := s.SetKeyEnvelope(ctx, c.ID, member, rewrapped)
+	require.NoError(t, err)
+	require.True(t, rewrapped.Equal(stored))
+
+	// ...and so does the member's own, which then stands.
+	own := keyEnvelope(4, member)
+	stored, err = s.SetKeyEnvelope(ctx, c.ID, member, own)
+	require.NoError(t, err)
+	require.True(t, own.Equal(stored))
+	stored, err = s.SetKeyEnvelope(ctx, c.ID, member, keyEnvelope(5, creator))
+	require.NoError(t, err)
+	require.True(t, own.Equal(stored))
+	got, err := s.GetKeyEnvelope(ctx, c.ID, member)
+	require.NoError(t, err)
+	require.True(t, own.Equal(got))
+
+	// A departure that discards the leaver's envelope takes the one they
+	// were created with.
+	changed, _, err := s.RemoveGroupMember(ctx, c.ID, leaver, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, err = s.GetKeyEnvelope(ctx, c.ID, leaver)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
 }

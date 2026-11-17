@@ -184,3 +184,67 @@ func (s *Server) keyEnvelopeAllowed(ctx context.Context, log *zap.Logger, chatID
 	}
 	return chatpb.GetKeyEnvelopeResponse_OK, nil
 }
+
+// MemberKeyEnvelope is a key envelope written with the private group it is
+// for, at the group's creation (see Store.PutPrivateGroup): Envelope is
+// UserID's envelope, wrapped by the group's creator.
+type MemberKeyEnvelope struct {
+	UserID   *commonpb.UserId
+	Envelope KeyEnvelope
+}
+
+// ValidatePrivateGroupCreation checks a private group and the envelopes it is
+// to be created with, as Store.PutPrivateGroup takes them, so that every
+// backend refuses the same creations: c must be a group (a GroupChatIDSize
+// ID, type GROUP) that is private and names its creator, with at least one
+// member (ErrNoMembers otherwise); each envelope must be for one of c's
+// members, at most one per member, and be one the creator wrapped (WrappedBy
+// is c.CreatorID) rather than an invite's copy, since at creation no one else
+// has wrapped anything and no invite exists; and c's distinct members and the
+// envelopes together must number at most MaxGroupChatCreationMembers
+// (ErrTooManyMembers otherwise), since every one is an item of the same
+// atomic write. Every other failure is a plain error: each is a caller's bug,
+// not a state a client can reach.
+func ValidatePrivateGroupCreation(c *Chat, envelopes []MemberKeyEnvelope) error {
+	if !IsGroupChatID(c.ID) || c.Type != chatpb.ChatType_GROUP {
+		return errors.New("not a group chat")
+	}
+	if !c.IsPrivate {
+		return errors.New("not a private group")
+	}
+	if c.CreatorID == nil {
+		return errors.New("private group names no creator")
+	}
+
+	var members []*commonpb.UserId
+	for _, member := range c.Members {
+		if !containsUser(members, member) {
+			members = append(members, member)
+		}
+	}
+	if len(members) == 0 {
+		return ErrNoMembers
+	}
+
+	var enveloped []*commonpb.UserId
+	for _, e := range envelopes {
+		switch {
+		case e.UserID == nil:
+			return errors.New("key envelope names no user")
+		case !containsUser(members, e.UserID):
+			return errors.New("key envelope for a user who is not a member")
+		case containsUser(enveloped, e.UserID):
+			return errors.New("more than one key envelope for a member")
+		case e.Envelope.IsInviteCopy():
+			return errors.New("key envelope is an invite's copy")
+		case !e.Envelope.IsWrappedBy(c.CreatorID):
+			return errors.New("key envelope not wrapped by the creator")
+		}
+		enveloped = append(enveloped, e.UserID)
+	}
+
+	if len(members)+len(envelopes) > MaxGroupChatCreationMembers {
+		return ErrTooManyMembers
+	}
+	return nil
+}

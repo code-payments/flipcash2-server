@@ -12,7 +12,8 @@ import (
 
 // ErrInvalidGrant is returned by AccessStore methods when a grant — or the key
 // used to look one up — is not well-formed: a missing blob id, an unknown
-// principal type, an empty principal id, or an unknown permission.
+// principal type, an empty principal id (or, for PrincipalTypePublic, one that
+// is not empty), or an unknown permission.
 var ErrInvalidGrant = errors.New("invalid grant")
 
 // PrincipalType identifies the kind of subject a grant is made to. It is the
@@ -49,12 +50,24 @@ const (
 	// members is not thereby public, and a blob granted to the profile is
 	// readable without membership.
 	PrincipalTypeChatProfile
+
+	// PrincipalTypePublic is everyone, on every surface: a blob granted to it
+	// is readable by any caller through any access context the read path
+	// knows (see Server.canRead), so one grant stands in for a grant to every
+	// chat, chat profile and user profile the blob is shown on. It exists for
+	// a shared asset shown on more surfaces than can be granted one by one,
+	// such as the one picture every welcome group carries; granting a blob
+	// to a surface per use would write one grant per use, all under the
+	// blob's own key. It identifies no one, so its ID is empty. Nothing a
+	// user does writes one: no RPC and no attach path (see SetAsChatMedia)
+	// grants it, only server setup (see SetAsPublicMedia).
+	PrincipalTypePublic
 )
 
 // Principal is the typed subject a grant is made to. ID is the type-specific
 // identifier bytes: a user id for PrincipalTypeUser, a chat id for
-// PrincipalTypeChat and PrincipalTypeChatProfile, and the profile owner's user
-// id for PrincipalTypeUserProfile.
+// PrincipalTypeChat and PrincipalTypeChatProfile, the profile owner's user id
+// for PrincipalTypeUserProfile, and empty for PrincipalTypePublic.
 type Principal struct {
 	Type PrincipalType
 	ID   []byte
@@ -81,8 +94,21 @@ func PrincipalForChatProfile(chatID *commonpb.ChatId) Principal {
 	return Principal{Type: PrincipalTypeChatProfile, ID: chatID.Value}
 }
 
+// PrincipalPublic returns the principal for everyone (see
+// PrincipalTypePublic).
+func PrincipalPublic() Principal {
+	return Principal{Type: PrincipalTypePublic}
+}
+
 func (p Principal) validate() error {
 	switch p.Type {
+	case PrincipalTypePublic:
+		// One public principal, so one public grant per (blob, permission):
+		// an ID would make many.
+		if len(p.ID) != 0 {
+			return fmt.Errorf("%w: public principal carries an id", ErrInvalidGrant)
+		}
+		return nil
 	case PrincipalTypeUser, PrincipalTypeChat, PrincipalTypeUserProfile, PrincipalTypeChatProfile:
 	default:
 		return fmt.Errorf("%w: unknown principal type %d", ErrInvalidGrant, p.Type)

@@ -128,7 +128,7 @@ const DefaultSpeakerAdmissionTTL = 30 * time.Second
 //     a remembered admission to speak (see above) answers the rules alone and
 //     never hides a silence. Deletion of one's own messages is carved out
 //     (see CanDelete); everything else a silence leaves alone — reading,
-//     reacting, voting, paying a requested share, boosting — gates on
+//     reacting, voting, paying into a payment request, boosting — gates on
 //     membership or reading and never asks.
 //   - A ban takes a full read from a non-member of a public group, whatever
 //     its listener rules say of them: a banned user previews it, redacted, as

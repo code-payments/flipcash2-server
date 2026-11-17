@@ -205,6 +205,44 @@ func (i *Integration) SetAsChatMedia(ctx context.Context, ownerID *commonpb.User
 	})
 }
 
+// SetAsPublicMedia makes a blob readable by everyone, on every surface (see
+// PrincipalTypePublic): it verifies that ownerID owns the blob and that it is
+// a READY image original, as a picture must be, then grants it to the public
+// principal. It is idempotent, so setting it up again, as on every start of a
+// process that relies on it, re-grants harmlessly.
+//
+// It is for server setup alone, never a user's request: it is how a shared
+// picture shown on more surfaces than can be granted one by one, such as the
+// picture every welcome group carries, is readable on all of them with a
+// single grant, so those surfaces are given none of their own. A blob made
+// public is readable by any caller who learns its id, so only an asset meant
+// for everyone is made public.
+//
+// It returns one of ErrBlobNotFound, ErrBlobNotReady, ErrBlobRejected, or
+// ErrBlobInvalid when the blob cannot back a picture. Nothing is granted then.
+func (i *Integration) SetAsPublicMedia(ctx context.Context, ownerID *commonpb.UserId, blobID *blobpb.BlobId) error {
+	records, err := i.blobs.GetByIDs(ctx, []*blobpb.BlobId{blobID})
+	if err != nil {
+		return err
+	}
+
+	var record *Blob
+	for _, b := range records {
+		if bytes.Equal(b.ID.Value, blobID.Value) {
+			record = b
+		}
+	}
+	if err := validateAttachable(record, ownerID, imagesOnly); err != nil {
+		return err
+	}
+
+	return i.access.Grant(ctx, &Grant{
+		BlobID:     blobID,
+		Principal:  PrincipalPublic(),
+		Permission: PermissionRead,
+	})
+}
+
 // mimeTypeFilter reports whether a surface accepts content of the given MIME type.
 //
 // Each attach point supplies its own, because what a surface can carry is a property

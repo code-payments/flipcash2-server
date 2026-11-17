@@ -664,6 +664,51 @@ func testGetBlobs(t *testing.T, accounts account.Store, blobs blob.Store, storag
 		require.Nil(t, resp.Blobs)
 	})
 
+	t.Run("anyone resolves a public blob through any context, and only with one", func(t *testing.T) {
+		// A blob of its own, so the grant to everyone cannot leak into the
+		// other cases' refusals of readyID.
+		publicID, publicTarget := initiate(t, h, signer, "image/png", uint64(len(imageBytes)))
+		upload(publicTarget, imageBytes)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, h, signer, publicID))
+		require.NoError(t, access.Grant(context.Background(), &blob.Grant{
+			BlobID: publicID, Principal: blob.PrincipalPublic(), Permission: blob.PermissionRead,
+		}))
+
+		// The caller belongs to nothing: no chat, and the resolver covers them
+		// for no principal. The blob carries no grant to any surface either.
+		_, other := registerUser(t, accounts)
+		chatID := newChatID(t)
+		for name, accessContext := range map[string]*blobpb.AccessContext{
+			"chat":         {Scope: &blobpb.AccessContext_Chat{Chat: chatID}},
+			"chat profile": {Scope: &blobpb.AccessContext_ChatProfile{ChatProfile: chatID}},
+			"user profile": {Scope: &blobpb.AccessContext_UserProfile{UserProfile: ownerID}},
+		} {
+			got := getBlobs(t, h, other, []*blobpb.BlobId{publicID}, accessContext)
+			require.Len(t, got, 1, name)
+			require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, got[0].Status, name)
+			require.NotNil(t, got[0].Metadata, name)
+		}
+
+		// A read with no context is still refused: a public blob is read by
+		// naming the surface it is shown on, as any other is.
+		require.Empty(t, getBlobs(t, h, other, []*blobpb.BlobId{publicID}, nil))
+
+		// A grant to a surface that does not cover the caller does not hide
+		// the grant to everyone: a non-member naming a chat the blob is also
+		// shared into still reads it.
+		require.NoError(t, access.Grant(context.Background(), &blob.Grant{
+			BlobID: publicID, Principal: blob.PrincipalForChat(chatID), Permission: blob.PermissionRead,
+		}))
+		got := getBlobs(t, h, other, []*blobpb.BlobId{publicID}, &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: chatID}})
+		require.Len(t, got, 1)
+
+		// Revoking the grant to everyone leaves the surface's own grant alone,
+		// which still admits only those it covers.
+		require.NoError(t, access.Revoke(context.Background(), publicID, blob.PrincipalPublic(), blob.PermissionRead))
+		require.Empty(t, getBlobs(t, h, other, []*blobpb.BlobId{publicID}, &blobpb.AccessContext{Scope: &blobpb.AccessContext_Chat{Chat: chatID}}))
+		require.Empty(t, getBlobs(t, h, other, []*blobpb.BlobId{publicID}, &blobpb.AccessContext{Scope: &blobpb.AccessContext_ChatProfile{ChatProfile: chatID}}))
+	})
+
 	t.Run("owner resolves a rejected blob with rejection metadata", func(t *testing.T) {
 		req := &blobpb.GetBlobsRequest{BlobIds: &blobpb.BlobIdBatch{BlobIds: []*blobpb.BlobId{rejectedID}}}
 		require.NoError(t, signer.Auth(req, &req.Auth))

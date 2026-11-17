@@ -119,7 +119,8 @@ func TestWrapGroupKey_RoundTrip(t *testing.T) {
 	assert.True(t, proto.Equal(env.teamUserID, envelope.WrappedBy))
 	assert.Nil(t, envelope.InviteCopy)
 
-	// It is what PutPrivateGroup takes for the user.
+	// It is what PutPrivateGroup takes for the user, from a store excluding
+	// the team, as production's are.
 	c := &chat.Chat{
 		ID:        env.chatID,
 		Type:      chatpb.ChatType_GROUP,
@@ -127,7 +128,7 @@ func TestWrapGroupKey_RoundTrip(t *testing.T) {
 		CreatorID: env.teamUserID,
 		Members:   []*commonpb.UserId{env.teamUserID, model.MustGenerateUserID()},
 	}
-	require.NoError(t, chat.ValidatePrivateGroupCreation(c, []chat.MemberKeyEnvelope{{UserID: c.Members[1], Envelope: envelope}}))
+	require.NoError(t, chat.ValidatePrivateGroupCreation(c, []chat.MemberKeyEnvelope{{UserID: c.Members[1], Envelope: envelope}}, chat.NewFeedExclusions([]*commonpb.UserId{env.teamUserID})))
 
 	groupKey, err := OpenGroupKey(env.user, env.team.Public(), env.chatID, envelope.ToProto())
 	require.NoError(t, err)

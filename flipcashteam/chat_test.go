@@ -47,6 +47,12 @@ func newChatEnv(t *testing.T) *chatEnv {
 // chat store and the Sender are built with it. setUp decides whether the team
 // account was set up before the process started; if not, there is none.
 func newChatEnvWithTeam(t *testing.T, setUp bool) *chatEnv {
+	return newChatEnvWithPusher(t, setUp, push.NewNoOpPusher())
+}
+
+// newChatEnvWithPusher is newChatEnvWithTeam with the Sender pushing through
+// pusher.
+func newChatEnvWithPusher(t *testing.T, setUp bool, pusher push.Pusher) *chatEnv {
 	ctx := context.Background()
 	profiles := profile_memory.NewInMemory()
 	team := model.MustGenerateUserID()
@@ -70,7 +76,7 @@ func newChatEnvWithTeam(t *testing.T, setUp bool) *chatEnv {
 		blocklist_memory.NewInMemory(),
 		nil,
 		ocp_data.NewTestDataProvider(),
-		push.NewNoOpPusher(),
+		pusher,
 		event.NewBus[*commonpb.UserId, *eventpb.Event](),
 		event.NewBus[*commonpb.ChatId, *eventpb.ChatEvent](),
 		teamUserID,

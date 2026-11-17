@@ -2043,7 +2043,10 @@ func newServerEnvTeam(t *testing.T, requests paymentrequest.Store, withTeam bool
 		teamConfig = team.id
 	}
 
-	chats := chatmemory.NewInMemory(nil)
+	// The chat store excludes the team whether or not the server knows it,
+	// as production's does, so the team's private groups are created as
+	// production creates them (see chat.Store.PutPrivateGroup).
+	chats := chatmemory.NewInMemory([]*commonpb.UserId{team.id})
 	accounts := accountmemory.NewInMemory()
 	ocpBalance := &fakeOcpBalance{byOwner: make(map[string]uint64)}
 	balances := balance.NewClient(log, accounts, ocpBalance)
@@ -2170,8 +2173,9 @@ func (e *serverEnv) putPrivateGroup(keyed bool, members ...user) *commonpb.ChatI
 // putTeamPrivateGroup stores a private group in the shape the server creates
 // for a user with the team account as creator: the team and u its only
 // members, and u's envelope, wrapped by the team, written with it. The team
-// stores no envelope of its own; a server whose rules know the team finds the
-// group keyed all the same.
+// stores no envelope of its own, which the store allows of the team alone,
+// since it excludes the team from the feed; a server whose rules know the
+// team finds the group keyed all the same.
 func (e *serverEnv) putTeamPrivateGroup(u user) *commonpb.ChatId {
 	chatID := chat.MustGenerateGroupChatID()
 	require.NoError(e.t, e.chats.PutPrivateGroup(e.ctx, &chat.Chat{

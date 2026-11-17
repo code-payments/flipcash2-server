@@ -215,7 +215,7 @@ func (m *memory) PutChat(_ context.Context, c *chat.Chat) error {
 // critical section, so the group and its envelopes appear together, and
 // neither does when the group exists already.
 func (m *memory) PutPrivateGroup(_ context.Context, c *chat.Chat, envelopes []chat.MemberKeyEnvelope) error {
-	if err := chat.ValidatePrivateGroupCreation(c, envelopes); err != nil {
+	if err := chat.ValidatePrivateGroupCreation(c, envelopes, m.exclusions); err != nil {
 		return err
 	}
 	groupMembers, err := newGroupMemberRecords(c)

@@ -633,15 +633,18 @@ func originalMedia(blobID *blobpb.BlobId) *blobpb.Media {
 // whether the envelope can be replaced: one a user wrapped for themself
 // stands (see Store.SetKeyEnvelope).
 //
-// A private group created through StartChat has a key exactly when its
-// creator has an envelope stored. Nothing else records it: the creator's
-// envelope is the only one that can be such a group's first, it is always one
-// they wrapped themself, and it is never deleted, so its presence is one-way.
-// A group the team account created for a user (see Store.PutPrivateGroup)
-// has its key from its creation instead, since the envelopes the team wrapped
-// for its members are written with it, and the team, having no client,
-// stores none of its own; its key is decided off its creator, not any
-// envelope (see Access.hasKey). Every envelope but the creator's is deleted
+// A private group created through StartChat, or by the store for any creator
+// but the team (see Store.PutPrivateGroup, which then requires the creator's
+// own envelope), has a key exactly when its creator has an envelope stored.
+// Nothing else records it: the creator's envelope is always among such a
+// group's first, it is always one they wrapped themself, and it is never
+// deleted, so its presence is one-way. A group the team account created for a
+// user (see Store.PutPrivateGroup) has its key from its creation instead,
+// since the envelopes the team wrapped for its members are written with it,
+// and the team, having no client, stores none of its own (the store refuses
+// one, since its envelopes would share one hot partition; see
+// FeedExclusions); its key is decided off its creator, not any envelope (see
+// Access.hasKey). Every envelope but the creator's is deleted
 // with its member's departure (see Server.LeaveChat).
 //
 // A member who joined with an invite holds the invite's copy of the chat key

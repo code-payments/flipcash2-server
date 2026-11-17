@@ -195,6 +195,15 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatTyp
 // listed or not as the last write to it was made (see Excludes). An excluded
 // user stays a member in every other respect: IsMember answers for them, and
 // the roster reads and the member count include them.
+//
+// The same users are the creators exempt from storing a key envelope of their
+// own when a private group is created through the store (see
+// ValidatePrivateGroupCreation): every other creator must, so the group has
+// its key from its creation, and an excluded one may not, since the key
+// envelopes are keyed by user, and an envelope for each of the groups the
+// team creates, one for each user, would put them all under one hot key, as
+// a listed membership record would. Such a group is keyed off its creator
+// instead (see Access.teamCreated).
 type FeedExclusions struct {
 	// userIDs are the users excluded, each named once.
 	userIDs []*commonpb.UserId

@@ -753,7 +753,7 @@ func (s *store) putGroupChat(ctx context.Context, c *chat.Chat) error {
 // cancels them with the rest, and ErrChatExists leaves any envelope already
 // stored as it was.
 func (s *store) PutPrivateGroup(ctx context.Context, c *chat.Chat, envelopes []chat.MemberKeyEnvelope) error {
-	if err := chat.ValidatePrivateGroupCreation(c, envelopes); err != nil {
+	if err := chat.ValidatePrivateGroupCreation(c, envelopes, s.exclusions); err != nil {
 		return err
 	}
 

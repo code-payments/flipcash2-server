@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+
 	badge_dynamodb "github.com/code-payments/flipcash2-server/badge/dynamodb"
 	blocklist_memory "github.com/code-payments/flipcash2-server/blocklist/memory"
 	chat_dynamodb "github.com/code-payments/flipcash2-server/chat/dynamodb"
@@ -39,7 +41,7 @@ func TestMessaging_DynamoDBServer(t *testing.T) {
 
 	badges := badge_dynamodb.NewInDynamoDB(testEnv.Client, badgesTable)
 	blocklists := blocklist_memory.NewInMemory()
-	chats := chat_dynamodb.NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable, pinsTable, nil)
+	chats := chat_dynamodb.NewInDynamoDB(testEnv.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable, pinsTable, []*commonpb.UserId{tests.TeamUserID})
 	profiles := profile_memory.NewInMemory()
 	messages := NewInDynamoDB(testEnv.Client, messagesTable, pointersTable, reactionsTable, reactorsTable, selfReactionsTable, boostsTable)
 	teardown := func() {

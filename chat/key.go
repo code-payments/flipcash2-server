@@ -199,18 +199,33 @@ type MemberKeyEnvelope struct {
 }
 
 // ValidatePrivateGroupCreation checks a private group and the envelopes it is
-// to be created with, as Store.PutPrivateGroup takes them, so that every
-// backend refuses the same creations: c must be a group (a GroupChatIDSize
-// ID, type GROUP) that is private and names its creator, with at least one
-// member (ErrNoMembers otherwise); each envelope must be for one of c's
-// members, at most one per member, and be one the creator wrapped (WrappedBy
-// is c.CreatorID) rather than an invite's copy, since at creation no one else
-// has wrapped anything and no invite exists; and c's distinct members and the
-// envelopes together must number at most MaxGroupChatCreationMembers
-// (ErrTooManyMembers otherwise), since every one is an item of the same
-// atomic write. Every other failure is a plain error: each is a caller's bug,
-// not a state a client can reach.
-func ValidatePrivateGroupCreation(c *Chat, envelopes []MemberKeyEnvelope) error {
+// to be created with, as Store.PutPrivateGroup takes them, for a store whose
+// feed exclusions are exclusions (see FeedExclusions), so that every backend
+// refuses the same creations: c must be a group (a GroupChatIDSize ID, type GROUP) that
+// is private and names its creator, with at least one member (ErrNoMembers
+// otherwise); each envelope must be for one of c's members, at most one per
+// member, and be one the creator wrapped (WrappedBy is c.CreatorID) rather
+// than an invite's copy, since at creation no one else has wrapped anything
+// and no invite exists; and c's distinct members and the envelopes together
+// must number at most MaxGroupChatCreationMembers (ErrTooManyMembers
+// otherwise), since every one is an item of the same atomic write.
+//
+// The creator's own envelope is required, unless exclusions name the
+// creator, and then refused. A group is keyed by its creator's envelope (see
+// Access.hasKey), so one created without it would be keyless, and nothing
+// could be said in it until the creator stored one: a creation through the
+// store is the server making a group ready to use, which StartChat's
+// create-then-SetKeyEnvelope is not. The creator must therefore be a member,
+// since an envelope is only ever for a member. A creator the store excludes,
+// in production exactly the team account, is the exception: its groups are
+// keyed by construction (see Access.teamCreated), it has no client to open
+// an envelope with, and envelopes are keyed by user, so storing one for each
+// group it creates would put every one under the same hot partition, which
+// is what excluding it is for.
+//
+// Every failure but ErrNoMembers and ErrTooManyMembers is a plain error: each
+// is a caller's bug, not a state a client can reach.
+func ValidatePrivateGroupCreation(c *Chat, envelopes []MemberKeyEnvelope, exclusions FeedExclusions) error {
 	if !IsGroupChatID(c.ID) || c.Type != chatpb.ChatType_GROUP {
 		return errors.New("not a group chat")
 	}
@@ -246,6 +261,14 @@ func ValidatePrivateGroupCreation(c *Chat, envelopes []MemberKeyEnvelope) error 
 			return errors.New("key envelope not wrapped by the creator")
 		}
 		enveloped = append(enveloped, e.UserID)
+	}
+
+	creatorEnveloped := containsUser(enveloped, c.CreatorID)
+	switch excluded := exclusions.Excludes(c.CreatorID); {
+	case excluded && creatorEnveloped:
+		return errors.New("key envelope for a creator the store excludes")
+	case !excluded && !creatorEnveloped:
+		return errors.New("no key envelope of the creator's own")
 	}
 
 	if len(members)+len(envelopes) > MaxGroupChatCreationMembers {

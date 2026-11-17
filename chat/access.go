@@ -751,21 +751,25 @@ func (a *Access) viewerState(ctx context.Context, chatID *commonpb.ChatId, userI
 // off its rules with nothing read: it is keyed by construction, since
 // Store.PutPrivateGroup writes its members' envelopes in the same write that
 // creates it, and the team, having no client, never stores an envelope of its
-// own, so asking for the creator's would find it keyless forever. Nothing is
-// remembered for it either, since the answer costs no read, and these groups,
-// one for each user, would grow the cache without bound.
+// own (the store refuses one, see ValidatePrivateGroupCreation), so asking
+// for the creator's would find it keyless forever. Nothing is remembered for
+// it either, since the answer costs no read, and these groups, one for each
+// user, would grow the cache without bound.
 //
 // Any other private group has its key exactly when its creator has stored a
-// key envelope (see KeyEnvelope), found with the rules read every gate makes,
-// which a store caches with the rules, and then one strongly consistent point
-// read of the creator's envelope. A group found keyed is remembered for the
-// life of the process and never read again: the creator's envelope is never
-// deleted (see Store.RemoveGroupMember), so a group that has its key has it
-// for good. A group found keyless is not remembered, so its first message
-// after the creator stores the key is admitted at once, and until then each
-// of its members' refused sends costs that one read. A private group with no
-// recorded creator can have no key, since its creator's envelope is the only
-// possible first one and it was not created with its members' envelopes.
+// key envelope (see KeyEnvelope): one created through StartChat once they
+// store it, and one created through Store.PutPrivateGroup from its creation,
+// since that write requires it. It is found with the rules read every gate
+// makes, which a store caches with the rules, and then one strongly
+// consistent point read of the creator's envelope. A group found keyed is
+// remembered for the life of the process and never read again: the
+// creator's envelope is never deleted (see Store.RemoveGroupMember), so a
+// group that has its key has it for good. A group found keyless is not
+// remembered, so its first message after the creator stores the key is
+// admitted at once, and until then each of its members' refused sends costs
+// that one read. A private group with no recorded creator can have no key,
+// since its creator's envelope is the only possible first one and it was not
+// created with its members' envelopes.
 func (a *Access) hasKey(ctx context.Context, chatID *commonpb.ChatId, rules ChatRules) (bool, error) {
 	if !rules.IsPrivate {
 		return false, nil

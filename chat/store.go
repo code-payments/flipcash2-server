@@ -247,9 +247,12 @@ type Store interface {
 	// (canonical record, membership records, RosterSummary, and the
 	// exclusions above), and each envelope is stored as its member's key
 	// envelope for the group, so the group never exists without them nor
-	// they without it. A member with no envelope among them holds none, the
-	// creator included: whether a group the creator holds no envelope for
-	// has its key is the caller's concern, not the store's.
+	// they without it. A member with no envelope among them holds none. The
+	// creator's own envelope must be among them, so the group has its key
+	// from its creation (see Access.hasKey), unless the store excludes the
+	// creator (see FeedExclusions), in production exactly the team account,
+	// whose groups are keyed by construction and which holds no envelope of
+	// its own (see ValidatePrivateGroupCreation).
 	//
 	// Each envelope is stored exactly as AdmitFromLobby stores the one a
 	// creator wraps for the member it admits: an envelope wrapped by someone
@@ -260,14 +263,16 @@ type Store interface {
 	// replaces.
 	//
 	// It refuses, with nothing written, whatever ValidatePrivateGroupCreation
-	// refuses: a chat that is not a private group naming its creator, no
-	// members (ErrNoMembers), an envelope for a user who is not a member,
-	// more than one for a member, or one the creator did not wrap, and a
-	// creation whose distinct members and envelopes together number more
-	// than MaxGroupChatCreationMembers (ErrTooManyMembers). Duplicate members
-	// collapse, as for PutChat. If a chat with c's ID exists, nothing is
-	// written, envelopes included, and it returns ErrChatExists, so a retry
-	// of a creation that landed changes nothing.
+	// refuses given the store's exclusions: a chat that is not a private
+	// group naming its creator; no members (ErrNoMembers); an envelope for a
+	// user who is not a member, more than one for a member, or one the
+	// creator did not wrap; a creator with no envelope of their own, or an
+	// excluded creator with one; and a creation whose distinct members and
+	// envelopes together number more than MaxGroupChatCreationMembers
+	// (ErrTooManyMembers). Duplicate members collapse, as for PutChat. If a
+	// chat with c's ID exists, nothing is written, envelopes included, and it
+	// returns ErrChatExists, so a retry of a creation that landed changes
+	// nothing.
 	PutPrivateGroup(ctx context.Context, c *Chat, envelopes []MemberKeyEnvelope) error
 
 	// AddGroupMembers adds users as joined members of a group chat. It is

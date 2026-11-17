@@ -51,8 +51,17 @@ import (
 	"github.com/code-payments/flipcash2-server/testutil"
 )
 
-// RunServerTests runs the shared chat.Server test suite against s. teardown is
-// called between tests to reset the store.
+// TeamUserID is the Flipcash team account every env's server is built with.
+// A store passed to RunServerTests must be built excluding it from the feed
+// (see chat.FeedExclusions), as production's store excludes the team, so the
+// store creates the team's private groups as production's does (see
+// chat.Store.PutPrivateGroup). It is one account for the whole suite, as
+// production has one, and the store is reset between tests.
+var TeamUserID = model.MustGenerateUserID()
+
+// RunServerTests runs the shared chat.Server test suite against s, a store
+// built excluding TeamUserID from the feed. teardown is called between tests
+// to reset the store.
 func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, s chat.Store){
 		testServer_GetChat_OK,
@@ -276,7 +285,7 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	userID := model.MustGenerateUserID()
 	keys := model.MustGenerateKeyPair()
 	authz.Add(userID, keys)
-	teamUserID := model.MustGenerateUserID()
+	teamUserID := TeamUserID
 
 	accounts := newStaffAccounts(accountmemory.NewInMemory())
 	ocpBalance := &fakeOcpBalance{byOwner: make(map[string]uint64)}
@@ -6646,12 +6655,14 @@ func testServer_TeamPrivateGroup(t *testing.T, s chat.Store) {
 	resp = e.getMentionSuggestions(e.keys, chatID)
 	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, resp.Result)
 
-	// The exception is the team's alone: the same group created by anyone
-	// else, who stores no envelope of their own, stays keyless, the
-	// envelope written for the user notwithstanding, and so has no lobby.
+	// The exception is the team's alone. The store refuses the same group
+	// created by anyone else, who must store an envelope of their own with
+	// it; and the same group made otherwise, with the user's envelope
+	// wrapped by its creator and none of the creator's own, stays keyless,
+	// the user's envelope notwithstanding, and so has no lobby.
 	otherCreator := model.MustGenerateUserID()
 	otherID := chat.MustGenerateGroupChatID()
-	require.NoError(t, s.PutPrivateGroup(e.ctx, &chat.Chat{
+	other := &chat.Chat{
 		ID:           otherID,
 		Type:         chatpb.ChatType_GROUP,
 		Members:      []*commonpb.UserId{otherCreator, e.userID},
@@ -6659,10 +6670,12 @@ func testServer_TeamPrivateGroup(t *testing.T, s chat.Store) {
 		IsPrivate:    true,
 		CreatorID:    otherCreator,
 		LastActivity: at(1),
-	}, []chat.MemberKeyEnvelope{{
-		UserID:   e.userID,
-		Envelope: chat.KeyEnvelopeFromProto(keyEnvelopeProto(1), otherCreator),
-	}}))
+	}
+	userEnvelope := chat.KeyEnvelopeFromProto(keyEnvelopeProto(1), otherCreator)
+	require.Error(t, s.PutPrivateGroup(e.ctx, other, []chat.MemberKeyEnvelope{{UserID: e.userID, Envelope: userEnvelope}}))
+	require.NoError(t, s.PutChat(e.ctx, other))
+	_, err = s.SetKeyEnvelope(e.ctx, otherID, e.userID, userEnvelope)
+	require.NoError(t, err)
 	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, e.getMentionSuggestions(e.keys, otherID).Result)
 	require.Equal(t, chatpb.EnterLobbyResponse_DENIED, e.enterLobby(strangerKeys, otherID).Result)
 

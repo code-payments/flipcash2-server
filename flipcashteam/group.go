@@ -80,11 +80,12 @@ type WelcomeGroupConfig struct {
 	// chat.Server.GetKeyEnvelope reports as the wrapper's key.
 	TeamKeyPair model.KeyPair
 
-	// GroupKeySecret is the secret every welcome group's chat key is
-	// derived from (see deriveGroupKey): at least 32 bytes of uniformly
-	// random data kept for this purpose alone, guarded like a private key,
-	// and never the team's signing key. It must never change for a group
-	// already created.
+	// GroupKeySecret is the team group key secret, which every welcome
+	// group's chat key is derived from (see deriveGroupKey), as is the key of
+	// any other group the team creates: at least 32 bytes of uniformly random
+	// data kept for this purpose alone, guarded like a private key, and never
+	// the team's signing key. It must never change for a group already
+	// created. The parent loads it with LoadTeamGroupKeySecret.
 	GroupKeySecret []byte
 
 	// ProfilePictureBlobID is the profile picture every welcome group is

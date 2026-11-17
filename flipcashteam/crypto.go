@@ -78,8 +78,11 @@ const (
 // server needs no record of it: a retried creation derives the same key, so
 // the envelope it wraps holds the key of the group as first written, and every
 // later post the team makes into the group derives the key again with no
-// read. Anyone holding secret can derive the key of every group the team
-// creates, so it is guarded like a private key.
+// read. One secret serves every group the team creates, whatever the group is
+// for (welcome groups are the first): each group's key is bound to its own
+// chat ID, so groups never share a key. Anyone holding secret can derive the
+// key of every group the team creates, so it is guarded like a private key
+// (see LoadTeamGroupKeySecret).
 //
 // For a group already created, neither secret nor the derivation (its domain
 // string, which carries the version) may ever change. The group's members

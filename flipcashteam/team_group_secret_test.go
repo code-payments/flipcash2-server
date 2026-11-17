@@ -10,14 +10,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseGroupKeySecret(t *testing.T) {
-	want := bytes.Repeat([]byte{0xab}, groupKeySecretSize)
+func TestParseTeamGroupKeySecret(t *testing.T) {
+	want := bytes.Repeat([]byte{0xab}, teamGroupKeySecretSize)
 	encoded := hex.EncodeToString(want)
 	str := func(s string) *string { return &s }
 
 	t.Run("hex string", func(t *testing.T) {
 		for _, s := range []string{encoded, strings.ToUpper(encoded), "  " + encoded + "\n"} {
-			got, err := parseGroupKeySecret(str(s), nil)
+			got, err := parseTeamGroupKeySecret(str(s), nil)
 			require.NoError(t, err)
 			assert.Equal(t, want, got)
 		}
@@ -25,7 +25,7 @@ func TestParseGroupKeySecret(t *testing.T) {
 
 	t.Run("binary", func(t *testing.T) {
 		raw := bytes.Clone(want)
-		got, err := parseGroupKeySecret(nil, raw)
+		got, err := parseTeamGroupKeySecret(nil, raw)
 		require.NoError(t, err)
 		assert.Equal(t, want, got)
 
@@ -51,7 +51,7 @@ func TestParseGroupKeySecret(t *testing.T) {
 			"raw bytes as string": {s: str(string(want))},
 		} {
 			t.Run(name, func(t *testing.T) {
-				got, err := parseGroupKeySecret(tc.s, tc.b)
+				got, err := parseTeamGroupKeySecret(tc.s, tc.b)
 				require.Error(t, err)
 				assert.Nil(t, got)
 				// The value never appears in the error.

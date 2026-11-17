@@ -202,7 +202,7 @@ func TestGroupWelcomer(t *testing.T) {
 	// The request that assigned the handle may be gone by the time the welcome
 	// is sent; it is sent all the same. Told twice, as racing claims would, it
 	// is sent once.
-	ctx, cancel := context.WithCancel(withUserAgent(t, e.ctx, "Flipcash/iOS/2026.9.5"))
+	ctx, cancel := context.WithCancel(withUserAgent(t, e.ctx, "Flipcash/iOS/2026.10.3"))
 	cancel()
 	welcomer.OnFirstUsername(ctx, e.user, "alice_1")
 	welcomer.OnFirstUsername(ctx, e.user, "alice_1")
@@ -242,11 +242,13 @@ func TestGroupWelcomer_MinClientVersion(t *testing.T) {
 		userAgent string
 		welcomed  bool
 	}{
-		{"Flipcash/iOS/2026.9.5", true},
-		{"Flipcash/Android/2026.9.5", true},
+		{"Flipcash/iOS/2026.10.3", true},
+		{"Flipcash/Android/2026.10.3", true},
+		{"Flipcash/Android/2026.11.0", true},
 		{"Flipcash/iOS/2027.1.0", true},
-		{"Flipcash/iOS/2026.9.4", false},
-		{"Flipcash/Android/2026.8.9", false},
+		{"Flipcash/iOS/2026.10.2", false},
+		{"Flipcash/Android/2026.10.2", false},
+		{"Flipcash/iOS/2026.9.5", false},
 		{"Mozilla/5.0", false},
 		{"", false},
 	} {

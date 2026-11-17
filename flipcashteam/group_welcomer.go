@@ -148,13 +148,17 @@ func cloneWelcomeGroupConfig(cfg *WelcomeGroupConfig) (*WelcomeGroupConfig, erro
 // minWelcomeGroupClientVersion is the first client release, on iOS and
 // Android alike, given the welcome in a welcome group: one that can read it,
 // which takes support for private groups, their end-to-end encryption and a
-// group created by the team. It is kept apart from minWelcomeClientVersion,
+// group created by someone else. It is kept apart from minWelcomeClientVersion,
 // which gates the DM welcome, since the two need different clients.
 //
-// No such release is decided yet, so it stands at minWelcomeClientVersion's
-// value as a placeholder. It must be set to the first release that reads
-// team-created private groups before a GroupWelcomer is used.
-var minWelcomeGroupClientVersion = &ocp_client.Version{Major: 2026, Minor: 9, Patch: 5}
+// 2026.10.3 is the first release on both platforms to read a private group
+// created by someone else: it opens an envelope wrapped by the group's
+// creator, resolving the creator's account key by user ID, and decrypts the
+// group's messages. Nothing in it treats a group whose creator is the team,
+// whose creator holds no envelope, or that the user joined without
+// admission, any differently. An earlier release carried private groups in
+// its protocol alone, with no way to read one.
+var minWelcomeGroupClientVersion = &ocp_client.Version{Major: 2026, Minor: 10, Patch: 3}
 
 // OnFirstUsername sends userID the welcome in their welcome group in the
 // background, if the client that assigned username is at or above

@@ -30,10 +30,10 @@ const (
 	loginWindow                 = 2 * time.Minute
 	requireIapOnAccountCreation = false
 
-	minIosBuildNumber          = 581
-	staffMinIosBuildNumber     = 581
-	minAndroidBuildNumber      = 4804
-	staffMinAndroidBuildNumber = 4804
+	minIosBuildNumber          = 591
+	staffMinIosBuildNumber     = 591
+	minAndroidBuildNumber      = 4907
+	staffMinAndroidBuildNumber = 4907
 
 	defaultBillExchangeDataTimeout = 5 * time.Minute
 

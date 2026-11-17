@@ -250,8 +250,9 @@ func (w *Worker) processOne(ctx context.Context, task *ExpiryTask) bool {
 // reached its ends_at by this server's clock. One that has not (the queue's
 // due time is ExpireDelay past ends_at, so only a clock well behind the one
 // that claimed it gets here) is put back on the queue at its due time. One
-// already final is left to Expire's no-op, which only dequeues it should it
-// still be queued. A failed read is a failed attempt like any other: the claim
+// already final, or with no ends_at (never queued, so never claimed; should
+// one be, it never expires), is left to Expire's no-op, which only dequeues it
+// should it still be queued. A failed read is a failed attempt like any other: the claim
 // is held, so the request is rescheduled under backoff rather than left until
 // its lease ends.
 //
@@ -270,7 +271,7 @@ func (w *Worker) expire(ctx context.Context, id *paymentrequestpb.PaymentRequest
 		return fmt.Errorf("loading payment request: %w", err)
 	}
 
-	if !r.Status.IsFinal() && time.Now().Before(r.EndsAt()) {
+	if endsAt, ok := r.EndsAt(); !r.Status.IsFinal() && ok && time.Now().Before(endsAt) {
 		// Not a failure, but DelayExpiry is the one way to reschedule, so it
 		// counts as an attempt; only clock skew between servers gets here.
 		if err := w.requests.DelayExpiry(expireCtx, id, ExpiryDueAt(r)); err != nil {

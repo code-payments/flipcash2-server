@@ -1,6 +1,7 @@
 package paymentrequest
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -81,9 +82,9 @@ func TestNewSplitRequest(t *testing.T) {
 		"a repeated user":  newSplit(createdAt.Add(time.Hour), creator, debtor, debtor),
 		"paid set": func() *paymentrequestpb.Split {
 			split := newSplit(createdAt.Add(time.Hour), debtor)
-			split.Shares[0].Paid = &paymentrequestpb.PaidShare{
+			split.Shares[0].Paid = &paymentrequestpb.Paid{
 				PaidAt: timestamppb.New(createdAt),
-				How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
+				How:    &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}},
 			}
 			return split
 		}(),
@@ -109,7 +110,7 @@ func TestValidate_CreatorPaidOnlyOnCreatorsShare(t *testing.T) {
 
 	// A debtor's share is never paid as the creator's.
 	bad := r.Clone()
-	bad.Share(debtor).Paid = proto.Clone(bad.CreatorShare().Paid).(*paymentrequestpb.PaidShare)
+	bad.Share(debtor).Paid = proto.Clone(bad.CreatorShare().Paid).(*paymentrequestpb.Paid)
 	require.ErrorIs(t, bad.Validate(), ErrInvalidShares)
 
 	// The creator's share is paid from creation, and at it.
@@ -131,7 +132,8 @@ func TestStatusAt(t *testing.T) {
 	creator := model.MustGenerateUserID()
 	r, err := NewSplitRequest(newID(), creator, newChatID(), newSplit(createdAt.Add(time.Hour), model.MustGenerateUserID()), createdAt)
 	require.NoError(t, err)
-	endsAt := r.EndsAt()
+	endsAt, hasEnd := r.EndsAt()
+	require.True(t, hasEnd)
 
 	// Open up to its end, and expired by the clock from it, at the same
 	// version and closed at its end.
@@ -222,4 +224,183 @@ func newSplit(endsAt time.Time, users ...*commonpb.UserId) *paymentrequestpb.Spl
 		EndsAt:   timestamppb.New(endsAt),
 		Shares:   shares,
 	}
+}
+
+func TestNewCollectionRequest(t *testing.T) {
+	createdAt := time.Now()
+	creator := model.MustGenerateUserID()
+	endsAt := createdAt.Add(time.Hour)
+
+	for name, collection := range map[string]*paymentrequestpb.Collection{
+		"dated":   newCollection(&endsAt, "usd", 12.34),
+		"undated": newCollection(nil, "usd", 12.34),
+		"no text": func() *paymentrequestpb.Collection {
+			c := newCollection(nil, "usd", 0.01)
+			c.Text = nil
+			return c
+		}(),
+		"no minor unit": newCollection(nil, "jpy", 500),
+		"float error":   newCollection(nil, "usd", 0.1+0.2),
+	} {
+		r, err := NewCollectionRequest(newID(), creator, newChatID(), collection, createdAt)
+		require.NoError(t, err, name)
+		require.True(t, r.IsCollection(), name)
+		require.Nil(t, r.Split, name)
+		require.Equal(t, StatusOpen, r.Status, name)
+		require.EqualValues(t, 1, r.Version, name)
+		require.Nil(t, r.ClosedAt, name)
+		require.Zero(t, r.PayerCount, name)
+		require.Empty(t, r.PaymentIntentIDs, name)
+		require.Empty(t, r.Shares(), name)
+		require.Nil(t, r.Share(creator), name)
+		require.True(t, proto.Equal(collection, r.Collection), name)
+
+		// The collection given is the request's own copy.
+		collection.Currency = "cad"
+		require.NotEqual(t, "cad", r.Collection.Currency, name)
+	}
+
+	// The amount must be a whole number, at least one, of the currency's
+	// minor unit.
+	for name, collection := range map[string]*paymentrequestpb.Collection{
+		"zero":           newCollection(nil, "usd", 0),
+		"under a cent":   newCollection(nil, "usd", 0.005),
+		"between cents":  newCollection(nil, "usd", 12.345),
+		"negative":       newCollection(nil, "usd", -1),
+		"nan":            newCollection(nil, "usd", math.NaN()),
+		"inf":            newCollection(nil, "usd", math.Inf(1)),
+		"no minor units": newCollection(nil, "jpy", 1.5),
+		"no amount": func() *paymentrequestpb.Collection {
+			c := newCollection(nil, "usd", 1)
+			c.PaymentAmount = nil
+			return c
+		}(),
+	} {
+		_, err := NewCollectionRequest(newID(), creator, newChatID(), collection, createdAt)
+		require.ErrorIs(t, err, ErrInvalidAmount, name)
+	}
+
+	// The currency must be set.
+	_, err := NewCollectionRequest(newID(), creator, newChatID(), newCollection(nil, "", 1), createdAt)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrInvalidAmount)
+}
+
+func TestValidate_Collection(t *testing.T) {
+	createdAt := time.Now()
+	creator := model.MustGenerateUserID()
+	r, err := NewCollectionRequest(newID(), creator, newChatID(), newCollection(nil, "usd", 5), createdAt)
+	require.NoError(t, err)
+	require.NoError(t, r.Validate())
+
+	both := r.Clone()
+	both.Split = newSplit(createdAt.Add(time.Hour), creator, model.MustGenerateUserID())
+	require.Error(t, both.Validate())
+
+	withIntents := r.Clone()
+	withIntents.PaymentIntentIDs = map[string][]byte{string(model.MustGenerateUserID().Value): make([]byte, PaymentIntentIDSize)}
+	require.Error(t, withIntents.Validate())
+
+	nonPositive := r.Clone()
+	nonPositive.Collection.GetFixed().NativeAmount = 0
+	require.ErrorIs(t, nonPositive.Validate(), ErrInvalidAmount)
+
+	noCurrency := r.Clone()
+	noCurrency.Collection.Currency = ""
+	require.Error(t, noCurrency.Validate())
+}
+
+// TestStatusAt_Undated pins that a request with no ends_at is open until
+// closed, whatever the clock says, and is never queued.
+func TestStatusAt_Undated(t *testing.T) {
+	createdAt := time.Now()
+	r, err := NewCollectionRequest(newID(), model.MustGenerateUserID(), newChatID(), newCollection(nil, "usd", 5), createdAt)
+	require.NoError(t, err)
+
+	_, ok := r.EndsAt()
+	require.False(t, ok)
+	require.True(t, ExpiryDueAt(r).IsZero())
+
+	for _, now := range []time.Time{createdAt, createdAt.Add(100 * 365 * 24 * time.Hour)} {
+		require.Equal(t, StatusOpen, r.StatusAt(now))
+		require.True(t, r.IsOpenAt(now))
+		_, ok := r.ClosedAtAt(now)
+		require.False(t, ok)
+
+		metadata := r.ToProto(now)
+		require.Equal(t, paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_OPEN, metadata.Status)
+		require.Nil(t, metadata.ClosedAt)
+	}
+
+	closedAt := createdAt.Add(time.Minute)
+	closed := r.Clone()
+	closed.Status = StatusClosed
+	closed.ClosedAt = &closedAt
+	require.Equal(t, StatusClosed, closed.StatusAt(createdAt.Add(time.Hour)))
+	got, ok := closed.ClosedAtAt(createdAt.Add(time.Hour))
+	require.True(t, ok)
+	require.True(t, closedAt.Equal(got))
+
+	// A dated collection expires by the clock like a split.
+	endsAt := createdAt.Add(time.Hour)
+	dated, err := NewCollectionRequest(newID(), model.MustGenerateUserID(), newChatID(), newCollection(&endsAt, "usd", 5), createdAt)
+	require.NoError(t, err)
+	gotEnd, ok := dated.EndsAt()
+	require.True(t, ok)
+	require.True(t, endsAt.Equal(gotEnd))
+	require.True(t, endsAt.Add(ExpireDelay).Equal(ExpiryDueAt(dated)))
+	require.True(t, dated.IsOpenAt(endsAt.Add(-time.Nanosecond)))
+	require.Equal(t, StatusExpired, dated.StatusAt(endsAt))
+	got, ok = dated.ClosedAtAt(endsAt)
+	require.True(t, ok)
+	require.True(t, endsAt.Equal(got))
+}
+
+func TestToProto_Collection(t *testing.T) {
+	createdAt := time.Now()
+	creator := model.MustGenerateUserID()
+	chatID := newChatID()
+	for _, endsAt := range []*time.Time{nil, func() *time.Time { at := createdAt.Add(time.Hour); return &at }()} {
+		r, err := NewCollectionRequest(newID(), creator, chatID, newCollection(endsAt, "usd", 2.5), createdAt)
+		require.NoError(t, err)
+		r.PayerCount = 3
+		r.Version = 4
+
+		metadata := r.ToProto(createdAt)
+		require.NoError(t, metadata.Validate())
+		require.True(t, proto.Equal(chatID, metadata.GetGroupChat().ChatId))
+		require.Nil(t, metadata.GetGroupChat().GetSplit())
+		require.True(t, proto.Equal(r.Collection, metadata.GetGroupChat().GetCollection()))
+		require.Equal(t, endsAt == nil, metadata.GetGroupChat().GetCollection().EndsAt == nil)
+		require.EqualValues(t, 4, metadata.Version)
+		require.True(t, proto.Equal(&paymentrequestpb.PayerSummary{
+			PayerCount:       3,
+			PaidCount:        3,
+			NativeAmountPaid: 7.5,
+		}, metadata.PayerSummary))
+
+		// The projection is a copy, and so is a clone.
+		metadata.GetGroupChat().GetCollection().GetFixed().NativeAmount = 99
+		require.Equal(t, 2.5, r.Collection.GetFixed().NativeAmount)
+		clone := r.Clone()
+		require.EqualValues(t, 3, clone.PayerCount)
+		clone.Collection.GetFixed().NativeAmount = 99
+		require.Equal(t, 2.5, r.Collection.GetFixed().NativeAmount)
+	}
+}
+
+func newCollection(endsAt *time.Time, currency string, amount float64) *paymentrequestpb.Collection {
+	collection := &paymentrequestpb.Collection{
+		Text: &paymentrequestpb.Collection_Plaintext{Plaintext: &paymentrequestpb.PaymentRequestText{
+			Title: "Gift",
+		}},
+		Currency: currency,
+		PaymentAmount: &paymentrequestpb.Collection_Fixed{Fixed: &paymentrequestpb.Collection_FixedAmount{
+			NativeAmount: amount,
+		}},
+	}
+	if endsAt != nil {
+		collection.EndsAt = timestamppb.New(*endsAt)
+	}
+	return collection
 }

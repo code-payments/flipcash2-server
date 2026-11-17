@@ -109,6 +109,10 @@ type Server struct {
 
 	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent]
 
+	// teamUserID is the Flipcash team account (see NewServer), nil when there
+	// is none.
+	teamUserID *commonpb.UserId
+
 	now func() time.Time
 
 	// allowPublicGroups lifts the refusal of public groups on creation (see
@@ -146,6 +150,14 @@ func WithPublicGroupRequests() ServerOption {
 // does not answer (a group's existence, and whether a split's debtors are its
 // members). chatEventBus is the chat-keyed event bus every change is
 // announced on (see PublishCreated).
+//
+// teamUserID is the Flipcash team account (see flipcashteam), nil when there
+// is none, in which case no split is refused for billing it. It is an
+// argument rather than an option so that a parent cannot build a Server
+// without deciding it. The team is a member of the private groups it creates
+// for users, but it never pays (intent validation refuses a requested payment
+// with it), so a split naming it as a debtor is refused at creation (see
+// validateShares) rather than left with a share no one can pay.
 func NewServer(
 	log *zap.Logger,
 
@@ -157,6 +169,8 @@ func NewServer(
 	moderator moderation.Client,
 
 	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent],
+
+	teamUserID *commonpb.UserId,
 
 	opts ...ServerOption,
 ) *Server {
@@ -171,6 +185,8 @@ func NewServer(
 		moderator: moderator,
 
 		chatEventBus: chatEventBus,
+
+		teamUserID: teamUserID,
 
 		now: time.Now,
 	}
@@ -198,8 +214,9 @@ func NewServer(
 // most MaxDuration away (INVALID_ENDS_AT; a split's is always set, which the
 // proto's validation requires, and a collection's may be unset, leaving it
 // open until its creator closes it); the currency must be one the server
-// values (INVALID_CURRENCY); a split's shares must be valid (INVALID_SHARES,
-// see validateShares), and a collection's fixed amount a whole number, at
+// values (INVALID_CURRENCY); a split's shares must be valid, every debtor a
+// member of the chat and none of them the team account (INVALID_SHARES, see
+// validateShares), and a collection's fixed amount a whole number, at
 // least one, of the currency's minimum transfer value (INVALID_AMOUNT, see
 // NewCollectionRequest); and plaintext, when set, must pass moderation
 // (TEXT_MODERATED, see moderate). Only then is anything written.
@@ -471,8 +488,9 @@ func isSupportedCurrency(code string) bool {
 // validateShares checks what NewSplitRequest cannot judge alone of r's shares
 // (it has already refused a share with paid set, a repeated user, and shares
 // naming no one but the creator): that every amount is a whole number, at
-// least one, of the currency's minimum transfer value (its minor unit), and
-// that every debtor is a member of the chat.
+// least one, of the currency's minimum transfer value (its minor unit), that
+// no debtor is the team account, and that every debtor is a member of the
+// chat.
 //
 // A share must be an amount a payment can pay exactly. A payment of it is
 // accepted within half a minor unit of the share (see intent's
@@ -489,6 +507,16 @@ func isSupportedCurrency(code string) bool {
 // was created and has since left, and a member who has just joined but is
 // refused by a stale read is a retry away from being accepted. The creator's
 // own share needs no read: their standing to speak has proved them a member.
+//
+// The team account is a member of the private groups it creates for users,
+// so membership alone would admit a share billing it, yet that share could
+// never be paid: the team never pays, and intent validation refuses a
+// requested payment with it. The request would sit unpaid until it expired,
+// so a split naming the team as a debtor is refused, in any group, as
+// INVALID_SHARES like a share naming a non-member, which is what it is in
+// every way that matters to the creator: someone who cannot pay it. It is
+// told from the share list alone, before the membership read. A collection
+// names no debtors and needs nothing: the team simply never contributes.
 func (s *Server) validateShares(ctx context.Context, r *PaymentRequest) (bool, error) {
 	minimum := send.MinimumTransferValue(currency_lib.Code(r.Split.Currency))
 	debtors := make([]*commonpb.UserId, 0, len(r.Shares()))
@@ -496,9 +524,13 @@ func (s *Server) validateShares(ctx context.Context, r *PaymentRequest) (bool, e
 		if !isWholeMinorUnits(share.NativeAmount, minimum) {
 			return false, nil
 		}
-		if !proto.Equal(share.UserId, r.Creator) {
-			debtors = append(debtors, share.UserId)
+		if proto.Equal(share.UserId, r.Creator) {
+			continue
 		}
+		if s.teamUserID != nil && bytes.Equal(share.UserId.Value, s.teamUserID.Value) {
+			return false, nil
+		}
+		debtors = append(debtors, share.UserId)
 	}
 
 	members, err := s.chats.GetGroupMembersByID(ctx, r.ChatID, debtors)

@@ -25,8 +25,8 @@ import (
 //
 // SetKeyEnvelope stores the envelope as one the caller wrapped for themself,
 // whatever they hold already. It is how a group gets its key: the creator
-// stores theirs as the second step of creating the group, and a private group
-// has a key exactly when they have (see KeyEnvelope). It is also how an
+// stores theirs as the second step of creating the group, and a group created
+// that way has a key exactly when they have (see KeyEnvelope). It is also how an
 // admitted member replaces the envelope the creator wrapped for them with one
 // that depends on no one else's key, and how a member who joined with an
 // invite replaces the invite's copy of the chat key they hold (see
@@ -54,14 +54,19 @@ import (
 // Nothing is published by either: a user's other devices fetch the envelope
 // when they need it.
 //
-// Storing the creator's envelope is what opens the group to its members'
-// messages and its lobby to those who would join (see Access.SpeakerStanding
-// and Server.EnterLobby); nothing is published for that either, since the
-// creator's client is the one that stored it. Every other envelope a group
-// holds was stored by the creator admitting that member (see
-// Server.AdmitLobbyMember), or is an invite's copy stored by the member's
-// join with it (see Server.JoinChat and Store.JoinWithInvite), until the
-// member replaces it with their own.
+// For a group created through StartChat, storing the creator's envelope is
+// what opens the group to its members' messages and its lobby to those who
+// would join (see Access.SpeakerStanding and Server.EnterLobby); nothing is
+// published for that either, since the creator's client is the one that
+// stored it. A group the team account created for a user is open to its
+// members' messages from its creation instead, having been written with their
+// envelopes (see Store.PutPrivateGroup), and never has a lobby; the team has
+// no client and stores no envelope of its own (see Access.hasKey). Every
+// other envelope a group holds was stored by the creator admitting that
+// member (see Server.AdmitLobbyMember), written with the group at its
+// creation, or is an invite's copy stored by the member's join with it (see
+// Server.JoinChat and Store.JoinWithInvite), until the member replaces it
+// with their own.
 
 func (s *Server) SetKeyEnvelope(ctx context.Context, req *chatpb.SetKeyEnvelopeRequest) (*chatpb.SetKeyEnvelopeResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)

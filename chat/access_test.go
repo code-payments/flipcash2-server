@@ -295,6 +295,87 @@ func TestAccess_PrivateGroup(t *testing.T) {
 	require.Zero(t, f.ocpBalance.asked)
 }
 
+// TestAccess_TeamCreatedPrivateGroup: a private group the team account
+// created has its key from its creation, with no envelope read and nothing
+// remembered, so its members speak under the chat key's scheme while a
+// silence and membership still apply. The exception is the team's alone, and
+// there is none without a team account.
+func TestAccess_TeamCreatedPrivateGroup(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	team := model.MustGenerateUserID()
+	a := NewAccess(f.chats, NewRuleEvaluator(f.accounts, f.rules.balances, f.chats, team))
+	privateSpeaking := SpeakerStanding{CanSpeak: true, Encryption: EncryptionRequired, Scheme: messagingpb.EncryptedContent_CHAT_KEY_XCHACHA20POLY1305}
+
+	speaker := func(a *Access, chatID *commonpb.ChatId, userID *commonpb.UserId) SpeakerStanding {
+		t.Helper()
+		s, err := a.SpeakerStanding(ctx, chatID, userID)
+		require.NoError(t, err)
+		return s
+	}
+
+	// The team stores no envelope, and its user holds one only in the store,
+	// which is not asked: the member speaks with nothing read and nothing
+	// remembered, on every ask.
+	member := model.MustGenerateUserID()
+	welcome := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: team})
+	f.chats.join(welcome.ID, team)
+	f.chats.join(welcome.ID, member)
+	f.chats.storeKey(welcome.ID, member)
+	for range 2 {
+		require.Equal(t, privateSpeaking, speaker(a, welcome.ID, member))
+	}
+	keyed, err := a.hasKey(ctx, welcome.ID, welcome.ChatRules())
+	require.NoError(t, err)
+	require.True(t, keyed)
+	require.Zero(t, f.chats.envelopeReads)
+	require.Zero(t, a.keyed.Count())
+
+	// Membership still decides, and a silence still takes speech while
+	// leaving deletion.
+	require.Equal(t, SpeakerStanding{}, speaker(a, welcome.ID, f.funded))
+	for _, mode := range []messagingpb.ViewMode{messagingpb.ViewMode_FULL, messagingpb.ViewMode_FULL_OR_REDACTED, messagingpb.ViewMode_REDACTED} {
+		standing, err := a.ListenerStanding(ctx, welcome.ID, f.funded, mode)
+		require.NoError(t, err)
+		require.Equal(t, ListenerStanding{}, standing, mode)
+	}
+	f.chats.setState(welcome.ID, member, ViewerState{Silence: &Silence{Forever: true}})
+	require.Equal(t, SpeakerStanding{Silenced: true}, speaker(a, welcome.ID, member))
+	ok, err := a.CanDelete(ctx, welcome.ID, member)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// A public group the team created is a public group like any other: the
+	// exception is the key's, which only a private group has.
+	public := &Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, CreatorID: team}
+	require.False(t, a.teamCreated(public.ChatRules()))
+	keyed, err = a.hasKey(ctx, public.ID, public.ChatRules())
+	require.NoError(t, err)
+	require.False(t, keyed)
+
+	// The same group by any other creator is keyless, found with the
+	// creator's envelope read as before.
+	other := model.MustGenerateUserID()
+	keyless := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: other})
+	f.chats.join(keyless.ID, other)
+	f.chats.join(keyless.ID, member)
+	f.chats.storeKey(keyless.ID, member)
+	require.Equal(t, SpeakerStanding{}, speaker(a, keyless.ID, member))
+	require.Equal(t, 1, f.chats.envelopeReads)
+
+	// And with no team account there is no exception: the group the team
+	// created is keyless, since its creator stored no envelope.
+	noTeam := NewAccess(f.chats, f.rules)
+	f.chats.setState(welcome.ID, member, ViewerState{})
+	require.False(t, noTeam.teamCreated(welcome.ChatRules()))
+	require.Equal(t, SpeakerStanding{}, speaker(noTeam, welcome.ID, member))
+	require.Equal(t, 2, f.chats.envelopeReads)
+	require.Zero(t, noTeam.keyed.Count())
+
+	// No rule was evaluated for any of it.
+	require.Zero(t, f.ocpBalance.asked)
+}
+
 // TestAccess_Speaking: what each kind of chat takes from a speaker comes with
 // the standing — a DM takes plaintext or its pairwise scheme, a public group
 // plaintext alone, a keyed private group its chat key's scheme alone — and a

@@ -51,6 +51,15 @@ import (
 // both: an invite passed to a public group is INVITE_NOT_FOUND, its rules
 // not evaluated, since no invite is ever made to one.
 //
+// A private group the team created (see Access.teamCreated) is the one group
+// whose roster is as fixed as a DM's: it is created with its members, the
+// team and the user it was made for (see Store.PutPrivateGroup), no one
+// joins it, since only its creator could admit anyone and the team has no
+// client to do it with, and no one leaves it, so LeaveChat refuses every
+// departure as DENIED. That keeps the user it was made for on its roster for
+// good, so the group always names them and anything the team sends into it
+// later reaches them. A user who no longer wants to hear from it mutes it.
+//
 // A public group without listener rules is open: the empty set is satisfied
 // by everyone, so anyone may join it, as anyone may read it (see Access).
 //
@@ -359,6 +368,15 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 		log.With(zap.Error(err)).Warn("Failure getting chat rules")
 		return nil, status.Error(codes.Internal, "")
 	}
+
+	// No one leaves a private group the team created (see
+	// Access.teamCreated), as no one leaves a DM: its two members are fixed
+	// for good. Decided off the rules alone, ahead of membership, so a
+	// non-member is DENIED too rather than answered with the no-op.
+	if s.access.teamCreated(rules) {
+		return &chatpb.LeaveChatResponse{Result: chatpb.LeaveChatResponse_DENIED}, nil
+	}
+
 	discardKeyEnvelope := rules.IsPrivate && !rules.isCreator(userID)
 
 	// Leaving a group the caller is not in — never joined, or already gone —

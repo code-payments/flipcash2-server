@@ -113,7 +113,12 @@ const DefaultSpeakerAdmissionTTL = 30 * time.Second
 // has no RuleSet, so a record written with rules cannot open it. Its record is still
 // shown to any registered user (see Server.GetChat), which is how a user sees
 // what they would ask to join. Its members speak in it on membership and the
-// group's key alone (see privateGroupSpeaker).
+// group's key alone (see privateGroupSpeaker), which it has once its creator
+// stores their envelope or, for a group the team account created for a user,
+// from its creation, which wrote its members' envelopes (see hasKey). The team
+// is its creator in name only: it has no client, so nothing a creator alone
+// may do (admit, invite, pin, edit, moderate) is done in such a group through
+// an RPC, and nothing here makes an exception for its members to do it.
 //
 // A group's creator moderates it (see Server.SilenceUser and Server.BanUser),
 // and both restrictions are answered here, read from the user's ViewerState
@@ -164,8 +169,9 @@ type Access struct {
 	speakersTTL time.Duration
 
 	// keyed remembers, by group, that a private group has its key (see
-	// privateGroupSpeaker). Positive entries only, held for the life of the process: a
-	// group that has its key has it for good.
+	// hasKey). Positive entries only, held for the life of the process: a
+	// group that has its key has it for good. A group the team account
+	// created is never entered, since its key is known without a read.
 	keyed *ttlcache.Cache
 }
 
@@ -704,27 +710,17 @@ func (a *Access) publicGroupSpeaker(ctx context.Context, chatID *commonpb.ChatId
 }
 
 // privateGroupSpeaker is a private group member's standing to speak: they speak
-// exactly when the group has its key — its creator has stored a key envelope
-// (see KeyEnvelope) — and no rule is evaluated, since none admitted them. A
-// keyless group's members are refused, and it is every gate CanSpeak stands
-// behind at once that refuses them: a send, an edit, a deletion, a typing
-// notification, and mention suggestions. A keyed group's members speak with
-// EncryptionRequired under the chat key's scheme, so messaging admits nothing
-// but encrypted content there (see messaging.Server.SendMessage). Whether a
-// member holds an envelope of their own is not asked: the key is the group's,
-// and a member without one cannot read what they would write, which is their
-// client's to notice.
-//
-// The key is found with the rules read every gate makes, which a store caches
-// with the rules, and then one strongly consistent point read of the
-// creator's envelope. A group found keyed is remembered for the life of the
-// process and never read again: the creator's envelope is never deleted (see
-// Store.RemoveGroupMember), so a group that has its key has it for good. A
-// group found keyless is not remembered, so its first message after the
-// creator stores the key is admitted at once, and until then each of its
-// members' refused sends costs that one read. A private group with no
-// recorded creator can have no key, since the creator's envelope is the only
-// possible first one.
+// exactly when the group has its key (see hasKey) and no rule is evaluated,
+// since none admitted them. A keyless group's members are refused, and it is
+// every gate CanSpeak stands behind at once that refuses them: a send, an
+// edit, a deletion, a typing notification, and mention suggestions. A keyed
+// group's members speak with EncryptionRequired under the chat key's scheme,
+// so messaging admits nothing but encrypted content there (see
+// messaging.Server.SendMessage). Whether a member holds an envelope of their
+// own is not asked: the key is the group's, and a member without one cannot
+// read what they would write, which is their client's to notice. A group the
+// team account created is keyed from its creation (see hasKey), so its
+// members speak in it as in any keyed group, silence included.
 func (a *Access) privateGroupSpeaker(ctx context.Context, chatID *commonpb.ChatId, rules ChatRules) (SpeakerStanding, error) {
 	keyed, err := a.hasKey(ctx, chatID, rules)
 	if err != nil || !keyed {
@@ -750,9 +746,32 @@ func (a *Access) viewerState(ctx context.Context, chatID *commonpb.ChatId, userI
 
 // hasKey reports whether the private group whose rules the caller holds has
 // its chat key (see privateGroupSpeaker). It is false for a public group.
+//
+// A group the team account created (see teamCreated) has its key, decided
+// off its rules with nothing read: it is keyed by construction, since
+// Store.PutPrivateGroup writes its members' envelopes in the same write that
+// creates it, and the team, having no client, never stores an envelope of its
+// own, so asking for the creator's would find it keyless forever. Nothing is
+// remembered for it either, since the answer costs no read, and these groups,
+// one for each user, would grow the cache without bound.
+//
+// Any other private group has its key exactly when its creator has stored a
+// key envelope (see KeyEnvelope), found with the rules read every gate makes,
+// which a store caches with the rules, and then one strongly consistent point
+// read of the creator's envelope. A group found keyed is remembered for the
+// life of the process and never read again: the creator's envelope is never
+// deleted (see Store.RemoveGroupMember), so a group that has its key has it
+// for good. A group found keyless is not remembered, so its first message
+// after the creator stores the key is admitted at once, and until then each
+// of its members' refused sends costs that one read. A private group with no
+// recorded creator can have no key, since its creator's envelope is the only
+// possible first one and it was not created with its members' envelopes.
 func (a *Access) hasKey(ctx context.Context, chatID *commonpb.ChatId, rules ChatRules) (bool, error) {
 	if !rules.IsPrivate {
 		return false, nil
+	}
+	if a.teamCreated(rules) {
+		return true, nil
 	}
 	key := string(chatID.Value)
 	if _, ok := a.keyed.Get(key); ok {
@@ -770,6 +789,17 @@ func (a *Access) hasKey(ctx context.Context, chatID *commonpb.ChatId, rules Chat
 	}
 	a.keyed.Set(key, struct{}{})
 	return true, nil
+}
+
+// teamCreated reports whether rules are a private group's whose recorded
+// creator is the Flipcash team account (see RuleEvaluator), which the server
+// creates for a user through the store, with the members' envelopes in the
+// creating write (see Store.PutPrivateGroup). Such a group is keyed from its
+// creation (see hasKey) and has no lobby (see Server.EnterLobby). It is false
+// when there is no team account.
+func (a *Access) teamCreated(rules ChatRules) bool {
+	team := a.rules.teamUserID
+	return rules.IsPrivate && team != nil && rules.isCreator(team)
 }
 
 // admissionKey keys the admission cache by (group, user). Group IDs are fixed

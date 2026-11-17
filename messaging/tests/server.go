@@ -115,6 +115,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_OpenVersusPrivate_NonMember,
 		testServer_PrivateGroup_Keyless,
 		testServer_PrivateGroup_Keyed,
+		testServer_PrivateGroup_TeamCreated,
 		testServer_BalanceGatedGroup_Rules,
 		testServer_SpeakerBalanceGroup_Rules,
 		testServer_SilencedMember,
@@ -4320,6 +4321,124 @@ func testServer_PrivateGroup_Keyless(t *testing.T, badges badge.Store, blocklist
 		denied, err := e.getMessagesByOptionsInChatWithMode(strangerKeys, groupID, nil, mode)
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.GetMessagesResponse_DENIED, denied.Result, mode)
+	}
+}
+
+// putTeamPrivateGroup creates, through the store, a private group in the
+// shape the server creates for a user with the team account as creator:
+// creator and userA as members, and userA's envelope, wrapped by creator,
+// written with it. creator stores no envelope of its own.
+func (e *serverEnv) putTeamPrivateGroup(chats chat.Store, creator *commonpb.UserId) *commonpb.ChatId {
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, chats.PutPrivateGroup(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{creator, e.userA},
+		Title:        "Welcome",
+		IsPrivate:    true,
+		CreatorID:    creator,
+		LastActivity: at(1),
+	}, []chat.MemberKeyEnvelope{{
+		UserID: e.userA,
+		Envelope: chat.KeyEnvelope{
+			Scheme:     chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305,
+			Nonce:      bytes.Repeat([]byte{1}, 24),
+			Ciphertext: bytes.Repeat([]byte{1}, 48),
+			WrappedBy:  creator,
+		},
+	}}))
+	return groupID
+}
+
+// testServer_PrivateGroup_TeamCreated pins that a private group the team
+// account created for a user is keyed from its creation, though the team
+// stores no envelope of its own: the user sends, edits, deletes and types
+// there under the chat key's scheme alone, as in any keyed private group,
+// and a silence still takes their speech. The exception is the team's
+// alone: the same group under a server that knows no team account, or by
+// any other creator, is keyless.
+func testServer_PrivateGroup_TeamCreated(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	team := model.MustGenerateUserID()
+	e := newServerEnvWithTeam(t, badges, blocklists, chats, messages, profiles, team)
+	groupID := e.putTeamPrivateGroup(chats, team)
+	_, err := chats.GetKeyEnvelope(e.ctx, groupID, team)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// Nothing but the group's scheme goes in.
+	for _, refused := range []struct {
+		content []*messagingpb.Content
+		result  messagingpb.SendMessageResponse_Result
+	}{
+		{textContent("plaintext"), messagingpb.SendMessageResponse_ENCRYPTION_REQUIRED},
+		{encryptedContent(1), messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED},
+	} {
+		resp, err := e.sendContentToChat(e.keysA, groupID, refused.content, generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, refused.result, resp.Result)
+		require.Nil(t, resp.Message)
+	}
+
+	// The user sends under the chat key, edits and deletes their own
+	// message, and types.
+	var sent []*messagingpb.Message
+	for i := byte(1); i <= 2; i++ {
+		resp, err := e.sendContentToChat(e.keysA, groupID, chatKeyEncryptedContent(i), generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+		require.True(t, proto.Equal(chatKeyEncryptedContent(i)[0], resp.Message.Content[0]))
+		sent = append(sent, resp.Message)
+	}
+	plainEdit, err := e.editMessageInChat(e.keysA, groupID, sent[0].MessageId, textContent("plaintext"), sent[0].EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_ENCRYPTION_REQUIRED, plainEdit.Result)
+	edited, err := e.editMessageInChat(e.keysA, groupID, sent[0].MessageId, chatKeyEncryptedContent(3), sent[0].EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_OK, edited.Result)
+	typing, err := e.notifyIsTypingInChat(e.keysA, groupID, messagingpb.IsTypingNotification_STARTED_TYPING)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.NotifyIsTypingResponse_OK, typing.Result)
+	deleted, err := e.deleteMessageInChat(e.keysA, groupID, sent[0].MessageId, edited.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, deleted.Result)
+
+	// A non-member is DENIED as in any private group.
+	_, strangerKeys := e.addUser()
+	strangerSend, err := e.sendContentToChat(strangerKeys, groupID, chatKeyEncryptedContent(4), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, strangerSend.Result)
+
+	// A silence, set as the creator would set it, takes speech and leaves
+	// deletion.
+	_, _, err = chats.SetSilence(e.ctx, groupID, e.userA, chat.Silence{Forever: true}, time.Now())
+	require.NoError(t, err)
+	silencedSend, err := e.sendContentToChat(e.keysA, groupID, chatKeyEncryptedContent(5), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, silencedSend.Result)
+	silencedTyping, err := e.notifyIsTypingInChat(e.keysA, groupID, messagingpb.IsTypingNotification_STARTED_TYPING)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, silencedTyping.Result)
+	silencedDelete, err := e.deleteMessageInChat(e.keysA, groupID, sent[1].MessageId, sent[1].EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, silencedDelete.Result)
+
+	// A server that knows no team account finds the same group keyless, and
+	// so does any server for a group another creator made the same way.
+	noTeam := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	other := model.MustGenerateUserID()
+	for _, tc := range []struct {
+		env     *serverEnv
+		creator *commonpb.UserId
+	}{
+		{noTeam, team},
+		{e, other},
+	} {
+		keyless := tc.env.putTeamPrivateGroup(chats, tc.creator)
+		resp, err := tc.env.sendContentToChat(tc.env.keysA, keyless, chatKeyEncryptedContent(6), generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_DENIED, resp.Result)
+		typing, err := tc.env.notifyIsTypingInChat(tc.env.keysA, keyless, messagingpb.IsTypingNotification_STARTED_TYPING)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typing.Result)
 	}
 }
 

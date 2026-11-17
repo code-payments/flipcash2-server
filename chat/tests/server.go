@@ -136,6 +136,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_Lobby_GetLobbyMembers,
 		testServer_Lobby_Admit,
 		testServer_Lobby_Deny,
+		testServer_TeamPrivateGroup,
 		testServer_PrivateGroup_UserJoinedMessages,
 		testServer_StartChat_InvalidRules,
 		testServer_StartChat_RulesNotSatisfied,
@@ -6561,6 +6562,115 @@ func (e *serverEnv) requireNoLobbyUpdatesOnChatTopic(chatID *commonpb.ChatId) {
 	for _, ev := range e.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, chatID.Value) }) {
 		require.Nil(e.t, ev.Event.GetEvent().GetChatUpdate().GetLobbyUpdates())
 	}
+}
+
+// putTeamPrivateGroup creates, through the store as the server will, a
+// private group whose creator is the Flipcash team account, with the team
+// and the env user as members and the env user's envelope, wrapped by the
+// team, written with it. The team holds no envelope of its own.
+func (e *serverEnv) putTeamPrivateGroup(title string) *commonpb.ChatId {
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, e.store.PutPrivateGroup(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.teamUserID, e.userID},
+		Title:        title,
+		IsPrivate:    true,
+		CreatorID:    e.teamUserID,
+		LastActivity: at(1),
+	}, []chat.MemberKeyEnvelope{{
+		UserID:   e.userID,
+		Envelope: chat.KeyEnvelopeFromProto(keyEnvelopeProto(1), e.teamUserID),
+	}}))
+	return chatID
+}
+
+// testServer_TeamPrivateGroup pins a private group the team account created
+// for a user: it has its key from its creation, though the team stores no
+// envelope, so the user speaks in it as a member of any keyed group, silence
+// included; it has no lobby, so a non-member is DENIED entry; and every
+// creator-only RPC stays refused to the user, who is not its creator.
+func testServer_TeamPrivateGroup(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	strangerID, strangerKeys := e.addBoundUser("Stranger")
+	e.profiles.usernames[string(strangerID.Value)] = "stranger"
+
+	chatID := e.putTeamPrivateGroup("Welcome")
+	_, err := s.GetKeyEnvelope(e.ctx, chatID, e.teamUserID)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// The user speaks, so mention suggestions are theirs.
+	resp := e.getMentionSuggestions(e.keys, chatID)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_OK, resp.Result)
+
+	// Nothing a creator alone may do is the user's.
+	perms := e.getChat(e.keys, chatID).Metadata.ViewerState.Permissions
+	require.False(t, perms.CanEdit)
+	require.False(t, perms.CanInvite)
+	require.False(t, perms.CanPin)
+	e.putMessage(chatID, 1, e.userID, "hello")
+	require.Equal(t, chatpb.PinMessageResponse_DENIED, e.pinMessage(e.keys, chatID, 1).Result)
+	title := "Renamed"
+	edited := e.mustEditChat(e.keys, chatID, &title, nil)
+	require.Equal(t, chatpb.EditChatResponse_DENIED, edited.Result)
+	require.Equal(t, chatpb.CreateInviteResponse_DENIED, e.createInvite(e.keys, createInviteRequest(e.keys, chatID, newInviteToken())).Result)
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_DENIED, e.admitLobbyMember(e.keys, chatID, strangerID, keyEnvelopeProto(2)).Result)
+	require.Equal(t, chatpb.SilenceUserResponse_DENIED, e.mustSilenceUser(e.keys, chatID, strangerID, silenceForever()))
+	got, err := e.getLobbyMembers(e.keys, chatID, nil)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetLobbyMembersResponse_DENIED, got.Result)
+
+	// It has no lobby: a non-member is DENIED entry and holds no entry, as
+	// for a keyless group, and the user, a member, is ALREADY_MEMBER.
+	require.Equal(t, chatpb.EnterLobbyResponse_DENIED, e.enterLobby(strangerKeys, chatID).Result)
+	require.False(t, e.getChat(strangerKeys, chatID).Metadata.InLobby)
+	require.Equal(t, chatpb.EnterLobbyResponse_ALREADY_MEMBER, e.enterLobby(e.keys, chatID).Result)
+
+	// Nor is it joined without an invite, and no one has one to give.
+	joined := e.mustJoinChat(strangerKeys, chatID)
+	require.Equal(t, chatpb.JoinChatResponse_DENIED, joined.Result)
+
+	// Nor is it left: the user stays a member, with their envelope, and a
+	// non-member is refused too rather than answered with the no-op.
+	require.Equal(t, chatpb.LeaveChatResponse_DENIED, e.mustLeaveChat(e.keys, chatID).Result)
+	isMember, err := s.IsMember(e.ctx, chatID, e.userID)
+	require.NoError(t, err)
+	require.True(t, isMember)
+	_, err = s.GetKeyEnvelope(e.ctx, chatID, e.userID)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.LeaveChatResponse_DENIED, e.mustLeaveChat(strangerKeys, chatID).Result)
+
+	// A silence, set as the creator would set it, still takes speech.
+	_, _, err = s.SetSilence(e.ctx, chatID, e.userID, chat.Silence{Forever: true}, time.Now())
+	require.NoError(t, err)
+	resp = e.getMentionSuggestions(e.keys, chatID)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, resp.Result)
+
+	// The exception is the team's alone: the same group created by anyone
+	// else, who stores no envelope of their own, stays keyless, the
+	// envelope written for the user notwithstanding, and so has no lobby.
+	otherCreator := model.MustGenerateUserID()
+	otherID := chat.MustGenerateGroupChatID()
+	require.NoError(t, s.PutPrivateGroup(e.ctx, &chat.Chat{
+		ID:           otherID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{otherCreator, e.userID},
+		Title:        "Other",
+		IsPrivate:    true,
+		CreatorID:    otherCreator,
+		LastActivity: at(1),
+	}, []chat.MemberKeyEnvelope{{
+		UserID:   e.userID,
+		Envelope: chat.KeyEnvelopeFromProto(keyEnvelopeProto(1), otherCreator),
+	}}))
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, e.getMentionSuggestions(e.keys, otherID).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_DENIED, e.enterLobby(strangerKeys, otherID).Result)
+
+	// And its member may leave it, as from any private group.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, otherID).Result)
+	isMember, err = s.IsMember(e.ctx, otherID, e.userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
 }
 
 // testServer_Lobby_Gates pins who may do what with a lobby: nothing of a

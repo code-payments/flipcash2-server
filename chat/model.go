@@ -301,14 +301,18 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 // group's, and are shown to any registered user.
 //
 // A private group's chat key reaches the server only as its members' key
-// envelopes (see KeyEnvelope), and nothing happens in one until its creator
-// has stored theirs: a keyless group's members are refused every send, and
-// a keyed group's members send encrypted content under the group's scheme
-// and nothing else (see Access.SpeakerStanding and
-// messaging.Server.SendMessage). Its other members are admitted by its
-// creator from its lobby (see LobbyEntry and Server.EnterLobby), with the
-// chat key wrapped for each by the creator, or join with an invite (see
-// Invite and Server.JoinChat), holding the invite's copy of the key.
+// envelopes (see KeyEnvelope), and nothing happens in one until it has its
+// key: once its creator has stored their envelope, or from its creation for a
+// group the team account created for a user (see Access.hasKey). A keyless
+// group's members are refused every send, and a keyed group's members send
+// encrypted content under the group's scheme and nothing else (see
+// Access.SpeakerStanding and messaging.Server.SendMessage). Its other members
+// are admitted by its creator from its lobby (see LobbyEntry and
+// Server.EnterLobby), with the chat key wrapped for each by the creator, or
+// join with an invite (see Invite and Server.JoinChat), holding the invite's
+// copy of the key. A group the team created has its members, and their
+// envelopes, from its creation (see Store.PutPrivateGroup), and takes no one
+// after: it has no lobby, and the team, having no client, invites no one.
 //
 // CreatorID is the user who created the group, or nil when unknown (a DM has
 // none, and so does any group written before the field existed). It is fixed
@@ -629,11 +633,16 @@ func originalMedia(blobID *blobpb.BlobId) *blobpb.Media {
 // whether the envelope can be replaced: one a user wrapped for themself
 // stands (see Store.SetKeyEnvelope).
 //
-// A private group has a key exactly when its creator has an envelope stored.
-// Nothing else records it: the creator's envelope is the only one that can
-// be the group's first, it is always one they wrapped themself, and it is
-// never deleted, so its presence is one-way. Every other member's envelope is
-// deleted with their departure (see Server.LeaveChat).
+// A private group created through StartChat has a key exactly when its
+// creator has an envelope stored. Nothing else records it: the creator's
+// envelope is the only one that can be such a group's first, it is always one
+// they wrapped themself, and it is never deleted, so its presence is one-way.
+// A group the team account created for a user (see Store.PutPrivateGroup)
+// has its key from its creation instead, since the envelopes the team wrapped
+// for its members are written with it, and the team, having no client,
+// stores none of its own; its key is decided off its creator, not any
+// envelope (see Access.hasKey). Every envelope but the creator's is deleted
+// with its member's departure (see Server.LeaveChat).
 //
 // A member who joined with an invite holds the invite's copy of the chat key
 // in place of an envelope, until they replace it with one they wrapped

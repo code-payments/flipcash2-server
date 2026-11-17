@@ -291,7 +291,9 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 //
 // IsPrivate marks a private group (see chatpb.Metadata.is_private): one whose
 // creator admits each member, and whose messages are end-to-end encrypted
-// with a chat key the server never holds. It is fixed at creation, like the
+// with a chat key the server never holds, except in a group the team account
+// created, whose key the server derives to post as the team (see
+// flipcashteam's welcome group). It is fixed at creation, like the
 // rules, and read with them (see ChatRules). A private group carries no
 // rules: StartChat writes none. No non-member is admitted to it in any form
 // (see Access), no rule admits anyone to it (see RuleEvaluator), and

@@ -624,8 +624,10 @@ func originalMedia(blobID *blobpb.BlobId) *blobpb.Media {
 // chatpb.KeyEnvelope and Chat.IsPrivate): the group's chat key, encrypted so
 // that only that user can open it. The server stores an envelope and hands it
 // back to the user it is for. It cannot open one and never holds the chat
-// key, so nothing in an envelope is checked beyond its shape, which is the
-// boundary's job (proto validation), not the record's.
+// key, except in a group the team account created, whose key the server
+// derives and whose envelopes it wraps as the team (see flipcashteam's welcome
+// group). Either way nothing in an envelope is checked beyond its shape, which
+// is the boundary's job (proto validation), not the record's.
 //
 // WrappedBy is who stored the envelope, as the server authenticated them: the
 // user it is for, or the group's creator admitting them, or creating the

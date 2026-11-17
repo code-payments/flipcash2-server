@@ -40,27 +40,34 @@ func AssignUsername(ctx context.Context, profiles profile.Store, userID *commonp
 // treats the team specially with that one ID, each taking it as a required
 // argument so none can be built without it: the chat store (its
 // excludedFromFeed, see chat.FeedExclusions), and the teamUserID of the chat
-// RuleEvaluator, the chat server, the Sender (which SendDmMessages takes it
-// from) and the intent integration. None of them calls this, since this package
-// imports them. A process started before the
-// team account was set up has none of them configured, and needs a restart
-// once it is.
+// RuleEvaluator, the chat server, the chat Hydrator, the Sender (which
+// SendDmMessages and SendWelcomeGroupMessages take it from), the payment
+// request server and the intent integration. None of them calls this: chat
+// and messaging cannot, since this package imports them, and every one takes
+// the ID the parent resolved, so they all agree on it. A process started
+// before the team account was set up has none of them configured, and needs a
+// restart once it is.
 func GetUserID(ctx context.Context, profiles profile.Store) (*commonpb.UserId, error) {
 	return profiles.GetUserIdByUsername(ctx, Username)
 }
 
-// ErrNoTeamAccount is returned by SendDmMessages when the Sender it is given was
-// built with no team account (see messaging.NewSender).
+// ErrNoTeamAccount is returned by SendDmMessages and SendWelcomeGroupMessages
+// when the Sender they are given was built with no team account (see
+// messaging.NewSender), and wrapped by NewGroupWelcomer, which refuses such a
+// Sender at startup.
 var ErrNoTeamAccount = errors.New("no team account configured")
 
-// clientMessageIDNamespace is the UUID namespace SendDmMessages derives its client
-// message IDs under, so they cannot collide with an ID a client or another
-// server-authored send picks.
+// clientMessageIDNamespace is the UUID namespace the team's sends
+// (SendDmMessages and SendWelcomeGroupMessages) derive their client message
+// IDs under, so they cannot collide with an ID a client or another
+// server-authored send picks. The two share it safely, since the chat ID is
+// part of what is hashed (see clientMessageID).
 var clientMessageIDNamespace = uuid.MustParse("0fea31a1-c7d6-4084-b481-fde267cf1177")
 
-// clientMessageID derives the client message ID of the index-th message
-// SendDmMessages sends into chatID under idempotencyKey. The key is length-prefixed
-// so no two (key, index) pairs hash the same input.
+// clientMessageID derives the client message ID of the index-th message the
+// team sends into chatID under idempotencyKey (see SendDmMessages and
+// SendWelcomeGroupMessages). The key is length-prefixed so no two (key,
+// index) pairs hash the same input.
 func clientMessageID(chatID *commonpb.ChatId, idempotencyKey string, index int) *messagingpb.ClientMessageId {
 	var data []byte
 	data = append(data, chatID.Value...)

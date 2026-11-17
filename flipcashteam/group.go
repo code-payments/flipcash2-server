@@ -5,9 +5,15 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"google.golang.org/protobuf/proto"
 
 	blobpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/blob/v1"
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
@@ -24,11 +30,11 @@ import (
 // the team as its creator and the team and the user as its only members, into
 // which the team posts end-to-end encrypted messages, the welcome first.
 //
-// It is built but not yet used to welcome anyone: Welcomer sends the welcome
-// into the team's DM with the user (see SendWelcomeV3), and nothing in the
+// It is built but not yet used to welcome anyone: DmWelcomer sends the welcome
+// into the team's DM with the user (see SendWelcomeDmV3), and nothing in the
 // parent calls what is here. GroupWelcomer is what would: switching the
 // welcome to the group is the parent handing it to the profile server in
-// place of Welcomer.
+// place of DmWelcomer.
 //
 // Every user has exactly one welcome group, ever: its ID is derived from the
 // team and the user alone (see welcomeGroupID), so every send into it, whatever
@@ -119,6 +125,78 @@ func (c *WelcomeGroupConfig) validate() error {
 	return nil
 }
 
+// cloneWelcomeGroupConfig returns a deep copy of cfg, which has passed
+// validate.
+func cloneWelcomeGroupConfig(cfg *WelcomeGroupConfig) (*WelcomeGroupConfig, error) {
+	teamKeyPair, err := model.FromPrivateKey(bytes.Clone(cfg.TeamKeyPair.Private()))
+	if err != nil {
+		return nil, err
+	}
+	return &WelcomeGroupConfig{
+		TeamKeyPair:          teamKeyPair,
+		GroupKeySecret:       bytes.Clone(cfg.GroupKeySecret),
+		ProfilePictureBlobID: proto.Clone(cfg.ProfilePictureBlobID).(*blobpb.BlobId),
+	}, nil
+}
+
+// teamGroupKeySecretSize is the size of the secret LoadTeamGroupKeySecret
+// returns: the exact size of the stored secret, though deriveGroupKey would
+// take a longer one.
+const teamGroupKeySecretSize = minGroupKeySecretSize
+
+// LoadTeamGroupKeySecret fetches the team group key secret from AWS Secrets
+// Manager: the one secret the chat key of every private group the team creates
+// is derived from (see deriveGroupKey), whatever the group is for. Welcome
+// groups are the first such groups (see WelcomeGroupConfig.GroupKeySecret);
+// any later kind uses the same secret, each group's key bound to its own chat
+// ID. secretID is the secret's name or ARN. The caller constructs and
+// configures the *secretsmanager.Client, as for
+// blob/s3.LoadCloudFrontPrivateKey.
+//
+// The secret is exactly teamGroupKeySecretSize bytes, stored either as a
+// string holding them hex-encoded (as `openssl rand -hex 32` makes one,
+// surrounding whitespace ignored) or as binary holding them raw. Any other
+// value is refused rather than used: the stored format is fixed with the first
+// group the team creates, and a value pasted wrong or encoded twice would
+// derive keys for no group that exists. An error never carries the value, or
+// any part of it.
+func LoadTeamGroupKeySecret(ctx context.Context, client *secretsmanager.Client, secretID string) ([]byte, error) {
+	out, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(secretID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get secret %q: %w", secretID, err)
+	}
+	secret, err := parseTeamGroupKeySecret(out.SecretString, out.SecretBinary)
+	if err != nil {
+		return nil, fmt.Errorf("secret %q: %w", secretID, err)
+	}
+	return secret, nil
+}
+
+// parseTeamGroupKeySecret is LoadTeamGroupKeySecret's decoding of a secret value, a
+// string secret's or a binary one's.
+func parseTeamGroupKeySecret(secretString *string, secretBinary []byte) ([]byte, error) {
+	var secret []byte
+	switch {
+	case secretString != nil:
+		decoded, err := hex.DecodeString(strings.TrimSpace(*secretString))
+		if err != nil {
+			// hex's error quotes the offending byte, so it is not wrapped.
+			return nil, errors.New("value is not hex")
+		}
+		secret = decoded
+	case len(secretBinary) > 0:
+		secret = append([]byte(nil), secretBinary...)
+	default:
+		return nil, errors.New("secret has no value")
+	}
+	if len(secret) != teamGroupKeySecretSize {
+		return nil, fmt.Errorf("value is %d bytes, want %d", len(secret), teamGroupKeySecretSize)
+	}
+	return secret, nil
+}
+
 // welcomeGroupID returns the ID of userID's welcome group, created by the team
 // account teamUserID: the group chat ID chat.MustDeriveGroupChatID derives for
 // teamUserID as creator and the idempotency key
@@ -152,12 +230,12 @@ func welcomeGroupID(teamUserID, userID *commonpb.UserId) *commonpb.ChatId {
 // earning its own push. At most messaging.MaxMessagesPerPut messages go in
 // one call.
 //
-// It refuses what SendMessages refuses, ErrNoTeamAccount included, and a cfg
+// It refuses what SendDmMessages refuses, ErrNoTeamAccount included, and a cfg
 // that fails its checks (see WelcomeGroupConfig) or a user with no account
 // key to wrap their copy of the chat key to, the last only when the group is
 // still to be created.
 //
-// It is idempotent on (the group, idempotencyKey) exactly as SendMessages is
+// It is idempotent on (the group, idempotencyKey) exactly as SendDmMessages is
 // on (the chat, idempotencyKey): the client message IDs are derived from the
 // pair and each message's position (see clientMessageID), so a retry returns
 // what the first call sent without sending again. A retry encrypts afresh,
@@ -227,7 +305,7 @@ func SendWelcomeGroupMessages(
 }
 
 // SendWelcomeGroupV3 sends the third version of the team's welcome (see
-// SendWelcomeV3) to userID in their welcome group (see
+// SendWelcomeDmV3) to userID in their welcome group (see
 // SendWelcomeGroupMessages), under the same key as the DM welcome: the key is
 // scoped to the chat it is sent in, so the two never meet.
 //
@@ -249,7 +327,7 @@ func SendWelcomeGroupV3(
 // attempt of this one, may have created it, so an existing group is expected,
 // not a failure.
 //
-// The group is looked up before it is created, as ensureChat looks up a DM and
+// The group is looked up before it is created, as ensureDm looks up a DM and
 // for the same reason: a create that finds the group there is a cancelled
 // transaction that spends write capacity on every item it names, and a lookup
 // that misses a group created a moment ago falls through to a create that

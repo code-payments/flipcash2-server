@@ -3,12 +3,9 @@ package flipcashteam
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/google/uuid"
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -19,16 +16,7 @@ import (
 	"github.com/code-payments/flipcash2-server/model"
 )
 
-// ErrNoTeamAccount is returned by SendMessages when the Sender it is given was
-// built with no team account (see messaging.NewSender).
-var ErrNoTeamAccount = errors.New("no team account configured")
-
-// clientMessageIDNamespace is the UUID namespace SendMessages derives its client
-// message IDs under, so they cannot collide with an ID a client or another
-// server-authored send picks.
-var clientMessageIDNamespace = uuid.MustParse("0fea31a1-c7d6-4084-b481-fde267cf1177")
-
-// SendMessages sends messages from the team account to userID, in the chat
+// SendDmMessages sends messages from the team account to userID, in the chat
 // between them, creating the chat first if it does not exist yet, and returns
 // the chat's ID and the messages as persisted, in order. The chat is their
 // canonical DM (ChatType_DM), the type DMs open as. Each element of messages is
@@ -56,7 +44,7 @@ var clientMessageIDNamespace = uuid.MustParse("0fea31a1-c7d6-4084-b481-fde267cf1
 // than the first call fails without sending anything, and one with fewer
 // returns the first call's leading messages, as a replay, without sending
 // anything either.
-func SendMessages(
+func SendDmMessages(
 	ctx context.Context,
 	chats chat.Store,
 	sender *messaging.Sender,
@@ -84,7 +72,7 @@ func SendMessages(
 
 	chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, teamUserID, userID)
 
-	if err := ensureChat(ctx, chats, chatID, teamUserID, userID); err != nil {
+	if err := ensureDm(ctx, chats, chatID, teamUserID, userID); err != nil {
 		return nil, nil, err
 	}
 
@@ -104,7 +92,22 @@ func SendMessages(
 	return chatID, sent, nil
 }
 
-// ensureChat creates the DM chatID between the team account and userID
+// SendWelcomeDmV3 sends the third version of the team's welcome to userID: one
+// text message (see SendDmMessages).
+//
+// It is idempotent on the user: every call for them sends under the same key,
+// so a retry returns what the first call sent without sending again (for as
+// long as SendDmMessages' idempotency lasts).
+func SendWelcomeDmV3(
+	ctx context.Context,
+	chats chat.Store,
+	sender *messaging.Sender,
+	userID *commonpb.UserId,
+) (*commonpb.ChatId, []*messagingpb.Message, error) {
+	return SendDmMessages(ctx, chats, sender, userID, welcomeV3IdempotencyKey, welcomeV3Messages())
+}
+
+// ensureDm creates the DM chatID between the team account and userID
 // unless it already exists. An earlier call, a prior attempt of this one, or a
 // DM payment between the two (made before those were refused) may have
 // created it, so an existing chat is expected, not a failure.
@@ -121,7 +124,7 @@ func SendMessages(
 // The lookup reads the chat's own item instead. It may be stale: a chat
 // created a moment ago can read as missing, in which case the create finds it
 // and reports ErrChatExists, which is handled like the lookup finding it.
-func ensureChat(ctx context.Context, chats chat.Store, chatID *commonpb.ChatId, teamUserID, userID *commonpb.UserId) error {
+func ensureDm(ctx context.Context, chats chat.Store, chatID *commonpb.ChatId, teamUserID, userID *commonpb.UserId) error {
 	_, err := chats.GetChatByID(ctx, chatID)
 	if err == nil {
 		return nil
@@ -140,18 +143,4 @@ func ensureChat(ctx context.Context, chats chat.Store, chatID *commonpb.ChatId, 
 		return fmt.Errorf("failed to create chat: %w", err)
 	}
 	return nil
-}
-
-// clientMessageID derives the client message ID of the index-th message
-// SendMessages sends into chatID under idempotencyKey. The key is length-prefixed
-// so no two (key, index) pairs hash the same input.
-func clientMessageID(chatID *commonpb.ChatId, idempotencyKey string, index int) *messagingpb.ClientMessageId {
-	var data []byte
-	data = append(data, chatID.Value...)
-	data = binary.BigEndian.AppendUint32(data, uint32(len(idempotencyKey)))
-	data = append(data, idempotencyKey...)
-	data = binary.BigEndian.AppendUint32(data, uint32(index))
-
-	id := uuid.NewSHA1(clientMessageIDNamespace, data)
-	return &messagingpb.ClientMessageId{Value: id[:]}
 }

@@ -138,7 +138,7 @@ func (e *groupEnv) openGroupKey(t *testing.T, chatID *commonpb.ChatId) []byte {
 	return groupKey
 }
 
-// welcomeV3Texts is the third welcome's text, as TestSendWelcomeV3 pins it.
+// welcomeV3Texts is the third welcome's text, as TestSendWelcomeDmV3 pins it.
 var welcomeV3Texts = []string{
 	"Welcome to Flipcash, the group money app. If someone sent you an invite link to a Flipcash group, tap it again to join.",
 }
@@ -327,7 +327,7 @@ func TestSendWelcomeGroupV3_Refused(t *testing.T) {
 		return err
 	}
 
-	// What SendMessages refuses.
+	// What SendDmMessages refuses.
 	require.Error(t, send(e.cfg, e.team, "welcome", messages))
 	require.Error(t, send(e.cfg, e.user, "", messages))
 	require.Error(t, send(e.cfg, e.user, "welcome", nil))

@@ -419,7 +419,7 @@ func (s *Sender) recordGroupSenders(ctx context.Context, log *zap.Logger, chatID
 
 // TeamAccount returns the team account the Sender was built with (see
 // NewSender), or nil when there is none. It is for sending as the team
-// (see flipcashteam.SendMessages), so that the account sent as is the one the
+// (see flipcashteam.SendDmMessages), so that the account sent as is the one the
 // Sender treats as the team, from one configuration.
 func (s *Sender) TeamAccount() *commonpb.UserId {
 	if s.teamUserID == nil {

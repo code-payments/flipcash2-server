@@ -5,8 +5,13 @@ package flipcashteam
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
+
+	"github.com/google/uuid"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/profile"
 )
@@ -35,11 +40,34 @@ func AssignUsername(ctx context.Context, profiles profile.Store, userID *commonp
 // treats the team specially with that one ID, each taking it as a required
 // argument so none can be built without it: the chat store (its
 // excludedFromFeed, see chat.FeedExclusions), and the teamUserID of the chat
-// RuleEvaluator, the chat server, the Sender (which SendMessages takes it
+// RuleEvaluator, the chat server, the Sender (which SendDmMessages takes it
 // from) and the intent integration. None of them calls this, since this package
 // imports them. A process started before the
 // team account was set up has none of them configured, and needs a restart
 // once it is.
 func GetUserID(ctx context.Context, profiles profile.Store) (*commonpb.UserId, error) {
 	return profiles.GetUserIdByUsername(ctx, Username)
+}
+
+// ErrNoTeamAccount is returned by SendDmMessages when the Sender it is given was
+// built with no team account (see messaging.NewSender).
+var ErrNoTeamAccount = errors.New("no team account configured")
+
+// clientMessageIDNamespace is the UUID namespace SendDmMessages derives its client
+// message IDs under, so they cannot collide with an ID a client or another
+// server-authored send picks.
+var clientMessageIDNamespace = uuid.MustParse("0fea31a1-c7d6-4084-b481-fde267cf1177")
+
+// clientMessageID derives the client message ID of the index-th message
+// SendDmMessages sends into chatID under idempotencyKey. The key is length-prefixed
+// so no two (key, index) pairs hash the same input.
+func clientMessageID(chatID *commonpb.ChatId, idempotencyKey string, index int) *messagingpb.ClientMessageId {
+	var data []byte
+	data = append(data, chatID.Value...)
+	data = binary.BigEndian.AppendUint32(data, uint32(len(idempotencyKey)))
+	data = append(data, idempotencyKey...)
+	data = binary.BigEndian.AppendUint32(data, uint32(index))
+
+	id := uuid.NewSHA1(clientMessageIDNamespace, data)
+	return &messagingpb.ClientMessageId{Value: id[:]}
 }

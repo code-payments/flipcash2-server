@@ -1547,6 +1547,12 @@ func paymentRequestCreatedEvent(chatID *commonpb.ChatId, creator *commonpb.UserI
 			CreatedAt:        timestamppb.Now(),
 			Status:           paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_OPEN,
 			Version:          1,
+			PayerSummary: &paymentrequestpb.PayerSummary{
+				PayerCount:       1,
+				PaidCount:        1,
+				NativeAmountDue:  1,
+				NativeAmountPaid: 1,
+			},
 			Kind: &paymentrequestpb.PaymentRequestMetadata_GroupChat{GroupChat: &paymentrequestpb.GroupChatPaymentRequest{
 				ChatId: chatID,
 				Type: &paymentrequestpb.GroupChatPaymentRequest_Split{Split: &paymentrequestpb.Split{
@@ -1561,19 +1567,37 @@ func paymentRequestCreatedEvent(chatID *commonpb.ChatId, creator *commonpb.UserI
 }
 
 // paymentRequestSharePaymentEvent builds an event carrying debtor's share of the
-// fixture request paid by hand, completing it, and nothing else.
+// fixture request paid by hand, completing it (the share, its Payer, the
+// summary and the completion, as the server sends them), and nothing else.
 func paymentRequestSharePaymentEvent(chatID *commonpb.ChatId, debtor *commonpb.UserId) *eventpb.Event {
 	paidAt := timestamppb.Now()
+	paid := &paymentrequestpb.Paid{
+		PaidAt: paidAt,
+		How:    &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}},
+	}
 	return paymentRequestEvent(chatID, &paymentrequestpb.PaymentRequestUpdate{
 		PaymentRequestId: fixturePaymentRequestID,
 		Kind: &paymentrequestpb.PaymentRequestUpdate_Updates_{Updates: &paymentrequestpb.PaymentRequestUpdate_Updates{
 			Version: 2,
 			Updates: []*paymentrequestpb.PaymentRequestUpdate_Update{
 				{Kind: &paymentrequestpb.PaymentRequestUpdate_Update_SharePaymentUpdate{SharePaymentUpdate: &paymentrequestpb.PaymentRequestUpdate_SharePaymentUpdate{
-					Share: &paymentrequestpb.Share{UserId: debtor, NativeAmount: 1, Paid: &paymentrequestpb.PaidShare{
-						PaidAt: paidAt,
-						How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
-					}},
+					Share: &paymentrequestpb.Share{UserId: debtor, NativeAmount: 1, Paid: paid},
+				}}},
+				{Kind: &paymentrequestpb.PaymentRequestUpdate_Update_PayerUpdate{PayerUpdate: &paymentrequestpb.PaymentRequestUpdate_PayerUpdate{
+					Payer: &paymentrequestpb.Payer{
+						UserId:           debtor,
+						NativeAmountDue:  1,
+						NativeAmountPaid: 1,
+						Status:           &paymentrequestpb.Payer_Paid{Paid: paid},
+					},
+				}}},
+				{Kind: &paymentrequestpb.PaymentRequestUpdate_Update_PayerSummaryUpdate{PayerSummaryUpdate: &paymentrequestpb.PaymentRequestUpdate_PayerSummaryUpdate{
+					PayerSummary: &paymentrequestpb.PayerSummary{
+						PayerCount:       2,
+						PaidCount:        2,
+						NativeAmountDue:  2,
+						NativeAmountPaid: 2,
+					},
 				}}},
 				{Kind: &paymentrequestpb.PaymentRequestUpdate_Update_StatusUpdate{StatusUpdate: &paymentrequestpb.PaymentRequestUpdate_StatusUpdate{
 					Status:   paymentrequestpb.PaymentRequestStatus_PAYMENT_REQUEST_STATUS_COMPLETED,

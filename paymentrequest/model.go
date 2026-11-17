@@ -3,42 +3,59 @@
 //
 // Requests are layered, as the proto is. The first layer is where a request
 // is made: today only a group chat (paymentrequestpb.GroupChatPaymentRequest),
-// never a DM. The second is its type within that: today only a split
-// (paymentrequestpb.Split), in which the creator asks named members of the
-// chat (its debtors) each to pay them a share, all in one fiat currency. A
-// kind or type added later is a new arm beside these (see PaymentRequest), not
-// a rewrite of what is here.
+// never a DM. The second is its type within that, one of two, each in one
+// fiat currency:
+//   - a split (paymentrequestpb.Split), in which the creator asks named
+//     members of the chat (its debtors) each to pay them a share;
+//   - a collection (paymentrequestpb.Collection), in which any member of the
+//     chat but the creator may pay the creator a fixed amount, once (a
+//     contribution).
+//
+// A kind or type added later is a new arm beside these (see PaymentRequest),
+// not a rewrite of what is here.
 //
 // A group chat request belongs to the chat it was created for, and is shown
 // there as a message carrying a messagingpb.PaymentRequestWidget, which names
 // the request by ID alone: the shares and state come from this package's RPCs.
 // It is live from creation, sent or not, and may be sent any number of times.
-// A split's title and description are plaintext, and moderated, in a group
-// that is not private, and encrypted with the chat key in a private group
-// (see paymentrequestpb.EncryptedPaymentRequestText); everything else (the
-// currency, ends_at, the shares and how each was paid) is plaintext on the
-// server in either, since the server checks every payment against its share
-// and decides when the request is complete.
+// A request's title and description are optional (its text may be unset);
+// when set, they are plaintext, and moderated, in a group that is not
+// private, and encrypted with the chat key in a private group (see
+// paymentrequestpb.EncryptedPaymentRequestText); everything else (the
+// currency, ends_at, a split's shares or a collection's amount, and how each
+// was paid) is plaintext on the server in either, since the server checks
+// every payment against the request and decides when a split is complete.
 //
 // A request is OPEN until one of three things ends it, each final:
-//   - every share is paid (COMPLETED). A share is paid all at once, for
-//     exactly its amount, either by a Flipcash payment
-//     (paymentrequestpb.PaidShare.Intent), at most once (see
+//   - every share of a split is paid (COMPLETED). A share is paid all at
+//     once, for exactly its amount, either by a Flipcash payment
+//     (paymentrequestpb.Paid.Intent), at most once (see
 //     PaymentRequest.PaymentIntentIDs), or by the creator marking it paid
-//     by hand (PaidShare.Manual); the creator's own share is paid from
-//     creation (PaidShare.Creator). A paid share stays paid, and only a hand
+//     by hand (Paid.Manual); the creator's own share is paid from
+//     creation (Paid.Creator). A paid share stays paid, and only a hand
 //     mark is ever replaced: by a payment that was in flight when it was
-//     made (see PaidShareSupersedes).
+//     made (see PaidShareSupersedes). A collection has no target and is
+//     never completed.
 //   - the creator closes it (CLOSED).
 //   - its ends_at passes (EXPIRED). ends_at is the request's one hard
-//     deadline, at most MaxDuration after its creation: no share can be paid
+//     deadline, at most MaxDuration after its creation: nothing can be paid
 //     after it. Expiry is decided by the clock
 //     (see PaymentRequest.StatusAt), and recorded later by a worker only so
-//     that listings can file the request as resolved (see ExpireDelay).
+//     that listings can file the request as resolved (see ExpireDelay). A
+//     split always has an ends_at; a collection may have none, and then
+//     stays open until its creator closes it (see PaymentRequest.EndsAt).
 //
-// Nothing about a request is editable after creation: not its text, currency,
-// deadline nor shares. No event announces a change to a request; clients
-// refetch it, ordering copies by PaymentRequest.Version.
+// Who has paid is shown per payer as a paymentrequestpb.Payer, and totalled
+// as a paymentrequestpb.PayerSummary. A split's are computed from its shares
+// on every read rather than stored (see PaymentRequest.Payer and payer.go); a
+// collection's Payers are its contributions, each stored as a record of its
+// own (see Store.RecordContribution), and its summary is computed from the
+// count of them it holds (PaymentRequest.PayerCount).
+//
+// Nothing a creator chose is editable after creation: not the text, currency,
+// deadline, shares nor amount. Every change is announced, best effort, on the
+// chat's event stream (see PublishCreated); clients order copies by
+// PaymentRequest.Version and refetch to reconcile one they missed.
 package paymentrequest
 
 import (
@@ -46,6 +63,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -54,7 +72,10 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	paymentrequestpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/paymentrequest/v1"
 
+	currency_lib "github.com/code-payments/ocp-server/currency"
+
 	"github.com/code-payments/flipcash2-server/model"
+	"github.com/code-payments/flipcash2-server/send"
 )
 
 // IDSize is the length, in bytes, of a PaymentRequestId.
@@ -74,11 +95,12 @@ const PaymentIntentIDSize = 32
 // chat-side caller, like messaging's of poll, sits outside chat.
 const groupChatIDSize = 16
 
-// MaxDuration bounds how long after its creation a request may end (see
-// Split.ends_at): four weeks, the longest a request is expected to stay open.
-// It also keeps every ends_at, and so every time the stores derive from it (the
-// expiry queue's due time and the open section's sort key, both Unix nanos),
-// well inside the range an int64 of nanoseconds can represent.
+// MaxDuration bounds how long after its creation a request may end, when it
+// has an end (see Split.ends_at and Collection.ends_at): four weeks, the
+// longest a dated request is expected to stay open. It also keeps every
+// ends_at, and so every time the stores derive from it (the expiry queue's due
+// time and the open section's sort key, both Unix nanos), well inside the range
+// an int64 of nanoseconds can represent.
 const MaxDuration = 4 * 7 * 24 * time.Hour
 
 // ExpireDelay is how long after a request's ends_at the expiry worker takes it
@@ -142,6 +164,24 @@ func MustDeriveID(creatorID *commonpb.UserId, key *paymentrequestpb.IdempotencyK
 // all as INVALID_SHARES.
 var ErrInvalidShares = errors.New("invalid shares")
 
+// ErrInvalidAmount is wrapped by every refusal of a collection's
+// payment_amount (see NewCollectionRequest and PaymentRequest.Validate), so a
+// caller can answer them all as INVALID_AMOUNT.
+var ErrInvalidAmount = errors.New("invalid amount")
+
+// NewPaymentIntentID draws a payment intent ID: PaymentIntentIDSize random
+// bytes, the form of every ID a payment into a request must use (a split
+// share's, see PaymentRequest.PaymentIntentIDs, and a collection payer's, see
+// Store.GetOrCreatePayerIntent). It is drawn, never derived, so no one can
+// compute it and use it up first.
+func NewPaymentIntentID() ([]byte, error) {
+	intentID := make([]byte, PaymentIntentIDSize)
+	if _, err := rand.Read(intentID); err != nil {
+		return nil, err
+	}
+	return intentID, nil
+}
+
 // Status is a request's status. It only moves forward: from open to one of
 // completed, closed or expired, which are final.
 //
@@ -199,23 +239,30 @@ func (s Status) ToProto() paymentrequestpb.PaymentRequestStatus {
 // state (Status, Version, ClosedAt). The layers are held one field per arm, as
 // the proto's oneofs are: ChatID is the first layer, a group chat request
 // (paymentrequestpb.GroupChatPaymentRequest; a 16-byte group chat ID, never a
-// DM's), and Split is the type within it. Exactly one type is set. Another
-// kind or type is a new field beside these, with a case in EndsAt, Validate
-// and ToProto, and nothing else changes.
+// DM's), and Split or Collection is the type within it. Exactly one type is
+// set. Another kind or type is a new field beside these, with a case in
+// EndsAt, Currency, Validate, PayerSummary and ToProto, and nothing else
+// changes.
+//
+// Collection is exactly what the creator chose, and never changes. Its
+// contributions are not held here but stored as records of their own (see
+// Store.RecordContribution), of which the request holds only the count
+// (PayerCount), so it stays one small record however many members contribute.
 //
 // Split is exactly what the creator chose, except each share's paid, the only
 // part of a request that changes after creation (see Store.PayShare): a share
 // is addressed by its user ID (see Share), and once paid stays paid, changing
 // only from a hand mark to a payment (see PaidShareSupersedes). The
 // creator's own share, when they listed one, is paid from creation
-// (paymentrequestpb.PaidShare.Creator with paid_at = CreatedAt; see
-// NewSplitRequest). Its text is plaintext in a group that is not private and
-// encrypted in a private group; the store holds either as given.
+// (paymentrequestpb.Paid.Creator with paid_at = CreatedAt; see
+// NewSplitRequest). Its text is optional, and when set is plaintext in a
+// group that is not private and encrypted in a private group; the store holds
+// whichever it is given, or none.
 //
 // Version starts at 1 on creation and advances by exactly one on every change
-// (a share paid, by payment or by hand, a completion, a close); an idempotent
-// no-op leaves it alone, and so does expiry, which is the clock's (see
-// paymentrequestpb.PaymentRequestMetadata). ClosedAt is nil while Status is
+// (a share paid, by payment or by hand, a completion, a contribution, a
+// close); an idempotent no-op leaves it alone, and so does expiry, which is
+// the clock's (see paymentrequestpb.PaymentRequestMetadata). ClosedAt is nil while Status is
 // StatusOpen, and set once it is not: ends_at when expired, when the creator
 // closed it when closed, when its last share was paid when completed.
 type PaymentRequest struct {
@@ -226,8 +273,19 @@ type PaymentRequest struct {
 	// ChatID is the group chat the request was made in.
 	ChatID *commonpb.ChatId
 
-	// Split is set for a split, the only type today.
+	// Split is set for a split.
 	Split *paymentrequestpb.Split
+
+	// Collection is set for a collection.
+	Collection *paymentrequestpb.Collection
+
+	// PayerCount is, for a collection, how many members have contributed:
+	// its Payers, all paid (see PayerSummary). It starts at 0 and advances by
+	// one, with the version, in the write that records each contribution (see
+	// Store.RecordContribution); an intent ID issued to a member who has not
+	// contributed with it is not counted. Always 0 for a split, whose Payers
+	// are its shares.
+	PayerCount uint32
 
 	// PaymentIntentIDs holds, for every debtor's share (every share but the
 	// creator's own), the OCP intent ID a payment of it must use, keyed by
@@ -243,11 +301,17 @@ type PaymentRequest struct {
 	// anything a client sees: an ID anyone could compute could be used up by
 	// someone else first, leaving the share unpayable.
 	//
-	// It is a secret until used, so it is never projected (see ToProto): the
-	// GetPaymentRequest RPC gives a debtor their own while their share is
-	// unpaid, and no one else. Once the share is paid by it, the ID is
-	// public in PaidShare.intent and on the cash message, which costs
+	// It is a secret until used, so it is never projected (see ToProto), nor
+	// logged: the GetPaymentIntentId RPC gives a debtor their own while their
+	// share is unpaid and the request open, and GetPaymentRequest, for
+	// clients that predate that RPC, while their share is unpaid; no one else
+	// is given it. Once the share is paid by it, the ID is
+	// public in Paid.intent and on the cash message, which costs
 	// nothing, since it can never be used again.
+	//
+	// A split's only, and nil for a collection: a collection's payers are not
+	// known at creation, so each one's ID is issued on demand and stored on
+	// its own (see Store.GetOrCreatePayerIntent).
 	PaymentIntentIDs map[string][]byte
 
 	Status   Status
@@ -258,7 +322,7 @@ type PaymentRequest struct {
 // NewSplitRequest returns the split request that creator, in the group chat
 // chatID, asks for with split at createdAt: stored open at version 1, with the
 // creator's own share, if they listed one, paid from creation
-// (paymentrequestpb.PaidShare.Creator at createdAt), and a random payment
+// (paymentrequestpb.Paid.Creator at createdAt), and a random payment
 // intent ID for every other share (see PaymentRequest.PaymentIntentIDs).
 //
 // split is as a client sends it, which it does not modify: an error wrapping
@@ -291,9 +355,9 @@ func NewSplitRequest(
 		Version:   1,
 	}
 	if own := r.Share(creator); own != nil {
-		own.Paid = &paymentrequestpb.PaidShare{
+		own.Paid = &paymentrequestpb.Paid{
 			PaidAt: timestamppb.New(createdAt),
-			How:    &paymentrequestpb.PaidShare_Creator_{Creator: &paymentrequestpb.PaidShare_Creator{}},
+			How:    &paymentrequestpb.Paid_Creator_{Creator: &paymentrequestpb.Paid_Creator{}},
 		}
 	}
 	r.PaymentIntentIDs = make(map[string][]byte, len(r.Shares()))
@@ -301,8 +365,8 @@ func NewSplitRequest(
 		if proto.Equal(share.GetUserId(), creator) {
 			continue
 		}
-		intentID := make([]byte, PaymentIntentIDSize)
-		if _, err := rand.Read(intentID); err != nil {
+		intentID, err := NewPaymentIntentID()
+		if err != nil {
 			return nil, err
 		}
 		r.PaymentIntentIDs[string(share.GetUserId().GetValue())] = intentID
@@ -313,15 +377,67 @@ func NewSplitRequest(
 	return r, nil
 }
 
-// Validate checks that the request is one a store may hold: every ID its fixed
-// width, exactly one type set, and for a split an ends_at and shares that name
-// distinct users, at least one of them not the creator, with the creator's own
-// share (if any) paid from creation and no other share claiming to be, and a
-// payment intent ID for every share but the creator's and for nothing else.
-// Share problems wrap ErrInvalidShares.
+// NewCollectionRequest returns the collection request that creator, in the
+// group chat chatID, asks for with collection at createdAt: stored open at
+// version 1 with no contributions (PayerCount 0) and no payment intent IDs,
+// which are issued to each payer on demand (see Store.GetOrCreatePayerIntent).
 //
-// It checks shape only: nothing about the chat, the currency, the amounts or
-// the clock, which are the creating caller's (see NewSplitRequest).
+// collection is as a client sends it, which it does not modify. Its currency
+// must be set, and its payment_amount must be a fixed amount that is a whole
+// number, at least one, of the currency's minimum transfer value
+// (send.MinimumTransferValue, as a split's shares are judged; see
+// isWholeMinorUnits), or an error wrapping ErrInvalidAmount is returned. Its
+// ends_at may be set or not (see EndsAt). What it cannot judge alone is the
+// caller's: that ends_at, when set, is in the future and at most MaxDuration
+// away, and that the currency can be valued.
+func NewCollectionRequest(
+	id *paymentrequestpb.PaymentRequestId,
+	creator *commonpb.UserId,
+	chatID *commonpb.ChatId,
+	collection *paymentrequestpb.Collection,
+	createdAt time.Time,
+) (*PaymentRequest, error) {
+	if collection.GetCurrency() == "" {
+		return nil, errors.New("collection currency is unset")
+	}
+	fixed := collection.GetFixed()
+	if fixed == nil {
+		return nil, fmt.Errorf("%w: payment amount is not a fixed amount", ErrInvalidAmount)
+	}
+	minimum := send.MinimumTransferValue(currency_lib.Code(collection.Currency))
+	if !isWholeMinorUnits(fixed.NativeAmount, minimum) {
+		return nil, fmt.Errorf("%w: fixed amount is not a whole number, at least one, of the currency's minimum transfer value", ErrInvalidAmount)
+	}
+
+	r := &PaymentRequest{
+		ID:         proto.Clone(id).(*paymentrequestpb.PaymentRequestId),
+		Creator:    proto.Clone(creator).(*commonpb.UserId),
+		CreatedAt:  createdAt,
+		ChatID:     proto.Clone(chatID).(*commonpb.ChatId),
+		Collection: proto.Clone(collection).(*paymentrequestpb.Collection),
+		Status:     StatusOpen,
+		Version:    1,
+	}
+	if err := r.Validate(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// Validate checks that the request is one a store may hold: every ID its fixed
+// width, exactly one type set, and:
+//   - for a split, an ends_at and shares that name distinct users, at least
+//     one of them not the creator, with the creator's own share (if any) paid
+//     from creation and no other share claiming to be, and a payment intent
+//     ID for every share but the creator's and for nothing else. Share
+//     problems wrap ErrInvalidShares.
+//   - for a collection, a currency, a fixed amount that is positive and
+//     finite (problems wrap ErrInvalidAmount), and no payment intent IDs.
+//     Its ends_at may be set or not.
+//
+// It checks shape only: nothing about the chat, the currency, whether an
+// amount is whole minor units, or the clock, which are the creating caller's
+// (see NewSplitRequest and NewCollectionRequest).
 func (r *PaymentRequest) Validate() error {
 	if len(r.ID.GetValue()) != IDSize {
 		return fmt.Errorf("payment request id must be %d bytes, got %d", IDSize, len(r.ID.GetValue()))
@@ -337,11 +453,34 @@ func (r *PaymentRequest) Validate() error {
 	}
 
 	switch {
+	case r.Split != nil && r.Collection != nil:
+		return errors.New("payment request has more than one type")
 	case r.Split != nil:
 		return r.validateSplit()
+	case r.Collection != nil:
+		return r.validateCollection()
 	default:
 		return errors.New("payment request has no type")
 	}
+}
+
+func (r *PaymentRequest) validateCollection() error {
+	if r.Collection.GetCurrency() == "" {
+		return errors.New("collection currency is unset")
+	}
+	fixed := r.Collection.GetFixed()
+	if fixed == nil {
+		return fmt.Errorf("%w: payment amount is not a fixed amount", ErrInvalidAmount)
+	}
+	if amount := fixed.NativeAmount; math.IsNaN(amount) || math.IsInf(amount, 0) || amount <= 0 {
+		return fmt.Errorf("%w: fixed amount must be positive", ErrInvalidAmount)
+	}
+	// A collection's payers' intent IDs are issued on demand and stored on
+	// their own, never on the request.
+	if len(r.PaymentIntentIDs) != 0 {
+		return fmt.Errorf("a collection holds no payment intent ids, got %d", len(r.PaymentIntentIDs))
+	}
+	return nil
 }
 
 func (r *PaymentRequest) validateSplit() error {
@@ -401,28 +540,41 @@ func (r *PaymentRequest) validateSplit() error {
 }
 
 // EndsAt is when the request stops accepting payments: its type's deadline
-// (for a split, Split.ends_at).
-func (r *PaymentRequest) EndsAt() time.Time {
+// (Split.ends_at, or Collection.ends_at). ok is false for a request with no
+// deadline, which only a collection may be: it stays open until its creator
+// closes it, is never expired, is never on the expiry queue, and is not
+// listed in the open section of its chat (see Store.GetChatPage).
+func (r *PaymentRequest) EndsAt() (endsAt time.Time, ok bool) {
+	var ts *timestamppb.Timestamp
 	switch {
 	case r.Split != nil:
-		return r.Split.GetEndsAt().AsTime()
-	default:
-		return time.Time{}
+		ts = r.Split.GetEndsAt()
+	case r.Collection != nil:
+		ts = r.Collection.GetEndsAt()
 	}
+	if ts == nil {
+		return time.Time{}, false
+	}
+	return ts.AsTime(), true
 }
 
 // StatusAt is the status a reader is shown at now: the stored status, except
 // that a request stored open is expired from its ends_at on, since nothing can
-// be paid from then (see ExpireDelay).
+// be paid from then (see ExpireDelay). A request with no ends_at is never
+// expired.
 func (r *PaymentRequest) StatusAt(now time.Time) Status {
-	if r.Status == StatusOpen && !now.Before(r.EndsAt()) {
+	if r.Status != StatusOpen {
+		return r.Status
+	}
+	if endsAt, ok := r.EndsAt(); ok && !now.Before(endsAt) {
 		return StatusExpired
 	}
 	return r.Status
 }
 
-// IsOpenAt reports whether the request accepts a share being marked paid, or
-// closed, at now: it is stored open and has not reached its ends_at.
+// IsOpenAt reports whether the request accepts a payment, a share being
+// marked paid, or a close at now: it is stored open and has not reached its
+// ends_at, if it has one.
 func (r *PaymentRequest) IsOpenAt(now time.Time) bool {
 	return r.StatusAt(now) == StatusOpen
 }
@@ -435,14 +587,22 @@ func (r *PaymentRequest) ClosedAtAt(now time.Time) (closedAt time.Time, ok bool)
 	case r.ClosedAt != nil:
 		return *r.ClosedAt, true
 	case r.StatusAt(now) == StatusExpired:
-		return r.EndsAt(), true
+		// Only a request with an ends_at is expired by the clock.
+		endsAt, _ := r.EndsAt()
+		return endsAt, true
 	default:
 		return time.Time{}, false
 	}
 }
 
-// Shares returns the request's shares, in the order the creator listed them.
-// They are the stored values: callers must not modify them.
+// IsCollection reports whether the request is a collection.
+func (r *PaymentRequest) IsCollection() bool {
+	return r.Collection != nil
+}
+
+// Shares returns the request's shares, in the order the creator listed them:
+// none for a collection, which has no shares. They are the stored values:
+// callers must not modify them.
 func (r *PaymentRequest) Shares() []*paymentrequestpb.Share {
 	switch {
 	case r.Split != nil:
@@ -493,9 +653,11 @@ func (r *PaymentRequest) AllSharesPaid() bool {
 // as a reader sees it at now: a request stored open past its ends_at is
 // EXPIRED, closed at its ends_at, at the version it was stored with (see
 // StatusAt and ClosedAtAt), which is exactly what the expiry worker will
-// store, so what a reader is shown never changes when it does. It never
-// carries PaymentIntentIDs, which only their debtor is given (see
-// PaymentIntentIDs).
+// store, so what a reader is shown never changes when it does. It carries the
+// request's PayerSummary (see PaymentRequest.PayerSummary: for a split
+// computed from its shares, for a collection from its PayerCount) on every
+// read. It never carries PaymentIntentIDs, which only their debtor is
+// given (see PaymentIntentIDs).
 func (r *PaymentRequest) ToProto(now time.Time) *paymentrequestpb.PaymentRequestMetadata {
 	metadata := &paymentrequestpb.PaymentRequestMetadata{
 		PaymentRequestId: proto.Clone(r.ID).(*paymentrequestpb.PaymentRequestId),
@@ -503,6 +665,7 @@ func (r *PaymentRequest) ToProto(now time.Time) *paymentrequestpb.PaymentRequest
 		CreatedAt:        timestamppb.New(r.CreatedAt),
 		Status:           r.StatusAt(now).ToProto(),
 		Version:          r.Version,
+		PayerSummary:     r.PayerSummary(),
 	}
 	if closedAt, ok := r.ClosedAtAt(now); ok {
 		metadata.ClosedAt = timestamppb.New(closedAt)
@@ -516,6 +679,10 @@ func (r *PaymentRequest) ToProto(now time.Time) *paymentrequestpb.PaymentRequest
 		groupChat.Type = &paymentrequestpb.GroupChatPaymentRequest_Split{
 			Split: proto.Clone(r.Split).(*paymentrequestpb.Split),
 		}
+	case r.Collection != nil:
+		groupChat.Type = &paymentrequestpb.GroupChatPaymentRequest_Collection{
+			Collection: proto.Clone(r.Collection).(*paymentrequestpb.Collection),
+		}
 	}
 	metadata.Kind = &paymentrequestpb.PaymentRequestMetadata_GroupChat{GroupChat: groupChat}
 
@@ -525,15 +692,19 @@ func (r *PaymentRequest) ToProto(now time.Time) *paymentrequestpb.PaymentRequest
 // Clone returns a deep copy of the request.
 func (r *PaymentRequest) Clone() *PaymentRequest {
 	clone := &PaymentRequest{
-		ID:        proto.Clone(r.ID).(*paymentrequestpb.PaymentRequestId),
-		Creator:   proto.Clone(r.Creator).(*commonpb.UserId),
-		CreatedAt: r.CreatedAt,
-		ChatID:    proto.Clone(r.ChatID).(*commonpb.ChatId),
-		Status:    r.Status,
-		Version:   r.Version,
+		ID:         proto.Clone(r.ID).(*paymentrequestpb.PaymentRequestId),
+		Creator:    proto.Clone(r.Creator).(*commonpb.UserId),
+		CreatedAt:  r.CreatedAt,
+		ChatID:     proto.Clone(r.ChatID).(*commonpb.ChatId),
+		Status:     r.Status,
+		Version:    r.Version,
+		PayerCount: r.PayerCount,
 	}
 	if r.Split != nil {
 		clone.Split = proto.Clone(r.Split).(*paymentrequestpb.Split)
+	}
+	if r.Collection != nil {
+		clone.Collection = proto.Clone(r.Collection).(*paymentrequestpb.Collection)
 	}
 	if r.PaymentIntentIDs != nil {
 		clone.PaymentIntentIDs = make(map[string][]byte, len(r.PaymentIntentIDs))
@@ -553,8 +724,10 @@ func (r *PaymentRequest) Clone() *PaymentRequest {
 type Section uint8
 
 const (
-	// SectionOpen holds the requests stored open, ordered by ends_at
-	// ascending, then ID ascending.
+	// SectionOpen holds the requests stored open that have an ends_at,
+	// ordered by ends_at ascending, then ID ascending. A request with no
+	// ends_at (a collection may have none) is in neither section while it is
+	// open.
 	SectionOpen Section = iota + 1
 
 	// SectionResolved holds the requests stored completed, closed or expired,
@@ -587,7 +760,8 @@ func CursorOf(r *PaymentRequest, section Section) *PageCursor {
 	cursor := &PageCursor{ID: append([]byte(nil), r.ID.GetValue()...)}
 	switch section {
 	case SectionOpen:
-		cursor.At = r.EndsAt()
+		// Only a request with an ends_at is in the open section.
+		cursor.At, _ = r.EndsAt()
 	case SectionResolved:
 		if r.ClosedAt != nil {
 			cursor.At = *r.ClosedAt
@@ -633,7 +807,12 @@ type ExpiryQueueStats struct {
 }
 
 // ExpiryDueAt is when a request first comes due for the expiry worker:
-// ExpireDelay after its ends_at.
+// ExpireDelay after its ends_at. A request with no ends_at is never queued
+// (see EndsAt), and gets the zero time.
 func ExpiryDueAt(r *PaymentRequest) time.Time {
-	return r.EndsAt().Add(ExpireDelay)
+	endsAt, ok := r.EndsAt()
+	if !ok {
+		return time.Time{}
+	}
+	return endsAt.Add(ExpireDelay)
 }

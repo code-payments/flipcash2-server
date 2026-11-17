@@ -34,9 +34,10 @@ type Executor struct {
 
 // NewExecutor constructs the task executor. messages is the messaging store,
 // written to mark a payment's return offer returned (see
-// sendReturnPaymentMessage); requests is the payment request store, written to mark a share paid by a requested payment, and
-// chatEventBus the chat-keyed event bus the mark is announced on (see
-// recordRequestedPayment).
+// sendReturnPaymentMessage); requests is the payment request store, written to
+// record a requested payment (a split's share paid, or a collection's
+// contribution), and chatEventBus the chat-keyed event bus the record is
+// announced on (see recordRequestedPayment).
 func NewExecutor(
 	accounts account.Store,
 	chats chat.Store,

@@ -33,8 +33,9 @@ func injectLocalizedTextForHistory(record *history.Record, notification *activit
 			// read Gave, which is a payment handed off in person.
 			localizedText = "Sent"
 		case intent.GetRequestedPayment(record.AppMetadata) != nil:
-			// A requested payment is always a send, of the payer's share to
-			// the request's creator, who is named beside it.
+			// A requested payment is always a send, of the payer's share of
+			// a split or their contribution to a collection, to the
+			// request's creator, who is named beside it.
 			localizedText = "Sent"
 		case intent.GetReturnPayment(record.AppMetadata) != nil:
 			// A return payment is always a send, of a DM payment back to the

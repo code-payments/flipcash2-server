@@ -1664,13 +1664,13 @@ func TestIntegration_AllowCreation_RequestedPayment(t *testing.T) {
 	})
 
 	t.Run("denied_share_already_paid", func(t *testing.T) {
-		for _, how := range []func(r *paymentrequest.PaymentRequest) *paymentrequestpb.PaidShare{
-			func(*paymentrequest.PaymentRequest) *paymentrequestpb.PaidShare {
-				return &paymentrequestpb.PaidShare{PaidAt: timestamppb.Now(), How: &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}}}
+		for _, how := range []func(r *paymentrequest.PaymentRequest) *paymentrequestpb.Paid{
+			func(*paymentrequest.PaymentRequest) *paymentrequestpb.Paid {
+				return &paymentrequestpb.Paid{PaidAt: timestamppb.Now(), How: &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}}}
 			},
 			// The store records a payment by the share's own intent alone.
-			func(r *paymentrequest.PaymentRequest) *paymentrequestpb.PaidShare {
-				return &paymentrequestpb.PaidShare{PaidAt: timestamppb.Now(), How: &paymentrequestpb.PaidShare_Intent{Intent: &commonpb.IntentId{Value: r.PaymentIntentID(payerUserID)}}}
+			func(r *paymentrequest.PaymentRequest) *paymentrequestpb.Paid {
+				return &paymentrequestpb.Paid{PaidAt: timestamppb.Now(), How: &paymentrequestpb.Paid_Intent{Intent: &commonpb.IntentId{Value: r.PaymentIntentID(payerUserID)}}}
 			},
 		} {
 			r := newRequest()
@@ -1698,9 +1698,9 @@ func TestIntegration_AllowCreation_RequestedPayment(t *testing.T) {
 		// Every share paid: the payer's own is paid, so the payment fails on
 		// the request's status first.
 		completed := e.putRequest(t, groupID, creatorUserID, "usd", endsAt, requestShare{payerUserID, 1.0})
-		completedNow, changed, _, err := e.requests.PayShare(e.ctx, completed.ID, payerUserID, &paymentrequestpb.PaidShare{
+		completedNow, changed, _, err := e.requests.PayShare(e.ctx, completed.ID, payerUserID, &paymentrequestpb.Paid{
 			PaidAt: timestamppb.Now(),
-			How:    &paymentrequestpb.PaidShare_Manual_{Manual: &paymentrequestpb.PaidShare_Manual{}},
+			How:    &paymentrequestpb.Paid_Manual_{Manual: &paymentrequestpb.Paid_Manual{}},
 		}, time.Now())
 		require.NoError(t, err)
 		require.True(t, changed)
@@ -1778,6 +1778,258 @@ func TestIntegration_AllowCreation_RequestedPayment(t *testing.T) {
 		tasks, err := e.integration.GetTasksToSchedule(e.ctx, record)
 		require.NoError(t, err)
 		assert.Empty(t, tasks)
+	})
+}
+
+// putCollection creates an open collection by creator in chatID, in
+// currency, asking amount of each payer, ending at endsAt, or never when
+// endsAt is zero, created at createdAt.
+func (e *integrationEnv) putCollection(t *testing.T, chatID *commonpb.ChatId, creator *commonpb.UserId, currency string, endsAt, createdAt time.Time, amount float64) *paymentrequest.PaymentRequest {
+	key := make([]byte, paymentrequest.IdempotencyKeySize)
+	_, err := rand.Read(key)
+	require.NoError(t, err)
+
+	collection := &paymentrequestpb.Collection{
+		Currency: currency,
+		PaymentAmount: &paymentrequestpb.Collection_Fixed{Fixed: &paymentrequestpb.Collection_FixedAmount{
+			NativeAmount: amount,
+		}},
+	}
+	if !endsAt.IsZero() {
+		collection.EndsAt = timestamppb.New(endsAt)
+	}
+
+	id := paymentrequest.MustDeriveID(creator, &paymentrequestpb.IdempotencyKey{Value: key})
+	r, err := paymentrequest.NewCollectionRequest(id, creator, chatID, collection, createdAt)
+	require.NoError(t, err)
+	require.NoError(t, e.requests.Create(e.ctx, r))
+	return r
+}
+
+// issue issues userID a payment intent ID for the collection r, as the
+// GetPaymentIntentId RPC does, and returns it.
+func (e *integrationEnv) issue(t *testing.T, r *paymentrequest.PaymentRequest, userID *commonpb.UserId) []byte {
+	candidate, err := paymentrequest.NewPaymentIntentID()
+	require.NoError(t, err)
+	held, err := e.requests.GetOrCreatePayerIntent(e.ctx, r.ID, userID, candidate)
+	require.NoError(t, err)
+	return held.IntentID
+}
+
+func TestIntegration_AllowCreation_RequestedPayment_Collection(t *testing.T) {
+	e := newIntegrationEnv(t)
+
+	creatorUserID, creatorKeys := e.bindUser(t)
+	payerUserID, payerKeys := e.bindUser(t)
+	otherUserID, otherKeys := e.bindUser(t)
+	_, outsiderKeys := e.bindUser(t)
+
+	groupID := e.putGroup(t, creatorUserID, payerUserID, otherUserID)
+	endsAt := time.Now().Add(time.Hour)
+
+	newCollection := func() *paymentrequest.PaymentRequest {
+		return e.putCollection(t, groupID, creatorUserID, "usd", endsAt, time.Now(), 1.0)
+	}
+	request := newCollection()
+	payerIntentID := e.issue(t, request, payerUserID)
+	otherIntentID := e.issue(t, request, otherUserID)
+
+	// pay is a SendPublicPayment of amount in currency from one user to
+	// another, contributing to r in chatID under intentID.
+	pay := func(chatID *commonpb.ChatId, r *paymentrequest.PaymentRequest, from, to model.KeyPair, currency string, amount float64, intentID []byte) *ocp_intent.Record {
+		record := dmPaymentIntentRecord(t, requestedPaymentMetadata(chatID, r.ID), base58.Encode(from.Public()), base58.Encode(to.Public()))
+		record.SendPublicPaymentMetadata.ExchangeCurrency = currency_lib.Code(currency)
+		record.SendPublicPaymentMetadata.NativeAmount = amount
+		record.IntentId = base58.Encode(intentID)
+		return record
+	}
+	validRecord := func() *ocp_intent.Record {
+		return pay(groupID, request, payerKeys, creatorKeys, "usd", 1.0, payerIntentID)
+	}
+
+	// Any member issued an ID contributes, in any mint.
+	t.Run("valid", func(t *testing.T) {
+		require.NoError(t, e.integration.AllowCreation(e.ctx, validRecord(), nil, nil))
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay(groupID, request, otherKeys, creatorKeys, "usd", 1.0, otherIntentID), nil, nil))
+		record := validRecord()
+		record.MintAccount = base58.Encode(model.MustGenerateKeyPair().Public())
+		require.NoError(t, e.integration.AllowCreation(e.ctx, record, nil, nil))
+	})
+
+	// The amount is the fixed amount to within half the currency's minor
+	// unit, either way.
+	t.Run("amount", func(t *testing.T) {
+		for _, tc := range []struct {
+			amount      float64
+			expectedErr string
+		}{
+			{1.0, ""},
+			{1.004, ""},
+			{0.996, ""},
+			{1.006, "payment must pay the collection's amount exactly"},
+			{0.994, "payment must pay the collection's amount exactly"},
+			{0.5, "payment must pay the collection's amount exactly"},
+			{2.0, "payment must pay the collection's amount exactly"},
+			{math.NaN(), "payment must pay the collection's amount exactly"},
+		} {
+			err := e.integration.AllowCreation(e.ctx, pay(groupID, request, payerKeys, creatorKeys, "usd", tc.amount, payerIntentID), nil, nil)
+			if tc.expectedErr == "" {
+				require.NoError(t, err, tc.amount)
+			} else {
+				require.ErrorContains(t, err, tc.expectedErr, tc.amount)
+			}
+		}
+
+		jpy := e.putCollection(t, groupID, creatorUserID, "jpy", endsAt, time.Now(), 150)
+		jpyID := e.issue(t, jpy, payerUserID)
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay(groupID, jpy, payerKeys, creatorKeys, "jpy", 150.4, jpyID), nil, nil))
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay(groupID, jpy, payerKeys, creatorKeys, "jpy", 150.6, jpyID), nil, nil), "payment must pay the collection's amount exactly")
+	})
+
+	t.Run("denied_wrong_currency", func(t *testing.T) {
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay(groupID, request, payerKeys, creatorKeys, "eur", 1.0, payerIntentID), nil, nil), "request's currency")
+	})
+
+	t.Run("denied_wrong_chat", func(t *testing.T) {
+		otherGroupID := e.putGroup(t, creatorUserID, payerUserID)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay(otherGroupID, request, payerKeys, creatorKeys, "usd", 1.0, payerIntentID), nil, nil), "not made in the chat")
+	})
+
+	t.Run("denied_wrong_destination", func(t *testing.T) {
+		for name, to := range map[string]model.KeyPair{
+			"another member": otherKeys,
+			"the payer":      payerKeys,
+			"an outsider":    outsiderKeys,
+			"a stranger":     model.MustGenerateKeyPair(),
+		} {
+			err := e.integration.AllowCreation(e.ctx, pay(groupID, request, payerKeys, to, "usd", 1.0, payerIntentID), nil, nil)
+			require.ErrorContains(t, err, "payment must be to the request's creator", name)
+		}
+	})
+
+	// The creator never pays into their own request, whatever the intent.
+	t.Run("denied_creator", func(t *testing.T) {
+		for name, intentID := range map[string][]byte{
+			"a fresh id":   model.MustGenerateKeyPair().Public(),
+			"a payer's id": payerIntentID,
+		} {
+			err := e.integration.AllowCreation(e.ctx, pay(groupID, request, creatorKeys, creatorKeys, "usd", 1.0, intentID), nil, nil)
+			require.ErrorContains(t, err, "payer is the request's creator", name)
+		}
+	})
+
+	// A payer must have been issued an ID, by GetPaymentIntentId, before
+	// paying: a member who never asked, or an outsider, cannot.
+	t.Run("denied_no_issued_id", func(t *testing.T) {
+		r := newCollection()
+		for name, from := range map[string]model.KeyPair{"a member": payerKeys, "an outsider": outsiderKeys} {
+			err := e.integration.AllowCreation(e.ctx, pay(groupID, r, from, creatorKeys, "usd", 1.0, model.MustGenerateKeyPair().Public()), nil, nil)
+			require.ErrorContains(t, err, "payer was issued no payment intent id", name)
+		}
+	})
+
+	// The intent's ID must be the one issued to the payer for this request:
+	// not a fresh one, not another payer's, not the payer's own for another
+	// request.
+	t.Run("denied_wrong_intent_id", func(t *testing.T) {
+		other := newCollection()
+		payersOther := e.issue(t, other, payerUserID)
+		for name, intentID := range map[string][]byte{
+			"a fresh id":                     model.MustGenerateKeyPair().Public(),
+			"another payer's":                otherIntentID,
+			"the payer's in another request": payersOther,
+		} {
+			err := e.integration.AllowCreation(e.ctx, pay(groupID, request, payerKeys, creatorKeys, "usd", 1.0, intentID), nil, nil)
+			require.ErrorContains(t, err, "payment must use the payer's payment intent id", name)
+		}
+		require.NoError(t, e.integration.AllowCreation(e.ctx, validRecord(), nil, nil))
+	})
+
+	// A member contributes once: once recorded, a payment, even under the
+	// same ID, is refused, while another member still contributes.
+	t.Run("denied_already_contributed", func(t *testing.T) {
+		r := newCollection()
+		intentID := e.issue(t, r, payerUserID)
+		othersID := e.issue(t, r, otherUserID)
+		_, changed, err := e.requests.RecordContribution(e.ctx, r.ID, payerUserID, &paymentrequestpb.Paid{
+			PaidAt: timestamppb.Now(),
+			How:    &paymentrequestpb.Paid_Intent{Intent: &commonpb.IntentId{Value: intentID}},
+		}, time.Now())
+		require.NoError(t, err)
+		require.True(t, changed)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay(groupID, r, payerKeys, creatorKeys, "usd", 1.0, intentID), nil, nil), "payer has already contributed")
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay(groupID, r, otherKeys, creatorKeys, "usd", 1.0, othersID), nil, nil))
+	})
+
+	t.Run("denied_not_open", func(t *testing.T) {
+		closed := newCollection()
+		closedID := e.issue(t, closed, payerUserID)
+		_, changed, err := e.requests.Close(e.ctx, closed.ID, time.Now())
+		require.NoError(t, err)
+		require.True(t, changed)
+
+		// Past its ends_at, whether or not the worker has stored it expired.
+		expired := e.putCollection(t, groupID, creatorUserID, "usd", time.Now().Add(-time.Second), time.Now().Add(-time.Hour), 1.0)
+		expiredID := e.issue(t, expired, payerUserID)
+		storedExpired := e.putCollection(t, groupID, creatorUserID, "usd", time.Now().Add(-time.Second), time.Now().Add(-time.Hour), 1.0)
+		storedExpiredID := e.issue(t, storedExpired, payerUserID)
+		changed, err = e.requests.Expire(e.ctx, storedExpired.ID)
+		require.NoError(t, err)
+		require.True(t, changed)
+
+		for name, tc := range map[string]struct {
+			r        *paymentrequest.PaymentRequest
+			intentID []byte
+		}{
+			"closed":         {closed, closedID},
+			"expired":        {expired, expiredID},
+			"stored_expired": {storedExpired, storedExpiredID},
+		} {
+			require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay(groupID, tc.r, payerKeys, creatorKeys, "usd", 1.0, tc.intentID), nil, nil), "payment request is not open", name)
+		}
+	})
+
+	// A collection with no ends_at never expires, however long ago it was
+	// created.
+	t.Run("undated", func(t *testing.T) {
+		r := e.putCollection(t, groupID, creatorUserID, "usd", time.Time{}, time.Now().Add(-10*paymentrequest.MaxDuration), 1.0)
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay(groupID, r, payerKeys, creatorKeys, "usd", 1.0, e.issue(t, r, payerUserID)), nil, nil))
+	})
+
+	// Membership is not checked again: a payer issued an ID who has since
+	// left still pays, and a creator who has left is still paid.
+	t.Run("departed_members", func(t *testing.T) {
+		groupID := e.putGroup(t, creatorUserID, payerUserID)
+		r := e.putCollection(t, groupID, creatorUserID, "usd", endsAt, time.Now(), 1.0)
+		intentID := e.issue(t, r, payerUserID)
+		for _, userID := range []*commonpb.UserId{payerUserID, creatorUserID} {
+			_, _, err := e.chats.RemoveGroupMember(e.ctx, groupID, userID, false)
+			require.NoError(t, err)
+		}
+		require.NoError(t, e.integration.AllowCreation(e.ctx, pay(groupID, r, payerKeys, creatorKeys, "usd", 1.0, intentID), nil, nil))
+	})
+
+	// No payment is allowed to or from the Flipcash team account.
+	t.Run("team_account", func(t *testing.T) {
+		groupID := e.putGroup(t, creatorUserID, payerUserID, e.team)
+
+		byTeam := e.putCollection(t, groupID, e.team, "usd", endsAt, time.Now(), 1.0)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay(groupID, byTeam, payerKeys, e.teamKeys, "usd", 1.0, e.issue(t, byTeam, payerUserID)), nil, nil), "flipcash team")
+
+		toCreator := e.putCollection(t, groupID, creatorUserID, "usd", endsAt, time.Now(), 1.0)
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, pay(groupID, toCreator, e.teamKeys, creatorKeys, "usd", 1.0, e.issue(t, toCreator, e.team)), nil, nil), "flipcash team")
+	})
+
+	// A collection pays its creator alone, so a multi payment never carries
+	// one.
+	t.Run("denied_multi_payment", func(t *testing.T) {
+		record := multiPaymentIntentRecord(base58.Encode(payerKeys.Public()), base58.Encode(creatorKeys.Public()), base58.Encode(otherKeys.Public()))
+		appMetadata, err := proto.Marshal(&intentpb.AppMetadata{
+			Domain: &intentpb.AppMetadata_Chat{Chat: requestedPaymentMetadata(groupID, request.ID)},
+		})
+		require.NoError(t, err)
+		record.AppMetadata = appMetadata
+		require.ErrorContains(t, e.integration.AllowCreation(e.ctx, record, nil, nil), "only supported for reaction boosts and group payments")
 	})
 }
 

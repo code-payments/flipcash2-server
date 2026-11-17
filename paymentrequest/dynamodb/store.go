@@ -1,6 +1,7 @@
 package dynamodb
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -30,21 +31,54 @@ import (
 //	                  16-byte group chat ID), created_at (epoch nanos,
 //	                  exactly: a creator's share is paid at created_at to the
 //	                  nanosecond, which PaymentRequest.Validate checks),
-//	                  details (B: the type's message marshalled, for a split
+//	                  details (B: the type's message marshalled: for a split
 //	                  the paymentrequestpb.Split, shares' paid included,
-//	                  rewritten whole whenever a share is paid),
-//	                  intent_ids (M: each debtor's user ID, hex, to their
-//	                  share's payment intent ID, B; written at creation and
-//	                  never again), status (N, see the status values below),
-//	                  version (N), and closed_at (epoch nanos) once the
-//	                  request is final.
+//	                  rewritten whole whenever a share is paid; for a
+//	                  collection the paymentrequestpb.Collection, written at
+//	                  creation and never again), status (N, see the status
+//	                  values below), version (N), and closed_at (epoch nanos)
+//	                  once the request is final. A split also has intent_ids
+//	                  (M: each debtor's user ID, hex, to their share's
+//	                  payment intent ID, B; written at creation and never
+//	                  again), and a collection payer_count (N: how many
+//	                  members have contributed, 0 at creation).
 //
-// The request is the only item in its partition today. The sort key is there
-// so a type that outgrows one item (a request's shares or contributions as
-// items of their own) can keep them beside it, read with it in one Query and
-// written with it in one transaction; a key schema cannot be changed once the
-// table exists. Such an item takes its own sk and must omit the index
-// attributes below.
+// A split is the only item in its partition. A collection keeps, beside its
+// #meta, two more kinds of item, read in the same partition and written with
+// #meta in one transaction where they change together:
+//
+//	payer#<user ID hex>     one per member issued a payment intent ID
+//	                        (GetOrCreatePayerIntent): intent_id (B), and payer
+//	                        (B, the marshalled paymentrequestpb.Payer, its
+//	                        status the contribution's Paid) once they have
+//	                        contributed. It is written alone when the ID is
+//	                        issued, and that moves nothing on #meta: a member
+//	                        holding an ID is not a Payer until payer is set.
+//	paid#<inv>#<user hex>   one per contribution, the paid section of
+//	                        GetPayers: payer (B), as on payer#. <inv> is the
+//	                        contribution's paid_at as 16 lowercase hex digits
+//	                        of ^sortableNanos(paid_at), so the sort keys read
+//	                        ascending are paid_at descending, then user ID
+//	                        ascending (hex keeps byte order), the order
+//	                        paymentrequest.PaidBefore defines. Every key is the
+//	                        same length, and a page resumes strictly after the
+//	                        cursor's Payer as the Query's ExclusiveStartKey.
+//
+// RecordContribution is one TransactWriteItems over all three: #meta
+// (version + 1 and payer_count + 1, conditioned on the version and status it
+// read), payer# (payer set, conditioned on its intent_id being the payment's
+// and payer being unset), and the paid# put (conditioned on not existing).
+// Any condition lost cancels all three, and the change is decided again from
+// a fresh read, which tells a contribution already recorded (a no-op) from a
+// race with another writer of #meta (retried). The close and the expiry
+// worker update #meta's own attributes in place (UpdateItem SET and REMOVE,
+// never a whole-item put), so they leave payer_count alone.
+//
+// Neither payer# nor paid# items carry chat, the section sort attributes or
+// the queue attributes, so they never reach the indexes below. The sort key
+// is the table's from the start, since a key schema cannot be changed once
+// the table exists; any further item type kept in a request's partition takes
+// its own sk prefix and likewise omits the index attributes.
 //
 // The table is deployed as payment_requests_v2. The first table keyed a
 // request on its raw binary ID; the prefixed string key leaves room for
@@ -84,6 +118,10 @@ import (
 // request, and the write that makes it final (its last share paid, a close,
 // or Expire) removes them, so a request is enqueued and dequeued atomically.
 //
+// A collection with no ends_at is created with neither open_sort nor the
+// queue attributes: while open it is in no index, and never expires. Its
+// close sets resolved_sort like any other's, so it is then listed resolved.
+//
 // Any other item type ever written into this table must omit chat and the
 // section sort attributes (open_sort, resolved_sort) and the queue attributes,
 // or it leaks into the indexes.
@@ -91,7 +129,8 @@ import (
 // Every change to a request is a read, a decision in Go by the same model
 // helpers the memory store uses (PaymentRequest.Share, IsOpenAt,
 // AllSharesPaid, Status.IsFinal, EndsAt), and one UpdateItem conditioned on
-// the version and status it read. The status is in the condition because
+// the version and status it read (a contribution's is the transaction
+// above). The status is in the condition because
 // Expire changes it without moving the version. A lost condition retries from
 // the item the failure returns (strongly consistent, it is the item as it
 // stood), after a short jittered, doubling wait, within a bounded number of
@@ -122,6 +161,11 @@ const (
 	// requestSK is the sort key of a request's own item.
 	requestSK = "#meta"
 
+	// payerSKPrefix and contributionSKPrefix prefix the sort keys of a
+	// collection's payer# and paid# items.
+	payerSKPrefix        = "payer#"
+	contributionSKPrefix = "paid#"
+
 	attrPK             = "pk"              // S, requestPK of the request ID
 	attrSK             = "sk"              // S, requestSK for the request itself
 	attrType           = "type"            // N, see the type values
@@ -138,6 +182,9 @@ const (
 	attrExpiryQueue    = "expiry_queue"    // S, expiryQueuePK (GSI hash); present only while queued
 	attrExpiryDueAt    = "expiry_due_at"   // N, Unix nanos (GSI range); when the request is next due
 	attrExpiryAttempts = "expiry_attempts" // N, failed attempts so far
+	attrPayerCount     = "payer_count"     // N, a collection's contributions; #meta only
+	attrIntentID       = "intent_id"       // B, a payer's issued intent ID; payer# only
+	attrPayer          = "payer"           // B, marshalled Payer; payer# once contributed, and paid#
 
 	// maxWriteAttempts bounds how many times one change is tried against
 	// concurrent writers before it fails, and writeBackoffBase and
@@ -151,7 +198,8 @@ const (
 // fields is set, and so which message details holds. A new type takes the next
 // number.
 const (
-	typeSplit = 1
+	typeSplit      = 1
+	typeCollection = 2
 )
 
 // The stored status values, by stable number.
@@ -203,34 +251,48 @@ func (s *store) Create(ctx context.Context, r *paymentrequest.PaymentRequest) er
 	if err := r.Validate(); err != nil {
 		return err
 	}
-	details, err := proto.Marshal(r.Split)
-	if err != nil {
-		return fmt.Errorf("marshalling split: %w", err)
-	}
-
-	intentIDs := make(map[string]types.AttributeValue, len(r.PaymentIntentIDs))
-	for userID, intentID := range r.PaymentIntentIDs {
-		intentIDs[hex.EncodeToString([]byte(userID))] = avB(intentID)
-	}
 
 	item := map[string]types.AttributeValue{
-		attrPK:             avS(requestPK(r.ID)),
-		attrSK:             avS(requestSK),
-		attrType:           avNInt(typeSplit),
-		attrCreator:        avB(r.Creator.Value),
-		attrChat:           avB(r.ChatID.Value),
-		attrCreatedAt:      avNInt(r.CreatedAt.UnixNano()),
-		attrDetails:        avB(details),
-		attrIntentIDs:      &types.AttributeValueMemberM{Value: intentIDs},
-		attrStatus:         avNInt(statusOpen),
-		attrVersion:        avNInt(1),
-		attrOpenSort:       avB(sortKey(r.EndsAt(), r.ID.Value)),
-		attrExpiryQueue:    avS(expiryQueuePK),
-		attrExpiryDueAt:    avNInt(paymentrequest.ExpiryDueAt(r).UnixNano()),
-		attrExpiryAttempts: avNInt(0),
+		attrPK:        avS(requestPK(r.ID)),
+		attrSK:        avS(requestSK),
+		attrCreator:   avB(r.Creator.Value),
+		attrChat:      avB(r.ChatID.Value),
+		attrCreatedAt: avNInt(r.CreatedAt.UnixNano()),
+		attrStatus:    avNInt(statusOpen),
+		attrVersion:   avNInt(1),
+	}
+	switch {
+	case r.Split != nil:
+		details, err := proto.Marshal(r.Split)
+		if err != nil {
+			return fmt.Errorf("marshalling split: %w", err)
+		}
+		intentIDs := make(map[string]types.AttributeValue, len(r.PaymentIntentIDs))
+		for userID, intentID := range r.PaymentIntentIDs {
+			intentIDs[hex.EncodeToString([]byte(userID))] = avB(intentID)
+		}
+		item[attrType] = avNInt(typeSplit)
+		item[attrDetails] = avB(details)
+		item[attrIntentIDs] = &types.AttributeValueMemberM{Value: intentIDs}
+	case r.Collection != nil:
+		details, err := proto.Marshal(r.Collection)
+		if err != nil {
+			return fmt.Errorf("marshalling collection: %w", err)
+		}
+		item[attrType] = avNInt(typeCollection)
+		item[attrDetails] = avB(details)
+		item[attrPayerCount] = avNInt(0)
+	}
+	// A request with no ends_at is in neither the open section nor the expiry
+	// queue while open.
+	if endsAt, ok := r.EndsAt(); ok {
+		item[attrOpenSort] = avB(sortKey(endsAt, r.ID.Value))
+		item[attrExpiryQueue] = avS(expiryQueuePK)
+		item[attrExpiryDueAt] = avNInt(paymentrequest.ExpiryDueAt(r).UnixNano())
+		item[attrExpiryAttempts] = avNInt(0)
 	}
 
-	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
+	_, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                aws.String(s.table),
 		Item:                     item,
 		ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
@@ -312,7 +374,7 @@ func (s *store) GetChatPage(ctx context.Context, chatID *commonpb.ChatId, sectio
 	}
 }
 
-func (s *store) PayShare(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.PaidShare, now time.Time) (*paymentrequest.PaymentRequest, bool, bool, error) {
+func (s *store) PayShare(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.Paid, now time.Time) (*paymentrequest.PaymentRequest, bool, bool, error) {
 	if err := paymentrequest.ValidatePaidShare(paid); err != nil {
 		return nil, false, false, err
 	}
@@ -344,7 +406,7 @@ func (s *store) PayShare(ctx context.Context, id *paymentrequestpb.PaymentReques
 		}
 
 		readVersion, readStatus := r.Version, r.Status
-		share.Paid = proto.Clone(paid).(*paymentrequestpb.PaidShare)
+		share.Paid = proto.Clone(paid).(*paymentrequestpb.Paid)
 		r.Version++
 		details, err := proto.Marshal(r.Split)
 		if err != nil {
@@ -438,10 +500,21 @@ func (s *store) Expire(ctx context.Context, id *paymentrequestpb.PaymentRequestI
 			return false, nil
 		}
 
+		endsAt, ok := r.EndsAt()
+		if !ok {
+			// A request with no ends_at never expires, and is never queued;
+			// should one somehow be, it is dequeued here.
+			if _, queued := item[attrExpiryQueue]; queued {
+				if err := s.dequeue(ctx, id); err != nil {
+					return false, err
+				}
+			}
+			return false, nil
+		}
+
 		// The version does not move: expiry is the clock's, and a reader was
 		// shown the request expired at this version already.
 		readVersion, readStatus := r.Version, r.Status
-		endsAt := r.EndsAt()
 		r.Status = paymentrequest.StatusExpired
 		r.ClosedAt = &endsAt
 		ch := &change{set: map[string]types.AttributeValue{}}
@@ -580,6 +653,292 @@ func (s *store) DelayExpiry(ctx context.Context, id *paymentrequestpb.PaymentReq
 	return err
 }
 
+func (s *store) GetOrCreatePayerIntent(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, candidate []byte) (*paymentrequest.PayerIntent, error) {
+	if err := paymentrequest.ValidatePayerIntentCandidate(candidate); err != nil {
+		return nil, err
+	}
+
+	// Requests are never deleted and their type and creator never change, so
+	// what this read decides holds for the write below without conditioning
+	// it on #meta.
+	item, err := s.read(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	r, err := requestFromItem(item)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case !r.IsCollection():
+		return nil, paymentrequest.ErrNotACollection
+	case proto.Equal(r.Creator, userID):
+		return nil, paymentrequest.ErrNotAPayer
+	}
+
+	// An ID already issued is read, never written over: a plain read never
+	// conflicts with the payer's contribution being recorded in a transaction
+	// on the same item, where a write would be refused with a
+	// TransactionConflictException. A contribution needs the ID, so one can
+	// be in flight only once the ID exists, and the write below, made only
+	// while there is none, never meets one.
+	switch current, err := s.GetPayerIntent(ctx, id, userID); {
+	case err == nil:
+		return current, nil
+	case !errors.Is(err, paymentrequest.ErrNotFound):
+		return nil, err
+	}
+
+	// The first call's candidate is the ID; a concurrent first call loses the
+	// condition and is answered with the item as it stood.
+	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(s.table),
+		Item: map[string]types.AttributeValue{
+			attrPK:       avS(requestPK(id)),
+			attrSK:       avS(payerSK(userID)),
+			attrIntentID: avB(candidate),
+		},
+		ConditionExpression:                 aws.String("attribute_not_exists(#pk)"),
+		ExpressionAttributeNames:            names("#pk"),
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	})
+	if current, failed := conditionFailedItem(err); failed {
+		if len(current) == 0 {
+			// ALL_OLD is always returned for an item that exists; read it.
+			return s.GetPayerIntent(ctx, id, userID)
+		}
+		return payerIntentFromItem(current)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &paymentrequest.PayerIntent{IntentID: append([]byte(nil), candidate...)}, nil
+}
+
+func (s *store) GetPayerIntent(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId) (*paymentrequest.PayerIntent, error) {
+	item, err := s.readPayer(ctx, id, userID)
+	if err != nil {
+		return nil, err
+	}
+	return payerIntentFromItem(item)
+}
+
+func (s *store) GetCollectionPayer(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId) (*paymentrequestpb.Payer, error) {
+	item, err := s.readPayer(ctx, id, userID)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := item[attrPayer]; !ok {
+		// Issued an ID, not yet contributed with it: not a Payer.
+		return nil, paymentrequest.ErrNotFound
+	}
+	return payerFromItem(item)
+}
+
+func (s *store) GetCollectionPayersPage(ctx context.Context, id *paymentrequestpb.PaymentRequestId, cursor *paymentrequest.PayerCursor, limit int) ([]*paymentrequestpb.Payer, error) {
+	input := &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("#pk = :pk AND begins_with(#sk, :prefix)"),
+		ExpressionAttributeNames: map[string]string{
+			"#pk": attrPK,
+			"#sk": attrSK,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":     avS(requestPK(id)),
+			":prefix": avS(contributionSKPrefix),
+		},
+		// Ascending sort keys are the paid section's order (see the layout).
+		ScanIndexForward: aws.Bool(true),
+		ConsistentRead:   aws.Bool(true),
+	}
+	if cursor != nil {
+		input.ExclusiveStartKey = map[string]types.AttributeValue{
+			attrPK: avS(requestPK(id)),
+			attrSK: avS(contributionSK(cursor.PaidAt, cursor.UserID)),
+		}
+	}
+
+	var page []*paymentrequestpb.Payer
+	for {
+		if limit > 0 {
+			input.Limit = aws.Int32(int32(limit - len(page)))
+		}
+		out, err := s.client.Query(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			payer, err := payerFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			page = append(page, payer)
+		}
+		if len(out.LastEvaluatedKey) == 0 || (limit > 0 && len(page) >= limit) {
+			return page, nil
+		}
+		input.ExclusiveStartKey = out.LastEvaluatedKey
+	}
+}
+
+func (s *store) RecordContribution(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId, paid *paymentrequestpb.Paid, _ time.Time) (*paymentrequest.PaymentRequest, bool, error) {
+	if err := paymentrequest.ValidateContribution(paid); err != nil {
+		return nil, false, err
+	}
+	intentID := paid.GetIntent().GetValue()
+
+	item, err := s.read(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	backoff := writeBackoffBase
+	for range maxWriteAttempts {
+		r, err := requestFromItem(item)
+		if err != nil {
+			return nil, false, err
+		}
+		if !r.IsCollection() {
+			return nil, false, paymentrequest.ErrNotACollection
+		}
+
+		// The rules are the memory store's: the payment must name the ID
+		// issued to the payer, and a payer who has contributed is a repeat.
+		record, err := s.GetPayerIntent(ctx, id, userID)
+		switch {
+		case errors.Is(err, paymentrequest.ErrNotFound):
+			return nil, false, paymentrequest.ErrWrongIntent
+		case err != nil:
+			return nil, false, err
+		}
+		if !bytes.Equal(record.IntentID, intentID) {
+			return nil, false, paymentrequest.ErrWrongIntent
+		}
+		if record.Paid != nil {
+			return r, false, nil
+		}
+
+		readVersion, readStatus := r.Version, r.Status
+		payer, err := proto.Marshal(r.ContributionPayer(userID, paid))
+		if err != nil {
+			return nil, false, fmt.Errorf("marshalling payer: %w", err)
+		}
+		r.Version++
+		r.PayerCount++
+
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: []types.TransactWriteItem{
+				{Update: &types.Update{
+					TableName:           aws.String(s.table),
+					Key:                 requestKey(id),
+					UpdateExpression:    aws.String("SET #version = :version, #count = :count"),
+					ConditionExpression: aws.String("#version = :readVersion AND #status = :readStatus"),
+					ExpressionAttributeNames: map[string]string{
+						"#version": attrVersion,
+						"#count":   attrPayerCount,
+						"#status":  attrStatus,
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":version":     avNInt(int64(r.Version)),
+						":count":       avNInt(int64(r.PayerCount)),
+						":readVersion": avNInt(int64(readVersion)),
+						":readStatus":  avNInt(storedStatus(readStatus)),
+					},
+				}},
+				{Update: &types.Update{
+					TableName:           aws.String(s.table),
+					Key:                 payerKey(id, userID),
+					UpdateExpression:    aws.String("SET #payer = :payer"),
+					ConditionExpression: aws.String("#intent = :intent AND attribute_not_exists(#payer)"),
+					ExpressionAttributeNames: map[string]string{
+						"#payer":  attrPayer,
+						"#intent": attrIntentID,
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":payer":  avB(payer),
+						":intent": avB(intentID),
+					},
+				}},
+				{Put: &types.Put{
+					TableName: aws.String(s.table),
+					Item: map[string]types.AttributeValue{
+						attrPK:    avS(requestPK(id)),
+						attrSK:    avS(contributionSK(paid.PaidAt.AsTime(), userID.Value)),
+						attrPayer: avB(payer),
+					},
+					ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
+					ExpressionAttributeNames: names("#pk"),
+				}},
+			},
+		})
+		if err == nil {
+			return r, true, nil
+		}
+		var canceled *types.TransactionCanceledException
+		if !errors.As(err, &canceled) {
+			return nil, false, err
+		}
+
+		// A condition lost or a conflicting write: decide again from a fresh
+		// read of both, which tells a contribution recorded meanwhile (the
+		// no-op) from another change to #meta (a retry).
+		if err := wait(ctx, &backoff); err != nil {
+			return nil, false, err
+		}
+		if item, err = s.read(ctx, id); err != nil {
+			return nil, false, err
+		}
+	}
+	return nil, false, fmt.Errorf("record contribution exhausted retries for payment request %s", hex.EncodeToString(id.GetValue()))
+}
+
+// readPayer returns a collection payer's payer# item, strongly consistent, or
+// ErrNotFound when no intent ID was issued to them.
+func (s *store) readPayer(ctx context.Context, id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId) (map[string]types.AttributeValue, error) {
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(s.table),
+		Key:            payerKey(id, userID),
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(out.Item) == 0 {
+		return nil, paymentrequest.ErrNotFound
+	}
+	return out.Item, nil
+}
+
+// payerIntentFromItem decodes a payer# item.
+func payerIntentFromItem(item map[string]types.AttributeValue) (*paymentrequest.PayerIntent, error) {
+	intentID, ok := item[attrIntentID].(*types.AttributeValueMemberB)
+	if !ok {
+		return nil, fmt.Errorf("%s is missing or not binary", attrIntentID)
+	}
+	record := &paymentrequest.PayerIntent{IntentID: intentID.Value}
+	if _, ok := item[attrPayer]; ok {
+		payer, err := payerFromItem(item)
+		if err != nil {
+			return nil, err
+		}
+		record.Paid = payer.GetPaid()
+	}
+	return record, nil
+}
+
+// payerFromItem decodes the Payer a payer# item (once contributed) or a paid#
+// item holds.
+func payerFromItem(item map[string]types.AttributeValue) (*paymentrequestpb.Payer, error) {
+	b, ok := item[attrPayer].(*types.AttributeValueMemberB)
+	if !ok {
+		return nil, fmt.Errorf("%s is missing or not binary", attrPayer)
+	}
+	payer := &paymentrequestpb.Payer{}
+	if err := proto.Unmarshal(b.Value, payer); err != nil {
+		return nil, fmt.Errorf("unmarshalling payer: %w", err)
+	}
+	return payer, nil
+}
+
 // dequeue removes a request's queue attributes, leaving the rest of it alone.
 func (s *store) dequeue(ctx context.Context, id *paymentrequestpb.PaymentRequestId) error {
 	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
@@ -695,8 +1054,8 @@ func (s *store) casWrite(ctx context.Context, id *paymentrequestpb.PaymentReques
 	}
 	var conflict *types.TransactionConflictException
 	if errors.As(err, &conflict) {
-		// A transaction held the item; nothing here writes one, but should
-		// anything come to, decide again from a fresh read.
+		// A transaction held the item (a contribution's, see
+		// RecordContribution): decide again from a fresh read.
 		current, err := s.read(ctx, id)
 		if err != nil {
 			return nil, err
@@ -719,6 +1078,16 @@ func wait(ctx context.Context, backoff *time.Duration) error {
 }
 
 func requestFromItem(item map[string]types.AttributeValue) (*paymentrequest.PaymentRequest, error) {
+	id, err := requestIDFromPK(item)
+	if err != nil {
+		return nil, err
+	}
+	r := &paymentrequest.PaymentRequest{
+		ID:      id,
+		Creator: &commonpb.UserId{Value: asB(item[attrCreator])},
+		ChatID:  &commonpb.ChatId{Value: asB(item[attrChat])},
+	}
+
 	// Decide the type before reading details, and refuse one this server does
 	// not know: details is every type's attribute, so another type's message
 	// could otherwise be read as a split.
@@ -726,16 +1095,35 @@ func requestFromItem(item map[string]types.AttributeValue) (*paymentrequest.Paym
 	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", attrType, err)
 	}
-	if storedType != typeSplit {
-		return nil, fmt.Errorf("unexpected payment request type %d", storedType)
-	}
 	details, ok := item[attrDetails].(*types.AttributeValueMemberB)
 	if !ok {
 		return nil, fmt.Errorf("%s is missing or not binary", attrDetails)
 	}
-	split := &paymentrequestpb.Split{}
-	if err := proto.Unmarshal(details.Value, split); err != nil {
-		return nil, fmt.Errorf("unmarshalling split: %w", err)
+	switch storedType {
+	case typeSplit:
+		split := &paymentrequestpb.Split{}
+		if err := proto.Unmarshal(details.Value, split); err != nil {
+			return nil, fmt.Errorf("unmarshalling split: %w", err)
+		}
+		intentIDs, err := intentIDsFromItem(item[attrIntentIDs])
+		if err != nil {
+			return nil, err
+		}
+		r.Split = split
+		r.PaymentIntentIDs = intentIDs
+	case typeCollection:
+		collection := &paymentrequestpb.Collection{}
+		if err := proto.Unmarshal(details.Value, collection); err != nil {
+			return nil, fmt.Errorf("unmarshalling collection: %w", err)
+		}
+		payerCount, err := parseInt(item[attrPayerCount])
+		if err != nil {
+			return nil, fmt.Errorf("reading %s: %w", attrPayerCount, err)
+		}
+		r.Collection = collection
+		r.PayerCount = uint32(payerCount)
+	default:
+		return nil, fmt.Errorf("unexpected payment request type %d", storedType)
 	}
 
 	createdAt, err := parseInt(item[attrCreatedAt])
@@ -755,26 +1143,9 @@ func requestFromItem(item map[string]types.AttributeValue) (*paymentrequest.Paym
 		return nil, err
 	}
 
-	intentIDs, err := intentIDsFromItem(item[attrIntentIDs])
-	if err != nil {
-		return nil, err
-	}
-
-	id, err := requestIDFromPK(item)
-	if err != nil {
-		return nil, err
-	}
-
-	r := &paymentrequest.PaymentRequest{
-		ID:               id,
-		Creator:          &commonpb.UserId{Value: asB(item[attrCreator])},
-		CreatedAt:        time.Unix(0, createdAt).UTC(),
-		ChatID:           &commonpb.ChatId{Value: asB(item[attrChat])},
-		Split:            split,
-		PaymentIntentIDs: intentIDs,
-		Status:           status,
-		Version:          uint64(version),
-	}
+	r.CreatedAt = time.Unix(0, createdAt).UTC()
+	r.Status = status
+	r.Version = uint64(version)
 	if av, ok := item[attrClosedAt]; ok {
 		nanos, err := parseInt(av)
 		if err != nil {
@@ -865,6 +1236,26 @@ func requestKey(id *paymentrequestpb.PaymentRequestId) map[string]types.Attribut
 		attrPK: avS(requestPK(id)),
 		attrSK: avS(requestSK),
 	}
+}
+
+// payerSK is the sort key of a collection payer's payer# item.
+func payerSK(userID *commonpb.UserId) string {
+	return payerSKPrefix + hex.EncodeToString(userID.GetValue())
+}
+
+// payerKey is the key of a collection payer's payer# item.
+func payerKey(id *paymentrequestpb.PaymentRequestId, userID *commonpb.UserId) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		attrPK: avS(requestPK(id)),
+		attrSK: avS(payerSK(userID)),
+	}
+}
+
+// contributionSK is the sort key of a contribution's paid# item: paid_at
+// inverted, as fixed-width hex, then the user ID, as hex, so that ascending
+// keys are paid_at descending then user ID ascending (see the layout).
+func contributionSK(paidAt time.Time, userID []byte) string {
+	return fmt.Sprintf("%s%016x#%s", contributionSKPrefix, ^sortableNanos(paidAt), hex.EncodeToString(userID))
 }
 
 // requestIDFromPK recovers a request ID from an item's pk ("req#<hex>"), the

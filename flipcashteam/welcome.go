@@ -60,6 +60,9 @@ const welcomeTimeout = 30 * time.Second
 // Nothing records a welcome that was never sent, so a process that stops
 // before sending one loses it. A second call for a user, as when two of their
 // claims race, sends nothing new (see SendWelcomeV3).
+//
+// GroupWelcomer is its counterpart that welcomes in a private group instead,
+// built but not yet used.
 type Welcomer struct {
 	log    *zap.Logger
 	chats  chat.Store

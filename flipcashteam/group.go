@@ -26,7 +26,9 @@ import (
 //
 // It is built but not yet used to welcome anyone: Welcomer sends the welcome
 // into the team's DM with the user (see SendWelcomeV3), and nothing in the
-// parent calls what is here.
+// parent calls what is here. GroupWelcomer is what would: switching the
+// welcome to the group is the parent handing it to the profile server in
+// place of Welcomer.
 //
 // Every user has exactly one welcome group, ever: its ID is derived from the
 // team and the user alone (see welcomeGroupID), so every send into it, whatever

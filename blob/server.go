@@ -441,6 +441,17 @@ func (s *Server) GetBlobs(ctx context.Context, req *blobpb.GetBlobsRequest) (*bl
 // read any blob id they can guess, and the grant alone would ignore who is
 // asking. A caller who may not read is reported (false, nil) so GetBlobs skips
 // the record, leaving it indistinguishable from one that does not exist.
+//
+// A blob granted to everyone (see PrincipalTypePublic) is the one exception to
+// needing both: it is readable through any access context this server knows,
+// whoever is asking and whatever the context names. It is asked only once
+// the exact grant has not admitted the caller, so a read the context's own
+// grant admits costs nothing more, and a refusal costs one more point read.
+// It is asked in that case too, rather than only when the exact grant is
+// missing, so a public blob that is also granted to a surface is not refused
+// to a caller that surface does not cover. A read with no context, or with
+// one this server does not know, is still refused: a public blob is read the
+// way any other is, by naming the surface it is shown on.
 func (s *Server) canRead(ctx context.Context, caller *commonpb.UserId, record *Blob, accessContext *blobpb.AccessContext) (bool, error) {
 	if record.Owner != nil && bytes.Equal(record.Owner.Value, caller.Value) {
 		return true, nil
@@ -467,10 +478,13 @@ func (s *Server) canRead(ctx context.Context, caller *commonpb.UserId, record *B
 	if err != nil {
 		return false, err
 	}
-	if !granted {
-		return false, nil
+	if granted {
+		covered, err := s.resolver.Covers(ctx, principal, caller)
+		if err != nil || covered {
+			return covered, err
+		}
 	}
-	return s.resolver.Covers(ctx, principal, caller)
+	return s.access.HasGrant(ctx, resourceID, PrincipalPublic(), PermissionRead)
 }
 
 // principalForAccessContext maps a request's access context to the principal a

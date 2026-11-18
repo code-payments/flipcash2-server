@@ -20,6 +20,7 @@ func RunAccessStoreTests(t *testing.T, store blob.AccessStore, teardown func()) 
 		testAccessGrants,
 		testAccessNoCollision,
 		testAccessProfileGrant,
+		testAccessPublicGrant,
 		testAccessValidation,
 	} {
 		tf(t, store)
@@ -189,6 +190,65 @@ func testAccessProfileGrant(t *testing.T, store blob.AccessStore) {
 	has, err = store.HasGrant(ctx, blobID, profilePrincipal, blob.PermissionRead)
 	require.NoError(t, err)
 	require.False(t, has)
+}
+
+// testAccessPublicGrant round-trips the grant to everyone — the ACL entry a
+// shared asset rides on — and checks it is its own entry: it neither stands
+// for nor is stood for by a grant to any one surface, which is left to the
+// read path (see blob.Server).
+func testAccessPublicGrant(t *testing.T, store blob.AccessStore) {
+	ctx := context.Background()
+
+	blobID := blob.MustGenerateID()
+	public := blob.PrincipalPublic()
+	chat := blob.PrincipalForChat(newChatID(t))
+
+	has, err := store.HasGrant(ctx, blobID, public, blob.PermissionRead)
+	require.NoError(t, err)
+	require.False(t, has)
+
+	// A grant to one surface is not a grant to everyone.
+	require.NoError(t, store.Grant(ctx, &blob.Grant{BlobID: blobID, Principal: chat, Permission: blob.PermissionRead}))
+	has, err = store.HasGrant(ctx, blobID, public, blob.PermissionRead)
+	require.NoError(t, err)
+	require.False(t, has)
+
+	require.NoError(t, store.Grant(ctx, &blob.Grant{BlobID: blobID, Principal: public, Permission: blob.PermissionRead}))
+	has, err = store.HasGrant(ctx, blobID, public, blob.PermissionRead)
+	require.NoError(t, err)
+	require.True(t, has)
+
+	// Idempotent, like every grant.
+	require.NoError(t, store.Grant(ctx, &blob.Grant{BlobID: blobID, Principal: public, Permission: blob.PermissionRead}))
+
+	// Nor is a grant to everyone a grant to one surface, and revoking one
+	// leaves the other.
+	other := blob.PrincipalForChatProfile(newChatID(t))
+	has, err = store.HasGrant(ctx, blobID, other, blob.PermissionRead)
+	require.NoError(t, err)
+	require.False(t, has)
+	require.NoError(t, store.Revoke(ctx, blobID, chat, blob.PermissionRead))
+	has, err = store.HasGrant(ctx, blobID, public, blob.PermissionRead)
+	require.NoError(t, err)
+	require.True(t, has)
+
+	// A grant to everyone on one blob is not one on another.
+	has, err = store.HasGrant(ctx, blob.MustGenerateID(), public, blob.PermissionRead)
+	require.NoError(t, err)
+	require.False(t, has)
+
+	require.NoError(t, store.Revoke(ctx, blobID, public, blob.PermissionRead))
+	has, err = store.HasGrant(ctx, blobID, public, blob.PermissionRead)
+	require.NoError(t, err)
+	require.False(t, has)
+
+	// There is one public principal: one carrying an ID is malformed, to grant
+	// and to look up.
+	withID := blob.Principal{Type: blob.PrincipalTypePublic, ID: []byte{1}}
+	err = store.Grant(ctx, &blob.Grant{BlobID: blobID, Principal: withID, Permission: blob.PermissionRead})
+	require.ErrorIs(t, err, blob.ErrInvalidGrant)
+	_, err = store.HasGrant(ctx, blobID, withID, blob.PermissionRead)
+	require.ErrorIs(t, err, blob.ErrInvalidGrant)
 }
 
 func testAccessValidation(t *testing.T, store blob.AccessStore) {

@@ -51,6 +51,13 @@ import (
 // both: an invite passed to a public group is INVITE_NOT_FOUND, its rules
 // not evaluated, since no invite is ever made to one.
 //
+// A private group the team created (see Access.teamCreated) is created with
+// its members, the team and the user it was made for (see
+// Store.PutPrivateGroup), and no one joins it: only its creator could admit
+// or invite anyone, and the team has no client to do it with. The user it was
+// made for may leave it like any member who is not the creator, and that is
+// final: with no way in, they can never return.
+//
 // A public group without listener rules is open: the empty set is satisfied
 // by everyone, so anyone may join it, as anyone may read it (see Access).
 //
@@ -359,6 +366,7 @@ func (s *Server) LeaveChat(ctx context.Context, req *chatpb.LeaveChatRequest) (*
 		log.With(zap.Error(err)).Warn("Failure getting chat rules")
 		return nil, status.Error(codes.Internal, "")
 	}
+
 	discardKeyEnvelope := rules.IsPrivate && !rules.isCreator(userID)
 
 	// Leaving a group the caller is not in — never joined, or already gone —

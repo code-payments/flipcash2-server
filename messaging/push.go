@@ -19,16 +19,16 @@ import (
 )
 
 // The push fan-out for a new message walks the chat's members in pages and
-// runs the whole pipeline per page — drop the sender, filter blockers, split
-// muted, look up tokens, bump badges, send — so what it holds at once is
-// bounded by the page size however large the group, and the first push
-// leaves after the first page rather than after the whole roster has been
-// read. Pages are read one after another, since a read is a small fraction
-// of a page's cost, but sent concurrently: each page's pipeline runs on its
-// own goroutine under a slot from the Sender's pool (see
-// defaultPushPageConcurrency), which the reader takes before launching the
-// page, so a walk holds at most one page more than it has in send, and every
-// fan-out the Sender runs shares one bound on the pages in flight.
+// runs the whole pipeline per page — drop the sender and the team account,
+// filter blockers, split muted, look up tokens, bump badges, send — so what
+// it holds at once is bounded by the page size however large the group, and
+// the first push leaves after the first page rather than after the whole
+// roster has been read. Pages are read one after another, since a read is a
+// small fraction of a page's cost, but sent concurrently: each page's
+// pipeline runs on its own goroutine under a slot from the Sender's pool
+// (see defaultPushPageConcurrency), which the reader takes before launching
+// the page, so a walk holds at most one page more than it has in send, and
+// every fan-out the Sender runs shares one bound on the pages in flight.
 // Everything that is the same for every recipient (the sender's profile, the
 // rendered push, the choice of mute read) is resolved once per message
 // before the walk. A DM is a walk of exactly one page: its inline pair, sent
@@ -37,7 +37,11 @@ import (
 // one with its own body, before the walk, which then leaves them out. The
 // walk's cursor is a user ID (see chat.Store.GetGroupMembersPage), which is
 // what a durable worker would checkpoint to resume a fan-out without
-// re-sending the pages already out.
+// re-sending the pages already out. The team account is pushed to in no
+// chat, DM or group (see NewSender): every page drops it as it drops the
+// sender, so a group it is a member of pushes everyone else as usual, and a
+// user's message in a group whose only other member is the team pushes
+// nobody.
 const (
 	// defaultPushPageSize is how many members a page holds. A member has a
 	// device or two, so a page's tokens fill every FCM batch the pusher runs
@@ -121,8 +125,10 @@ func (s *Sender) pushSentMessages(ctx context.Context, log *zap.Logger, chatID *
 	} else {
 		chatType = chat.DeriveDmChatType(chatID, members)
 
-		// The team account is never pushed to (see NewSender). It is
-		// dropped only now: the type derivation above needs the pair whole.
+		// The team account is never pushed to (see NewSender), which every
+		// page drops (see sendPageStep). A DM's pair drops it here as well,
+		// so that a user's message to the team earns no push at all, below;
+		// only now, since the type derivation above needs the pair whole.
 		members = s.withoutTeamAccount(members)
 	}
 
@@ -424,20 +430,25 @@ func (p *messagePush) sendPage(ctx context.Context, chatPush *push.ChatMessagePu
 }
 
 func (p *messagePush) sendPageStep(ctx context.Context, chatPush *push.ChatMessagePush, members []*commonpb.UserId) {
-	// Push recipients are every member but the sender, minus anyone who has
-	// blocked the sender — a user who blocks another must stop receiving
-	// pushes for that user's messages. The check is scoped to each
-	// recipient's own blocklist (recipient is the owner, sender the blocked
-	// candidate), and the page's recipients are resolved in one batched read.
+	// Push recipients are every member but the sender and the team account,
+	// minus anyone who has blocked the sender — a user who blocks another
+	// must stop receiving pushes for that user's messages. The team account
+	// is dropped from every page of every chat, a group's walk and its cash
+	// receivers' pages included, not only from the groups it created: it has
+	// no devices, so a push to it is only a blocklist, mute and token read
+	// and a badge bump spent on nobody (see NewSender). The blocklist check is
+	// scoped to each recipient's own blocklist (recipient is the owner,
+	// sender the blocked candidate), and the page's recipients are resolved
+	// in one batched read.
 	candidates := make([]*commonpb.UserId, 0, len(members))
 	for _, member := range members {
-		if bytes.Equal(member.Value, p.message.SenderId.Value) {
+		if bytes.Equal(member.Value, p.message.SenderId.Value) || p.sender.isTeamAccount(member) {
 			continue
 		}
 		candidates = append(candidates, member)
 	}
-	// The sender was the page's only member: nothing to push, and nothing to
-	// ask the blocklist about.
+	// The sender and the team were the page's only members: nothing to push,
+	// and nothing to ask the blocklist about.
 	if len(candidates) == 0 {
 		return
 	}

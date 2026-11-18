@@ -47,6 +47,12 @@ func newChatEnv(t *testing.T) *chatEnv {
 // chat store and the Sender are built with it. setUp decides whether the team
 // account was set up before the process started; if not, there is none.
 func newChatEnvWithTeam(t *testing.T, setUp bool) *chatEnv {
+	return newChatEnvWithPusher(t, setUp, push.NewNoOpPusher())
+}
+
+// newChatEnvWithPusher is newChatEnvWithTeam with the Sender pushing through
+// pusher.
+func newChatEnvWithPusher(t *testing.T, setUp bool, pusher push.Pusher) *chatEnv {
 	ctx := context.Background()
 	profiles := profile_memory.NewInMemory()
 	team := model.MustGenerateUserID()
@@ -70,7 +76,7 @@ func newChatEnvWithTeam(t *testing.T, setUp bool) *chatEnv {
 		blocklist_memory.NewInMemory(),
 		nil,
 		ocp_data.NewTestDataProvider(),
-		push.NewNoOpPusher(),
+		pusher,
 		event.NewBus[*commonpb.UserId, *eventpb.Event](),
 		event.NewBus[*commonpb.ChatId, *eventpb.ChatEvent](),
 		teamUserID,
@@ -91,10 +97,10 @@ func text(s string) *messagingpb.Content {
 	return &messagingpb.Content{Type: &messagingpb.Content_Text{Text: &messagingpb.TextContent{Text: s}}}
 }
 
-func TestSendMessages(t *testing.T) {
+func TestSendDmMessages(t *testing.T) {
 	e := newChatEnv(t)
 
-	chatID, sent, err := flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi"), text("welcome")})
+	chatID, sent, err := flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi"), text("welcome")})
 	require.NoError(t, err)
 
 	// The chat is the pair's canonical DM.
@@ -128,7 +134,7 @@ func TestSendMessages(t *testing.T) {
 	}
 
 	// A retry under the same key sends nothing new.
-	_, replayed, err := flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi"), text("welcome")})
+	_, replayed, err := flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi"), text("welcome")})
 	require.NoError(t, err)
 	require.Equal(t, sent[1].MessageId.Value, replayed[1].MessageId.Value)
 	stored, err := e.messages.GetMessages(e.ctx, chatID)
@@ -136,7 +142,7 @@ func TestSendMessages(t *testing.T) {
 	require.Len(t, stored, 2)
 
 	// Another key sends into the chat that already exists.
-	_, more, err := flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.user, "follow-up", []*messagingpb.Content{text("again")})
+	_, more, err := flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, e.user, "follow-up", []*messagingpb.Content{text("again")})
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), more[0].MessageId.Value)
 }
@@ -161,24 +167,24 @@ func (s *createCountingStore) GetChatByID(ctx context.Context, chatID *commonpb.
 	return s.Store.GetChatByID(ctx, chatID)
 }
 
-func TestSendMessages_CreatesChatOnce(t *testing.T) {
+func TestSendDmMessages_CreatesChatOnce(t *testing.T) {
 	e := newChatEnv(t)
 	chats := &createCountingStore{Store: e.chats}
 
 	// The first send creates the chat.
-	_, _, err := flipcashteam.SendMessages(e.ctx, chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi")})
+	_, _, err := flipcashteam.SendDmMessages(e.ctx, chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi")})
 	require.NoError(t, err)
 	require.Equal(t, 1, chats.puts)
 
 	// Later sends find it and never ask to create it again.
-	_, _, err = flipcashteam.SendMessages(e.ctx, chats, e.sender, e.user, "follow-up", []*messagingpb.Content{text("again")})
+	_, _, err = flipcashteam.SendDmMessages(e.ctx, chats, e.sender, e.user, "follow-up", []*messagingpb.Content{text("again")})
 	require.NoError(t, err)
 	require.Equal(t, 1, chats.puts)
 
 	// A lookup that misses a chat that exists falls through to a create that
 	// finds it, and the send goes ahead into it.
 	chats.staleReads = true
-	chatID, sent, err := flipcashteam.SendMessages(e.ctx, chats, e.sender, e.user, "stale", []*messagingpb.Content{text("still")})
+	chatID, sent, err := flipcashteam.SendDmMessages(e.ctx, chats, e.sender, e.user, "stale", []*messagingpb.Content{text("still")})
 	require.NoError(t, err)
 	require.Equal(t, 2, chats.puts)
 	require.Equal(t, uint64(3), sent[0].MessageId.Value)
@@ -187,23 +193,23 @@ func TestSendMessages_CreatesChatOnce(t *testing.T) {
 	require.Len(t, stored, 3)
 }
 
-func TestSendMessages_RetryByPosition(t *testing.T) {
+func TestSendDmMessages_RetryByPosition(t *testing.T) {
 	e := newChatEnv(t)
 
-	chatID, sent, err := flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi"), text("welcome")})
+	chatID, sent, err := flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi"), text("welcome")})
 	require.NoError(t, err)
 	require.Len(t, sent, 2)
 
 	// Fewer messages under the same key replay the first call's leading ones,
 	// whatever the retry's content.
-	_, replayed, err := flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("different")})
+	_, replayed, err := flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("different")})
 	require.NoError(t, err)
 	require.Len(t, replayed, 1)
 	require.Equal(t, sent[0].MessageId.Value, replayed[0].MessageId.Value)
 	require.Equal(t, "hi", replayed[0].Content[0].GetText().Text)
 
 	// More messages under the same key fail.
-	_, _, err = flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi"), text("welcome"), text("more")})
+	_, _, err = flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi"), text("welcome"), text("more")})
 	require.Error(t, err)
 
 	// Neither sent anything.
@@ -212,33 +218,33 @@ func TestSendMessages_RetryByPosition(t *testing.T) {
 	require.Len(t, stored, 2)
 }
 
-func TestSendMessages_Refused(t *testing.T) {
+func TestSendDmMessages_Refused(t *testing.T) {
 	e := newChatEnv(t)
 	messages := []*messagingpb.Content{text("hi")}
 
-	_, _, err := flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.team, "welcome", messages)
+	_, _, err := flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, e.team, "welcome", messages)
 	require.Error(t, err)
 
-	_, _, err = flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.user, "", messages)
+	_, _, err = flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, e.user, "", messages)
 	require.Error(t, err)
 
-	_, _, err = flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.user, "welcome", nil)
+	_, _, err = flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, e.user, "welcome", nil)
 	require.Error(t, err)
 
 	// A missing or malformed user ID is refused, never a panic.
-	_, _, err = flipcashteam.SendMessages(e.ctx, e.chats, e.sender, nil, "welcome", messages)
+	_, _, err = flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, nil, "welcome", messages)
 	require.Error(t, err)
-	_, _, err = flipcashteam.SendMessages(e.ctx, e.chats, e.sender, &commonpb.UserId{Value: []byte{1, 2, 3}}, "welcome", messages)
+	_, _, err = flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, &commonpb.UserId{Value: []byte{1, 2, 3}}, "welcome", messages)
 	require.Error(t, err)
 }
 
-func TestSendMessages_NoTeamAccount(t *testing.T) {
+func TestSendDmMessages_NoTeamAccount(t *testing.T) {
 	// A process started before the team account was set up has none, and
 	// sends as no one, even once the handle is given out: it takes a restart.
 	e := newChatEnvWithTeam(t, false)
 	require.NoError(t, flipcashteam.AssignUsername(e.ctx, e.profiles, e.team))
 
-	_, _, err := flipcashteam.SendMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi")})
+	_, _, err := flipcashteam.SendDmMessages(e.ctx, e.chats, e.sender, e.user, "welcome", []*messagingpb.Content{text("hi")})
 	require.ErrorIs(t, err, flipcashteam.ErrNoTeamAccount)
 
 	// Nothing was created.

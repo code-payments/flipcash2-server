@@ -78,8 +78,9 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 					// the user's slice; membership state rides along in the
 					// projection. Keyed by the sparse user attribute — present on
 					// membership rows (tombstones included) and nothing else — so
-					// non-membership items like the counter stay out of the index
-					// (see gsiByUser).
+					// non-membership items like the counter stay out of the index,
+					// as do the rows of users excluded from the feed (see
+					// gsiByUser).
 					IndexName: aws.String(gsiByUser),
 					KeySchema: []types.KeySchemaElement{
 						{AttributeName: aws.String(attrUser), KeyType: types.KeyTypeHash},

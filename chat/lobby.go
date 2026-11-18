@@ -45,6 +45,16 @@ import (
 // them and no one is admitted without a key to be wrapped for them. The
 // creator is DENIED their own lobby: they rejoin with JoinChat.
 //
+// A group the team account created for a user (see Access.teamCreated) has
+// its key from its creation but no lobby: entering it is DENIED, as for a
+// keyless group, the one other case of a lobby that cannot take anyone.
+// Only the creator admits, and the team has no client, so an entry would
+// wait unanswered for good, holding a place against the user's cap of
+// lobbies. A non-member is told so after membership is asked, so a member
+// is still ALREADY_MEMBER. A member who leaves such a group cannot come
+// back, as from any private group whose creator neither admits nor invites
+// them.
+//
 // An admission is one write (see Store.AdmitFromLobby): the envelope the
 // creator wrapped, the membership transition and the entry's removal commit
 // together, so an admitted member always has an envelope and a waiting user is
@@ -137,8 +147,12 @@ func (s *Server) EnterLobby(ctx context.Context, req *chatpb.EnterLobbyRequest) 
 		return &chatpb.EnterLobbyResponse{Result: chatpb.EnterLobbyResponse_ALREADY_MEMBER}, nil
 	}
 
-	// A keyless group has no lobby (see above). Decided off the record's
-	// rules, as the speaker gate decides it.
+	// A group the team created has no lobby, and nor does a keyless group
+	// (see above). Both are decided off the record's rules, as the speaker
+	// gate decides them.
+	if s.access.teamCreated(c.ChatRules()) {
+		return &chatpb.EnterLobbyResponse{Result: chatpb.EnterLobbyResponse_DENIED}, nil
+	}
 	keyed, err := s.access.hasKey(ctx, c.ID, c.ChatRules())
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure checking chat key")
@@ -332,8 +346,10 @@ func (s *Server) AdmitLobbyMember(ctx context.Context, req *chatpb.AdmitLobbyMem
 		return &chatpb.AdmitLobbyMemberResponse{Result: chatpb.AdmitLobbyMemberResponse_DENIED}, nil
 	}
 
-	// Nobody is admitted to a group before its creator holds its key (see
-	// above). The creator is the caller by now, so this is their own envelope.
+	// Nobody is admitted to a group before it has its key (see above). The
+	// creator is the caller by now, so this is their own envelope, unless the
+	// group is one the team created, which has its key from its creation and
+	// whose creator has no client to call this.
 	keyed, err := s.access.hasKey(ctx, c.ID, c.ChatRules())
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure checking chat key")

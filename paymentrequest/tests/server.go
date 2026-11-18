@@ -49,6 +49,7 @@ func RunServerTests(t *testing.T, s paymentrequest.Store, teardown func()) {
 		testServer_Create_PrivateGroup,
 		testServer_Create_Idempotent,
 		testServer_Create_Refused,
+		testServer_Create_TeamDebtor,
 		testServer_Create_Order,
 		testServer_Create_Amount,
 		testServer_Create_EndsAt,
@@ -255,6 +256,66 @@ func testServer_Create_Refused(t *testing.T, s paymentrequest.Store) {
 		require.ErrorIs(t, err, paymentrequest.ErrNotFound, tc.name)
 	}
 	require.Zero(t, e.moderator.classifiedCount())
+}
+
+// testServer_Create_TeamDebtor pins that a split never bills the team
+// account. In a private group the team created for a user, of which it is a
+// member, the user's split naming it as a debtor is INVALID_SHARES, as a
+// non-member's share is, with nothing written, moderated or announced, while
+// the user's collection there is accepted: the team simply never contributes.
+// The refusal holds in any group the team is a member of, while splits among
+// the other members go through, and only on a server that knows the team: one
+// configured with none takes the same split.
+func testServer_Create_TeamDebtor(t *testing.T, s paymentrequest.Store) {
+	e := newServerEnv(t, s)
+	u := e.addUser()
+	member := e.addUser()
+	endsAt := e.clock.Now().Add(time.Hour)
+
+	// requireRefused asserts that a split is INVALID_SHARES, with nothing
+	// stored under its ID and nothing announced on the chat.
+	requireRefused := func(env *serverEnv, creator user, chatID *commonpb.ChatId, split *paymentrequestpb.Split, name string) {
+		t.Helper()
+		key := newKey()
+		resp := env.create(creator, chatID, split, key)
+		require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_INVALID_SHARES, resp.Result, name)
+		require.Nil(t, resp.PaymentRequest, name)
+		_, err := s.Get(env.ctx, paymentrequest.MustDeriveID(creator.id, key))
+		require.ErrorIs(t, err, paymentrequest.ErrNotFound, name)
+	}
+	requireNothingAnnounced := func(env *serverEnv, chatID *commonpb.ChatId) {
+		t.Helper()
+		time.Sleep(100 * time.Millisecond)
+		require.Empty(t, env.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, chatID.Value) }))
+	}
+
+	// In the team's group, whether the team's share is the only debtor's or
+	// the user lists their own beside it.
+	teamGroup := e.putTeamPrivateGroup(u)
+	requireRefused(e, u, teamGroup, e.encryptedSplit(endsAt, share(e.team, 2)), "team alone")
+	requireRefused(e, u, teamGroup, e.encryptedSplit(endsAt, share(u, 1), share(e.team, 2)), "team beside the creator")
+	requireNothingAnnounced(e, teamGroup)
+
+	// A collection there is accepted.
+	collected := e.createCollection(u, teamGroup, encryptedCollection(endsAt, 1), newKey())
+	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, collected.Result)
+	e.requireUpdates(teamGroup, collected.PaymentRequest.PaymentRequestId, 1)
+
+	// In an ordinary keyed group the team happens to be a member of, a split
+	// among the others goes through and one billing the team does not.
+	group := e.putPrivateGroup(true, member, e.team)
+	ok := e.create(e.creator, group, e.encryptedSplit(endsAt, share(e.creator, 1), share(member, 2)), newKey())
+	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, ok.Result)
+	e.requireUpdates(group, ok.PaymentRequest.PaymentRequestId, 1)
+	requireRefused(e, e.creator, group, e.encryptedSplit(endsAt, share(member, 2), share(e.team, 2)), "team in an ordinary group")
+	require.Zero(t, e.moderator.classifiedCount())
+
+	// A server that knows no team takes the same split.
+	noTeam := newServerEnvWithoutTeam(t, s)
+	other := noTeam.addUser()
+	noTeamGroup := noTeam.putPrivateGroup(true, other, noTeam.team)
+	billed := noTeam.create(noTeam.creator, noTeamGroup, noTeam.encryptedSplit(endsAt, share(other, 2), share(noTeam.team, 2)), newKey())
+	require.Equal(t, paymentrequestpb.CreatePaymentRequestResponse_OK, billed.Result)
 }
 
 // testServer_Create_Order pins the order refusals are judged in, where a
@@ -1950,14 +2011,42 @@ type serverEnv struct {
 	chatEventBus *event.Bus[*commonpb.ChatId, *eventpb.ChatEvent]
 	chatObserver *event.TestEventObserver[*commonpb.ChatId, *eventpb.ChatEvent]
 
-	// creator is the user who creates every group the env puts.
+	// creator is the user who creates every group the env puts, but for the
+	// team's (see putTeamPrivateGroup).
 	creator user
+
+	// team is the Flipcash team account the server and the chat rules know,
+	// unless the env was built by newServerEnvWithoutTeam, which leaves it
+	// unset. Either way it is a registered user, so it can be put in a group.
+	team       user
+	teamConfig *commonpb.UserId
 }
 
+// newServerEnv returns an env whose server and chat rules know a team
+// account, as production's do.
 func newServerEnv(t *testing.T, requests paymentrequest.Store, opts ...paymentrequest.ServerOption) *serverEnv {
+	return newServerEnvTeam(t, requests, true, opts...)
+}
+
+// newServerEnvWithoutTeam is newServerEnv with no team account configured:
+// env.team is a user like any other.
+func newServerEnvWithoutTeam(t *testing.T, requests paymentrequest.Store, opts ...paymentrequest.ServerOption) *serverEnv {
+	return newServerEnvTeam(t, requests, false, opts...)
+}
+
+func newServerEnvTeam(t *testing.T, requests paymentrequest.Store, withTeam bool, opts ...paymentrequest.ServerOption) *serverEnv {
 	log := zaptest.NewLogger(t)
 
-	chats := chatmemory.NewInMemory(nil)
+	team := user{id: model.MustGenerateUserID(), keys: model.MustGenerateKeyPair()}
+	var teamConfig *commonpb.UserId
+	if withTeam {
+		teamConfig = team.id
+	}
+
+	// The chat store excludes the team whether or not the server knows it,
+	// as production's does, so the team's private groups are created as
+	// production creates them (see chat.Store.PutPrivateGroup).
+	chats := chatmemory.NewInMemory([]*commonpb.UserId{team.id})
 	accounts := accountmemory.NewInMemory()
 	ocpBalance := &fakeOcpBalance{byOwner: make(map[string]uint64)}
 	balances := balance.NewClient(log, accounts, ocpBalance)
@@ -1966,7 +2055,7 @@ func newServerEnv(t *testing.T, requests paymentrequest.Store, opts ...paymentre
 	// rosters show on the next call.
 	access := chat.NewAccess(
 		chats,
-		chat.NewRuleEvaluator(accounts, balances, chats, nil),
+		chat.NewRuleEvaluator(accounts, balances, chats, teamConfig),
 		chat.WithListenerAdmissionTTL(0),
 		chat.WithSpeakerAdmissionTTL(0),
 	)
@@ -1981,7 +2070,10 @@ func newServerEnv(t *testing.T, requests paymentrequest.Store, opts ...paymentre
 		ocpBalance: ocpBalance,
 		moderator:  newFakeModerator(),
 		clock:      &fakeClock{now: time.Now().UTC().Truncate(time.Millisecond)},
+		team:       team,
+		teamConfig: teamConfig,
 	}
+	e.authz.Add(team.id, team.keys)
 	e.start(requests, opts...)
 	e.creator = e.addUser()
 	return e
@@ -2011,6 +2103,7 @@ func (e *serverEnv) start(requests paymentrequest.Store, opts ...paymentrequest.
 		e.access,
 		e.moderator,
 		chatEventBus,
+		e.teamConfig,
 		append([]paymentrequest.ServerOption{paymentrequest.WithClock(e.clock.Now)}, opts...)...,
 	)
 	cc := testutil.RunGRPCServer(e.t, log, testutil.WithService(func(s *grpc.Server) {
@@ -2074,6 +2167,34 @@ func (e *serverEnv) putPrivateGroup(keyed bool, members ...user) *commonpb.ChatI
 		_, err := e.chats.SetKeyEnvelope(e.ctx, chatID, e.creator.id, chat.KeyEnvelopeFromProto(envelope, e.creator.id))
 		require.NoError(e.t, err)
 	}
+	return chatID
+}
+
+// putTeamPrivateGroup stores a private group in the shape the server creates
+// for a user with the team account as creator: the team and u its only
+// members, and u's envelope, wrapped by the team, written with it. The team
+// stores no envelope of its own, which the store allows of the team alone,
+// since it excludes the team from the feed; a server whose rules know the
+// team finds the group keyed all the same.
+func (e *serverEnv) putTeamPrivateGroup(u user) *commonpb.ChatId {
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, e.chats.PutPrivateGroup(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.team.id, u.id},
+		Title:        "Welcome",
+		IsPrivate:    true,
+		CreatorID:    e.team.id,
+		LastActivity: time.Now(),
+	}, []chat.MemberKeyEnvelope{{
+		UserID: u.id,
+		Envelope: chat.KeyEnvelope{
+			Scheme:     chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305,
+			Nonce:      bytes.Repeat([]byte{1}, 24),
+			Ciphertext: bytes.Repeat([]byte{1}, 48),
+			WrappedBy:  e.team.id,
+		},
+	}}))
 	return chatID
 }
 

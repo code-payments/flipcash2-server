@@ -51,8 +51,17 @@ import (
 	"github.com/code-payments/flipcash2-server/testutil"
 )
 
-// RunServerTests runs the shared chat.Server test suite against s. teardown is
-// called between tests to reset the store.
+// TeamUserID is the Flipcash team account every env's server is built with.
+// A store passed to RunServerTests must be built excluding it from the feed
+// (see chat.FeedExclusions), as production's store excludes the team, so the
+// store creates the team's private groups as production's does (see
+// chat.Store.PutPrivateGroup). It is one account for the whole suite, as
+// production has one, and the store is reset between tests.
+var TeamUserID = model.MustGenerateUserID()
+
+// RunServerTests runs the shared chat.Server test suite against s, a store
+// built excluding TeamUserID from the feed. teardown is called between tests
+// to reset the store.
 func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, s chat.Store){
 		testServer_GetChat_OK,
@@ -136,6 +145,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_Lobby_GetLobbyMembers,
 		testServer_Lobby_Admit,
 		testServer_Lobby_Deny,
+		testServer_TeamPrivateGroup,
 		testServer_PrivateGroup_UserJoinedMessages,
 		testServer_StartChat_InvalidRules,
 		testServer_StartChat_RulesNotSatisfied,
@@ -275,7 +285,7 @@ func newServerEnvWithConfig(t *testing.T, s chat.Store, cfg serverConfig) *serve
 	userID := model.MustGenerateUserID()
 	keys := model.MustGenerateKeyPair()
 	authz.Add(userID, keys)
-	teamUserID := model.MustGenerateUserID()
+	teamUserID := TeamUserID
 
 	accounts := newStaffAccounts(accountmemory.NewInMemory())
 	ocpBalance := &fakeOcpBalance{byOwner: make(map[string]uint64)}
@@ -6561,6 +6571,144 @@ func (e *serverEnv) requireNoLobbyUpdatesOnChatTopic(chatID *commonpb.ChatId) {
 	for _, ev := range e.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, chatID.Value) }) {
 		require.Nil(e.t, ev.Event.GetEvent().GetChatUpdate().GetLobbyUpdates())
 	}
+}
+
+// putTeamPrivateGroup creates, through the store as the server will, a
+// private group whose creator is the Flipcash team account, with the team
+// and the env user as members and the env user's envelope, wrapped by the
+// team, written with it. The team holds no envelope of its own.
+func (e *serverEnv) putTeamPrivateGroup(title string) *commonpb.ChatId {
+	chatID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, e.store.PutPrivateGroup(e.ctx, &chat.Chat{
+		ID:           chatID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.teamUserID, e.userID},
+		Title:        title,
+		IsPrivate:    true,
+		CreatorID:    e.teamUserID,
+		LastActivity: at(1),
+	}, []chat.MemberKeyEnvelope{{
+		UserID:   e.userID,
+		Envelope: chat.KeyEnvelopeFromProto(keyEnvelopeProto(1), e.teamUserID),
+	}}))
+	return chatID
+}
+
+// testServer_TeamPrivateGroup pins a private group the team account created
+// for a user: it has its key from its creation, though the team stores no
+// envelope, so the user speaks in it as a member of any keyed group, silence
+// included; it has no lobby, so a non-member is DENIED entry; every
+// creator-only RPC stays refused to the user, who is not its creator; and the
+// user may leave it like any private group, for good, since nothing lets them
+// back in.
+func testServer_TeamPrivateGroup(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	strangerID, strangerKeys := e.addBoundUser("Stranger")
+	e.profiles.usernames[string(strangerID.Value)] = "stranger"
+
+	chatID := e.putTeamPrivateGroup("Welcome")
+	_, err := s.GetKeyEnvelope(e.ctx, chatID, e.teamUserID)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// The user speaks, so mention suggestions are theirs.
+	resp := e.getMentionSuggestions(e.keys, chatID)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_OK, resp.Result)
+
+	// Nothing a creator alone may do is the user's.
+	perms := e.getChat(e.keys, chatID).Metadata.ViewerState.Permissions
+	require.False(t, perms.CanEdit)
+	require.False(t, perms.CanInvite)
+	require.False(t, perms.CanPin)
+	e.putMessage(chatID, 1, e.userID, "hello")
+	require.Equal(t, chatpb.PinMessageResponse_DENIED, e.pinMessage(e.keys, chatID, 1).Result)
+	title := "Renamed"
+	edited := e.mustEditChat(e.keys, chatID, &title, nil)
+	require.Equal(t, chatpb.EditChatResponse_DENIED, edited.Result)
+	require.Equal(t, chatpb.CreateInviteResponse_DENIED, e.createInvite(e.keys, createInviteRequest(e.keys, chatID, newInviteToken())).Result)
+	require.Equal(t, chatpb.AdmitLobbyMemberResponse_DENIED, e.admitLobbyMember(e.keys, chatID, strangerID, keyEnvelopeProto(2)).Result)
+	require.Equal(t, chatpb.SilenceUserResponse_DENIED, e.mustSilenceUser(e.keys, chatID, strangerID, silenceForever()))
+	got, err := e.getLobbyMembers(e.keys, chatID, nil)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetLobbyMembersResponse_DENIED, got.Result)
+
+	// It has no lobby: a non-member is DENIED entry and holds no entry, as
+	// for a keyless group, and the user, a member, is ALREADY_MEMBER.
+	require.Equal(t, chatpb.EnterLobbyResponse_DENIED, e.enterLobby(strangerKeys, chatID).Result)
+	require.False(t, e.getChat(strangerKeys, chatID).Metadata.InLobby)
+	require.Equal(t, chatpb.EnterLobbyResponse_ALREADY_MEMBER, e.enterLobby(e.keys, chatID).Result)
+
+	// Nor is it joined without an invite, and no one has one to give.
+	joined := e.mustJoinChat(strangerKeys, chatID)
+	require.Equal(t, chatpb.JoinChatResponse_DENIED, joined.Result)
+
+	// A silence, set as the creator would set it, still takes speech.
+	_, _, err = s.SetSilence(e.ctx, chatID, e.userID, chat.Silence{Forever: true}, time.Now())
+	require.NoError(t, err)
+	resp = e.getMentionSuggestions(e.keys, chatID)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, resp.Result)
+
+	// A non-member's leave is the ordinary no-op.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(strangerKeys, chatID).Result)
+	e.requireNoRosterUpdates(strangerID, chatID)
+
+	// The user may leave it, as any member but the creator leaves a private
+	// group: they are no longer a member, their envelope goes with them, the
+	// departure is announced, and the group leaves their feed.
+	require.Len(t, e.mustGetGroupFeed(nil).Chats, 1)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	e.waitForRosterUpdates(e.userID, chatID, 1)
+	isMember, err := s.IsMember(e.ctx, chatID, e.userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
+	_, err = s.GetKeyEnvelope(e.ctx, chatID, e.userID)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+	require.Equal(t, chatpb.GetKeyEnvelopeResponse_DENIED, e.mustGetKeyEnvelope(e.keys, chatID).Result)
+	left := e.getChat(e.keys, chatID)
+	require.Equal(t, chatpb.GetChatResponse_OK, left.Result)
+	require.Nil(t, left.Metadata.ViewerState)
+	require.Empty(t, e.mustGetGroupFeed(nil).Chats)
+
+	// Leaving again is the no-op, announcing nothing more.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, chatID).Result)
+	time.Sleep(100 * time.Millisecond)
+	require.Len(t, e.rosterUpdatesOnUserTopic(e.userID, chatID), 1)
+
+	// And it is for good: with no lobby and no invite, there is no way back.
+	require.Equal(t, chatpb.EnterLobbyResponse_DENIED, e.enterLobby(e.keys, chatID).Result)
+	require.Equal(t, chatpb.JoinChatResponse_DENIED, e.mustJoinChat(e.keys, chatID).Result)
+	isMember, err = s.IsMember(e.ctx, chatID, e.userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
+
+	// The exception is the team's alone. The store refuses the same group
+	// created by anyone else, who must store an envelope of their own with
+	// it; and the same group made otherwise, with the user's envelope
+	// wrapped by its creator and none of the creator's own, stays keyless,
+	// the user's envelope notwithstanding, and so has no lobby.
+	otherCreator := model.MustGenerateUserID()
+	otherID := chat.MustGenerateGroupChatID()
+	other := &chat.Chat{
+		ID:           otherID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{otherCreator, e.userID},
+		Title:        "Other",
+		IsPrivate:    true,
+		CreatorID:    otherCreator,
+		LastActivity: at(1),
+	}
+	userEnvelope := chat.KeyEnvelopeFromProto(keyEnvelopeProto(1), otherCreator)
+	require.Error(t, s.PutPrivateGroup(e.ctx, other, []chat.MemberKeyEnvelope{{UserID: e.userID, Envelope: userEnvelope}}))
+	require.NoError(t, s.PutChat(e.ctx, other))
+	_, err = s.SetKeyEnvelope(e.ctx, otherID, e.userID, userEnvelope)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetMentionSuggestionsResponse_DENIED, e.getMentionSuggestions(e.keys, otherID).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_DENIED, e.enterLobby(strangerKeys, otherID).Result)
+
+	// And its member may leave it, as from any private group.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, otherID).Result)
+	isMember, err = s.IsMember(e.ctx, otherID, e.userID)
+	require.NoError(t, err)
+	require.False(t, isMember)
 }
 
 // testServer_Lobby_Gates pins who may do what with a lobby: nothing of a

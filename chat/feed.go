@@ -163,23 +163,47 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatTyp
 }
 
 // ---------------------------------------------------------------------------
-// DM feed exclusions
+// Feed exclusions
 // ---------------------------------------------------------------------------
 
-// FeedExclusions are the users a Store creates every DM with them excluding
-// from the feed (see Store.PutChat). Every Store implementation takes the
+// FeedExclusions are the users a Store keeps out of the listings of their own
+// chats: every DM is created with them excluding them from its feed (see
+// Store.PutChat), and every group membership record of theirs is written
+// unlisted, so no listing of their groups returns it (see
+// Store.GetGroupMembershipsForUser). Every Store implementation takes the
 // users as a required constructor argument and applies them through
-// FeedExclusions, so they mean the same thing in every backend.
+// FeedExclusions, so they mean the same thing in every backend, and the one
+// argument configures both: there is no second list for groups to forget.
 //
-// It is for an account in a DM with every user whose feed nobody reads, today
-// the Flipcash team account (see flipcashteam): a DM created with it in the
-// feed puts every one of its DMs under one feed key ordered by time, which
-// every creation and every message then writes at the same end of. Taking the
-// users at construction is what keeps any path that creates a DM from
-// forgetting to, and taking them as an argument rather than an option is what
-// keeps a parent from forgetting to configure it: a store with no one to
-// exclude says so with nil. The exclusion is recorded on each DM at creation,
-// so a DM created by a store that forgot is excluding no one for good.
+// It is for an account in a chat with every user whose chat listings nobody
+// reads, today the Flipcash team account (see flipcashteam): a DM created
+// with it in the feed puts every one of its DMs under one feed key ordered by
+// time, which every creation and every message then writes at the same end
+// of, and a group membership record of it listed puts every group it is in
+// under one index key, which every creation of such a group writes. Taking
+// the users at construction is what keeps any path that creates a DM, or
+// moves a group membership, from forgetting to, and taking them as an
+// argument rather than an option is what keeps a parent from forgetting to
+// configure it: a store with no one to exclude says so with nil.
+//
+// The two are recorded differently because they are read differently. A DM
+// records its exclusion at creation and keeps it, so a DM created by a store
+// that forgot is excluding no one for good, and an advance by any process
+// agrees with its creation (see For). A group membership record carries its
+// listing on the record itself, decided by the store making each write to it
+// — the creation, and every join and departure after — so the record is
+// listed or not as the last write to it was made (see Excludes). An excluded
+// user stays a member in every other respect: IsMember answers for them, and
+// the roster reads and the member count include them.
+//
+// The same users are the creators exempt from storing a key envelope of their
+// own when a private group is created through the store (see
+// ValidatePrivateGroupCreation): every other creator must, so the group has
+// its key from its creation, and an excluded one may not, since the key
+// envelopes are keyed by user, and an envelope for each of the groups the
+// team creates, one for each user, would put them all under one hot key, as
+// a listed membership record would. Such a group is keyed off its creator
+// instead (see Access.teamCreated).
 type FeedExclusions struct {
 	// userIDs are the users excluded, each named once.
 	userIDs []*commonpb.UserId
@@ -202,7 +226,8 @@ func NewFeedExclusions(userIDs []*commonpb.UserId) FeedExclusions {
 // For returns the members a DM being created is to exclude from the feed:
 // those of c's members e names, each once, in the order c lists them. It is
 // empty when there are none, and for every group, which keeps no per-member
-// feed copies to exclude anyone from.
+// feed copies to exclude anyone from; a group's members are excluded record
+// by record instead (see Excludes).
 func (e FeedExclusions) For(c *Chat) []*commonpb.UserId {
 	if len(e.userIDs) == 0 || IsGroupChatID(c.ID) {
 		return nil
@@ -214,6 +239,15 @@ func (e FeedExclusions) For(c *Chat) []*commonpb.UserId {
 		}
 	}
 	return excluded
+}
+
+// Excludes reports whether e names userID, and so whether a group membership
+// record of theirs is written unlisted: present on the group's roster, and
+// absent from every listing of the user's groups (see FeedExclusions). A
+// store asks it on every write of a membership record, a creation's and every
+// transition's, so no write can list the record again.
+func (e FeedExclusions) Excludes(userID *commonpb.UserId) bool {
+	return userID != nil && containsUser(e.userIDs, userID)
 }
 
 // containsUser reports whether userIDs names userID.

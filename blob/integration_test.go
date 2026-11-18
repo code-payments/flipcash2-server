@@ -157,10 +157,12 @@ func TestIntegration_EncryptedBlobIsNeverAttachable(t *testing.T) {
 	require.ErrorIs(t, integration.ShareIntoChat(ctx, owner, chatID, []*blobpb.BlobId{id}), blob.ErrBlobNotShareable)
 	require.ErrorIs(t, integration.SetAsProfileMedia(ctx, owner, id), blob.ErrBlobInvalid)
 	require.ErrorIs(t, integration.SetAsChatMedia(ctx, owner, chatID, id), blob.ErrBlobInvalid)
+	require.ErrorIs(t, integration.SetAsPublicMedia(ctx, owner, id), blob.ErrBlobInvalid)
 	for _, principal := range []blob.Principal{
 		blob.PrincipalForChat(chatID),
 		blob.PrincipalForChatProfile(chatID),
 		blob.PrincipalForUserProfile(owner),
+		blob.PrincipalPublic(),
 	} {
 		granted, err := access.HasGrant(ctx, id, principal, blob.PermissionRead)
 		require.NoError(t, err)
@@ -263,6 +265,66 @@ func TestIntegration_SetAsChatPicture(t *testing.T) {
 		_, err := store.Advance(ctx, id, blob.StateReady, nil)
 		require.NoError(t, err)
 		require.ErrorIs(t, integration.SetAsChatMedia(ctx, owner, chatID, id), blob.ErrBlobInvalid)
+	})
+}
+
+func TestIntegration_SetAsPublicMedia(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewInMemory()
+	access := memory.NewInMemoryAccessStore()
+	integration := blob.NewIntegration(store, memory.NewInMemoryStorage(), access)
+
+	owner := model.MustGenerateUserID()
+
+	t.Run("a ready image original owned by the caller is granted to everyone, and to no one surface", func(t *testing.T) {
+		id := putReadyOriginal(t, store, owner)
+		require.NoError(t, integration.SetAsPublicMedia(ctx, owner, id))
+
+		has, err := access.HasGrant(ctx, id, blob.PrincipalPublic(), blob.PermissionRead)
+		require.NoError(t, err)
+		require.True(t, has)
+
+		// The one grant is the whole of it: no surface is granted its own.
+		has, err = access.HasGrant(ctx, id, blob.PrincipalForUserProfile(owner), blob.PermissionRead)
+		require.NoError(t, err)
+		require.False(t, has)
+
+		// Idempotent: setting it up again, as every process start does, is not
+		// an error.
+		require.NoError(t, integration.SetAsPublicMedia(ctx, owner, id))
+	})
+
+	t.Run("an unknown blob is not found", func(t *testing.T) {
+		require.ErrorIs(t, integration.SetAsPublicMedia(ctx, owner, newBlobID(t)), blob.ErrBlobNotFound)
+	})
+
+	t.Run("a blob owned by someone else is not found and grants nothing", func(t *testing.T) {
+		theirs := putReadyOriginal(t, store, model.MustGenerateUserID())
+		require.ErrorIs(t, integration.SetAsPublicMedia(ctx, owner, theirs), blob.ErrBlobNotFound)
+
+		has, err := access.HasGrant(ctx, theirs, blob.PrincipalPublic(), blob.PermissionRead)
+		require.NoError(t, err)
+		require.False(t, has)
+	})
+
+	t.Run("a pending blob is not ready", func(t *testing.T) {
+		id := newBlobID(t)
+		require.NoError(t, store.CreatePending(ctx, &blob.Blob{
+			ID: id, Rendition: blob.RenditionOriginal, Owner: owner, State: blob.StatePending,
+			StorageKey: "k", MimeType: "image/png", SizeBytes: 1,
+		}))
+		require.ErrorIs(t, integration.SetAsPublicMedia(ctx, owner, id), blob.ErrBlobNotReady)
+	})
+
+	t.Run("a non-image blob is invalid", func(t *testing.T) {
+		id := newBlobID(t)
+		require.NoError(t, store.CreatePending(ctx, &blob.Blob{
+			ID: id, Rendition: blob.RenditionOriginal, Owner: owner, State: blob.StatePending,
+			StorageKey: "k", MimeType: "video/mp4", SizeBytes: 1,
+		}))
+		_, err := store.Advance(ctx, id, blob.StateReady, nil)
+		require.NoError(t, err)
+		require.ErrorIs(t, integration.SetAsPublicMedia(ctx, owner, id), blob.ErrBlobInvalid)
 	})
 }
 

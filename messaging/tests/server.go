@@ -53,8 +53,18 @@ import (
 	ocp_data "github.com/code-payments/ocp-server/ocp/data"
 )
 
+// TeamUserID is the Flipcash team account every env built with a team (see
+// newServerEnvWithTeam) is built with. The chats store passed to
+// RunServerTests must be built excluding it from the feed (see
+// chat.FeedExclusions), as production's chat store excludes the team, so the
+// store creates the team's private groups as production's does (see
+// chat.Store.PutPrivateGroup). It is one account for the whole suite, as
+// production has one.
+var TeamUserID = model.MustGenerateUserID()
+
 // RunServerTests runs the shared messaging.Server test suite. chats and messages
-// are the backing stores; teardown resets both between tests.
+// are the backing stores, chats built excluding TeamUserID from the feed;
+// teardown resets both between tests.
 func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store, teardown func()) {
 	for _, tf := range []func(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store){
 		// Messaging
@@ -115,6 +125,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_OpenVersusPrivate_NonMember,
 		testServer_PrivateGroup_Keyless,
 		testServer_PrivateGroup_Keyed,
+		testServer_PrivateGroup_TeamCreated,
+		testServer_SendMessage_TeamNotPushedInGroups,
 		testServer_BalanceGatedGroup_Rules,
 		testServer_SpeakerBalanceGroup_Rules,
 		testServer_SilencedMember,
@@ -341,6 +353,20 @@ type capturingPusher struct {
 	hold        chan struct{}
 	inFlight    int
 	maxInFlight int
+
+	// resolveBadges, when set, makes a badged send resolve its recipients'
+	// badges, as the real pusher does for each recipient with an iOS device,
+	// so a test can see whose stored count a push moved. Off by default,
+	// leaving the badge store untouched.
+	resolveBadges bool
+}
+
+// setResolveBadges turns on badge resolution for every send after it (see
+// capturingPusher.resolveBadges).
+func (p *capturingPusher) setResolveBadges() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.resolveBadges = true
 }
 
 func (p *capturingPusher) SendPushes(ctx context.Context, title, body string, customPayload *pushpb.Payload, users ...*commonpb.UserId) error {
@@ -348,6 +374,14 @@ func (p *capturingPusher) SendPushes(ctx context.Context, title, body string, cu
 }
 
 func (p *capturingPusher) SendPushesWithBadges(ctx context.Context, title, body string, customPayload *pushpb.Payload, resolve push.BadgeResolver, users ...*commonpb.UserId) error {
+	p.mu.Lock()
+	resolveBadges := p.resolveBadges
+	p.mu.Unlock()
+	if resolveBadges && resolve != nil {
+		if _, err := resolve(ctx, users); err != nil {
+			return err
+		}
+	}
 	return p.record(ctx, capturedPush{title: title, body: body, payload: customPayload, users: users, badged: resolve != nil})
 }
 
@@ -1881,7 +1915,7 @@ func testServer_SendUserJoined(t *testing.T, badges badge.Store, blocklists bloc
 }
 
 func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	team := model.MustGenerateUserID()
+	team := TeamUserID
 	e := newServerEnvWithTeam(t, badges, blocklists, chats, messages, profiles, team)
 
 	// A display name is what a DM push renders, so both have one: a push
@@ -1962,7 +1996,7 @@ func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blockl
 }
 
 func testServer_TeamAccount_Refused(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
-	team := model.MustGenerateUserID()
+	team := TeamUserID
 	e := newServerEnvWithTeam(t, badges, blocklists, chats, messages, profiles, team)
 	teamKeys := model.MustGenerateKeyPair()
 	e.authz.Add(team, teamKeys)
@@ -4321,6 +4355,213 @@ func testServer_PrivateGroup_Keyless(t *testing.T, badges badge.Store, blocklist
 		require.NoError(t, err)
 		require.Equal(t, messagingpb.GetMessagesResponse_DENIED, denied.Result, mode)
 	}
+}
+
+// putTeamPrivateGroup creates, through the store, a private group in the
+// shape the server creates for a user with the team account as creator:
+// creator and userA as members, and userA's envelope, wrapped by creator,
+// written with it. creator stores no envelope of its own, which the store
+// allows only of a creator it excludes from the feed (see TeamUserID).
+func (e *serverEnv) putTeamPrivateGroup(chats chat.Store, creator *commonpb.UserId) *commonpb.ChatId {
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(e.t, chats.PutPrivateGroup(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{creator, e.userA},
+		Title:        "Welcome",
+		IsPrivate:    true,
+		CreatorID:    creator,
+		LastActivity: at(1),
+	}, []chat.MemberKeyEnvelope{{
+		UserID: e.userA,
+		Envelope: chat.KeyEnvelope{
+			Scheme:     chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305,
+			Nonce:      bytes.Repeat([]byte{1}, 24),
+			Ciphertext: bytes.Repeat([]byte{1}, 48),
+			WrappedBy:  creator,
+		},
+	}}))
+	return groupID
+}
+
+// testServer_PrivateGroup_TeamCreated pins that a private group the team
+// account created for a user is keyed from its creation, though the team
+// stores no envelope of its own: the user sends, edits, deletes and types
+// there under the chat key's scheme alone, as in any keyed private group,
+// and a silence still takes their speech. The exception is the team's
+// alone: the same group under a server that knows no team account is
+// keyless, and the store refuses it by any other creator, who must store an
+// envelope of their own with it (see chat.Store.PutPrivateGroup).
+func testServer_PrivateGroup_TeamCreated(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	team := TeamUserID
+	e := newServerEnvWithTeam(t, badges, blocklists, chats, messages, profiles, team)
+	groupID := e.putTeamPrivateGroup(chats, team)
+	_, err := chats.GetKeyEnvelope(e.ctx, groupID, team)
+	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+
+	// Nothing but the group's scheme goes in.
+	for _, refused := range []struct {
+		content []*messagingpb.Content
+		result  messagingpb.SendMessageResponse_Result
+	}{
+		{textContent("plaintext"), messagingpb.SendMessageResponse_ENCRYPTION_REQUIRED},
+		{encryptedContent(1), messagingpb.SendMessageResponse_ENCRYPTION_NOT_ALLOWED},
+	} {
+		resp, err := e.sendContentToChat(e.keysA, groupID, refused.content, generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, refused.result, resp.Result)
+		require.Nil(t, resp.Message)
+	}
+
+	// The user sends under the chat key, edits and deletes their own
+	// message, and types.
+	var sent []*messagingpb.Message
+	for i := byte(1); i <= 2; i++ {
+		resp, err := e.sendContentToChat(e.keysA, groupID, chatKeyEncryptedContent(i), generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+		require.True(t, proto.Equal(chatKeyEncryptedContent(i)[0], resp.Message.Content[0]))
+		sent = append(sent, resp.Message)
+	}
+	plainEdit, err := e.editMessageInChat(e.keysA, groupID, sent[0].MessageId, textContent("plaintext"), sent[0].EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_ENCRYPTION_REQUIRED, plainEdit.Result)
+	edited, err := e.editMessageInChat(e.keysA, groupID, sent[0].MessageId, chatKeyEncryptedContent(3), sent[0].EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_OK, edited.Result)
+	typing, err := e.notifyIsTypingInChat(e.keysA, groupID, messagingpb.IsTypingNotification_STARTED_TYPING)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.NotifyIsTypingResponse_OK, typing.Result)
+	deleted, err := e.deleteMessageInChat(e.keysA, groupID, sent[0].MessageId, edited.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, deleted.Result)
+
+	// A non-member is DENIED as in any private group.
+	_, strangerKeys := e.addUser()
+	strangerSend, err := e.sendContentToChat(strangerKeys, groupID, chatKeyEncryptedContent(4), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, strangerSend.Result)
+
+	// A silence, set as the creator would set it, takes speech and leaves
+	// deletion.
+	_, _, err = chats.SetSilence(e.ctx, groupID, e.userA, chat.Silence{Forever: true}, time.Now())
+	require.NoError(t, err)
+	silencedSend, err := e.sendContentToChat(e.keysA, groupID, chatKeyEncryptedContent(5), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, silencedSend.Result)
+	silencedTyping, err := e.notifyIsTypingInChat(e.keysA, groupID, messagingpb.IsTypingNotification_STARTED_TYPING)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, silencedTyping.Result)
+	silencedDelete, err := e.deleteMessageInChat(e.keysA, groupID, sent[1].MessageId, sent[1].EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.DeleteMessageResponse_OK, silencedDelete.Result)
+
+	// A server that knows no team account finds the same group keyless.
+	noTeam := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	keyless := noTeam.putTeamPrivateGroup(chats, team)
+	resp, err := noTeam.sendContentToChat(noTeam.keysA, keyless, chatKeyEncryptedContent(6), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, resp.Result)
+	typing, err = noTeam.notifyIsTypingInChat(noTeam.keysA, keyless, messagingpb.IsTypingNotification_STARTED_TYPING)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.NotifyIsTypingResponse_DENIED, typing.Result)
+
+	// Any other creator is refused the same group, with nothing written.
+	other := model.MustGenerateUserID()
+	otherGroup := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{other, e.userA},
+		Title:        "Welcome",
+		IsPrivate:    true,
+		CreatorID:    other,
+		LastActivity: at(1),
+	}
+	require.Error(t, chats.PutPrivateGroup(e.ctx, otherGroup, []chat.MemberKeyEnvelope{{
+		UserID: e.userA,
+		Envelope: chat.KeyEnvelope{
+			Scheme:     chatpb.KeyEnvelope_X25519_XCHACHA20POLY1305,
+			Nonce:      bytes.Repeat([]byte{1}, 24),
+			Ciphertext: bytes.Repeat([]byte{1}, 48),
+			WrappedBy:  other,
+		},
+	}}))
+	_, err = chats.GetChatByID(e.ctx, otherGroup.ID)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+}
+
+// testServer_SendMessage_TeamNotPushedInGroups pins that the team account is
+// never pushed to in a group, as in a DM. In the private group the team
+// created for a user, the user's message pushes nobody, the team's devices
+// getting nothing and its badge unmoved, while the team's message, sent
+// through the Sender as the server sends it, pushes the user. In an ordinary
+// group the team happens to be a member of, a message pushes every other
+// member but the team.
+func testServer_SendMessage_TeamNotPushedInGroups(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	team := TeamUserID
+	e := newServerEnvWithTeam(t, badges, blocklists, chats, messages, profiles, team)
+	e.pusher.setResolveBadges()
+
+	// Everyone has a display name, which a group push renders, so a push that
+	// is missing is missing because of the team account, not the name.
+	require.NoError(t, profiles.SetDisplayName(e.ctx, team, "Flipcash"))
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Alice"))
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userB, "Bob"))
+
+	// pushedTo reports how many pushes so far were addressed to the user.
+	pushedTo := func(userID *commonpb.UserId) int {
+		var n int
+		for _, p := range e.pusher.snapshot() {
+			for _, u := range p.users {
+				if bytes.Equal(u.Value, userID.Value) {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	badgeOf := func(userID *commonpb.UserId) uint64 {
+		t.Helper()
+		count, err := badges.Get(e.ctx, userID)
+		require.NoError(t, err)
+		return count
+	}
+
+	// The user's message in the team's group: the team is the only one to
+	// push, and is not. The window gives the asynchronous push room to (not)
+	// fire.
+	groupID := e.putTeamPrivateGroup(chats, team)
+	own, err := e.sendContentToChat(e.keysA, groupID, chatKeyEncryptedContent(1), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, own.Result)
+	require.Never(t, func() bool { return len(e.pusher.snapshot()) > 0 }, 500*time.Millisecond, 20*time.Millisecond)
+
+	// The team's message there pushes the user, and only the user.
+	_, err = e.sender.Send(e.ctx, groupID, team, textContent("welcome"), generateClientID(), true)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return pushedTo(e.userA) == 1 }, time.Second, 20*time.Millisecond)
+	require.Never(t, func() bool { return len(e.pusher.snapshot()) > 1 }, 300*time.Millisecond, 20*time.Millisecond)
+	require.Zero(t, pushedTo(team))
+	require.EqualValues(t, 1, badgeOf(e.userA))
+	require.Zero(t, badgeOf(team))
+
+	// In an ordinary group the team is a member of, a message pushes the
+	// other members, and still not the team.
+	ordinary := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           ordinary,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB, team},
+		LastActivity: at(1),
+	}))
+	sent, err := e.sendContentToChat(e.keysA, ordinary, textContent("hello"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	require.Eventually(t, func() bool { return pushedTo(e.userB) == 1 }, time.Second, 20*time.Millisecond)
+	require.Never(t, func() bool { return len(e.pusher.snapshot()) > 2 }, 300*time.Millisecond, 20*time.Millisecond)
+	require.Zero(t, pushedTo(team))
+	require.EqualValues(t, 1, badgeOf(e.userB))
+	require.Zero(t, badgeOf(team))
 }
 
 // testServer_PrivateGroup_Keyed pins what a private group takes once its

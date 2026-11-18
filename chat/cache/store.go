@@ -62,6 +62,14 @@ func (c *Cache) PutChat(ctx context.Context, ch *chat.Chat) error {
 	return c.db.PutChat(ctx, ch)
 }
 
+// PutPrivateGroup passes through. Nothing it writes is held here before it
+// is read: a group's rules are cached only on a successful read, which a
+// group not yet created never has, and membership and key envelopes are
+// never cached.
+func (c *Cache) PutPrivateGroup(ctx context.Context, ch *chat.Chat, envelopes []chat.MemberKeyEnvelope) error {
+	return c.db.PutPrivateGroup(ctx, ch, envelopes)
+}
+
 func (c *Cache) AddGroupMembers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (bool, chat.RosterSummary, error) {
 	return c.db.AddGroupMembers(ctx, chatID, userIDs)
 }

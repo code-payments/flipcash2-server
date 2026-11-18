@@ -174,20 +174,17 @@ func (m *memory) PutChat(_ context.Context, c *chat.Chat) error {
 	// existence check so a malformed request is rejected on its own terms
 	// regardless of whether the chat happens to exist, matching the persistent
 	// stores, which validate before they attempt the write.
-	var groupMembers map[string]*memberRecord
 	if chat.IsGroupChatID(c.ID) {
-		now := time.Now().UTC()
-		groupMembers = make(map[string]*memberRecord, len(c.Members))
-		for _, member := range c.Members {
-			groupMembers[string(member.Value)] = &memberRecord{joined: true, joinedAt: now}
+		groupMembers, err := newGroupMemberRecords(c)
+		if err != nil {
+			return err
 		}
-		if len(groupMembers) == 0 {
-			return chat.ErrNoMembers
-		}
-		if len(groupMembers) > chat.MaxGroupChatCreationMembers {
-			return chat.ErrTooManyMembers
-		}
-	} else if len(c.Members) == 0 {
+
+		m.Lock()
+		defer m.Unlock()
+		return m.putGroupLocked(c, groupMembers)
+	}
+	if len(c.Members) == 0 {
 		return chat.ErrNoMembers
 	}
 
@@ -199,22 +196,9 @@ func (m *memory) PutChat(_ context.Context, c *chat.Chat) error {
 		return chat.ErrChatExists
 	}
 
-	// Group membership lives in its own records; the canonical chat holds no
-	// member list and no roster summary. DM membership is stored inline and
-	// immutable, so its summary is fixed here.
+	// DM membership is stored inline and immutable, so its summary is fixed
+	// here.
 	stored := c.Clone()
-	if chat.IsGroupChatID(c.ID) {
-		stored.Members = nil
-		stored.RosterSummary = chat.RosterSummary{}
-		stored.OpeningIntentID = nil
-		m.chats[key] = stored
-		m.groupMembers[key] = groupMembers
-		if mint, ok := chat.GatedMint(c); ok {
-			m.enqueueHoldingsRefreshLocked(c.ID, mint, time.Now())
-		}
-		return nil
-	}
-
 	stored.RosterSummary = chat.RosterSummary{MemberCount: uint64(len(stored.Members))}
 	m.chats[key] = stored
 	if excluded := m.exclusions.For(c); len(excluded) > 0 {
@@ -223,6 +207,74 @@ func (m *memory) PutChat(_ context.Context, c *chat.Chat) error {
 			set[string(userID.Value)] = struct{}{}
 		}
 		m.excludedFromFeed[key] = set
+	}
+	return nil
+}
+
+// PutPrivateGroup is putGroupLocked with the envelopes stored in the same
+// critical section, so the group and its envelopes appear together, and
+// neither does when the group exists already.
+func (m *memory) PutPrivateGroup(_ context.Context, c *chat.Chat, envelopes []chat.MemberKeyEnvelope) error {
+	if err := chat.ValidatePrivateGroupCreation(c, envelopes, m.exclusions); err != nil {
+		return err
+	}
+	groupMembers, err := newGroupMemberRecords(c)
+	if err != nil {
+		return err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	if err := m.putGroupLocked(c, groupMembers); err != nil {
+		return err
+	}
+	for _, e := range envelopes {
+		byChat := m.keyEnvelopes[string(e.UserID.Value)]
+		if byChat == nil {
+			byChat = make(map[string]chat.KeyEnvelope)
+			m.keyEnvelopes[string(e.UserID.Value)] = byChat
+		}
+		byChat[string(c.ID.Value)] = e.Envelope.Clone()
+	}
+	return nil
+}
+
+// newGroupMemberRecords is a group's initial membership records, one per
+// distinct member of c, joined as of now, refused as the persistent stores
+// refuse them: ErrNoMembers for none and ErrTooManyMembers past the cap.
+func newGroupMemberRecords(c *chat.Chat) (map[string]*memberRecord, error) {
+	now := time.Now().UTC()
+	records := make(map[string]*memberRecord, len(c.Members))
+	for _, member := range c.Members {
+		records[string(member.Value)] = &memberRecord{joined: true, joinedAt: now}
+	}
+	if len(records) == 0 {
+		return nil, chat.ErrNoMembers
+	}
+	if len(records) > chat.MaxGroupChatCreationMembers {
+		return nil, chat.ErrTooManyMembers
+	}
+	return records, nil
+}
+
+// putGroupLocked creates the group c with its initial membership records,
+// or returns ErrChatExists, writing nothing, when it exists. Group membership
+// lives in its own records; the canonical chat holds no member list and no
+// roster summary.
+func (m *memory) putGroupLocked(c *chat.Chat, groupMembers map[string]*memberRecord) error {
+	key := string(c.ID.Value)
+	if _, ok := m.chats[key]; ok {
+		return chat.ErrChatExists
+	}
+	stored := c.Clone()
+	stored.Members = nil
+	stored.RosterSummary = chat.RosterSummary{}
+	stored.OpeningIntentID = nil
+	m.chats[key] = stored
+	m.groupMembers[key] = groupMembers
+	if mint, ok := chat.GatedMint(c); ok {
+		m.enqueueHoldingsRefreshLocked(c.ID, mint, time.Now())
 	}
 	return nil
 }
@@ -516,11 +568,20 @@ func (m *memory) IsMember(_ context.Context, chatID *commonpb.ChatId, userID *co
 	return hasInlineMember(m.chats[string(chatID.Value)], userID), nil
 }
 
+// GetGroupMembershipsForUser lists nothing for a user the store excludes
+// from the feed (see chat.Store.PutChat). The persistent stores decide that
+// on each write of a record; this store's exclusions are fixed at
+// construction and it is the only writer of its records, so deciding it here
+// on the read is the same, and leaves the records themselves as for anyone.
+// GetGroupChatsForUser and GetGroupChatsForUserByIDs do likewise.
 func (m *memory) GetGroupMembershipsForUser(_ context.Context, userID *commonpb.UserId) ([]chat.GroupMembership, error) {
 	m.Lock()
 	defer m.Unlock()
 
 	memberships := make([]chat.GroupMembership, 0)
+	if m.exclusions.Excludes(userID) {
+		return memberships, nil
+	}
 	for chatKey, members := range m.groupMembers {
 		// A departed member is a false entry, kept as the persistent stores
 		// keep a tombstone; a user never in the group has no entry.
@@ -542,6 +603,9 @@ func (m *memory) GetGroupChatsForUser(_ context.Context, userID *commonpb.UserId
 	defer m.Unlock()
 
 	chats := make([]*chat.Chat, 0)
+	if m.exclusions.Excludes(userID) {
+		return chats, nil
+	}
 	for chatKey := range m.groupMembers {
 		if m.isJoinedLocked(chatKey, string(userID.Value)) {
 			chats = append(chats, m.chats[chatKey].Clone())
@@ -561,6 +625,9 @@ func (m *memory) GetGroupChatsForUserByIDs(_ context.Context, userID *commonpb.U
 	defer m.Unlock()
 
 	chats := make([]*chat.Chat, 0, len(chatIDs))
+	if m.exclusions.Excludes(userID) {
+		return chats, nil
+	}
 	seen := make(map[string]struct{}, len(chatIDs))
 	for _, chatID := range chatIDs {
 		key := string(chatID.Value)

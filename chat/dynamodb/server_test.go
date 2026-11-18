@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+
 	"github.com/code-payments/flipcash2-server/chat/tests"
 )
 
@@ -28,7 +30,7 @@ const (
 func TestChat_DynamoDBServer(t *testing.T) {
 	require.NoError(t, CreateTables(context.Background(), testEnv.Client, serverChatsTable, serverDmInboxTable, serverGroupMembersTable, serverUserStateTable, serverActivityTable, serverKeyEnvelopesTable, serverLobbiesTable, serverFeaturedGroupsTable, serverHoldingsTable, serverInvitesTable, serverPinsTable))
 
-	testStore := NewInDynamoDB(testEnv.Client, serverChatsTable, serverDmInboxTable, serverGroupMembersTable, serverUserStateTable, serverActivityTable, serverKeyEnvelopesTable, serverLobbiesTable, serverFeaturedGroupsTable, serverHoldingsTable, serverInvitesTable, serverPinsTable, nil)
+	testStore := NewInDynamoDB(testEnv.Client, serverChatsTable, serverDmInboxTable, serverGroupMembersTable, serverUserStateTable, serverActivityTable, serverKeyEnvelopesTable, serverLobbiesTable, serverFeaturedGroupsTable, serverHoldingsTable, serverInvitesTable, serverPinsTable, []*commonpb.UserId{tests.TeamUserID})
 	teardown := func() {
 		testStore.(*store).reset()
 	}

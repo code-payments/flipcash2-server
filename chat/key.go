@@ -25,8 +25,8 @@ import (
 //
 // SetKeyEnvelope stores the envelope as one the caller wrapped for themself,
 // whatever they hold already. It is how a group gets its key: the creator
-// stores theirs as the second step of creating the group, and a private group
-// has a key exactly when they have (see KeyEnvelope). It is also how an
+// stores theirs as the second step of creating the group, and a group created
+// that way has a key exactly when they have (see KeyEnvelope). It is also how an
 // admitted member replaces the envelope the creator wrapped for them with one
 // that depends on no one else's key, and how a member who joined with an
 // invite replaces the invite's copy of the chat key they hold (see
@@ -54,14 +54,19 @@ import (
 // Nothing is published by either: a user's other devices fetch the envelope
 // when they need it.
 //
-// Storing the creator's envelope is what opens the group to its members'
-// messages and its lobby to those who would join (see Access.SpeakerStanding
-// and Server.EnterLobby); nothing is published for that either, since the
-// creator's client is the one that stored it. Every other envelope a group
-// holds was stored by the creator admitting that member (see
-// Server.AdmitLobbyMember), or is an invite's copy stored by the member's
-// join with it (see Server.JoinChat and Store.JoinWithInvite), until the
-// member replaces it with their own.
+// For a group created through StartChat, storing the creator's envelope is
+// what opens the group to its members' messages and its lobby to those who
+// would join (see Access.SpeakerStanding and Server.EnterLobby); nothing is
+// published for that either, since the creator's client is the one that
+// stored it. A group the team account created for a user is open to its
+// members' messages from its creation instead, having been written with their
+// envelopes (see Store.PutPrivateGroup), and never has a lobby; the team has
+// no client and stores no envelope of its own (see Access.hasKey). Every
+// other envelope a group holds was stored by the creator admitting that
+// member (see Server.AdmitLobbyMember), written with the group at its
+// creation, or is an invite's copy stored by the member's join with it (see
+// Server.JoinChat and Store.JoinWithInvite), until the member replaces it
+// with their own.
 
 func (s *Server) SetKeyEnvelope(ctx context.Context, req *chatpb.SetKeyEnvelopeRequest) (*chatpb.SetKeyEnvelopeResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
@@ -183,4 +188,91 @@ func (s *Server) keyEnvelopeAllowed(ctx context.Context, log *zap.Logger, chatID
 		return chatpb.GetKeyEnvelopeResponse_DENIED, nil
 	}
 	return chatpb.GetKeyEnvelopeResponse_OK, nil
+}
+
+// MemberKeyEnvelope is a key envelope written with the private group it is
+// for, at the group's creation (see Store.PutPrivateGroup): Envelope is
+// UserID's envelope, wrapped by the group's creator.
+type MemberKeyEnvelope struct {
+	UserID   *commonpb.UserId
+	Envelope KeyEnvelope
+}
+
+// ValidatePrivateGroupCreation checks a private group and the envelopes it is
+// to be created with, as Store.PutPrivateGroup takes them, for a store whose
+// feed exclusions are exclusions (see FeedExclusions), so that every backend
+// refuses the same creations: c must be a group (a GroupChatIDSize ID, type GROUP) that
+// is private and names its creator, with at least one member (ErrNoMembers
+// otherwise); each envelope must be for one of c's members, at most one per
+// member, and be one the creator wrapped (WrappedBy is c.CreatorID) rather
+// than an invite's copy, since at creation no one else has wrapped anything
+// and no invite exists; and c's distinct members and the envelopes together
+// must number at most MaxGroupChatCreationMembers (ErrTooManyMembers
+// otherwise), since every one is an item of the same atomic write.
+//
+// The creator's own envelope is required, unless exclusions name the
+// creator, and then refused. A group is keyed by its creator's envelope (see
+// Access.hasKey), so one created without it would be keyless, and nothing
+// could be said in it until the creator stored one: a creation through the
+// store is the server making a group ready to use, which StartChat's
+// create-then-SetKeyEnvelope is not. The creator must therefore be a member,
+// since an envelope is only ever for a member. A creator the store excludes,
+// in production exactly the team account, is the exception: its groups are
+// keyed by construction (see Access.teamCreated), it has no client to open
+// an envelope with, and envelopes are keyed by user, so storing one for each
+// group it creates would put every one under the same hot partition, which
+// is what excluding it is for.
+//
+// Every failure but ErrNoMembers and ErrTooManyMembers is a plain error: each
+// is a caller's bug, not a state a client can reach.
+func ValidatePrivateGroupCreation(c *Chat, envelopes []MemberKeyEnvelope, exclusions FeedExclusions) error {
+	if !IsGroupChatID(c.ID) || c.Type != chatpb.ChatType_GROUP {
+		return errors.New("not a group chat")
+	}
+	if !c.IsPrivate {
+		return errors.New("not a private group")
+	}
+	if c.CreatorID == nil {
+		return errors.New("private group names no creator")
+	}
+
+	var members []*commonpb.UserId
+	for _, member := range c.Members {
+		if !containsUser(members, member) {
+			members = append(members, member)
+		}
+	}
+	if len(members) == 0 {
+		return ErrNoMembers
+	}
+
+	var enveloped []*commonpb.UserId
+	for _, e := range envelopes {
+		switch {
+		case e.UserID == nil:
+			return errors.New("key envelope names no user")
+		case !containsUser(members, e.UserID):
+			return errors.New("key envelope for a user who is not a member")
+		case containsUser(enveloped, e.UserID):
+			return errors.New("more than one key envelope for a member")
+		case e.Envelope.IsInviteCopy():
+			return errors.New("key envelope is an invite's copy")
+		case !e.Envelope.IsWrappedBy(c.CreatorID):
+			return errors.New("key envelope not wrapped by the creator")
+		}
+		enveloped = append(enveloped, e.UserID)
+	}
+
+	creatorEnveloped := containsUser(enveloped, c.CreatorID)
+	switch excluded := exclusions.Excludes(c.CreatorID); {
+	case excluded && creatorEnveloped:
+		return errors.New("key envelope for a creator the store excludes")
+	case !excluded && !creatorEnveloped:
+		return errors.New("no key envelope of the creator's own")
+	}
+
+	if len(members)+len(envelopes) > MaxGroupChatCreationMembers {
+		return ErrTooManyMembers
+	}
+	return nil
 }

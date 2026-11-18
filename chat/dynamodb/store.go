@@ -52,7 +52,9 @@ import (
 //	          mutable — unlike a DM's inline member list. Group chats
 //	          deliberately have no per-message inbox fan-out: a send touches
 //	          only the canonical chats item, and a user's group feed is
-//	          assembled at read time via the inverted gsiByUser. Joined members
+//	          assembled at read time via the inverted gsiByUser, which leaves
+//	          out the rows of users excluded from the feed (see
+//	          chat.Store.PutChat and groupMemberItem). Joined members
 //	          are enumerated from the partition itself, which tombstone expiry
 //	          keeps near-dense (see getGroupMembers).
 //
@@ -391,9 +393,11 @@ const (
 
 	// gsiByUser is the inverted (user, chat) index on group_members, for
 	// listing the group chats a user is a member of. It is keyed by the sparse
-	// user attribute — the member's ID, written once and present on membership
-	// rows (tombstones included) and nothing else — rather than the sk itself,
-	// so non-membership items in the table stay out of the index.
+	// user attribute — the member's ID, present on membership rows (tombstones
+	// included) and nothing else — rather than the sk itself, so
+	// non-membership items in the table stay out of the index. The rows of a
+	// user the store excludes from the feed omit it too (see groupMemberItem),
+	// so the index holds no key for an account in every user's groups.
 	gsiByUser = "by_user"
 
 	// gsiByJoinedAt is the sparse (chat, joined_at) index on group_members.
@@ -669,7 +673,10 @@ const maxTransactWriteItems = 100
 // A group chat is created in one transaction covering the canonical item, the
 // #meta counter, every membership record and, for a group gated on a currency,
 // its holdings refresh entry, so the domain's cap on the initial member set
-// must leave room for those three items within maxTransactWriteItems.
+// must leave room for those three items within maxTransactWriteItems. A
+// private group created with key envelopes (see PutPrivateGroup) puts each in
+// the same transaction, and the domain holds its members and envelopes
+// together to the same cap, so the bound covers that creation too.
 // Asserted rather than assumed, since the cap lives in the chat package and this
 // is the constraint it exists to respect: raising it past the ceiling fails to
 // compile here, because the difference underflows uint.
@@ -733,10 +740,41 @@ func (s *store) putDmChat(ctx context.Context, c *chat.Chat) error {
 
 // putGroupChat creates a group chat: the canonical metadata item, the #meta
 // counter seeded with the initial member count, and every initial membership
-// record, in one transaction. The canonical item's condition enforces uniqueness
-// for the whole write, so a duplicate reports ErrChatExists with nothing else
-// written.
+// record, in one transaction (see createGroup).
 func (s *store) putGroupChat(ctx context.Context, c *chat.Chat) error {
+	return s.createGroup(ctx, c, nil)
+}
+
+// PutPrivateGroup is createGroup carrying an unconditional put of each
+// envelope, the same put AdmitFromLobby carries for the envelope of the
+// member it admits, so an envelope written here is stored as an admission's
+// is. The puts need no condition of their own: the canonical item's
+// condition decides the whole transaction, so a group that exists already
+// cancels them with the rest, and ErrChatExists leaves any envelope already
+// stored as it was.
+func (s *store) PutPrivateGroup(ctx context.Context, c *chat.Chat, envelopes []chat.MemberKeyEnvelope) error {
+	if err := chat.ValidatePrivateGroupCreation(c, envelopes, s.exclusions); err != nil {
+		return err
+	}
+
+	puts := make([]types.TransactWriteItem, 0, len(envelopes))
+	for _, e := range envelopes {
+		puts = append(puts, types.TransactWriteItem{Put: &types.Put{
+			TableName: aws.String(s.keyEnvelopesTable),
+			Item:      keyEnvelopeItem(c.ID, e.UserID, e.Envelope),
+		}})
+	}
+	return s.createGroup(ctx, c, puts)
+}
+
+// createGroup creates the group chat c, with alongside committed in the same
+// transaction: the canonical metadata item, the #meta counter seeded with the
+// initial member count, every initial membership record (see
+// groupMemberItem) and, for a group gated on a currency, its holdings refresh
+// entry, then alongside's items. The canonical item is first, and its
+// condition enforces uniqueness for the whole write, so a duplicate reports
+// ErrChatExists with nothing else written, alongside included.
+func (s *store) createGroup(ctx context.Context, c *chat.Chat, alongside []types.TransactWriteItem) error {
 	// Collapse duplicates before building the transaction: two actions on one
 	// item is a validation error, not a cancellation, so a repeated member would
 	// fail the write outright rather than being absorbed the way AddGroupMembers
@@ -781,6 +819,7 @@ func (s *store) putGroupChat(ctx context.Context, c *chat.Chat) error {
 			},
 		})
 	}
+	transactItems = append(transactItems, alongside...)
 	_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 		TransactItems: transactItems,
 	})
@@ -865,24 +904,35 @@ func (s *store) banCheck(chatID *commonpb.ChatId, userID *commonpb.UserId) *type
 }
 
 // joinUpdate is the membership transition that (re)joins userID to chatID
-// (see addGroupMembers), for transitionMembership to carry.
+// (see addGroupMembers), for transitionMembership to carry. It sets the user
+// attribute, listing the record in gsiByUser, unless the store excludes the
+// user from the feed, when it removes it instead, so the record is unlisted
+// whatever an earlier write left on it (see groupMemberItem).
 func (s *store) joinUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.Update {
+	values := map[string]types.AttributeValue{
+		":joined": avN(memberStateJoined),
+		":now":    avN(uint64(time.Now().UTC().UnixNano())),
+	}
+	expression := fmt.Sprintf(
+		"SET #state = :joined, #user = :user, %s = :now, %s = :version REMOVE %s, %s", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
+	)
+	if s.exclusions.Excludes(userID) {
+		expression = fmt.Sprintf(
+			"SET #state = :joined, %s = :now, %s = :version REMOVE %s, %s, #user", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
+		)
+	} else {
+		values[":user"] = avS(userIndexKey(userID))
+	}
 	return &types.Update{
 		TableName: aws.String(s.groupMembersTable),
 		Key: map[string]types.AttributeValue{
 			attrPK: avS(chatPK(chatID)),
 			attrSK: avS(userPK(userID)),
 		},
-		UpdateExpression: aws.String(fmt.Sprintf(
-			"SET #state = :joined, #user = :user, %s = :now, %s = :version REMOVE %s, %s", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
-		)),
-		ConditionExpression:      aws.String("attribute_not_exists(#state) OR #state <> :joined"),
-		ExpressionAttributeNames: map[string]string{"#state": attrState, "#user": attrUser},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":joined": avN(memberStateJoined),
-			":user":   avS(userIndexKey(userID)),
-			":now":    avN(uint64(time.Now().UTC().UnixNano())),
-		},
+		UpdateExpression:          aws.String(expression),
+		ConditionExpression:       aws.String("attribute_not_exists(#state) OR #state <> :joined"),
+		ExpressionAttributeNames:  map[string]string{"#state": attrState, "#user": attrUser},
+		ExpressionAttributeValues: values,
 	}
 }
 
@@ -922,20 +972,29 @@ func (s *store) keyEnvelopeDiscard(chatID *commonpb.ChatId, userID *commonpb.Use
 // tombstoneTTL). Only a joined member transitions — the condition makes
 // removing a non-member (or an unknown user) a no-op rather than an upsert of
 // a malformed tombstone. Removing joined_at drops the member from the sparse
-// gsiByJoinedAt.
+// gsiByJoinedAt. The user attribute is left as the join wrote it, so a
+// tombstone stays listed in gsiByUser, unless the store excludes the user
+// from the feed, when it is removed, as joinUpdate removes it, so the
+// tombstone is unlisted however the join was written.
 func (s *store) leaveUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.Update {
 	now := time.Now().UTC()
+	expression := fmt.Sprintf(
+		"SET #state = :left, %s = :now, %s = :version, %s = :expires REMOVE %s", attrLeftAt, attrVersion, attrExpiresAt, attrJoinedAt,
+	)
+	names := map[string]string{"#state": attrState}
+	if s.exclusions.Excludes(userID) {
+		expression += ", #user"
+		names["#user"] = attrUser
+	}
 	return &types.Update{
 		TableName: aws.String(s.groupMembersTable),
 		Key: map[string]types.AttributeValue{
 			attrPK: avS(chatPK(chatID)),
 			attrSK: avS(userPK(userID)),
 		},
-		UpdateExpression: aws.String(fmt.Sprintf(
-			"SET #state = :left, %s = :now, %s = :version, %s = :expires REMOVE %s", attrLeftAt, attrVersion, attrExpiresAt, attrJoinedAt,
-		)),
+		UpdateExpression:         aws.String(expression),
 		ConditionExpression:      aws.String("#state = :joined"),
-		ExpressionAttributeNames: map[string]string{"#state": attrState},
+		ExpressionAttributeNames: names,
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":joined":  avN(memberStateJoined),
 			":left":    avN(memberStateLeft),
@@ -1692,7 +1751,9 @@ func groupMemberFromItem(item map[string]types.AttributeValue) (chat.GroupMember
 // GetGroupMembershipsForUser lists the user's membership records via the
 // inverted gsiByUser. The index is keyed by the sparse user attribute, which
 // tombstones keep (unlike joined_at), so departed memberships are in the user's
-// slice alongside joined ones, and come back with their state.
+// slice alongside joined ones, and come back with their state. A user excluded
+// from the feed has no rows in the index, so the query returns nothing for
+// them, as it does in GetGroupChatsForUser and GetGroupChatsForUserByIDs.
 func (s *store) GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId) ([]chat.GroupMembership, error) {
 	return s.queryGroupMemberships(ctx, userID, nil, nil, false)
 }
@@ -2273,15 +2334,22 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 // groupMemberItem is a joined membership record, as written at group creation.
 // It matches what addGroupMembers converges to: state joined, user set (the
 // gsiByUser hash key), joined_at present (the sparse gsiByJoinedAt keys off its
-// presence), no left_at.
+// presence), no left_at. The record of a user the store excludes from the feed
+// carries no user attribute, so it is not in gsiByUser and no listing of the
+// user's groups returns it (see chat.Store.PutChat); nothing else reads the
+// attribute, since every reader of a membership record takes the member's ID
+// from its sk, so the record is a member's in every other respect.
 func (s *store) groupMemberItem(chatID *commonpb.ChatId, member *commonpb.UserId, joinedAt time.Time) map[string]types.AttributeValue {
-	return map[string]types.AttributeValue{
+	item := map[string]types.AttributeValue{
 		attrPK:       avS(chatPK(chatID)),
 		attrSK:       avS(userPK(member)),
-		attrUser:     avS(userIndexKey(member)),
 		attrState:    avN(memberStateJoined),
 		attrJoinedAt: avN(uint64(joinedAt.UnixNano())),
 	}
+	if !s.exclusions.Excludes(member) {
+		item[attrUser] = avS(userIndexKey(member))
+	}
+	return item
 }
 
 // groupMetaItem is a group's aggregates item as written at creation: the

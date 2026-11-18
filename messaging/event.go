@@ -40,8 +40,9 @@ const broadcastTimeout = 5 * time.Second
 // ignored for a group.
 //
 // The team account is never delivered to, on the stream or by push, whatever
-// happened in its DMs (see NewSender): nobody reads as it. The user it
-// talks to hears about everything as usual.
+// happened in its DMs, and never pushed to in a group (see NewSender): nobody
+// reads as it. The users it shares a chat with hear about everything as
+// usual.
 func (s *Sender) publishChatUpdate(
 	ctx context.Context,
 	log *zap.Logger,

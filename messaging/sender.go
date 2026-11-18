@@ -123,7 +123,12 @@ func WithPushPageConcurrency(n int) SenderOption {
 // push (see publishChatUpdate): a stream opened as it would carry every event
 // in every one of its DMs, and a push to it is a profile, mute, blocklist and
 // token read spent on an account with no devices. The user it talks to hears
-// about everything as usual.
+// about everything as usual. Nor is it pushed to in a group it is a member
+// of, the private groups it creates for users among them, whoever sends:
+// every page of a group's push fan-out drops it (see pushSentMessages), and
+// the group's other members hear about everything as usual. A group's events
+// go out on its chat topic, which reaches only the streams subscribed to it,
+// and the team opens none.
 //
 // Its DMs are the team's to write in alone: they carry a Never speaker rule
 // (see chat.RuleEvaluator, which the parent builds with the same team
@@ -414,7 +419,7 @@ func (s *Sender) recordGroupSenders(ctx context.Context, log *zap.Logger, chatID
 
 // TeamAccount returns the team account the Sender was built with (see
 // NewSender), or nil when there is none. It is for sending as the team
-// (see flipcashteam.SendMessages), so that the account sent as is the one the
+// (see flipcashteam.SendDmMessages), so that the account sent as is the one the
 // Sender treats as the team, from one configuration.
 func (s *Sender) TeamAccount() *commonpb.UserId {
 	if s.teamUserID == nil {

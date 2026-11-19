@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -83,6 +84,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_PaymentRequestWidget,
 		testServer_PaymentRequestWidget_PrivateGroup,
 		testServer_SendMessage_Broadcast,
+		testServer_SendMessage_PublishedBeforeBookkeeping,
 		testServer_SendBatch,
 		testServer_SendBatch_SideEffects,
 		testServer_SendBatch_Group,
@@ -1493,10 +1495,10 @@ func testServer_SendMessage_Broadcast(t *testing.T, badges badge.Store, blocklis
 	// new message in this phase).
 	require.Equal(t, id, resp.Message.EventSequence)
 
-	// userB receives a single ChatUpdate carrying the send as a gap-detected,
-	// single-mutation message_sent event (sequenced at its event_sequence),
-	// alongside a last-activity metadata update and the sender's auto-advanced
-	// READ pointer (the sender has implicitly read their own message). The
+	// userB hears of the send in two updates. The first carries the send, as a
+	// gap-detected, single-mutation message_sent event (sequenced at its
+	// event_sequence), alongside a last-activity metadata update. It is
+	// published ahead of the send's bookkeeping, so it has no pointer. The
 	// deprecated new_messages field is not asserted on either way.
 	e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
 		if u.Events == nil || len(u.Events.Events) != 1 {
@@ -1510,9 +1512,151 @@ func testServer_SendMessage_Broadcast(t *testing.T, badges badge.Store, blocklis
 		if sent == nil || sent.MessageId.Value != id || sent.EventSequence != id {
 			return false
 		}
-		return len(u.MetadataUpdates) > 0 &&
-			u.PointerUpdates != nil && hasPointer(u.PointerUpdates.Pointers, messagingpb.Pointer_READ, e.userA, id)
+		return carriesLastActivityOnly(u)
 	})
+
+	// The second carries the sender's auto-advanced READ pointer (the sender
+	// has implicitly read their own message) and nothing else.
+	e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
+		return isPointerFollowUp(u) &&
+			len(u.GetPointerUpdates().GetPointers()) == 1 &&
+			hasPointer(u.GetPointerUpdates().GetPointers(), messagingpb.Pointer_READ, e.userA, id)
+	})
+}
+
+// testServer_SendMessage_PublishedBeforeBookkeeping pins the order of a send's
+// side effects: members hear of the message while the chat's last-message
+// bump is still outstanding, in an update that already names the chat's new
+// last activity, the send returns only once the bump has landed, and a DM's
+// members then hear of the sender's pointer in a second update, while a group
+// hears nothing more.
+func testServer_SendMessage_PublishedBeforeBookkeeping(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	gated := &gatedChats{Store: chats}
+	e := newServerEnv(t, badges, blocklists, gated, messages, profiles)
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+
+	for _, tc := range []struct {
+		name   string
+		chatID *commonpb.ChatId
+	}{
+		{"dm", e.chatID},
+		{"group", groupID},
+	} {
+		isGroup := chat.IsGroupChatID(tc.chatID)
+		updates := func() (out []*eventpb.ChatUpdate) {
+			for _, u := range e.chatUpdatesFor(e.userB) {
+				if bytes.Equal(u.GetChat().GetValue(), tc.chatID.Value) {
+					out = append(out, u)
+				}
+			}
+			return out
+		}
+
+		release := gated.hold()
+		done := make(chan error, 1)
+		go func() {
+			_, err := e.sender.Send(e.ctx, tc.chatID, e.userA, textContent("hello"), generateClientID(), true)
+			done <- err
+		}()
+
+		// The message is out with the bump still held...
+		require.Eventually(t, func() bool {
+			return slices.ContainsFunc(updates(), func(u *eventpb.ChatUpdate) bool { return carriesSentMessage(u, 1) })
+		}, 2*time.Second, 10*time.Millisecond, tc.name)
+		record, err := chats.GetChatByID(e.ctx, tc.chatID)
+		require.NoError(t, err)
+		require.Zero(t, record.LastMessageID.GetValue(), "%s: the bump is still held", tc.name)
+
+		// ...alone, already naming the new last activity, and the send has not
+		// returned.
+		require.Len(t, updates(), 1, tc.name)
+		require.True(t, carriesLastActivityOnly(updates()[0]), tc.name)
+		select {
+		case err := <-done:
+			t.Fatalf("%s: send returned ahead of its bookkeeping (err: %v)", tc.name, err)
+		default:
+		}
+
+		release()
+		require.NoError(t, <-done, tc.name)
+		record, err = chats.GetChatByID(e.ctx, tc.chatID)
+		require.NoError(t, err)
+		require.Equal(t, uint64(1), record.LastMessageID.GetValue(), tc.name)
+
+		if isGroup {
+			// A group send publishes once.
+			require.Never(t, func() bool { return len(updates()) != 1 }, 200*time.Millisecond, 20*time.Millisecond, tc.name)
+			continue
+		}
+		e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
+			return bytes.Equal(u.GetChat().GetValue(), tc.chatID.Value) && isPointerFollowUp(u) &&
+				hasPointer(u.GetPointerUpdates().GetPointers(), messagingpb.Pointer_READ, e.userA, 1)
+		})
+		require.Len(t, updates(), 2, tc.name)
+	}
+}
+
+// gatedChats is a chat.Store whose AdvanceLastMessage can be held, so that a
+// test can observe what a send has done while that part of its bookkeeping is
+// still outstanding.
+type gatedChats struct {
+	chat.Store
+
+	mu   sync.Mutex
+	gate chan struct{} // nil when nothing is held
+}
+
+// hold makes every AdvanceLastMessage from now on wait until the returned
+// function is called.
+func (g *gatedChats) hold() (release func()) {
+	gate := make(chan struct{})
+	g.mu.Lock()
+	g.gate = gate
+	g.mu.Unlock()
+	return func() {
+		g.mu.Lock()
+		g.gate = nil
+		g.mu.Unlock()
+		close(gate)
+	}
+}
+
+func (g *gatedChats) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, []*commonpb.UserId, error) {
+	g.mu.Lock()
+	gate := g.gate
+	g.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return false, nil, ctx.Err()
+		}
+	}
+	return g.Store.AdvanceLastMessage(ctx, chatID, messageID, ts)
+}
+
+// carriesLastActivityOnly reports whether, beyond its events, the update
+// carries the chat's new last activity and nothing else: no other metadata
+// and no pointers. It is what the update carrying a send's messages looks
+// like, being published ahead of the send's bookkeeping.
+func carriesLastActivityOnly(u *eventpb.ChatUpdate) bool {
+	return u.PointerUpdates == nil &&
+		len(u.MetadataUpdates) == 1 &&
+		u.MetadataUpdates[0].GetLastActivityChanged() != nil
+}
+
+// isPointerFollowUp reports whether the update is the one a DM send follows
+// its messages with: pointers, and neither events nor metadata. The caller
+// checks which pointers it expects.
+func isPointerFollowUp(u *eventpb.ChatUpdate) bool {
+	return u.Events == nil && len(u.MetadataUpdates) == 0 && u.PointerUpdates != nil
 }
 
 func testServer_SendBatch(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
@@ -1533,8 +1677,8 @@ func testServer_SendBatch(t *testing.T, badges badge.Store, blocklists blocklist
 	}
 
 	// One update carries the whole batch, one message_sent event per message in
-	// batch order, with each sender's READ pointer past the last message they
-	// sent in it.
+	// batch order, with the new last activity, and a second follows with each
+	// sender's READ pointer past the last message they sent in it.
 	e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
 		events := u.GetEvents().GetEvents()
 		if len(events) != 3 {
@@ -1545,7 +1689,10 @@ func testServer_SendBatch(t *testing.T, badges badge.Store, blocklists blocklist
 				return false
 			}
 		}
-		return len(u.MetadataUpdates) > 0 &&
+		return carriesLastActivityOnly(u)
+	})
+	e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
+		return isPointerFollowUp(u) &&
 			hasPointer(u.GetPointerUpdates().GetPointers(), messagingpb.Pointer_READ, e.userA, 3) &&
 			hasPointer(u.GetPointerUpdates().GetPointers(), messagingpb.Pointer_READ, e.userB, 2)
 	})
@@ -1621,7 +1768,8 @@ func testServer_SendBatch_SideEffects(t *testing.T, badges badge.Store, blocklis
 		require.Equal(t, uint64(4), page[0].LastMessageID.GetValue())
 	}
 
-	// One update per member carries the whole batch.
+	// One update per member carries the whole batch and the new last activity,
+	// and one more carries both senders' pointers.
 	for _, member := range []*commonpb.UserId{e.userA, e.userB} {
 		e.waitForChatUpdate(member, func(u *eventpb.ChatUpdate) bool {
 			events := u.GetEvents().GetEvents()
@@ -1633,7 +1781,10 @@ func testServer_SendBatch_SideEffects(t *testing.T, badges badge.Store, blocklis
 					return false
 				}
 			}
-			return len(u.MetadataUpdates) == 1 &&
+			return carriesLastActivityOnly(u)
+		})
+		e.waitForChatUpdate(member, func(u *eventpb.ChatUpdate) bool {
+			return isPointerFollowUp(u) &&
 				len(u.GetPointerUpdates().GetPointers()) == 2 &&
 				hasPointer(u.GetPointerUpdates().GetPointers(), messagingpb.Pointer_READ, e.userA, 2) &&
 				hasPointer(u.GetPointerUpdates().GetPointers(), messagingpb.Pointer_READ, e.userB, 4)

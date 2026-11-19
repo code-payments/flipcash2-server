@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -28,7 +29,7 @@ import (
 )
 
 // sideEffectTimeout bounds the post-persistence side effects of a send
-// (pointer advance, last-message bump, broadcast, pushes) once they have been
+// (broadcast, pointer advance, last-message bump, pushes) once they have been
 // detached from the caller's cancellation.
 const sideEffectTimeout = 5 * time.Second
 
@@ -226,11 +227,13 @@ func (s *Sender) Send(
 
 // SendBatch persists a batch of messages in one chat atomically (see
 // Store.PutMessages) and performs every side effect of a send once for the
-// whole batch: it advances each sender's own read pointer past the last message
-// they sent in it, records the batch's last message as the chat's most recent,
-// broadcasts one update carrying every message to all members, and in a group
-// records each sender's activity (see recordGroupSenders). The result is in
-// batch order.
+// whole batch. It first broadcasts one update carrying every message and the
+// chat's new last activity to all members, so that delivery waits on nothing
+// but the write. It then advances each sender's own read pointer past the
+// last message they sent in it and records the batch's last message as the
+// chat's most recent, tells a DM's members of the pointers that moved in a
+// second update (a group send publishes once), and in a group records each
+// sender's activity (see recordGroupSenders). The result is in batch order.
 //
 // A SenderID may be nil to denote a system message, in which case no read
 // pointer is advanced for it. CountsTowardUnread controls whether a message
@@ -324,73 +327,108 @@ func (s *Sender) SendBatch(
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sideEffectTimeout)
 	defer cancel()
 
+	// Notify all members (including the senders' other devices) of the new
+	// messages first, ahead of the bookkeeping below. Nothing there is needed
+	// to deliver a message, and concurrent sends publish in the order their
+	// handlers get here, not the order they committed: every store call made
+	// between the commit and this publish is time in which a later message's
+	// update can overtake this one. Each send rides the gap-detected event log
+	// as a message_sent event, and only there: the deprecated new_messages
+	// field is no longer populated, so a message crosses the wire once per
+	// recipient. msgProtos were already built and media-hydrated above. A DM's
+	// members are loaded by the publish, which is no read where the chat store
+	// holds a DM's fixed membership (see chat/cache).
+	//
+	// The update also carries the chat's new last activity, the last message's
+	// timestamp, although the write that records it has yet to run. It is
+	// announced on the assumption that the write succeeds, so that a send is
+	// one publish and a group never needs a second for this alone. That is a
+	// deliberate exception to publishing only what a write changed: when the
+	// write turns out to be a no-op (a later message got there first) or
+	// fails, members were still told this message's time. That is the time of
+	// a message the chat holds, so it is never ahead of the chat's newest, and
+	// the next send's bump repairs a record a failure left behind.
+	events := make([]*messagingpb.Event, len(msgProtos))
+	for i, msgProto := range msgProtos {
+		events[i] = NewMessageSentEvent(msgProto)
+	}
+	last := msgs[len(msgs)-1]
+	s.publishChatUpdate(ctx, log, chatID, &eventpb.ChatUpdate{
+		Events: &messagingpb.EventBatch{Events: events},
+		MetadataUpdates: []*chatpb.MetadataUpdate{{
+			Kind: &chatpb.MetadataUpdate_LastActivityChanged_{
+				LastActivityChanged: &chatpb.MetadataUpdate_LastActivityChanged{
+					NewLastActivity: timestamppb.New(last.Timestamp),
+				},
+			},
+		}},
+	}, nil, nil)
+
+	// The bookkeeping runs concurrently: the two writes are independent and
+	// best effort, and each logs its own failure. The handler still waits for
+	// both, so the pointers and the chat's last message are in place when the
+	// send returns.
+	var (
+		wg               sync.WaitGroup
+		advancedPointers []*messagingpb.Pointer
+		members          []*commonpb.UserId
+	)
+
 	// Each sender has implicitly read their own messages, so advance their READ
 	// pointer past the last one they sent. The targets are messages we just
 	// persisted, so their existence is guaranteed — advance directly without a
 	// separate existence read. Best-effort: it's reconstructable and self-heals.
 	// A system message (no sender) has no pointer to advance, and neither does
 	// the team account, which reads nothing (see NewSender).
-	var advancedPointers []*messagingpb.Pointer
-	for _, last := range lastMessagePerSender(msgs) {
-		if s.isTeamAccount(last.SenderID) {
-			continue
+	wg.Go(func() {
+		for _, last := range lastMessagePerSender(msgs) {
+			if s.isTeamAccount(last.SenderID) {
+				continue
+			}
+			pointer, advanced, err := s.messages.AdvancePointer(ctx, chatID, last.SenderID, messagingpb.Pointer_READ, last.ID)
+			if err != nil {
+				log.With(zap.Error(err)).Warn("Failure advancing sender read pointer")
+				continue
+			}
+			if advanced {
+				advancedPointers = append(advancedPointers, pointer)
+			}
 		}
-		pointer, advanced, err := s.messages.AdvancePointer(ctx, chatID, last.SenderID, messagingpb.Pointer_READ, last.ID)
-		if err != nil {
-			log.With(zap.Error(err)).Warn("Failure advancing sender read pointer")
-			continue
-		}
-		if advanced {
-			advancedPointers = append(advancedPointers, pointer)
-		}
-	}
+	})
 
 	// Record the batch's last message as the chat's most recent: bumps
 	// last_activity so the chat sorts to the top of members' inboxes and
 	// denormalizes last_message_id for the feed. Decoupled from persistence: a
 	// lagging bump self-heals on the next message. It also hands back the chat
-	// members, which the broadcast below reuses to avoid a second membership
-	// read — only for DMs, whose members ride on the canonical record the bump
+	// members, which the pointer update below reuses to avoid a membership read
+	// — only for DMs, whose members ride on the canonical record the bump
 	// touches anyway. A group chat's membership lives in its own records, so
-	// members comes back empty and the broadcast loads it itself.
-	last := msgs[len(msgs)-1]
-	lastMessageAdvanced, members, err := s.chats.AdvanceLastMessage(ctx, chatID, last.ID, last.Timestamp)
-	if err != nil && !errors.Is(err, chat.ErrChatNotFound) {
-		log.With(zap.Error(err)).Warn("Failure advancing chat last message")
-	}
+	// members comes back empty.
+	wg.Go(func() {
+		var err error
+		_, members, err = s.chats.AdvanceLastMessage(ctx, chatID, last.ID, last.Timestamp)
+		if err != nil && !errors.Is(err, chat.ErrChatNotFound) {
+			log.With(zap.Error(err)).Warn("Failure advancing chat last message")
+		}
+	})
+	wg.Wait()
 
-	// Notify all members (including the senders' other devices) of the new
-	// messages. Each send rides the gap-detected event log as a message_sent
-	// event, and only there: the deprecated new_messages field is no longer
-	// populated, so a message crosses the wire once per recipient. The senders'
-	// read pointers and the new last activity are only included when they
-	// actually advanced — a no-op must not broadcast a stale pointer or
-	// timestamp. A group never carries real-time pointers (see AdvancePointer):
-	// the senders' auto-advances are stored, but riding them along here would
-	// give group clients a partial pointer stream they can't rely on. msgProtos
-	// were already built and media-hydrated above.
-	events := make([]*messagingpb.Event, len(msgProtos))
-	for i, msgProto := range msgProtos {
-		events[i] = NewMessageSentEvent(msgProto)
-	}
-	update := &eventpb.ChatUpdate{
-		Events: &messagingpb.EventBatch{Events: events},
-	}
+	// A DM's members then hear of the senders' read pointers, in an update of
+	// its own and only those that actually advanced — a no-op must not
+	// broadcast a stale pointer. Pointers are a convergent overlay outside the
+	// event log, so they need not arrive with the messages they follow.
+	//
+	// A group never carries real-time pointers (see AdvancePointer): the
+	// senders' auto-advances are stored, but riding them along here would give
+	// group clients a partial pointer stream they can't rely on. A group send
+	// is therefore the one publish above.
 	if len(advancedPointers) > 0 && !chat.IsGroupChatID(chatID) {
-		update.PointerUpdates = &messagingpb.PointerBatch{Pointers: advancedPointers}
+		// Reuse the members AdvanceLastMessage already loaded (empty if it
+		// failed, in which case publishChatUpdate loads them itself).
+		s.publishChatUpdate(ctx, log, chatID, &eventpb.ChatUpdate{
+			PointerUpdates: &messagingpb.PointerBatch{Pointers: advancedPointers},
+		}, nil, members)
 	}
-	if lastMessageAdvanced {
-		update.MetadataUpdates = []*chatpb.MetadataUpdate{{
-			Kind: &chatpb.MetadataUpdate_LastActivityChanged_{
-				LastActivityChanged: &chatpb.MetadataUpdate_LastActivityChanged{
-					NewLastActivity: timestamppb.New(last.Timestamp),
-				},
-			},
-		}}
-	}
-	// Reuse the members AdvanceLastMessage already loaded (empty for a group
-	// chat or if it failed, in which case publishChatUpdate loads them itself).
-	s.publishChatUpdate(ctx, log, chatID, update, nil, members)
 
 	s.recordGroupSenders(ctx, log, chatID, msgs)
 

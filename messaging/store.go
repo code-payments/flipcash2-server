@@ -318,6 +318,16 @@ type Store interface {
 	// through the batch as it would over the same sends made one at a time.
 	// The result is in batch order, one persisted message per input.
 	//
+	// Each message is stored with the timestamp it came with, unless the store
+	// had to retry the write. A send that loses the chat to another has waited
+	// while sends made after it took lower IDs, so a retried attempt stamps
+	// every message of the batch with the clock's reading at the retry
+	// instead, which keeps a message that waited from carrying an earlier time
+	// than the IDs ahead of it. This narrows that gap rather than closing it:
+	// a first attempt still carries a reading taken before the write began,
+	// and no two servers' clocks agree exactly. The result carries the
+	// timestamps stored, which are the ones a caller must go on to use.
+	//
 	// Idempotency is the batch's, on its client message IDs: a retry whose
 	// every ID already names a message returns those messages (in batch order)
 	// with created false, exactly as PutMessage answers a retried send. A

@@ -263,6 +263,9 @@ func (s *Sender) SendBatch(
 	if len(outgoing) == 0 {
 		return nil, errors.New("expected at least one message")
 	}
+	// now is when the send arrived. A store that has to retry the write stamps
+	// the messages later than this (see Store.PutMessages), so everything
+	// after the write reads a message's time off the stored message.
 	now := time.Now().UTC()
 	inputs := make([]MessageInput, len(outgoing))
 	for i, out := range outgoing {

@@ -2198,6 +2198,11 @@ func (s *store) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *c
 }
 
 func (s *store) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, []*commonpb.UserId, error) {
+	if chat.IsGroupChatID(chatID) {
+		advanced, err := s.advanceGroupLastMessage(ctx, chatID, messageID, ts)
+		return advanced, nil, err
+	}
+
 	// Load the canonical record for the current value and the member set to
 	// fan out to.
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
@@ -2273,6 +2278,42 @@ func (s *store) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId,
 		return false, nil, err
 	}
 	return true, members, nil
+}
+
+// advanceGroupLastMessage is AdvanceLastMessage for a group: one conditional
+// write, with no read before it. A DM has to load its record, for the members
+// whose feed rows move with it. A group has neither: its roster lives in
+// group_members and its members' feeds are assembled at read time, so the
+// canonical record is all there is to move, and there are no members to hand
+// back. Every send to a group makes this call, so it is a single write rather
+// than a strongly consistent read followed by a transaction.
+//
+// The condition is the DM path's: the activity only moves forward. When it
+// fails, the record the failure returns tells a group already at or past ts,
+// which is a no-op, from one that does not exist.
+func (s *store) advanceGroupLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (bool, error) {
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:           aws.String(s.chatsTable),
+		Key:                 map[string]types.AttributeValue{attrPK: avS(chatPK(chatID))},
+		UpdateExpression:    aws.String(fmt.Sprintf("SET %s = :ts, %s = :mid", attrLastActivity, attrLastMessageID)),
+		ConditionExpression: aws.String(fmt.Sprintf("%s < :ts", attrLastActivity)),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":ts":  avN(uint64(ts.UnixNano())),
+			":mid": avN(messageID.Value),
+		},
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	})
+	if err != nil {
+		var ccf *types.ConditionalCheckFailedException
+		if errors.As(err, &ccf) {
+			if len(ccf.Item) == 0 {
+				return false, chat.ErrChatNotFound
+			}
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {

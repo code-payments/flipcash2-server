@@ -36,12 +36,13 @@ func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.M
 
 	// The reading is fixed at stream open, like the head below: every batch is
 	// answered under it, so a delta is wholly full or wholly redacted however
-	// the viewer's standing moves while it streams.
-	reading, err := s.reading(ctx, log, req.ChatId, userID, req.GetViewMode())
+	// the viewer's standing moves while it streams. Each batch's reactions are
+	// read as it is sent, so they are current to the batch, not to the open.
+	read, err := s.reading(ctx, log, req.ChatId, userID, req.GetViewMode())
 	if err != nil {
 		return err
 	}
-	if reading == chat.ReadingDenied {
+	if read.reading == chat.ReadingDenied {
 		// A terminal DENIED is a single response that ends the stream.
 		return stream.Send(&messagingpb.GetDeltaResponse{Result: messagingpb.GetDeltaResponse_DENIED})
 	}
@@ -107,7 +108,7 @@ func (s *Server) GetDelta(req *messagingpb.GetDeltaRequest, stream messagingpb.M
 		// A page may carry no surviving messages (all superseded) yet still advance
 		// the checkpoint, so only attach a batch when there's something to apply.
 		if len(msgs) > 0 {
-			batch, err := s.present(ctx, log, reading, msgs)
+			batch, err := s.present(ctx, log, read, msgs)
 			if err != nil {
 				return err
 			}

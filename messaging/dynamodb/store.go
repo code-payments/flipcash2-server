@@ -363,6 +363,11 @@ type store struct {
 	selfReactionsTable string
 	boostsTable        string
 
+	// beforeSendWrite, when set, runs between a send's state read and its
+	// transaction (see PutMessages). Tests use it to land a concurrent send in
+	// that gap; it is nil in production.
+	beforeSendWrite func()
+
 	// beforeReactionWrite, when set, runs between a reaction write's state read
 	// and its transaction. Tests use it to land a concurrent write in that gap;
 	// it is nil in production.
@@ -420,6 +425,7 @@ func (s *store) PutMessages(
 	}
 	contentBlobs := make([][]types.AttributeValue, len(inputs))
 	clientMessageIDs := make([]*messagingpb.ClientMessageId, len(inputs))
+	timestamps := make([]time.Time, len(inputs))
 	for i, in := range inputs {
 		blobs, err := marshalContent(in.Content)
 		if err != nil {
@@ -427,9 +433,23 @@ func (s *store) PutMessages(
 		}
 		contentBlobs[i] = blobs
 		clientMessageIDs[i] = in.ClientMessageID
+		timestamps[i] = in.Timestamp
 	}
 
 	for attempt := 0; attempt < maxPutMessageAttempts; attempt++ {
+		// A retry means another write got to the chat first. A send among
+		// them took a lower ID than this batch will and, being sent while this
+		// one waited, a later timestamp, so the timestamps the batch came with
+		// are stale: stamp the retried attempt with a fresh reading of the
+		// clock, or time would run backwards against the IDs (see
+		// messaging.Store.PutMessages).
+		if attempt > 0 {
+			now := time.Now().UTC()
+			for i := range timestamps {
+				timestamps[i] = now
+			}
+		}
+
 		// The idempotency markers (each its own partition) and the chat's
 		// sequence counter are all exact keys, so one consistent batch read
 		// fetches them together.
@@ -509,7 +529,7 @@ func (s *store) PutMessages(
 				ID:            &messagingpb.MessageId{Value: nextSeq},
 				SenderID:      in.SenderID,
 				Content:       in.Content,
-				Timestamp:     in.Timestamp,
+				Timestamp:     timestamps[i],
 				UnreadSeq:     nextUnread,
 				EventSequence: nextEventSeq,
 			}
@@ -554,6 +574,9 @@ func (s *store) PutMessages(
 			},
 		}}
 
+		if s.beforeSendWrite != nil {
+			s.beforeSendWrite()
+		}
 		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 		if err == nil {
 			return msgs, true, nil
@@ -890,11 +913,15 @@ func (s *store) GetLatestEventSequencesForChats(ctx context.Context, chatIDs []*
 			end = len(keys)
 		}
 
-		// Retry UnprocessedKeys until the batch drains.
+		// Strongly consistent, as the one-chat read is (see lastEventSeq and
+		// the Store contract): a head that trails the log tells a client it
+		// has caught up when it has not. Retry UnprocessedKeys until the batch
+		// drains; they come back carrying the request's consistency.
 		req := map[string]types.KeysAndAttributes{
 			s.messagesTable: {
 				Keys:                 keys[start:end],
 				ProjectionExpression: aws.String(strings.Join([]string{attrPK, attrLastEventSeq}, ", ")),
+				ConsistentRead:       aws.Bool(true),
 			},
 		}
 		for len(req[s.messagesTable].Keys) > 0 {
@@ -1238,6 +1265,10 @@ func (s *store) GetMessages(ctx context.Context, chatID *commonpb.ChatId, opts .
 			":prefix": avS(msgPrefix),
 		},
 		ScanIndexForward: aws.Bool(q.Order != commonpb.QueryOptions_DESC),
+		// Every page, not only the newest: which pages reach the newest end
+		// of the chat is not something the request says (see the Store
+		// contract).
+		ConsistentRead: aws.Bool(true),
 	}
 	if q.Limit > 0 {
 		input.Limit = aws.Int32(int32(q.Limit))
@@ -1292,9 +1323,11 @@ func (s *store) GetMessagesByRefs(ctx context.Context, refs []messaging.MessageR
 			end = len(keys)
 		}
 
-		// Retry UnprocessedKeys until the batch drains.
+		// Strongly consistent (see the Store contract): a ref is often to a
+		// message committed a moment ago. Retry UnprocessedKeys until the
+		// batch drains; they come back carrying the request's consistency.
 		req := map[string]types.KeysAndAttributes{
-			s.messagesTable: {Keys: keys[start:end]},
+			s.messagesTable: {Keys: keys[start:end], ConsistentRead: aws.Bool(true)},
 		}
 		for len(req[s.messagesTable].Keys) > 0 {
 			resp, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})

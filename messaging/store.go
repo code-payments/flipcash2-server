@@ -318,6 +318,16 @@ type Store interface {
 	// through the batch as it would over the same sends made one at a time.
 	// The result is in batch order, one persisted message per input.
 	//
+	// Each message is stored with the timestamp it came with, unless the store
+	// had to retry the write. A send that loses the chat to another has waited
+	// while sends made after it took lower IDs, so a retried attempt stamps
+	// every message of the batch with the clock's reading at the retry
+	// instead, which keeps a message that waited from carrying an earlier time
+	// than the IDs ahead of it. This narrows that gap rather than closing it:
+	// a first attempt still carries a reading taken before the write began,
+	// and no two servers' clocks agree exactly. The result carries the
+	// timestamps stored, which are the ones a caller must go on to use.
+	//
 	// Idempotency is the batch's, on its client message IDs: a retry whose
 	// every ID already names a message returns those messages (in batch order)
 	// with created false, exactly as PutMessage answers a retried send. A
@@ -442,6 +452,15 @@ type Store interface {
 	// token's value is the message ID of the last message from the previous
 	// page (see PageTokenFromID). Returns an empty result (no error) when the
 	// chat has no messages.
+	//
+	// The read is strongly consistent: a page reflects every send, edit and
+	// delete that completed before it, so one read after a head (see
+	// GetLatestEventSequence) holds everything up to that head that falls in
+	// its range. Every page is read this way, not only the newest. A page
+	// reaches the newest end of the chat whichever way it runs, descending
+	// from the top or ascending from a message the reader holds, and one
+	// descending from a message just received starts right behind it; the
+	// request does not say which pages those are.
 	GetMessages(ctx context.Context, chatID *commonpb.ChatId, opts ...database.QueryOption) ([]*Message, error)
 
 	// GetMessagesByRefs returns the messages identified by the given refs that
@@ -453,6 +472,12 @@ type Store interface {
 	// It is the batch read behind the DM feed, where it fetches every chat's last
 	// message in one call (one ref per chat). For the single-chat case the caller
 	// builds refs from a shared chat ID.
+	//
+	// The read is strongly consistent, as GetMessage's is: it reflects every
+	// send, edit and delete that completed before it. A ref is often to a
+	// message committed a moment ago, one an event, a push or a chat's record
+	// of its last message has just named, which is the message a lagging read
+	// would leave out.
 	GetMessagesByRefs(ctx context.Context, refs []MessageRef) ([]*Message, error)
 
 	// GetEventDelta reads up to limit event-log entries with event_sequence in
@@ -485,6 +510,12 @@ type Store interface {
 	// chat's highest message ID. The two are distinct concepts: once edits and
 	// deletes advance the event sequence without minting a new message ID, they
 	// diverge.
+	//
+	// The read is strongly consistent: the head reflects every event logged
+	// before it. A client compares the head with its cursor to decide whether
+	// to catch up, so a head that trailed the log would tell it that it had
+	// caught up when it had not, and nothing would correct that before the
+	// chat's next event.
 	GetLatestEventSequence(ctx context.Context, chatID *commonpb.ChatId) (uint64, error)
 
 	// GetLatestEventSequencesForChats returns the head event sequence of each of
@@ -494,6 +525,11 @@ type Store interface {
 	// messages (head 0) is absent from the map and duplicate chat IDs collapse, so
 	// callers must treat a missing key as 0. Returns an empty map (no error) when
 	// chatIDs is empty.
+	//
+	// The read is strongly consistent, as GetLatestEventSequence's is and for
+	// the same reason. The head is the one value on a feed row that has to be
+	// right: whatever else on the row trails a write is put right by the
+	// catch-up a correct head sets off.
 	GetLatestEventSequencesForChats(ctx context.Context, chatIDs []*commonpb.ChatId) (map[string]uint64, error)
 
 	// GetPointers returns all delivered/read pointers for a chat. Returns an

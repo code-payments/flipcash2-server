@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -33,11 +34,11 @@ func (s *Server) GetMessage(ctx context.Context, req *messagingpb.GetMessageRequ
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	reading, err := s.reading(ctx, log, req.ChatId, userID, req.GetViewMode())
+	read, err := s.reading(ctx, log, req.ChatId, userID, req.GetViewMode())
 	if err != nil {
 		return nil, err
 	}
-	if reading == chat.ReadingDenied {
+	if read.reading == chat.ReadingDenied {
 		return &messagingpb.GetMessageResponse{Result: messagingpb.GetMessageResponse_DENIED}, nil
 	}
 
@@ -50,7 +51,7 @@ func (s *Server) GetMessage(ctx context.Context, req *messagingpb.GetMessageRequ
 		return nil, status.Error(codes.Internal, "")
 	}
 
-	protos, err := s.present(ctx, log, reading, []*Message{msg})
+	protos, err := s.present(ctx, log, read, []*Message{msg})
 	if err != nil {
 		return nil, err
 	}
@@ -69,11 +70,11 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
-	reading, err := s.reading(ctx, log, req.ChatId, userID, req.GetViewMode())
+	read, err := s.reading(ctx, log, req.ChatId, userID, req.GetViewMode())
 	if err != nil {
 		return nil, err
 	}
-	if reading == chat.ReadingDenied {
+	if read.reading == chat.ReadingDenied {
 		return &messagingpb.GetMessagesResponse{Result: messagingpb.GetMessagesResponse_DENIED}, nil
 	}
 
@@ -96,7 +97,7 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 	if len(msgs) == 0 {
 		return &messagingpb.GetMessagesResponse{Result: messagingpb.GetMessagesResponse_NOT_FOUND}, nil
 	}
-	protos, err := s.present(ctx, log, reading, msgs)
+	protos, err := s.present(ctx, log, read, msgs)
 	if err != nil {
 		return nil, err
 	}
@@ -106,13 +107,40 @@ func (s *Server) GetMessages(ctx context.Context, req *messagingpb.GetMessagesRe
 	}, nil
 }
 
-// present projects stored messages into what a read returns for the given
-// reading (see presentMessages), failing the read with Internal when a message
+// present projects stored messages of one chat into what a read of the
+// Messaging service returns (GetMessage, GetMessages, GetDelta): the messages
+// as their reading answers them (see presentMessages), each with its reactions
+// attached for the viewer (Message.reactions, see
+// reactionSummariesBestEffort). It fails the read with Internal when a message
 // cannot be redacted.
-func (s *Server) present(ctx context.Context, log *zap.Logger, reading chat.Reading, msgs []*Message) ([]*messagingpb.Message, error) {
-	protos, err := presentMessages(ctx, log, s.media, reading, msgs)
+//
+// The reactions are attached to the copy presentMessages returns, after any
+// redaction, and are the same for a redacted reader as for a full one: they
+// are an overlay on the conversation, not its words (see overlayStanding). A
+// message with no reactions carries an empty summary, not none, so a client
+// can tell "no one reacts to this" from "this copy says nothing of
+// reactions", which is what every other carrier of a message means by leaving
+// the field unset: a send's response, an event, a push, the Chat service's
+// reads. It is also what a read falls back to when the reactions cannot be
+// read (see reactionSummariesBestEffort): the messages are what was asked
+// for, and a client refreshes an overlay it was not given.
+//
+// The two are read side by side, since neither needs the other, so the
+// reactions add to a read's latency only what they take beyond resolving the
+// messages' media.
+func (s *Server) present(ctx context.Context, log *zap.Logger, read messageRead, msgs []*Message) ([]*messagingpb.Message, error) {
+	var (
+		wg        sync.WaitGroup
+		reactions map[uint64]*messagingpb.ReactionSummary
+	)
+	wg.Go(func() { reactions = s.reactionSummariesBestEffort(ctx, log, read, msgs) })
+	protos, err := presentMessages(ctx, log, s.media, read.reading, msgs)
+	wg.Wait()
 	if err != nil {
 		return nil, status.Error(codes.Internal, "")
+	}
+	for _, p := range protos {
+		p.Reactions = reactions[p.GetMessageId().GetValue()]
 	}
 	return protos, nil
 }
@@ -125,7 +153,9 @@ func (s *Server) present(ctx context.Context, log *zap.Logger, reading chat.Read
 // Messaging service (GetMessage, GetMessages, GetDelta) and the Chat
 // service's reads of chosen messages (see chatMessagingReader.Messages) —
 // so all of them answer a redacted viewer the same way, and a page is wholly
-// full or wholly redacted.
+// full or wholly redacted. It leaves Message.reactions unset: the Messaging
+// service's reads attach them afterwards (see Server.present), and the Chat
+// service's carry none.
 //
 // Media is resolved before redaction, not skipped for it: the placeholder
 // keeps each rendition's intrinsic metadata — dimensions, blurhash — and drops

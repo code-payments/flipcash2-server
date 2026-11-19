@@ -295,6 +295,40 @@ func (s *Server) GetReactors(ctx context.Context, req *messagingpb.GetReactorsRe
 	return resp, nil
 }
 
+// reactionSummariesBestEffort reads the reaction overlay a read of one chat's
+// messages carries (see present): for each message, its summary as
+// GetReactionSummaries would answer the same viewer for it, the viewer's own
+// reactions marked (see applySelfReactions), keyed by message ID. A message
+// with no reactions has an empty summary. The store answers a run of
+// neighbouring IDs with one query (see Store.GetReactionSummariesByRefs), so a
+// page of history costs one read, and a group member's own reactions one more
+// when the page has any.
+//
+// It is best effort and all or nothing: on a failure it logs and returns nil,
+// so the read goes out with no message carrying reactions rather than failing,
+// and never with aggregates whose self entries could not be resolved, which
+// would tell the viewer they do not react where they do.
+func (s *Server) reactionSummariesBestEffort(ctx context.Context, log *zap.Logger, read messageRead, msgs []*Message) map[uint64]*messagingpb.ReactionSummary {
+	messageIDs := make([]*messagingpb.MessageId, len(msgs))
+	for i, msg := range msgs {
+		messageIDs[i] = msg.ID
+	}
+	summaries, err := s.messages.GetReactionSummariesByRefs(ctx, read.chatID, messageIDs)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure getting reaction summaries for messages")
+		return nil
+	}
+	if err := s.applySelfReactions(ctx, read.chatID, read.userID, read.isMember, summaries); err != nil {
+		log.With(zap.Error(err)).Warn("Failure resolving self reactions for messages")
+		return nil
+	}
+	byMessage := make(map[uint64]*messagingpb.ReactionSummary, len(summaries))
+	for _, summary := range summaries {
+		byMessage[summary.MessageID.Value] = summary.ToProto()
+	}
+	return byMessage
+}
+
 // applySelfReactions sets Self on the given summaries' aggregates for the
 // viewer, choosing its strategy by chat type. A viewer who is not a member
 // has no entry to find — a reaction is a member's write (see AddReaction) —

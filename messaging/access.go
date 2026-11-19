@@ -27,7 +27,10 @@ import (
 //     and every non-member does when the group carries none, and redacted
 //     otherwise, so any registered user can see a gated group's shape (see
 //     present). A user the group's creator has banned reads it redacted
-//     whatever its rules say of them (see chat.Access).
+//     whatever its rules say of them (see chat.Access). Whoever is answered
+//     at all, in full or redacted, is answered with the messages' reactions
+//     attached (see present): it is the same set of users overlayStanding
+//     answers, since any reading but a denial implies CanPreview.
 //   - overlayStanding: the reaction summaries and reactor lists. They carry
 //     no ViewMode, since they return no message, and are answered for anyone
 //     who may read the chat at all — a member, or any non-member of a public
@@ -72,13 +75,30 @@ import (
 // evaluate the rules, since nothing else can admit them; Access bounds what
 // that costs.
 
-func (s *Server) reading(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (chat.Reading, error) {
+// messageRead is a read of a chat's messages as the reading gate resolved it:
+// how it is answered (see chat.Reading) and for whom. The messages are
+// presented under it (see present), which needs more than the verdict: their
+// reactions are attached for the viewer, and only a member can have reactions
+// of their own to mark (see applySelfReactions).
+type messageRead struct {
+	chatID   *commonpb.ChatId
+	userID   *commonpb.UserId
+	isMember bool
+	reading  chat.Reading
+}
+
+func (s *Server) reading(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId, mode messagingpb.ViewMode) (messageRead, error) {
 	standing, err := s.access.ListenerStanding(ctx, chatID, userID, mode)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure determining chat standing")
-		return chat.ReadingDenied, status.Error(codes.Internal, "")
+		return messageRead{reading: chat.ReadingDenied}, status.Error(codes.Internal, "")
 	}
-	return standing.Reading(mode), nil
+	return messageRead{
+		chatID:   chatID,
+		userID:   userID,
+		isMember: standing.IsMember,
+		reading:  standing.Reading(mode),
+	}, nil
 }
 
 // overlayStanding is the caller's standing in the chat as needed to answer a

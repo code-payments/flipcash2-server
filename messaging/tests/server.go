@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -113,6 +114,8 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_Reactions_SummaryOrder,
 		testServer_Reactions_Errors,
 		testServer_Reactions_GroupSelfReaction,
+		testServer_Reactions_OnMessageReads,
+		testServer_Reactions_OnMessageReads_Unavailable,
 		testServer_Reactions_RemoveBoosted,
 		testServer_Reactions_Boost,
 		testServer_Reactions_BoostDm,
@@ -686,6 +689,16 @@ func (e *serverEnv) waitForChatUpdate(recipient *commonpb.UserId, match func(*ev
 		}
 		return false
 	}, 250*time.Millisecond, 50*time.Millisecond, "timed out waiting for chat update")
+}
+
+// withoutReactions returns a copy of a read message with its reaction overlay
+// taken off (see Message.reactions): the message itself, comparable with the
+// copy a carrier without the overlay holds, such as a send's response, an
+// event or a push.
+func withoutReactions(m *messagingpb.Message) *messagingpb.Message {
+	out := proto.Clone(m).(*messagingpb.Message)
+	out.Reactions = nil
+	return out
 }
 
 // carriesSentMessage reports whether the update introduces msgID as a
@@ -1818,7 +1831,7 @@ func testServer_SendBatch_SideEffects(t *testing.T, badges badge.Store, blocklis
 		msgs, latest, checkpoint := collectDelta(resps)
 		require.Equal(t, wantIDs, protoMessageIDs(msgs), "after %d", after)
 		for _, m := range msgs {
-			require.True(t, proto.Equal(sent[m.MessageId.Value-1], m), "after %d: message %d", after, m.MessageId.Value)
+			require.True(t, proto.Equal(sent[m.MessageId.Value-1], withoutReactions(m)), "after %d: message %d", after, m.MessageId.Value)
 		}
 		require.Equal(t, uint64(4), latest)
 		require.Equal(t, uint64(4), checkpoint)
@@ -5954,6 +5967,259 @@ func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.St
 	require.Equal(t, [][]byte{e.userB.Value}, userValues(pushes[3].users))
 	require.False(t, pushes[3].payload.ChatMetadata.Muted)
 	require.True(t, pushes[3].badged)
+}
+
+// testServer_Reactions_OnMessageReads pins that a read of the Messaging
+// service carries each message's reactions (Message.reactions): GetMessage,
+// GetMessages by page and by ID, and GetDelta each attach, for the viewer, the
+// very summary GetReactionSummaries answers them for that message, and an
+// empty one for a message no one reacts to. It holds in a DM and in a group,
+// where a member's own reaction is found past the sample; for a non-member
+// reading a public group, who has none of their own; and on a redacted read,
+// whose placeholder carries the same reactions the full message does.
+func testServer_Reactions_OnMessageReads(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	// requireReads reads the chat's three messages every way the service
+	// offers, as the viewer and under the mode, and requires each copy to
+	// carry what GetReactionSummaries answers the same viewer. It returns
+	// those summaries by message ID.
+	requireReads := func(name string, keys model.KeyPair, chatID *commonpb.ChatId, mode messagingpb.ViewMode) map[uint64]*messagingpb.ReactionSummary {
+		t.Helper()
+		summaries, err := e.getReactionSummariesByIDsInChat(keys, chatID, 1, 2, 3)
+		require.NoError(t, err, name)
+		require.Equal(t, messagingpb.GetReactionSummariesResponse_OK, summaries.Result, name)
+		require.Len(t, summaries.Summaries, 3, name)
+		want := make(map[uint64]*messagingpb.ReactionSummary)
+		for _, summary := range summaries.Summaries {
+			want[summary.MessageId.Value] = summary
+		}
+
+		requireCarried := func(read string, msgs []*messagingpb.Message) {
+			t.Helper()
+			require.Equal(t, []uint64{1, 2, 3}, protoMessageIDs(msgs), "%s: %s", name, read)
+			for _, msg := range msgs {
+				require.NotNil(t, msg.Reactions, "%s: %s: message %d", name, read, msg.MessageId.Value)
+				require.True(t, proto.Equal(want[msg.MessageId.Value], msg.Reactions), "%s: %s: message %d carries %v, want %v", name, read, msg.MessageId.Value, msg.Reactions, want[msg.MessageId.Value])
+				require.Equal(t, mode == messagingpb.ViewMode_REDACTED, msg.Redacted, "%s: %s: message %d", name, read, msg.MessageId.Value)
+			}
+		}
+
+		var single []*messagingpb.Message
+		for id := uint64(1); id <= 3; id++ {
+			resp, err := e.getMessageInChatWithMode(keys, chatID, &messagingpb.MessageId{Value: id}, mode)
+			require.NoError(t, err, name)
+			require.Equal(t, messagingpb.GetMessageResponse_OK, resp.Result, name)
+			single = append(single, resp.Message)
+		}
+		requireCarried("GetMessage", single)
+
+		page, err := e.getMessagesByOptionsInChatWithMode(keys, chatID, &commonpb.QueryOptions{}, mode)
+		require.NoError(t, err, name)
+		require.Equal(t, messagingpb.GetMessagesResponse_OK, page.Result, name)
+		requireCarried("GetMessages by page", page.Messages.Messages)
+
+		byID, err := e.getMessagesByIDsInChatWithMode(keys, chatID, mode, 1, 2, 3)
+		require.NoError(t, err, name)
+		require.Equal(t, messagingpb.GetMessagesResponse_OK, byID.Result, name)
+		requireCarried("GetMessages by ID", byID.Messages.Messages)
+
+		delta, err := e.getDeltaInChatWithMode(keys, chatID, 0, mode)
+		require.NoError(t, err, name)
+		deltaMsgs, _, _ := collectDelta(delta)
+		requireCarried("GetDelta", deltaMsgs)
+
+		return want
+	}
+
+	// The DM: B reacts to the first message, both react to the third, no one
+	// to the second.
+	for i := 0; i < 3; i++ {
+		sent, err := e.sendEncrypted(e.keysA, generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+		// A send's response is not a read, and says nothing of reactions.
+		require.Nil(t, sent.Message.Reactions)
+	}
+	for _, add := range []struct {
+		keys  model.KeyPair
+		id    uint64
+		emoji string
+	}{{e.keysB, 1, "👍"}, {e.keysA, 3, "🔥"}, {e.keysB, 3, "🔥"}, {e.keysB, 3, "👍"}} {
+		resp, err := e.addReaction(add.keys, &messagingpb.MessageId{Value: add.id}, add.emoji)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AddReactionResponse_OK, resp.Result)
+	}
+
+	asA := requireReads("dm as A", e.keysA, e.chatID, messagingpb.ViewMode_FULL)
+	require.Len(t, asA[1].Reactions, 1)
+	require.EqualValues(t, 1, asA[1].Reactions[0].Count)
+	require.Nil(t, asA[1].Reactions[0].SelfReactor, "A does not react to the first message")
+	require.Equal(t, uint64(2), asA[2].MessageId.Value)
+	require.Empty(t, asA[2].Reactions, "no one reacts to the second message")
+	require.Len(t, asA[3].Reactions, 2)
+
+	asB := requireReads("dm as B", e.keysB, e.chatID, messagingpb.ViewMode_FULL)
+	require.NotNil(t, asB[1].Reactions[0].SelfReactor, "B reacts to the first message")
+	require.Equal(t, e.userB.Value, asB[1].Reactions[0].SelfReactor.UserId.Value)
+
+	requireReads("dm as B, redacted", e.keysB, e.chatID, messagingpb.ViewMode_REDACTED)
+
+	// A public group: A reacts to the first message and is then buried under
+	// more reactors than the sample holds, so A's own reaction is found only
+	// by the per-viewer read.
+	others := make([]model.KeyPair, messaging.MaxSampleReactors+1)
+	members := []*commonpb.UserId{e.userA, e.userB}
+	for i := range others {
+		userID, keys := e.addUser()
+		others[i] = keys
+		members = append(members, userID)
+	}
+	_, strangerKeys := e.addUser()
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      members,
+		Title:        "Reactions on reads",
+		LastActivity: at(1),
+	}))
+	for i := 0; i < 3; i++ {
+		sent, err := e.sendContentToChat(e.keysB, groupID, textContent("react to me"), generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	}
+	first := &messagingpb.MessageId{Value: 1}
+	for _, keys := range append([]model.KeyPair{e.keysA}, others...) {
+		resp, err := e.addReactionInChat(keys, groupID, first, "👍")
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AddReactionResponse_OK, resp.Result)
+	}
+
+	requireBuried := func(name string, summaries map[uint64]*messagingpb.ReactionSummary, wantSelf bool) {
+		t.Helper()
+		require.Len(t, summaries[1].Reactions, 1, name)
+		reaction := summaries[1].Reactions[0]
+		require.EqualValues(t, len(others)+1, reaction.Count, name)
+		for _, reactor := range reaction.SampleReactors {
+			require.NotEqual(t, e.userA.Value, reactor.UserId.Value, name)
+		}
+		if wantSelf {
+			require.NotNil(t, reaction.SelfReactor, name)
+			require.Equal(t, e.userA.Value, reaction.SelfReactor.UserId.Value, name)
+		} else {
+			require.Nil(t, reaction.SelfReactor, name)
+		}
+		require.Empty(t, summaries[2].Reactions, name)
+		require.Empty(t, summaries[3].Reactions, name)
+	}
+	requireBuried("group as A", requireReads("group as A", e.keysA, groupID, messagingpb.ViewMode_FULL), true)
+	requireBuried("group as A, redacted", requireReads("group as A, redacted", e.keysA, groupID, messagingpb.ViewMode_REDACTED), true)
+	requireBuried("group as B", requireReads("group as B", e.keysB, groupID, messagingpb.ViewMode_FULL), false)
+
+	// A non-member reads the group in full, as its rules (none) allow, and
+	// redacted; neither view has a reaction of their own to mark.
+	requireBuried("group as a stranger", requireReads("group as a stranger", strangerKeys, groupID, messagingpb.ViewMode_FULL), false)
+	requireBuried("group as a stranger, redacted", requireReads("group as a stranger, redacted", strangerKeys, groupID, messagingpb.ViewMode_REDACTED), false)
+}
+
+// testServer_Reactions_OnMessageReads_Unavailable pins that a read whose
+// reactions cannot be read still answers with its messages, none of them
+// carrying reactions: unset, which says nothing, never an empty summary,
+// which would say no one reacts. It is all or nothing, so aggregates are
+// never served when the viewer's own reactions could not be resolved.
+func testServer_Reactions_OnMessageReads_Unavailable(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	failing := &failingReactions{Store: messages}
+	e := newServerEnv(t, badges, blocklists, chats, failing, profiles)
+
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		Title:        "Reactions unavailable",
+		LastActivity: at(1),
+	}))
+	for i := 0; i < 2; i++ {
+		sent, err := e.sendContentToChat(e.keysA, groupID, textContent("react to me"), generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	}
+	resp, err := e.addReactionInChat(e.keysB, groupID, &messagingpb.MessageId{Value: 1}, "👍")
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AddReactionResponse_OK, resp.Result)
+
+	// read reads the group's two messages every way the service offers and
+	// returns every copy.
+	read := func() []*messagingpb.Message {
+		t.Helper()
+		var out []*messagingpb.Message
+		single, err := e.getMessageInChat(e.keysB, groupID, &messagingpb.MessageId{Value: 1})
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_OK, single.Result)
+		out = append(out, single.Message)
+
+		page, err := e.getMessagesByOptionsInChat(e.keysB, groupID, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_OK, page.Result)
+		require.Len(t, page.Messages.Messages, 2)
+		out = append(out, page.Messages.Messages...)
+
+		delta, err := e.getDeltaInChat(e.keysB, groupID, 0)
+		require.NoError(t, err)
+		deltaMsgs, _, _ := collectDelta(delta)
+		require.Len(t, deltaMsgs, 2)
+		return append(out, deltaMsgs...)
+	}
+
+	for _, msg := range read() {
+		require.NotNil(t, msg.Reactions, "message %d", msg.MessageId.Value)
+	}
+
+	// The aggregates cannot be read.
+	failing.summaries.Store(true)
+	for _, msg := range read() {
+		require.Nil(t, msg.Reactions, "message %d", msg.MessageId.Value)
+		require.NotEmpty(t, msg.Content, "message %d", msg.MessageId.Value)
+	}
+	failing.summaries.Store(false)
+
+	// The aggregates can, the viewer's own reactions cannot: no message
+	// carries any, not even the one no one reacts to.
+	failing.self.Store(true)
+	for _, msg := range read() {
+		require.Nil(t, msg.Reactions, "message %d", msg.MessageId.Value)
+	}
+	failing.self.Store(false)
+
+	for _, msg := range read() {
+		require.NotNil(t, msg.Reactions, "message %d", msg.MessageId.Value)
+	}
+}
+
+// failingReactions is a messaging.Store whose reaction reads behind a message
+// read can be made to fail: the aggregates (GetReactionSummariesByRefs), or
+// a group viewer's own reactions (GetSelfReactions).
+type failingReactions struct {
+	messaging.Store
+
+	summaries atomic.Bool
+	self      atomic.Bool
+}
+
+func (f *failingReactions) GetReactionSummariesByRefs(ctx context.Context, chatID *commonpb.ChatId, messageIDs []*messagingpb.MessageId) ([]*messaging.ReactionSummary, error) {
+	if f.summaries.Load() {
+		return nil, errors.New("reaction summaries unavailable")
+	}
+	return f.Store.GetReactionSummariesByRefs(ctx, chatID, messageIDs)
+}
+
+func (f *failingReactions) GetSelfReactions(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, messageIDs []*messagingpb.MessageId) ([]messaging.SelfReaction, error) {
+	if f.self.Load() {
+		return nil, errors.New("self reactions unavailable")
+	}
+	return f.Store.GetSelfReactions(ctx, chatID, userID, messageIDs)
 }
 
 // testServer_Reactions_RemoveBoosted pins that a boosted reaction is

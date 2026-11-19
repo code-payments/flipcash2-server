@@ -913,11 +913,15 @@ func (s *store) GetLatestEventSequencesForChats(ctx context.Context, chatIDs []*
 			end = len(keys)
 		}
 
-		// Retry UnprocessedKeys until the batch drains.
+		// Strongly consistent, as the one-chat read is (see lastEventSeq and
+		// the Store contract): a head that trails the log tells a client it
+		// has caught up when it has not. Retry UnprocessedKeys until the batch
+		// drains; they come back carrying the request's consistency.
 		req := map[string]types.KeysAndAttributes{
 			s.messagesTable: {
 				Keys:                 keys[start:end],
 				ProjectionExpression: aws.String(strings.Join([]string{attrPK, attrLastEventSeq}, ", ")),
+				ConsistentRead:       aws.Bool(true),
 			},
 		}
 		for len(req[s.messagesTable].Keys) > 0 {
@@ -1261,6 +1265,10 @@ func (s *store) GetMessages(ctx context.Context, chatID *commonpb.ChatId, opts .
 			":prefix": avS(msgPrefix),
 		},
 		ScanIndexForward: aws.Bool(q.Order != commonpb.QueryOptions_DESC),
+		// Every page, not only the newest: which pages reach the newest end
+		// of the chat is not something the request says (see the Store
+		// contract).
+		ConsistentRead: aws.Bool(true),
 	}
 	if q.Limit > 0 {
 		input.Limit = aws.Int32(int32(q.Limit))
@@ -1315,9 +1323,11 @@ func (s *store) GetMessagesByRefs(ctx context.Context, refs []messaging.MessageR
 			end = len(keys)
 		}
 
-		// Retry UnprocessedKeys until the batch drains.
+		// Strongly consistent (see the Store contract): a ref is often to a
+		// message committed a moment ago. Retry UnprocessedKeys until the
+		// batch drains; they come back carrying the request's consistency.
 		req := map[string]types.KeysAndAttributes{
-			s.messagesTable: {Keys: keys[start:end]},
+			s.messagesTable: {Keys: keys[start:end], ConsistentRead: aws.Bool(true)},
 		}
 		for len(req[s.messagesTable].Keys) > 0 {
 			resp, err := s.client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: req})

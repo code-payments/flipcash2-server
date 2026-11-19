@@ -2282,10 +2282,37 @@ func testStore_GroupChat_AdvanceLastMessage(t *testing.T, s chat.Store) {
 	require.NotNil(t, got.LastMessageID)
 	require.Equal(t, uint64(5), got.LastMessageID.Value)
 
-	// Backward is a no-op, as for DMs.
-	advanced, _, err = s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: 3}, at(150))
+	// Backward is a no-op, as for DMs, and so is the time the group is
+	// already at: neither moves the record, and neither returns members.
+	for _, ts := range []time.Time{at(150), at(200)} {
+		advanced, members, err = s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: 3}, ts)
+		require.NoError(t, err)
+		require.False(t, advanced)
+		require.Empty(t, members)
+
+		got, err = s.GetChatByID(ctx, c.ID)
+		require.NoError(t, err)
+		require.True(t, got.LastActivity.Equal(at(200)))
+		require.Equal(t, uint64(5), got.LastMessageID.Value)
+	}
+
+	// Forward again advances again.
+	advanced, _, err = s.AdvanceLastMessage(ctx, c.ID, &messagingpb.MessageId{Value: 6}, at(300))
 	require.NoError(t, err)
+	require.True(t, advanced)
+	got, err = s.GetChatByID(ctx, c.ID)
+	require.NoError(t, err)
+	require.True(t, got.LastActivity.Equal(at(300)))
+	require.Equal(t, uint64(6), got.LastMessageID.Value)
+
+	// A group that does not exist is not found, and is not created.
+	missing := chat.MustGenerateGroupChatID()
+	advanced, members, err = s.AdvanceLastMessage(ctx, missing, &messagingpb.MessageId{Value: 1}, at(1))
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
 	require.False(t, advanced)
+	require.Nil(t, members)
+	_, err = s.GetChatByID(ctx, missing)
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
 }
 
 func testStore_GroupChat_NotInDmFeed(t *testing.T, s chat.Store) {

@@ -44,9 +44,24 @@ func (r *chatMessagingReader) LastMessages(ctx context.Context, refs []chat.Mess
 		return nil, err
 	}
 
-	out := make(map[string]*messagingpb.Message, len(msgs))
-	for _, m := range msgs {
-		out[string(m.ChatID.Value)] = m.ToProto()
+	protos := make([]*messagingpb.Message, len(msgs))
+	for i, m := range msgs {
+		protos[i] = m.ToProto()
+	}
+	// Media is resolved as the Messaging service's reads resolve it, so a feed
+	// row's last message carries the renditions and download URLs a client
+	// renders without fetching the message again. The caller redacts after
+	// this, so a redacted placeholder keeps each rendition's dimensions and
+	// blurhash (see presentMessages). A resolution failure leaves the stored
+	// ORIGINAL rendition, as every message read does, rather than failing the
+	// feed. A page whose last messages carry no media resolves nothing.
+	if err := hydrateMedia(ctx, r.media, protos); err != nil {
+		r.log.With(zap.Error(err)).Warn("Failure resolving last message media metadata")
+	}
+
+	out := make(map[string]*messagingpb.Message, len(protos))
+	for i, m := range msgs {
+		out[string(m.ChatID.Value)] = protos[i]
 	}
 	return out, nil
 }

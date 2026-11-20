@@ -56,7 +56,9 @@ type PointerRef struct {
 // one-way; the messaging package supplies the concrete adapter.
 type MessagingReader interface {
 	// LastMessages returns the message for each ref that exists, keyed by
-	// string(chatID.Value). Refs without a message are absent from the map.
+	// string(chatID.Value), with its media resolved as Messages resolves it
+	// and unredacted: the caller redacts. Refs without a message are absent
+	// from the map.
 	LastMessages(ctx context.Context, refs []MessageRef) (map[string]*messagingpb.Message, error)
 
 	// Messages returns the message for each ref that exists, across any

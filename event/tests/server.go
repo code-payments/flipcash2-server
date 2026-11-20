@@ -31,6 +31,7 @@ import (
 
 	"github.com/code-payments/flipcash2-server/account"
 	"github.com/code-payments/flipcash2-server/auth"
+	"github.com/code-payments/flipcash2-server/badge"
 	badgememory "github.com/code-payments/flipcash2-server/badge/memory"
 	"github.com/code-payments/flipcash2-server/balance"
 	"github.com/code-payments/flipcash2-server/chat"
@@ -59,6 +60,7 @@ func RunServerTests(t *testing.T, accounts account.Store, teardown func()) {
 		testChatPreviewOpenVersusPrivate,
 		testChatPreviewExpires,
 		testServerShutdown,
+		testBadgeResetsAtStreamOpenAndClose,
 	} {
 		tf(t, accounts)
 		teardown()
@@ -152,6 +154,61 @@ func testMultipleOpenStreams(t *testing.T, accounts account.Store) {
 			}
 		}
 	}
+}
+
+// testBadgeResetsAtStreamOpenAndClose pins the badge's two resets: a stream's
+// open clears what built up while the user was away, and its end clears what
+// was pushed while they were in the app, so the first push after they leave
+// counts from one.
+func testBadgeResetsAtStreamOpenAndClose(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, false)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	userID := model.MustGenerateUserID()
+	keyPair := model.MustGenerateKeyPair()
+	accounts.Bind(ctx, userID, keyPair.Proto())
+	accounts.SetRegistrationFlag(ctx, userID, true)
+
+	badgeCount := func() uint64 {
+		count, err := testEnv.badges.Get(ctx, userID)
+		require.NoError(t, err)
+		return count
+	}
+
+	// Pushed while away.
+	_, err := testEnv.badges.Increment(ctx, userID, 3)
+	require.NoError(t, err)
+
+	testEnv.client1.openUserEventStream(t, userID, keyPair)
+
+	time.Sleep(500 * time.Millisecond)
+
+	// The open reset is waited for before the stream's topics are registered
+	// with the cluster, so an event delivered over it proves the reset has
+	// happened.
+	expected := testEnv.server1.sendTestUserEvent(userID)
+	actual := testEnv.client1.receiveEventsInRealTime(t, userID)
+	require.Len(t, actual, 1)
+	assertEquivalentTestEvents(t, expected, actual[0])
+	require.Zero(t, badgeCount())
+
+	// Pushed while in the app.
+	_, err = testEnv.badges.Increment(ctx, userID, 2)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, badgeCount())
+
+	testEnv.client1.closeOneUserEventStream(t, userID)
+
+	require.Eventually(t, func() bool {
+		return badgeCount() == 0
+	}, 5*time.Second, 10*time.Millisecond)
+
+	// The first push after leaving counts from one.
+	count, err := testEnv.badges.Increment(ctx, userID, 1)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, count)
 }
 
 // testBurstDelivery pins delivery under a burst: events published faster than
@@ -809,6 +866,7 @@ func newTestEvent() *eventpb.Event {
 }
 
 type testEnv struct {
+	badges       badge.Store
 	clusterStore cluster.Store
 	chats        chat.Store
 	accounts     *staffAccounts
@@ -896,8 +954,9 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool, opt
 	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
 
 	// A shared badge store, mirroring the shared cluster backend; both server
-	// instances reset the same user's badge on stream open.
+	// instances reset the same user's badge on stream open and close.
 	badges := badgememory.NewInMemory()
+	env.badges = badges
 
 	env.clusterStore = cluster_memory.NewInMemory()
 

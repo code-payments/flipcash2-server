@@ -8,9 +8,10 @@ import (
 
 // Store persists per-user app-icon badge counts.
 //
-// The count is a "notifications since last open" counter, not a live unread
-// total: Increment bumps it as unread-eligible messages fan out to a user, and
-// Reset zeroes it when the user opens the app. All mutations are atomic, so the
+// The count is a "notifications since the user was last in the app" counter,
+// not a live unread total: Increment bumps it as unread-eligible messages fan
+// out to a user, and Reset zeroes it when their event stream opens and again
+// when it ends (see event.Server). All mutations are atomic, so the
 // concurrent increments produced by a noisy chat's fan-out serialize on the
 // user's item rather than racing through a read-modify-write.
 type Store interface {
@@ -37,6 +38,7 @@ type Store interface {
 	// Get returns a user's current badge count, or zero if the user has none.
 	Get(ctx context.Context, userID *commonpb.UserId) (uint64, error)
 
-	// Reset sets a user's badge count back to zero, e.g. when the app is opened.
+	// Reset sets a user's badge count back to zero, e.g. when the app is
+	// opened or closed.
 	Reset(ctx context.Context, userID *commonpb.UserId) error
 }

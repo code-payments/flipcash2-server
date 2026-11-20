@@ -74,7 +74,8 @@ const (
 	// shared event pointers — 2KB per stream at this size — so the ceiling is
 	// a burst-headroom choice, not a memory one. It stays under the delta
 	// sync's reset threshold so a lag-closed client catches up on the cheap
-	// path rather than a full reload.
+	// path rather than a full reload. Typing notifications are refused once
+	// it is half full rather than counted toward a close (see isTypingOnly).
 	streamBufferSize   = 256
 	streamPingDelay    = 5 * time.Second
 	streamSendTimeout  = 5 * time.Second
@@ -551,6 +552,10 @@ func (s *Server) deliverLocal(streamKey string, e *eventpb.Event, exclude []*com
 			// Closed (by lag or shutdown) but not yet removed by its handler,
 			// which is winding down: expected, and brief.
 			s.log.Debug("Skipping closed local stream", zap.String("stream_id", stream.ID()))
+		case errors.Is(err, ErrEventDropped):
+			// A typing notification for a stream that is behind: the stream
+			// stays open, and the client simply never sees this one.
+			s.log.Debug("Dropped transient event on lagging local stream", zap.String("stream_id", stream.ID()))
 		default:
 			s.log.With(zap.Error(err)).Warn(
 				"Failed to notify event on local stream",

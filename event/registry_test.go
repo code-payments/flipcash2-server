@@ -211,8 +211,8 @@ func TestStreamRegistry_EachDeliversUnderLock(t *testing.T) {
 	e := &eventpb.Event{Id: model.MustGenerateEventID()}
 
 	// A one-slot stream lag-closes on its second notify; a roomy one never does.
-	laggy := NewEventStream[*eventpb.Event]("laggy", 1)
-	healthy := NewEventStream[*eventpb.Event]("healthy", 8)
+	laggy := NewEventStream[*eventpb.Event]("laggy", 1, nil)
+	healthy := NewEventStream[*eventpb.Event]("healthy", 8, nil)
 	require.True(t, r.add("laggy", localStream{stream: laggy, userID: userID(1)}, []string{key}))
 	require.True(t, r.add("healthy", localStream{stream: healthy, userID: userID(2)}, []string{key}))
 
@@ -250,7 +250,7 @@ func TestStreamRegistry_EachDeliversUnderLock(t *testing.T) {
 			defer wg.Done()
 			id := fmt.Sprintf("s%d", i)
 			for range 100 {
-				require.True(t, r.add(id, localStream{stream: NewEventStream[*eventpb.Event](id, 1024), userID: userID(10 + i)}, []string{key}))
+				require.True(t, r.add(id, localStream{stream: NewEventStream[*eventpb.Event](id, 1024, nil), userID: userID(10 + i)}, []string{key}))
 				r.remove(id, []string{key})
 			}
 		}(i)

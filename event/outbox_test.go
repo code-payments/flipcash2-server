@@ -12,6 +12,7 @@ import (
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/model"
 )
@@ -67,6 +68,32 @@ func userItem(userID byte, n int) forwardItem {
 		UserId: &commonpb.UserId{Value: []byte{userID}},
 		Event:  &eventpb.Event{Id: model.MustGenerateEventID(), Type: &eventpb.Event_Test{Test: &eventpb.TestEvent{Nonce: uint64(n)}}},
 	}}
+}
+
+// typingItem is a chat item carrying a typing notification and nothing else.
+func typingItem(chatID byte) forwardItem {
+	id := &commonpb.ChatId{Value: []byte{chatID}}
+	return forwardItem{chat: &eventpb.ChatEvent{
+		ChatId: id,
+		Event: &eventpb.Event{Id: model.MustGenerateEventID(), Type: &eventpb.Event_ChatUpdate{ChatUpdate: &eventpb.ChatUpdate{
+			Chat: id,
+			IsTypingNotifications: &messagingpb.IsTypingNotificationBatch{
+				IsTypingNotifications: []*messagingpb.IsTypingNotification{{UserId: &commonpb.UserId{Value: []byte("typer")}}},
+			},
+		}}},
+	}}
+}
+
+// labels names each item by its test nonce, or "typing" for a typing item.
+func labels(items []forwardItem) (out []string) {
+	for _, it := range items {
+		if isTypingOnly(it.event()) {
+			out = append(out, "typing")
+			continue
+		}
+		out = append(out, fmt.Sprint(it.event().GetTest().GetNonce()))
+	}
+	return out
 }
 
 func nonces(items []forwardItem) (out []int) {
@@ -148,6 +175,41 @@ func TestOutboxes_DropsWhenFull(t *testing.T) {
 	require.Equal(t, uint64(3), ob.reported)
 
 	close(sender.gate)
+}
+
+// TestOutboxes_DropsTypingWhenBehind pins the typing reserve: a typing
+// notification is refused once its shard is half full, counted apart from
+// real drops, and the other half still takes the events that matter.
+func TestOutboxes_DropsTypingWhenBehind(t *testing.T) {
+	sender := newRecordingSender(true)
+	o := newOutboxes(zaptest.NewLogger(t), sender.send, testOutboxConfig())
+
+	require.True(t, o.enqueue("peer", chatItem(1, 0)))
+	sender.waitForBatches(t, "peer", 1) // in flight, gated
+
+	require.True(t, o.enqueue("peer", typingItem(1)), "under half full, typing queues")
+	require.True(t, o.enqueue("peer", chatItem(1, 1)))
+	require.False(t, o.enqueue("peer", typingItem(1)), "half full, typing is refused")
+	require.True(t, o.enqueue("peer", chatItem(1, 2)))
+	require.True(t, o.enqueue("peer", chatItem(1, 3)), "the rest of the shard still takes real events")
+	require.False(t, o.enqueue("peer", chatItem(1, 4)), "full, a real event drops as before")
+
+	o.mu.Lock()
+	ob := o.byAddress["peer"]
+	o.mu.Unlock()
+	require.Equal(t, uint64(1), ob.typingDropped.Load())
+	require.Equal(t, uint64(1), ob.dropped.Load(), "a refused typing notification is not a lost event")
+	require.Equal(t, uint64(1), o.dropped.Load())
+
+	o.sweep(time.Now())
+	require.Equal(t, uint64(1), ob.typingReported)
+	require.Equal(t, uint64(1), ob.reported)
+
+	close(sender.gate)
+	batches := sender.waitForBatches(t, "peer", 3)
+	require.Equal(t, []string{"0"}, labels(batches[0]))
+	require.Equal(t, []string{"typing", "1", "2"}, labels(batches[1]))
+	require.Equal(t, []string{"3"}, labels(batches[2]))
 }
 
 // TestOutboxes_PeersAreIndependent pins that one peer's backlog never

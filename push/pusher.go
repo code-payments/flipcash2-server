@@ -125,23 +125,12 @@ func (p *FCMPusher) SendPushesWithBadges(ctx context.Context, title, body string
 		return nil
 	}
 
-	// Badges are resolved for iOS users only, and only once the token list is in
-	// hand: the same read that addresses the push decides who can display one,
-	// so the resolver's per-user work is never spent on an Android-only user.
-	// A resolver failure costs the badges, not the push — the alerts still go
-	// out, and the error is reported once they have.
-	var badges BadgeCounts
-	var badgeErr error
-	if resolveBadges != nil {
-		if iosUsers := usersWithTokenType(users, pushTokens, pushpb.TokenType_FCM_APNS); len(iosUsers) > 0 {
-			badges, badgeErr = resolveBadges(ctx, iosUsers)
-		}
-	}
-
 	if customPayload == nil {
 		customPayload = &pushpb.Payload{}
 	}
 
+	// The payload is checked and encoded before any badge is resolved, so an
+	// invalid push fails without bumping anyone's count.
 	err = customPayload.Validate()
 	if err != nil {
 		return err
@@ -157,17 +146,16 @@ func (p *FCMPusher) SendPushesWithBadges(ctx context.Context, title, body string
 	// device. Only the badge varies, so each message gets its own Aps while the
 	// read-only pieces are shared.
 	android := &messaging.AndroidConfig{
-		Priority: "high",
+		Priority: androidPriority(customPayload),
 		Data:     customDataAndroid,
 	}
-	messages := make([]*messaging.Message, len(pushTokens))
-	for i, pushToken := range pushTokens {
+	newMessage := func(pushToken Token, badges BadgeCounts) *messaging.Message {
 		var badge *int
 		if count, ok := badges[string(pushToken.UserID.Value)]; ok {
 			b := int(count)
 			badge = &b
 		}
-		messages[i] = &messaging.Message{
+		return &messaging.Message{
 			Token:   pushToken.Token,
 			Android: android,
 			APNS: &messaging.APNSConfig{
@@ -175,8 +163,64 @@ func (p *FCMPusher) SendPushesWithBadges(ctx context.Context, title, body string
 			},
 		}
 	}
+	newMessages := func(pushTokens []Token, badges BadgeCounts) []*messaging.Message {
+		messages := make([]*messaging.Message, len(pushTokens))
+		for i, pushToken := range pushTokens {
+			messages[i] = newMessage(pushToken, badges)
+		}
+		return messages
+	}
 
-	return errors.Join(p.sendInBatches(ctx, messages, pushTokens), badgeErr)
+	// One bound on in-flight SendEach calls for the whole push, shared by the
+	// sends below when the push is split.
+	sem := make(chan struct{}, maxConcurrentBatches)
+
+	// Badges are resolved for iOS users only, and only once the token list is in
+	// hand: the same read that addresses the push decides who can display one,
+	// so the resolver's per-user work is never spent on an Android-only user.
+	var iosUsers []*commonpb.UserId
+	if resolveBadges != nil {
+		iosUsers = usersWithTokenType(users, pushTokens, pushpb.TokenType_FCM_APNS)
+	}
+	if len(iosUsers) == 0 {
+		return p.sendInBatches(ctx, sem, newMessages(pushTokens, nil), pushTokens)
+	}
+
+	// Only an APNs device displays a badge, so only APNs devices wait for the
+	// resolver: every other device is sent to while the badges are resolved,
+	// rather than behind a per-user write it has no use for.
+	apnsTokens, otherTokens := splitByTokenType(pushTokens, pushpb.TokenType_FCM_APNS)
+
+	var (
+		otherErr error
+		others   sync.WaitGroup
+	)
+	if len(otherTokens) > 0 {
+		others.Go(func() {
+			otherErr = p.sendInBatches(ctx, sem, newMessages(otherTokens, nil), otherTokens)
+		})
+	}
+
+	// A resolver failure costs the badges, not the push — the alerts still go
+	// out, and the error is reported once they have.
+	badges, badgeErr := resolveBadges(ctx, iosUsers)
+	apnsErr := p.sendInBatches(ctx, sem, newMessages(apnsTokens, badges), apnsTokens)
+
+	others.Wait()
+	return errors.Join(otherErr, apnsErr, badgeErr)
+}
+
+// androidPriority is the FCM priority an Android device receives a push at.
+// Every push reaches Android as data the client renders itself, and a push
+// for a muted chat is one the client keeps quiet. FCM deprioritizes an app
+// whose high-priority messages show the user nothing, which would delay the
+// alerts that do, so a muted push goes at normal priority and arrives
+// whenever the device next wakes, which is soon enough for a push nobody sees.
+func androidPriority(customPayload *pushpb.Payload) string {
+	if customPayload.GetChatMetadata().GetMuted() {
+		return "normal"
+	}
+	return "high"
 }
 
 // customPushData is the data every device of a push receives: the rendered
@@ -269,16 +313,16 @@ func payloadSize(title, body string, customPayload *pushpb.Payload) (int, error)
 }
 
 // sendInBatches sends messages to FCM in batches of at most maxBatchSize,
-// concurrently up to maxConcurrentBatches at a time. Batches are independent:
-// one failing costs only its own devices, and its error is joined with the
-// rest. pushTokens must be positionally aligned with messages.
-func (p *FCMPusher) sendInBatches(ctx context.Context, messages []*messaging.Message, pushTokens []Token) error {
+// with at most cap(sem) SendEach calls in flight at a time across every
+// sendInBatches sharing sem. Batches are independent: one failing costs only
+// its own devices, and its error is joined with the rest. pushTokens must be
+// positionally aligned with messages.
+func (p *FCMPusher) sendInBatches(ctx context.Context, sem chan struct{}, messages []*messaging.Message, pushTokens []Token) error {
 	var (
 		mu            sync.Mutex
 		errs          error
 		invalidTokens []Token
 		wg            sync.WaitGroup
-		sem           = make(chan struct{}, maxConcurrentBatches)
 	)
 	for start := 0; start < len(messages); start += maxBatchSize {
 		end := min(start+maxBatchSize, len(messages))
@@ -358,6 +402,19 @@ func chatIDPathSegment(chatID *commonpb.ChatId) string {
 		return id.String()
 	}
 	return base64.URLEncoding.EncodeToString(chatID.GetValue())
+}
+
+// splitByTokenType partitions pushTokens, each part in their given order, into
+// the tokens of the given type and every other token.
+func splitByTokenType(pushTokens []Token, tokenType pushpb.TokenType) (matched, others []Token) {
+	for _, token := range pushTokens {
+		if token.Type == tokenType {
+			matched = append(matched, token)
+		} else {
+			others = append(others, token)
+		}
+	}
+	return matched, others
 }
 
 // withoutTokenType returns pushTokens, in their given order, less every token

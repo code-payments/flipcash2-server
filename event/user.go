@@ -3,6 +3,7 @@ package event
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -20,12 +21,27 @@ import (
 // addressed to them, on their own topic and on the topic of every group they
 // are a member of, following their membership as it moves.
 func (s *Server) streamUserEvents(ctx context.Context, log *zap.Logger, stream grpc.BidiStreamingServer[eventpb.StreamEventsRequest, eventpb.StreamEventsResponse], userID *commonpb.UserId) error {
-	// A stream open is the client coming to the foreground (guaranteed on app
-	// open), which is when the badge resets to zero. Best-effort: a failure here
-	// must not block streaming.
-	if err := s.badges.Reset(ctx, userID); err != nil {
-		log.With(zap.Error(err)).Warn("Failed to reset badge count on stream open")
-	}
+	// The badge counts what was pushed while the user was not in the app, so
+	// it resets at both ends of a stream. A stream open is the client coming to
+	// the foreground (guaranteed on app open), so the count that built up while
+	// they were away is cleared, and the pushes they receive while here count
+	// from one. A stream's end (see the teardown below) is them leaving it, or
+	// the stream dying under them: what arrived while it was open was seen as
+	// it arrived, so the first push after they leave counts from one too,
+	// rather than from everything delivered during the session. Best-effort
+	// both times: a failure here must not block streaming.
+	//
+	// The reset at open runs alongside the membership read below and is
+	// waited for right after it, so it costs the open no latency of its own
+	// yet still lands before the stream goes live. It never outlives the
+	// handler: the deferred wait covers the exits taken before that point.
+	var openReset sync.WaitGroup
+	openReset.Go(func() {
+		if err := s.badges.Reset(ctx, userID); err != nil {
+			log.With(zap.Error(err)).Warn("Failed to reset badge count on stream open")
+		}
+	})
+	defer openReset.Wait()
 
 	streamID := uuid.New().String()
 
@@ -101,9 +117,24 @@ func (s *Server) streamUserEvents(ctx context.Context, log *zap.Logger, stream g
 			log.With(zap.Error(err)).Warn("Failed to close stream subscriptions")
 		}
 		cancel()
+
+		// The badge resets on the way out as on the way in (see the reset
+		// at open). Every end of a registered stream passes through here: the
+		// client leaving, a missed pong, a lag close, a draining server. A
+		// stream that was never registered was turned away at open, which
+		// had already reset. The stream's context is done by now, so the
+		// reset runs on its own budget.
+		resetCtx, cancel := context.WithTimeout(context.Background(), badgeResetTimeout)
+		if err := s.badges.Reset(resetCtx, userID); err != nil {
+			log.With(zap.Error(err)).Warn("Failed to reset badge count on stream close")
+		}
+		cancel()
 	}()
 
 	memberships, err := s.chats.GetGroupMembershipsForUser(ctx, userID)
+	// Before any return from here, so the open reset always lands before the
+	// teardown's reset at close.
+	openReset.Wait()
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure loading group memberships for stream")
 		return status.Error(codes.Internal, "failure loading group memberships")

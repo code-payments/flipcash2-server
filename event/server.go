@@ -88,6 +88,12 @@ const (
 	// last local holder of go out as a single batched delete (CloseAll).
 	subscriptionCloseTimeout = 2 * time.Second
 
+	// badgeResetTimeout bounds the badge reset on stream teardown (see
+	// streamUserEvents), which, like the registry cleanup, runs after the
+	// stream's own context is already done. It is one write to the user's
+	// badge item.
+	badgeResetTimeout = 500 * time.Millisecond
+
 	// forwardRpcTimeout bounds one forwarding RPC, which now carries a batch
 	// (see outboxes): the receiver's cost is a non-blocking notify per local
 	// stream per event, so even a full batch across thousands of streams is

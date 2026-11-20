@@ -178,7 +178,8 @@ func (s *Server) streamChatPreview(ctx context.Context, log *zap.Logger, stream 
 	}
 
 	// A preview is opened to read a chat, not on coming to the foreground,
-	// so the badge is left to the user stream that open already reset.
+	// so the badge is left to the user stream, which resets it at its open
+	// and its end.
 
 	streamID := uuid.New().String()
 

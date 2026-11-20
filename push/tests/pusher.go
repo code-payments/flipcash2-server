@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"firebase.google.com/go/v4/messaging"
 	"github.com/stretchr/testify/require"
@@ -61,6 +62,19 @@ func (c *testFCMClient) tokens() []string {
 	return tokens
 }
 
+// sentTo reports whether a message has been sent to the given device token. It
+// is safe to call while a push is still sending.
+func (c *testFCMClient) sentTo(token string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, m := range c.sentMessages {
+		if m.Token == token {
+			return true
+		}
+	}
+	return false
+}
+
 // byToken returns the message addressed to the given device token.
 func (c *testFCMClient) byToken(t *testing.T, token string) *messaging.Message {
 	for _, m := range c.sentMessages {
@@ -81,6 +95,7 @@ func RunPusherTests(t *testing.T, s push.TokenStore, teardown func()) {
 		testFCMPusher_SendPushesWithBadges,
 		testFCMPusher_SendPushesWithBadges_ResolverFailure,
 		testFCMPusher_SendPushesWithBadges_NoIOSUsers,
+		testFCMPusher_SendPushesWithBadges_OtherDevicesDoNotWait,
 		testFCMPusher_SendPushes_MutedSkipsIOS,
 		testFCMPusher_SendPushes_Batched,
 		testFCMPusher_SendPushes_BatchFailureIsolated,
@@ -493,10 +508,47 @@ func testFCMPusher_SendPushesWithBadges_NoIOSUsers(t *testing.T, store push.Toke
 	require.Equal(t, "title", fcmClient.sentMessages[0].Android.Data["push_notification_title"])
 }
 
+// testFCMPusher_SendPushesWithBadges_OtherDevicesDoNotWait verifies that only
+// APNs devices wait for the badge resolver: an Android device, which displays
+// no badge, is sent to while the badges are still being resolved, and no APNs
+// device is sent to until they are.
+func testFCMPusher_SendPushesWithBadges_OtherDevicesDoNotWait(t *testing.T, store push.TokenStore) {
+	ctx := context.Background()
+
+	fcmClient := &testFCMClient{}
+	pusher := push.NewFCMPusher(zap.NewNop(), store, fcmClient)
+
+	alice := &commonpb.UserId{Value: []byte("alice")}
+	bob := &commonpb.UserId{Value: []byte("bob")}
+
+	// Alice has both an iOS and an Android device, Bob is Android only.
+	require.NoError(t, store.AddToken(ctx, alice, &commonpb.AppInstallId{Value: "ios"}, pushpb.TokenType_FCM_APNS, "alice_apns"))
+	require.NoError(t, store.AddToken(ctx, alice, &commonpb.AppInstallId{Value: "android"}, pushpb.TokenType_FCM_ANDROID, "alice_android"))
+	require.NoError(t, store.AddToken(ctx, bob, &commonpb.AppInstallId{Value: "android"}, pushpb.TokenType_FCM_ANDROID, "bob_android"))
+
+	resolve := func(_ context.Context, users []*commonpb.UserId) (push.BadgeCounts, error) {
+		// The resolver holds out until the Android devices have their push,
+		// which they could not if they were waiting on it.
+		require.Eventually(t, func() bool {
+			return fcmClient.sentTo("alice_android") && fcmClient.sentTo("bob_android")
+		}, 5*time.Second, time.Millisecond)
+		require.False(t, fcmClient.sentTo("alice_apns"), "APNs device sent to before its badge was resolved")
+		return push.BadgeCounts{string(alice.Value): 3}, nil
+	}
+	require.NoError(t, pusher.SendPushesWithBadges(ctx, "title", "body", &pushpb.Payload{}, resolve, alice, bob))
+
+	require.ElementsMatch(t, []string{"alice_apns", "alice_android", "bob_android"}, fcmClient.tokens())
+
+	aliceApns := fcmClient.byToken(t, "alice_apns")
+	require.NotNil(t, aliceApns.APNS.Payload.Aps.Badge)
+	require.Equal(t, 3, *aliceApns.APNS.Payload.Aps.Badge)
+	require.Nil(t, fcmClient.byToken(t, "alice_android").APNS.Payload.Aps.Badge)
+}
+
 // testFCMPusher_SendPushes_MutedSkipsIOS verifies a push flagged as muted is
-// delivered to Android devices only: a muted recipient's iOS devices get
-// nothing, an iOS-only recipient gets nothing at all, and the same payload
-// unflagged still reaches every device.
+// delivered to Android devices only, at normal priority: a muted recipient's
+// iOS devices get nothing, an iOS-only recipient gets nothing at all, and the
+// same payload unflagged still reaches every device, at high priority.
 func testFCMPusher_SendPushes_MutedSkipsIOS(t *testing.T, store push.TokenStore) {
 	ctx := context.Background()
 
@@ -520,24 +572,28 @@ func testFCMPusher_SendPushes_MutedSkipsIOS(t *testing.T, store push.TokenStore)
 	}
 
 	for _, tc := range []struct {
-		name       string
-		payload    *pushpb.Payload
-		wantTokens []string
+		name            string
+		payload         *pushpb.Payload
+		wantTokens      []string
+		wantAndroidPrio string
 	}{
 		{
-			name:       "muted",
-			payload:    &pushpb.Payload{Category: pushpb.Payload_CHAT, ChatMetadata: chatMetadata(true)},
-			wantTokens: []string{"alice_android", "carol_android"},
+			name:            "muted",
+			payload:         &pushpb.Payload{Category: pushpb.Payload_CHAT, ChatMetadata: chatMetadata(true)},
+			wantTokens:      []string{"alice_android", "carol_android"},
+			wantAndroidPrio: "normal",
 		},
 		{
-			name:       "unmuted",
-			payload:    &pushpb.Payload{Category: pushpb.Payload_CHAT, ChatMetadata: chatMetadata(false)},
-			wantTokens: []string{"alice_apns", "alice_android", "bob_apns", "carol_android"},
+			name:            "unmuted",
+			payload:         &pushpb.Payload{Category: pushpb.Payload_CHAT, ChatMetadata: chatMetadata(false)},
+			wantTokens:      []string{"alice_apns", "alice_android", "bob_apns", "carol_android"},
+			wantAndroidPrio: "high",
 		},
 		{
-			name:       "no chat metadata",
-			payload:    &pushpb.Payload{},
-			wantTokens: []string{"alice_apns", "alice_android", "bob_apns", "carol_android"},
+			name:            "no chat metadata",
+			payload:         &pushpb.Payload{},
+			wantTokens:      []string{"alice_apns", "alice_android", "bob_apns", "carol_android"},
+			wantAndroidPrio: "high",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -546,6 +602,9 @@ func testFCMPusher_SendPushes_MutedSkipsIOS(t *testing.T, store push.TokenStore)
 
 			require.NoError(t, pusher.SendPushes(ctx, "title", "body", tc.payload, alice, bob, carol))
 			require.ElementsMatch(t, tc.wantTokens, fcmClient.tokens())
+			for _, m := range fcmClient.sentMessages {
+				require.Equal(t, tc.wantAndroidPrio, m.Android.Priority, m.Token)
+			}
 		})
 	}
 

@@ -615,7 +615,7 @@ func renderWidgetPushBody(widget *messagingpb.WidgetContent) (body string, ok bo
 // muted half receives the same payload flagged (ChatMetadata.muted) and
 // without a badge bump, since a muted chat must not move the app icon's
 // count — and only on Android, where the client can deliver the message
-// quietly; the FCMPusher drops a muted recipient's iOS devices, which could
+// quietly, at normal priority (see androidPriority); the FCMPusher drops a muted recipient's iOS devices, which could
 // not suppress the alert, so an iOS user hears nothing from a chat they
 // muted. Which half a recipient lands in is the sender's best-effort call at
 // send time; the client's own copy of its mute is the last word.

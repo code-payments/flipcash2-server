@@ -3,6 +3,7 @@ package messaging_test
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"testing"
 	"time"
 
@@ -72,6 +73,53 @@ func TestChatMessagingReader(t *testing.T) {
 	noSeqs, err := reader.LatestEventSequences(ctx, nil)
 	require.NoError(t, err)
 	require.Empty(t, noSeqs)
+}
+
+// TestChatMessagingReader_LastMessagesMedia pins that a feed row's last
+// message comes back with its media resolved, as a message read's does, and
+// that a resolution failure costs the renditions, not the feed.
+func TestChatMessagingReader_LastMessagesMedia(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewInMemory()
+	original := randomBlobID()
+	thumbnail := randomBlobID()
+	media := &fakeMedia{renditions: map[string][]*blobpb.Rendition{
+		string(original.Value): {
+			{Role: blobpb.Rendition_ORIGINAL, BlobId: original},
+			{Role: blobpb.Rendition_THUMBNAIL, BlobId: thumbnail},
+		},
+	}}
+	reader := messaging.NewChatMessagingReader(zap.NewNop(), store, media)
+
+	chatA := randomChatID()
+	chatB := randomChatID()
+	sender := model.MustGenerateUserID()
+
+	a1, _, err := store.PutMessage(ctx, chatA, sender, mediaContent(original), time.Unix(1, 0), randomClientID(), true)
+	require.NoError(t, err)
+	b1, _, err := store.PutMessage(ctx, chatB, sender, textContent("b1"), time.Unix(1, 0), randomClientID(), true)
+	require.NoError(t, err)
+	refs := []chat.MessageRef{
+		{ChatID: chatA, MessageID: a1.ID},
+		{ChatID: chatB, MessageID: b1.ID},
+	}
+
+	got, err := reader.LastMessages(ctx, refs)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	renditions := got[string(chatA.Value)].Content[0].GetMedia().Items[0].Renditions
+	require.Len(t, renditions, 2)
+	require.Equal(t, blobpb.Rendition_THUMBNAIL, renditions[1].Role)
+	require.Equal(t, "b1", got[string(chatB.Value)].Content[0].GetText().Text)
+	require.False(t, got[string(chatA.Value)].Redacted, "the caller redacts, not the reader")
+
+	// A failed resolution leaves the stored ORIGINAL and still answers.
+	media.err = errors.New("blob store unavailable")
+	got, err = reader.LastMessages(ctx, refs)
+	require.NoError(t, err)
+	renditions = got[string(chatA.Value)].Content[0].GetMedia().Items[0].Renditions
+	require.Len(t, renditions, 1)
+	require.Equal(t, blobpb.Rendition_ORIGINAL, renditions[0].Role)
 }
 
 func TestChatMessagingReader_Messages(t *testing.T) {
@@ -147,6 +195,7 @@ func TestChatMessagingReader_Messages(t *testing.T) {
 // shares nothing.
 type fakeMedia struct {
 	renditions map[string][]*blobpb.Rendition
+	err        error
 }
 
 func (f *fakeMedia) ShareIntoChat(context.Context, *commonpb.UserId, *commonpb.ChatId, []*blobpb.BlobId) error {
@@ -154,6 +203,9 @@ func (f *fakeMedia) ShareIntoChat(context.Context, *commonpb.UserId, *commonpb.C
 }
 
 func (f *fakeMedia) ResolveRenditions(_ context.Context, ids []*blobpb.BlobId) (map[string][]*blobpb.Rendition, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
 	out := make(map[string][]*blobpb.Rendition)
 	for _, id := range ids {
 		if r, ok := f.renditions[string(id.Value)]; ok {

@@ -11,6 +11,11 @@ import (
 // server is delayed on its account.
 var ErrStreamLagging = errors.New("stream lagging; closed")
 
+// ErrEventDropped is returned by Notify when it refuses a droppable event (see
+// NewEventStream) because the stream's buffer is already half full. The
+// stream stays open: only that event is lost.
+var ErrEventDropped = errors.New("droppable event dropped; stream behind")
+
 var errStreamClosed = errors.New("cannot notify closed stream")
 
 // Stream is one open client stream as the delivery path sees it.
@@ -20,7 +25,9 @@ type Stream[E any] interface {
 	// Notify enqueues an event for the stream's handler without blocking: a
 	// full buffer closes the stream and returns ErrStreamLagging rather than
 	// waiting on it. Delivery to a topic with many streams therefore costs one
-	// channel operation per stream, however slow any one client is.
+	// channel operation per stream, however slow any one client is. A
+	// droppable event arriving while the stream is behind is refused with
+	// ErrEventDropped and leaves the stream open (see NewEventStream).
 	Notify(event E) error
 
 	Close()
@@ -38,12 +45,26 @@ type EventStream[E any] struct {
 
 	closed bool
 	ch     chan E
+
+	droppable func(E) bool
+	dropAt    int
 }
 
-func NewEventStream[E any](id string, bufferSize int) *EventStream[E] {
+// NewEventStream returns a stream whose handler may fall bufferSize events
+// behind before Notify closes it.
+//
+// droppable, when not nil, marks the events that are worth less than the
+// stream: transient ones a client can do without and never catches up on,
+// like typing notifications. Once the buffer is half full, Notify refuses a
+// droppable event rather than queue it. A burst of them therefore never
+// closes a stream on its own, and never takes the room the other events need:
+// a lag close still means the stream fell behind on what it must deliver.
+func NewEventStream[E any](id string, bufferSize int, droppable func(E) bool) *EventStream[E] {
 	return &EventStream[E]{
-		id: id,
-		ch: make(chan E, bufferSize),
+		id:        id,
+		ch:        make(chan E, bufferSize),
+		droppable: droppable,
+		dropAt:    bufferSize / 2,
 	}
 }
 
@@ -57,6 +78,12 @@ func (s *EventStream[E]) Notify(event E) error {
 
 	if s.closed {
 		return errStreamClosed
+	}
+
+	// The length is read under the mutex, which excludes other senders; the
+	// handler may be draining concurrently, which only makes room.
+	if s.droppable != nil && len(s.ch) >= s.dropAt && s.droppable(event) {
+		return ErrEventDropped
 	}
 
 	select {

@@ -203,7 +203,7 @@ func (s *Server) streamChatPreview(ctx context.Context, log *zap.Logger, stream 
 		reading:   reading,
 		expiresAt: time.Now().Add(s.chatPreviewLifetime),
 	}
-	ss := NewEventStream[*eventpb.Event](streamID, streamBufferSize)
+	ss := NewEventStream(streamID, streamBufferSize, isTypingOnly)
 
 	// The stream's one key is fixed by the chat it names (see chatPreview). As
 	// at a user stream's open, the local registration leads the cluster one,

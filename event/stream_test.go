@@ -11,7 +11,7 @@ import (
 // instead of stalling the publisher — discarding the backlog, so the handler
 // observes the close immediately.
 func TestEventStream_NotifyNeverBlocks(t *testing.T) {
-	s := NewEventStream[int]("s", 2)
+	s := NewEventStream[int]("s", 2, nil)
 
 	require.NoError(t, s.Notify(1))
 	require.NoError(t, s.Notify(2))
@@ -29,8 +29,44 @@ func TestEventStream_NotifyNeverBlocks(t *testing.T) {
 	s.Close()
 }
 
+// TestEventStream_DropsDroppableWhenBehind pins the droppable contract: a
+// droppable event is refused once the buffer is half full, leaving the stream
+// open, so droppable events alone never close it and never take the room the
+// rest need; a non-droppable event still closes a full stream.
+func TestEventStream_DropsDroppableWhenBehind(t *testing.T) {
+	// Negative events stand in for typing notifications.
+	s := NewEventStream[int]("s", 4, func(e int) bool { return e < 0 })
+
+	require.NoError(t, s.Notify(-1))
+	require.NoError(t, s.Notify(-2))
+
+	// Half full: droppable events are refused, the stream stays open.
+	for e := -3; e > -100; e-- {
+		require.ErrorIs(t, s.Notify(e), ErrEventDropped)
+	}
+
+	// The other half is still there for the events that matter.
+	require.NoError(t, s.Notify(1))
+	require.NoError(t, s.Notify(2))
+
+	require.Equal(t, []int{-1, -2, 1, 2}, []int{<-s.Channel(), <-s.Channel(), <-s.Channel(), <-s.Channel()})
+
+	// Drained, droppable events are queued again.
+	require.NoError(t, s.Notify(-3))
+	<-s.Channel()
+
+	// A full buffer still closes the stream for an event that is not droppable.
+	for e := range 4 {
+		require.NoError(t, s.Notify(e))
+	}
+	require.ErrorIs(t, s.Notify(-4), ErrEventDropped)
+	require.ErrorIs(t, s.Notify(5), ErrStreamLagging)
+	_, ok := <-s.Channel()
+	require.False(t, ok)
+}
+
 func TestEventStream_NotifyAfterClose(t *testing.T) {
-	s := NewEventStream[int]("s", 4)
+	s := NewEventStream[int]("s", 4, nil)
 	s.Close()
 	require.ErrorIs(t, s.Notify(1), errStreamClosed)
 	_, ok := <-s.Channel()

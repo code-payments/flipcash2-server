@@ -58,7 +58,7 @@ func (s *Server) streamUserEvents(ctx context.Context, log *zap.Logger, stream g
 
 	log.Debug("Initializing stream")
 
-	ss := NewEventStream[*eventpb.Event](streamID, streamBufferSize)
+	ss := NewEventStream(streamID, streamBufferSize, isTypingOnly)
 
 	// The stream serves the user's own topic plus one topic per group chat
 	// they are joined to, so group publishers can resolve the hosting servers

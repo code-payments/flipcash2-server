@@ -25,7 +25,9 @@ const (
 	// backstop — which is where unbounded goroutine growth used to be. Drops
 	// are counted per peer and reported on the sweep tick, never logged per
 	// event: a wedged peer at production event rates would otherwise turn
-	// every publish into a log line.
+	// every publish into a log line. A typing notification is refused once
+	// its shard is half full (see outboxes.enqueue), so typing never takes the
+	// room the events that matter need.
 	forwardQueueSize = 4096
 
 	// forwardMaxBatchSize and forwardMaxBatchBytes cap one forwarding RPC, on
@@ -56,6 +58,14 @@ func (i forwardItem) key() []byte {
 		return i.user.GetUserId().GetValue()
 	}
 	return i.chat.GetChatId().GetValue()
+}
+
+// event is the item's event.
+func (i forwardItem) event() *eventpb.Event {
+	if i.user != nil {
+		return i.user.GetEvent()
+	}
+	return i.chat.GetEvent()
 }
 
 func (i forwardItem) size() int {
@@ -125,6 +135,13 @@ type peerOutbox struct {
 	// has already logged, so each tick reports only the delta.
 	dropped  atomic.Uint64
 	reported uint64 // sweep-only, under outboxes.mu
+
+	// typingDropped counts the typing notifications refused because the
+	// peer's outbox was behind, apart from dropped: losing one costs a client
+	// nothing it would catch up on, so it is no sign of lost events, only of
+	// a peer falling behind. typingReported is its sweep-side twin.
+	typingDropped  atomic.Uint64
+	typingReported uint64 // sweep-only, under outboxes.mu
 }
 
 func newOutboxes(log *zap.Logger, send batchSendFunc, cfg outboxConfig) *outboxes {
@@ -141,16 +158,28 @@ func newOutboxes(log *zap.Logger, send batchSendFunc, cfg outboxConfig) *outboxe
 }
 
 // enqueue queues item for address, opening the peer's outbox on first use.
-// It returns false if the item's shard was full and the item was dropped. A
-// drop is counted, not logged: the sweep reports each peer's tally.
+// It returns false if the item was dropped: because its shard was full, or
+// because it is a typing notification and its shard was already half full.
+// A shard carries every topic forwarded to the peer that hashes to it (with
+// one sender, all of them), for every stream the peer hosts, so a burst of
+// typing must not crowd out the messages queued beside it: typing
+// can fill at most half a shard, and the rest is kept for everything else, as
+// a stream's buffer is (see NewEventStream). A drop is counted, not logged:
+// the sweep reports each peer's tally.
 func (o *outboxes) enqueue(address string, item forwardItem) bool {
 	ob := o.acquire(address)
 	defer o.mu.RUnlock()
 
 	ob.lastEnqueue.Store(time.Now().UnixNano())
 
+	shard := ob.shards[shardIndex(item.key(), len(ob.shards))]
+	if len(shard) >= o.cfg.QueueSize/2 && isTypingOnly(item.event()) {
+		ob.typingDropped.Add(1)
+		return false
+	}
+
 	select {
-	case ob.shards[shardIndex(item.key(), len(ob.shards))] <- item:
+	case shard <- item:
 		return true
 	default:
 		ob.dropped.Add(1)
@@ -260,6 +289,17 @@ func (o *outboxes) reportDrops(address string, ob *peerOutbox) {
 		)
 	}
 	ob.reported = dropped
+
+	typingDropped := ob.typingDropped.Load()
+	if delta := typingDropped - ob.typingReported; delta > 0 {
+		o.log.Info(
+			"Dropped typing notifications for a peer whose outbox was behind",
+			zap.String("receiver_address", address),
+			zap.Uint64("dropped", delta),
+			zap.Duration("window", o.cfg.SweepInterval),
+		)
+	}
+	ob.typingReported = typingDropped
 }
 
 func (ob *peerOutbox) empty() bool {

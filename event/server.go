@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
@@ -117,6 +118,15 @@ const (
 	defaultMembershipReconcileInterval = 5 * time.Minute
 	defaultMembershipReconcileTick     = time.Second
 	membershipReconcileWorkers         = 8
+
+	// defaultShutdownSpread and defaultShutdownWaves pace Shutdown's closes
+	// (see Shutdown): a server's streams are closed in this many shuffled
+	// waves spread evenly over this long, so their clients reconnect to the
+	// surviving servers a wave at a time rather than all at once. The spread
+	// sits well inside a typical termination grace period (Kubernetes'
+	// default is 30s), leaving room for the drain and GracefulStop after it.
+	defaultShutdownSpread = 10 * time.Second
+	defaultShutdownWaves  = 10
 )
 
 // ServerOption tunes a Server at construction.
@@ -130,6 +140,16 @@ func WithMembershipReconcile(interval, tick time.Duration) ServerOption {
 	return func(s *Server) {
 		s.reconcileInterval = interval
 		s.reconcileTick = tick
+	}
+}
+
+// WithShutdownSpread overrides how Shutdown paces its closes: over how long,
+// and in how many waves (see Shutdown). A spread of zero closes every stream
+// at once. Tests use it to keep shutdown fast; production keeps the defaults.
+func WithShutdownSpread(spread time.Duration, waves int) ServerOption {
+	return func(s *Server) {
+		s.shutdownSpread = spread
+		s.shutdownWaves = waves
 	}
 }
 
@@ -187,6 +207,10 @@ type Server struct {
 	// chatPreviewLifetime is how long a chat preview stream lives (see
 	// chatPreview).
 	chatPreviewLifetime time.Duration
+
+	// shutdownSpread and shutdownWaves pace Shutdown's closes (see Shutdown).
+	shutdownSpread time.Duration
+	shutdownWaves  int
 
 	// self is the cluster member this process registers subscription rows as:
 	// its instance ID recognizes our own rows on the publish path, its address
@@ -254,6 +278,9 @@ func NewServer(
 		reconcileStop:     make(chan struct{}),
 
 		chatPreviewLifetime: defaultChatPreviewLifetime,
+
+		shutdownSpread: defaultShutdownSpread,
+		shutdownWaves:  defaultShutdownWaves,
 
 		self:         subscriptions.Self(),
 		internalAuth: internalrpc.NewAuthenticator(currentRpcApiKey),
@@ -506,20 +533,73 @@ func (s *Server) ForwardChatEvents(ctx context.Context, events ...*eventpb.ChatE
 }
 
 // Shutdown closes every open client stream — each StreamEvents handler returns
-// and cleans up its subscription — and refuses new ones. Call it on shutdown
-// after Subscriptions.Drain and before the gRPC server's GracefulStop: the
-// streams are held open indefinitely by connected clients, so a GracefulStop
-// without this never returns. Closed clients reconnect to a healthy server and
-// delta sync. Idempotent. It also stops the membership reconcile's sweep; a
-// reconcile in flight finishes against sessions that refuse it (see
-// streamSession.close).
-func (s *Server) Shutdown() {
+// and cleans up its subscription — and refuses new ones, returning once every
+// stream is closed. The streams are held open indefinitely by connected
+// clients, so a GracefulStop without this never returns. Closed clients
+// reconnect to a healthy server and delta sync.
+//
+// The closes are spread out (see WithShutdownSpread): the streams are shuffled
+// and closed in waves evenly over the spread, the first at once, so their
+// clients' reconnects — each a stream open on a surviving server and a delta
+// sync behind it — arrive a wave at a time rather than as one herd. A stream
+// awaiting its wave stays fully live: it is still registered here, and its
+// rows in the cluster still direct other servers' publishes to it, so it
+// misses nothing while it waits. Each stream's own teardown releases its rows
+// and resets its user's badge as any close does, so that work is spread out
+// too. ctx bounds the spread: once it ends, every stream still open is closed
+// at once.
+//
+// Call it on shutdown first, then Subscriptions.Drain, then the gRPC server's
+// GracefulStop. The drain must come after: a drained server's rows are gone,
+// so a stream still awaiting its wave would stay open but hear nothing
+// published on any other server. The process should already be failing its
+// readiness check, so the load balancer sends it no new streams; any that
+// arrive are refused with Unavailable.
+//
+// Idempotent: a later call closes whatever an earlier one left open. It also
+// stops the membership reconcile's sweep; a reconcile in flight finishes
+// against sessions that refuse it (see streamSession.close).
+func (s *Server) Shutdown(ctx context.Context) {
 	s.reconcileStopOnce.Do(func() { close(s.reconcileStop) })
 
 	targets := s.streams.drain()
+	if len(targets) == 0 {
+		return
+	}
+	rand.Shuffle(len(targets), func(i, j int) { targets[i], targets[j] = targets[j], targets[i] })
 
-	s.log.Debug("Closing all event streams for shutdown", zap.Int("streams", len(targets)))
-	for _, stream := range targets {
+	waves := 1
+	if s.shutdownSpread > 0 {
+		waves = max(1, min(s.shutdownWaves, len(targets)))
+	}
+	interval := s.shutdownSpread / time.Duration(waves)
+
+	s.log.Info(
+		"Closing event streams for shutdown",
+		zap.Int("streams", len(targets)),
+		zap.Int("waves", waves),
+		zap.Duration("spread", s.shutdownSpread),
+	)
+
+	// Wave i is targets[i*n/waves : (i+1)*n/waves], so the waves differ in
+	// size by at most one and together cover every stream exactly once.
+	waveStart := func(i int) int { return i * len(targets) / waves }
+	for i := range waves {
+		if i > 0 {
+			select {
+			case <-time.After(interval):
+			case <-ctx.Done():
+				s.log.Info("Shutdown spread cut short; closing remaining event streams", zap.Int("streams", len(targets)-waveStart(i)))
+				closeStreams(targets[waveStart(i):])
+				return
+			}
+		}
+		closeStreams(targets[waveStart(i):waveStart(i+1)])
+	}
+}
+
+func closeStreams(streams []Stream[*eventpb.Event]) {
+	for _, stream := range streams {
 		stream.Close()
 	}
 }

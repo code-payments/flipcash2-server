@@ -60,6 +60,8 @@ func RunServerTests(t *testing.T, accounts account.Store, teardown func()) {
 		testChatPreviewOpenVersusPrivate,
 		testChatPreviewExpires,
 		testServerShutdown,
+		testServerShutdownInWaves,
+		testServerShutdownCutShort,
 		testBadgeResetsAtStreamOpenAndClose,
 	} {
 		tf(t, accounts)
@@ -823,7 +825,7 @@ func testServerShutdown(t *testing.T, accounts account.Store) {
 
 	time.Sleep(500 * time.Millisecond)
 
-	testEnv.server1.server.Shutdown()
+	testEnv.server1.server.Shutdown(context.Background())
 
 	// The open stream terminates promptly with Aborted (the handler returned).
 	testEnv.client1.waitUntilStreamTerminationOrTimeout(t, userID, true, 5*time.Second)
@@ -852,6 +854,183 @@ func testServerShutdown(t *testing.T, accounts account.Store) {
 	actual := testEnv.client2.receiveEventsInRealTime(t, userID)
 	require.Len(t, actual, 1)
 	assertEquivalentTestEvents(t, expected, actual[0])
+}
+
+// testServerShutdownInWaves pins the paced shutdown: streams close a wave at
+// a time over the spread, the first wave at once, and a stream awaiting its
+// wave stays fully live, still receiving events published on another server,
+// since its rows in the cluster outlive it.
+func testServerShutdownInWaves(t *testing.T, accounts account.Store) {
+	const (
+		streams = 6
+		waves   = 3
+		spread  = 3 * time.Second
+	)
+	testEnv, cleanup := setupTest(t, accounts, true, event.WithShutdownSpread(spread, waves))
+	defer cleanup()
+
+	users := make([]*commonpb.UserId, streams)
+	watched := make([]*watchedStream, streams)
+	for i := range users {
+		users[i] = model.MustGenerateUserID()
+		keyPair := model.MustGenerateKeyPair()
+		accounts.Bind(context.Background(), users[i], keyPair.Proto())
+		accounts.SetRegistrationFlag(context.Background(), users[i], true)
+		testEnv.client1.openUserEventStream(t, users[i], keyPair)
+	}
+	time.Sleep(500 * time.Millisecond)
+	for i, user := range users {
+		watched[i] = watchStream(testEnv.client1.streams[model.UserIDString(user)][0])
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		testEnv.server1.server.Shutdown(context.Background())
+		close(shutdownDone)
+	}()
+
+	// The first wave closes at once; the rest wait for theirs.
+	require.Eventually(t, func() bool { return countClosed(watched) == streams/waves }, time.Second, 10*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	require.Equal(t, streams/waves, countClosed(watched), "only the first wave is closed")
+
+	// A stream awaiting its wave still receives what another server publishes.
+	var open *watchedStream
+	var openUser *commonpb.UserId
+	for i, w := range watched {
+		if !w.isClosed() {
+			open, openUser = w, users[i]
+			break
+		}
+	}
+	expected := testEnv.server2.sendTestUserEvent(openUser)
+	select {
+	case actual := <-open.events:
+		assertEquivalentTestEvents(t, expected, actual)
+	case <-time.After(time.Second):
+		require.Fail(t, "a stream awaiting its wave missed an event published on another server")
+	}
+
+	// Every stream closes, the last waves spread over the window.
+	select {
+	case <-shutdownDone:
+	case <-time.After(spread + 2*time.Second):
+		require.Fail(t, "shutdown did not finish within its spread")
+	}
+	// Shutdown returns once it has closed the last wave; the clients see their
+	// streams end a moment later.
+	require.Eventually(t, func() bool { return countClosed(watched) == streams }, 2*time.Second, 10*time.Millisecond)
+	first, last := watched[0].closedAt(), watched[0].closedAt()
+	for _, w := range watched[1:] {
+		if at := w.closedAt(); at.Before(first) {
+			first = at
+		} else if at.After(last) {
+			last = at
+		}
+	}
+	require.GreaterOrEqual(t, last.Sub(first), spread*(waves-1)/waves-500*time.Millisecond, "closes are spread over the window")
+}
+
+// testServerShutdownCutShort pins the bound on the spread: once Shutdown's
+// context ends, every stream still awaiting its wave is closed at once.
+func testServerShutdownCutShort(t *testing.T, accounts account.Store) {
+	const streams = 4
+	testEnv, cleanup := setupTest(t, accounts, false, event.WithShutdownSpread(time.Minute, streams))
+	defer cleanup()
+
+	watched := make([]*watchedStream, streams)
+	users := make([]*commonpb.UserId, streams)
+	for i := range users {
+		users[i] = model.MustGenerateUserID()
+		keyPair := model.MustGenerateKeyPair()
+		accounts.Bind(context.Background(), users[i], keyPair.Proto())
+		accounts.SetRegistrationFlag(context.Background(), users[i], true)
+		testEnv.client1.openUserEventStream(t, users[i], keyPair)
+	}
+	time.Sleep(500 * time.Millisecond)
+	for i, user := range users {
+		watched[i] = watchStream(testEnv.client1.streams[model.UserIDString(user)][0])
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	shutdownDone := make(chan struct{})
+	go func() {
+		testEnv.server1.server.Shutdown(ctx)
+		close(shutdownDone)
+	}()
+
+	require.Eventually(t, func() bool { return countClosed(watched) == 1 }, time.Second, 10*time.Millisecond)
+	cancel()
+
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "shutdown did not return once its context ended")
+	}
+	require.Eventually(t, func() bool { return countClosed(watched) == streams }, 2*time.Second, 10*time.Millisecond)
+}
+
+// watchedStream pumps one client stream on its own goroutine, answering pings,
+// passing on the events it receives, and recording when the stream ends.
+type watchedStream struct {
+	events chan *eventpb.Event
+	done   chan struct{}
+	mu     sync.Mutex
+	at     time.Time
+}
+
+func watchStream(streamer *cancellableStream) *watchedStream {
+	w := &watchedStream{events: make(chan *eventpb.Event, 16), done: make(chan struct{})}
+	go func() {
+		defer func() {
+			w.mu.Lock()
+			w.at = time.Now()
+			w.mu.Unlock()
+			close(w.done)
+		}()
+		for {
+			resp, err := streamer.stream.Recv()
+			if err != nil {
+				return
+			}
+			switch typed := resp.Type.(type) {
+			case *eventpb.StreamEventsResponse_Ping:
+				_ = streamer.stream.Send(&eventpb.StreamEventsRequest{
+					Type: &eventpb.StreamEventsRequest_Pong{Pong: &eventpb.ClientPong{Timestamp: timestamppb.Now()}},
+				})
+			case *eventpb.StreamEventsResponse_Events:
+				for _, e := range typed.Events.Events {
+					w.events <- e
+				}
+			}
+		}
+	}()
+	return w
+}
+
+func (w *watchedStream) isClosed() bool {
+	select {
+	case <-w.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *watchedStream) closedAt() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.at
+}
+
+func countClosed(watched []*watchedStream) int {
+	n := 0
+	for _, w := range watched {
+		if w.isClosed() {
+			n++
+		}
+	}
+	return n
 }
 
 // newTestEvent builds a bare test event, with no forwarding hops yet.
@@ -927,6 +1106,10 @@ func (c quietAfterCleanup) With(fields []zapcore.Field) zapcore.Core {
 }
 
 func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool, opts ...event.ServerOption) (env testEnv, cleanup func()) {
+	// Shutdown closes every stream at once unless a test asks for waves, so
+	// teardown never waits out the production spread.
+	opts = append([]event.ServerOption{event.WithShutdownSpread(0, 1)}, opts...)
+
 	quiet := new(atomic.Bool)
 	log := zaptest.NewLogger(t, zaptest.WrapOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
 		return quietAfterCleanup{Core: core, quiet: quiet}
@@ -1032,8 +1215,8 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool, opt
 
 	return env, func() {
 		quiet.Store(true)
-		env.server1.server.Shutdown()
-		env.server2.server.Shutdown()
+		env.server1.server.Shutdown(context.Background())
+		env.server2.server.Shutdown(context.Background())
 		cleanup1()
 		cleanup2()
 		env.server1.membership.Stop()

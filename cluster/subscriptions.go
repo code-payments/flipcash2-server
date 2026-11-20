@@ -722,7 +722,9 @@ func (s *Subscriptions) Subscribers(ctx context.Context, namespace string, key [
 
 // Drain removes every registry row this instance holds and refuses new
 // subscriptions; outstanding handles' Closes become no-ops. Call on shutdown
-// once streams are closing. Best-effort by design: a row that fails to delete
+// once the streams the rows serve have closed (see event.Server.Shutdown): a
+// stream still open after its rows go stays connected but hears nothing
+// published on any other server. Best-effort by design: a row that fails to delete
 // stops counting anyway once this member's heartbeats stop, and is swept as a
 // corpse row after RowGCAfter.
 func (s *Subscriptions) Drain(ctx context.Context) error {

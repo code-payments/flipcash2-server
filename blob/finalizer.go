@@ -237,6 +237,9 @@ func (f *Finalizer) finalizeImage(ctx context.Context, record *Blob) (blobpb.Blo
 				// attempt can be retried rather than wrongly marking it servable.
 				return blobpb.BlobStatus_BLOB_STATUS_UNKNOWN, err
 			}
+			// A QR code is ordinary in shared media (a payment code, a ticket, a
+			// screenshot), so it never rejects a blob on its own.
+			result = result.Ignoring(moderation.CategoryQRCode)
 			if result.Flagged {
 				return f.reject(ctx, record, &RejectionMetadata{
 					Reason:          RejectionReasonModeration,

@@ -385,6 +385,26 @@ func testModeration(t *testing.T, accounts account.Store, blobs blob.Store, stor
 		require.Equal(t, moderationpb.FlaggedCategory_NSFW, resp.RejectionMetadata.FlaggedCategory)
 	})
 
+	t.Run("image flagged only for a qr code is ready", func(t *testing.T) {
+		h := newHarness(t, accounts, blobs, storage, access, resolver, &fakeModerator{flagged: true, categories: []string{moderation.CategoryQRCode}})
+		blobID, target := initiate(t, h, signer, "image/png", uint64(len(imageBytes)))
+		upload(target, imageBytes)
+
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_READY, complete(t, h, signer, blobID))
+	})
+
+	t.Run("image flagged for a qr code and more is rejected for the rest", func(t *testing.T) {
+		h := newHarness(t, accounts, blobs, storage, access, resolver, &fakeModerator{flagged: true, categories: []string{"general_nsfw", moderation.CategoryQRCode}})
+		blobID, target := initiate(t, h, signer, "image/png", uint64(len(imageBytes)))
+		upload(target, imageBytes)
+
+		resp := completeAndProcess(t, h, signer, blobID)
+		require.Equal(t, blobpb.BlobStatus_BLOB_STATUS_REJECTED, resp.Status)
+		require.NotNil(t, resp.RejectionMetadata)
+		require.Equal(t, blobpb.RejectionReason_REJECTION_REASON_MODERATION, resp.RejectionMetadata.Reason)
+		require.Equal(t, moderationpb.FlaggedCategory_NSFW, resp.RejectionMetadata.FlaggedCategory)
+	})
+
 	t.Run("clean image is ready", func(t *testing.T) {
 		h := newHarness(t, accounts, blobs, storage, access, resolver, &fakeModerator{flagged: false})
 		blobID, target := initiate(t, h, signer, "image/png", uint64(len(imageBytes)))

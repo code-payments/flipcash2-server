@@ -13,8 +13,14 @@ var ErrUnsupportedLanguage = errors.New("unsupported language")
 // CategoryGibberish is the category the generic text classifier and the group
 // title classifier score text under when it has no plausible meaning. It is
 // named here because a caller moderating a name ignores it (see
-// Result.Ignoring); no other category is singled out that way.
+// Result.Ignoring).
 const CategoryGibberish = "gibberish"
+
+// CategoryQRCode is the category the image classifier flags an image under
+// when it contains a QR code. It is named here because the blob pipeline
+// ignores it (see Result.Ignoring): a QR code in chat media is ordinary, while
+// a profile picture or currency icon still rejects one.
+const CategoryQRCode = "yes_qr_code"
 
 type Result struct {
 	// Is the piece of data flaggged as unsafe?
@@ -34,11 +40,12 @@ type Result struct {
 // is, verdict included, and a nil r yields nil, so a classifier that declined
 // (ErrUnsupportedLanguage) needs no special case. r itself is never modified.
 //
-// It exists for a caller that runs the generic text classifier on input one of
-// its categories does not apply to and cannot ask the classifier to leave that
+// It exists for a caller that runs a generic classifier on input one of its
+// categories does not apply to and cannot ask the classifier to leave that
 // category out: a display name or username is a user's to make meaningless, so
 // the gibberish class that is right for prose, and for a group title, is wrong
-// for them.
+// for them; and a blob may show a QR code (CategoryQRCode), which is a spam
+// signal in a profile picture but not in media shared in a chat.
 func (r *Result) Ignoring(categories ...string) *Result {
 	if r == nil {
 		return nil

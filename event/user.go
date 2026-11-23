@@ -14,7 +14,10 @@ import (
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
 	eventpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/event/v1"
 
+	ocp_client "github.com/code-payments/ocp-server/grpc/client"
+
 	"github.com/code-payments/flipcash2-server/cluster"
+	"github.com/code-payments/flipcash2-server/rpc"
 )
 
 // streamUserEvents serves a stream for the signing user: every event
@@ -35,12 +38,22 @@ func (s *Server) streamUserEvents(ctx context.Context, log *zap.Logger, stream g
 	// waited for right after it, so it costs the open no latency of its own
 	// yet still lands before the stream goes live. It never outlives the
 	// handler: the deferred wait covers the exits taken before that point.
+	//
+	// Only a stream from an iOS client resets, at either end. The count only
+	// moves for iOS devices (see push.BadgeResolver), so for anyone else there
+	// is nothing to clear, and for a user on several platforms, activity
+	// elsewhere must not clear what the iOS device has yet to show. A client
+	// whose device type cannot be read is not known to be iOS, so it does not
+	// reset either.
+	resetsBadge := rpc.GetClientDeviceType(ctx) == ocp_client.DeviceTypeIOS
 	var openReset sync.WaitGroup
-	openReset.Go(func() {
-		if err := s.badges.Reset(ctx, userID); err != nil {
-			log.With(zap.Error(err)).Warn("Failed to reset badge count on stream open")
-		}
-	})
+	if resetsBadge {
+		openReset.Go(func() {
+			if err := s.badges.Reset(ctx, userID); err != nil {
+				log.With(zap.Error(err)).Warn("Failed to reset badge count on stream open")
+			}
+		})
+	}
 	defer openReset.Wait()
 
 	streamID := uuid.New().String()
@@ -119,16 +132,19 @@ func (s *Server) streamUserEvents(ctx context.Context, log *zap.Logger, stream g
 		cancel()
 
 		// The badge resets on the way out as on the way in (see the reset
-		// at open). Every end of a registered stream passes through here: the
-		// client leaving, a missed pong, a lag close, a draining server. A
-		// stream that was never registered was turned away at open, which
-		// had already reset. The stream's context is done by now, so the
-		// reset runs on its own budget.
-		resetCtx, cancel := context.WithTimeout(context.Background(), badgeResetTimeout)
-		if err := s.badges.Reset(resetCtx, userID); err != nil {
-			log.With(zap.Error(err)).Warn("Failed to reset badge count on stream close")
+		// at open), for an iOS stream only. Every end of a registered stream
+		// passes through here: the client leaving, a missed pong, a lag close,
+		// a draining server. A stream that was never registered was turned
+		// away at open, which had already reset if it was going to. The
+		// stream's context is done by now, so the reset runs on its own
+		// budget.
+		if resetsBadge {
+			resetCtx, cancel := context.WithTimeout(context.Background(), badgeResetTimeout)
+			if err := s.badges.Reset(resetCtx, userID); err != nil {
+				log.With(zap.Error(err)).Warn("Failed to reset badge count on stream close")
+			}
+			cancel()
 		}
-		cancel()
 	}()
 
 	memberships, err := s.chats.GetGroupMembershipsForUser(ctx, userID)

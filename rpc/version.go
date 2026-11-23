@@ -22,3 +22,16 @@ func GetClientVersion(ctx context.Context) *ocp_client.Version {
 	}
 	return clientVersion
 }
+
+// GetClientDeviceType extracts the client's device type from the gRPC
+// user-agent, or returns DeviceTypeUnknown if no parseable Flipcash user-agent
+// is present. As with GetClientVersion, an unknown device type means the caller
+// is unidentifiable: gating on a device type should treat it as no particular
+// platform.
+func GetClientDeviceType(ctx context.Context) ocp_client.DeviceType {
+	userAgent, err := ocp_client.GetUserAgentByNames(ctx, UserAgentName+"/Core", UserAgentName)
+	if err != nil {
+		return ocp_client.DeviceTypeUnknown
+	}
+	return userAgent.DeviceType
+}

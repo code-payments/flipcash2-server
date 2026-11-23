@@ -47,6 +47,16 @@ import (
 //	          carries neither feed nor last_activity, so it is in neither GSI:
 //	          it records membership alone, and no advance ever touches it.
 //
+//	          Every feed read uses gsiByTypeActivity. gsiByFeedActivity is the
+//	          same (feed, last_activity) index under the name it is to be read
+//	          by once feed names the user's folder for the chat as well as its
+//	          type (see dmFeedKey; every row's folder is the inbox today). Every
+//	          row already carries both its keys, so it fills with no backfill.
+//	          CreateTables leaves an existing table as it is, so on a live
+//	          table the index is created out of band by the infrastructure and
+//	          must be ACTIVE before any read uses it. Nothing reads it yet;
+//	          gsiByTypeActivity is to be dropped once the reads switch.
+//
 //	group_members  pk = "chat#<id>", sk = "user#<id>" (one item per (group,
 //	          member), kept as a tombstone after departure). Group membership,
 //	          mutable — unlike a DM's inline member list. Group chats
@@ -66,10 +76,26 @@ import (
 //	          enumeration. "#" sorts before "user#", so it is the head of the
 //	          partition.
 //
-//	          Both GSIs are sparse, keyed by attributes only membership rows
-//	          carry (user, joined_at) — that discipline is load-bearing: the
-//	          #meta item, and any new item type added to this table, must omit
-//	          those attributes or it leaks into the indexes.
+//	          A membership row also carries feed (see groupFeedKey), the
+//	          user's folder for the group — the inbox, for every row today —
+//	          with exactly the user attribute's presence: set to the inbox by
+//	          every join and every departure, so a tombstone is always filed
+//	          in the inbox, and absent from the rows of users excluded from
+//	          the feed. It keys gsiByFeed on (feed, pk), which is to
+//	          replace gsiByUser as the listing of a user's groups. Rows
+//	          written before feed existed are given it by a one-off backfill
+//	          run out of band, which sets the inbox value on every row that
+//	          carries user and lacks feed. CreateTables leaves an existing
+//	          table as it is, so on a live table the index is created out of
+//	          band by the infrastructure and must be ACTIVE, and the backfill
+//	          finished, before any read uses it. Nothing reads it yet;
+//	          gsiByUser is to be dropped once the reads switch.
+//
+//	          All three GSIs are sparse, keyed by attributes only membership
+//	          rows carry (user, feed, joined_at) — that discipline is
+//	          load-bearing: the #meta item, and any new item type added to
+//	          this table, must omit those attributes or it leaks into the
+//	          indexes.
 //
 //	chat_user_state  pk = "user#<id>", sk = "chat#<id>" (one item per (user,
 //	          chat) the user has ever set state on; see chat.Store).
@@ -388,8 +414,16 @@ const (
 	gsiByActivity = "by_activity"
 
 	// gsiByTypeActivity orders one chat type's slice of a user's inbox by
-	// last_activity, keyed by the composite feed attribute.
+	// last_activity, keyed by the composite feed attribute. Every DM feed read
+	// uses it today; it is to be dropped once they read gsiByFeedActivity.
 	gsiByTypeActivity = "by_type_activity"
+
+	// gsiByFeedActivity is the same (feed, last_activity) index on dm_inbox
+	// as gsiByTypeActivity, under a name that says what keys it: feed names
+	// one of a user's folders as well as the chat type (see dmFeedKey), and
+	// DynamoDB cannot rename an index. Every row gsiByTypeActivity holds is in
+	// it, with no backfill. Nothing reads it yet.
+	gsiByFeedActivity = "by_feed_activity"
 
 	// gsiByUser is the inverted (user, chat) index on group_members, for
 	// listing the group chats a user is a member of. It is keyed by the sparse
@@ -397,8 +431,18 @@ const (
 	// included) and nothing else — rather than the sk itself, so
 	// non-membership items in the table stay out of the index. The rows of a
 	// user the store excludes from the feed omit it too (see groupMemberItem),
-	// so the index holds no key for an account in every user's groups.
+	// so the index holds no key for an account in every user's groups. Every
+	// group listing uses it today; it is to be dropped once they read
+	// gsiByFeed.
 	gsiByUser = "by_user"
+
+	// gsiByFeed is the (feed, chat) index on group_members: one of a user's
+	// folders of groups (see groupFeedKey), in chat order. It is sparse on
+	// feed exactly as gsiByUser is on user: membership rows carry both or
+	// neither (see groupMemberItem), tombstones included, and the #meta item
+	// carries neither. Rows written before feed existed are given it by a
+	// one-off backfill (see the store's doc). Nothing reads it yet.
+	gsiByFeed = "by_feed"
 
 	// gsiByJoinedAt is the sparse (chat, joined_at) index on group_members.
 	// joined_at is present iff the member is currently joined (a left tombstone
@@ -503,7 +547,7 @@ const (
 	attrPK                   = "pk"
 	attrSK                   = "sk"
 	attrType                 = "type"
-	attrFeed                 = "feed"
+	attrFeed                 = "feed" // dm_inbox and group_members rows: the user's folder the chat is filed in — see dmFeedKey and groupFeedKey
 	attrMembers              = "members"
 	attrExcludedFromFeed     = "excluded_from_feed" // DM chats item: binary set of the members the DM excludes from the feed (see chat.Store.PutChat), absent when none
 	attrTitle                = "title"
@@ -905,23 +949,25 @@ func (s *store) banCheck(chatID *commonpb.ChatId, userID *commonpb.UserId) *type
 
 // joinUpdate is the membership transition that (re)joins userID to chatID
 // (see addGroupMembers), for transitionMembership to carry. It sets the user
-// attribute, listing the record in gsiByUser, unless the store excludes the
-// user from the feed, when it removes it instead, so the record is unlisted
-// whatever an earlier write left on it (see groupMemberItem).
+// and feed attributes, listing the record in gsiByUser and in the user's inbox
+// in gsiByFeed, unless the store excludes the user from the feed, when it
+// removes both instead, so the record is unlisted whatever an earlier write
+// left on it (see groupMemberItem). A (re)join files the group in the inbox.
 func (s *store) joinUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.Update {
 	values := map[string]types.AttributeValue{
 		":joined": avN(memberStateJoined),
 		":now":    avN(uint64(time.Now().UTC().UnixNano())),
 	}
 	expression := fmt.Sprintf(
-		"SET #state = :joined, #user = :user, %s = :now, %s = :version REMOVE %s, %s", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
+		"SET #state = :joined, #user = :user, #feed = :feed, %s = :now, %s = :version REMOVE %s, %s", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
 	)
 	if s.exclusions.Excludes(userID) {
 		expression = fmt.Sprintf(
-			"SET #state = :joined, %s = :now, %s = :version REMOVE %s, %s, #user", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
+			"SET #state = :joined, %s = :now, %s = :version REMOVE %s, %s, #user, #feed", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
 		)
 	} else {
 		values[":user"] = avS(userIndexKey(userID))
+		values[":feed"] = avS(groupFeedKey(userID, false))
 	}
 	return &types.Update{
 		TableName: aws.String(s.groupMembersTable),
@@ -931,7 +977,7 @@ func (s *store) joinUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *ty
 		},
 		UpdateExpression:          aws.String(expression),
 		ConditionExpression:       aws.String("attribute_not_exists(#state) OR #state <> :joined"),
-		ExpressionAttributeNames:  map[string]string{"#state": attrState, "#user": attrUser},
+		ExpressionAttributeNames:  map[string]string{"#state": attrState, "#user": attrUser, "#feed": attrFeed},
 		ExpressionAttributeValues: values,
 	}
 }
@@ -973,18 +1019,33 @@ func (s *store) keyEnvelopeDiscard(chatID *commonpb.ChatId, userID *commonpb.Use
 // removing a non-member (or an unknown user) a no-op rather than an upsert of
 // a malformed tombstone. Removing joined_at drops the member from the sparse
 // gsiByJoinedAt. The user attribute is left as the join wrote it, so a
-// tombstone stays listed in gsiByUser, unless the store excludes the user
-// from the feed, when it is removed, as joinUpdate removes it, so the
-// tombstone is unlisted however the join was written.
+// tombstone stays listed in gsiByUser, and feed is set to the user's inbox
+// whatever folder the membership was filed in, so a departure always files
+// the tombstone in the inbox: a membership's folder lasts only as long as the
+// membership, and a rejoin starts in the inbox too (see joinUpdate). Both are
+// removed instead when the store excludes the user from the feed, as
+// joinUpdate removes them, so the tombstone is unlisted however the join was
+// written.
 func (s *store) leaveUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.Update {
 	now := time.Now().UTC()
 	expression := fmt.Sprintf(
 		"SET #state = :left, %s = :now, %s = :version, %s = :expires REMOVE %s", attrLeftAt, attrVersion, attrExpiresAt, attrJoinedAt,
 	)
-	names := map[string]string{"#state": attrState}
+	names := map[string]string{"#state": attrState, "#feed": attrFeed}
+	values := map[string]types.AttributeValue{
+		":joined":  avN(memberStateJoined),
+		":left":    avN(memberStateLeft),
+		":now":     avN(uint64(now.UnixNano())),
+		":expires": avN(uint64(now.Add(tombstoneTTL).Unix())),
+	}
 	if s.exclusions.Excludes(userID) {
-		expression += ", #user"
+		expression += ", #user, #feed"
 		names["#user"] = attrUser
+	} else {
+		expression = fmt.Sprintf(
+			"SET #state = :left, #feed = :feed, %s = :now, %s = :version, %s = :expires REMOVE %s", attrLeftAt, attrVersion, attrExpiresAt, attrJoinedAt,
+		)
+		values[":feed"] = avS(groupFeedKey(userID, false))
 	}
 	return &types.Update{
 		TableName: aws.String(s.groupMembersTable),
@@ -992,15 +1053,10 @@ func (s *store) leaveUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *t
 			attrPK: avS(chatPK(chatID)),
 			attrSK: avS(userPK(userID)),
 		},
-		UpdateExpression:         aws.String(expression),
-		ConditionExpression:      aws.String("#state = :joined"),
-		ExpressionAttributeNames: names,
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":joined":  avN(memberStateJoined),
-			":left":    avN(memberStateLeft),
-			":now":     avN(uint64(now.UnixNano())),
-			":expires": avN(uint64(now.Add(tombstoneTTL).Unix())),
-		},
+		UpdateExpression:          aws.String(expression),
+		ConditionExpression:       aws.String("#state = :joined"),
+		ExpressionAttributeNames:  names,
+		ExpressionAttributeValues: values,
 	}
 }
 
@@ -1322,7 +1378,7 @@ func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chat
 		KeyConditionExpression:   aws.String(fmt.Sprintf("#feed = :f AND %s <= :snap", attrLastActivity)),
 		ExpressionAttributeNames: map[string]string{"#feed": attrFeed},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":f":    avS(feedPK(userID, chatType)),
+			":f":    avS(dmFeedKey(userID, chatType, false)),
 			":snap": avN(uint64(snapshot.UnixNano())),
 		},
 		ScanIndexForward: aws.Bool(false),
@@ -1338,7 +1394,7 @@ func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chat
 		input.ExclusiveStartKey = map[string]types.AttributeValue{
 			attrPK:           avS(userPK(userID)),
 			attrSK:           avS(chatSK(cursor.ChatID)),
-			attrFeed:         avS(feedPK(userID, chatType)),
+			attrFeed:         avS(dmFeedKey(userID, chatType, false)),
 			attrLastActivity: avN(uint64(cursor.LastActivity.UnixNano())),
 		}
 	}
@@ -2373,12 +2429,13 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 }
 
 // groupMemberItem is a joined membership record, as written at group creation.
-// It matches what addGroupMembers converges to: state joined, user set (the
-// gsiByUser hash key), joined_at present (the sparse gsiByJoinedAt keys off its
-// presence), no left_at. The record of a user the store excludes from the feed
-// carries no user attribute, so it is not in gsiByUser and no listing of the
+// It matches what addGroupMembers converges to: state joined, user and feed set
+// (the gsiByUser and gsiByFeed hash keys, feed naming the user's inbox),
+// joined_at present (the sparse gsiByJoinedAt keys off its presence), no
+// left_at. The record of a user the store excludes from the feed carries
+// neither user nor feed, so it is in neither index and no listing of the
 // user's groups returns it (see chat.Store.PutChat); nothing else reads the
-// attribute, since every reader of a membership record takes the member's ID
+// attributes, since every reader of a membership record takes the member's ID
 // from its sk, so the record is a member's in every other respect.
 func (s *store) groupMemberItem(chatID *commonpb.ChatId, member *commonpb.UserId, joinedAt time.Time) map[string]types.AttributeValue {
 	item := map[string]types.AttributeValue{
@@ -2389,13 +2446,14 @@ func (s *store) groupMemberItem(chatID *commonpb.ChatId, member *commonpb.UserId
 	}
 	if !s.exclusions.Excludes(member) {
 		item[attrUser] = avS(userIndexKey(member))
+		item[attrFeed] = avS(groupFeedKey(member, false))
 	}
 	return item
 }
 
 // groupMetaItem is a group's aggregates item as written at creation: the
-// initial joined member count and a roster version of zero. It carries neither
-// user nor joined_at, so it stays out of both sparse GSIs.
+// initial joined member count and a roster version of zero. It carries none of
+// user, feed and joined_at, so it stays out of every sparse GSI.
 func (s *store) groupMetaItem(chatID *commonpb.ChatId, memberCount uint64) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{
 		attrPK:          avS(chatPK(chatID)),
@@ -2421,7 +2479,7 @@ func (s *store) dmInboxItem(c *chat.Chat, member *commonpb.UserId, excluded bool
 	if excluded {
 		return item
 	}
-	item[attrFeed] = avS(feedPK(member, c.Type))
+	item[attrFeed] = avS(dmFeedKey(member, c.Type, false))
 	item[attrLastActivity] = avN(uint64(c.LastActivity.UnixNano()))
 	if c.LastMessageID != nil {
 		item[attrLastMessageID] = avN(c.LastMessageID.Value)
@@ -2570,10 +2628,36 @@ func userPK(userID *commonpb.UserId) string { return userKeyPrefix + hex.EncodeT
 // than an error.
 func userIndexKey(userID *commonpb.UserId) string { return hex.EncodeToString(userID.Value) }
 
-// feedPK is the composite hash key of gsiByTypeActivity: one chat type's slice
-// of a user's inbox. The chat type is encoded by its stable proto enum number.
-func feedPK(userID *commonpb.UserId, chatType chatpb.ChatType) string {
-	return fmt.Sprintf("%s#%d", userPK(userID), chatType)
+// archivedFeedSuffix ends the feed attribute of a chat filed in the user's
+// archive rather than their inbox (see dmFeedKey and groupFeedKey).
+const archivedFeedSuffix = "#archived"
+
+// dmFeedKey is the feed attribute of a user's dm_inbox row, the hash key of
+// gsiByTypeActivity and gsiByFeedActivity: one chat type's slice of one of the
+// user's folders, "user#<id>#<type>" for the inbox and the same with
+// archivedFeedSuffix for the archive. The chat type is encoded by its stable
+// proto enum number. Nothing parses the value: it is only ever built here and
+// compared whole, so its layout may change with a backfill and no reader.
+func dmFeedKey(userID *commonpb.UserId, chatType chatpb.ChatType, archived bool) string {
+	key := fmt.Sprintf("%s#%d", userPK(userID), chatType)
+	if archived {
+		key += archivedFeedSuffix
+	}
+	return key
+}
+
+// groupFeedKey is the feed attribute of a user's group_members row, the hash
+// key of gsiByFeed: one of the user's folders of groups, "user#<id>" for the
+// inbox and the same with archivedFeedSuffix for the archive. It has no chat
+// type segment, since every row of the table is a group's. Nothing parses the
+// value, as with dmFeedKey: every reader of a membership record takes the
+// member's ID from its sk.
+func groupFeedKey(userID *commonpb.UserId, archived bool) string {
+	key := userPK(userID)
+	if archived {
+		key += archivedFeedSuffix
+	}
+	return key
 }
 
 // chatIDFromSK recovers a chat ID from a dm_inbox item's sk ("chat#<hex>"),

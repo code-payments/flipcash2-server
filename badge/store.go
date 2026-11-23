@@ -10,8 +10,10 @@ import (
 //
 // The count is a "notifications since the user was last in the app" counter,
 // not a live unread total: Increment bumps it as unread-eligible messages fan
-// out to a user, and Reset zeroes it when their event stream opens and again
-// when it ends (see event.Server). All mutations are atomic, so the
+// out to a user, and Reset zeroes it when their event stream from an iOS
+// client opens and again when it ends (see event.Server); a stream from any
+// other client, or one that cannot be identified, leaves it alone, since only
+// iOS displays it. All mutations are atomic, so the
 // concurrent increments produced by a noisy chat's fan-out serialize on the
 // user's item rather than racing through a read-modify-write.
 type Store interface {

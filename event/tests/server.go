@@ -3,6 +3,7 @@ package tests
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"maps"
 	"math/rand/v2"
@@ -17,6 +18,7 @@ import (
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -63,6 +65,7 @@ func RunServerTests(t *testing.T, accounts account.Store, teardown func()) {
 		testServerShutdownInWaves,
 		testServerShutdownCutShort,
 		testBadgeResetsAtStreamOpenAndClose,
+		testBadgeNotResetByNonIOSStream,
 	} {
 		tf(t, accounts)
 		teardown()
@@ -158,10 +161,10 @@ func testMultipleOpenStreams(t *testing.T, accounts account.Store) {
 	}
 }
 
-// testBadgeResetsAtStreamOpenAndClose pins the badge's two resets: a stream's
-// open clears what built up while the user was away, and its end clears what
-// was pushed while they were in the app, so the first push after they leave
-// counts from one.
+// testBadgeResetsAtStreamOpenAndClose pins the badge's two resets for an iOS
+// client: a stream's open clears what built up while the user was away, and
+// its end clears what was pushed while they were in the app, so the first push
+// after they leave counts from one.
 func testBadgeResetsAtStreamOpenAndClose(t *testing.T, accounts account.Store) {
 	testEnv, cleanup := setupTest(t, accounts, false)
 	defer cleanup()
@@ -183,7 +186,7 @@ func testBadgeResetsAtStreamOpenAndClose(t *testing.T, accounts account.Store) {
 	_, err := testEnv.badges.Increment(ctx, userID, 3)
 	require.NoError(t, err)
 
-	testEnv.client1.openUserEventStream(t, userID, keyPair)
+	testEnv.client1.openUserEventStreamAs(t, "Flipcash/iOS/2026.11.1", userID, keyPair)
 
 	time.Sleep(500 * time.Millisecond)
 
@@ -211,6 +214,57 @@ func testBadgeResetsAtStreamOpenAndClose(t *testing.T, accounts account.Store) {
 	count, err := testEnv.badges.Increment(ctx, userID, 1)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, count)
+}
+
+// testBadgeNotResetByNonIOSStream pins that a stream from any client not
+// identified as iOS leaves the badge alone at both ends: the count only moves
+// for iOS devices, so activity elsewhere must not clear it.
+func testBadgeNotResetByNonIOSStream(t *testing.T, accounts account.Store) {
+	for _, userAgent := range []string{"Flipcash/Android/2026.11.1", ""} {
+		t.Run(fmt.Sprintf("user agent %q", userAgent), func(t *testing.T) {
+			testEnv, cleanup := setupTest(t, accounts, false)
+			defer cleanup()
+
+			ctx := context.Background()
+
+			userID := model.MustGenerateUserID()
+			keyPair := model.MustGenerateKeyPair()
+			accounts.Bind(ctx, userID, keyPair.Proto())
+			accounts.SetRegistrationFlag(ctx, userID, true)
+
+			badgeCount := func() uint64 {
+				count, err := testEnv.badges.Get(ctx, userID)
+				require.NoError(t, err)
+				return count
+			}
+
+			_, err := testEnv.badges.Increment(ctx, userID, 3)
+			require.NoError(t, err)
+
+			if userAgent == "" {
+				testEnv.client1.openUserEventStream(t, userID, keyPair)
+			} else {
+				testEnv.client1.openUserEventStreamAs(t, userAgent, userID, keyPair)
+			}
+
+			time.Sleep(500 * time.Millisecond)
+
+			// An event delivered over the stream proves the open has passed
+			// the point where a reset would have landed.
+			expected := testEnv.server1.sendTestUserEvent(userID)
+			actual := testEnv.client1.receiveEventsInRealTime(t, userID)
+			require.Len(t, actual, 1)
+			assertEquivalentTestEvents(t, expected, actual[0])
+			require.EqualValues(t, 3, badgeCount())
+
+			testEnv.client1.closeOneUserEventStream(t, userID)
+
+			// The close's reset would run on teardown; give it time to land
+			// if it were going to.
+			time.Sleep(500 * time.Millisecond)
+			require.EqualValues(t, 3, badgeCount())
+		})
+	}
 }
 
 // testBurstDelivery pins delivery under a burst: events published faster than
@@ -1065,6 +1119,7 @@ type serverTestEnv struct {
 
 type clientTestEnv struct {
 	client  eventpb.EventStreamingClient
+	target  string
 	streams map[string][]*cancellableStream
 }
 
@@ -1124,6 +1179,7 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool, opt
 
 	env.client1 = &clientTestEnv{
 		client:  eventpb.NewEventStreamingClient(conn1),
+		target:  conn1.Target(),
 		streams: make(map[string][]*cancellableStream),
 	}
 	env.client2 = &clientTestEnv{
@@ -1231,6 +1287,25 @@ func (s *serverTestEnv) sendTestUserEvent(userID *commonpb.UserId) *eventpb.Even
 }
 
 func (c *clientTestEnv) openUserEventStream(t *testing.T, userID *commonpb.UserId, keyPair model.KeyPair) {
+	c.openUserEventStreamOn(t, c.client, userID, keyPair)
+}
+
+// openUserEventStreamAs opens a user event stream from a client identifying
+// itself with the given user-agent, over a connection of its own: grpc-go
+// takes the user-agent from the connection, not from call metadata.
+func (c *clientTestEnv) openUserEventStreamAs(t *testing.T, userAgent string, userID *commonpb.UserId, keyPair model.KeyPair) {
+	conn, err := grpc.NewClient(
+		c.target,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUserAgent(userAgent),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+
+	c.openUserEventStreamOn(t, eventpb.NewEventStreamingClient(conn), userID, keyPair)
+}
+
+func (c *clientTestEnv) openUserEventStreamOn(t *testing.T, client eventpb.EventStreamingClient, userID *commonpb.UserId, keyPair model.KeyPair) {
 	key := model.UserIDString(userID)
 
 	cancellableCtx, cancel := context.WithCancel(context.Background())
@@ -1244,7 +1319,7 @@ func (c *clientTestEnv) openUserEventStream(t *testing.T, userID *commonpb.UserI
 	}
 	require.NoError(t, keyPair.Auth(req.GetParams(), &req.GetParams().Auth))
 
-	streamer, err := c.client.StreamEvents(cancellableCtx)
+	streamer, err := client.StreamEvents(cancellableCtx)
 	require.NoError(t, err)
 
 	require.NoError(t, streamer.Send(req))

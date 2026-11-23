@@ -63,6 +63,55 @@ func requireUnlisted(t *testing.T, chatID *commonpb.ChatId, sk string) {
 	require.NotContains(t, item, attrUser)
 }
 
+// setIndexKeys gives userID's row in chatID both index attributes, with their
+// inbox values, as a write from before the store excluded the user left it.
+func setIndexKeys(t *testing.T, chatID *commonpb.ChatId, userID *commonpb.UserId) {
+	t.Helper()
+	_, err := testEnv.Client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
+		TableName:                aws.String(groupMembersTable),
+		Key:                      map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(userPK(userID))},
+		UpdateExpression:         aws.String("SET #user = :user, #feed = :feed"),
+		ConditionExpression:      aws.String("attribute_exists(#state)"),
+		ExpressionAttributeNames: map[string]string{"#user": attrUser, "#feed": attrFeed, "#state": attrState},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":user": avS(hex.EncodeToString(userID.Value)),
+			":feed": avS("user#" + hex.EncodeToString(userID.Value)),
+		},
+	})
+	require.NoError(t, err)
+}
+
+// queryFeed lists the pks gsiByFeed holds under feed.
+func queryFeed(t *testing.T, feed string) []string {
+	t.Helper()
+	out, err := testEnv.Client.Query(context.Background(), &dynamodb.QueryInput{
+		TableName:                 aws.String(groupMembersTable),
+		IndexName:                 aws.String(gsiByFeed),
+		KeyConditionExpression:    aws.String("#feed = :feed"),
+		ExpressionAttributeNames:  map[string]string{"#feed": attrFeed},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":feed": avS(feed)},
+	})
+	require.NoError(t, err)
+	var pks []string
+	for _, item := range out.Items {
+		pks = append(pks, asS(item[attrPK]))
+	}
+	return pks
+}
+
+// membershipIDs lists the chat IDs GetGroupMembershipsForUser returns, hex
+// encoded, failing the test on an error.
+func membershipIDs(t *testing.T, s chat.Store, userID *commonpb.UserId) []string {
+	t.Helper()
+	memberships, err := s.GetGroupMembershipsForUser(context.Background(), userID)
+	require.NoError(t, err)
+	ids := make([]string, 0, len(memberships))
+	for _, m := range memberships {
+		ids = append(ids, hex.EncodeToString(m.ChatID.Value))
+	}
+	return ids
+}
+
 // removeFeed makes userID's row in chatID what a write from before feed left.
 func removeFeed(t *testing.T, chatID *commonpb.ChatId, userID *commonpb.UserId) {
 	t.Helper()
@@ -76,10 +125,11 @@ func removeFeed(t *testing.T, chatID *commonpb.ChatId, userID *commonpb.UserId) 
 }
 
 // TestChat_DynamoDBGroupMemberFeed pins the feed attribute on group_members,
-// which no Store method reads yet: every membership write sets it beside user,
-// to the user's inbox, a departure (a leave or a ban) sets it on the
-// tombstone, even to a row that lacked it, and neither the rows of a user excluded from the feed nor #meta
-// ever carry it.
+// the hash key of gsiByFeed, which every listing of a user's groups reads:
+// every membership write sets it beside user, to the user's inbox, a departure
+// (a leave or a ban) sets it on the tombstone, even to a row that lacked it,
+// and neither the rows of a user excluded from the feed nor #meta ever carry
+// it.
 func TestChat_DynamoDBGroupMemberFeed(t *testing.T) {
 	ctx := context.Background()
 	team := model.MustGenerateUserID()
@@ -197,10 +247,10 @@ func TestChat_DynamoDBGroupMemberFeed(t *testing.T) {
 }
 
 // TestChat_DynamoDBFeedIndexes checks that CreateTables defines the two feed
-// indexes, that gsiByFeed lists a user's membership rows, tombstones
-// included, and nothing of an excluded user's, and that a DM inbox row's feed
-// is the value gsiByTypeActivity has always been keyed by, so that
-// gsiByFeedActivity holds it unchanged.
+// indexes the reads use beside the legacy ones it keeps, that gsiByFeed lists
+// a user's membership rows, tombstones included, and nothing of an excluded
+// user's, and that a DM inbox row's feed is the value gsiByTypeActivity has
+// always been keyed by, so that gsiByFeedActivity holds every row unchanged.
 func TestChat_DynamoDBFeedIndexes(t *testing.T) {
 	ctx := context.Background()
 	team := model.MustGenerateUserID()
@@ -237,28 +287,12 @@ func TestChat_DynamoDBFeedIndexes(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, changed)
 
-	queryFeed := func(feed string) []string {
-		t.Helper()
-		out, err := testEnv.Client.Query(ctx, &dynamodb.QueryInput{
-			TableName:                 aws.String(groupMembersTable),
-			IndexName:                 aws.String(gsiByFeed),
-			KeyConditionExpression:    aws.String("#feed = :feed"),
-			ExpressionAttributeNames:  map[string]string{"#feed": attrFeed},
-			ExpressionAttributeValues: map[string]types.AttributeValue{":feed": avS(feed)},
-		})
-		require.NoError(t, err)
-		var pks []string
-		for _, item := range out.Items {
-			pks = append(pks, asS(item[attrPK]))
-		}
-		return pks
-	}
 	// The index is eventually consistent.
 	require.Eventually(t, func() bool {
-		return len(queryFeed(groupFeedKey(user, false))) == 2
+		return len(queryFeed(t, groupFeedKey(user, false))) == 2
 	}, 5*time.Second, 50*time.Millisecond)
-	require.ElementsMatch(t, []string{chatPK(joined), chatPK(left)}, queryFeed(groupFeedKey(user, false)))
-	require.Empty(t, queryFeed(groupFeedKey(team, false)))
+	require.ElementsMatch(t, []string{chatPK(joined), chatPK(left)}, queryFeed(t, groupFeedKey(user, false)))
+	require.Empty(t, queryFeed(t, groupFeedKey(team, false)))
 
 	dmIDValue := make([]byte, chat.DmChatIDSize)
 	_, err = rand.Read(dmIDValue)
@@ -281,4 +315,100 @@ func TestChat_DynamoDBFeedIndexes(t *testing.T) {
 	require.Equal(t, asS(out.Item[attrFeed]), dmFeedKey(user, chatpb.ChatType_DM, false))
 	require.Equal(t, asS(out.Item[attrFeed])+"#archived", dmFeedKey(user, chatpb.ChatType_DM, true))
 	require.Equal(t, "user#"+hex.EncodeToString(user.Value)+"#archived", groupFeedKey(user, true))
+}
+
+// TestChat_DynamoDBExcludedRowLosesIndexKeys checks that the row of a user
+// the store excludes from the feed which still carries user and feed — as a
+// row written before the user was excluded would — loses both on a departure
+// and on a join, and is then in no listing of the user's groups.
+func TestChat_DynamoDBExcludedRowLosesIndexKeys(t *testing.T) {
+	ctx := context.Background()
+	team := model.MustGenerateUserID()
+	s := newFeedTestStore(t, team)
+
+	creator := model.MustGenerateUserID()
+	departed := chat.MustGenerateGroupChatID()
+	rejoined := chat.MustGenerateGroupChatID()
+	for _, id := range []*commonpb.ChatId{departed, rejoined} {
+		require.NoError(t, s.PutChat(ctx, &chat.Chat{
+			ID:           id,
+			Type:         chatpb.ChatType_GROUP,
+			Members:      []*commonpb.UserId{creator, team},
+			Title:        "Feed",
+			LastActivity: time.Now(),
+		}))
+	}
+
+	// A joined row and a tombstone, each carrying both attributes. The
+	// listing reads them, so the raw rows are what the store must clean.
+	changed, _, err := s.RemoveGroupMember(ctx, rejoined, team, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	setIndexKeys(t, departed, team)
+	setIndexKeys(t, rejoined, team)
+	require.Eventually(t, func() bool {
+		return len(membershipIDs(t, s, team)) == 2
+	}, 5*time.Second, 50*time.Millisecond)
+
+	changed, _, err = s.RemoveGroupMember(ctx, departed, team, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	requireUnlisted(t, departed, userPK(team))
+
+	changed, _, err = s.AddGroupMembers(ctx, rejoined, []*commonpb.UserId{team})
+	require.NoError(t, err)
+	require.True(t, changed)
+	requireUnlisted(t, rejoined, userPK(team))
+
+	require.Eventually(t, func() bool {
+		return len(queryFeed(t, groupFeedKey(team, false))) == 0 && len(membershipIDs(t, s, team)) == 0
+	}, 5*time.Second, 50*time.Millisecond)
+	chats, err := s.GetGroupChatsForUser(ctx, team)
+	require.NoError(t, err)
+	require.Empty(t, chats)
+	chats, err = s.GetGroupChatsForUserByIDs(ctx, team, []*commonpb.ChatId{departed, rejoined})
+	require.NoError(t, err)
+	require.Empty(t, chats)
+}
+
+// TestChat_DynamoDBListingsReadFeed checks that the listings of a user's
+// groups read gsiByFeed, not gsiByUser: a row carrying user but no feed — a
+// row written before feed existed that the backfill missed — is in none of
+// them. The backfill, which gave feed to every such row, is what makes the
+// switch to gsiByFeed lose no membership.
+func TestChat_DynamoDBListingsReadFeed(t *testing.T) {
+	ctx := context.Background()
+	s := newFeedTestStore(t)
+
+	user := model.MustGenerateUserID()
+	listed := chat.MustGenerateGroupChatID()
+	legacy := chat.MustGenerateGroupChatID()
+	for _, id := range []*commonpb.ChatId{listed, legacy} {
+		require.NoError(t, s.PutChat(ctx, &chat.Chat{
+			ID:           id,
+			Type:         chatpb.ChatType_GROUP,
+			Members:      []*commonpb.UserId{user},
+			Title:        "Feed",
+			LastActivity: time.Now(),
+		}))
+	}
+	removeFeed(t, legacy, user)
+	item := groupMembersItem(t, legacy, userPK(user))
+	require.Equal(t, hex.EncodeToString(user.Value), asS(item[attrUser]))
+
+	want := []string{hex.EncodeToString(listed.Value)}
+	require.Eventually(t, func() bool {
+		ids := membershipIDs(t, s, user)
+		return len(ids) == 1 && ids[0] == want[0]
+	}, 5*time.Second, 50*time.Millisecond)
+
+	chats, err := s.GetGroupChatsForUser(ctx, user)
+	require.NoError(t, err)
+	require.Len(t, chats, 1)
+	require.Equal(t, listed.Value, chats[0].ID.Value)
+
+	chats, err = s.GetGroupChatsForUserByIDs(ctx, user, []*commonpb.ChatId{listed, legacy})
+	require.NoError(t, err)
+	require.Len(t, chats, 1)
+	require.Equal(t, listed.Value, chats[0].ID.Value)
 }

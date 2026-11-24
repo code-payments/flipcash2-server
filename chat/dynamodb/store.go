@@ -56,12 +56,11 @@ import (
 //	          so archiving moves the row between partitions of the index and
 //	          no read filters. An advance moves an archived row's
 //	          last_activity as any other's, so the archived folder is ordered
-//	          by activity too. It has the same keys as gsiByTypeActivity, which
-//	          it replaced, so it filled with no backfill. Nothing reads
-//	          gsiByTypeActivity or the older gsiByActivity any more; both stay
-//	          on the table until a cleanup drops them, and gsiByTypeActivity,
-//	          keyed by the same feed, holds the archived rows under keys
-//	          nothing reads.
+//	          by activity too. It has the same keys as the by_type_activity
+//	          index it replaced, so it filled with no backfill. That index and
+//	          the older by_activity on (pk, last_activity) are no longer
+//	          defined or read; a live table keeps them until infrastructure
+//	          drops them.
 //
 //	group_members  pk = "chat#<id>", sk = "user#<id>" (one item per (group,
 //	          member), kept as a tombstone after departure). Group membership,
@@ -95,17 +94,17 @@ import (
 //	          filed in the archive and the record never holds an archive of a
 //	          group its user has left. It keys gsiByFeed on (feed, pk), the
 //	          listing of a user's groups (one folder at a time), which
-//	          replaced gsiByUser. Rows written before feed existed were given
-//	          it by a one-off backfill run out of band, which set the inbox
-//	          value on every row that carried user and lacked feed; the
-//	          backfill is what makes gsiByFeed list every membership gsiByUser
-//	          did, since a row with user and no feed is in no listing.
-//	          Nothing reads gsiByUser any more; it stays on the table, and
-//	          writes still set user, until a cleanup stops writing user and
-//	          drops the index.
+//	          replaced the by_user index on the user attribute. Rows written
+//	          before feed existed were given it by a one-off backfill run out
+//	          of band, which set the inbox value on every row that carried
+//	          user and lacked feed; the backfill is what makes gsiByFeed list
+//	          every membership by_user did, since a row with user and no feed
+//	          is in no listing. by_user is no longer defined or read, and a
+//	          live table keeps it until infrastructure drops it; writes still
+//	          set user, which nothing reads.
 //
-//	          All three GSIs are sparse, keyed by attributes only membership
-//	          rows carry (user, feed, joined_at) — that discipline is
+//	          Both GSIs are sparse, keyed by attributes only membership rows
+//	          carry (feed, joined_at) — that discipline is
 //	          load-bearing: the #meta item, and any new item type added to
 //	          this table, must omit those attributes or it leaks into the
 //	          indexes.
@@ -443,36 +442,15 @@ import (
 //	          cannot give one to a table that exists, so the infrastructure
 //	          creates the table with it.
 const (
-	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
-	// all of a user's DM types. Superseded by gsiByTypeActivity and then by
-	// gsiByFeedActivity; nothing reads it. It is kept, as it still exists on
-	// the live table, until a cleanup drops it.
-	gsiByActivity = "by_activity"
-
-	// gsiByTypeActivity orders one chat type's slice of a user's inbox by
-	// last_activity, keyed by the composite feed attribute. Superseded by
-	// gsiByFeedActivity, on the same keys; nothing reads it. It is kept, as it
-	// still exists on the live table, until a cleanup drops it.
-	gsiByTypeActivity = "by_type_activity"
-
 	// gsiByFeedActivity orders one of a user's dm_inbox feeds by
 	// last_activity: the (feed, last_activity) index every DM feed read uses.
 	// feed names one of a user's folders as well as the chat type (see
 	// dmFeedKey), the inbox or the archive SetArchived files a row in, so
-	// each folder of each type is its own partition of the index. It has
-	// gsiByTypeActivity's keys under a name that says what keys it, since
-	// DynamoDB cannot rename an index, so every row that index holds is in
-	// it, with no backfill.
+	// each folder of each type is its own partition of the index. It has the
+	// keys of the by_type_activity index it replaced, under a name that says
+	// what keys it, since DynamoDB cannot rename an index, so it held every
+	// row that index did with no backfill.
 	gsiByFeedActivity = "by_feed_activity"
-
-	// gsiByUser is the legacy inverted (user, chat) index on group_members,
-	// keyed by the sparse user attribute — the member's ID, present on
-	// membership rows (tombstones included) and nothing else, and omitted
-	// from the rows of a user the store excludes from the feed (see
-	// groupMemberItem). Superseded by gsiByFeed; nothing reads it. It is
-	// kept, as it still exists on the live table and writes still set user,
-	// until a cleanup stops writing user and drops it.
-	gsiByUser = "by_user"
 
 	// gsiByFeed is the inverted (feed, chat) index on group_members, for
 	// listing the group chats a user is a member of: one of a user's folders
@@ -992,8 +970,8 @@ func (s *store) banCheck(chatID *commonpb.ChatId, userID *commonpb.UserId) *type
 
 // joinUpdate is the membership transition that (re)joins userID to chatID
 // (see addGroupMembers), for transitionMembership to carry. It sets the user
-// and feed attributes, listing the record in gsiByUser and in the user's inbox
-// in gsiByFeed, unless the store excludes the user from the feed, when it
+// and feed attributes, listing the record in the user's inbox in gsiByFeed,
+// unless the store excludes the user from the feed, when it
 // removes both instead, so the record is unlisted whatever an earlier write
 // left on it (see groupMemberItem). A (re)join files the group in the inbox.
 func (s *store) joinUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.Update {
@@ -1146,8 +1124,8 @@ func (s *store) keyEnvelopeDiscard(chatID *commonpb.ChatId, userID *commonpb.Use
 // tombstoneTTL). Only a joined member transitions — the condition makes
 // removing a non-member (or an unknown user) a no-op rather than an upsert of
 // a malformed tombstone. Removing joined_at drops the member from the sparse
-// gsiByJoinedAt. The user attribute is left as the join wrote it, so a
-// tombstone stays listed in gsiByUser, and feed is set to the user's inbox
+// gsiByJoinedAt. The user attribute is left as the join wrote it, and feed is
+// set to the user's inbox
 // whatever folder the membership was filed in, so a departure always files
 // the tombstone in the inbox: a membership's folder lasts only as long as the
 // membership, and a rejoin starts in the inbox too (see joinUpdate). Both are
@@ -1524,8 +1502,8 @@ func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chat
 	// The cursor carries (last_activity, chat_id) explicitly, so the GSI start
 	// key is built directly without a lookup. A GSI start key must include the
 	// GSI key (feed, last_activity) and the base table key (pk, sk). The
-	// cursor names no index, so one issued while the read used
-	// gsiByTypeActivity, which has the same keys, resumes here unchanged. It
+	// cursor names no index, so one issued while the read used the older
+	// by_type_activity index, which has the same keys, resumes here unchanged. It
 	// names no folder either: it resumes in the folder asked for, the one the
 	// caller read it from.
 	if cursor != nil {
@@ -2615,11 +2593,10 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 
 // groupMemberItem is a joined membership record, as written at group creation.
 // It matches what addGroupMembers converges to: state joined, user and feed set
-// (the gsiByUser and gsiByFeed hash keys, feed naming the user's inbox),
-// joined_at present (the sparse gsiByJoinedAt keys off its presence), no
-// left_at. The record of a user the store excludes from the feed carries
-// neither user nor feed, so it is in neither index and no listing of the
-// user's groups returns it (see chat.Store.PutChat); nothing else reads the
+// (feed, the gsiByFeed hash key, naming the user's inbox), joined_at present
+// (the sparse gsiByJoinedAt keys off its presence), no left_at. The record of
+// a user the store excludes from the feed carries neither user nor feed, so
+// no listing of the user's groups returns it (see chat.Store.PutChat); nothing else reads the
 // attributes, since every reader of a membership record takes the member's ID
 // from its sk, so the record is a member's in every other respect.
 func (s *store) groupMemberItem(chatID *commonpb.ChatId, member *commonpb.UserId, joinedAt time.Time) map[string]types.AttributeValue {
@@ -2804,13 +2781,10 @@ func chatPK(chatID *commonpb.ChatId) string { return chatKeyPrefix + hex.EncodeT
 func chatSK(chatID *commonpb.ChatId) string { return chatKeyPrefix + hex.EncodeToString(chatID.Value) }
 func userPK(userID *commonpb.UserId) string { return userKeyPrefix + hex.EncodeToString(userID.Value) }
 
-// userIndexKey is the user attribute of a group_members row, the hash key of
-// the unread gsiByUser: the member's ID in bare hex, with no "user#" prefix.
-// The prefix disambiguates a key space shared by several entity types — the
-// group_members sk needs it, as does every pk here — but this attribute's name
-// already fixes its type, so the prefix would say nothing the name doesn't.
-// Writes still set it, so the legacy index stays whole until a cleanup stops
-// writing it and drops the index; nothing reads it.
+// userIndexKey is the user attribute of a group_members row: the member's ID
+// in bare hex, with no "user#" prefix. It was the hash key of the legacy
+// by_user index, which gsiByFeed replaced; no index is keyed by it and nothing
+// reads it, but writes still set it, for now.
 func userIndexKey(userID *commonpb.UserId) string { return hex.EncodeToString(userID.Value) }
 
 // archivedFeedSuffix ends the feed attribute of a chat filed in the user's
@@ -2818,7 +2792,7 @@ func userIndexKey(userID *commonpb.UserId) string { return hex.EncodeToString(us
 const archivedFeedSuffix = "#archived"
 
 // dmFeedKey is the feed attribute of a user's dm_inbox row, the hash key of
-// gsiByFeedActivity (and of the unread gsiByTypeActivity): one chat type's
+// gsiByFeedActivity: one chat type's
 // slice of one of the user's folders, "user#<id>#<type>" for the inbox, as a
 // row is created, and the same with archivedFeedSuffix for the archive, as
 // SetArchived files it. The chat type is encoded by

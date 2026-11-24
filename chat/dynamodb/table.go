@@ -14,13 +14,10 @@ import (
 // chat_user_state, chat_activity, chat_key_envelopes, chat_lobbies,
 // chat_featured_groups, chat_holdings, chat_invites and chat_pins tables with
 // on-demand billing. The chats table is keyed by pk only; dm_inbox is keyed
-// by (pk, sk) with GSIs ordering each user's DMs by last_activity: the one
-// read, gsiByFeedActivity on (feed, last_activity), and two that are no
-// longer read, gsiByTypeActivity on the same keys and the older gsiByActivity
-// on (pk, last_activity); group_members is keyed by (pk, sk) = (chat, user)
-// — plus one "#meta" aggregates item per group — with two inverted GSIs of a
-// user's group chats, gsiByFeed, which listings read, and gsiByUser, which
-// they no longer do, a sparse GSI of a group's joined members by join time
+// by (pk, sk) with a GSI ordering each of a user's DM feeds by last_activity
+// (see gsiByFeedActivity); group_members is keyed by (pk, sk) = (chat, user)
+// — plus one "#meta" aggregates item per group — with an inverted GSI of a
+// user's group chats (see gsiByFeed), a sparse GSI of a group's joined members by join time
 // (paging a large roster newest-first; see gsiByJoinedAt), and TTL on
 // expires_at sweeping departed members' tombstones (see tombstoneTTL);
 // chat_user_state is keyed by (pk, sk) = (user, chat) — plus one "#meta"
@@ -72,7 +69,6 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 			AttributeDefinitions: []types.AttributeDefinition{
 				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
-				{AttributeName: aws.String(attrUser), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String(attrFeed), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String(attrJoinedAt), AttributeType: types.ScalarAttributeTypeN},
 			},
@@ -81,17 +77,6 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				{AttributeName: aws.String(attrSK), KeyType: types.KeyTypeRange},
 			},
 			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
-				{
-					// Legacy inverted index: (user, chat), keyed by the sparse
-					// user attribute. No longer read; superseded by the index
-					// below (see gsiByUser).
-					IndexName: aws.String(gsiByUser),
-					KeySchema: []types.KeySchemaElement{
-						{AttributeName: aws.String(attrUser), KeyType: types.KeyTypeHash},
-						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeRange},
-					},
-					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
-				},
 				{
 					// Inverted index: (feed, chat), one of a user's folders of
 					// groups. Listing a user's group chats (the group feed's
@@ -140,27 +125,8 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 			},
 			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
 				{
-					// Legacy, no longer read (see gsiByActivity).
-					IndexName: aws.String(gsiByActivity),
-					KeySchema: []types.KeySchemaElement{
-						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
-						{AttributeName: aws.String(attrLastActivity), KeyType: types.KeyTypeRange},
-					},
-					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
-				},
-				{
-					// No longer read; superseded by the index below, on the
-					// same keys (see gsiByTypeActivity).
-					IndexName: aws.String(gsiByTypeActivity),
-					KeySchema: []types.KeySchemaElement{
-						{AttributeName: aws.String(attrFeed), KeyType: types.KeyTypeHash},
-						{AttributeName: aws.String(attrLastActivity), KeyType: types.KeyTypeRange},
-					},
-					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
-				},
-				{
-					// The feed index every DM feed read uses: the index above's
-					// keys under the name it is read by (see gsiByFeedActivity).
+					// The feed index every DM feed read uses (see
+					// gsiByFeedActivity).
 					IndexName: aws.String(gsiByFeedActivity),
 					KeySchema: []types.KeySchemaElement{
 						{AttributeName: aws.String(attrFeed), KeyType: types.KeyTypeHash},

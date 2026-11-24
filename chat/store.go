@@ -689,7 +689,9 @@ type Store interface {
 	// absent rather than reported, and duplicate IDs collapse. The read is
 	// eventually consistent, at half the cost of a strong one: it may trail a
 	// write by a moment, which its readers tolerate, since they rank and show
-	// people (e.g. dropping banned users from mention suggestions) rather than
+	// people (e.g. dropping banned users from mention suggestions) or keep a
+	// push quiet (a DM recipient's mute and archive, a group cash message's
+	// receivers' archives, read as the fan-out's mute reads are) rather than
 	// gate an action — a gate reads the user's own state with GetViewerStates.
 	// An empty userIDs is an empty result, not an error.
 	GetViewerStatesForUsers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]ViewerState, error)

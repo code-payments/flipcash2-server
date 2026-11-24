@@ -141,6 +141,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_KeyEnvelope_Member,
 		testServer_Lobby_Gates,
 		testServer_Lobby_EnterAndLeave,
+		testServer_Lobby_EnteredPushArchived,
 		testServer_Lobby_Limits,
 		testServer_Lobby_GetLobbyMembers,
 		testServer_Lobby_Admit,
@@ -6891,6 +6892,64 @@ func testServer_Lobby_EnterAndLeave(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(namelessKeys, chatID).Result)
 	pushes = e.waitForPushes(e.userID, 2)
 	requireLobbyPush(t, pushes[1], chatID, "Sunday Hikers", "Someone requested to join")
+}
+
+// failingViewerStatesStore is a chat store whose GetViewerStates fails for
+// one user once failFor names them, and answers as the store it wraps
+// otherwise.
+type failingViewerStatesStore struct {
+	chat.Store
+
+	mu      sync.Mutex
+	failFor *commonpb.UserId
+}
+
+func (s *failingViewerStatesStore) setFailFor(userID *commonpb.UserId) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failFor = userID
+}
+
+func (s *failingViewerStatesStore) GetViewerStates(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.ViewerState, error) {
+	s.mu.Lock()
+	failFor := s.failFor
+	s.mu.Unlock()
+	if failFor != nil && bytes.Equal(failFor.Value, userID.Value) {
+		return nil, errors.New("viewer states unavailable")
+	}
+	return s.Store.GetViewerStates(ctx, userID, chatIDs)
+}
+
+// testServer_Lobby_EnteredPushArchived pins that a creator who has archived
+// their group is not pushed that someone entered its lobby, though the
+// LobbyUpdate still reaches them; that the push resumes once they unarchive;
+// and that it is sent when their archive cannot be read.
+func testServer_Lobby_EnteredPushArchived(t *testing.T, s chat.Store) {
+	store := &failingViewerStatesStore{Store: s}
+	e := newServerEnv(t, store)
+	_, aKeys := e.addBoundUser("A")
+	_, bKeys := e.addBoundUser("B")
+	_, cKeys := e.addBoundUser("C")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, chatID).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(aKeys, chatID).Result)
+	e.waitForLobbyUpdates(e.userID, chatID, 1)
+	require.Never(t, func() bool {
+		return len(e.pusher.pushesTo(e.userID)) > 0
+	}, 300*time.Millisecond, 20*time.Millisecond)
+
+	require.Equal(t, chatpb.UnarchiveChatResponse_OK, e.unarchiveChat(e.keys, chatID).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(bKeys, chatID).Result)
+	pushes := e.waitForPushes(e.userID, 1)
+	requireLobbyPush(t, pushes[0], chatID, "Sunday Hikers", "B requested to join")
+
+	// Archived again, but the read of it fails: the push goes out.
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, chatID).Result)
+	store.setFailFor(e.userID)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(cKeys, chatID).Result)
+	pushes = e.waitForPushes(e.userID, 2)
+	requireLobbyPush(t, pushes[1], chatID, "Sunday Hikers", "C requested to join")
 }
 
 // testServer_Lobby_Limits pins the server's caps: a full lobby is LOBBY_FULL,

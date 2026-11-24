@@ -57,12 +57,16 @@ import (
 // user who returns is given their state afresh. A DM has no departure, so a
 // DM's archive lasts until it is unarchived.
 //
-// Who has archived a chat is read two ways, for what an archive keeps quiet
-// for its user: a page of a group's roster says which of its members have
-// archived it (see MembersPage.Archived), and a user's archives across all
-// their chats are one strongly consistent read with the version of each
-// (see Store.GetArchivedChats). The store applies no quiet itself; it
-// records the archive, files the chat by it and answers those reads.
+// Who has archived a chat is read for what an archive keeps quiet for its
+// user, every push from the chat (see messaging's push fan-out and the
+// lobby's pushes, lobby.go): a page of a group's roster says which of its
+// members have archived it (see MembersPage.Archived), a few users' states
+// on one chat say it of each of them (see Store.GetViewerStatesForUsers), as
+// a user's own state on a chat does (see Store.GetViewerStates), and a
+// user's archives across all their chats are one strongly consistent read
+// with the version of each (see Store.GetArchivedChats). The store applies
+// no quiet itself; it records the archive, files the chat by it and answers
+// those reads.
 
 // Folder is which of a user's two lists of their chats a chat is filed in
 // (see chatpb.ChatFolder): FolderArchived while they hold an archive of it,

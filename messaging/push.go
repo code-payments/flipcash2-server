@@ -19,11 +19,11 @@ import (
 )
 
 // The push fan-out for a new message walks the chat's members in pages and
-// runs the whole pipeline per page — drop the sender and the team account,
-// filter blockers, split muted, look up tokens, bump badges, send — so what
-// it holds at once is bounded by the page size however large the group, and
-// the first push leaves after the first page rather than after the whole
-// roster has been read. Pages are read one after another, since a read is a
+// runs the whole pipeline per page — drop those who have archived the chat,
+// the sender and the team account, filter blockers, split muted, look up
+// tokens, bump badges, send — so what it holds at once is bounded by the
+// page size however large the group, and the first push leaves after the
+// first page rather than after the whole roster has been read. Pages are read one after another, since a read is a
 // small fraction of a page's cost, but sent concurrently: each page's
 // pipeline runs on its own goroutine under a slot from the Sender's pool
 // (see defaultPushPageConcurrency), which the reader takes before launching
@@ -42,6 +42,25 @@ import (
 // sender, so a group it is a member of pushes everyone else as usual, and a
 // user's message in a group whose only other member is the team pushes
 // nobody.
+//
+// A member who has archived the chat (see chatpb.ArchiveState) is pushed
+// nothing from it, flagged or not, and their badge is not moved: an archive
+// is quieter than a mute, whose push still goes out flagged (see
+// push.ChatRecipients). They are dropped before anything else is read about
+// them, so an archived member costs no blocklist, mute or token read. What
+// says who has archived is read with the recipients, never per recipient: a
+// group's roster page names its archived members from the same read (see
+// chat.MembersPage.Archived), so a group's walk reads nothing more for it; a
+// DM's recipient's archive comes with their mute, in the one read of the
+// DM's viewer states that replaces the mute read (see readDmStates); and a
+// group cash message's receivers are read together, once per message, before
+// their pushes (see sendReceivers). Like a mute, an archive is read as it
+// stands a moment ago — an archive or unarchive landing during a send may be
+// missed by that send — and a failed read fails open, sending as though no
+// one had archived, as the mute read does (see mutedUnknown): a transient
+// error costs an archived user one stray notification rather than silencing
+// a chat for everyone who never archived it. Unarchiving restores pushes,
+// subject to any mute.
 const (
 	// defaultPushPageSize is how many members a page holds. A member has a
 	// device or two, so a page's tokens fill every FCM batch the pusher runs
@@ -92,6 +111,8 @@ const (
 // the messages themselves are already delivered on the event stream and a
 // failed push costs only the notification. members is a DM's inline pair
 // (the one page a DM walks) and ignored for a group, whose roster is paged.
+// Whoever has archived the chat is dropped from each (see the fan-out's doc
+// above).
 func (s *Sender) pushSentMessages(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, members []*commonpb.UserId, sent []*messagingpb.Message) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pushBudget)
 	defer cancel()
@@ -148,7 +169,7 @@ func (s *Sender) pushSentMessages(ctx context.Context, log *zap.Logger, chatID *
 			message: message,
 			now:     time.Now(),
 		}
-		if err := pushStep(ctx, func(ctx context.Context) error { return p.prepare(ctx, chatType, chatTitle) }); err != nil {
+		if err := pushStep(ctx, func(ctx context.Context) error { return p.prepare(ctx, chatType, chatTitle, members) }); err != nil {
 			p.log.With(zap.Error(err)).Warn("Failure preparing message push")
 			continue
 		}
@@ -159,7 +180,7 @@ func (s *Sender) pushSentMessages(ctx context.Context, log *zap.Logger, chatID *
 			p.sendReceivers(ctx)
 			p.walkGroup(ctx)
 		} else {
-			p.sendPage(ctx, p.push, members)
+			p.sendPage(ctx, p.push, withoutUsers(members, p.archived))
 		}
 	}
 }
@@ -193,7 +214,8 @@ const (
 	// the message delivery the flag exists to preserve.
 	mutedUnknown mutedShape = iota
 	// mutedWhole: the chat's active muted set was read once and is held in
-	// messagePush.muted.
+	// messagePush.muted; for a DM, out of its recipients' viewer states (see
+	// readDmStates).
 	mutedWhole
 	// mutedPerPage: each page reads the mutes in its own key range.
 	mutedPerPage
@@ -224,13 +246,21 @@ type messagePush struct {
 
 	shape mutedShape
 	muted map[string]struct{}
+
+	// archived is the DM recipients who have archived the DM, read with
+	// their mutes (see readDmStates), which the DM's page drops; nil for a
+	// group, whose roster pages name their own (see walkGroup), and when the
+	// read failed.
+	archived map[string]struct{}
 }
 
 // prepare resolves what every page shares: the sender's profile, the
-// rendered push, and how mutes will be read; for a group cash message, also
-// its receivers' pushes. A sender without a profile, or without what the chat
-// type's title needs, earns no push and is not an error.
-func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, chatTitle string) error {
+// rendered push, and how mutes will be read — for a DM, its recipients' mutes
+// and archives themselves, from dmMembers, the DM's pair (nil for a group);
+// for a group cash message, also its receivers' pushes. A sender without a
+// profile, or without what the chat type's title needs, earns no push and is
+// not an error.
+func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, chatTitle string, dmMembers []*commonpb.UserId) error {
 	senderProfile, err := p.sender.profiles.GetFullProfile(ctx, p.message.SenderId, true)
 	if err == profile.ErrNotFound {
 		return nil
@@ -264,7 +294,11 @@ func (p *messagePush) prepare(ctx context.Context, chatType chatpb.ChatType, cha
 		return err
 	}
 
-	p.chooseMutedShape(ctx)
+	if chat.IsGroupChatID(p.chatID) {
+		p.chooseMutedShape(ctx)
+	} else {
+		p.readDmStates(ctx, dmMembers)
+	}
 	return nil
 }
 
@@ -305,20 +339,17 @@ func (p *messagePush) receiverDisplayName(ctx context.Context) string {
 	return receiverProfile.DisplayName
 }
 
-// chooseMutedShape picks how the pages will learn who has muted the chat. A
-// DM's set is at most its pair, so it is read whole without asking the
-// count. A lookup failure at any point falls back to mutedUnknown.
+// chooseMutedShape picks how a group's pages will learn who has muted the
+// chat. A lookup failure at any point falls back to mutedUnknown.
 func (p *messagePush) chooseMutedShape(ctx context.Context) {
-	if chat.IsGroupChatID(p.chatID) {
-		count, err := p.sender.chats.GetMutedCount(ctx, p.chatID)
-		if err != nil {
-			p.log.With(zap.Error(err)).Warn("Failure reading muted count for message push; sending all as unmuted")
-			return
-		}
-		if count > p.sender.pushMutedWholeSetCap {
-			p.shape = mutedPerPage
-			return
-		}
+	count, err := p.sender.chats.GetMutedCount(ctx, p.chatID)
+	if err != nil {
+		p.log.With(zap.Error(err)).Warn("Failure reading muted count for message push; sending all as unmuted")
+		return
+	}
+	if count > p.sender.pushMutedWholeSetCap {
+		p.shape = mutedPerPage
+		return
 	}
 
 	users, err := p.sender.chats.GetMutedUsers(ctx, p.chatID, p.now, 0)
@@ -330,13 +361,53 @@ func (p *messagePush) chooseMutedShape(ctx context.Context) {
 	p.muted = userSet(users)
 }
 
+// readDmStates learns, for a DM, which of its recipients (dmMembers but the
+// sender) have it muted and which have archived it, from one batched read of
+// their viewer states on it (see chat.Store.GetViewerStatesForUsers): a DM's
+// recipients are at most its pair, so the read is as small as the mute read
+// it replaces, and the archive comes with it at no extra read. The read is
+// eventually consistent, as the mute reads are, and a mute is active or
+// lapsed against the fan-out's start, as for a group. A failed read falls
+// back to mutedUnknown with no one archived, so the push goes out unmuted to
+// every recipient: both halves fail open (see the fan-out's doc).
+func (p *messagePush) readDmStates(ctx context.Context, dmMembers []*commonpb.UserId) {
+	recipients := make([]*commonpb.UserId, 0, len(dmMembers))
+	for _, member := range dmMembers {
+		if !bytes.Equal(member.Value, p.message.SenderId.Value) {
+			recipients = append(recipients, member)
+		}
+	}
+
+	states, err := p.sender.chats.GetViewerStatesForUsers(ctx, p.chatID, recipients)
+	if err != nil {
+		p.log.With(zap.Error(err)).Warn("Failure reading viewer states for message push; sending all as unmuted and unarchived")
+		return
+	}
+	p.shape = mutedWhole
+	p.muted = make(map[string]struct{})
+	for user, state := range states {
+		if state.Mute != nil && state.Mute.Active(p.now) {
+			p.muted[user] = struct{}{}
+		}
+		if state.ArchivedAt != nil {
+			if p.archived == nil {
+				p.archived = make(map[string]struct{})
+			}
+			p.archived[user] = struct{}{}
+		}
+	}
+}
+
 // walkGroup pages the group's roster and sends each page on its own
 // goroutine under a slot from the Sender's pool, taken before the page is
-// launched and before the next is read. It returns once every page it
-// launched has finished, so the caller's context outlives the sends. A
-// failed page read, or a budget that runs out while waiting for a slot, ends
-// the walk: the cursor to continue from is what failed to arrive, or the
-// page that never launched.
+// launched and before the next is read. Each page goes out without the
+// members it names as having archived the group (see MembersPage.Archived)
+// and without the cash message's receivers, who get their own pushes (see
+// sendReceivers); a page left with no one is not launched. It returns once
+// every page it launched has finished, so the caller's context outlives the
+// sends. A failed page read, or a budget that runs out while waiting for a
+// slot, ends the walk: the cursor to continue from is what failed to arrive,
+// or the page that never launched.
 func (p *messagePush) walkGroup(ctx context.Context) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -353,7 +424,8 @@ func (p *messagePush) walkGroup(ctx context.Context) {
 			p.log.With(zap.Error(err)).Warn("Failure loading members page for message pushes; abandoning remaining pages")
 			return
 		}
-		if len(page.Users) > 0 {
+		users := withoutUsers(withoutUsers(page.Users, page.Archived), p.receiverSet)
+		if len(users) > 0 {
 			select {
 			case p.sender.pushPageSlots <- struct{}{}:
 			case <-ctx.Done():
@@ -364,8 +436,8 @@ func (p *messagePush) walkGroup(ctx context.Context) {
 			go func(users []*commonpb.UserId) {
 				defer wg.Done()
 				defer func() { <-p.sender.pushPageSlots }()
-				p.sendPage(ctx, p.push, p.withoutReceivers(users))
-			}(page.Users)
+				p.sendPage(ctx, p.push, users)
+			}(users)
 		}
 		if page.Next == nil {
 			return
@@ -377,16 +449,49 @@ func (p *messagePush) walkGroup(ctx context.Context) {
 // sendReceivers pushes a group cash message's receivers their own
 // notifications, each push as a page of its receivers through the same
 // pipeline as every other page (blocks and mutes apply to them as to anyone),
-// to those still members: the walk reaches only members, so receivers are
-// held to the same, and a receiver who has left since the payment is not
-// pushed into a group they are no longer in. Membership is read one receiver
-// at a time, strongly consistent, at most intent.MaxGroupPaymentReceivers (10)
-// of them. It is a no-op for any other message.
+// to those still members who have not archived the group. The walk reaches
+// only members, so receivers are held to the same, and a receiver who has
+// left since the payment is not pushed into a group they are no longer in;
+// membership is read one receiver at a time, strongly consistent, at most
+// intent.MaxGroupPaymentReceivers (10) of them. The walk's pages leave the
+// receivers out, so the archives their roster reads name are of no use here:
+// the receivers' archives are one batched read of their viewer states
+// instead (see chat.Store.GetViewerStatesForUsers), once per message, before
+// any of their pushes and before their membership, which an archived
+// receiver is spared (a non-member holds no archive). It fails open, as every
+// archive read does (see the fan-out's doc). It is a no-op for any other
+// message.
 func (p *messagePush) sendReceivers(ctx context.Context) {
+	if len(p.receivers) == 0 {
+		return
+	}
+
+	var archived map[string]struct{}
+	_ = pushStep(ctx, func(ctx context.Context) error {
+		receivers := make([]*commonpb.UserId, 0, len(p.receiverSet))
+		for _, receiverPush := range p.receivers {
+			receivers = append(receivers, receiverPush.Receivers...)
+		}
+		states, err := p.sender.chats.GetViewerStatesForUsers(ctx, p.chatID, receivers)
+		if err != nil {
+			p.log.With(zap.Error(err)).Warn("Failure reading receiver viewer states for message push; sending receivers as unarchived")
+			return nil
+		}
+		for user, state := range states {
+			if state.ArchivedAt != nil {
+				if archived == nil {
+					archived = make(map[string]struct{})
+				}
+				archived[user] = struct{}{}
+			}
+		}
+		return nil
+	})
+
 	for _, receiverPush := range p.receivers {
 		_ = pushStep(ctx, func(ctx context.Context) error {
 			members := make([]*commonpb.UserId, 0, len(receiverPush.Receivers))
-			for _, receiver := range receiverPush.Receivers {
+			for _, receiver := range withoutUsers(receiverPush.Receivers, archived) {
 				isMember, err := p.sender.chats.IsMember(ctx, p.chatID, receiver)
 				if err != nil {
 					p.log.With(zap.Error(err), zap.String("receiver", model.UserIDString(receiver))).Warn("Failure checking receiver membership for message push; suppressing receiver push")
@@ -404,15 +509,18 @@ func (p *messagePush) sendReceivers(ctx context.Context) {
 	}
 }
 
-// withoutReceivers drops a group cash message's receivers from a page of the
-// walk, since they get their own pushes (see sendReceivers).
-func (p *messagePush) withoutReceivers(members []*commonpb.UserId) []*commonpb.UserId {
-	if len(p.receiverSet) == 0 {
+// withoutUsers returns members without those in drop, keyed by
+// string(userID.Value): members itself when drop is empty, a new slice
+// otherwise. It is how a page sheds those who have archived the chat (see the
+// fan-out's doc) and, in a group's walk, a cash message's receivers, who get
+// their own pushes (see sendReceivers).
+func withoutUsers(members []*commonpb.UserId, drop map[string]struct{}) []*commonpb.UserId {
+	if len(drop) == 0 {
 		return members
 	}
 	out := make([]*commonpb.UserId, 0, len(members))
 	for _, member := range members {
-		if _, ok := p.receiverSet[string(member.Value)]; !ok {
+		if _, ok := drop[string(member.Value)]; !ok {
 			out = append(out, member)
 		}
 	}
@@ -430,16 +538,17 @@ func (p *messagePush) sendPage(ctx context.Context, chatPush *push.ChatMessagePu
 }
 
 func (p *messagePush) sendPageStep(ctx context.Context, chatPush *push.ChatMessagePush, members []*commonpb.UserId) {
-	// Push recipients are every member but the sender and the team account,
-	// minus anyone who has blocked the sender — a user who blocks another
-	// must stop receiving pushes for that user's messages. The team account
-	// is dropped from every page of every chat, a group's walk and its cash
-	// receivers' pages included, not only from the groups it created: it has
-	// no devices, so a push to it is only a blocklist, mute and token read
-	// and a badge bump spent on nobody (see NewSender). The blocklist check is
-	// scoped to each recipient's own blocklist (recipient is the owner,
-	// sender the blocked candidate), and the page's recipients are resolved
-	// in one batched read.
+	// members arrives without those who have archived the chat, whom every
+	// caller drops off its own read (see the fan-out's doc). Push recipients
+	// are every member but the sender and the team account, minus anyone who
+	// has blocked the sender — a user who blocks another must stop receiving
+	// pushes for that user's messages. The team account is dropped from every
+	// page of every chat, a group's walk and its cash receivers' pages
+	// included, not only from the groups it created: it has no devices, so a
+	// push to it is only a blocklist, mute and token read and a badge bump
+	// spent on nobody (see NewSender). The blocklist check is scoped to each
+	// recipient's own blocklist (recipient is the owner, sender the blocked
+	// candidate), and the page's recipients are resolved in one batched read.
 	candidates := make([]*commonpb.UserId, 0, len(members))
 	for _, member := range members {
 		if bytes.Equal(member.Value, p.message.SenderId.Value) || p.sender.isTeamAccount(member) {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sync"
 	"testing"
 
 	"github.com/mr-tron/base58"
@@ -137,8 +138,13 @@ type fakeChats struct {
 	chats map[string]*Chat
 	reads int
 
+	// membershipMu guards membershipReads, since Access reads two users'
+	// memberships concurrently (see Access.SharePrivateGroup). members is
+	// only written by the test itself, never during a read.
+	membershipMu    sync.Mutex
 	members         map[string]bool
 	membershipReads int
+	membershipErr   error
 
 	envelopes     map[string]bool
 	envelopeReads int
@@ -200,7 +206,12 @@ func (f *fakeChats) leave(chatID *commonpb.ChatId, userID *commonpb.UserId) {
 }
 
 func (f *fakeChats) IsMember(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
+	f.membershipMu.Lock()
+	defer f.membershipMu.Unlock()
 	f.membershipReads++
+	if f.membershipErr != nil {
+		return false, f.membershipErr
+	}
 	return f.members[string(chatID.Value)+string(userID.Value)], nil
 }
 

@@ -52,8 +52,13 @@ func (e *Executor) sendDmPaymentMessage(ctx context.Context, record *ocp_task.Re
 // whose PutChat created it is recorded, and every other one finds the chat
 // existing; but a retry of the opener's own task, after its first attempt
 // created the DM and failed before the message landed, finds it existing too,
-// and must still offer the return. A DM created before opening intents were
-// recorded has none, so no payment into it offers one.
+// and must still offer the return. A DM with no opening intent offers no
+// return on any payment into it, its first included: one opened without a
+// payment, through StartChat with proof that its members share a private
+// group (see chat.Server.StartChat), and one created before opening intents
+// were recorded. A payment validated while the DM did not exist, whose task
+// then finds it opened that way, is such a payment: it cleared the fee, but
+// did not open the DM.
 func (e *Executor) sendDmPaymentMessageOfType(ctx context.Context, record *ocp_task.Record, chatType chatpb.ChatType) error {
 	payment, err := e.loadChatPayment(ctx, record)
 	if err != nil {

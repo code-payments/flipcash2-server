@@ -324,11 +324,12 @@ func DeriveDmChatType(chatID *commonpb.ChatId, members []*commonpb.UserId) chatp
 //
 // OpeningIntentID is the payment that opened a DM: the intent whose cash
 // message task created the chat (see task.Executor), or nil when unknown (a
-// group has none, and neither does a DM created any other way or before the
-// field existed). It is written with the DM, by the one PutChat that creates
-// it, and never changed, so of several payments racing to open a DM exactly
-// one is recorded, and a retry of that payment's task can tell it was the
-// one. Only that payment's cash message offers a return (see
+// group has none, and neither does a DM created any other way, such as one
+// opened through StartChat with a roster proof, or before the field existed).
+// It is written with the DM, by the one PutChat that creates it, and never
+// changed, so of several payments racing to open a DM exactly one is
+// recorded, and a retry of that payment's task can tell it was the one. Only
+// that payment's cash message offers a return (see
 // messagingpb.CashContent_Return).
 //
 // Description is the group's free-form description, written by its creator,

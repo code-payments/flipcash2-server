@@ -133,6 +133,11 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_StartChat_TitleModerated,
 		testServer_StartChat_ModerationFailureIsInternal,
 		testServer_StartChat_PrivateGroup,
+		testServer_StartChat_Dm_OK,
+		testServer_StartChat_Dm_Existing,
+		testServer_StartChat_Dm_ProofCounts,
+		testServer_StartChat_Dm_ProofDenied,
+		testServer_StartChat_Dm_Refused,
 		testServer_OpenVersusPrivate_NonMember,
 		testServer_PrivateGroup_Visibility,
 		testServer_PrivateGroup_Membership,
@@ -10615,4 +10620,254 @@ func testServer_LeaveChat_EndsArchive(t *testing.T, s chat.Store) {
 	// The departure removed the archive, moving the version by one.
 	require.NoError(t, protoutil.ProtoEqualError(viewerState(2, nil, false), e.getChat(e.keys, group).Metadata.ViewerState))
 	e.waitForViewerStateUpdates(e.userID, group, 1)
+}
+
+// startDm asks StartChat to open the DM with recipientID, carrying no
+// idempotency key, which a DM neither needs nor reads.
+func (e *serverEnv) startDm(keys model.KeyPair, recipientID *commonpb.UserId, proof *commonpb.ChatId) (*chatpb.StartChatResponse, error) {
+	req := &chatpb.StartChatRequest{
+		Parameters: &chatpb.StartChatRequest_Dm{Dm: &chatpb.StartChatRequest_DmChatParameters{
+			Recipient:   recipientID,
+			RosterProof: proof,
+		}},
+	}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	return e.client.StartChat(e.ctx, req)
+}
+
+func (e *serverEnv) mustStartDm(keys model.KeyPair, recipientID *commonpb.UserId, proof *commonpb.ChatId) *chatpb.StartChatResponse {
+	resp, err := e.startDm(keys, recipientID, proof)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// requireDmOpened asserts that StartChat opened, or returned, the DM between
+// a and b, and returns its ID.
+func (e *serverEnv) requireDmOpened(resp *chatpb.StartChatResponse, a, b *commonpb.UserId) *commonpb.ChatId {
+	e.t.Helper()
+	require.Equal(e.t, chatpb.StartChatResponse_OK, resp.Result)
+	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, a, b)
+	require.Equal(e.t, dmID.Value, resp.Chat.GetChatId().GetValue())
+	require.Equal(e.t, chatpb.ChatType_DM, resp.Chat.Type)
+	return dmID
+}
+
+// requireDmDenied asserts that StartChat refused to open the DM between the
+// env's user and recipientID, and that no DM exists between them.
+func (e *serverEnv) requireDmDenied(keys model.KeyPair, recipientID *commonpb.UserId, proof *commonpb.ChatId) {
+	e.t.Helper()
+	resp := e.mustStartDm(keys, recipientID, proof)
+	require.Equal(e.t, chatpb.StartChatResponse_DENIED, resp.Result)
+	require.Nil(e.t, resp.Chat)
+	_, err := e.store.GetChatByID(e.ctx, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.userID, recipientID))
+	require.ErrorIs(e.t, err, chat.ErrChatNotFound)
+}
+
+// dmUpdatesOnUserTopics returns every event published on any user topic
+// about chatID.
+func (e *serverEnv) dmUpdatesOnUserTopics(chatID *commonpb.ChatId) []*eventpb.Event {
+	var found []*eventpb.Event
+	for _, ev := range e.userObserver.GetEvents(func(*commonpb.UserId) bool { return true }) {
+		if bytes.Equal(ev.Event.GetChatUpdate().GetChat().GetValue(), chatID.Value) {
+			found = append(found, ev.Event)
+		}
+	}
+	return found
+}
+
+// testServer_StartChat_Dm_OK pins opening a DM with a roster proof: the
+// canonical DM between the two users, written with no opening intent so that
+// no payment into it ever offers a return, announced to no one, and returned
+// as either member sees it with GetChat. Once open, the proof no longer
+// matters: a retry, or the recipient asking, gets the DM back whatever proof
+// it carries.
+func testServer_StartChat_Dm_OK(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	e.profiles.displayNames[string(e.userID.Value)] = "Caller"
+	recipientID, recipientKeys := e.addBoundUser("Recipient")
+	group := e.putPrivateGroup("Friends", recipientID)
+
+	resp := e.mustStartDm(e.keys, recipientID, group)
+	dmID := e.requireDmOpened(resp, e.userID, recipientID)
+	require.Len(t, resp.Chat.Members, 2)
+	require.NoError(t, protoutil.ProtoEqualError(&chatpb.RosterSummary{MemberCount: 2}, resp.Chat.GetRosterSummary()))
+	require.True(t, resp.Chat.UseE2Ee)
+	require.Nil(t, resp.Chat.Rules)
+
+	stored, err := s.GetChatByID(e.ctx, dmID)
+	require.NoError(t, err)
+	require.Equal(t, chatpb.ChatType_DM, stored.Type)
+	require.True(t, stored.HasMember(e.userID))
+	require.True(t, stored.HasMember(recipientID))
+	require.Nil(t, stored.OpeningIntentID)
+	opening, err := s.GetDmOpeningIntentID(e.ctx, dmID)
+	require.NoError(t, err)
+	require.Nil(t, opening)
+
+	// The recipient reads it like any DM they are in, with the summary the
+	// opener was given.
+	got := e.getChat(recipientKeys, dmID)
+	require.Equal(t, chatpb.GetChatResponse_OK, got.Result)
+	require.Equal(t, dmID.Value, got.Metadata.ChatId.Value)
+	require.NoError(t, protoutil.ProtoEqualError(resp.Chat.GetRosterSummary(), got.Metadata.GetRosterSummary()))
+
+	// A retry, with any proof, and the recipient opening it from their side,
+	// are answered with the same DM.
+	public := e.putGroup("Public", at(1), recipientID)
+	e.requireDmOpened(e.mustStartDm(e.keys, recipientID, group), e.userID, recipientID)
+	e.requireDmOpened(e.mustStartDm(e.keys, recipientID, public), e.userID, recipientID)
+	e.requireDmOpened(e.mustStartDm(recipientKeys, e.userID, chat.MustGenerateGroupChatID()), e.userID, recipientID)
+
+	// The proof is needed only to open it: the DM stays open, and returned,
+	// once neither user is in the group.
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(recipientKeys, group).Result)
+	e.requireDmOpened(e.mustStartDm(e.keys, recipientID, group), e.userID, recipientID)
+
+	// Nothing was published about the DM, to either user.
+	require.Empty(t, e.dmUpdatesOnUserTopics(dmID))
+}
+
+// testServer_StartChat_Dm_Existing pins that a DM already open, however it
+// was opened, is returned as it is, with the proof not checked. A DM a
+// payment opened keeps its opening intent, and so its return offer.
+func testServer_StartChat_Dm_Existing(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	recipientID, _ := e.addBoundUser("Recipient")
+	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.userID, recipientID)
+	openingIntentID := &commonpb.IntentId{Value: bytes.Repeat([]byte{7}, 32)}
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
+		ID:              dmID,
+		Type:            chatpb.ChatType_DM,
+		Members:         []*commonpb.UserId{recipientID, e.userID},
+		OpeningIntentID: openingIntentID,
+		LastActivity:    at(1),
+	}))
+
+	// No group is shared.
+	e.requireDmOpened(e.mustStartDm(e.keys, recipientID, chat.MustGenerateGroupChatID()), e.userID, recipientID)
+
+	opening, err := s.GetDmOpeningIntentID(e.ctx, dmID)
+	require.NoError(t, err)
+	require.Equal(t, openingIntentID.Value, opening.GetValue())
+}
+
+// testServer_StartChat_Dm_ProofCounts pins who a private group proves share
+// it: any two of its members now, whether or not they hold its key, a member
+// the creator has silenced, and the members of a group the team created. A
+// block, either way, does not stop them: blocks are not checked, as for the
+// payment that opens a DM.
+func testServer_StartChat_Dm_ProofCounts(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// Neither holds the group's key: membership alone counts.
+	keyless, _ := e.addBoundUser("Keyless")
+	e.requireDmOpened(e.mustStartDm(e.keys, keyless, e.putPrivateGroup("No key yet", keyless)), e.userID, keyless)
+
+	// A silenced member still counts, either side of the open.
+	silenced, silencedKeys := e.addBoundUser("Silenced")
+	keyed := e.putKeyedPrivateGroup("Keyed", silenced)
+	require.Equal(t, chatpb.SilenceUserResponse_OK, e.mustSilenceUser(e.keys, keyed, silenced, silenceForever()))
+	e.requireDmOpened(e.mustStartDm(silencedKeys, e.userID, keyed), e.userID, silenced)
+
+	// A group the team created counts like any other private group.
+	teammate, _ := e.addBoundUser("Teammate")
+	welcome := chat.MustGenerateGroupChatID()
+	require.NoError(t, s.PutPrivateGroup(e.ctx, &chat.Chat{
+		ID:           welcome,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.teamUserID, e.userID, teammate},
+		Title:        "Team",
+		IsPrivate:    true,
+		CreatorID:    e.teamUserID,
+		LastActivity: at(1),
+	}, []chat.MemberKeyEnvelope{
+		{UserID: e.userID, Envelope: chat.KeyEnvelopeFromProto(keyEnvelopeProto(1), e.teamUserID)},
+		{UserID: teammate, Envelope: chat.KeyEnvelopeFromProto(keyEnvelopeProto(2), e.teamUserID)},
+	}))
+	e.requireDmOpened(e.mustStartDm(e.keys, teammate, welcome), e.userID, teammate)
+
+	// A block either way.
+	blocked, _ := e.addBoundUser("Blocked")
+	e.blocklist.block(e.userID, blocked)
+	e.requireDmOpened(e.mustStartDm(e.keys, blocked, e.putPrivateGroup("Blocked", blocked)), e.userID, blocked)
+	blocker, _ := e.addBoundUser("Blocker")
+	e.blocklist.block(blocker, e.userID)
+	e.requireDmOpened(e.mustStartDm(e.keys, blocker, e.putPrivateGroup("Blocker", blocker)), e.userID, blocker)
+}
+
+// testServer_StartChat_Dm_ProofDenied pins what is no proof: anything but a
+// private group both users are members of now. Each refusal is DENIED, and
+// opens nothing.
+func testServer_StartChat_Dm_ProofDenied(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+	recipientID, recipientKeys := e.addBoundUser("Recipient")
+	otherID, _ := e.addBoundUser("Other")
+
+	// A public group both are in.
+	e.requireDmDenied(e.keys, recipientID, e.putGroup("Public", at(1), recipientID))
+
+	// A DM's ID, of a DM both are in with no one else, and of one they are not.
+	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, otherID, recipientID)
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{ID: dmID, Type: chatpb.ChatType_DM, Members: []*commonpb.UserId{otherID, recipientID}, LastActivity: at(1)}))
+	e.requireDmDenied(e.keys, recipientID, dmID)
+
+	// A group that does not exist.
+	e.requireDmDenied(e.keys, recipientID, chat.MustGenerateGroupChatID())
+
+	// A private group only the caller is in, and one only the recipient is in.
+	e.requireDmDenied(e.keys, recipientID, e.putPrivateGroup("Mine"))
+	theirs := chat.MustGenerateGroupChatID()
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{
+		ID:           theirs,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{recipientID},
+		Title:        "Theirs",
+		IsPrivate:    true,
+		CreatorID:    recipientID,
+		LastActivity: at(1),
+	}))
+	e.requireDmDenied(e.keys, recipientID, theirs)
+
+	// A recipient waiting in the lobby is not a member.
+	lobby := e.putKeyedPrivateGroup("Lobby")
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(recipientKeys, lobby).Result)
+	e.requireDmDenied(e.keys, recipientID, lobby)
+
+	// Nor is one who has left.
+	left := e.putPrivateGroup("Left", recipientID)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(recipientKeys, left).Result)
+	e.requireDmDenied(e.keys, recipientID, left)
+
+	// Nor one the creator has banned.
+	banned := e.putKeyedPrivateGroup("Banned", recipientID)
+	_, err := s.SetKeyEnvelope(e.ctx, banned, recipientID, chat.KeyEnvelopeFromProto(keyEnvelopeProto(2), e.userID))
+	require.NoError(t, err)
+	require.Equal(t, chatpb.BanUserResponse_OK, e.mustBanUser(e.keys, banned, recipientID))
+	e.requireDmDenied(e.keys, recipientID, banned)
+}
+
+// testServer_StartChat_Dm_Refused pins whom no proof opens a DM with: the
+// caller themselves and the team account, whether or not a DM with them
+// exists. A recipient that is not a user ID is a malformed request.
+func testServer_StartChat_Dm_Refused(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	// Themselves, even from a group they are in.
+	resp := e.mustStartDm(e.keys, e.userID, e.putPrivateGroup("Alone"))
+	require.Equal(t, chatpb.StartChatResponse_DENIED, resp.Result)
+	_, err := s.GetChatByID(e.ctx, chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.userID, e.userID))
+	require.ErrorIs(t, err, chat.ErrChatNotFound)
+
+	// The team, from a group it created, and even once a DM with it exists:
+	// no DM with the team is opened or returned here.
+	e.requireDmDenied(e.keys, e.teamUserID, e.putTeamPrivateGroup("Welcome"))
+	teamDm := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.teamUserID, e.userID)
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{ID: teamDm, Type: chatpb.ChatType_DM, Members: []*commonpb.UserId{e.teamUserID, e.userID}, LastActivity: at(1)}))
+	resp = e.mustStartDm(e.keys, e.teamUserID, e.putTeamPrivateGroup("Welcome"))
+	require.Equal(t, chatpb.StartChatResponse_DENIED, resp.Result)
+	require.Nil(t, resp.Chat)
+
+	// A recipient that is not a user ID.
+	_, err = e.startDm(e.keys, &commonpb.UserId{Value: []byte{1, 2, 3}}, e.putPrivateGroup("Shared"))
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }

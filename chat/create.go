@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"time"
@@ -21,7 +22,10 @@ import (
 	"github.com/code-payments/flipcash2-server/moderation"
 )
 
-// StartChat creates a group chat with the caller as its first and only member.
+// StartChat creates a group chat with the caller as its first and only member,
+// or, given DmChatParameters, opens the DM between the caller and another
+// user they share a private group with; everything below is about groups, and
+// a DM is opened by startDm, which says how.
 //
 // The request is checked in the order a client can act on: the rules it asks
 // for must be ones a group can carry — which today means they must include a
@@ -79,10 +83,17 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 
 	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
 
+	// A DM is opened, not created like a group, and shares none of what
+	// follows: it has no title, pictures, rules or idempotency key (see
+	// startDm).
+	if params, ok := req.Parameters.(*chatpb.StartChatRequest_Dm); ok {
+		return s.startDm(ctx, log, userID, params.Dm)
+	}
+
 	// Validation requires the oneof to be set, so anything but the two kinds
-	// of group here is a variant this server predates. The two differ in what
-	// a group is created with: a public group has rules, a private one has
-	// none.
+	// of group and a DM here is a variant this server predates. The two kinds
+	// of group differ in what a group is created with: a public group has
+	// rules, a private one has none.
 	var (
 		title          string
 		description    string
@@ -102,8 +113,10 @@ func (s *Server) StartChat(ctx context.Context, req *chatpb.StartChatRequest) (*
 		return nil, status.Error(codes.InvalidArgument, "unsupported chat parameters")
 	}
 
-	// Validation also requires the key, at its fixed width; this is the check
-	// MustDeriveGroupChatID relies on.
+	// A group requires the key, at its fixed width; this is the check
+	// MustDeriveGroupChatID relies on. The request's validation does not
+	// require it, since a DM has none (see startDm), so this is the only
+	// check that it is present.
 	if len(req.GetIdempotencyKey().GetValue()) != IdempotencyKeySize {
 		return nil, status.Error(codes.InvalidArgument, "idempotency key is required")
 	}
@@ -295,6 +308,136 @@ func (s *Server) replayStartChat(ctx context.Context, log *zap.Logger, userID *c
 	return &chatpb.StartChatResponse{
 		Result: chatpb.StartChatResponse_OK,
 		Chat:   metadata[0],
+	}, nil
+}
+
+// startDm is StartChat for a DM (StartChatRequest.DmChatParameters): it opens
+// the canonical DM between the caller and the recipient without a payment,
+// given proof that the two share a private group (see
+// Access.SharePrivateGroup), or returns the DM if it is already open.
+//
+// A DM is otherwise opened only by the DM payment that initializes it, which
+// must clear the recipient's DM chat initialization fee (see the intent
+// integration's DM payment validation), and that path is unchanged: it never
+// needs StartChat, and a payment below the fee still opens nothing, even
+// between users who share a private group. A roster proof is what lets users
+// who already know each other from a private group skip the fee, which exists
+// to keep strangers out.
+//
+// The checks, in order:
+//   - the recipient is a user ID (InvalidArgument otherwise: a malformed
+//     request, not a refusal);
+//   - the recipient is neither the caller nor the Flipcash team account, whom
+//     nobody may DM (DENIED), checked before anything is read so that no DM
+//     with the team is ever returned or opened here;
+//   - a DM that already exists, however it was opened, is returned as the
+//     caller sees it with GetChat, and nothing else is checked: the proof is
+//     needed only to open one;
+//   - otherwise roster_proof must be a private group both are members of now
+//     (DENIED otherwise).
+//
+// Blocks are not checked, as for the DM payment that opens a DM the other
+// way: a block hides the DM from the blocker (see Hydrator) rather than
+// keeping it from being opened, and refusing here would only tell a caller,
+// who can already see that the proof is good, that the recipient blocked
+// them, while paying the fee would open the DM regardless.
+//
+// The DM is then written with PutChat, exactly as the DM payment task writes
+// it except that no OpeningIntentID is recorded, since no payment opened it.
+// A DM without one never offers a return of a payment (see
+// messagingpb.CashContent_Return): every payment into it, the first included,
+// is an ordinary one. Nothing about how the DM was opened is kept, the proof
+// group above all. A payment that opens the DM concurrently (validated
+// against a DM that did not exist yet) loses to this write if this lands
+// first, and its cash message then offers no return, though it cleared the
+// fee; the DM was opened here, not by it, so that is accepted.
+//
+// Nothing is published and no one is pushed: the recipient learns of the DM
+// from its first message, which is why clients call this only when the user
+// sends one (see the proto), and the caller has the metadata in the response.
+//
+// It is retry-safe without the request's idempotency key, which a DM neither
+// needs nor reads (it is optional, and required only to create a group): a
+// DM's ID is derived from its two members, so a retry finds the DM open and is
+// answered from it. A retry or a concurrent open that loses
+// the write to its twin, or to a payment's task, is answered the same way.
+func (s *Server) startDm(ctx context.Context, log *zap.Logger, userID *commonpb.UserId, params *chatpb.StartChatRequest_DmChatParameters) (*chatpb.StartChatResponse, error) {
+	recipientID := params.GetRecipient()
+	if len(recipientID.GetValue()) != model.UserIDSize {
+		return nil, status.Error(codes.InvalidArgument, "invalid recipient")
+	}
+	log = log.With(zap.String("recipient_id", model.UserIDString(recipientID)))
+
+	if bytes.Equal(userID.Value, recipientID.Value) || s.access.Rules().isTeam(recipientID) {
+		return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_DENIED}, nil
+	}
+
+	chatID := MustDeriveDmChatID(chatpb.ChatType_DM, userID, recipientID)
+	log = log.With(zap.String("chat_id", model.ChatIDString(chatID)))
+
+	existing, err := s.chats.GetChatByID(ctx, chatID)
+	switch {
+	case err == nil:
+		return s.dmAsSeenBy(ctx, log, existing, userID)
+	case !errors.Is(err, ErrChatNotFound):
+		log.With(zap.Error(err)).Warn("Failure getting dm")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	sharesGroup, err := s.access.SharePrivateGroup(ctx, params.GetRosterProof(), userID, recipientID)
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure checking dm roster proof")
+		return nil, status.Error(codes.Internal, "")
+	}
+	if !sharesGroup {
+		return &chatpb.StartChatResponse{Result: chatpb.StartChatResponse_DENIED}, nil
+	}
+
+	// The roster summary is derived state the store fills in on reads (see
+	// Chat.RosterSummary) and ignores on PutChat. A DM's is fixed by its two
+	// members, so the record answered from below carries it as a read would.
+	c := &Chat{
+		ID:            chatID,
+		Type:          chatpb.ChatType_DM,
+		Members:       []*commonpb.UserId{userID, recipientID},
+		RosterSummary: RosterSummary{MemberCount: 2},
+		LastActivity:  time.Now().UTC(),
+	}
+	err = s.chats.PutChat(ctx, c)
+	switch {
+	case errors.Is(err, ErrChatExists):
+		// A retry, a concurrent open or a payment's task wrote it first. The
+		// read may lag that write and miss it; that is an error here, and the
+		// client's retry finds the DM on the way in.
+		existing, err := s.chats.GetChatByID(ctx, chatID)
+		if err != nil {
+			log.With(zap.Error(err)).Warn("Failure getting dm created by concurrent request")
+			return nil, status.Error(codes.Internal, "")
+		}
+		return s.dmAsSeenBy(ctx, log, existing, userID)
+	case err != nil:
+		log.With(zap.Error(err)).Warn("Failure creating dm")
+		return nil, status.Error(codes.Internal, "")
+	}
+
+	return s.dmAsSeenBy(ctx, log, c, userID)
+}
+
+// dmAsSeenBy answers startDm with DM c as userID, one of its two members,
+// sees it with GetChat.
+func (s *Server) dmAsSeenBy(ctx context.Context, log *zap.Logger, c *Chat, userID *commonpb.UserId) (*chatpb.StartChatResponse, error) {
+	md, ok, err := s.chatAsSeenBy(ctx, log, c, userID, messagingpb.ViewMode_FULL)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		// The DM's ID derives from the caller, so they are always a member.
+		log.Warn("Caller is not a member of their own dm")
+		return nil, status.Error(codes.Internal, "")
+	}
+	return &chatpb.StartChatResponse{
+		Result: chatpb.StartChatResponse_OK,
+		Chat:   md,
 	}, nil
 }
 

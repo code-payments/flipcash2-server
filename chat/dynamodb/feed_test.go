@@ -247,11 +247,12 @@ func TestChat_DynamoDBGroupMemberFeed(t *testing.T) {
 	requireUnlisted(t, groupID, skMeta)
 }
 
-// TestChat_DynamoDBFeedIndexes checks that CreateTables defines the two feed
-// indexes the reads use beside the legacy ones it keeps, that gsiByFeed lists
-// a user's membership rows, tombstones included, and nothing of an excluded
-// user's, and that a DM inbox row's feed is the value gsiByTypeActivity has
-// always been keyed by, so that gsiByFeedActivity holds every row unchanged.
+// TestChat_DynamoDBFeedIndexes checks that CreateTables defines the feed
+// indexes the reads use and none of the legacy ones, that gsiByFeed lists a
+// user's membership rows, tombstones included, and nothing of an excluded
+// user's, and that a DM inbox row's feed is the value the legacy
+// by_type_activity index was always keyed by, so that gsiByFeedActivity held
+// every row unchanged.
 func TestChat_DynamoDBFeedIndexes(t *testing.T) {
 	ctx := context.Background()
 	team := model.MustGenerateUserID()
@@ -267,10 +268,8 @@ func TestChat_DynamoDBFeedIndexes(t *testing.T) {
 		}
 		return names
 	}
-	require.Contains(t, indexes(groupMembersTable), gsiByFeed)
-	require.Contains(t, indexes(groupMembersTable), gsiByUser)
-	require.Contains(t, indexes(dmInboxTable), gsiByFeedActivity)
-	require.Contains(t, indexes(dmInboxTable), gsiByTypeActivity)
+	require.ElementsMatch(t, []string{gsiByFeed, gsiByJoinedAt}, indexes(groupMembersTable))
+	require.ElementsMatch(t, []string{gsiByFeedActivity}, indexes(dmInboxTable))
 
 	user := model.MustGenerateUserID()
 	joined := chat.MustGenerateGroupChatID()
@@ -373,7 +372,8 @@ func TestChat_DynamoDBExcludedRowLosesIndexKeys(t *testing.T) {
 }
 
 // TestChat_DynamoDBListingsReadFeed checks that the listings of a user's
-// groups read gsiByFeed, not gsiByUser: a row carrying user but no feed — a
+// groups read gsiByFeed, not the user attribute the legacy by_user index was
+// keyed by: a row carrying user but no feed — a
 // row written before feed existed that the backfill missed — is in none of
 // them. The backfill, which gave feed to every such row, is what makes the
 // switch to gsiByFeed lose no membership.

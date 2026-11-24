@@ -23,10 +23,11 @@ import (
 // mutable — and can be mutated by other processes, which this cache can never
 // observe — so group membership checks and member lists always defer to the
 // backing store. The rest of the store is passed straight through, viewer
-// state (restrictions included), activity reads, key envelopes, invites and
-// pins included: a user's state is theirs, or their group creator's, to change at any time, a group's recent senders change with every send, and
-// both reads are already one strongly consistent query, so nothing of either
-// is held.
+// state (archives and restrictions included), activity reads, key
+// envelopes, invites and pins included: a user's state is theirs, or their
+// group creator's, to change at any time, a group's recent senders change
+// with every send, and both reads are already one strongly consistent query,
+// so nothing of either is held.
 //
 // One thing is held that is not fixed at creation: a lower bound on each
 // activity record, so a throttled send costs no store request (see
@@ -130,8 +131,8 @@ func copyIntentID(intentID *commonpb.IntentId) *commonpb.IntentId {
 	return &commonpb.IntentId{Value: append([]byte(nil), intentID.Value...)}
 }
 
-func (c *Cache) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
-	return c.db.GetDmFeedPage(ctx, userID, chatType, snapshot, cursor, limit)
+func (c *Cache) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, folder chat.Folder, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
+	return c.db.GetDmFeedPage(ctx, userID, chatType, folder, snapshot, cursor, limit)
 }
 
 // GetMembers is cached for a DM: its member pair is fixed at creation, so a
@@ -248,12 +249,12 @@ func (c *Cache) GetGroupMembershipsForUser(ctx context.Context, userID *commonpb
 	return c.db.GetGroupMembershipsForUser(ctx, userID)
 }
 
-func (c *Cache) GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserId) ([]*chat.Chat, error) {
-	return c.db.GetGroupChatsForUser(ctx, userID)
+func (c *Cache) GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserId, folder chat.Folder) ([]*chat.Chat, error) {
+	return c.db.GetGroupChatsForUser(ctx, userID, folder)
 }
 
-func (c *Cache) GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) ([]*chat.Chat, error) {
-	return c.db.GetGroupChatsForUserByIDs(ctx, userID, chatIDs)
+func (c *Cache) GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.UserId, folder chat.Folder, chatIDs []*commonpb.ChatId) ([]*chat.Chat, error) {
+	return c.db.GetGroupChatsForUserByIDs(ctx, userID, folder, chatIDs)
 }
 
 // GetGroupChatsByID passes through: a group's record changes with every edit
@@ -272,6 +273,16 @@ func (c *Cache) SetMute(ctx context.Context, chatID *commonpb.ChatId, userID *co
 
 func (c *Cache) ClearMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, bool, error) {
 	return c.db.ClearMute(ctx, chatID, userID)
+}
+
+// SetArchived and GetArchivedChats pass through: viewer state is never
+// cached, and an archive is part of it.
+func (c *Cache) SetArchived(ctx context.Context, ch *chat.Chat, userID *commonpb.UserId, archived bool, now time.Time) (chat.ViewerState, bool, error) {
+	return c.db.SetArchived(ctx, ch, userID, archived, now)
+}
+
+func (c *Cache) GetArchivedChats(ctx context.Context, userID *commonpb.UserId) ([]chat.ArchivedChat, error) {
+	return c.db.GetArchivedChats(ctx, userID)
 }
 
 func (c *Cache) GetViewerStates(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.ViewerState, error) {

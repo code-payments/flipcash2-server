@@ -341,7 +341,19 @@ func (m *memory) RemoveGroupMember(_ context.Context, chatID *commonpb.ChatId, u
 	if discardKeyEnvelope {
 		delete(m.keyEnvelopes[string(userID.Value)], key)
 	}
+	m.unarchiveOnDepartureLocked(chatID, userID)
 	return true, m.rosterSummaryLocked(chatID), nil
+}
+
+// unarchiveOnDepartureLocked removes the user's archive of the group as the
+// departure being recorded ends it (see chat.Store.RemoveGroupMember).
+func (m *memory) unarchiveOnDepartureLocked(chatID *commonpb.ChatId, userID *commonpb.UserId) {
+	state := m.viewerStateLocked(chatID, userID, false)
+	if state == nil || state.ArchivedAt == nil {
+		return
+	}
+	state.ArchivedAt = nil
+	state.Version++
 }
 
 func (m *memory) SetGroupPicture(_ context.Context, chatID *commonpb.ChatId, blobID *blobpb.BlobId) error {
@@ -493,7 +505,7 @@ func (m *memory) rosterSummaryLocked(chatID *commonpb.ChatId) chat.RosterSummary
 	}
 }
 
-func (m *memory) GetDmFeedPage(_ context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
+func (m *memory) GetDmFeedPage(_ context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, folder chat.Folder, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
 	m.Lock()
 	defer m.Unlock()
 
@@ -506,6 +518,9 @@ func (m *memory) GetDmFeedPage(_ context.Context, userID *commonpb.UserId, chatT
 		// A member the DM excludes from the feed never has it listed (see
 		// chat.Store.PutChat).
 		if _, ok := m.excludedFromFeed[key][string(userID.Value)]; ok {
+			continue
+		}
+		if m.isArchivedLocked(key, string(userID.Value)) != folder.IsArchived() {
 			continue
 		}
 		if c.Type == chatType && hasInlineMember(c, userID) && !c.LastActivity.After(snapshot) {
@@ -573,7 +588,10 @@ func (m *memory) IsMember(_ context.Context, chatID *commonpb.ChatId, userID *co
 // on each write of a record; this store's exclusions are fixed at
 // construction and it is the only writer of its records, so deciding it here
 // on the read is the same, and leaves the records themselves as for anyone.
-// GetGroupChatsForUser and GetGroupChatsForUserByIDs do likewise.
+// GetGroupChatsForUser and GetGroupChatsForUserByIDs do likewise. The folder
+// a record is filed in is likewise decided on the read, from the user's
+// archive (see chat.Folder), which every write that moves it holds the lock
+// for: only the inbox is listed here.
 func (m *memory) GetGroupMembershipsForUser(_ context.Context, userID *commonpb.UserId) ([]chat.GroupMembership, error) {
 	m.Lock()
 	defer m.Unlock()
@@ -586,7 +604,7 @@ func (m *memory) GetGroupMembershipsForUser(_ context.Context, userID *commonpb.
 		// A departed member is a false entry, kept as the persistent stores
 		// keep a tombstone; a user never in the group has no entry.
 		r, ok := members[string(userID.Value)]
-		if !ok {
+		if !ok || m.isArchivedLocked(chatKey, string(userID.Value)) {
 			continue
 		}
 		memberships = append(memberships, chat.GroupMembership{
@@ -598,7 +616,7 @@ func (m *memory) GetGroupMembershipsForUser(_ context.Context, userID *commonpb.
 	return memberships, nil
 }
 
-func (m *memory) GetGroupChatsForUser(_ context.Context, userID *commonpb.UserId) ([]*chat.Chat, error) {
+func (m *memory) GetGroupChatsForUser(_ context.Context, userID *commonpb.UserId, folder chat.Folder) ([]*chat.Chat, error) {
 	m.Lock()
 	defer m.Unlock()
 
@@ -607,14 +625,14 @@ func (m *memory) GetGroupChatsForUser(_ context.Context, userID *commonpb.UserId
 		return chats, nil
 	}
 	for chatKey := range m.groupMembers {
-		if m.isJoinedLocked(chatKey, string(userID.Value)) {
+		if m.isJoinedLocked(chatKey, string(userID.Value)) && m.isArchivedLocked(chatKey, string(userID.Value)) == folder.IsArchived() {
 			chats = append(chats, m.chats[chatKey].Clone())
 		}
 	}
 	return chats, nil
 }
 
-func (m *memory) GetGroupChatsForUserByIDs(_ context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) ([]*chat.Chat, error) {
+func (m *memory) GetGroupChatsForUserByIDs(_ context.Context, userID *commonpb.UserId, folder chat.Folder, chatIDs []*commonpb.ChatId) ([]*chat.Chat, error) {
 	for _, chatID := range chatIDs {
 		if !chat.IsGroupChatID(chatID) {
 			return nil, fmt.Errorf("not a group chat id")
@@ -637,7 +655,7 @@ func (m *memory) GetGroupChatsForUserByIDs(_ context.Context, userID *commonpb.U
 		seen[key] = struct{}{}
 		// Membership first, then the record: a chat that exists but the user is
 		// not joined to is as absent as one that does not exist.
-		if !m.isJoinedLocked(key, string(userID.Value)) {
+		if !m.isJoinedLocked(key, string(userID.Value)) || m.isArchivedLocked(key, string(userID.Value)) != folder.IsArchived() {
 			continue
 		}
 		if c, ok := m.chats[key]; ok {
@@ -813,6 +831,14 @@ func (m *memory) GetGroupMembersPage(_ context.Context, chatID *commonpb.ChatId,
 		page.Users = users[:limit]
 		page.Next = users[limit-1]
 	}
+	for _, user := range page.Users {
+		if m.isArchivedLocked(string(chatID.Value), string(user.Value)) {
+			if page.Archived == nil {
+				page.Archived = make(map[string]struct{})
+			}
+			page.Archived[string(user.Value)] = struct{}{}
+		}
+	}
 	return page, nil
 }
 
@@ -907,6 +933,82 @@ func (m *memory) ClearMute(_ context.Context, chatID *commonpb.ChatId, userID *c
 	return state.Clone(), true, nil
 }
 
+func (m *memory) SetArchived(_ context.Context, c *chat.Chat, userID *commonpb.UserId, archived bool, now time.Time) (chat.ViewerState, bool, error) {
+	if err := chat.ValidateArchiveChat(c); err != nil {
+		return chat.ViewerState{}, false, err
+	}
+	var archivedAt time.Time
+	if archived {
+		var err error
+		if archivedAt, err = chat.RecordedTime(now); err != nil {
+			return chat.ViewerState{}, false, err
+		}
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	chatKey, userKey := string(c.ID.Value), string(userID.Value)
+
+	// Judged as the persistent stores judge it: the no-op first, then
+	// membership, then the exclusion.
+	var current chat.ViewerState
+	if state := m.viewerStateLocked(c.ID, userID, false); state != nil {
+		current = state.Clone()
+	}
+	if (current.ArchivedAt != nil) == archived {
+		return current, false, nil
+	}
+	if chat.IsGroupChatID(c.ID) {
+		if !m.isJoinedLocked(chatKey, userKey) {
+			return chat.ViewerState{}, false, chat.ErrNotMember
+		}
+		if m.exclusions.Excludes(userID) {
+			return chat.ViewerState{}, false, chat.ErrExcludedFromFeed
+		}
+	} else {
+		// The stored DM decides, as the persistent stores' rows do: a user
+		// it does not hold is a non-member whatever c says, and a c of
+		// another type than the stored one is refused.
+		stored, ok := m.chats[chatKey]
+		if !ok || !stored.HasMember(userID) {
+			return chat.ViewerState{}, false, chat.ErrNotMember
+		}
+		if stored.Type != c.Type {
+			return chat.ViewerState{}, false, fmt.Errorf("chat %x is stored as type %d, not %s", c.ID.Value, stored.Type, c.Type)
+		}
+		if _, ok := m.excludedFromFeed[chatKey][userKey]; ok {
+			return chat.ViewerState{}, false, chat.ErrExcludedFromFeed
+		}
+	}
+
+	state := m.viewerStateLocked(c.ID, userID, true)
+	state.ArchivedAt = nil
+	if archived {
+		state.ArchivedAt = &archivedAt
+	}
+	state.Version++
+	return state.Clone(), true, nil
+}
+
+func (m *memory) GetArchivedChats(_ context.Context, userID *commonpb.UserId) ([]chat.ArchivedChat, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	out := make([]chat.ArchivedChat, 0)
+	for chatKey, state := range m.viewerStates[string(userID.Value)] {
+		if state.ArchivedAt == nil {
+			continue
+		}
+		out = append(out, chat.ArchivedChat{
+			ChatID:     &commonpb.ChatId{Value: []byte(chatKey)},
+			ArchivedAt: *state.ArchivedAt,
+			Version:    state.Version,
+		})
+	}
+	return out, nil
+}
+
 func (m *memory) GetViewerStates(_ context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.ViewerState, error) {
 	m.Lock()
 	defer m.Unlock()
@@ -932,6 +1034,13 @@ func (m *memory) GetViewerStatesForUsers(_ context.Context, chatID *commonpb.Cha
 		}
 	}
 	return out, nil
+}
+
+// isArchivedLocked reports whether the user's record on the chat holds an
+// archive, which files the chat in their archived folder (see chat.Folder).
+func (m *memory) isArchivedLocked(chatKey, userKey string) bool {
+	state := m.viewerStates[userKey][chatKey]
+	return state != nil && state.ArchivedAt != nil
 }
 
 // isBannedLocked reports whether the user's record on the chat holds a ban.
@@ -961,17 +1070,6 @@ func (m *memory) viewerStateLocked(chatID *commonpb.ChatId, userID *commonpb.Use
 	return state
 }
 
-// restrictionTime is now as a restriction records it: at the persistent
-// store's nanosecond precision, in UTC, with no monotonic reading, so two
-// stores return equal times; or an error when it is before the Unix epoch,
-// which no store records.
-func restrictionTime(now time.Time) (time.Time, error) {
-	if now.Before(time.Unix(0, 0)) {
-		return time.Time{}, fmt.Errorf("restriction time before the unix epoch")
-	}
-	return time.Unix(0, now.UnixNano()).UTC(), nil
-}
-
 func (m *memory) SetSilence(_ context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, silence chat.Silence, now time.Time) (chat.ViewerState, bool, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return chat.ViewerState{}, false, fmt.Errorf("not a group chat id")
@@ -980,7 +1078,7 @@ func (m *memory) SetSilence(_ context.Context, chatID *commonpb.ChatId, userID *
 	if err != nil {
 		return chat.ViewerState{}, false, err
 	}
-	now, err = restrictionTime(now)
+	now, err = chat.RecordedTime(now)
 	if err != nil {
 		return chat.ViewerState{}, false, err
 	}
@@ -1025,7 +1123,7 @@ func (m *memory) BanUser(_ context.Context, chatID *commonpb.ChatId, userID *com
 	if !chat.IsGroupChatID(chatID) {
 		return chat.BanResult{}, fmt.Errorf("not a group chat id")
 	}
-	now, err := restrictionTime(now)
+	now, err := chat.RecordedTime(now)
 	if err != nil {
 		return chat.BanResult{}, err
 	}
@@ -1053,7 +1151,10 @@ func (m *memory) BanUser(_ context.Context, chatID *commonpb.ChatId, userID *com
 	}
 	result.LeftLobby = m.leaveLobbyLocked(chatID, userID)
 
+	// The ban removes an archive in its one move of the version, as the
+	// persistent stores' single write of the record does.
 	state := m.viewerStateLocked(chatID, userID, true)
+	state.ArchivedAt = nil
 	state.BannedAt = &now
 	state.RestrictedAt = &now
 	state.Version++

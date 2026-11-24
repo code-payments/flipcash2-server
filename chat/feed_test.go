@@ -76,7 +76,7 @@ type fakeFeedStore struct {
 	fullReads int // GetGroupChatsForUser calls
 }
 
-func (f *fakeFeedStore) GetGroupChatsForUser(context.Context, *commonpb.UserId) ([]*Chat, error) {
+func (f *fakeFeedStore) GetGroupChatsForUser(context.Context, *commonpb.UserId, Folder) ([]*Chat, error) {
 	f.fullReads++
 	var out []*Chat
 	for id, c := range f.chats {
@@ -87,7 +87,7 @@ func (f *fakeFeedStore) GetGroupChatsForUser(context.Context, *commonpb.UserId) 
 	return out, nil
 }
 
-func (f *fakeFeedStore) GetGroupChatsForUserByIDs(_ context.Context, _ *commonpb.UserId, chatIDs []*commonpb.ChatId) ([]*Chat, error) {
+func (f *fakeFeedStore) GetGroupChatsForUserByIDs(_ context.Context, _ *commonpb.UserId, _ Folder, chatIDs []*commonpb.ChatId) ([]*Chat, error) {
 	var out []*Chat
 	for _, id := range chatIDs {
 		if c, ok := f.chats[string(id.Value)]; ok && f.joined[string(id.Value)] {

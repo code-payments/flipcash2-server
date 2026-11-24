@@ -93,7 +93,7 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 	}
 
 	// Fetch one extra to detect whether a further page remains.
-	chats, err := s.chats.GetDmFeedPage(ctx, userID, chatType, snapshot, cursor, limit+1)
+	chats, err := s.chats.GetDmFeedPage(ctx, userID, chatType, FolderInbox, snapshot, cursor, limit+1)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure getting DM chats")
 		return nil, status.Error(codes.Internal, "")
@@ -448,7 +448,7 @@ func (s *Server) groupFeedPage(ctx context.Context, userID *commonpb.UserId, tok
 
 		// Re-check membership and re-read the records for exactly the IDs about
 		// to be emitted. The read is unordered; the token's order is restored.
-		chats, err := s.chats.GetGroupChatsForUserByIDs(ctx, userID, ids)
+		chats, err := s.chats.GetGroupChatsForUserByIDs(ctx, userID, FolderInbox, ids)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -471,7 +471,7 @@ func (s *Server) groupFeedPage(ctx context.Context, userID *commonpb.UserId, tok
 // in descending (last_activity, chat_id) order. It reads every group the
 // caller is in.
 func (s *Server) sortedGroupFeed(ctx context.Context, userID *commonpb.UserId, snapshot time.Time) ([]*Chat, error) {
-	all, err := s.chats.GetGroupChatsForUser(ctx, userID)
+	all, err := s.chats.GetGroupChatsForUser(ctx, userID, FolderInbox)
 	if err != nil {
 		return nil, err
 	}

@@ -4022,7 +4022,7 @@ func testServer_StartChat_Idempotent(t *testing.T, s chat.Store) {
 	e.fundEnvUser(startChatMinimumBalance)
 
 	// One group exists, and only its creation was announced.
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Len(t, groups, 1)
 	require.Len(t, e.rosterUpdatesOnUserTopic(e.userID, chatID), 1)
@@ -4066,7 +4066,7 @@ func testServer_StartChat_Idempotent(t *testing.T, s chat.Store) {
 		_, err = e.client.StartChat(e.ctx, req)
 		require.Equal(t, codes.InvalidArgument, status.Code(err))
 	}
-	groups, err = s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err = s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Len(t, groups, 1)
 }
@@ -4109,7 +4109,7 @@ func testServer_StartChat_PictureNotAccepted(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.StartChatResponse_PROFILE_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
 	require.Nil(t, resp.Chat)
 
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 	require.Empty(t, e.media.chatPictures)
@@ -4121,7 +4121,7 @@ func testServer_StartChat_PictureNotAccepted(t *testing.T, s chat.Store) {
 	params.ProfilePicture = &blobpb.BlobId{Value: []byte("group-picture-01")}
 	_, err = e.startGroupChat(e.keys, params)
 	require.Equal(t, codes.Internal, status.Code(err))
-	groups, err = s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err = s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 }
@@ -4132,7 +4132,7 @@ func testServer_StartChat_TitleModerated(t *testing.T, s chat.Store) {
 
 	noGroups := func() {
 		t.Helper()
-		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 		require.NoError(t, err)
 		require.Empty(t, groups)
 	}
@@ -4193,7 +4193,7 @@ func testServer_StartChat_ModerationFailureIsInternal(t *testing.T, s chat.Store
 	_, err = e.startGroupChat(e.keys, groupParams("Sunday Hikers"))
 	require.Equal(t, codes.Internal, status.Code(err))
 
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 }
@@ -4208,7 +4208,7 @@ func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
 
 	groups := func() []*chat.Chat {
 		t.Helper()
-		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 		require.NoError(t, err)
 		return groups
 	}
@@ -4592,7 +4592,7 @@ func testServer_StartChat_InvalidRules(t *testing.T, s chat.Store) {
 		})
 	}
 
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 }
@@ -4621,7 +4621,7 @@ func testServer_StartChat_RulesNotSatisfied(t *testing.T, s chat.Store) {
 	resp = e.mustStartGroupChat(e.keys, staffOnly)
 	require.Equal(t, chatpb.StartChatResponse_RULES_NOT_SATISFIED, resp.Result)
 
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 }
@@ -4657,7 +4657,7 @@ func testServer_StartChat_MinimumSpeakerBalance(t *testing.T, s chat.Store) {
 	resp := e.mustStartGroupChat(e.keys, params)
 	require.Equal(t, chatpb.StartChatResponse_RULES_NOT_SATISFIED, resp.Result)
 	require.Nil(t, resp.Chat)
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 
@@ -5451,7 +5451,7 @@ func testServer_StartChat_CoverPictureNotAccepted(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.StartChatResponse_COVER_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
 	require.Nil(t, resp.Chat)
 
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 
@@ -5476,7 +5476,7 @@ func testServer_StartChat_Description(t *testing.T, s chat.Store) {
 
 	noGroups := func() {
 		t.Helper()
-		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 		require.NoError(t, err)
 		require.Empty(t, groups)
 	}

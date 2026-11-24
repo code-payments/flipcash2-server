@@ -18,6 +18,7 @@ import (
 
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+	messagingpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/messaging/v1"
 
 	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/model"
@@ -363,10 +364,10 @@ func TestChat_DynamoDBExcludedRowLosesIndexKeys(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(queryFeed(t, groupFeedKey(team, false))) == 0 && len(membershipIDs(t, s, team)) == 0
 	}, 5*time.Second, 50*time.Millisecond)
-	chats, err := s.GetGroupChatsForUser(ctx, team)
+	chats, err := s.GetGroupChatsForUser(ctx, team, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, chats)
-	chats, err = s.GetGroupChatsForUserByIDs(ctx, team, []*commonpb.ChatId{departed, rejoined})
+	chats, err = s.GetGroupChatsForUserByIDs(ctx, team, chat.FolderInbox, []*commonpb.ChatId{departed, rejoined})
 	require.NoError(t, err)
 	require.Empty(t, chats)
 }
@@ -402,13 +403,180 @@ func TestChat_DynamoDBListingsReadFeed(t *testing.T) {
 		return len(ids) == 1 && ids[0] == want[0]
 	}, 5*time.Second, 50*time.Millisecond)
 
-	chats, err := s.GetGroupChatsForUser(ctx, user)
+	chats, err := s.GetGroupChatsForUser(ctx, user, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Len(t, chats, 1)
 	require.Equal(t, listed.Value, chats[0].ID.Value)
 
-	chats, err = s.GetGroupChatsForUserByIDs(ctx, user, []*commonpb.ChatId{listed, legacy})
+	chats, err = s.GetGroupChatsForUserByIDs(ctx, user, chat.FolderInbox, []*commonpb.ChatId{listed, legacy})
 	require.NoError(t, err)
 	require.Len(t, chats, 1)
 	require.Equal(t, listed.Value, chats[0].ID.Value)
+}
+
+// userStateItem is userID's raw chat_user_state record on chatID, empty when
+// there is none.
+func userStateItem(t *testing.T, chatID *commonpb.ChatId, userID *commonpb.UserId) map[string]types.AttributeValue {
+	t.Helper()
+	out, err := testEnv.Client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName:      aws.String(userStateTable),
+		Key:            userStateKey(chatID, userID),
+		ConsistentRead: aws.Bool(true),
+	})
+	require.NoError(t, err)
+	return out.Item
+}
+
+// dmInboxRow is userID's raw dm_inbox row for the DM chatID.
+func dmInboxRow(t *testing.T, chatID *commonpb.ChatId, userID *commonpb.UserId) map[string]types.AttributeValue {
+	t.Helper()
+	out, err := testEnv.Client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName:      aws.String(dmInboxTable),
+		Key:            map[string]types.AttributeValue{attrPK: avS(userPK(userID)), attrSK: avS(chatSK(chatID))},
+		ConsistentRead: aws.Bool(true),
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, out.Item)
+	return out.Item
+}
+
+// queryDmFeed lists the sks gsiByFeedActivity holds under feed, most
+// recently active first.
+func queryDmFeed(t *testing.T, feed string) []string {
+	t.Helper()
+	out, err := testEnv.Client.Query(context.Background(), &dynamodb.QueryInput{
+		TableName:                 aws.String(dmInboxTable),
+		IndexName:                 aws.String(gsiByFeedActivity),
+		KeyConditionExpression:    aws.String("#feed = :feed"),
+		ExpressionAttributeNames:  map[string]string{"#feed": attrFeed},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":feed": avS(feed)},
+		ScanIndexForward:          aws.Bool(false),
+	})
+	require.NoError(t, err)
+	var sks []string
+	for _, item := range out.Items {
+		sks = append(sks, asS(item[attrSK]))
+	}
+	return sks
+}
+
+// TestChat_DynamoDBArchiveFiling pins how an archive is filed in the raw
+// items: archiving sets archived_at on the user's chat_user_state record and
+// moves their dm_inbox or group_members row's feed to the archived folder's
+// key, spelled out here, so the row leaves the inbox partition of
+// gsiByFeedActivity or gsiByFeed for the archived one, keeping its
+// last_activity, which an advance still moves; the chat's #meta muted count
+// never carries it; and a departure files the tombstone in the inbox and
+// removes archived_at from the record.
+func TestChat_DynamoDBArchiveFiling(t *testing.T) {
+	ctx := context.Background()
+	s := newFeedTestStore(t)
+
+	user, other := model.MustGenerateUserID(), model.MustGenerateUserID()
+	userHex := hex.EncodeToString(user.Value)
+	dmIDValue := make([]byte, chat.DmChatIDSize)
+	_, err := rand.Read(dmIDValue)
+	require.NoError(t, err)
+	dm := &chat.Chat{
+		ID:           &commonpb.ChatId{Value: dmIDValue},
+		Type:         chatpb.ChatType_DM,
+		Members:      []*commonpb.UserId{user, other},
+		LastActivity: time.Unix(1_700_000_000, 0).UTC(),
+	}
+	require.NoError(t, s.PutChat(ctx, dm))
+	group := &chat.Chat{
+		ID:           chat.MustGenerateGroupChatID(),
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{user, other},
+		Title:        "Archive",
+		LastActivity: time.Now(),
+	}
+	require.NoError(t, s.PutChat(ctx, group))
+	_, _, err = s.SetMute(ctx, group.ID, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+
+	inboxDmFeed := fmt.Sprintf("user#%s#%d", userHex, chatpb.ChatType_DM)
+	archivedDmFeed := inboxDmFeed + "#archived"
+	inboxGroupFeed := "user#" + userHex
+	archivedGroupFeed := inboxGroupFeed + "#archived"
+	require.Equal(t, []string{chatSK(dm.ID)}, queryDmFeed(t, inboxDmFeed))
+	require.Equal(t, []string{chatPK(group.ID)}, queryFeed(t, inboxGroupFeed))
+
+	archivedAt := time.Unix(1_700_000_100, 123456789).UTC()
+	for _, c := range []*chat.Chat{dm, group} {
+		_, changed, err := s.SetArchived(ctx, c, user, true, archivedAt)
+		require.NoError(t, err)
+		require.True(t, changed)
+		record := userStateItem(t, c.ID, user)
+		nanos, err := parseN(record[attrArchivedAt])
+		require.NoError(t, err)
+		require.EqualValues(t, archivedAt.UnixNano(), nanos)
+		require.Equal(t, c.ID.Value, asB(record[attrChat]))
+	}
+
+	row := dmInboxRow(t, dm.ID, user)
+	require.Equal(t, archivedDmFeed, asS(row[attrFeed]))
+	require.Equal(t, dmFeedKey(user, chatpb.ChatType_DM, true), asS(row[attrFeed]))
+	activity, err := parseN(row[attrLastActivity])
+	require.NoError(t, err)
+	require.EqualValues(t, dm.LastActivity.UnixNano(), activity)
+	require.Equal(t, fmt.Sprintf("user#%s#%d", hex.EncodeToString(other.Value), chatpb.ChatType_DM), asS(dmInboxRow(t, dm.ID, other)[attrFeed]))
+	member := groupMembersItem(t, group.ID, userPK(user))
+	require.Equal(t, archivedGroupFeed, asS(member[attrFeed]))
+	require.Equal(t, groupFeedKey(user, true), asS(member[attrFeed]))
+	require.Equal(t, userHex, asS(member[attrUser]))
+
+	require.Eventually(t, func() bool {
+		return len(queryDmFeed(t, inboxDmFeed)) == 0 && len(queryFeed(t, inboxGroupFeed)) == 0
+	}, 5*time.Second, 50*time.Millisecond)
+	require.Equal(t, []string{chatSK(dm.ID)}, queryDmFeed(t, archivedDmFeed))
+	require.Equal(t, []string{chatPK(group.ID)}, queryFeed(t, archivedGroupFeed))
+
+	// An advance moves the archived row's activity, leaving it archived.
+	advancedTo := dm.LastActivity.Add(time.Minute)
+	advanced, _, err := s.AdvanceLastMessage(ctx, dm.ID, &messagingpb.MessageId{Value: 1}, advancedTo)
+	require.NoError(t, err)
+	require.True(t, advanced)
+	row = dmInboxRow(t, dm.ID, user)
+	require.Equal(t, archivedDmFeed, asS(row[attrFeed]))
+	activity, err = parseN(row[attrLastActivity])
+	require.NoError(t, err)
+	require.EqualValues(t, advancedTo.UnixNano(), activity)
+
+	// The #meta muted count is the mute's alone.
+	meta, err := testEnv.Client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(userStateTable),
+		Key:            map[string]types.AttributeValue{attrPK: avS(chatPK(group.ID)), attrSK: avS(skMeta)},
+		ConsistentRead: aws.Bool(true),
+	})
+	require.NoError(t, err)
+	require.NotContains(t, meta.Item, attrArchivedAt)
+	count, err := parseInt(meta.Item[attrMutedCount])
+	require.NoError(t, err)
+	require.EqualValues(t, 1, count)
+
+	// A departure files the tombstone in the inbox and removes the archive
+	// from the record, in the same write, leaving the mute.
+	changed, _, err := s.RemoveGroupMember(ctx, group.ID, user, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	tombstone := groupMembersItem(t, group.ID, userPK(user))
+	require.Equal(t, inboxGroupFeed, asS(tombstone[attrFeed]))
+	require.Contains(t, tombstone, attrLeftAt)
+	record := userStateItem(t, group.ID, user)
+	require.NotContains(t, record, attrArchivedAt)
+	require.Contains(t, record, attrMutedUntil)
+	version, err := parseN(record[attrVersion])
+	require.NoError(t, err)
+	require.EqualValues(t, 3, version)
+	require.Eventually(t, func() bool {
+		return len(queryFeed(t, archivedGroupFeed)) == 0 && len(queryFeed(t, inboxGroupFeed)) == 1
+	}, 5*time.Second, 50*time.Millisecond)
+
+	// Unarchiving the DM files the row back in the inbox.
+	_, changed, err = s.SetArchived(ctx, dm, user, false, time.Now())
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, inboxDmFeed, asS(dmInboxRow(t, dm.ID, user)[attrFeed]))
+	require.NotContains(t, userStateItem(t, dm.ID, user), attrArchivedAt)
 }

@@ -1775,7 +1775,7 @@ func testServer_SendBatch_SideEffects(t *testing.T, badges badge.Store, blocklis
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), record.LastMessageID.GetValue())
 	for _, member := range []*commonpb.UserId{e.userA, e.userB} {
-		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_DM, time.Now().Add(time.Hour), nil, 0)
+		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_DM, chat.FolderInbox, time.Now().Add(time.Hour), nil, 0)
 		require.NoError(t, err)
 		require.Len(t, page, 1)
 		require.Equal(t, uint64(4), page[0].LastMessageID.GetValue())
@@ -2112,7 +2112,7 @@ func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blockl
 	// feedEntry is the DM as the member's own DM feed lists it.
 	feedEntry := func(member *commonpb.UserId) *chat.Chat {
 		t.Helper()
-		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_DM, time.Now().Add(time.Hour), nil, 0)
+		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_DM, chat.FolderInbox, time.Now().Add(time.Hour), nil, 0)
 		require.NoError(t, err)
 		require.Len(t, page, 1)
 		return page[0]

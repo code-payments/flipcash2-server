@@ -297,7 +297,7 @@ func testExecutor_SendDmPaymentMessage(t *testing.T, location intentpb.ChatMetad
 
 	// Only the team account is ever excluded from the feed, and it is a
 	// member all the same.
-	recipientFeed, err := chats.GetDmFeedPage(ctx, recipientUserID, chatpb.ChatType_DM, time.Now().Add(time.Hour), nil, 0)
+	recipientFeed, err := chats.GetDmFeedPage(ctx, recipientUserID, chatpb.ChatType_DM, chat.FolderInbox, time.Now().Add(time.Hour), nil, 0)
 	require.NoError(t, err)
 	if toTeam {
 		require.Empty(t, recipientFeed)

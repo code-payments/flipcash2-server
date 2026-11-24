@@ -95,8 +95,9 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				{
 					// Inverted index: (feed, chat), one of a user's folders of
 					// groups. Listing a user's group chats (the group feed's
-					// fan-out-on-read entry point) is a query on the user's
-					// inbox; membership state rides along in the projection.
+					// fan-out-on-read entry point) is a query on one of the
+					// user's folders; membership state rides along in the
+					// projection.
 					// Keyed by the sparse feed attribute — present on membership
 					// rows (tombstones included) and nothing else — so
 					// non-membership items like the counter stay out of the

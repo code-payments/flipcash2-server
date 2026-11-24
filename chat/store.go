@@ -540,11 +540,19 @@ type Store interface {
 	// from the feed has every record unlisted, so gets an empty result (see
 	// PutChat).
 	//
-	// It lists the records filed in the user's inbox alone (see archive.go):
-	// a group the user has archived is left out while the archive stands, and
-	// every departed record is in the inbox, since a departure files it there.
-	// GetArchivedChats is what lists the user's archived groups.
-	GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId) ([]GroupMembership, error)
+	// It lists the records filed in folder alone (see archive.go): the inbox
+	// leaves out a group the user has archived while the archive stands, and
+	// the archived folder lists only those, each joined, since every departed
+	// record is in the inbox, a departure filing it there. Like the inbox's,
+	// the archived folder's listing is read from an index that may trail an
+	// archive, an unarchive or a departure by a moment, so a group that just
+	// moved may still be listed in the folder it left, or not yet in the one
+	// it entered; GetArchivedChats is the strongly consistent answer to which
+	// chats the user has archived. The event stream reads the inbox at open
+	// and on every reconcile, and the archived folder when it starts
+	// following the user's archive and on every reconcile while it follows
+	// (see event.Server).
+	GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId, folder Folder) ([]GroupMembership, error)
 
 	// GetGroupChatsForUser returns the canonical record of every group chat
 	// userID is currently a joined member of and has filed in folder (see

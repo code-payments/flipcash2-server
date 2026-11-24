@@ -31,8 +31,11 @@ const broadcastTimeout = 5 * time.Second
 // group's update is published once on its chat topic — the delivery layer
 // resolves the servers hosting subscribed streams from the chat-keyed
 // subscription registry — so publishing costs the same no matter how large
-// the group, and no member read is needed at all. The pushes an update earns
-// walk the group's roster in pages of their own (see pushSentMessages).
+// the group, and no member read is needed at all. It reaches the streams
+// following the group, which leaves out those of a member who has archived
+// it, unless a stream follows their archive (see event.Server). The pushes
+// an update earns walk the group's roster in pages of their own (see
+// pushSentMessages).
 //
 // members may be supplied by a caller that already has a DM's pair in hand
 // (e.g. from AdvanceLastMessage), avoiding a redundant read; when nil, they

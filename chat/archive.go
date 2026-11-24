@@ -59,14 +59,29 @@ import (
 //
 // Who has archived a chat is read for what an archive keeps quiet for its
 // user, every push from the chat (see messaging's push fan-out and the
-// lobby's pushes, lobby.go): a page of a group's roster says which of its
-// members have archived it (see MembersPage.Archived), a few users' states
-// on one chat say it of each of them (see Store.GetViewerStatesForUsers), as
-// a user's own state on a chat does (see Store.GetViewerStates), and a
-// user's archives across all their chats are one strongly consistent read
-// with the version of each (see Store.GetArchivedChats). The store applies
-// no quiet itself; it records the archive, files the chat by it and answers
-// those reads.
+// lobby's pushes, lobby.go) and, for a group, the user's event streams: a
+// page of a group's roster says which of its members have archived it (see
+// MembersPage.Archived), a few users' states on one chat say it of each of
+// them (see Store.GetViewerStatesForUsers), as a user's own state on a chat
+// does (see Store.GetViewerStates), a user's archives across all their chats
+// are one strongly consistent read with the version of each (see
+// Store.GetArchivedChats), and their archived groups are listed, each with
+// the roster version of their last transition there, from the archived
+// folder of their memberships (see Store.GetGroupMembershipsForUser). The
+// store applies no quiet itself; it records the archive, files the chat by
+// it and answers those reads.
+//
+// The event stream is where a group's quiet is applied (see event.Server).
+// A user stream follows the chat topics of the user's groups, and of an
+// archived group only while the client has asked that stream to follow the
+// user's archive, which it does while the user is looking at it; otherwise
+// the stream carries of an archived group only what is published on the
+// user's own topic, such as their own ViewerStateChanged and their own
+// departure. An archived DM is streamed as every DM is, on the user's own
+// topic, so nothing about a DM's delivery changes. The stream learns of an
+// archive or an unarchive from the ViewerStateChanged it publishes, which
+// carries the archive at the state's Version, and the same strongly
+// consistent read of the user's archives backs it up periodically.
 
 // Folder is which of a user's two lists of their chats a chat is filed in
 // (see chatpb.ChatFolder): FolderArchived while they hold an archive of it,
@@ -157,7 +172,9 @@ func ValidateArchiveChat(c *Chat) error {
 // archived is answered with the current state, its original archive time
 // kept, and publishes nothing, and a real archive reaches the caller's other
 // devices as a MetadataUpdate.ViewerStateChanged on their user topic (see
-// publishViewerStateChanged), with the state the response carries. An
+// publishViewerStateChanged), with the state the response carries. That
+// publish is also what takes the caller's event streams off a group's chat
+// topic, but for a stream following their archive (see archive.go). An
 // archive changes nothing anyone else sees, so nothing is published on the
 // chat topic. Nothing in the chat ends it: only UnarchiveChat does while the
 // caller is a member, and a departure ends it with the membership, in the
@@ -193,9 +210,12 @@ func (s *Server) ArchiveChat(ctx context.Context, req *chatpb.ArchiveChatRequest
 // UnarchiveChat removes the caller's archive of a chat, filing it back in
 // their inbox. It is gated, written and published exactly as ArchiveChat is;
 // unarchiving a chat that is not archived is the no-op that returns the
-// current state and publishes nothing.
+// current state and publishes nothing. The ViewerStateChanged it publishes
+// puts every event stream of the caller's back on a group's chat topic,
+// whatever the stream's following of the archive (see archive.go).
 //
-// Nothing missed while the chat was archived is replayed. The response
+// Nothing missed while the chat was archived is replayed: a stream that was
+// not following the archive did not carry the group's updates meanwhile. The response
 // carries the chat's Metadata instead, on every OK, a no-op included, so the
 // client can show the chat again and catch up from it: the chat as GetChat
 // returns it to a member under ViewMode FULL (see chatAsSeenBy), hydrated the

@@ -54,11 +54,15 @@ import (
 // between pages is dropped from the pages of the folder it left; a DM that
 // moves leaves its folder's partition in the write that moves it, so the
 // pages that follow do not reach it either. The ARCHIVED folder is paged
-// under a snapshot like the INBOX, though the stream carries nothing for an
-// archived chat, so an archived chat that goes active after the snapshot is
-// left to the client's next read of the folder rather than to the stream:
-// the proto has the client read the folder whole each time it shows it, with
-// no stream to merge.
+// under a snapshot like the INBOX, and merged with the stream the same way.
+// For DMs the stream is always there to merge, since it carries an archived
+// DM as it does any other. For groups it is there while the client's stream
+// follows the user's archive (see event.Server): the client turns following
+// on and reads the folder only after the stream's ack, from which the
+// stream carries every archived group's updates, so an archived group that
+// goes active after the snapshot reaches the client on the stream as an
+// INBOX group's does. Once the client stops following, it reads the folder
+// again the next time it shows it.
 //
 // Both tokens' layouts have changed once, to bind the folder, and the old
 // layouts are still decoded, as tokens of the INBOX, the only folder there

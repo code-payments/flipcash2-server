@@ -88,7 +88,8 @@ import (
 // chatpb.ArchiveState), so the push is sent only once a strongly consistent
 // read of their state finds no archive, and sent anyway when that read fails,
 // as a message's push is (see messaging's fan-out). The LobbyUpdate is
-// published to them as before. A creator who has left holds no archive (a
+// published to them as before, and reaches their event streams whatever
+// their archive, being on their own topic rather than the group's. A creator who has left holds no archive (a
 // departure removes it, see archive.go), so they are pushed as before. The
 // admission's push needs no such read: it goes to a user who was not a
 // member until the admission, and only a member holds an archive. Both are

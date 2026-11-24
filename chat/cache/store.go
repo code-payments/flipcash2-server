@@ -245,8 +245,8 @@ func (c *Cache) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *c
 
 // Never cached, for the same reason group IsMember checks are not: group
 // membership is mutable from other processes.
-func (c *Cache) GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId) ([]chat.GroupMembership, error) {
-	return c.db.GetGroupMembershipsForUser(ctx, userID)
+func (c *Cache) GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId, folder chat.Folder) ([]chat.GroupMembership, error) {
+	return c.db.GetGroupMembershipsForUser(ctx, userID, folder)
 }
 
 func (c *Cache) GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserId, folder chat.Folder) ([]*chat.Chat, error) {

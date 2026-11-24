@@ -82,6 +82,10 @@ github.com/code-payments/flipcash2-protobuf-api v1.33.1-0.20261117142334-4bdb573
 github.com/code-payments/flipcash2-protobuf-api v1.33.1-0.20261117142334-4bdb573973c5/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
 github.com/code-payments/flipcash2-protobuf-api v1.33.1-0.20261123203707-5a435a8b7fc4 h1:a+YLxW6mrYzoOWNikAHZjFSwgPdWYg2UTNUuTjBA0HA=
 github.com/code-payments/flipcash2-protobuf-api v1.33.1-0.20261123203707-5a435a8b7fc4/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
+github.com/code-payments/flipcash2-protobuf-api v1.33.1-0.20261124145001-3e0737d14f88 h1:OnTNw4mqkfT29wqnxgMSoP4nSUrWtAvdoqunHmvq6dA=
+github.com/code-payments/flipcash2-protobuf-api v1.33.1-0.20261124145001-3e0737d14f88/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
+github.com/code-payments/flipcash2-protobuf-api v1.33.1-0.20261124153419-faf917253fbf h1:3ospO/uj2SxzB1t1MIMYv39bNRh7FCHcclqosAX8LfU=
+github.com/code-payments/flipcash2-protobuf-api v1.33.1-0.20261124153419-faf917253fbf/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
 github.com/code-payments/ocp-protobuf-api v1.19.1-0.20261110151028-0e8e6564f211 h1:yfIIC+SQPJ4vbyNNl+Tc4HWVI5mQEjk4lWmCwidM7/k=
 github.com/code-payments/ocp-protobuf-api v1.19.1-0.20261110151028-0e8e6564f211/go.mod h1:tw6BooY5a8l6CtSZnKOruyKII0W04n89pcM4BizrgG8=
 github.com/code-payments/ocp-server v1.29.1-0.20261111232727-734fce13f631 h1:OPH70JyO3xhj5bEwB6KpftcTOiAAQT6fxYjt3lXaZOI=

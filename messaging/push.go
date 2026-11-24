@@ -60,7 +60,9 @@ import (
 // one had archived, as the mute read does (see mutedUnknown): a transient
 // error costs an archived user one stray notification rather than silencing
 // a chat for everyone who never archived it. Unarchiving restores pushes,
-// subject to any mute.
+// subject to any mute. A group's updates are likewise left off an archived
+// member's event streams, but for one following their archive (see
+// event.Server); a DM's are streamed to them as before.
 const (
 	// defaultPushPageSize is how many members a page holds. A member has a
 	// device or two, so a page's tokens fill every FCM batch the pusher runs

@@ -104,7 +104,7 @@ func queryFeed(t *testing.T, feed string) []string {
 // encoded, failing the test on an error.
 func membershipIDs(t *testing.T, s chat.Store, userID *commonpb.UserId) []string {
 	t.Helper()
-	memberships, err := s.GetGroupMembershipsForUser(context.Background(), userID)
+	memberships, err := s.GetGroupMembershipsForUser(context.Background(), userID, chat.FolderInbox)
 	require.NoError(t, err)
 	ids := make([]string, 0, len(memberships))
 	for _, m := range memberships {

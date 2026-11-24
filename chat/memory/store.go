@@ -591,8 +591,9 @@ func (m *memory) IsMember(_ context.Context, chatID *commonpb.ChatId, userID *co
 // GetGroupChatsForUser and GetGroupChatsForUserByIDs do likewise. The folder
 // a record is filed in is likewise decided on the read, from the user's
 // archive (see chat.Folder), which every write that moves it holds the lock
-// for: only the inbox is listed here.
-func (m *memory) GetGroupMembershipsForUser(_ context.Context, userID *commonpb.UserId) ([]chat.GroupMembership, error) {
+// for, so this store's listing never trails a move as the index the
+// persistent stores read may.
+func (m *memory) GetGroupMembershipsForUser(_ context.Context, userID *commonpb.UserId, folder chat.Folder) ([]chat.GroupMembership, error) {
 	m.Lock()
 	defer m.Unlock()
 
@@ -604,7 +605,7 @@ func (m *memory) GetGroupMembershipsForUser(_ context.Context, userID *commonpb.
 		// A departed member is a false entry, kept as the persistent stores
 		// keep a tombstone; a user never in the group has no entry.
 		r, ok := members[string(userID.Value)]
-		if !ok || m.isArchivedLocked(chatKey, string(userID.Value)) {
+		if !ok || m.isArchivedLocked(chatKey, string(userID.Value)) != folder.IsArchived() {
 			continue
 		}
 		memberships = append(memberships, chat.GroupMembership{

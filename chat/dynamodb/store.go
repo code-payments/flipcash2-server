@@ -1955,16 +1955,17 @@ func groupMemberFromItem(item map[string]types.AttributeValue) (chat.GroupMember
 }
 
 // GetGroupMembershipsForUser lists the user's membership records via the
-// inverted gsiByFeed, from the user's inbox folder (see groupFeedKey): a
-// group they have archived is in their archived folder's partition of the
-// index, and is not listed. The index is keyed by the sparse feed attribute,
-// which tombstones keep (unlike joined_at), so departed memberships are in the
-// user's slice alongside joined ones, and come back with their state; every
-// departure files its tombstone in the inbox. A user excluded from the feed
-// has no rows in the index, so the query returns nothing for them, as it does
-// in GetGroupChatsForUser and GetGroupChatsForUserByIDs.
-func (s *store) GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId) ([]chat.GroupMembership, error) {
-	return s.queryGroupMemberships(ctx, userID, chat.FolderInbox, nil, nil, false)
+// inverted gsiByFeed, from the partition of the folder asked for (see
+// groupFeedKey): a group they have archived is in their archived folder's
+// partition of the index, every other in their inbox's. The index is keyed
+// by the sparse feed attribute, which tombstones keep (unlike joined_at), so
+// departed memberships are in the user's inbox slice alongside joined ones,
+// and come back with their state; every departure files its tombstone in the
+// inbox, so the archived slice holds joined records alone. A user excluded
+// from the feed has no rows in the index, so the query returns nothing for
+// them, as it does in GetGroupChatsForUser and GetGroupChatsForUserByIDs.
+func (s *store) GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId, folder chat.Folder) ([]chat.GroupMembership, error) {
+	return s.queryGroupMemberships(ctx, userID, folder, nil, nil, false)
 }
 
 // queryGroupMemberships is the gsiByFeed query of one of the user's folders
@@ -2069,7 +2070,7 @@ func (s *store) GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserI
 
 // GetGroupChatsForUserByIDs checks membership by querying the user's slice of
 // the inverted membership index for the folder — the read
-// GetGroupMembershipsForUser makes of the inbox — rather than by a keyed read
+// GetGroupMembershipsForUser makes of it — rather than by a keyed read
 // of each given ID's membership record, so a group in the user's other folder
 // is not confirmed, as a group they left is not. A query is
 // billed on the bytes it scans, and membership rows are small, so the user's

@@ -1637,7 +1637,7 @@ func testStore_GroupChat_MembershipsForUser(t *testing.T, s chat.Store) {
 	}
 
 	// No memberships is an empty result, not an error.
-	memberships, err := s.GetGroupMembershipsForUser(ctx, userA)
+	memberships, err := s.GetGroupMembershipsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, memberships)
 
@@ -1650,7 +1650,7 @@ func testStore_GroupChat_MembershipsForUser(t *testing.T, s chat.Store) {
 
 	// Memberships from creation are at version zero: no transition has
 	// touched them.
-	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Equal(t, map[string]record{
 		string(groupAB.ID.Value): {joined: true, version: 0},
@@ -1660,7 +1660,7 @@ func testStore_GroupChat_MembershipsForUser(t *testing.T, s chat.Store) {
 	// Departure keeps the record, departed, at the departure's version — the
 	// group's first transition.
 	removeGroupMember(t, s, groupAB.ID, userA)
-	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Equal(t, map[string]record{
 		string(groupAB.ID.Value): {joined: false, version: 1},
@@ -1673,7 +1673,7 @@ func testStore_GroupChat_MembershipsForUser(t *testing.T, s chat.Store) {
 	addGroupMembers(t, s, groupAB.ID, userA)
 	addGroupMembers(t, s, groupB.ID, userA)
 	addGroupMembers(t, s, groupAB.ID, model.MustGenerateUserID())
-	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Equal(t, map[string]record{
 		string(groupAB.ID.Value): {joined: true, version: 2},
@@ -1685,12 +1685,12 @@ func testStore_GroupChat_MembershipsForUser(t *testing.T, s chat.Store) {
 	// leaves a departed record, but groupA, which userB never joined, is
 	// absent from userB's slice rather than departed.
 	removeGroupMember(t, s, groupB.ID, userA)
-	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Equal(t, record{joined: false, version: 2}, byChat(memberships)[string(groupB.ID.Value)])
 
 	// userB's view was never disturbed by userA's churn.
-	memberships, err = s.GetGroupMembershipsForUser(ctx, userB)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userB, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Equal(t, map[string]record{
 		string(groupAB.ID.Value): {joined: true, version: 0},
@@ -4937,7 +4937,7 @@ func testStore_Restriction_BanMember(t *testing.T, s chat.Store) {
 	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
 
 	// The departure is a tombstone at the ban's roster version, as any.
-	memberships, err := s.GetGroupMembershipsForUser(ctx, member)
+	memberships, err := s.GetGroupMembershipsForUser(ctx, member, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Len(t, memberships, 1)
 	assert.False(t, memberships[0].Joined)
@@ -5007,7 +5007,7 @@ func testStore_Restriction_BanNonMember(t *testing.T, s chat.Store) {
 		Roster:  chat.RosterSummary{MemberCount: 1},
 	}, result)
 	requireRosterSummary(t, s, group, 1, 0)
-	memberships, err := s.GetGroupMembershipsForUser(ctx, stranger)
+	memberships, err := s.GetGroupMembershipsForUser(ctx, stranger, chat.FolderInbox)
 	require.NoError(t, err)
 	assert.Empty(t, memberships)
 
@@ -7292,7 +7292,7 @@ func testStore_FeedExclusions_Groups(t *testing.T, newStore func(excludedFromFee
 	// departed records included in the first.
 	listed := func(member *commonpb.UserId, chatIDs ...*commonpb.ChatId) (memberships, chats, byIDs [][]byte) {
 		t.Helper()
-		ms, err := s.GetGroupMembershipsForUser(ctx, member)
+		ms, err := s.GetGroupMembershipsForUser(ctx, member, chat.FolderInbox)
 		require.NoError(t, err)
 		for _, m := range ms {
 			memberships = append(memberships, m.ChatID.Value)
@@ -7770,10 +7770,11 @@ func groupFolder(t *testing.T, s chat.Store, user *commonpb.UserId, folder chat.
 	return chatIDValues(chats)
 }
 
-// membershipIDValues is the chats GetGroupMembershipsForUser lists for user.
-func membershipIDValues(t *testing.T, s chat.Store, user *commonpb.UserId) [][]byte {
+// membershipIDValues is the chats GetGroupMembershipsForUser lists for user
+// in folder.
+func membershipIDValues(t *testing.T, s chat.Store, user *commonpb.UserId, folder chat.Folder) [][]byte {
 	t.Helper()
-	memberships, err := s.GetGroupMembershipsForUser(context.Background(), user)
+	memberships, err := s.GetGroupMembershipsForUser(context.Background(), user, folder)
 	require.NoError(t, err)
 	out := make([][]byte, len(memberships))
 	for i, m := range memberships {
@@ -8078,9 +8079,11 @@ func testStore_Archive_DmFeedFolders(t *testing.T, s chat.Store) {
 
 // testStore_Archive_GroupFolders pins the group listings' folders: an
 // archived group is listed in the archived folder alone, by
-// GetGroupChatsForUser and GetGroupChatsForUserByIDs alike, and
-// GetGroupMembershipsForUser, which lists the inbox, leaves it out until it
-// is unarchived. The other members' folders are their own.
+// GetGroupChatsForUser, GetGroupChatsForUserByIDs and
+// GetGroupMembershipsForUser alike, until it is unarchived, and its
+// membership record is listed there joined at the roster version of the
+// user's last transition, as the inbox lists it. The other members' folders
+// are their own.
 func testStore_Archive_GroupFolders(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 	user, other := model.MustGenerateUserID(), model.MustGenerateUserID()
@@ -8100,11 +8103,37 @@ func testStore_Archive_GroupFolders(t *testing.T, s chat.Store) {
 	archived, err := s.GetGroupChatsForUserByIDs(ctx, user, chat.FolderArchived, all)
 	require.NoError(t, err)
 	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g2}), chatIDValues(archived))
-	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g3}), membershipIDValues(t, s, user))
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g3}), membershipIDValues(t, s, user, chat.FolderInbox))
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g2}), membershipIDValues(t, s, user, chat.FolderArchived))
 
 	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g2}), groupFolder(t, s, other, chat.FolderInbox))
 	assert.Empty(t, groupFolder(t, s, other, chat.FolderArchived))
-	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g2}), membershipIDValues(t, s, other))
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g2}), membershipIDValues(t, s, other, chat.FolderInbox))
+	assert.Empty(t, membershipIDValues(t, s, other, chat.FolderArchived))
+
+	// The archived folder's record carries the user's last transition on the
+	// group, as the inbox's does: a group they left and rejoined, then
+	// archived, is listed joined at the rejoin's version.
+	changed, _, err = s.RemoveGroupMember(ctx, g1.ID, user, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	changed, rejoined, err := s.AddGroupMembers(ctx, g1.ID, []*commonpb.UserId{user})
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, changed = setArchived(t, s, g1, user, true, archiveAt(15))
+	require.True(t, changed)
+	memberships, err := s.GetGroupMembershipsForUser(ctx, user, chat.FolderArchived)
+	require.NoError(t, err)
+	byChat := make(map[string]chat.GroupMembership, len(memberships))
+	for _, m := range memberships {
+		byChat[string(m.ChatID.Value)] = m
+	}
+	require.Len(t, byChat, 2)
+	assert.Equal(t, chat.GroupMembership{ChatID: g1.ID, Joined: true, Version: rejoined.Version}, byChat[string(g1.ID.Value)])
+	assert.True(t, byChat[string(g2.ID.Value)].Joined)
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g3}), membershipIDValues(t, s, user, chat.FolderInbox))
+	_, changed = setArchived(t, s, g1, user, false, archiveAt(16))
+	require.True(t, changed)
 
 	_, changed = setArchived(t, s, g2, user, false, archiveAt(20))
 	require.True(t, changed)
@@ -8113,7 +8142,8 @@ func testStore_Archive_GroupFolders(t *testing.T, s chat.Store) {
 	archived, err = s.GetGroupChatsForUserByIDs(ctx, user, chat.FolderArchived, all)
 	require.NoError(t, err)
 	assert.Empty(t, archived)
-	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g2, g3}), membershipIDValues(t, s, user))
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g2, g3}), membershipIDValues(t, s, user, chat.FolderInbox))
+	assert.Empty(t, membershipIDValues(t, s, user, chat.FolderArchived))
 }
 
 // testStore_Archive_ArchivedChats pins GetArchivedChats: exactly the chats
@@ -8230,10 +8260,11 @@ func testStore_Archive_EndsWithDeparture(t *testing.T, s chat.Store) {
 	requireViewerState(t, s, group.ID, leaver, want)
 	requireArchivedChats(t, s, leaver, chat.ArchivedChat{ChatID: dm.ID, ArchivedAt: archiveAt(10), Version: 1})
 	assert.Empty(t, groupFolder(t, s, leaver, chat.FolderArchived))
+	assert.Empty(t, membershipIDValues(t, s, leaver, chat.FolderArchived))
 
 	// The departure is listed in the inbox, where the listing of
 	// memberships finds it.
-	memberships, err := s.GetGroupMembershipsForUser(ctx, leaver)
+	memberships, err := s.GetGroupMembershipsForUser(ctx, leaver, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Len(t, memberships, 1)
 	assert.Equal(t, group.ID.Value, memberships[0].ChatID.Value)
@@ -8255,7 +8286,7 @@ func testStore_Archive_EndsWithDeparture(t *testing.T, s chat.Store) {
 	addGroupMembers(t, s, group.ID, leaver)
 	assert.Equal(t, chatIDValues([]*chat.Chat{group}), groupFolder(t, s, leaver, chat.FolderInbox))
 	assert.Empty(t, groupFolder(t, s, leaver, chat.FolderArchived))
-	assert.Equal(t, chatIDValues([]*chat.Chat{group}), membershipIDValues(t, s, leaver))
+	assert.Equal(t, chatIDValues([]*chat.Chat{group}), membershipIDValues(t, s, leaver, chat.FolderInbox))
 	requireViewerState(t, s, group.ID, leaver, want)
 
 	// A ban.

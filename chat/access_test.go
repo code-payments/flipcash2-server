@@ -1352,3 +1352,76 @@ func TestAccess_Ban(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, reads, f.chats.stateReads)
 }
+
+// TestAccess_SharePrivateGroup pins what proves two users share a private
+// group: the group is private, and both are members of it now, whatever else
+// is true of either. Anything else is a false, never an error, and a chat that
+// is not a private group costs no membership read.
+func TestAccess_SharePrivateGroup(t *testing.T) {
+	ctx := context.Background()
+	f := newAccessFixture(t)
+	team := model.MustGenerateUserID()
+	a := NewAccess(f.chats, NewRuleEvaluator(f.accounts, f.rules.balances, f.chats, team))
+
+	share := func(groupID *commonpb.ChatId, userA, userB *commonpb.UserId) bool {
+		t.Helper()
+		ok, err := a.SharePrivateGroup(ctx, groupID, userA, userB)
+		require.NoError(t, err)
+		return ok
+	}
+
+	creator := model.MustGenerateUserID()
+	member := model.MustGenerateUserID()
+	outsider := model.MustGenerateUserID()
+	private := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: creator})
+	f.chats.join(private.ID, creator)
+	f.chats.join(private.ID, member)
+
+	// Two members share it, either way round. Neither holds the group's key:
+	// membership alone counts.
+	require.True(t, share(private.ID, creator, member))
+	require.True(t, share(private.ID, member, creator))
+
+	// One member is not enough, from either side, and a non-member asking
+	// about themselves and a member is no different.
+	require.False(t, share(private.ID, member, outsider))
+	require.False(t, share(private.ID, outsider, member))
+
+	// A silenced member still counts: a silence limits speech in the group,
+	// not who is on the roster.
+	f.chats.setState(private.ID, member, ViewerState{Silence: &Silence{Forever: true}})
+	require.True(t, share(private.ID, creator, member))
+
+	// A member who has left no longer counts, and counts again once back.
+	f.chats.leave(private.ID, member)
+	require.False(t, share(private.ID, creator, member))
+	f.chats.join(private.ID, member)
+	require.True(t, share(private.ID, creator, member))
+
+	// A team-created private group counts like any other.
+	welcome := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, IsPrivate: true, CreatorID: team})
+	f.chats.join(welcome.ID, team)
+	f.chats.join(welcome.ID, creator)
+	f.chats.join(welcome.ID, member)
+	require.True(t, share(welcome.ID, creator, member))
+
+	// A public group is no proof, whoever is in it, and neither is a group
+	// that does not exist or a DM's ID. None of them reads a membership.
+	public := f.chats.put(&Chat{ID: MustGenerateGroupChatID(), Type: chatpb.ChatType_GROUP, CreatorID: creator})
+	f.chats.join(public.ID, creator)
+	f.chats.join(public.ID, member)
+	dm := MustDeriveDmChatID(chatpb.ChatType_DM, creator, member)
+	f.chats.join(dm, creator)
+	f.chats.join(dm, member)
+	membershipReads := f.chats.membershipReads
+	for _, groupID := range []*commonpb.ChatId{public.ID, MustGenerateGroupChatID(), dm} {
+		require.False(t, share(groupID, creator, member))
+	}
+	require.Equal(t, membershipReads, f.chats.membershipReads)
+
+	// A membership that cannot be read is an error, never a pass.
+	f.chats.membershipErr = errors.New("unavailable")
+	ok, err := a.SharePrivateGroup(ctx, private.ID, creator, member)
+	require.Error(t, err)
+	require.False(t, ok)
+}

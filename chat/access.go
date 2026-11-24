@@ -45,6 +45,10 @@ const DefaultSpeakerAdmissionTTL = 30 * time.Second
 //   - CanDelete: may the user delete their own message. CanSpeak, except that
 //     a silence does not take it away: a silenced member may still take back
 //     what they said.
+//   - SharePrivateGroup: is a given group proof that two users share a
+//     private group, so that one may open a DM with the other without paying
+//     the recipient's fee. Unlike the others it is a question about two
+//     users, asked of a chat neither will act in.
 //
 // Membership is always checked first: it is the cheaper check (a keyed read,
 // cached for a DM), and it answers for a member without evaluating a rule — a
@@ -245,6 +249,64 @@ func (a *Access) Rules() *RuleEvaluator {
 // error, for a chat that does not exist and for a group member since removed.
 func (a *Access) IsMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (bool, error) {
 	return a.chats.IsMember(ctx, chatID, userID)
+}
+
+// SharePrivateGroup reports whether groupID proves that userA and userB are
+// on each other's roster: groupID is a private group (see Chat.IsPrivate) and
+// both are members of it now. A user's roster is everyone they share a
+// private group with. It is never stored; a caller that needs it is handed a
+// group as proof and asks this. It is what lets one user open a DM with
+// another without paying the recipient's DM chat initialization fee (see
+// Server.StartChat).
+//
+// Membership alone counts, as IsMember answers it: a member who does not hold
+// the group's key yet counts, and so does one the creator has silenced, while
+// a user in the lobby, a member who has left and a banned user do not. Any
+// private group counts, a team-created one included (see teamCreated). Who
+// the two users are is not judged here: the caller refuses whatever a proof
+// must never open, such as a DM with the team account.
+//
+// It is false, not an error, for a chat ID that is not a group's, a group
+// that does not exist, and a public group. The group's privacy is read first
+// through GetGroupRules, which the production cache answers for a private
+// group without a store read (see chat/cache); membership is never cached,
+// and both memberships are read concurrently.
+//
+// A proof is asked for once, to open the DM, and the DM stays open whatever
+// happens to the group or either user's membership after. Because private
+// group invites are links that may be passed on, anyone who joins a group
+// through one shares it with every member; that widening of the roster is
+// accepted.
+func (a *Access) SharePrivateGroup(ctx context.Context, groupID *commonpb.ChatId, userA, userB *commonpb.UserId) (bool, error) {
+	if !IsGroupChatID(groupID) {
+		return false, nil
+	}
+
+	rules, err := a.chats.GetGroupRules(ctx, groupID)
+	if errors.Is(err, ErrChatNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !rules.IsPrivate {
+		return false, nil
+	}
+
+	var aIsMember, bIsMember bool
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() (err error) {
+		aIsMember, err = a.chats.IsMember(gctx, groupID, userA)
+		return err
+	})
+	g.Go(func() (err error) {
+		bIsMember, err = a.chats.IsMember(gctx, groupID, userB)
+		return err
+	})
+	if err := g.Wait(); err != nil {
+		return false, err
+	}
+	return aIsMember && bIsMember, nil
 }
 
 // ListenerStanding is a user's relation to a chat as Access sees it: whether they are

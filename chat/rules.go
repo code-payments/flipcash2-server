@@ -615,6 +615,12 @@ func (e *RuleEvaluator) rulesFor(ctx context.Context, chatID *commonpb.ChatId, u
 	return e.chats.GetGroupRules(ctx, chatID)
 }
 
+// isTeam reports whether userID is the Flipcash team account. It is false
+// when there is no team account.
+func (e *RuleEvaluator) isTeam(userID *commonpb.UserId) bool {
+	return e.teamUserID != nil && bytes.Equal(userID.GetValue(), e.teamUserID.Value)
+}
+
 // inTeamDm reports whether chatID is a DM that userID shares with the team
 // account, or, when userID is the team account itself, any DM. It is decided
 // off the IDs alone, with no read: a DM's ID is derived from its members, so

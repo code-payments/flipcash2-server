@@ -380,9 +380,13 @@ func (i *Integration) validateContactDmAppMetadata(ctx context.Context, intentRe
 // otherwise. The fee is what the recipient asks of anyone reaching them for
 // the first time, and it can be no lower than its own currency's preset
 // minimum (profile.ValidateMinDmChatInitFee), so it stands in for the preset
-// rather than stacking on it. Once the chat exists the gate has been paid, and
-// every later payment into it may be any amount. No payment either way between
-// a user and the Flipcash team account is allowed, tip or send.
+// rather than stacking on it. Once the chat exists, every later payment into
+// it may be any amount: the gate has been paid, or was waived for a user who
+// opened the DM without a payment by proving they share a private group with
+// the recipient (see chat.Server.StartChat). That proof never rides on a
+// payment: a payment below the fee opens no DM, even between users who share
+// a private group. No payment either way between a user and the Flipcash team
+// account is allowed, tip or send.
 func (i *Integration) validateDmAppMetadata(ctx context.Context, intentRecord *ocp_intent.Record, appMetadata *intentpb.AppMetadata) error {
 	chatMetadata := appMetadata.GetChat()
 	dmPayment := chatMetadata.GetDmPayment()
@@ -419,8 +423,9 @@ func (i *Integration) validateDmAppMetadata(ctx context.Context, intentRecord *o
 	_, err = i.chats.GetChatByID(ctx, expectedChatID)
 	switch {
 	case err == nil:
-		// An initialized chat has already had its gate paid: every later
-		// payment is any amount.
+		// An initialized chat has had its gate paid, or waived by a roster
+		// proof (see chat.Server.StartChat): every later payment is any
+		// amount.
 		return nil
 	case errors.Is(err, chat.ErrChatNotFound):
 	default:

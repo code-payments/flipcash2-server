@@ -146,6 +146,9 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_SendMessage_MutedRecipientsFlagged,
 		testServer_SendMessage_GroupPushPaged,
 		testServer_SendMessage_GroupPushPagesConcurrent,
+		testServer_SendMessage_ArchivedGroupMembersNotPushed,
+		testServer_SendMessage_ArchivedDmRecipientNotPushed,
+		testServer_SendMessage_ArchiveReadFailsOpen,
 	} {
 		tf(t, badges, blocklists, chats, messages, profiles)
 		teardown()
@@ -1775,7 +1778,7 @@ func testServer_SendBatch_SideEffects(t *testing.T, badges badge.Store, blocklis
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), record.LastMessageID.GetValue())
 	for _, member := range []*commonpb.UserId{e.userA, e.userB} {
-		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_DM, time.Now().Add(time.Hour), nil, 0)
+		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_DM, chat.FolderInbox, time.Now().Add(time.Hour), nil, 0)
 		require.NoError(t, err)
 		require.Len(t, page, 1)
 		require.Equal(t, uint64(4), page[0].LastMessageID.GetValue())
@@ -2112,7 +2115,7 @@ func testServer_SendMessage_TeamAccount(t *testing.T, badges badge.Store, blockl
 	// feedEntry is the DM as the member's own DM feed lists it.
 	feedEntry := func(member *commonpb.UserId) *chat.Chat {
 		t.Helper()
-		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_DM, time.Now().Add(time.Hour), nil, 0)
+		page, err := chats.GetDmFeedPage(e.ctx, member, chatpb.ChatType_DM, chat.FolderInbox, time.Now().Add(time.Hour), nil, 0)
 		require.NoError(t, err)
 		require.Len(t, page, 1)
 		return page[0]
@@ -5476,7 +5479,8 @@ func testServer_SendMessage_GroupChatPush(t *testing.T, badges badge.Store, bloc
 // receiver a push of their own, addressed to them, and every other member but
 // the sender one that names both parties. The receiver's push goes through the
 // same pipeline as any page: a muted receiver gets it flagged and unbadged, a
-// receiver who blocked the sender gets none, and one who has left gets none.
+// receiver who blocked the sender gets none, one who archived the group gets
+// none, muted or not, until they unarchive, and one who has left gets none.
 func testServer_SendMessage_GroupPaymentPush(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
 	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
 	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Alice"))
@@ -5578,6 +5582,27 @@ func testServer_SendMessage_GroupPaymentPush(t *testing.T, badges badge.Store, b
 	requireUsers(pushes["Alice sent Bob "+amount], userC)
 	_, err = e.blocklist.Unblock(e.ctx, e.userB, e.userA)
 	require.NoError(t, err)
+
+	// A receiver who archived the group gets nothing, flagged or not;
+	// everyone else still hears of the payment. Unarchived, they are pushed
+	// again.
+	c, err := chats.GetChatByID(e.ctx, chatID)
+	require.NoError(t, err)
+	_, _, err = chats.SetArchived(e.ctx, c, e.userB, true, time.Now())
+	require.NoError(t, err)
+	pushes = pushesFor(pay(), 1)
+	requireUsers(pushes["Alice sent Bob "+amount], userC)
+	_, _, err = chats.SetMute(e.ctx, chatID, e.userB, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	pushes = pushesFor(pay(), 1)
+	requireUsers(pushes["Alice sent Bob "+amount], userC)
+	_, _, err = chats.ClearMute(e.ctx, chatID, e.userB)
+	require.NoError(t, err)
+	_, _, err = chats.SetArchived(e.ctx, c, e.userB, false, time.Now())
+	require.NoError(t, err)
+	pushes = pushesFor(pay(), 2)
+	requireUsers(pushes["Alice sent you "+amount], e.userB)
+	requireUsers(pushes["Alice sent Bob "+amount], userC)
 
 	// A receiver who has left the group is not pushed into it.
 	_, _, err = chats.RemoveGroupMember(e.ctx, chatID, e.userB, false)
@@ -6092,6 +6117,302 @@ func testServer_SendMessage_MutedRecipientsFlagged(t *testing.T, badges badge.St
 	require.Equal(t, [][]byte{e.userB.Value}, userValues(pushes[3].users))
 	require.False(t, pushes[3].payload.ChatMetadata.Muted)
 	require.True(t, pushes[3].badged)
+}
+
+// testServer_SendMessage_ArchivedGroupMembersNotPushed walks a group's roster
+// in pages of two, where some members have archived the group: an archived
+// member gets no push at all, neither the badged one nor, when they have
+// also muted the group, the flagged one, and their badge does not move,
+// while every other member is pushed as usual on whichever page they fall.
+// Unarchiving restores their pushes, subject to the mute. It runs under both
+// mute shapes, which must agree.
+func testServer_SendMessage_ArchivedGroupMembersNotPushed(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	for _, tc := range []struct {
+		name string
+		opts []messaging.SenderOption
+	}{
+		{name: "muted set read whole", opts: []messaging.SenderOption{messaging.WithPushPageSize(2)}},
+		{name: "muted set read per page", opts: []messaging.SenderOption{messaging.WithPushPageSize(2), messaging.WithPushMutedWholeSetCap(0)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newServerEnv(t, badges, blocklists, chats, messages, profiles, tc.opts...)
+			e.pusher.setResolveBadges()
+			require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
+
+			// Seven others, so a page of two walks four pages or more
+			// whatever order the IDs sort in.
+			var others []*commonpb.UserId
+			for range 7 {
+				user, _ := e.addUser()
+				others = append(others, user)
+			}
+			archived, archivedMuted, muted := others[0], others[1], others[2]
+			plain := others[3:]
+
+			groupID := chat.MustGenerateGroupChatID()
+			require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+				ID:           groupID,
+				Type:         chatpb.ChatType_GROUP,
+				Members:      append([]*commonpb.UserId{e.userA}, others...),
+				Title:        "Archived",
+				LastActivity: at(1),
+			}))
+			c, err := chats.GetChatByID(e.ctx, groupID)
+			require.NoError(t, err)
+			setArchived := func(userID *commonpb.UserId, archive bool) {
+				_, changed, err := chats.SetArchived(e.ctx, c, userID, archive, time.Now())
+				require.NoError(t, err)
+				require.True(t, changed)
+			}
+			setArchived(archived, true)
+			setArchived(archivedMuted, true)
+			for _, userID := range []*commonpb.UserId{archivedMuted, muted} {
+				_, _, err = chats.SetMute(e.ctx, groupID, userID, chat.Mute{Forever: true})
+				require.NoError(t, err)
+			}
+
+			// audience waits for a message's pushes, want of them in each
+			// half, and returns who each half reached.
+			audience := func(sent *messagingpb.Message, wantUnmuted, wantMuted int) (unmuted, muted [][]byte) {
+				collect := func() (unmuted, muted [][]byte) {
+					for _, p := range e.pusher.snapshot() {
+						if p.payload.ChatMetadata.GetMessage().GetMessageId().GetValue() != sent.MessageId.Value {
+							continue
+						}
+						require.LessOrEqual(t, len(p.users), 2)
+						require.Equal(t, !p.payload.ChatMetadata.Muted, p.badged)
+						for _, u := range p.users {
+							if p.payload.ChatMetadata.Muted {
+								muted = append(muted, u.Value)
+							} else {
+								unmuted = append(unmuted, u.Value)
+							}
+						}
+					}
+					return unmuted, muted
+				}
+				require.Eventually(t, func() bool {
+					unmuted, muted := collect()
+					return len(unmuted) >= wantUnmuted && len(muted) >= wantMuted
+				}, 5*time.Second, 10*time.Millisecond)
+				// Nothing more arrives for the message.
+				require.Never(t, func() bool {
+					unmuted, muted := collect()
+					return len(unmuted) > wantUnmuted || len(muted) > wantMuted
+				}, 300*time.Millisecond, 20*time.Millisecond)
+				return collect()
+			}
+			values := func(users ...*commonpb.UserId) [][]byte {
+				out := make([][]byte, len(users))
+				for i, u := range users {
+					out[i] = u.Value
+				}
+				return out
+			}
+			badgeOf := func(userID *commonpb.UserId) uint64 {
+				t.Helper()
+				count, err := badges.Get(e.ctx, userID)
+				require.NoError(t, err)
+				return count
+			}
+
+			// The archived members hear nothing, the muted one alone gets the
+			// flagged copy, and every plain member the badged push.
+			resp, err := e.sendContentToChat(e.keysA, groupID, textContent("first"), generateClientID())
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+			unmutedTo, mutedTo := audience(resp.Message, len(plain), 1)
+			require.ElementsMatch(t, values(plain...), unmutedTo)
+			require.Equal(t, values(muted), mutedTo)
+			require.Zero(t, badgeOf(archived))
+			require.Zero(t, badgeOf(archivedMuted))
+			require.Zero(t, badgeOf(muted))
+			for _, userID := range plain {
+				require.EqualValues(t, 1, badgeOf(userID))
+			}
+
+			// Unarchived, they are pushed again: the unmuted one badged, the
+			// muted one flagged, as any member.
+			setArchived(archived, false)
+			setArchived(archivedMuted, false)
+			resp, err = e.sendContentToChat(e.keysA, groupID, textContent("second"), generateClientID())
+			require.NoError(t, err)
+			require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+			unmutedTo, mutedTo = audience(resp.Message, len(plain)+1, 2)
+			require.ElementsMatch(t, values(append([]*commonpb.UserId{archived}, plain...)...), unmutedTo)
+			require.ElementsMatch(t, values(muted, archivedMuted), mutedTo)
+			require.EqualValues(t, 1, badgeOf(archived))
+			require.Zero(t, badgeOf(archivedMuted))
+			for _, userID := range plain {
+				require.EqualValues(t, 2, badgeOf(userID))
+			}
+		})
+	}
+}
+
+// testServer_SendMessage_ArchivedDmRecipientNotPushed sends into a DM whose
+// recipient has archived it: no push reaches them and their badge does not
+// move, nor the flagged copy once they have muted it too. Unarchiving
+// restores the push, flagged while the mute stands and badged once it is
+// cleared.
+func testServer_SendMessage_ArchivedDmRecipientNotPushed(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.pusher.setResolveBadges()
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Sender Name"))
+
+	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.userA, e.userB)
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           dmID,
+		Type:         chatpb.ChatType_DM,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+	c, err := chats.GetChatByID(e.ctx, dmID)
+	require.NoError(t, err)
+	_, changed, err := chats.SetArchived(e.ctx, c, e.userB, true, time.Now())
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	send := func(ciphertext byte) {
+		t.Helper()
+		resp, err := e.sendContentToChat(e.keysA, dmID, encryptedContent(ciphertext), generateClientID())
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+	}
+	requireNoPush := func() {
+		t.Helper()
+		require.Never(t, func() bool {
+			return len(e.pusher.snapshot()) > 0
+		}, 500*time.Millisecond, 20*time.Millisecond)
+	}
+	badgeOfB := func() uint64 {
+		t.Helper()
+		count, err := badges.Get(e.ctx, e.userB)
+		require.NoError(t, err)
+		return count
+	}
+
+	send(1)
+	requireNoPush()
+	require.Zero(t, badgeOfB())
+
+	// Muted as well as archived: not even the flagged copy.
+	_, _, err = chats.SetMute(e.ctx, dmID, e.userB, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	send(2)
+	requireNoPush()
+
+	// Unarchived, the mute decides again: the flagged copy, unbadged.
+	_, changed, err = chats.SetArchived(e.ctx, c, e.userB, false, time.Now())
+	require.NoError(t, err)
+	require.True(t, changed)
+	send(3)
+	require.Eventually(t, func() bool {
+		return len(e.pusher.snapshot()) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+	pushes := e.pusher.snapshot()
+	require.Len(t, pushes[0].users, 1)
+	require.Equal(t, e.userB.Value, pushes[0].users[0].Value)
+	require.True(t, pushes[0].payload.ChatMetadata.Muted)
+	require.False(t, pushes[0].badged)
+
+	// And with the mute cleared, the badged push.
+	_, _, err = chats.ClearMute(e.ctx, dmID, e.userB)
+	require.NoError(t, err)
+	send(4)
+	require.Eventually(t, func() bool {
+		return len(e.pusher.snapshot()) == 2
+	}, 5*time.Second, 10*time.Millisecond)
+	pushes = e.pusher.snapshot()
+	require.Equal(t, e.userB.Value, pushes[1].users[0].Value)
+	require.False(t, pushes[1].payload.ChatMetadata.Muted)
+	require.True(t, pushes[1].badged)
+	require.EqualValues(t, 1, badgeOfB())
+}
+
+// failingViewerStatesStore is a chat store whose GetViewerStatesForUsers
+// always fails, for the push fan-out's reads of who has archived a DM or a
+// group cash message's receivers.
+type failingViewerStatesStore struct {
+	chat.Store
+}
+
+func (failingViewerStatesStore) GetViewerStatesForUsers(context.Context, *commonpb.ChatId, []*commonpb.UserId) (map[string]chat.ViewerState, error) {
+	return nil, errors.New("viewer states unavailable")
+}
+
+// testServer_SendMessage_ArchiveReadFailsOpen pins that a failed read of who
+// has archived a chat sends the push anyway: a DM recipient and a group cash
+// message's receiver who have both archived are pushed as though they had
+// not, when the server cannot read their states.
+func testServer_SendMessage_ArchiveReadFailsOpen(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, failingViewerStatesStore{Store: chats}, messages, profiles)
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Alice"))
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userB, "Bob"))
+
+	dmID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, e.userA, e.userB)
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           dmID,
+		Type:         chatpb.ChatType_DM,
+		Members:      []*commonpb.UserId{e.userA, e.userB},
+		LastActivity: at(1),
+	}))
+	dm, err := chats.GetChatByID(e.ctx, dmID)
+	require.NoError(t, err)
+	_, _, err = chats.SetArchived(e.ctx, dm, e.userB, true, time.Now())
+	require.NoError(t, err)
+
+	resp, err := e.sendContentToChat(e.keysA, dmID, encryptedContent(1), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, resp.Result)
+	require.Eventually(t, func() bool {
+		return len(e.pusher.snapshot()) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+	pushes := e.pusher.snapshot()
+	require.Len(t, pushes[0].users, 1)
+	require.Equal(t, e.userB.Value, pushes[0].users[0].Value)
+	require.True(t, pushes[0].badged)
+
+	// A group payment to a receiver who archived the group: the receiver's
+	// own push goes out on the failed read. The walk's own pages still drop
+	// them, as they read the archive with the roster, and the other member
+	// is pushed as usual.
+	userC, _ := e.addUser()
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB, userC},
+		Title:        "Trip Planning",
+		LastActivity: at(1),
+	}))
+	group, err := chats.GetChatByID(e.ctx, groupID)
+	require.NoError(t, err)
+	_, _, err = chats.SetArchived(e.ctx, group, e.userB, true, time.Now())
+	require.NoError(t, err)
+
+	_, err = e.sender.Send(e.ctx, groupID, e.userA, []*messagingpb.Content{{Type: &messagingpb.Content_Cash{Cash: &messagingpb.CashContent{
+		IntentId: &commonpb.IntentId{Value: model.MustGenerateKeyPair().Public()},
+		TotalAmount: &commonpb.CryptoPaymentAmount{
+			Currency:     "usd",
+			NativeAmount: 2.5,
+			Quarks:       2_500_000,
+			Mint:         &commonpb.PublicKey{Value: ocp_common.CoreMintAccount.PublicKey().ToBytes()},
+		},
+		Recipient: &messagingpb.CashContent_SingleReceiver{SingleReceiver: e.userB},
+	}}}}, generateClientID(), true)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return len(e.pusher.snapshot()) == 3
+	}, 5*time.Second, 10*time.Millisecond)
+	amount := "$2.50 of " + ocp_common.CoreMintName
+	byBody := make(map[string][]byte)
+	for _, p := range e.pusher.snapshot()[1:] {
+		require.Len(t, p.users, 1)
+		byBody[p.body] = p.users[0].Value
+	}
+	require.Equal(t, e.userB.Value, byBody["Alice sent you "+amount])
+	require.Equal(t, userC.Value, byBody["Alice sent Bob "+amount])
 }
 
 // testServer_Reactions_OnMessageReads pins that a read of the Messaging

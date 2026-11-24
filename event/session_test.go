@@ -542,3 +542,119 @@ func TestStreamSessions_Due(t *testing.T) {
 }
 
 var _ Stream[*eventpb.Event] = (*fakeStream)(nil)
+
+// TestStreamSession_ArchiveGate pins the follow rule over the two gates: a
+// stream not following the archive is under a group's key only while the
+// user is joined and has not archived it, whichever order a join, a seed and
+// an archive land in; following, or lingering after it, keeps an archived
+// key; and the archive gate is applied by its own version, apart from the
+// roster's.
+func TestStreamSession_ArchiveGate(t *testing.T) {
+	r := newStreamRegistry()
+	s := newTestSession("s1", 1, r)
+	require.True(t, s.open())
+	on := func(key string) bool { return len(targets(r, key, nil)) == 1 }
+
+	// An archive arriving before the join it followed: the join records the
+	// membership and attaches nothing, and a seed of the same record, a
+	// reconcile's, attaches nothing either.
+	require.Equal(t, archiveChange{}, s.archiveChanged("chat:a", 1, true))
+	require.False(t, s.attach("chat:a", 3))
+	require.False(t, on("chat:a"))
+	attached, released := s.seed([]topicSeed{{key: "chat:a", version: 3, joined: true}})
+	require.Empty(t, attached)
+	require.Empty(t, released)
+
+	// A stale unarchive moves nothing; a newer one asks for the key at the
+	// roster version the gate holds, which then attaches though it is not
+	// news.
+	require.Equal(t, archiveChange{}, s.archiveChanged("chat:a", 1, false))
+	require.Equal(t, archiveChange{attach: true, known: true, version: 3}, s.archiveChanged("chat:a", 2, false))
+	require.True(t, s.attach("chat:a", 3))
+	handle := &cluster.SubscriptionHandle{}
+	require.True(t, s.setHandle("chat:a", handle))
+
+	// An archive takes a held key off and hands back its handle; a stale
+	// one does not.
+	require.Equal(t, archiveChange{}, s.archiveChanged("chat:a", 2, true))
+	require.True(t, on("chat:a"))
+	require.Equal(t, archiveChange{released: handle}, s.archiveChanged("chat:a", 3, true))
+	require.False(t, on("chat:a"))
+
+	// An unarchive of a group the gate has no record of asks for a read; of
+	// one it has the user departed from, asks for nothing.
+	require.Equal(t, archiveChange{attach: true}, s.archiveChanged("chat:b", 1, false))
+	require.Nil(t, s.detach("chat:c", 2))
+	require.Equal(t, archiveChange{}, s.archiveChanged("chat:c", 1, false))
+
+	// Following: an archived key is attached and kept through an archive.
+	require.False(t, s.startFollowing())
+	attached, _ = s.seed(s.unheldMembers())
+	require.Equal(t, []string{"chat:a"}, attached)
+	require.Empty(t, s.setChatHandles(attached, []*cluster.SubscriptionHandle{handle}))
+	require.Equal(t, archiveChange{}, s.archiveChanged("chat:a", 4, true))
+	require.True(t, on("chat:a"))
+
+	// Off: the key stays for the linger; on again cancels it, with nothing
+	// to read, so the cancelled linger's end does nothing.
+	gen, started := s.stopFollowing()
+	require.True(t, started)
+	_, started = s.stopFollowing()
+	require.False(t, started)
+	require.True(t, s.startFollowing())
+	require.Nil(t, s.endLinger(gen))
+	require.True(t, on("chat:a"))
+
+	// Off again: the linger's end takes the archived key off.
+	gen, started = s.stopFollowing()
+	require.True(t, started)
+	require.Equal(t, []*cluster.SubscriptionHandle{handle}, s.endLinger(gen))
+	require.False(t, on("chat:a"))
+
+	// A departure ends the archive: the return is followed.
+	require.Nil(t, s.detach("chat:a", 4))
+	require.True(t, s.attach("chat:a", 5))
+	require.True(t, on("chat:a"))
+}
+
+// TestStreamSession_ApplyArchives pins how a strongly consistent read of the
+// archives merges with the gate: an archive it lists newer than the gate's
+// applies, and an archive it does not list is undone only if the gate
+// recorded it before the read was issued — one recorded meanwhile may have
+// landed after the read.
+func TestStreamSession_ApplyArchives(t *testing.T) {
+	r := newStreamRegistry()
+	s := newTestSession("s1", 1, r)
+	require.True(t, s.open())
+	on := func(key string) bool { return len(targets(r, key, nil)) == 1 }
+
+	attached, _ := s.seed([]topicSeed{
+		{key: "chat:a", version: 1, joined: true},
+		{key: "chat:b", version: 1, joined: true},
+		{key: "chat:c", version: 1, joined: true},
+	})
+	require.Len(t, attached, 3)
+
+	// Archived before the read: chat:a's archive is undone by the read not
+	// listing it, chat:b's is kept, recorded after the read was issued.
+	s.archiveChanged("chat:a", 1, true)
+	readStartedAt := time.Now()
+	s.archiveChanged("chat:b", 1, true)
+
+	// The read lists chat:c archived, and chat:b at a version older than
+	// the gate's.
+	s.applyArchives(map[string]uint64{"chat:c": 2}, readStartedAt)
+	released := s.detachUnfollowed()
+	require.Empty(t, released)
+	require.False(t, on("chat:b"))
+	require.False(t, on("chat:c"))
+
+	// chat:a is unarchived by the gate, so a reconcile's record attaches it.
+	require.True(t, s.attach("chat:a", 1))
+	require.True(t, on("chat:a"))
+
+	// A stale archive of chat:c, older than what the read found, moves
+	// nothing; an unarchive newer than it puts it back.
+	require.Equal(t, archiveChange{}, s.archiveChanged("chat:c", 2, false))
+	require.Equal(t, archiveChange{attach: true, known: true, version: 1}, s.archiveChanged("chat:c", 3, false))
+}

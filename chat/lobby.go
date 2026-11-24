@@ -83,9 +83,18 @@ import (
 // an admission to the admitted user. A withdrawal or a denial is pushed to no
 // one. Neither push is a message's, so neither is held back by a mute: a
 // creator who muted the group still hears that someone is waiting, which no
-// message in it would tell them. They are best effort: a lost push stays
-// lost, since a retry is the no-op path, and the lobby and the chat are there
-// to read.
+// message in it would tell them. An archive does hold the entry's push back:
+// a creator who has archived the group is pushed nothing from it (see
+// chatpb.ArchiveState), so the push is sent only once a strongly consistent
+// read of their state finds no archive, and sent anyway when that read fails,
+// as a message's push is (see messaging's fan-out). The LobbyUpdate is
+// published to them as before, and reaches their event streams whatever
+// their archive, being on their own topic rather than the group's. A creator who has left holds no archive (a
+// departure removes it, see archive.go), so they are pushed as before. The
+// admission's push needs no such read: it goes to a user who was not a
+// member until the admission, and only a member holds an archive. Both are
+// best effort: a lost push stays lost, since a retry is the no-op path, and
+// the lobby and the chat are there to read.
 //
 // A user the group's creator has banned (see Store.BanUser) holds no entry —
 // the ban removes one — and gains none until unbanned: EnterLobby is BANNED,
@@ -207,6 +216,9 @@ func (s *Server) EnterLobby(ctx context.Context, req *chatpb.EnterLobbyRequest) 
 		}
 		if c.CreatorID != nil {
 			s.sendLobbyPush(ctx, log, func(ctx context.Context) error {
+				if s.hasArchived(ctx, log, c.ID, c.CreatorID) {
+					return nil
+				}
 				return push.SendLobbyEnteredPush(ctx, s.pusher, c.CreatorID, c.ID, c.Title, displayName)
 			})
 		}
@@ -570,6 +582,20 @@ func (s *Server) sendLobbyPush(ctx context.Context, log *zap.Logger, send func(c
 			log.With(zap.Error(err)).Warn("Failure sending lobby push")
 		}
 	}()
+}
+
+// hasArchived reports whether userID holds an archive of chatID, from one
+// strongly consistent point read of their viewer state, for a lobby push that
+// an archive holds back (see above). A failed read is logged and reported as
+// no archive, so the push is sent: it fails open, as a message's push does.
+func (s *Server) hasArchived(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) bool {
+	states, err := s.chats.GetViewerStates(ctx, userID, []*commonpb.ChatId{chatID})
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure reading archive for lobby push; sending it")
+		return false
+	}
+	state, ok := states[string(chatID.Value)]
+	return ok && state.ArchivedAt != nil
 }
 
 // publishLobbyLeft announces that userID is no longer in c's lobby, whichever

@@ -43,6 +43,30 @@ import (
 // mid-read and a token a client has tampered with. The same read re-applies the
 // snapshot, dropping a group that became active after it — that group's
 // freshness is the stream's job, as for a DM.
+//
+// Each feed lists one of the caller's two folders (see Folder and
+// archive.go), the one the request names, INBOX when it names none, as old
+// clients do. A folder is its own list, read from its own index partition, so
+// a paging token is a position in the folder it was read from alone, and binds
+// it: a token presented for the other folder is rejected as invalid, as a DM
+// token presented for another DM type is. Every page of the group feed
+// re-checks the folder with the membership, so a group archived or unarchived
+// between pages is dropped from the pages of the folder it left; a DM that
+// moves leaves its folder's partition in the write that moves it, so the
+// pages that follow do not reach it either. The ARCHIVED folder is paged
+// under a snapshot like the INBOX, and merged with the stream the same way.
+// For DMs the stream is always there to merge, since it carries an archived
+// DM as it does any other. For groups it is there while the client's stream
+// follows the user's archive (see event.Server): the client turns following
+// on and reads the folder only after the stream's ack, from which the
+// stream carries every archived group's updates, so an archived group that
+// goes active after the snapshot reaches the client on the stream as an
+// INBOX group's does. Once the client stops following, it reads the folder
+// again the next time it shows it.
+//
+// Both tokens' layouts have changed once, to bind the folder, and the old
+// layouts are still decoded, as tokens of the INBOX, the only folder there
+// was, so a read paging across the deploy that changed them carries on.
 
 // ---------------------------------------------------------------------------
 // DM feed
@@ -70,6 +94,12 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 		chatType = chatpb.ChatType_CONTACT_DM
 	}
 
+	// Proto validation restricts the folder to one the store has.
+	folder, err := FolderFromProto(req.GetFolder())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
 	limit := maxDmChatFeedPageSize
 	if pageSize := req.GetQueryOptions().GetPageSize(); pageSize > 0 && int(pageSize) < limit {
 		limit = int(pageSize)
@@ -78,13 +108,13 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 	// The first request (no token) mints a snapshot watermark at the current
 	// time; later requests carry it back in the token so every page is served
 	// against the same point-in-time view. The cursor advances within it. The
-	// token also binds the feed's chat type, so a cursor from one feed cannot
-	// be replayed against another.
+	// token also binds the feed's chat type and folder, so a cursor from one
+	// feed cannot be replayed against another.
 	var snapshot time.Time
 	var cursor *DmFeedCursor
 	if token := req.GetQueryOptions().GetPagingToken(); token != nil {
-		tokenSnapshot, tokenChatType, tokenCursor, ok := decodeDmFeedToken(token)
-		if !ok || tokenChatType != chatType {
+		tokenSnapshot, tokenChatType, tokenFolder, tokenCursor, ok := decodeDmFeedToken(token)
+		if !ok || tokenChatType != chatType || tokenFolder != folder {
 			return nil, status.Error(codes.InvalidArgument, "invalid paging token")
 		}
 		snapshot, cursor = tokenSnapshot, tokenCursor
@@ -93,7 +123,7 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 	}
 
 	// Fetch one extra to detect whether a further page remains.
-	chats, err := s.chats.GetDmFeedPage(ctx, userID, chatType, snapshot, cursor, limit+1)
+	chats, err := s.chats.GetDmFeedPage(ctx, userID, chatType, folder, snapshot, cursor, limit+1)
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure getting DM chats")
 		return nil, status.Error(codes.Internal, "")
@@ -119,7 +149,7 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 	// chat. An empty page has nothing to resume from, so the token is omitted.
 	if n := len(chats); n > 0 {
 		last := chats[n-1]
-		resp.PagingToken = encodeDmFeedToken(snapshot, chatType, &DmFeedCursor{
+		resp.PagingToken = encodeDmFeedToken(snapshot, chatType, folder, &DmFeedCursor{
 			LastActivity: last.LastActivity,
 			ChatID:       last.ID,
 		})
@@ -127,31 +157,53 @@ func (s *Server) GetDmChatFeed(ctx context.Context, req *chatpb.GetDmChatFeedReq
 	return resp, nil
 }
 
-// dmFeedTokenLen is the byte length of an encoded GetDmChatFeed paging token:
-// the snapshot watermark and the cursor's last_activity, each as big-endian
-// int64 unix-nanos, followed by the cursor's chat ID and the feed's chat type
-// as a single byte.
-const dmFeedTokenLen = 8 + 8 + DmChatIDSize + 1
+const (
+	// dmFeedTokenLen is the byte length of an encoded GetDmChatFeed paging
+	// token: the snapshot watermark and the cursor's last_activity, each as
+	// big-endian int64 unix-nanos, followed by the cursor's chat ID, the
+	// feed's chat type as a single byte, and the feed's folder as a single
+	// byte (see Folder).
+	dmFeedTokenLen = legacyDmFeedTokenLen + 1
 
-// encodeDmFeedToken serializes the snapshot watermark, feed chat type, and
-// resume cursor into an opaque paging token for the client to echo on the next
-// request.
-func encodeDmFeedToken(snapshot time.Time, chatType chatpb.ChatType, cursor *DmFeedCursor) *commonpb.PagingToken {
+	// legacyDmFeedTokenLen is the byte length of a token minted before the
+	// feed had folders: dmFeedTokenLen's layout without the folder byte. It
+	// is decoded as a token of the INBOX (see decodeDmFeedToken).
+	legacyDmFeedTokenLen = 8 + 8 + DmChatIDSize + 1
+)
+
+// encodeDmFeedToken serializes the snapshot watermark, feed chat type, folder
+// and resume cursor into an opaque paging token for the client to echo on the
+// next request.
+func encodeDmFeedToken(snapshot time.Time, chatType chatpb.ChatType, folder Folder, cursor *DmFeedCursor) *commonpb.PagingToken {
 	buf := make([]byte, dmFeedTokenLen)
 	binary.BigEndian.PutUint64(buf[0:8], uint64(snapshot.UnixNano()))
 	binary.BigEndian.PutUint64(buf[8:16], uint64(cursor.LastActivity.UnixNano()))
 	copy(buf[16:16+DmChatIDSize], cursor.ChatID.Value)
 	buf[16+DmChatIDSize] = byte(chatType)
+	buf[legacyDmFeedTokenLen] = byte(folder)
 	return &commonpb.PagingToken{Value: buf}
 }
 
-// decodeDmFeedToken reverses encodeDmFeedToken. ok is false if the token is nil
-// or not the expected length (e.g. a client-fabricated value). The caller must
-// check the returned chat type against the request's, rejecting a token minted
-// for a different feed.
-func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatType chatpb.ChatType, cursor *DmFeedCursor, ok bool) {
-	if token == nil || len(token.Value) != dmFeedTokenLen {
-		return time.Time{}, chatpb.ChatType_UNKNOWN, nil, false
+// decodeDmFeedToken reverses encodeDmFeedToken. ok is false if the token is
+// nil, neither the current nor the legacy length, or names no folder (e.g. a
+// client-fabricated value). A legacy token, minted before the feed had
+// folders, decodes as a token of the INBOX, which is the folder every request
+// then read. The caller must check the returned chat type and folder against
+// the request's, rejecting a token minted for a different feed.
+func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatType chatpb.ChatType, folder Folder, cursor *DmFeedCursor, ok bool) {
+	if token == nil {
+		return time.Time{}, chatpb.ChatType_UNKNOWN, FolderInbox, nil, false
+	}
+	switch len(token.Value) {
+	case legacyDmFeedTokenLen:
+		folder = FolderInbox
+	case dmFeedTokenLen:
+		folder = Folder(token.Value[legacyDmFeedTokenLen])
+		if folder != FolderInbox && folder != FolderArchived {
+			return time.Time{}, chatpb.ChatType_UNKNOWN, FolderInbox, nil, false
+		}
+	default:
+		return time.Time{}, chatpb.ChatType_UNKNOWN, FolderInbox, nil, false
 	}
 	snapshot = time.Unix(0, int64(binary.BigEndian.Uint64(token.Value[0:8]))).UTC()
 	chatType = chatpb.ChatType(token.Value[16+DmChatIDSize])
@@ -159,7 +211,7 @@ func decodeDmFeedToken(token *commonpb.PagingToken) (snapshot time.Time, chatTyp
 		LastActivity: time.Unix(0, int64(binary.BigEndian.Uint64(token.Value[8:16]))).UTC(),
 		ChatID:       &commonpb.ChatId{Value: append([]byte(nil), token.Value[16:16+DmChatIDSize]...)},
 	}
-	return snapshot, chatType, cursor, true
+	return snapshot, chatType, folder, cursor, true
 }
 
 // ---------------------------------------------------------------------------
@@ -267,22 +319,34 @@ const (
 	maxGroupChatFeedPageSize = 100
 
 	// maxGroupFeedChats bounds how many group chats a user's feed may hold
-	// within one snapshot. The feed's order is computed on the first page and
-	// carried in the paging token from there, so this is what the token can
-	// hold: a feed past it is refused with ErrGroupFeedTooLarge rather than
-	// served in part. Sized so that a token carrying every ID but the first
-	// page's stays within maxPagingTokenLen.
+	// within one snapshot, in the one folder it lists: each folder is its own
+	// feed, its order computed on its own first page. The order is carried in
+	// the paging token from there, so this is what the token can hold: a feed
+	// past it is refused with ErrGroupFeedTooLarge rather than served in part.
+	// Sized so that a token carrying every ID but the first page's stays
+	// within maxPagingTokenLen.
 	maxGroupFeedChats = 1000
 
 	// maxPagingTokenLen mirrors the max_len on common.v1.PagingToken.value.
 	// A token longer than this fails proto validation on the way back in.
 	maxPagingTokenLen = 16384
 
-	groupFeedTokenVersion = 1
+	// groupFeedTokenVersion is the version byte of the token encoded today,
+	// whose header binds the folder.
+	groupFeedTokenVersion = 2
 
 	// groupFeedTokenHeaderLen is the fixed prefix of a group feed token: the
-	// version byte and the snapshot watermark. The rest is the window.
-	groupFeedTokenHeaderLen = 1 + 8
+	// version byte, the snapshot watermark as big-endian int64 unix-nanos, and
+	// the folder as a single byte (see Folder). The rest is the window.
+	groupFeedTokenHeaderLen = 1 + 8 + 1
+
+	// legacyGroupFeedTokenVersion is the version byte of a token minted before
+	// the feed had folders, whose header is the version byte and the snapshot
+	// alone, legacyGroupFeedTokenHeaderLen long, with the window after it as
+	// today. It is decoded as a token of the INBOX (see decodeGroupFeedToken).
+	legacyGroupFeedTokenVersion = 1
+
+	legacyGroupFeedTokenHeaderLen = 1 + 8
 )
 
 // A token holding every chat of the largest allowed feed must fit the proto's
@@ -306,19 +370,25 @@ func (s *Server) GetGroupChatFeed(ctx context.Context, req *chatpb.GetGroupChatF
 		limit = int(pageSize)
 	}
 
+	// Proto validation restricts the folder to one the store has.
+	folder, err := FolderFromProto(req.GetFolder())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
 	// As for the DM feed, the first request (no token) mints the snapshot
-	// watermark and later requests carry it back. Here the token also carries
-	// the order to resume from; a first request has none yet, so it computes
-	// the order from the top.
+	// watermark and later requests carry it back, with the folder it binds.
+	// Here the token also carries the order to resume from; a first request
+	// has none yet, so it computes the order from the top.
 	var tok *groupFeedToken
 	if token := req.GetQueryOptions().GetPagingToken(); token != nil {
 		decoded, ok := decodeGroupFeedToken(token)
-		if !ok {
+		if !ok || decoded.Folder != folder {
 			return nil, status.Error(codes.InvalidArgument, "invalid paging token")
 		}
 		tok = decoded
 	} else {
-		tok = &groupFeedToken{Snapshot: time.Now().UTC()}
+		tok = &groupFeedToken{Snapshot: time.Now().UTC(), Folder: folder}
 	}
 
 	page, next, err := s.groupFeedPage(ctx, userID, tok, limit)
@@ -355,6 +425,9 @@ type groupFeedToken struct {
 	// Snapshot is the watermark every page of this read is served against.
 	Snapshot time.Time
 
+	// Folder is the folder every page of this read lists.
+	Folder Folder
+
 	// Window is the rest of the feed: every chat ID after those already
 	// emitted, in feed order. Nil before the first page, when the order has
 	// not been computed yet; empty once the feed is exhausted.
@@ -366,6 +439,7 @@ func encodeGroupFeedToken(t *groupFeedToken) *commonpb.PagingToken {
 	buf := make([]byte, groupFeedTokenHeaderLen, groupFeedTokenHeaderLen+len(t.Window)*GroupChatIDSize)
 	buf[0] = groupFeedTokenVersion
 	binary.BigEndian.PutUint64(buf[1:9], uint64(t.Snapshot.UnixNano()))
+	buf[9] = byte(t.Folder)
 	for _, id := range t.Window {
 		buf = append(buf, id.Value...)
 	}
@@ -373,31 +447,52 @@ func encodeGroupFeedToken(t *groupFeedToken) *commonpb.PagingToken {
 }
 
 // decodeGroupFeedToken reverses encodeGroupFeedToken. ok is false for anything
-// the server would not have minted: a nil token, a wrong version, a length that
-// is not a header plus whole chat IDs, a window over the bound, or a window
-// with a repeated ID. Rejecting the malformed here is only a courtesy to the
-// client; what a well-formed token may read is decided by the membership check
-// on every page. The decoded window is never nil, so a token always resumes
+// the server would not have minted: a nil token, an unknown version, a header
+// naming no folder, a length that is not a header plus whole chat IDs, a
+// window over the bound, or a window with a repeated ID. A legacy token (see
+// legacyGroupFeedTokenVersion) decodes as a token of the INBOX, which is the
+// folder every request then read. Rejecting the malformed here is only a
+// courtesy to the client; what a well-formed token may read is decided by the
+// membership check on every page, and the caller checks the folder against
+// the request's. The decoded window is never nil, so a token always resumes
 // rather than recomputing.
 func decodeGroupFeedToken(token *commonpb.PagingToken) (t *groupFeedToken, ok bool) {
-	if token == nil || len(token.Value) < groupFeedTokenHeaderLen || token.Value[0] != groupFeedTokenVersion {
+	if token == nil || len(token.Value) == 0 {
 		return nil, false
 	}
 	buf := token.Value
-	if (len(buf)-groupFeedTokenHeaderLen)%GroupChatIDSize != 0 {
+
+	var headerLen int
+	switch buf[0] {
+	case legacyGroupFeedTokenVersion:
+		headerLen = legacyGroupFeedTokenHeaderLen
+	case groupFeedTokenVersion:
+		headerLen = groupFeedTokenHeaderLen
+	default:
 		return nil, false
 	}
-	n := (len(buf) - groupFeedTokenHeaderLen) / GroupChatIDSize
+	if len(buf) < headerLen || (len(buf)-headerLen)%GroupChatIDSize != 0 {
+		return nil, false
+	}
+	folder := FolderInbox
+	if buf[0] == groupFeedTokenVersion {
+		folder = Folder(buf[9])
+		if folder != FolderInbox && folder != FolderArchived {
+			return nil, false
+		}
+	}
+	n := (len(buf) - headerLen) / GroupChatIDSize
 	if n > maxGroupFeedChats {
 		return nil, false
 	}
 
 	t = &groupFeedToken{
 		Snapshot: time.Unix(0, int64(binary.BigEndian.Uint64(buf[1:9]))).UTC(),
+		Folder:   folder,
 		Window:   make([]*commonpb.ChatId, 0, n),
 	}
 	seen := make(map[string]struct{}, n)
-	for off := groupFeedTokenHeaderLen; off < len(buf); off += GroupChatIDSize {
+	for off := headerLen; off < len(buf); off += GroupChatIDSize {
 		id := buf[off : off+GroupChatIDSize]
 		if _, dup := seen[string(id)]; dup {
 			return nil, false
@@ -408,23 +503,24 @@ func decodeGroupFeedToken(token *commonpb.PagingToken) (t *groupFeedToken, ok bo
 	return t, true
 }
 
-// groupFeedPage serves one page of the caller's group feed from the state in
-// tok, returning the page in feed order and the state the next page resumes
-// from. limit must be positive.
+// groupFeedPage serves one page of the caller's group feed, in tok's folder,
+// from the state in tok, returning the page in feed order and the state the
+// next page resumes from. limit must be positive.
 //
-// The first page (a nil window) computes the whole feed within the snapshot,
-// refusing with ErrGroupFeedTooLarge one larger than maxGroupFeedChats, emits
-// its head and windows the rest. Every later page is served from the window
-// alone. A window ID the caller has since left, or whose group went active
-// after the snapshot, is dropped rather than emitted, and the page keeps
-// filling from what follows; so a page is short only when the feed within the
-// snapshot is exhausted.
+// The first page (a nil window) computes the folder's whole feed within the
+// snapshot, refusing with ErrGroupFeedTooLarge one larger than
+// maxGroupFeedChats, emits its head and windows the rest. Every later page is
+// served from the window alone. A window ID the caller has since left, has
+// since moved to their other folder, or whose group went active after the
+// snapshot, is dropped rather than emitted, and the page keeps filling from
+// what follows; so a page is short only when the feed within the snapshot is
+// exhausted.
 func (s *Server) groupFeedPage(ctx context.Context, userID *commonpb.UserId, tok *groupFeedToken, limit int) ([]*Chat, *groupFeedToken, error) {
-	next := &groupFeedToken{Snapshot: tok.Snapshot, Window: tok.Window}
+	next := &groupFeedToken{Snapshot: tok.Snapshot, Folder: tok.Folder, Window: tok.Window}
 
 	var page []*Chat
 	if next.Window == nil {
-		feed, err := s.sortedGroupFeed(ctx, userID, next.Snapshot)
+		feed, err := s.sortedGroupFeed(ctx, userID, next.Folder, next.Snapshot)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -446,9 +542,10 @@ func (s *Server) groupFeedPage(ctx context.Context, userID *commonpb.UserId, tok
 		ids := next.Window[:take]
 		next.Window = next.Window[take:]
 
-		// Re-check membership and re-read the records for exactly the IDs about
-		// to be emitted. The read is unordered; the token's order is restored.
-		chats, err := s.chats.GetGroupChatsForUserByIDs(ctx, userID, ids)
+		// Re-check membership and the folder, and re-read the records, for
+		// exactly the IDs about to be emitted. The read is unordered; the
+		// token's order is restored.
+		chats, err := s.chats.GetGroupChatsForUserByIDs(ctx, userID, next.Folder, ids)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -459,7 +556,7 @@ func (s *Server) groupFeedPage(ctx context.Context, userID *commonpb.UserId, tok
 		for _, id := range ids {
 			c, ok := byID[string(id.Value)]
 			if !ok || c.LastActivity.After(next.Snapshot) {
-				continue // Left, gone, or active since the snapshot: dropped.
+				continue // Left, gone, refiled, or active since the snapshot: dropped.
 			}
 			page = append(page, c)
 		}
@@ -467,11 +564,11 @@ func (s *Server) groupFeedPage(ctx context.Context, userID *commonpb.UserId, tok
 	return page, next, nil
 }
 
-// sortedGroupFeed computes the caller's whole group feed within the snapshot,
-// in descending (last_activity, chat_id) order. It reads every group the
-// caller is in.
-func (s *Server) sortedGroupFeed(ctx context.Context, userID *commonpb.UserId, snapshot time.Time) ([]*Chat, error) {
-	all, err := s.chats.GetGroupChatsForUser(ctx, userID)
+// sortedGroupFeed computes the caller's whole group feed of folder within the
+// snapshot, in descending (last_activity, chat_id) order. It reads every group
+// the caller is in and has filed in folder.
+func (s *Server) sortedGroupFeed(ctx context.Context, userID *commonpb.UserId, folder Folder, snapshot time.Time) ([]*Chat, error) {
+	all, err := s.chats.GetGroupChatsForUser(ctx, userID, folder)
 	if err != nil {
 		return nil, err
 	}

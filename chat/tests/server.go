@@ -141,6 +141,7 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_KeyEnvelope_Member,
 		testServer_Lobby_Gates,
 		testServer_Lobby_EnterAndLeave,
+		testServer_Lobby_EnteredPushArchived,
 		testServer_Lobby_Limits,
 		testServer_Lobby_GetLobbyMembers,
 		testServer_Lobby_Admit,
@@ -158,6 +159,18 @@ func RunServerTests(t *testing.T, s chat.Store, teardown func()) {
 		testServer_LeaveChat_ClearsMute,
 		testServer_GetChat_ViewerState_LapsedMuteReturned,
 		testServer_GetDmChatFeed_ViewerState,
+		testServer_ArchiveChat_Dm,
+		testServer_ArchiveChat_Group,
+		testServer_ArchiveChat_Gates,
+		testServer_ArchiveChat_IndependentOfMute,
+		testServer_GetDmChatFeed_Folders,
+		testServer_GetDmChatFeed_ArchivedPaging,
+		testServer_GetDmChatFeed_TokenBoundToFolder,
+		testServer_GetGroupChatFeed_Folders,
+		testServer_GetGroupChatFeed_ArchivedPaging,
+		testServer_GetGroupChatFeed_TokenBoundToFolder,
+		testServer_GetGroupChatFeed_DropsArchivedBetweenPages,
+		testServer_LeaveChat_EndsArchive,
 		testServer_EditChat_Title,
 		testServer_EditChat_Picture,
 		testServer_EditChat_Both,
@@ -4022,7 +4035,7 @@ func testServer_StartChat_Idempotent(t *testing.T, s chat.Store) {
 	e.fundEnvUser(startChatMinimumBalance)
 
 	// One group exists, and only its creation was announced.
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Len(t, groups, 1)
 	require.Len(t, e.rosterUpdatesOnUserTopic(e.userID, chatID), 1)
@@ -4066,7 +4079,7 @@ func testServer_StartChat_Idempotent(t *testing.T, s chat.Store) {
 		_, err = e.client.StartChat(e.ctx, req)
 		require.Equal(t, codes.InvalidArgument, status.Code(err))
 	}
-	groups, err = s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err = s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Len(t, groups, 1)
 }
@@ -4109,7 +4122,7 @@ func testServer_StartChat_PictureNotAccepted(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.StartChatResponse_PROFILE_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
 	require.Nil(t, resp.Chat)
 
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 	require.Empty(t, e.media.chatPictures)
@@ -4121,7 +4134,7 @@ func testServer_StartChat_PictureNotAccepted(t *testing.T, s chat.Store) {
 	params.ProfilePicture = &blobpb.BlobId{Value: []byte("group-picture-01")}
 	_, err = e.startGroupChat(e.keys, params)
 	require.Equal(t, codes.Internal, status.Code(err))
-	groups, err = s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err = s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 }
@@ -4132,7 +4145,7 @@ func testServer_StartChat_TitleModerated(t *testing.T, s chat.Store) {
 
 	noGroups := func() {
 		t.Helper()
-		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 		require.NoError(t, err)
 		require.Empty(t, groups)
 	}
@@ -4193,7 +4206,7 @@ func testServer_StartChat_ModerationFailureIsInternal(t *testing.T, s chat.Store
 	_, err = e.startGroupChat(e.keys, groupParams("Sunday Hikers"))
 	require.Equal(t, codes.Internal, status.Code(err))
 
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 }
@@ -4208,7 +4221,7 @@ func testServer_StartChat_PrivateGroup(t *testing.T, s chat.Store) {
 
 	groups := func() []*chat.Chat {
 		t.Helper()
-		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 		require.NoError(t, err)
 		return groups
 	}
@@ -4592,7 +4605,7 @@ func testServer_StartChat_InvalidRules(t *testing.T, s chat.Store) {
 		})
 	}
 
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 }
@@ -4621,7 +4634,7 @@ func testServer_StartChat_RulesNotSatisfied(t *testing.T, s chat.Store) {
 	resp = e.mustStartGroupChat(e.keys, staffOnly)
 	require.Equal(t, chatpb.StartChatResponse_RULES_NOT_SATISFIED, resp.Result)
 
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 }
@@ -4657,7 +4670,7 @@ func testServer_StartChat_MinimumSpeakerBalance(t *testing.T, s chat.Store) {
 	resp := e.mustStartGroupChat(e.keys, params)
 	require.Equal(t, chatpb.StartChatResponse_RULES_NOT_SATISFIED, resp.Result)
 	require.Nil(t, resp.Chat)
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 
@@ -5451,7 +5464,7 @@ func testServer_StartChat_CoverPictureNotAccepted(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.StartChatResponse_COVER_PICTURE_BLOB_NOT_ACCEPTED, resp.Result)
 	require.Nil(t, resp.Chat)
 
-	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+	groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, groups)
 
@@ -5476,7 +5489,7 @@ func testServer_StartChat_Description(t *testing.T, s chat.Store) {
 
 	noGroups := func() {
 		t.Helper()
-		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID)
+		groups, err := s.GetGroupChatsForUser(e.ctx, e.userID, chat.FolderInbox)
 		require.NoError(t, err)
 		require.Empty(t, groups)
 	}
@@ -6879,6 +6892,64 @@ func testServer_Lobby_EnterAndLeave(t *testing.T, s chat.Store) {
 	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(namelessKeys, chatID).Result)
 	pushes = e.waitForPushes(e.userID, 2)
 	requireLobbyPush(t, pushes[1], chatID, "Sunday Hikers", "Someone requested to join")
+}
+
+// failingViewerStatesStore is a chat store whose GetViewerStates fails for
+// one user once failFor names them, and answers as the store it wraps
+// otherwise.
+type failingViewerStatesStore struct {
+	chat.Store
+
+	mu      sync.Mutex
+	failFor *commonpb.UserId
+}
+
+func (s *failingViewerStatesStore) setFailFor(userID *commonpb.UserId) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failFor = userID
+}
+
+func (s *failingViewerStatesStore) GetViewerStates(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (map[string]chat.ViewerState, error) {
+	s.mu.Lock()
+	failFor := s.failFor
+	s.mu.Unlock()
+	if failFor != nil && bytes.Equal(failFor.Value, userID.Value) {
+		return nil, errors.New("viewer states unavailable")
+	}
+	return s.Store.GetViewerStates(ctx, userID, chatIDs)
+}
+
+// testServer_Lobby_EnteredPushArchived pins that a creator who has archived
+// their group is not pushed that someone entered its lobby, though the
+// LobbyUpdate still reaches them; that the push resumes once they unarchive;
+// and that it is sent when their archive cannot be read.
+func testServer_Lobby_EnteredPushArchived(t *testing.T, s chat.Store) {
+	store := &failingViewerStatesStore{Store: s}
+	e := newServerEnv(t, store)
+	_, aKeys := e.addBoundUser("A")
+	_, bKeys := e.addBoundUser("B")
+	_, cKeys := e.addBoundUser("C")
+	chatID := e.putKeyedPrivateGroup("Sunday Hikers")
+
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, chatID).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(aKeys, chatID).Result)
+	e.waitForLobbyUpdates(e.userID, chatID, 1)
+	require.Never(t, func() bool {
+		return len(e.pusher.pushesTo(e.userID)) > 0
+	}, 300*time.Millisecond, 20*time.Millisecond)
+
+	require.Equal(t, chatpb.UnarchiveChatResponse_OK, e.unarchiveChat(e.keys, chatID).Result)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(bKeys, chatID).Result)
+	pushes := e.waitForPushes(e.userID, 1)
+	requireLobbyPush(t, pushes[0], chatID, "Sunday Hikers", "B requested to join")
+
+	// Archived again, but the read of it fails: the push goes out.
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, chatID).Result)
+	store.setFailFor(e.userID)
+	require.Equal(t, chatpb.EnterLobbyResponse_OK, e.enterLobby(cKeys, chatID).Result)
+	pushes = e.waitForPushes(e.userID, 2)
+	requireLobbyPush(t, pushes[1], chatID, "Sunday Hikers", "C requested to join")
 }
 
 // testServer_Lobby_Limits pins the server's caps: a full lobby is LOBBY_FULL,
@@ -9992,4 +10063,556 @@ func testServer_PinSummary_MissingMessage(t *testing.T, s chat.Store) {
 	// Unpinning it leaves nothing missing to show.
 	require.Equal(t, chatpb.UnpinMessageResponse_OK, e.unpinMessage(e.keys, owned, 1).Result)
 	requirePinSummaryProto(t, e.getChat(e.keys, owned).Metadata.PinSummary, 0, 2, nil, nil)
+}
+
+// ---------------------------------------------------------------------------
+// Archive
+// ---------------------------------------------------------------------------
+
+func (e *serverEnv) archiveChat(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.ArchiveChatResponse {
+	req := &chatpb.ArchiveChatRequest{ChatId: chatID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.ArchiveChat(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+func (e *serverEnv) unarchiveChat(keys model.KeyPair, chatID *commonpb.ChatId) *chatpb.UnarchiveChatResponse {
+	req := &chatpb.UnarchiveChatRequest{ChatId: chatID}
+	require.NoError(e.t, keys.Auth(req, &req.Auth))
+	resp, err := e.client.UnarchiveChat(e.ctx, req)
+	require.NoError(e.t, err)
+	return resp
+}
+
+// getDmFeedInFolder reads a page of the env user's DM feed of chatType in
+// folder.
+func (e *serverEnv) getDmFeedInFolder(chatType chatpb.ChatType, folder chatpb.ChatFolder, opts *commonpb.QueryOptions) (*chatpb.GetDmChatFeedResponse, error) {
+	req := &chatpb.GetDmChatFeedRequest{DmChatType: chatType, Folder: folder, QueryOptions: opts}
+	require.NoError(e.t, e.keys.Auth(req, &req.Auth))
+	return e.client.GetDmChatFeed(e.ctx, req)
+}
+
+// getGroupFeedInFolder reads a page of the env user's group feed in folder.
+func (e *serverEnv) getGroupFeedInFolder(folder chatpb.ChatFolder, opts *commonpb.QueryOptions) (*chatpb.GetGroupChatFeedResponse, error) {
+	req := &chatpb.GetGroupChatFeedRequest{Folder: folder, QueryOptions: opts}
+	require.NoError(e.t, e.keys.Auth(req, &req.Auth))
+	return e.client.GetGroupChatFeed(e.ctx, req)
+}
+
+// pageDmFeed pages folder of the env user's contact DM feed to exhaustion,
+// pageSize chats at a time, and returns the chat IDs in feed order.
+func (e *serverEnv) pageDmFeed(folder chatpb.ChatFolder, pageSize int32) [][]byte {
+	var got [][]byte
+	var token *commonpb.PagingToken
+	for {
+		resp, err := e.getDmFeedInFolder(chatpb.ChatType_CONTACT_DM, folder, &commonpb.QueryOptions{PageSize: pageSize, PagingToken: token})
+		require.NoError(e.t, err)
+		require.Equal(e.t, chatpb.GetDmChatFeedResponse_OK, resp.Result)
+		require.LessOrEqual(e.t, len(resp.Chats), int(pageSize))
+		got = append(got, metadataChatIDs(resp.Chats)...)
+		if !resp.HasMore {
+			return got
+		}
+		require.NotNil(e.t, resp.PagingToken)
+		token = resp.PagingToken
+	}
+}
+
+// pageGroupFeed is pageDmFeed for the env user's group feed.
+func (e *serverEnv) pageGroupFeed(folder chatpb.ChatFolder, pageSize int32) [][]byte {
+	var got [][]byte
+	var token *commonpb.PagingToken
+	for {
+		resp, err := e.getGroupFeedInFolder(folder, &commonpb.QueryOptions{PageSize: pageSize, PagingToken: token})
+		require.NoError(e.t, err)
+		require.Equal(e.t, chatpb.GetGroupChatFeedResponse_OK, resp.Result)
+		require.LessOrEqual(e.t, len(resp.Chats), int(pageSize))
+		got = append(got, metadataChatIDs(resp.Chats)...)
+		if !resp.HasMore {
+			return got
+		}
+		require.NotNil(e.t, resp.PagingToken)
+		token = resp.PagingToken
+	}
+}
+
+// withArchive returns a copy of state with settings.archive set to an
+// archive made at archivedAt.
+func withArchive(state *chatpb.ViewerState, archivedAt time.Time) *chatpb.ViewerState {
+	out := proto.Clone(state).(*chatpb.ViewerState)
+	out.Settings.Archive = &chatpb.ArchiveState{ArchivedAt: timestamppb.New(archivedAt)}
+	return out
+}
+
+// requireArchivedBetween requires that state carries an archive made within
+// [before, after], and returns its time.
+func requireArchivedBetween(t *testing.T, state *chatpb.ViewerState, before, after time.Time) time.Time {
+	t.Helper()
+	require.NotNil(t, state.GetSettings().GetArchive())
+	archivedAt := state.Settings.Archive.ArchivedAt.AsTime()
+	require.False(t, archivedAt.Before(before), "archived at %v, before %v", archivedAt, before)
+	require.False(t, archivedAt.After(after), "archived at %v, after %v", archivedAt, after)
+	return archivedAt
+}
+
+// requireNothingOnChatTopic requires that, after giving the bus a moment,
+// nothing at all was published on chatID's topic.
+func (e *serverEnv) requireNothingOnChatTopic(chatID *commonpb.ChatId) {
+	e.t.Helper()
+	time.Sleep(100 * time.Millisecond)
+	require.Empty(e.t, e.chatObserver.GetEvents(func(k *commonpb.ChatId) bool { return bytes.Equal(k.Value, chatID.Value) }))
+}
+
+// testServer_ArchiveChat_Dm is the archive lifecycle on a DM: an archive and
+// an unarchive each move the version by one, are hydrated onto GetChat and
+// reach the caller's other devices once; a repeat of either is a no-op that
+// returns the current state and publishes nothing; and UnarchiveChat returns
+// the chat as GetChat does, a no-op included. The peer is told nothing.
+func testServer_ArchiveChat_Dm(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	peer, _ := e.addUser()
+	chatID := e.putDMWithPeer(chatpb.ChatType_CONTACT_DM, peer, at(1))
+
+	before := time.Now()
+	archived := e.archiveChat(e.keys, chatID)
+	after := time.Now()
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, archived.Result)
+	archivedAt := requireArchivedBetween(t, archived.ViewerState, before, after)
+	want := withArchive(dmViewerState(1, nil), archivedAt)
+	require.NoError(t, protoutil.ProtoEqualError(want, archived.ViewerState))
+
+	require.NoError(t, protoutil.ProtoEqualError(want, e.getChat(e.keys, chatID).Metadata.ViewerState))
+	states := e.waitForViewerStateUpdates(e.userID, chatID, 1)
+	require.NoError(t, protoutil.ProtoEqualError(want, states[0]))
+
+	// Archiving again keeps the original archive and its version, and
+	// publishes nothing.
+	again := e.archiveChat(e.keys, chatID)
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, again.Result)
+	require.NoError(t, protoutil.ProtoEqualError(want, again.ViewerState))
+	e.waitForViewerStateUpdates(e.userID, chatID, 1)
+
+	// Unarchiving is a real change, and carries the chat as GetChat returns
+	// it, with the same state.
+	unarchived := e.unarchiveChat(e.keys, chatID)
+	require.Equal(t, chatpb.UnarchiveChatResponse_OK, unarchived.Result)
+	want = dmViewerState(2, nil)
+	require.NoError(t, protoutil.ProtoEqualError(want, unarchived.ViewerState))
+	require.NotNil(t, unarchived.Chat)
+	require.NoError(t, protoutil.ProtoEqualError(e.getChat(e.keys, chatID).Metadata, unarchived.Chat))
+	require.NoError(t, protoutil.ProtoEqualError(want, unarchived.Chat.ViewerState))
+	states = e.waitForViewerStateUpdates(e.userID, chatID, 2)
+	require.NoError(t, protoutil.ProtoEqualError(want, states[1]))
+
+	// Unarchiving again is the no-op, and still carries the chat.
+	unarchived = e.unarchiveChat(e.keys, chatID)
+	require.Equal(t, chatpb.UnarchiveChatResponse_OK, unarchived.Result)
+	require.NoError(t, protoutil.ProtoEqualError(want, unarchived.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(e.getChat(e.keys, chatID).Metadata, unarchived.Chat))
+	e.waitForViewerStateUpdates(e.userID, chatID, 2)
+
+	require.Empty(t, e.viewerStateUpdatesOnUserTopic(peer, chatID))
+}
+
+// testServer_ArchiveChat_Group is the lifecycle on a group: a member's
+// archive is theirs alone — another member reads the group with the zero
+// state and is told nothing — and nothing is published on the chat topic.
+func testServer_ArchiveChat_Group(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	otherID, otherKeys := e.addUser()
+	group := e.putGroup("Archived", at(1), otherID)
+
+	before := time.Now()
+	archived := e.archiveChat(e.keys, group)
+	after := time.Now()
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, archived.Result)
+	archivedAt := requireArchivedBetween(t, archived.ViewerState, before, after)
+	want := withArchive(viewerState(1, nil, false), archivedAt)
+	require.NoError(t, protoutil.ProtoEqualError(want, archived.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(want, e.getChat(e.keys, group).Metadata.ViewerState))
+	states := e.waitForViewerStateUpdates(e.userID, group, 1)
+	require.NoError(t, protoutil.ProtoEqualError(want, states[0]))
+
+	require.NoError(t, protoutil.ProtoEqualError(memberViewerState, e.getChat(otherKeys, group).Metadata.ViewerState))
+	require.Empty(t, e.viewerStateUpdatesOnUserTopic(otherID, group))
+
+	again := e.archiveChat(e.keys, group)
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, again.Result)
+	require.NoError(t, protoutil.ProtoEqualError(want, again.ViewerState))
+	e.waitForViewerStateUpdates(e.userID, group, 1)
+
+	unarchived := e.unarchiveChat(e.keys, group)
+	require.Equal(t, chatpb.UnarchiveChatResponse_OK, unarchived.Result)
+	want = viewerState(2, nil, false)
+	require.NoError(t, protoutil.ProtoEqualError(want, unarchived.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(e.getChat(e.keys, group).Metadata, unarchived.Chat))
+	require.NoError(t, protoutil.ProtoEqualError(want, unarchived.Chat.ViewerState))
+	states = e.waitForViewerStateUpdates(e.userID, group, 2)
+	require.NoError(t, protoutil.ProtoEqualError(want, states[1]))
+
+	unarchived = e.unarchiveChat(e.keys, group)
+	require.Equal(t, chatpb.UnarchiveChatResponse_OK, unarchived.Result)
+	require.NoError(t, protoutil.ProtoEqualError(want, unarchived.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(e.getChat(e.keys, group).Metadata, unarchived.Chat))
+	e.waitForViewerStateUpdates(e.userID, group, 2)
+
+	require.Empty(t, e.viewerStateUpdatesOnUserTopic(otherID, group))
+	e.requireNothingOnChatTopic(group)
+}
+
+// testServer_ArchiveChat_Gates pins who may archive: NOT_FOUND for a chat
+// that does not exist, DENIED for anyone not a member — a stranger to a DM,
+// a group non-member, a departed member — and for the team account, which
+// has no folder to move a chat to.
+func testServer_ArchiveChat_Gates(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	for _, chatID := range []*commonpb.ChatId{generateDmChatID(), chat.MustGenerateGroupChatID()} {
+		archived := e.archiveChat(e.keys, chatID)
+		require.Equal(t, chatpb.ArchiveChatResponse_NOT_FOUND, archived.Result)
+		require.Nil(t, archived.ViewerState)
+		unarchived := e.unarchiveChat(e.keys, chatID)
+		require.Equal(t, chatpb.UnarchiveChatResponse_NOT_FOUND, unarchived.Result)
+		require.Nil(t, unarchived.ViewerState)
+		require.Nil(t, unarchived.Chat)
+	}
+
+	requireDenied := func(keys model.KeyPair, chatID *commonpb.ChatId) {
+		t.Helper()
+		archived := e.archiveChat(keys, chatID)
+		require.Equal(t, chatpb.ArchiveChatResponse_DENIED, archived.Result)
+		require.Nil(t, archived.ViewerState)
+		unarchived := e.unarchiveChat(keys, chatID)
+		require.Equal(t, chatpb.UnarchiveChatResponse_DENIED, unarchived.Result)
+		require.Nil(t, unarchived.ViewerState)
+		require.Nil(t, unarchived.Chat)
+	}
+
+	// A DM between two other users.
+	a := model.MustGenerateUserID()
+	b := model.MustGenerateUserID()
+	othersDM := generateDmChatID()
+	require.NoError(t, s.PutChat(e.ctx, &chat.Chat{ID: othersDM, Type: chatpb.ChatType_CONTACT_DM, Members: []*commonpb.UserId{a, b}, LastActivity: at(1)}))
+	requireDenied(e.keys, othersDM)
+
+	// A group the caller is not a member of, though they could read it.
+	group := e.putGroup("Open", at(1))
+	strangerID, strangerKeys := e.addUser()
+	requireDenied(strangerKeys, group)
+
+	// Once a member they may; once departed they may not, and nothing is
+	// published for the departure ending their archive.
+	e.mustJoinChat(strangerKeys, group)
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(strangerKeys, group).Result)
+	e.waitForViewerStateUpdates(strangerID, group, 1)
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(strangerKeys, group).Result)
+	requireDenied(strangerKeys, group)
+	e.waitForViewerStateUpdates(strangerID, group, 1)
+
+	// The team account is a member of its DMs, but excluded from the feed: it
+	// has no folder to move one to. The user on the other side of the DM has.
+	teamKeys := model.MustGenerateKeyPair()
+	e.authz.Add(e.teamUserID, teamKeys)
+	teamDM := e.putDMWithPeer(chatpb.ChatType_DM, e.teamUserID, at(1))
+	archived := e.archiveChat(teamKeys, teamDM)
+	require.Equal(t, chatpb.ArchiveChatResponse_DENIED, archived.Result)
+	require.Nil(t, archived.ViewerState)
+	require.Empty(t, e.viewerStateUpdatesOnUserTopic(e.teamUserID, teamDM))
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, teamDM).Result)
+}
+
+// testServer_ArchiveChat_IndependentOfMute pins that an archive and a mute
+// are set and cleared under each other: each write moves the shared version
+// by one and leaves the other setting as it was.
+func testServer_ArchiveChat_IndependentOfMute(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	chatID := e.putDM(at(1))
+	require.Equal(t, chatpb.MuteChatResponse_OK, e.mustMuteChat(e.keys, chatID, muteForever()).Result)
+
+	before := time.Now()
+	archived := e.archiveChat(e.keys, chatID)
+	after := time.Now()
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, archived.Result)
+	archivedAt := requireArchivedBetween(t, archived.ViewerState, before, after)
+	require.NoError(t, protoutil.ProtoEqualError(withArchive(dmViewerState(2, muteForever()), archivedAt), archived.ViewerState))
+
+	unmuted := e.mustUnmuteChat(e.keys, chatID)
+	require.NoError(t, protoutil.ProtoEqualError(withArchive(dmViewerState(3, nil), archivedAt), unmuted.ViewerState))
+	muted := e.mustMuteChat(e.keys, chatID, muteForever())
+	require.NoError(t, protoutil.ProtoEqualError(withArchive(dmViewerState(4, muteForever()), archivedAt), muted.ViewerState))
+
+	unarchived := e.unarchiveChat(e.keys, chatID)
+	require.Equal(t, chatpb.UnarchiveChatResponse_OK, unarchived.Result)
+	want := dmViewerState(5, muteForever())
+	require.NoError(t, protoutil.ProtoEqualError(want, unarchived.ViewerState))
+	require.NoError(t, protoutil.ProtoEqualError(want, unarchived.Chat.ViewerState))
+	e.waitForViewerStateUpdates(e.userID, chatID, 5)
+}
+
+// testServer_GetDmChatFeed_Folders pins that an archived DM is listed in the
+// ARCHIVED folder alone, with its archive on its state, that an unset folder
+// is the INBOX, and that an unarchive moves it back.
+func testServer_GetDmChatFeed_Folders(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	kept := e.putDM(at(2))
+	moved := e.putDM(at(1))
+	archived := e.archiveChat(e.keys, moved)
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, archived.Result)
+
+	require.Equal(t, [][]byte{kept.Value}, metadataChatIDs(e.getDmFeed(&commonpb.QueryOptions{}).Chats))
+	inbox, err := e.getDmFeedInFolder(chatpb.ChatType_CONTACT_DM, chatpb.ChatFolder_INBOX, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{kept.Value}, metadataChatIDs(inbox.Chats))
+
+	archive, err := e.getDmFeedInFolder(chatpb.ChatType_CONTACT_DM, chatpb.ChatFolder_ARCHIVED, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetDmChatFeedResponse_OK, archive.Result)
+	require.Equal(t, [][]byte{moved.Value}, metadataChatIDs(archive.Chats))
+	require.False(t, archive.HasMore)
+	require.NoError(t, protoutil.ProtoEqualError(archived.ViewerState, archive.Chats[0].ViewerState))
+
+	// Another DM type's archived folder is its own.
+	other, err := e.getDmFeedInFolder(chatpb.ChatType_DM, chatpb.ChatFolder_ARCHIVED, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Empty(t, other.Chats)
+
+	require.Equal(t, chatpb.UnarchiveChatResponse_OK, e.unarchiveChat(e.keys, moved).Result)
+	require.Equal(t, [][]byte{kept.Value, moved.Value}, metadataChatIDs(e.getDmFeed(&commonpb.QueryOptions{}).Chats))
+	archive, err = e.getDmFeedInFolder(chatpb.ChatType_CONTACT_DM, chatpb.ChatFolder_ARCHIVED, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Empty(t, archive.Chats)
+	require.False(t, archive.HasMore)
+	require.Nil(t, archive.PagingToken)
+}
+
+// testServer_GetDmChatFeed_ArchivedPaging pages the ARCHIVED folder across
+// several pages, in activity order, with the INBOX's DMs left out.
+func testServer_GetDmChatFeed_ArchivedPaging(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	const total = 5
+	want := make([][]byte, total)
+	for i := 0; i < total; i++ {
+		chatID := e.putDM(at(int64(i + 1)))
+		require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, chatID).Result)
+		want[total-1-i] = chatID.Value
+	}
+	inbox := e.putDM(at(10))
+
+	require.Equal(t, want, e.pageDmFeed(chatpb.ChatFolder_ARCHIVED, 2))
+	require.Equal(t, [][]byte{inbox.Value}, e.pageDmFeed(chatpb.ChatFolder_INBOX, 2))
+}
+
+// testServer_GetDmChatFeed_TokenBoundToFolder pins that a DM feed token
+// resumes only the folder it was minted for, and that a token in the layout
+// minted before the feed had folders, the current one less its folder byte,
+// resumes the INBOX.
+func testServer_GetDmChatFeed_TokenBoundToFolder(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	e.putDM(at(1))
+	e.putDM(at(2))
+	for i := int64(3); i <= 4; i++ {
+		require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, e.putDM(at(i))).Result)
+	}
+
+	page := func(folder chatpb.ChatFolder, token *commonpb.PagingToken) (*chatpb.GetDmChatFeedResponse, error) {
+		return e.getDmFeedInFolder(chatpb.ChatType_CONTACT_DM, folder, &commonpb.QueryOptions{PageSize: 1, PagingToken: token})
+	}
+
+	inbox, err := page(chatpb.ChatFolder_INBOX, nil)
+	require.NoError(t, err)
+	require.True(t, inbox.HasMore)
+	archive, err := page(chatpb.ChatFolder_ARCHIVED, nil)
+	require.NoError(t, err)
+	require.True(t, archive.HasMore)
+
+	// Each resumes its own folder...
+	inboxNext, err := page(chatpb.ChatFolder_INBOX, inbox.PagingToken)
+	require.NoError(t, err)
+	require.Len(t, inboxNext.Chats, 1)
+	archiveNext, err := page(chatpb.ChatFolder_ARCHIVED, archive.PagingToken)
+	require.NoError(t, err)
+	require.Len(t, archiveNext.Chats, 1)
+
+	// ...and is rejected for the other.
+	_, err = page(chatpb.ChatFolder_ARCHIVED, inbox.PagingToken)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = page(chatpb.ChatFolder_INBOX, archive.PagingToken)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	// A token in the old layout resumes the INBOX where the current one does,
+	// and is rejected for the ARCHIVED folder.
+	legacy := &commonpb.PagingToken{Value: inbox.PagingToken.Value[:len(inbox.PagingToken.Value)-1]}
+	legacyNext, err := page(chatpb.ChatFolder_INBOX, legacy)
+	require.NoError(t, err)
+	require.Equal(t, metadataChatIDs(inboxNext.Chats), metadataChatIDs(legacyNext.Chats))
+	_, err = page(chatpb.ChatFolder_ARCHIVED, legacy)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+// testServer_GetGroupChatFeed_Folders is testServer_GetDmChatFeed_Folders
+// for groups.
+func testServer_GetGroupChatFeed_Folders(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	kept := e.putGroup("Kept", at(2), model.MustGenerateUserID())
+	moved := e.putGroup("Moved", at(1), model.MustGenerateUserID())
+	archived := e.archiveChat(e.keys, moved)
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, archived.Result)
+
+	require.Equal(t, [][]byte{kept.Value}, metadataChatIDs(e.mustGetGroupFeed(&commonpb.QueryOptions{}).Chats))
+	inbox, err := e.getGroupFeedInFolder(chatpb.ChatFolder_INBOX, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{kept.Value}, metadataChatIDs(inbox.Chats))
+
+	archive, err := e.getGroupFeedInFolder(chatpb.ChatFolder_ARCHIVED, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Equal(t, chatpb.GetGroupChatFeedResponse_OK, archive.Result)
+	require.Equal(t, [][]byte{moved.Value}, metadataChatIDs(archive.Chats))
+	require.False(t, archive.HasMore)
+	require.NoError(t, protoutil.ProtoEqualError(archived.ViewerState, archive.Chats[0].ViewerState))
+
+	require.Equal(t, chatpb.UnarchiveChatResponse_OK, e.unarchiveChat(e.keys, moved).Result)
+	require.Equal(t, [][]byte{kept.Value, moved.Value}, metadataChatIDs(e.mustGetGroupFeed(&commonpb.QueryOptions{}).Chats))
+	archive, err = e.getGroupFeedInFolder(chatpb.ChatFolder_ARCHIVED, &commonpb.QueryOptions{})
+	require.NoError(t, err)
+	require.Empty(t, archive.Chats)
+	require.False(t, archive.HasMore)
+	require.Nil(t, archive.PagingToken)
+}
+
+// testServer_GetGroupChatFeed_ArchivedPaging is
+// testServer_GetDmChatFeed_ArchivedPaging for groups.
+func testServer_GetGroupChatFeed_ArchivedPaging(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	const total = 5
+	want := make([][]byte, total)
+	for i := 0; i < total; i++ {
+		chatID := e.putGroup("", at(int64(i+1)), model.MustGenerateUserID())
+		require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, chatID).Result)
+		want[total-1-i] = chatID.Value
+	}
+	inbox := e.putGroup("", at(10), model.MustGenerateUserID())
+
+	require.Equal(t, want, e.pageGroupFeed(chatpb.ChatFolder_ARCHIVED, 2))
+	require.Equal(t, [][]byte{inbox.Value}, e.pageGroupFeed(chatpb.ChatFolder_INBOX, 2))
+}
+
+// testServer_GetGroupChatFeed_TokenBoundToFolder pins that a group feed
+// token resumes only the folder it was minted for, and that a version 1
+// token, minted before the feed had folders (the version byte, the snapshot,
+// then the window), resumes the INBOX.
+func testServer_GetGroupChatFeed_TokenBoundToFolder(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	e.putGroup("", at(1), model.MustGenerateUserID())
+	e.putGroup("", at(2), model.MustGenerateUserID())
+	for i := int64(3); i <= 4; i++ {
+		require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, e.putGroup("", at(i), model.MustGenerateUserID())).Result)
+	}
+
+	page := func(folder chatpb.ChatFolder, token *commonpb.PagingToken) (*chatpb.GetGroupChatFeedResponse, error) {
+		return e.getGroupFeedInFolder(folder, &commonpb.QueryOptions{PageSize: 1, PagingToken: token})
+	}
+
+	inbox, err := page(chatpb.ChatFolder_INBOX, nil)
+	require.NoError(t, err)
+	require.True(t, inbox.HasMore)
+	archive, err := page(chatpb.ChatFolder_ARCHIVED, nil)
+	require.NoError(t, err)
+	require.True(t, archive.HasMore)
+
+	inboxNext, err := page(chatpb.ChatFolder_INBOX, inbox.PagingToken)
+	require.NoError(t, err)
+	require.Len(t, inboxNext.Chats, 1)
+	archiveNext, err := page(chatpb.ChatFolder_ARCHIVED, archive.PagingToken)
+	require.NoError(t, err)
+	require.Len(t, archiveNext.Chats, 1)
+
+	_, err = page(chatpb.ChatFolder_ARCHIVED, inbox.PagingToken)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = page(chatpb.ChatFolder_INBOX, archive.PagingToken)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	// The current header is the version byte, the snapshot and the folder
+	// byte; version 1's is the same without the folder.
+	current := inbox.PagingToken.Value
+	legacyValue := append([]byte{1}, current[1:9]...)
+	legacyValue = append(legacyValue, current[10:]...)
+	legacy := &commonpb.PagingToken{Value: legacyValue}
+	legacyNext, err := page(chatpb.ChatFolder_INBOX, legacy)
+	require.NoError(t, err)
+	require.Equal(t, metadataChatIDs(inboxNext.Chats), metadataChatIDs(legacyNext.Chats))
+	_, err = page(chatpb.ChatFolder_ARCHIVED, legacy)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+// testServer_GetGroupChatFeed_DropsArchivedBetweenPages pins that a group
+// archived between pages of the INBOX is dropped from the pages that follow,
+// and one unarchived between pages of the ARCHIVED folder likewise.
+func testServer_GetGroupChatFeed_DropsArchivedBetweenPages(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	g1 := e.putGroup("", at(1), model.MustGenerateUserID())
+	g2 := e.putGroup("", at(2), model.MustGenerateUserID())
+	g3 := e.putGroup("", at(3), model.MustGenerateUserID())
+
+	page1, err := e.getGroupFeedInFolder(chatpb.ChatFolder_INBOX, &commonpb.QueryOptions{PageSize: 1})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{g3.Value}, metadataChatIDs(page1.Chats))
+	require.True(t, page1.HasMore)
+
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, g2).Result)
+
+	page2, err := e.getGroupFeedInFolder(chatpb.ChatFolder_INBOX, &commonpb.QueryOptions{PageSize: 10, PagingToken: page1.PagingToken})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{g1.Value}, metadataChatIDs(page2.Chats))
+	require.False(t, page2.HasMore)
+
+	// Now both g1 and g2 are archived; g1 is unarchived after the first page
+	// of the ARCHIVED folder, and dropped from the next.
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, g1).Result)
+	archive1, err := e.getGroupFeedInFolder(chatpb.ChatFolder_ARCHIVED, &commonpb.QueryOptions{PageSize: 1})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{g2.Value}, metadataChatIDs(archive1.Chats))
+	require.True(t, archive1.HasMore)
+
+	require.Equal(t, chatpb.UnarchiveChatResponse_OK, e.unarchiveChat(e.keys, g1).Result)
+
+	archive2, err := e.getGroupFeedInFolder(chatpb.ChatFolder_ARCHIVED, &commonpb.QueryOptions{PageSize: 10, PagingToken: archive1.PagingToken})
+	require.NoError(t, err)
+	require.Empty(t, archive2.Chats)
+	require.False(t, archive2.HasMore)
+}
+
+// testServer_LeaveChat_EndsArchive pins that a departure ends the archive
+// with the membership: a member who leaves an archived group and rejoins it
+// finds it in their INBOX with no archive on their state, and nothing was
+// published for the archive's end.
+func testServer_LeaveChat_EndsArchive(t *testing.T, s chat.Store) {
+	e := newServerEnv(t, s)
+
+	group := e.putGroup("Group", at(1), model.MustGenerateUserID())
+	require.Equal(t, chatpb.ArchiveChatResponse_OK, e.archiveChat(e.keys, group).Result)
+	e.waitForViewerStateUpdates(e.userID, group, 1)
+	require.Equal(t, [][]byte{group.Value}, e.pageGroupFeed(chatpb.ChatFolder_ARCHIVED, 10))
+
+	require.Equal(t, chatpb.LeaveChatResponse_OK, e.mustLeaveChat(e.keys, group).Result)
+	require.Empty(t, e.pageGroupFeed(chatpb.ChatFolder_ARCHIVED, 10))
+	require.Empty(t, e.pageGroupFeed(chatpb.ChatFolder_INBOX, 10))
+
+	require.Equal(t, chatpb.JoinChatResponse_OK, e.mustJoinChat(e.keys, group).Result)
+	require.Equal(t, [][]byte{group.Value}, e.pageGroupFeed(chatpb.ChatFolder_INBOX, 10))
+	require.Empty(t, e.pageGroupFeed(chatpb.ChatFolder_ARCHIVED, 10))
+
+	// The departure removed the archive, moving the version by one.
+	require.NoError(t, protoutil.ProtoEqualError(viewerState(2, nil, false), e.getChat(e.keys, group).Metadata.ViewerState))
+	e.waitForViewerStateUpdates(e.userID, group, 1)
 }

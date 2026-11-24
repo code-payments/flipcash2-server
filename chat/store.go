@@ -84,6 +84,16 @@ var (
 	// the cap the pin was made under allows (see Store.PinMessage and
 	// MaxPinnedMessages).
 	ErrTooManyPins = errors.New("too many pins")
+
+	// ErrNotMember indicates that a user is not a member of the chat they
+	// were to archive (see Store.SetArchived).
+	ErrNotMember = errors.New("not a member")
+
+	// ErrExcludedFromFeed indicates that a user's copy of the chat they were
+	// to archive is in none of their folders, because the store excludes
+	// them from the feed (see FeedExclusions), so it cannot be moved between
+	// them (see Store.SetArchived).
+	ErrExcludedFromFeed = errors.New("excluded from the feed")
 )
 
 // MaxGroupChatCreationMembers is the largest initial member set a group chat
@@ -137,23 +147,28 @@ type DmFeedCursor struct {
 // methods, which accept both and do not care which.
 //
 // Viewer state (see ViewerState) is one record per (user, chat), written by
-// that user's own actions (a mute) and by the group creator's moderation of
-// them (a silence, a ban), and read back to them — plus the chat-scoped reads
-// GetMutedUsers, GetMutedUsersPage and GetMutedCount, which serve the push
-// fan-out, GetRestrictedUsersPage, the creator's listing, and
-// GetViewerStatesForUsers. Records are sparse: nothing is written when a chat
-// is created or joined, a record appears on the first write about the user,
-// and nothing removes it — a cleared mute or a lifted restriction leaves the
-// record and its version behind. The user's own settings and the creator's
-// restrictions are independent within it: a mute's writes never touch a
-// restriction, and a restriction's never touch a mute or the muted count.
-// The record knows nothing of membership: a departure clears a mute only
-// because the leave handler calls ClearMute (see Server.LeaveChat), which
-// leaves a silence and a ban as they are, and whether the caller may act on
-// the chat, or on the user, is likewise the caller's gate. The one tie to the
-// roster is a ban, which removes the user from it, and from the lobby, in the
-// same write (see BanUser), and which the writes that join a user check (see
-// ErrBanned). Every write is conditional — a single update, or one
+// that user's own actions (a mute, an archive) and by the group creator's
+// moderation of them (a silence, a ban), and read back to them — plus the
+// chat-scoped reads GetMutedUsers, GetMutedUsersPage and GetMutedCount,
+// which serve the push fan-out, GetRestrictedUsersPage, the creator's
+// listing, and GetViewerStatesForUsers. Records are sparse: nothing is
+// written when a chat is created or joined, a record appears on the first
+// write about the user, and nothing removes it — a cleared mute, a removed
+// archive or a lifted restriction leaves the record and its version behind.
+// The user's own settings and the creator's restrictions are independent
+// within it: a mute's writes never touch an archive or a restriction, an
+// archive's never touch a mute, the muted count or a restriction, and a
+// restriction's never touch a mute, the muted count or an archive, but for
+// the ban's departure below. A mute knows nothing of membership: a departure
+// clears it only because the leave handler calls ClearMute (see
+// Server.LeaveChat), which leaves a silence and a ban as they are, and
+// whether the caller may act on the chat, or on the user, is likewise the
+// caller's gate. The ties to the roster are an archive and a ban. An archive
+// is held only by a member, judged in the write that records it, and is
+// removed by the write that records a group departure (see archive.go and
+// SetArchived). A ban removes the user from the roster, and from the lobby,
+// in the same write (see BanUser), and the writes that join a user check it
+// (see ErrBanned). Every write is conditional — a single update, or one
 // transaction where a store keeps an aggregate or the roster alongside the
 // record — and moves Version by exactly one on a real change and not at all
 // on a no-op, so a retried or duplicated request is harmless.
@@ -306,6 +321,14 @@ type Store interface {
 	// ErrChatNotFound if the chat does not exist, and an error if chatID is not
 	// a group chat ID.
 	//
+	// A departure that actually happens also ends the user's archive of the
+	// group, if they hold one (see archive.go), atomically with it: their
+	// ViewerState loses ArchivedAt and moves Version by one, and the departed
+	// record is filed in the inbox, as every departure's is. It touches
+	// nothing else of the state, a mute included (see Server.LeaveChat).
+	// Nothing reports the archive's end: a departure always ends it, so the
+	// departure itself says so (see archive.go).
+	//
 	// With discardKeyEnvelope, a departure that actually happens also removes
 	// the user's key envelope for the chat (see KeyEnvelope), atomically with
 	// it: the user stops being a member and stops holding an envelope
@@ -359,10 +382,11 @@ type Store interface {
 	// chatID is not a DM chat ID.
 	GetDmOpeningIntentID(ctx context.Context, chatID *commonpb.ChatId) (*commonpb.IntentId, error)
 
-	// GetDmFeedPage returns one page of userID's DM feed for a single chat type,
-	// pinned to a snapshot: the DMs of chatType userID is a member of (never
-	// one that excludes them from the feed, see PutChat) whose last_activity
-	// is at or before snapshot, ordered by (last_activity, chat_id) descending
+	// GetDmFeedPage returns one page of userID's DM feed for a single chat type
+	// and folder, pinned to a snapshot: the DMs of chatType userID is a member
+	// of (never one that excludes them from the feed, see PutChat), filed in
+	// folder for them (see archive.go), whose last_activity is at or before
+	// snapshot, ordered by (last_activity, chat_id) descending
 	// (most recent first), at most limit chats (limit <= 0 means unbounded).
 	// When cursor is nil the page starts at the most recent chat in the
 	// snapshot; otherwise it resumes strictly after cursor. An empty result
@@ -376,9 +400,13 @@ type Store interface {
 	// MetadataUpdate event stream instead (see the Chat service's GetDmChatFeed).
 	//
 	// It is scoped to a single DM type because each type is its own feed (see
-	// GetDmChatFeedRequest.dm_chat_type). Group chats will have a parallel
-	// accessor, and the server merges the descending streams into one feed.
-	GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, snapshot time.Time, cursor *DmFeedCursor, limit int) ([]*Chat, error)
+	// GetDmChatFeedRequest.dm_chat_type), and to a single folder because each
+	// folder is its own list (see GetDmChatFeedRequest.folder): an archived DM
+	// is in the archived folder alone, ordered there by its last_activity
+	// like any other, and a cursor is a position in the one folder it was read
+	// from. Group chats will have a parallel accessor, and the server merges
+	// the descending streams into one feed.
+	GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, folder Folder, snapshot time.Time, cursor *DmFeedCursor, limit int) ([]*Chat, error)
 
 	// GetMembers returns the member user IDs of a chat, or ErrChatNotFound. For
 	// a DM this is the canonical inline member list; for a group chat it is the
@@ -400,8 +428,9 @@ type Store interface {
 	// group that does not exist is an empty page, not ErrChatNotFound, and a
 	// caller that needs the distinction reads GetChatByID first — which the
 	// walkers do anyway, for the metadata a push carries. Like GetMembers, it
-	// may lag a transition by a moment. It returns an error if chatID is not a
-	// group chat ID.
+	// may lag a transition by a moment, and an archive or unarchive likewise
+	// (see MembersPage.Archived), which the records file the group by. It
+	// returns an error if chatID is not a group chat ID.
 	GetGroupMembersPage(ctx context.Context, chatID *commonpb.ChatId, after *commonpb.UserId, limit int) (MembersPage, error)
 
 	// GetGroupRoster returns a group's RosterSummary and every joined member
@@ -510,13 +539,27 @@ type Store interface {
 	// filters on Joined (see GetGroupChatsForUser). A user the store excludes
 	// from the feed has every record unlisted, so gets an empty result (see
 	// PutChat).
-	GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId) ([]GroupMembership, error)
+	//
+	// It lists the records filed in folder alone (see archive.go): the inbox
+	// leaves out a group the user has archived while the archive stands, and
+	// the archived folder lists only those, each joined, since every departed
+	// record is in the inbox, a departure filing it there. Like the inbox's,
+	// the archived folder's listing is read from an index that may trail an
+	// archive, an unarchive or a departure by a moment, so a group that just
+	// moved may still be listed in the folder it left, or not yet in the one
+	// it entered; GetArchivedChats is the strongly consistent answer to which
+	// chats the user has archived. The event stream reads the inbox at open
+	// and on every reconcile, and the archived folder when it starts
+	// following the user's archive and on every reconcile while it follows
+	// (see event.Server).
+	GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId, folder Folder) ([]GroupMembership, error)
 
 	// GetGroupChatsForUser returns the canonical record of every group chat
-	// userID is currently a joined member of, in no particular order. It is
-	// GetGroupMembershipsForUser, less the departed records, followed by the
-	// canonical read of each ID, and returns records exactly as GetChatByID
-	// does: Members empty and RosterSummary zero. A user with no group
+	// userID is currently a joined member of and has filed in folder (see
+	// archive.go), in no particular order. It is the membership listing of
+	// that folder, less the departed records, followed by the canonical read
+	// of each ID, and returns records exactly as GetChatByID does: Members
+	// empty and RosterSummary zero. A user with no group
 	// memberships gets an empty result, not an error, as does a user the
 	// store excludes from the feed, whose records are unlisted (see PutChat).
 	//
@@ -524,13 +567,14 @@ type Store interface {
 	// groups are ordered by reading every one of them and sorting — so this is
 	// paid once per feed snapshot, and the order is carried forward from there
 	// (see Server.GetGroupChatFeed).
-	GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserId) ([]*Chat, error)
+	GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserId, folder Folder) ([]*Chat, error)
 
 	// GetGroupChatsForUserByIDs is GetGroupChatsForUser restricted to chatIDs:
-	// the canonical record of each given group chat that exists and that userID
-	// is currently a joined member of, in no particular order. IDs the user is
-	// not a member of (never, or no longer) and IDs of chats that do not exist
-	// are omitted rather than reported; duplicate IDs collapse. It returns an
+	// the canonical record of each given group chat that exists, that userID
+	// is currently a joined member of and that they have filed in folder, in
+	// no particular order. IDs the user is not a member of (never, or no
+	// longer), IDs filed in their other folder and IDs of chats that do not
+	// exist are omitted rather than reported; duplicate IDs collapse. It returns an
 	// error if any ID is not a group chat ID, and an empty result (no error) when
 	// chatIDs is empty. Like GetGroupChatsForUser, it returns nothing for a
 	// user the store excludes from the feed (see PutChat).
@@ -539,8 +583,10 @@ type Store interface {
 	// IDs are a caller's hint of what to read, never its authority to read it.
 	// The group feed resumes from IDs a client echoed back in a paging token,
 	// and this is what keeps a tampered token, or one that outlived the caller's
-	// membership, from surfacing a chat they cannot see.
-	GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) ([]*Chat, error)
+	// membership, from surfacing a chat they cannot see, and a group archived
+	// or unarchived since the token was minted from surfacing in the folder it
+	// left.
+	GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.UserId, folder Folder, chatIDs []*commonpb.ChatId) ([]*Chat, error)
 
 	// GetGroupChatsByID returns the canonical record of each given group chat
 	// that exists, keyed by string(chatID.Value), whoever is asking: it checks
@@ -576,8 +622,10 @@ type Store interface {
 	//
 	// A DM keeps a copy of its activity per member, which is what orders that
 	// member's DM feed (see GetDmFeedPage); an advance moves every such copy
-	// with the canonical record. A member the DM excludes from the feed (see
-	// PutChat) has no copy to move and is left out.
+	// with the canonical record, in whichever folder the member has filed the
+	// DM, so an archived DM stays ordered by its activity and is not moved out
+	// of the archive. A member the DM excludes from the feed (see PutChat) has
+	// no copy to move and is left out.
 	AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId, ts time.Time) (advanced bool, members []*commonpb.UserId, err error)
 
 	// SetMute records mute as userID's mute on chatID, replacing any mute
@@ -586,16 +634,54 @@ type Store interface {
 	// Mute.Normalize) is a no-op that returns the current state at its
 	// current version. It returns ErrMuteUntilOutOfRange for a timed mute
 	// outside the recordable range (see Mute). It touches nothing of the
-	// user's restrictions.
+	// user's archive or restrictions.
 	SetMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mute Mute) (state ViewerState, changed bool, err error)
 
 	// ClearMute removes userID's mute on chatID, lapsed or not, and returns
 	// the state after the write. Clearing when no mute is recorded is a no-op
 	// that returns the current state — the zero state when the user has no
 	// record, which the no-op does not create. It touches nothing of the
-	// user's restrictions, which is what lets a departure clear a mute (see
-	// Server.LeaveChat) and leave a silence or a ban standing.
+	// user's archive or restrictions, which is what lets a departure clear a
+	// mute (see Server.LeaveChat) and leave a silence or a ban standing.
 	ClearMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (state ViewerState, changed bool, err error)
+
+	// SetArchived archives the chat c for userID as of now when archived is
+	// set, and removes their archive of it otherwise (see archive.go),
+	// returning their state after the call. c is the chat as the caller read
+	// it (see GetChatByID): its ID, its type and a DM's members are all the
+	// store takes from it. A real change records or removes ArchivedAt, moves
+	// Version by exactly one and, in the same write, files the chat in the
+	// folder that follows for the user, so a listing of either folder never
+	// disagrees with the state; it touches nothing of the user's mute, the
+	// muted count or the restrictions. now is the archive's time, recorded at
+	// nanosecond precision in UTC (see RecordedTime), and is ignored by an
+	// unarchive.
+	//
+	// It is judged in this order. Archiving a chat the user has archived, or
+	// unarchiving one they have not, is a no-op that writes nothing and
+	// returns the current state with changed false — the zero state when
+	// they have no record, which the no-op does not create — whether or not
+	// they are a member, since a non-member holds no archive. Otherwise a
+	// user who is not a member of c is refused with ErrNotMember: a DM's
+	// member is one of c's members, and a group's one whose membership is
+	// joined as of the write, so an archive never lands for a user who left
+	// meanwhile. A member whose copy of the chat is in no folder, a member a
+	// DM excludes from the feed or one whose group membership the store
+	// writes unlisted (see FeedExclusions), is refused with
+	// ErrExcludedFromFeed. Both refusals write nothing. It returns an error,
+	// writing nothing, if c fails ValidateArchiveChat, if c is a DM stored as
+	// another type than c's (the type is part of the folder the DM is filed
+	// in), or if, when archiving, now is before the Unix epoch.
+	SetArchived(ctx context.Context, c *Chat, userID *commonpb.UserId, archived bool, now time.Time) (state ViewerState, changed bool, err error)
+
+	// GetArchivedChats returns every chat userID holds an archive of, DMs and
+	// groups alike, in no particular order, each with when it was archived
+	// and the Version of the user's state there. The read is strongly
+	// consistent: it reflects every archive, unarchive and departure that
+	// completed before it, so each version is at least that of every write
+	// of the state completed before the read. A user who has archived
+	// nothing gets an empty result, not an error.
+	GetArchivedChats(ctx context.Context, userID *commonpb.UserId) ([]ArchivedChat, error)
 
 	// GetViewerStates returns userID's state on each of chatIDs that they have
 	// a record on, keyed by string(chatID.Value); a chat with no record is
@@ -611,7 +697,9 @@ type Store interface {
 	// absent rather than reported, and duplicate IDs collapse. The read is
 	// eventually consistent, at half the cost of a strong one: it may trail a
 	// write by a moment, which its readers tolerate, since they rank and show
-	// people (e.g. dropping banned users from mention suggestions) rather than
+	// people (e.g. dropping banned users from mention suggestions) or keep a
+	// push quiet (a DM recipient's mute and archive, a group cash message's
+	// receivers' archives, read as the fan-out's mute reads are) rather than
 	// gate an action — a gate reads the user's own state with GetViewerStates.
 	// An empty userIDs is an empty result, not an error.
 	GetViewerStatesForUsers(ctx context.Context, chatID *commonpb.ChatId, userIDs []*commonpb.UserId) (map[string]ViewerState, error)
@@ -647,7 +735,10 @@ type Store interface {
 	// join, an admission or an entry racing the ban either lands first and is
 	// undone by it, or lands after and is refused (see ErrBanned): a banned
 	// user never holds a membership or an entry. A ban leaves a silence, and
-	// a mute, as they are.
+	// a mute, as they are. A ban removes the user's archive of the group, if
+	// they hold one, in the same write (see archive.go), as the departure it
+	// makes of a member does, so State is without it, at the one version the
+	// ban moves it to.
 	//
 	// Banning a user already banned is a no-op that writes nothing, returning
 	// Changed false with the state at its current version and the roster as

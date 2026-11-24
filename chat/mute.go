@@ -58,14 +58,14 @@ func (s *Server) MuteChat(ctx context.Context, req *chatpb.MuteChatRequest) (*ch
 		return nil, status.Error(codes.InvalidArgument, "mute must end in the future")
 	}
 
-	c, allowed, err := s.mutingAllowed(ctx, log, req.ChatId, userID)
+	c, gate, err := s.memberSettingGate(ctx, log, req.ChatId, userID)
 	if err != nil {
 		return nil, err
 	}
-	switch allowed {
-	case chatpb.MuteChatResponse_NOT_FOUND:
+	switch gate {
+	case memberGateNotFound:
 		return &chatpb.MuteChatResponse{Result: chatpb.MuteChatResponse_NOT_FOUND}, nil
-	case chatpb.MuteChatResponse_DENIED:
+	case memberGateDenied:
 		return &chatpb.MuteChatResponse{Result: chatpb.MuteChatResponse_DENIED}, nil
 	}
 
@@ -103,14 +103,14 @@ func (s *Server) UnmuteChat(ctx context.Context, req *chatpb.UnmuteChatRequest) 
 		zap.String("chat_id", model.ChatIDString(req.ChatId)),
 	)
 
-	c, allowed, err := s.mutingAllowed(ctx, log, req.ChatId, userID)
+	c, gate, err := s.memberSettingGate(ctx, log, req.ChatId, userID)
 	if err != nil {
 		return nil, err
 	}
-	switch allowed {
-	case chatpb.MuteChatResponse_NOT_FOUND:
+	switch gate {
+	case memberGateNotFound:
 		return &chatpb.UnmuteChatResponse{Result: chatpb.UnmuteChatResponse_NOT_FOUND}, nil
-	case chatpb.MuteChatResponse_DENIED:
+	case memberGateDenied:
 		return &chatpb.UnmuteChatResponse{Result: chatpb.UnmuteChatResponse_DENIED}, nil
 	}
 
@@ -130,22 +130,36 @@ func (s *Server) UnmuteChat(ctx context.Context, req *chatpb.UnmuteChatRequest) 
 	}, nil
 }
 
-// mutingAllowed is the gate MuteChat and UnmuteChat share, reported in
-// MuteChat's result vocabulary (Unmute's is identical): NOT_FOUND for a chat
-// that does not exist, DENIED for a non-member, OK otherwise. The canonical
-// record is read first because a membership check alone cannot tell the two
-// failures apart, and then decides what it can: a DM's membership is on it,
-// so a DM is gated on that one read; a group's is read from the store,
-// strongly consistent, as every gate reads it (see Access.IsMemberWithChat)
-// — the first thing a user does after joining may be to mute. The rules are
-// never evaluated: membership alone is the gate. The record is returned with
-// an OK, since the caller projects the member's permissions off it. A gRPC
-// error is returned only for a failed read.
-func (s *Server) mutingAllowed(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (*Chat, chatpb.MuteChatResponse_Result, error) {
+// memberGate is the outcome of memberSettingGate, which each RPC that uses
+// it reports in its own result vocabulary.
+type memberGate int
+
+const (
+	// memberGateOK: the chat exists and the caller is a member of it.
+	memberGateOK memberGate = iota
+	// memberGateNotFound: the chat does not exist.
+	memberGateNotFound
+	// memberGateDenied: the chat exists and the caller is not a member.
+	memberGateDenied
+)
+
+// memberSettingGate is the gate shared by the RPCs that write a member's own
+// setting on a chat — MuteChat and UnmuteChat, ArchiveChat and UnarchiveChat
+// (see archive.go) — each reporting it in its own result vocabulary:
+// NOT_FOUND for a chat that does not exist, DENIED for a non-member, OK
+// otherwise. The canonical record is read first because a membership check
+// alone cannot tell the two failures apart, and then decides what it can: a
+// DM's membership is on it, so a DM is gated on that one read; a group's is
+// read from the store, strongly consistent, as every gate reads it (see
+// Access.IsMemberWithChat) — the first thing a user does after joining may be
+// to mute. The rules are never evaluated: membership alone is the gate. The
+// record is returned with an OK, since the caller projects the member's
+// permissions off it. A gRPC error is returned only for a failed read.
+func (s *Server) memberSettingGate(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId) (*Chat, memberGate, error) {
 	c, err := s.chats.GetChatByID(ctx, chatID)
 	if err != nil {
 		if errors.Is(err, ErrChatNotFound) {
-			return nil, chatpb.MuteChatResponse_NOT_FOUND, nil
+			return nil, memberGateNotFound, nil
 		}
 		log.With(zap.Error(err)).Warn("Failure getting chat")
 		return nil, 0, status.Error(codes.Internal, "")
@@ -157,9 +171,9 @@ func (s *Server) mutingAllowed(ctx context.Context, log *zap.Logger, chatID *com
 		return nil, 0, status.Error(codes.Internal, "")
 	}
 	if !isMember {
-		return nil, chatpb.MuteChatResponse_DENIED, nil
+		return nil, memberGateDenied, nil
 	}
-	return c, chatpb.MuteChatResponse_OK, nil
+	return c, memberGateOK, nil
 }
 
 // publishViewerStateChanged sends the user's new state on chatID, with their

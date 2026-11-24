@@ -1021,6 +1021,18 @@ func (m Mute) Normalize() (Mute, error) {
 // range a store can record (see Silence.Until).
 var ErrSilenceUntilOutOfRange = errors.New("silence until is out of range")
 
+// RecordedTime is now as a store records a time on a user's ViewerState (a
+// restriction's, an archive's): at nanosecond precision, in UTC, with no
+// monotonic reading, which is what the record reads back, so every store
+// returns the same time for it; or an error when it is before the Unix
+// epoch, which no store records.
+func RecordedTime(now time.Time) (time.Time, error) {
+	if now.Before(time.Unix(0, 0)) {
+		return time.Time{}, fmt.Errorf("time before the unix epoch")
+	}
+	return time.Unix(0, now.UnixNano()).UTC(), nil
+}
+
 // Silence is a silence a group's creator set on a user: until an instant, or
 // until the creator lifts it (Forever). While a silence is active the user
 // may still read the group, react and vote, but not speak in it (send, edit,
@@ -1082,7 +1094,7 @@ func (s Silence) Normalize() (Silence, error) {
 }
 
 // ViewerState is what a chat holds about one user, independent of whether
-// they are a member: state the user set for themselves (today, a mute),
+// they are a member: state the user set for themselves (a mute, an archive),
 // restrictions the group's creator set on them (a silence, a ban; see
 // Store.SetSilence and Store.BanUser), and a version over all of it. It is
 // private to that user and never shared with other members, and shown to the
@@ -1091,13 +1103,17 @@ func (s Silence) Normalize() (Silence, error) {
 // Store.GetRestrictedUsersPage). The record outlives membership — the version
 // never resets — but what it holds may not: a mute is cleared, best effort,
 // when the user leaves the chat (see Server.LeaveChat), so a user who returns
-// to a group starts unmuted unless that clear failed. Restrictions are not:
-// they are the creator's, and survive any number of departures and returns,
-// which is the point of them.
+// to a group starts unmuted unless that clear failed, and an archive is
+// removed by the store in the write that records a group departure (see
+// archive.go), so a user who returns starts in their inbox. Restrictions are
+// not: they are the creator's, and survive any number of departures and
+// returns, which is the point of them.
 //
 // Mute is the recorded mute, or nil when none is set; see Mute for what a
-// recorded mute may still mean. Silence is likewise the recorded silence, or
-// nil, lapsed or not (see Silence). BannedAt is when the user was banned,
+// recorded mute may still mean. ArchivedAt is when the user archived the
+// chat, or nil when they hold no archive of it (see archive.go): it decides
+// the Folder the chat is filed in for them. Silence is likewise the recorded
+// silence, or nil, lapsed or not (see Silence). BannedAt is when the user was banned,
 // or nil when they are not: a ban has no duration, and holds until lifted
 // (see Store.UnbanUser). A banned user is never a member of the group nor
 // waiting in its lobby, which the store guarantees in the writes that join,
@@ -1108,9 +1124,10 @@ func (s Silence) Normalize() (Silence, error) {
 // listing, most recently restricted first.
 //
 // Version is state, not a delta: every real change — a mute or silence set,
-// replaced or cleared, a ban made or lifted — moves it by exactly one and an
-// idempotent no-op leaves it alone, so a client keeps the greater of two
-// versions and drops the rest, whatever order they arrived in. The user's own
+// replaced or cleared, an archive made or removed, a ban made or lifted —
+// moves it by exactly one and an idempotent no-op leaves it alone, so a
+// client keeps the greater of two versions and drops the rest, whatever
+// order they arrived in. The user's own
 // settings and the creator's restrictions share it, since one ViewerState
 // carries both. It is not the roster version (see RosterSummary), which
 // nothing here ever moves; a ban that removes a member moves both, each by
@@ -1127,6 +1144,7 @@ func (s Silence) Normalize() (Silence, error) {
 // moving the version on every transition of a user who may hold no record.
 type ViewerState struct {
 	Mute         *Mute
+	ArchivedAt   *time.Time
 	Silence      *Silence
 	BannedAt     *time.Time
 	RestrictedAt *time.Time
@@ -1194,8 +1212,10 @@ func (p RestrictionPosition) Compare(o RestrictionPosition) int {
 // call; whether the ban was made (Changed false when it was already in
 // force, with nothing written); whether it removed the user from the roster
 // (Departed), with Roster the group's summary as of the write — after the
-// departure when there was one, as read otherwise; and whether it removed
-// the user from the group's lobby (LeftLobby).
+// departure when there was one, as read otherwise; whether it removed the
+// user from the group's lobby (LeftLobby). A ban also removes the user's
+// archive of the group, as a departure does (see archive.go), so State is
+// without it.
 type BanResult struct {
 	State     ViewerState
 	Changed   bool
@@ -1265,10 +1285,20 @@ func (p Permissions) ToProto() *chatpb.ViewerState_Permissions {
 // MembersPage is one page of a group's joined members in user-ID order (see
 // Store.GetGroupMembersPage): the users, and the cursor to resume after, nil
 // once the walk is complete. Its first and last user bound the key range a
-// caller hands Store.GetMutedUsersPage for the same page.
+// caller hands Store.GetMutedUsersPage for the same page. Archived names the
+// users on the page who hold an archive of the group (see archive.go), keyed
+// by string(userID.Value), as of the same read; it is nil when none does.
 type MembersPage struct {
-	Users []*commonpb.UserId
-	Next  *commonpb.UserId
+	Users    []*commonpb.UserId
+	Next     *commonpb.UserId
+	Archived map[string]struct{}
+}
+
+// IsArchived reports whether the page has userID holding an archive of the
+// group.
+func (p MembersPage) IsArchived(userID *commonpb.UserId) bool {
+	_, ok := p.Archived[string(userID.GetValue())]
+	return ok
 }
 
 // GroupMember is one joined member of a group as its membership record holds
@@ -1329,10 +1359,11 @@ func (v ViewerState) ActiveMute(now time.Time) *Mute {
 }
 
 // ToProto projects the state onto a chatpb.ViewerState exactly as recorded:
-// the version, under settings the mute if one is recorded, under
-// restrictions the silence if one is recorded, each lapsed or not, and the
-// user's permissions in the chat as the caller computed them (see
-// Permissions). A version names one exact state, and every carrier of that
+// the version, under settings the mute and the archive if either is
+// recorded (settings itself always, so a state with neither still carries
+// it), under restrictions the silence if one is recorded, each lapsed or
+// not, and the user's permissions in the chat as the caller computed them
+// (see Permissions). A version names one exact state, and every carrier of that
 // version — a response, a hydrated Metadata, a ViewerStateChanged — must
 // agree on it, which they could not if the projection depended on the clock
 // it was made at. Whether a timed mute or silence is still in force is the
@@ -1353,6 +1384,9 @@ func (v ViewerState) ToProto(permissions Permissions) *chatpb.ViewerState {
 	if v.Mute != nil {
 		out.Settings.Mute = v.Mute.ToProto()
 	}
+	if v.ArchivedAt != nil {
+		out.Settings.Archive = &chatpb.ArchiveState{ArchivedAt: timestamppb.New(*v.ArchivedAt)}
+	}
 	if v.Silence != nil {
 		out.Restrictions = &chatpb.ViewerState_Restrictions{Silence: v.Silence.ToProto()}
 	}
@@ -1365,6 +1399,10 @@ func (v ViewerState) Clone() ViewerState {
 	if v.Mute != nil {
 		mute := *v.Mute
 		out.Mute = &mute
+	}
+	if v.ArchivedAt != nil {
+		archivedAt := *v.ArchivedAt
+		out.ArchivedAt = &archivedAt
 	}
 	if v.Silence != nil {
 		silence := *v.Silence

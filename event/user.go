@@ -16,13 +16,16 @@ import (
 
 	ocp_client "github.com/code-payments/ocp-server/grpc/client"
 
+	"github.com/code-payments/flipcash2-server/chat"
 	"github.com/code-payments/flipcash2-server/cluster"
 	"github.com/code-payments/flipcash2-server/rpc"
 )
 
 // streamUserEvents serves a stream for the signing user: every event
 // addressed to them, on their own topic and on the topic of every group they
-// are a member of, following their membership as it moves.
+// are a member of and have not archived — and of their archived groups too
+// while the stream follows their archive (see archive.go) — following their
+// membership and archives as they move.
 func (s *Server) streamUserEvents(ctx context.Context, log *zap.Logger, stream grpc.BidiStreamingServer[eventpb.StreamEventsRequest, eventpb.StreamEventsResponse], userID *commonpb.UserId) error {
 	// The badge counts what was pushed while the user was not in the app, so
 	// it resets at both ends of a stream. A stream open is the client coming to
@@ -100,6 +103,23 @@ func (s *Server) streamUserEvents(ctx context.Context, log *zap.Logger, stream g
 	// also predates, by its timing or by the inverted membership index's
 	// replication lag. The reconcile sweep re-reads for those (see
 	// reconcileMembership).
+	//
+	// The read is of the user's inbox alone: a stream opens not following
+	// their archive, so their archived groups' topics are not its to follow
+	// until it is asked to (see followArchiveRequest). Nothing else is read
+	// at open, the strongly consistent read of their archives included, which
+	// costs a query of their whole state partition on every open, every app
+	// foreground, to close a window the reconcile closes anyway: the listing
+	// trails an archive or unarchive by the index's replication lag, so a
+	// group archived a moment before the open may still be listed and
+	// attached — its updates reach a client that holds it archived and has
+	// no use for them until the archive's ViewerStateChanged, if it arrives,
+	// or the first reconcile takes the stream off it — and one unarchived a
+	// moment before may not be listed yet, and is missed until its
+	// ViewerStateChanged or the reconcile attaches it, the gap covered by the
+	// client's catch-up after an unarchive. A transition or state the stream
+	// does hear of meanwhile is merged through the gates as above, so a seed
+	// never attaches a group an archive delivered before it has taken off.
 	session := newStreamSession(streamID, localStream{stream: ss, userID: userID}, userStreamKey(userID), s.streams)
 	s.sessions.add(session)
 	if !session.open() {
@@ -147,7 +167,7 @@ func (s *Server) streamUserEvents(ctx context.Context, log *zap.Logger, stream g
 		}
 	}()
 
-	memberships, err := s.chats.GetGroupMembershipsForUser(ctx, userID)
+	memberships, err := s.chats.GetGroupMembershipsForUser(ctx, userID, chat.FolderInbox)
 	// Before any return from here, so the open reset always lands before the
 	// teardown's reset at close.
 	openReset.Wait()
@@ -195,5 +215,5 @@ func (s *Server) streamUserEvents(ctx context.Context, log *zap.Logger, stream g
 		s.releaseHandles(ctx, refused)
 	}
 
-	return s.run(ctx, log, stream, ss, nil)
+	return s.run(ctx, log, stream, ss, nil, session)
 }

@@ -58,6 +58,14 @@ func RunServerTests(t *testing.T, accounts account.Store, teardown func()) {
 		testChatEventPublishing,
 		testMembershipFollowsStreams,
 		testMembershipReconciles,
+		testArchiveFollowing,
+		testFollowArchiveAcks,
+		testArchivePerStream,
+		testArchiveStaleViewerState,
+		testArchivedAtOpen,
+		testArchiveLeaveAndJoin,
+		testArchiveReconciles,
+		testFollowArchiveIgnoredByPreview,
 		testChatPreview,
 		testChatPreviewOpenVersusPrivate,
 		testChatPreviewExpires,
@@ -1102,11 +1110,15 @@ type testEnv struct {
 	badges       badge.Store
 	clusterStore cluster.Store
 	chats        chat.Store
-	accounts     *staffAccounts
-	client1      *clientTestEnv
-	client2      *clientTestEnv
-	server1      *serverTestEnv
-	server2      *serverTestEnv
+	// archivesDelay holds back the servers' reads of a user's archives by
+	// its value in nanoseconds (see delayedArchives), so a test can tell what
+	// waits on that read from what does not.
+	archivesDelay *atomic.Int64
+	accounts      *staffAccounts
+	client1       *clientTestEnv
+	client2       *clientTestEnv
+	server1       *serverTestEnv
+	server2       *serverTestEnv
 }
 
 type serverTestEnv struct {
@@ -1201,6 +1213,8 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool, opt
 
 	// A shared chat store, so both servers resolve the same group memberships.
 	env.chats = chat_memory.NewInMemory(nil)
+	env.archivesDelay = new(atomic.Int64)
+	serverChats := delayedArchives{Store: env.chats, delay: env.archivesDelay}
 
 	// The access a chat stream's viewer is admitted by, over the shared chat
 	// store, with a staff flag the tests can set and no admission window, so a
@@ -1233,7 +1247,7 @@ func setupTest(t *testing.T, accounts account.Store, enableMultiServer bool, opt
 				authz,
 				accounts,
 				badges,
-				env.chats,
+				serverChats,
 				access,
 				subscriptions,
 				userEventBus,
@@ -2051,4 +2065,577 @@ type emptyOcpBalance struct{}
 
 func (emptyOcpBalance) GetBalances(context.Context, *ocp_balancepb.GetBalancesRequest, ...grpc.CallOption) (*ocp_balancepb.GetBalancesResponse, error) {
 	return &ocp_balancepb.GetBalancesResponse{}, nil
+}
+
+// delayedArchives is a chat store whose reads of a user's archives wait
+// out delay first.
+type delayedArchives struct {
+	chat.Store
+	delay *atomic.Int64
+}
+
+func (d delayedArchives) GetArchivedChats(ctx context.Context, userID *commonpb.UserId) ([]chat.ArchivedChat, error) {
+	time.Sleep(time.Duration(d.delay.Load()))
+	return d.Store.GetArchivedChats(ctx, userID)
+}
+
+// archiveFixture is the common shape of the archive tests: userA, who
+// archives, and userB, a fellow member who never does, in one group, with
+// helpers over its chat topic.
+type archiveFixture struct {
+	t     *testing.T
+	env   testEnv
+	group *commonpb.ChatId
+
+	userA, userB *commonpb.UserId
+	keysA, keysB model.KeyPair
+}
+
+func newArchiveFixture(t *testing.T, accounts account.Store, opts ...event.ServerOption) (*archiveFixture, func()) {
+	env, cleanup := setupTest(t, accounts, true, opts...)
+	f := &archiveFixture{t: t, env: env}
+	f.userA, f.keysA = registerUser(t, accounts)
+	f.userB, f.keysB = registerUser(t, accounts)
+	f.group = putGroupChat(t, env.chats, f.userA, f.userB)
+	return f, cleanup
+}
+
+func (f *archiveFixture) self(s *serverTestEnv) string { return s.membership.Self().InstanceID }
+
+// subscribers is the servers registered on the group's chat topic.
+func (f *archiveFixture) subscribers() map[string]bool {
+	rows, err := f.env.clusterStore.GetSubscribers(context.Background(), event.ChatEventsNamespace, f.group.Value)
+	require.NoError(f.t, err)
+	out := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		out[row.InstanceID] = true
+	}
+	return out
+}
+
+// on names the servers a subscriber set should hold.
+func (f *archiveFixture) on(servers ...*serverTestEnv) map[string]bool {
+	out := make(map[string]bool, len(servers))
+	for _, s := range servers {
+		out[f.self(s)] = true
+	}
+	return out
+}
+
+// waitForSubscribers waits for the group's chat topic to be registered by
+// exactly the given servers, then past the publishers' subscriber cache, so
+// the next publish resolves the rows as they now stand.
+func (f *archiveFixture) waitForSubscribers(servers ...*serverTestEnv) {
+	want := f.on(servers...)
+	require.Eventually(f.t, func() bool { return maps.Equal(f.subscribers(), want) }, 5*time.Second, 10*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+}
+
+// publishChat publishes a test event on the group's chat topic.
+func (f *archiveFixture) publishChat(sender *serverTestEnv) *eventpb.Event {
+	e := newTestEvent()
+	sender.chatEventBus.OnEvent(f.group, &eventpb.ChatEvent{ChatId: f.group, Event: e})
+	return e
+}
+
+// setArchived archives or unarchives chatID for user in the store and
+// publishes the ViewerStateChanged the chat server would, on sender's bus,
+// returning it.
+func (f *archiveFixture) setArchived(sender *serverTestEnv, user *commonpb.UserId, chatID *commonpb.ChatId, archived bool) *eventpb.Event {
+	state := f.setArchivedSilently(user, chatID, archived)
+	e := viewerStateChangedEvent(chatID, state)
+	sender.userEventBus.OnEvent(user, e)
+	return e
+}
+
+// setArchivedSilently archives or unarchives chatID for user in the store
+// with nothing published, the shape of a ViewerStateChanged lost on its way.
+func (f *archiveFixture) setArchivedSilently(user *commonpb.UserId, chatID *commonpb.ChatId, archived bool) chat.ViewerState {
+	ctx := context.Background()
+	c, err := f.env.chats.GetChatByID(ctx, chatID)
+	require.NoError(f.t, err)
+	state, changed, err := f.env.chats.SetArchived(ctx, c, user, archived, time.Now())
+	require.NoError(f.t, err)
+	require.True(f.t, changed)
+	return state
+}
+
+// expect asserts that each stream's next event is expected: a test event
+// compared less its forwarding hops, anything else as is.
+func expect(t *testing.T, expected *eventpb.Event, streamers ...*cancellableStream) {
+	t.Helper()
+	for _, streamer := range streamers {
+		got := receiveNextEvents(t, streamer)
+		require.Len(t, got, 1)
+		if expected.GetTest() != nil {
+			assertEquivalentTestEvents(t, expected, got[0])
+		} else {
+			require.NoError(t, protoutil.ProtoEqualError(expected, got[0]))
+		}
+	}
+}
+
+// expectNotFollowing asserts that the group's chat topic no longer reaches
+// the streams: a chat publish reaches the witnesses, which proves it
+// delivered, and the streams' next event is a user event published after it.
+func (f *archiveFixture) expectNotFollowing(sender *serverTestEnv, user *commonpb.UserId, witnesses []*cancellableStream, streamers ...*cancellableStream) {
+	f.t.Helper()
+	expect(f.t, f.publishChat(sender), witnesses...)
+	expect(f.t, sender.sendTestUserEvent(user), streamers...)
+}
+
+// openStream opens a user stream for user on the client and returns it.
+func openStream(t *testing.T, c *clientTestEnv, user *commonpb.UserId, keys model.KeyPair) *cancellableStream {
+	c.openUserEventStream(t, user, keys)
+	streamers := c.streams[model.UserIDString(user)]
+	return streamers[len(streamers)-1]
+}
+
+// sendFollowArchive sends a FollowArchive on the stream.
+func sendFollowArchive(t *testing.T, streamer *cancellableStream, follow bool, seq uint64) {
+	t.Helper()
+	require.NoError(t, streamer.stream.Send(&eventpb.StreamEventsRequest{
+		Type: &eventpb.StreamEventsRequest_FollowArchive_{
+			FollowArchive: &eventpb.StreamEventsRequest_FollowArchive{Follow: follow, Seq: seq},
+		},
+	}))
+}
+
+// receiveAck pumps the stream, answering pings, until it yields a
+// FollowArchiveAck, and returns its seq. Anything else before it is a
+// failure.
+func receiveAck(t *testing.T, streamer *cancellableStream) uint64 {
+	t.Helper()
+	for {
+		resp, err := streamer.stream.Recv()
+		require.NoError(t, err)
+
+		switch typed := resp.Type.(type) {
+		case *eventpb.StreamEventsResponse_FollowArchiveAck_:
+			return typed.FollowArchiveAck.Seq
+		case *eventpb.StreamEventsResponse_Ping:
+			err = streamer.stream.Send(&eventpb.StreamEventsRequest{
+				Type: &eventpb.StreamEventsRequest_Pong{Pong: &eventpb.ClientPong{Timestamp: timestamppb.Now()}},
+			})
+			if err != io.EOF {
+				require.NoError(t, err)
+			}
+		default:
+			require.Failf(t, "unexpected response", "expected a follow archive ack, got %T", resp.Type)
+		}
+	}
+}
+
+// followArchive sends a FollowArchive and waits for its ack.
+func followArchive(t *testing.T, streamer *cancellableStream, follow bool, seq uint64) {
+	t.Helper()
+	sendFollowArchive(t, streamer, follow, seq)
+	require.Equal(t, seq, receiveAck(t, streamer))
+}
+
+// viewerStateChangedEvent builds the user's copy of a change to their state
+// on chatID, as the chat server publishes it.
+func viewerStateChangedEvent(chatID *commonpb.ChatId, state chat.ViewerState) *eventpb.Event {
+	e := &eventpb.Event{
+		Id: model.MustGenerateEventID(),
+		Ts: timestamppb.Now(),
+		Type: &eventpb.Event_ChatUpdate{ChatUpdate: &eventpb.ChatUpdate{
+			Chat: chatID,
+			MetadataUpdates: []*chatpb.MetadataUpdate{{Kind: &chatpb.MetadataUpdate_ViewerStateChanged_{
+				ViewerStateChanged: &chatpb.MetadataUpdate_ViewerStateChanged{ViewerState: state.ToProto(chat.Permissions{})},
+			}}},
+		}},
+	}
+	if err := e.Validate(); err != nil {
+		panic(err)
+	}
+	return e
+}
+
+// archiveStateEvent builds a ViewerStateChanged at version, archived or not,
+// with nothing written to the store.
+func archiveStateEvent(chatID *commonpb.ChatId, version uint64, archived bool) *eventpb.Event {
+	state := chat.ViewerState{Version: version}
+	if archived {
+		at := time.Now().UTC()
+		state.ArchivedAt = &at
+	}
+	return viewerStateChangedEvent(chatID, state)
+}
+
+// rosterJoinedEvent builds the subject's copy of their join at the given
+// roster version.
+func rosterJoinedEvent(chatID *commonpb.ChatId, subject *commonpb.UserId, version uint64) *eventpb.Event {
+	e := &eventpb.Event{
+		Id: model.MustGenerateEventID(),
+		Ts: timestamppb.Now(),
+		Type: &eventpb.Event_ChatUpdate{ChatUpdate: &eventpb.ChatUpdate{
+			Chat: chatID,
+			RosterUpdates: &chatpb.RosterUpdateBatch{RosterUpdates: []*chatpb.RosterUpdate{{
+				Kind: &chatpb.RosterUpdate_MemberJoined_{MemberJoined: &chatpb.RosterUpdate_MemberJoined{Member: &chatpb.Member{
+					UserId: subject,
+					UserProfile: &profilepb.UserProfile{
+						UserId:                subject,
+						DisplayName:           "Alice",
+						JoinTs:                timestamppb.Now(),
+						FlipcardCustomization: &profilepb.FlipcardCustomization{Color: &commonpb.Color{Hex: "#19191A"}},
+					},
+				}}},
+				RosterSummary: &chatpb.RosterSummary{MemberCount: 2, Version: version},
+			}}},
+		}},
+	}
+	if err := e.Validate(); err != nil {
+		panic(err)
+	}
+	return e
+}
+
+// testArchiveFollowing pins what a user stream follows of an archived group,
+// by FollowArchive: not following, an archived group's chat topic stops
+// reaching it while the user's own ViewerStateChanged still does, its server
+// gives up the topic, and the other member is unaffected; an archived DM is
+// delivered as before. Following on is acked only once the topic is
+// registered again, and from the ack the group's updates arrive; following
+// off is acked at once, the updates still arrive for the linger, and the
+// topic goes when it ends, unless following was turned back on meanwhile.
+func testArchiveFollowing(t *testing.T, accounts account.Store) {
+	const linger = 300 * time.Millisecond
+	f, cleanup := newArchiveFixture(t, accounts, event.WithFollowArchiveLinger(linger))
+	defer cleanup()
+	env := f.env
+
+	dm := putDmChat(t, env.chats, f.userA, f.userB)
+	a := openStream(t, env.client1, f.userA, f.keysA)
+	b := openStream(t, env.client2, f.userB, f.keysB)
+	f.waitForSubscribers(env.server1, env.server2)
+	expect(t, f.publishChat(env.server2), a, b)
+
+	// userA archives the group: their stream receives the change, server1
+	// gives up the topic, and a chat publish from either side reaches userB
+	// alone.
+	expect(t, f.setArchived(env.server2, f.userA, f.group, true), a)
+	f.waitForSubscribers(env.server2)
+	f.expectNotFollowing(env.server1, f.userA, []*cancellableStream{b}, a)
+	f.expectNotFollowing(env.server2, f.userA, []*cancellableStream{b}, a)
+
+	// An archived DM is streamed as before.
+	expect(t, f.setArchived(env.server2, f.userA, dm, true), a)
+	message := newMessageSentEvent(dm, f.userB, 1, "hello")
+	env.server2.userEventBus.OnEvent(f.userA, message)
+	expect(t, message, a)
+
+	// Following on: by the ack, server1 is registered on the topic again,
+	// and the group's updates reach userA. The read behind it is slowed, so
+	// an ack sent ahead of the registration would be seen as one.
+	env.archivesDelay.Store(int64(300 * time.Millisecond))
+	followArchive(t, a, true, 7)
+	require.Equal(t, f.on(env.server1, env.server2), f.subscribers())
+	env.archivesDelay.Store(0)
+	time.Sleep(100 * time.Millisecond)
+	expect(t, f.publishChat(env.server2), a, b)
+
+	// Following off: acked at once, and the updates still arrive during the
+	// linger.
+	followArchive(t, a, false, 8)
+	expect(t, f.publishChat(env.server2), a, b)
+
+	// Once the linger ends, the topic goes.
+	f.waitForSubscribers(env.server2)
+	f.expectNotFollowing(env.server2, f.userA, []*cancellableStream{b}, a)
+
+	// On, off and on again within the linger: the last cancels the release,
+	// and the updates keep arriving well past when it would have ended.
+	followArchive(t, a, true, 9)
+	followArchive(t, a, false, 10)
+	followArchive(t, a, true, 11)
+	time.Sleep(3 * linger)
+	require.Equal(t, f.on(env.server1, env.server2), f.subscribers())
+	expect(t, f.publishChat(env.server2), a, b)
+}
+
+// testFollowArchiveAcks pins the acks: every FollowArchive is answered with
+// its own seq, in the order sent, however quickly they follow each other and
+// whether or not they change anything.
+func testFollowArchiveAcks(t *testing.T, accounts account.Store) {
+	f, cleanup := newArchiveFixture(t, accounts)
+	defer cleanup()
+	env := f.env
+
+	a := openStream(t, env.client1, f.userA, f.keysA)
+	b := openStream(t, env.client2, f.userB, f.keysB)
+	f.waitForSubscribers(env.server1, env.server2)
+	expect(t, f.setArchived(env.server1, f.userA, f.group, true), a)
+	f.waitForSubscribers(env.server2)
+
+	sequence := []bool{true, false, true, false, true, true, false, false, true}
+	for i, follow := range sequence {
+		sendFollowArchive(t, a, follow, uint64(100+i))
+	}
+	for i := range sequence {
+		require.Equal(t, uint64(100+i), receiveAck(t, a))
+	}
+
+	// The last turned following on, and it holds.
+	require.Equal(t, f.on(env.server1, env.server2), f.subscribers())
+	time.Sleep(100 * time.Millisecond)
+	expect(t, f.publishChat(env.server2), a, b)
+}
+
+// testArchivePerStream pins that following is each stream's own: of userA's
+// three streams, two on server1 and one on server2, only the one following
+// the archive keeps an archived group, while all three follow the archive and
+// the unarchive as they happen — an unarchive is delivered again at once,
+// with no reconcile, whatever a stream's setting.
+func testArchivePerStream(t *testing.T, accounts account.Store) {
+	const linger = 300 * time.Millisecond
+	f, cleanup := newArchiveFixture(t, accounts, event.WithFollowArchiveLinger(linger))
+	defer cleanup()
+	env := f.env
+
+	following := openStream(t, env.client1, f.userA, f.keysA)
+	sameServer := openStream(t, env.client1, f.userA, f.keysA)
+	otherServer := openStream(t, env.client2, f.userA, f.keysA)
+	b := openStream(t, env.client2, f.userB, f.keysB)
+	allA := []*cancellableStream{following, sameServer, otherServer}
+	f.waitForSubscribers(env.server1, env.server2)
+	expect(t, f.publishChat(env.server1), append(allA, b)...)
+
+	followArchive(t, following, true, 1)
+
+	// Archived while one stream follows: it keeps the group, the other two
+	// let it go.
+	expect(t, f.setArchived(env.server2, f.userA, f.group, true), allA...)
+	time.Sleep(200 * time.Millisecond)
+	e := f.publishChat(env.server2)
+	expect(t, e, following, b)
+	expect(t, env.server2.sendTestUserEvent(f.userA), allA...)
+
+	// Unarchived: every stream has it again, at once.
+	expect(t, f.setArchived(env.server1, f.userA, f.group, false), allA...)
+	time.Sleep(200 * time.Millisecond)
+	expect(t, f.publishChat(env.server2), append(allA, b)...)
+	expect(t, f.publishChat(env.server1), append(allA, b)...)
+
+	// Turning following off on the one stream changes nothing for an
+	// unarchived group, linger or not.
+	followArchive(t, following, false, 2)
+	time.Sleep(3 * linger)
+	expect(t, f.publishChat(env.server2), append(allA, b)...)
+
+	// Archived again with no stream following: all three let it go, and
+	// server1 gives up the topic.
+	expect(t, f.setArchived(env.server1, f.userA, f.group, true), allA...)
+	f.waitForSubscribers(env.server2)
+	expect(t, f.publishChat(env.server2), b)
+	expect(t, env.server1.sendTestUserEvent(f.userA), allA...)
+
+	// Unarchived again with none following: all three have it at once.
+	expect(t, f.setArchived(env.server2, f.userA, f.group, false), allA...)
+	f.waitForSubscribers(env.server1, env.server2)
+	expect(t, f.publishChat(env.server1), append(allA, b)...)
+}
+
+// testArchiveStaleViewerState pins that the archive is applied by the
+// ViewerState's version: a state older than the last one applied moves
+// nothing, whichever way it points.
+func testArchiveStaleViewerState(t *testing.T, accounts account.Store) {
+	f, cleanup := newArchiveFixture(t, accounts)
+	defer cleanup()
+	env := f.env
+
+	a := openStream(t, env.client1, f.userA, f.keysA)
+	b := openStream(t, env.client2, f.userB, f.keysB)
+	f.waitForSubscribers(env.server1, env.server2)
+
+	archived := archiveStateEvent(f.group, 2, true)
+	env.server2.userEventBus.OnEvent(f.userA, archived)
+	expect(t, archived, a)
+	f.waitForSubscribers(env.server2)
+
+	// An unarchive older than the archive is stale: the group stays off.
+	stale := archiveStateEvent(f.group, 1, false)
+	env.server2.userEventBus.OnEvent(f.userA, stale)
+	expect(t, stale, a)
+	time.Sleep(200 * time.Millisecond)
+	require.Equal(t, f.on(env.server2), f.subscribers())
+	f.expectNotFollowing(env.server2, f.userA, []*cancellableStream{b}, a)
+
+	// A newer unarchive applies.
+	unarchived := archiveStateEvent(f.group, 3, false)
+	env.server1.userEventBus.OnEvent(f.userA, unarchived)
+	expect(t, unarchived, a)
+	f.waitForSubscribers(env.server1, env.server2)
+	expect(t, f.publishChat(env.server2), a, b)
+
+	// An archive older than the unarchive is stale: the group stays on.
+	stale = archiveStateEvent(f.group, 2, true)
+	env.server1.userEventBus.OnEvent(f.userA, stale)
+	expect(t, stale, a)
+	time.Sleep(200 * time.Millisecond)
+	require.Equal(t, f.on(env.server1, env.server2), f.subscribers())
+	expect(t, f.publishChat(env.server2), a, b)
+}
+
+// testArchivedAtOpen pins a stream opened while a group is archived: the
+// open reads the inbox alone, so the stream does not follow the group; an
+// unarchive puts it on the group with no transition of the stream's to go
+// by, from a read of the membership; and following the archive puts it on a
+// group archived before it opened, from the archived listing.
+func testArchivedAtOpen(t *testing.T, accounts account.Store) {
+	f, cleanup := newArchiveFixture(t, accounts)
+	defer cleanup()
+	env := f.env
+
+	b := openStream(t, env.client2, f.userB, f.keysB)
+	f.setArchivedSilently(f.userA, f.group, true)
+	a := openStream(t, env.client1, f.userA, f.keysA)
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, f.on(env.server2), f.subscribers())
+	f.expectNotFollowing(env.server2, f.userA, []*cancellableStream{b}, a)
+
+	expect(t, f.setArchived(env.server2, f.userA, f.group, false), a)
+	f.waitForSubscribers(env.server1, env.server2)
+	expect(t, f.publishChat(env.server2), a, b)
+
+	// Closed and reopened while archived again: following the archive puts
+	// the new stream on the group by the ack.
+	expect(t, f.setArchived(env.server2, f.userA, f.group, true), a)
+	f.waitForSubscribers(env.server2)
+	env.client1.closeOneUserEventStream(t, f.userA)
+	a = openStream(t, env.client1, f.userA, f.keysA)
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, f.on(env.server2), f.subscribers())
+	followArchive(t, a, true, 1)
+	require.Equal(t, f.on(env.server1, env.server2), f.subscribers())
+	time.Sleep(100 * time.Millisecond)
+	expect(t, f.publishChat(env.server2), a, b)
+}
+
+// testArchiveLeaveAndJoin pins how the archive meets membership: a departure
+// ends the archive, so a return is followed again; and a join that arrives
+// after an archive of the same group, the two having crossed, does not put a
+// stream that is not following the archive on it.
+func testArchiveLeaveAndJoin(t *testing.T, accounts account.Store) {
+	f, cleanup := newArchiveFixture(t, accounts)
+	defer cleanup()
+	env := f.env
+
+	a := openStream(t, env.client1, f.userA, f.keysA)
+	b := openStream(t, env.client2, f.userB, f.keysB)
+	f.waitForSubscribers(env.server1, env.server2)
+
+	// Archived, then left and rejoined: followed again.
+	archived := archiveStateEvent(f.group, 1, true)
+	env.server2.userEventBus.OnEvent(f.userA, archived)
+	expect(t, archived, a)
+	f.waitForSubscribers(env.server2)
+	leave := rosterLeftEvent(f.group, f.userA, 2)
+	env.server2.userEventBus.OnEvent(f.userA, leave)
+	expect(t, leave, a)
+	join := rosterJoinedEvent(f.group, f.userA, 3)
+	env.server2.userEventBus.OnEvent(f.userA, join)
+	expect(t, join, a)
+	f.waitForSubscribers(env.server1, env.server2)
+	expect(t, f.publishChat(env.server2), a, b)
+
+	// A join crossing an archive of the group: the archive arrives first,
+	// then the join it followed. The stream is not put on the group.
+	archived = archiveStateEvent(f.group, 3, true)
+	env.server1.userEventBus.OnEvent(f.userA, archived)
+	expect(t, archived, a)
+	f.waitForSubscribers(env.server2)
+	leave = rosterLeftEvent(f.group, f.userA, 4)
+	env.server1.userEventBus.OnEvent(f.userA, leave)
+	expect(t, leave, a)
+	archived = archiveStateEvent(f.group, 5, true)
+	env.server1.userEventBus.OnEvent(f.userA, archived)
+	expect(t, archived, a)
+	join = rosterJoinedEvent(f.group, f.userA, 5)
+	env.server1.userEventBus.OnEvent(f.userA, join)
+	expect(t, join, a)
+	time.Sleep(200 * time.Millisecond)
+	require.Equal(t, f.on(env.server2), f.subscribers())
+	f.expectNotFollowing(env.server2, f.userA, []*cancellableStream{b}, a)
+
+	// Following the archive puts it on the group the stream knows it is in,
+	// though the store lists no archive of it.
+	followArchive(t, a, true, 1)
+	require.Equal(t, f.on(env.server1, env.server2), f.subscribers())
+	time.Sleep(100 * time.Millisecond)
+	expect(t, f.publishChat(env.server2), a, b)
+}
+
+// testArchiveReconciles pins the reconcile's part: an archive or unarchive
+// whose ViewerStateChanged never arrives is applied from the store within the
+// reconcile's interval, and an archive found while the stream follows the
+// archive takes nothing off.
+func testArchiveReconciles(t *testing.T, accounts account.Store) {
+	const reconcileInterval, reconcileTick = 200 * time.Millisecond, 25 * time.Millisecond
+	const linger = 300 * time.Millisecond
+	f, cleanup := newArchiveFixture(t, accounts, event.WithMembershipReconcile(reconcileInterval, reconcileTick), event.WithFollowArchiveLinger(linger))
+	defer cleanup()
+	env := f.env
+
+	a := openStream(t, env.client1, f.userA, f.keysA)
+	b := openStream(t, env.client2, f.userB, f.keysB)
+	f.waitForSubscribers(env.server1, env.server2)
+
+	// A missed archive: the stream comes off the group.
+	f.setArchivedSilently(f.userA, f.group, true)
+	f.waitForSubscribers(env.server2)
+	f.expectNotFollowing(env.server2, f.userA, []*cancellableStream{b}, a)
+
+	// A missed unarchive: back on.
+	f.setArchivedSilently(f.userA, f.group, false)
+	f.waitForSubscribers(env.server1, env.server2)
+	expect(t, f.publishChat(env.server2), a, b)
+
+	// A missed archive while following: nothing comes off.
+	followArchive(t, a, true, 1)
+	f.setArchivedSilently(f.userA, f.group, true)
+	time.Sleep(3 * reconcileInterval)
+	require.Equal(t, f.on(env.server1, env.server2), f.subscribers())
+	expect(t, f.publishChat(env.server2), a, b)
+
+	// Following off: the archive the reconcile learned is what the linger's
+	// end takes off.
+	followArchive(t, a, false, 2)
+	f.waitForSubscribers(env.server2)
+	f.expectNotFollowing(env.server2, f.userA, []*cancellableStream{b}, a)
+
+	// A stale archive state injected where the store has none is overruled
+	// by the reconcile's strong read of the archives: back on.
+	f.setArchivedSilently(f.userA, f.group, false)
+	f.waitForSubscribers(env.server1, env.server2)
+	stale := archiveStateEvent(f.group, 100, true)
+	env.server2.userEventBus.OnEvent(f.userA, stale)
+	expect(t, stale, a)
+	time.Sleep(3 * reconcileInterval)
+	f.waitForSubscribers(env.server1, env.server2)
+	expect(t, f.publishChat(env.server2), a, b)
+}
+
+// testFollowArchiveIgnoredByPreview pins that a preview stream ignores
+// FollowArchive: no ack, and the stream carries on.
+func testFollowArchiveIgnoredByPreview(t *testing.T, accounts account.Store) {
+	testEnv, cleanup := setupTest(t, accounts, true)
+	defer cleanup()
+
+	member, _ := registerUser(t, accounts)
+	staff, staffKeys := registerUser(t, accounts)
+	testEnv.accounts.setStaff(staff, true)
+	group := putStaffGroupChat(t, testEnv.chats, member)
+
+	preview := testEnv.client1.openChatPreview(t, staffKeys, group, messagingpb.ViewMode_FULL)
+	time.Sleep(500 * time.Millisecond)
+
+	sendFollowArchive(t, preview, true, 1)
+	sendFollowArchive(t, preview, false, 2)
+	time.Sleep(200 * time.Millisecond)
+
+	// The next thing on the stream is the message, not an ack.
+	e := newMessageSentEvent(group, member, 1, "hello")
+	testEnv.server2.chatEventBus.OnEvent(group, &eventpb.ChatEvent{ChatId: group, Event: e})
+	expect(t, e, preview)
 }

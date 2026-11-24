@@ -38,8 +38,10 @@ const UserEventsNamespace = "user-events"
 
 // ChatEventsNamespace is the cluster subscription namespace for per-chat
 // event topics, keyed by the raw chat ID bytes. A topic's subscribers are the
-// servers currently hosting at least one open stream belonging to a member of
-// that chat, so a chat publisher resolves the hosting servers in one lookup
+// servers currently hosting at least one open stream that follows that chat —
+// a stream of a member who has not archived it, or who has and whose stream
+// follows their archive (see archive.go) — so a chat publisher resolves the
+// hosting servers in one lookup
 // instead of one per member. Today only group chats register here — DM
 // delivery stays user-keyed — but nothing about the topic shape is
 // group-specific.
@@ -55,8 +57,23 @@ func userStreamKey(userID *commonpb.UserId) string {
 	return userStreamKeyPrefix + model.UserIDString(userID)
 }
 
+const chatStreamKeyPrefix = "chat:"
+
 func chatStreamKey(chatID *commonpb.ChatId) string {
-	return "chat:" + hex.EncodeToString(chatID.GetValue())
+	return chatStreamKeyPrefix + hex.EncodeToString(chatID.GetValue())
+}
+
+// chatIDFromStreamKey is chatStreamKey's inverse, reporting false for a key
+// that is not a chat's.
+func chatIDFromStreamKey(key string) (*commonpb.ChatId, bool) {
+	if !strings.HasPrefix(key, chatStreamKeyPrefix) {
+		return nil, false
+	}
+	value, err := hex.DecodeString(key[len(chatStreamKeyPrefix):])
+	if err != nil {
+		return nil, false
+	}
+	return &commonpb.ChatId{Value: value}, true
 }
 
 const (
@@ -108,16 +125,40 @@ const (
 	membershipSyncTimeout = 2 * time.Second
 
 	// The membership reconcile's schedule (see reconcileMembership). The
-	// interval is how often each user's memberships are re-read: the longest
-	// a transition this server never saw can leave a stream on the wrong
-	// topics, and the read rate a server pays for its streams — one index
-	// query per user per interval, so a few thousand users cost a few reads
-	// a second. The tick is the sweep's cadence, and with the interval sets
-	// the per-tick ration of re-reads. Workers bounds the reads in flight at
+	// interval is how often each user's memberships and archives are
+	// re-read: the longest a transition or an archive this server never saw
+	// can leave a stream on the wrong topics, and the read rate a server pays
+	// for its streams — per user per interval, one index query of their inbox
+	// and one strongly consistent query of their state partition for their
+	// archives, plus one index query of their archived groups while a stream
+	// of theirs follows their archive, so a few thousand users cost several
+	// reads a second. The tick is the sweep's cadence, and with the interval
+	// sets the per-tick ration of re-reads. Workers bounds the reads in flight at
 	// once, whatever a backlog makes due together.
 	defaultMembershipReconcileInterval = 5 * time.Minute
 	defaultMembershipReconcileTick     = time.Second
 	membershipReconcileWorkers         = 8
+
+	// defaultFollowArchiveLinger is how long a stream that stops following
+	// the user's archive keeps the archived groups it holds (see
+	// followArchiveRequest): a client steps out of its archive and back in
+	// often, as a user moves between the archive and a chat in it or flicks
+	// the app, and a linger lets a FollowArchive turning following back on be
+	// answered with no read at all. Archived groups' updates delivered
+	// meanwhile are ones the client ignores, as the proto allows.
+	defaultFollowArchiveLinger = time.Minute
+
+	// followArchiveTimeout bounds what turning following on costs before its
+	// ack (see followArchiveRequest): two reads and one batched registration.
+	// Past it the stream ends, and the client reconnects and asks again.
+	followArchiveTimeout = 5 * time.Second
+
+	// followArchiveQueueSize is how many FollowArchive requests a stream
+	// holds before its receive loop waits for the oldest to be answered (see
+	// run): a client turns following on and off as its user moves in and out
+	// of the archive, a handful at a time, and one that sends faster than
+	// they are answered is slowed down, not refused.
+	followArchiveQueueSize = 16
 
 	// defaultShutdownSpread and defaultShutdownWaves pace Shutdown's closes
 	// (see Shutdown): a server's streams are closed in this many shuffled
@@ -140,6 +181,16 @@ func WithMembershipReconcile(interval, tick time.Duration) ServerOption {
 	return func(s *Server) {
 		s.reconcileInterval = interval
 		s.reconcileTick = tick
+	}
+}
+
+// WithFollowArchiveLinger overrides how long a stream that stops following
+// the user's archive keeps the archived groups it holds (see
+// followArchiveRequest). Tests use it to keep the linger short; production
+// keeps the default.
+func WithFollowArchiveLinger(linger time.Duration) ServerOption {
+	return func(s *Server) {
+		s.followArchiveLinger = linger
 	}
 }
 
@@ -192,7 +243,8 @@ type Server struct {
 	// It also refuses new streams once Shutdown has begun, so a stream can't
 	// slip in behind the closing sweep. sessions is the per-stream view of the
 	// same registrations, by user, for moving a user's streams between chat
-	// topics as their membership changes (see followMembership).
+	// topics as their membership and archives change (see followMembership
+	// and followArchive).
 	streams                 *streamRegistry
 	sessions                *streamSessions
 	staleEventDetectorCtors []StaleEventDetectorCtor[*eventpb.Event]
@@ -207,6 +259,11 @@ type Server struct {
 	// chatPreviewLifetime is how long a chat preview stream lives (see
 	// chatPreview).
 	chatPreviewLifetime time.Duration
+
+	// followArchiveLinger is how long a stream that stops following the
+	// user's archive keeps the archived groups it holds (see
+	// followArchiveRequest).
+	followArchiveLinger time.Duration
 
 	// shutdownSpread and shutdownWaves pace Shutdown's closes (see Shutdown).
 	shutdownSpread time.Duration
@@ -278,6 +335,7 @@ func NewServer(
 		reconcileStop:     make(chan struct{}),
 
 		chatPreviewLifetime: defaultChatPreviewLifetime,
+		followArchiveLinger: defaultFollowArchiveLinger,
 
 		shutdownSpread: defaultShutdownSpread,
 		shutdownWaves:  defaultShutdownWaves,
@@ -356,7 +414,16 @@ func (s *Server) StreamEvents(stream grpc.BidiStreamingServer[eventpb.StreamEven
 // (preview non-nil) additionally shapes every event for its viewer (see
 // chatPreview.shape) and ends with STREAM_EXPIRED when its window closes,
 // whatever the client is doing: pongs keep the stream healthy, not alive.
-func (s *Server) run(ctx context.Context, log *zap.Logger, stream grpc.BidiStreamingServer[eventpb.StreamEventsRequest, eventpb.StreamEventsResponse], ss *EventStream[*eventpb.Event], preview *chatPreview) error {
+//
+// A user stream (session non-nil) also answers the client's FollowArchive
+// requests (see serveFollowArchive): they are handled one at a time, in the
+// order received, off this loop, and each one's FollowArchiveAck goes out
+// through the same sender as the stream's events and pings, so the acks
+// reach the client in request order. One that fails ends the stream with the
+// failure's status. A preview ignores FollowArchive and answers nothing, as
+// the proto has it. Any message the client sends counts toward its liveness,
+// a FollowArchive as much as a pong.
+func (s *Server) run(ctx context.Context, log *zap.Logger, stream grpc.BidiStreamingServer[eventpb.StreamEventsRequest, eventpb.StreamEventsResponse], ss *EventStream[*eventpb.Event], preview *chatPreview, session *streamSession) error {
 	staleEventDetectors := make([]StaleEventDetector[*eventpb.Event], len(s.staleEventDetectorCtors))
 	for i, ctor := range s.staleEventDetectorCtors {
 		staleEventDetectors[i] = ctor()
@@ -385,17 +452,41 @@ func (s *Server) run(ctx context.Context, log *zap.Logger, stream grpc.BidiStrea
 	pongTimer := time.NewTimer(streamPongTimeout)
 	defer pongTimer.Stop()
 
+	// A user stream's FollowArchive requests, queued in arrival order for the
+	// goroutine that answers them, and its answers, in the same order. A
+	// preview has neither, and a nil channel never fires.
+	var followRequests chan *eventpb.StreamEventsRequest_FollowArchive
+	var followResults <-chan followArchiveResult
+	if session != nil {
+		followRequests = make(chan *eventpb.StreamEventsRequest_FollowArchive, followArchiveQueueSize)
+		results := make(chan followArchiveResult, followArchiveQueueSize)
+		followResults = results
+		go s.serveFollowArchive(ctx, log, session, followRequests, results)
+	}
+
 	pongs := protoutil.Heartbeats(stream, func(t *eventpb.StreamEventsRequest) bool {
-		pong := t.GetPong()
-		if pong == nil {
+		switch typed := t.Type.(type) {
+		case *eventpb.StreamEventsRequest_Pong:
+			if ts := typed.Pong.GetTimestamp(); ts != nil {
+				log.Debug("Received pong from client", zap.Duration("upstream_latency", time.Since(ts.AsTime())))
+			}
+			return true
+		case *eventpb.StreamEventsRequest_FollowArchive_:
+			if followRequests == nil {
+				return true
+			}
+			// A full queue holds the receive here until the oldest request
+			// is answered, which slows the client down rather than refusing
+			// it; the stream ending lets go.
+			select {
+			case followRequests <- typed.FollowArchive:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		default:
 			return false
 		}
-
-		if ts := pong.GetTimestamp(); ts != nil {
-			log.Debug("Received pong from client", zap.Duration("upstream_latency", time.Since(ts.AsTime())))
-		}
-
-		return true
 	})
 
 	sendPing := func() error {
@@ -445,6 +536,19 @@ func (s *Server) run(ctx context.Context, log *zap.Logger, stream grpc.BidiStrea
 			})
 			if err != nil {
 				log.Info("Failed to send events to client stream", zap.Error(err))
+				return err
+			}
+		case result := <-followResults:
+			if result.err != nil {
+				return result.err
+			}
+			err := sender.Send(ctx, &eventpb.StreamEventsResponse{
+				Type: &eventpb.StreamEventsResponse_FollowArchiveAck_{
+					FollowArchiveAck: &eventpb.StreamEventsResponse_FollowArchiveAck{Seq: result.seq},
+				},
+			})
+			if err != nil {
+				log.Info("Failed to send follow archive ack to client stream", zap.Error(err))
 				return err
 			}
 		case <-expired:
@@ -617,11 +721,14 @@ func closeStreams(streams []Stream[*eventpb.Event]) {
 // than over a snapshot, so it allocates nothing per event either.
 func (s *Server) deliverLocal(streamKey string, e *eventpb.Event, exclude []*commonpb.UserId) {
 	// A user-keyed delivery may be the user's own copy of a membership
-	// transition, which moves their streams between chat topics. That runs
-	// before the notify, so a departure stops chat-topic delivery to the
-	// leaver's streams from this event on.
+	// transition, or of a change to their state on a group that archives or
+	// unarchives it, either of which moves their streams between chat
+	// topics. That runs before the notify, so a departure, or an archive on a
+	// stream not following the archive, stops chat-topic delivery to the
+	// user's streams from this event on.
 	if strings.HasPrefix(streamKey, userStreamKeyPrefix) {
 		s.followMembership(streamKey, e)
+		s.followArchive(streamKey, e)
 	}
 
 	s.streams.each(streamKey, exclude, func(stream Stream[*eventpb.Event]) {
@@ -655,8 +762,12 @@ func (s *Server) deliverLocal(streamKey string, e *eventpb.Event, exclude []*com
 // with no further fan-out.
 //
 // A join puts each of the user's local streams under the chat's key and
-// registers this server's interest in the topic; a departure takes them out
-// from under the key at once and releases the registration. The local
+// registers this server's interest in the topic — each stream that follows
+// the group by the archive rule, so a join that crosses an archive of the
+// same group attaches no stream that does not follow it (see streamSession);
+// a departure takes them out from under the key at once, ends the user's
+// archive of the group in the sessions as it does in the store, and releases
+// the registration. The local
 // registration leads and the cluster one follows on a detached goroutine, as
 // a stream open does, so a publish that resolves this server's row always
 // finds the streams behind it, and a leaver hears nothing further on the
@@ -722,8 +833,10 @@ func (s *Server) joinStreams(sessions []*streamSession, chatID *commonpb.ChatId,
 	}
 }
 
-// attachSession applies a join at the given roster version to one session:
-// the local registration first (see streamSession.attach), then the cluster
+// attachSession applies a join at the given roster version to one session,
+// and puts it under the chat's key if the follow rule wants it there (see
+// streamSession.attach) — a join, a record the reconcile read or the version
+// an unarchive found alike: the local registration first, then the cluster
 // one, whose handle the session takes — or, if it ended or left the chat
 // meanwhile, releases. It reports whether the session was attached, and the
 // registration error if there was one, after undoing the attach so the join
@@ -778,9 +891,11 @@ func (s *Server) releaseHandles(ctx context.Context, handles []*cluster.Subscrip
 	}
 }
 
-// reconcileMembership is the sweep that re-reads users' memberships from the
-// store and brings their open streams' chat topics into line, the backstop
-// for the transitions followMembership never sees. A stream open merges the
+// reconcileMembership is the sweep that re-reads users' memberships and
+// archives from the store and brings their open streams' chat topics into
+// line, the backstop for the transitions followMembership never sees and the
+// archives and unarchives followArchive never sees, whose ViewerStateChanged
+// is as best-effort as any other publish. A stream open merges the
 // records it reads with the transitions delivered to it, but a transition
 // this server was not registered for — published before the row for the
 // user's topic landed — reaches it only through the read, and the read may
@@ -792,14 +907,15 @@ func (s *Server) releaseHandles(ctx context.Context, handles []*cluster.Subscrip
 // stream open is re-read every interval, counted from their first open here.
 //
 // The sweep runs every tick over the users the index says are due (see
-// streamSessions.due): a read per user, not per stream, applied to all their
-// local sessions through the same version gate the transitions use, so a
-// read older than what a session has already applied moves nothing, and one
-// racing a live transition converges on the newer of the two. Reads are
-// bounded to membershipReconcileWorkers in flight, and a tick's batch
+// streamSessions.due): a few reads per user, not per stream (see
+// reconcileUser), applied to all their local sessions through the same gates
+// the transitions use, so a read older than what a session has already
+// applied moves nothing, and one racing a live transition converges on the
+// newer of the two. Users are bounded to membershipReconcileWorkers in
+// flight, and a tick's batch
 // finishes before the next begins, so however many users a backlog makes
-// due at once, the store sees at most that many concurrent queries from
-// this server.
+// due at once, the store sees at most that many users' queries at once
+// from this server.
 func (s *Server) reconcileMembership() {
 	ticker := time.NewTicker(s.reconcileTick)
 	defer ticker.Stop()
@@ -834,16 +950,28 @@ func (s *Server) reconcileMembership() {
 	}
 }
 
-// reconcileUser re-reads one user's memberships and applies each record to
-// every local session of theirs as a transition at the record's version:
-// attaching joined ones, detaching departed ones, releasing what the detaches
-// freed as one batch. A chat the read does not mention is left alone — a
-// session cannot hold a key for a membership that never existed, and a
-// record is never deleted from under a key it did. The read failing leaves
-// the user due for the next tick.
+// reconcileUser re-reads one user's memberships and archives and brings
+// every local session of theirs into line with them. The reads are a fixed
+// few, issued together: the inbox listing of their memberships, the strongly
+// consistent read of their archives (chat.Store.GetArchivedChats), and — only
+// while one of the sessions follows the archive or lingers on it — the
+// archived listing of their memberships.
+//
+// The archives are applied first, through each session's archive gate (see
+// streamSession.applyArchives), and every session not following the archive
+// comes off the archived groups it is still under: an archive it never heard
+// of. Then each membership record is applied as a transition at the record's
+// version, attaching joined ones the follow rule wants held — a group in the
+// inbox whose unarchive the session never heard of included, which the
+// archives read has just marked unarchived — and detaching departed ones,
+// releasing what the detaches freed as one batch. A chat the reads do not
+// mention is left alone — a session cannot hold a key for a membership that
+// never existed, and a record is never deleted from under a key it did. A
+// read failing leaves the user due for the next tick.
 func (s *Server) reconcileUser(userKey string) {
 	// The start is what markReconciled records: the read's view of the store
-	// is current as of then, and the sweep orders users by it.
+	// is current as of then, and the sweep orders users by it. It is also
+	// what the archives read is ordered against (see applyArchives).
 	startedAt := time.Now()
 	sessions := s.sessions.forUser(userKey)
 	if len(sessions) == 0 {
@@ -855,31 +983,62 @@ func (s *Server) reconcileUser(userKey string) {
 	ctx, cancel := context.WithTimeout(context.Background(), membershipSyncTimeout)
 	defer cancel()
 
-	memberships, err := s.chats.GetGroupMembershipsForUser(ctx, userID)
-	if err != nil {
+	followed := false
+	for _, session := range sessions {
+		if session.followsArchive() {
+			followed = true
+			break
+		}
+	}
+
+	var inbox, archivedFolder []chat.GroupMembership
+	var archives []chat.ArchivedChat
+	var inboxErr, archivedFolderErr, archivesErr error
+	var reads sync.WaitGroup
+	reads.Go(func() {
+		archives, archivesErr = s.chats.GetArchivedChats(ctx, userID)
+	})
+	if followed {
+		reads.Go(func() {
+			archivedFolder, archivedFolderErr = s.chats.GetGroupMembershipsForUser(ctx, userID, chat.FolderArchived)
+		})
+	}
+	inbox, inboxErr = s.chats.GetGroupMembershipsForUser(ctx, userID, chat.FolderInbox)
+	reads.Wait()
+	if err := errors.Join(inboxErr, archivedFolderErr, archivesErr); err != nil {
 		log.With(zap.Error(err)).Warn("Failure reading group memberships for stream reconcile")
 		return
 	}
 
+	archivedKeys := archivedGroupKeys(archives)
 	var attached, detached int
 	var handles []*cluster.SubscriptionHandle
-	for _, m := range memberships {
-		chatKey := chatStreamKey(m.ChatID)
-		for _, session := range sessions {
-			if m.Joined {
-				ok, err := s.attachSession(ctx, session, m.ChatID, chatKey, m.Version)
-				if err != nil {
-					// The store is failing; what is done stays done, and the
-					// next tick picks the user up again.
-					s.releaseHandles(ctx, handles)
-					return
+	for _, session := range sessions {
+		session.applyArchives(archivedKeys, startedAt)
+		freed := session.detachUnfollowed()
+		detached += len(freed)
+		handles = append(handles, freed...)
+	}
+
+	for _, memberships := range [][]chat.GroupMembership{inbox, archivedFolder} {
+		for _, m := range memberships {
+			chatKey := chatStreamKey(m.ChatID)
+			for _, session := range sessions {
+				if m.Joined {
+					ok, err := s.attachSession(ctx, session, m.ChatID, chatKey, m.Version)
+					if err != nil {
+						// The store is failing; what is done stays done, and the
+						// next tick picks the user up again.
+						s.releaseHandles(ctx, handles)
+						return
+					}
+					if ok {
+						attached++
+					}
+				} else if handle := session.detach(chatKey, m.Version); handle != nil {
+					detached++
+					handles = append(handles, handle)
 				}
-				if ok {
-					attached++
-				}
-			} else if handle := session.detach(chatKey, m.Version); handle != nil {
-				detached++
-				handles = append(handles, handle)
 			}
 		}
 	}

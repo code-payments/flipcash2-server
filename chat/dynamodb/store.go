@@ -44,15 +44,31 @@ import (
 //	          one query. AdvanceLastActivity fans the new last_activity out to
 //	          each member's row (two for a DM), re-sorting the GSI. The row
 //	          of a member excluded from the feed (see chat.Store.PutChat)
-//	          carries neither feed nor last_activity, so it is in neither GSI:
-//	          it records membership alone, and no advance ever touches it.
+//	          carries neither feed nor last_activity, so it is in none of the
+//	          table's GSIs: it records membership alone, and no advance ever
+//	          touches it.
+//
+//	          Every feed read uses gsiByFeedActivity, named for feed, which
+//	          names the user's folder for the chat as well as its type (see
+//	          dmFeedKey): the inbox, as every row is created, or the archive,
+//	          which SetArchived files the row in and out of, in the same
+//	          transaction as the archive on the user's chat_user_state record,
+//	          so archiving moves the row between partitions of the index and
+//	          no read filters. An advance moves an archived row's
+//	          last_activity as any other's, so the archived folder is ordered
+//	          by activity too. It has the same keys as gsiByTypeActivity, which
+//	          it replaced, so it filled with no backfill. Nothing reads
+//	          gsiByTypeActivity or the older gsiByActivity any more; both stay
+//	          on the table until a cleanup drops them, and gsiByTypeActivity,
+//	          keyed by the same feed, holds the archived rows under keys
+//	          nothing reads.
 //
 //	group_members  pk = "chat#<id>", sk = "user#<id>" (one item per (group,
 //	          member), kept as a tombstone after departure). Group membership,
 //	          mutable — unlike a DM's inline member list. Group chats
 //	          deliberately have no per-message inbox fan-out: a send touches
 //	          only the canonical chats item, and a user's group feed is
-//	          assembled at read time via the inverted gsiByUser, which leaves
+//	          assembled at read time via the inverted gsiByFeed, which leaves
 //	          out the rows of users excluded from the feed (see
 //	          chat.Store.PutChat and groupMemberItem). Joined members
 //	          are enumerated from the partition itself, which tombstone expiry
@@ -66,19 +82,45 @@ import (
 //	          enumeration. "#" sorts before "user#", so it is the head of the
 //	          partition.
 //
-//	          Both GSIs are sparse, keyed by attributes only membership rows
-//	          carry (user, joined_at) — that discipline is load-bearing: the
-//	          #meta item, and any new item type added to this table, must omit
-//	          those attributes or it leaks into the indexes.
+//	          A membership row also carries feed (see groupFeedKey), the
+//	          user's folder for the group, with exactly the user attribute's
+//	          presence: set to the inbox by every join and every departure, so
+//	          a tombstone is always filed in the inbox and a rejoin starts
+//	          there, set to the archive and back by SetArchived on a joined
+//	          row alone, in the same transaction as the archive on the user's
+//	          chat_user_state record, and absent from the rows of users
+//	          excluded from the feed. A departure removes the archive from the
+//	          record in the departure's own transaction (see
+//	          RemoveGroupMember and BanUser), so a departed row is never
+//	          filed in the archive and the record never holds an archive of a
+//	          group its user has left. It keys gsiByFeed on (feed, pk), the
+//	          listing of a user's groups (one folder at a time), which
+//	          replaced gsiByUser. Rows written before feed existed were given
+//	          it by a one-off backfill run out of band, which set the inbox
+//	          value on every row that carried user and lacked feed; the
+//	          backfill is what makes gsiByFeed list every membership gsiByUser
+//	          did, since a row with user and no feed is in no listing.
+//	          Nothing reads gsiByUser any more; it stays on the table, and
+//	          writes still set user, until a cleanup stops writing user and
+//	          drops the index.
+//
+//	          All three GSIs are sparse, keyed by attributes only membership
+//	          rows carry (user, feed, joined_at) — that discipline is
+//	          load-bearing: the #meta item, and any new item type added to
+//	          this table, must omit those attributes or it leaks into the
+//	          indexes.
 //
 //	chat_user_state  pk = "user#<id>", sk = "chat#<id>" (one item per (user,
 //	          chat) the user has ever set state on; see chat.Store).
-//	          What a chat holds about one user, independent of membership:
-//	          today a mute (muted_until) and the state's version. Keyed by
-//	          user so that the user's own read — their state across a page of
-//	          chats, the one they expect to reflect the mute they just set —
-//	          is a strongly consistent query on their partition, bounded to
-//	          the page's key range, rather than a key probe per chat.
+//	          What a chat holds about one user: a mute (muted_until), an
+//	          archive (archived_at), the creator's restrictions (below) and
+//	          the state's version. Keyed by user so that the user's own read —
+//	          their state across a page of chats, the one they expect to
+//	          reflect the mute they just set — is a strongly consistent query
+//	          on their partition, bounded to the page's key range, rather than
+//	          a key probe per chat; and so that their archives across every
+//	          chat are one strongly consistent query of the partition (see
+//	          GetArchivedChats).
 //
 //	          The chat-scoped read the push fan-out needs — who has this chat
 //	          muted right now — has two shapes, and the fan-out picks by size.
@@ -115,6 +157,26 @@ import (
 //	          an item. Nothing deletes an item: a cleared mute drops
 //	          muted_until (and so its gsiByMuted entry) and keeps the record
 //	          and its version.
+//
+//	          archived_at (epoch nanos) is present exactly while the user
+//	          holds an archive of the chat (see chat.Store.SetArchived), and
+//	          keys no index: a chat's archivers are read off its feed rows
+//	          (see GetGroupMembersPage) and a user's archives off their
+//	          partition. An archive is the user's own setting beside the mute,
+//	          sharing its version: an archive's writes never name muted_until
+//	          or the #meta count, and a mute's never name archived_at, and the
+//	          #meta item never carries it. Unlike a mute, an archive is held
+//	          only by a member, and is written with the user's dm_inbox or
+//	          group_members row: SetArchived reads the record strongly
+//	          consistent, which decides the no-op, and then writes the record
+//	          (compare-and-set on the version read) and the row's feed
+//	          (conditioned on the row being a listed member's) in one
+//	          transaction, so the record and the folder agree, and an archive
+//	          never lands for a user who is not a member. A group departure
+//	          removes it in the departure's transaction, compare-and-set on
+//	          the version a read before it found, or checks that it is still
+//	          absent (see RemoveGroupMember), and a ban removes it in its own
+//	          write of the record (see BanUser).
 //
 //	          The same record carries the restrictions a group's creator set
 //	          on the user (see chat.Store.SetSilence and BanUser), sharing
@@ -382,23 +444,47 @@ import (
 //	          creates the table with it.
 const (
 	// gsiByActivity is the legacy feed index on (pk, last_activity), spanning
-	// all of a user's DM types. Superseded by gsiByTypeActivity; retained until
-	// the feed backfill completes everywhere and the index is dropped from the
-	// table.
+	// all of a user's DM types. Superseded by gsiByTypeActivity and then by
+	// gsiByFeedActivity; nothing reads it. It is kept, as it still exists on
+	// the live table, until a cleanup drops it.
 	gsiByActivity = "by_activity"
 
 	// gsiByTypeActivity orders one chat type's slice of a user's inbox by
-	// last_activity, keyed by the composite feed attribute.
+	// last_activity, keyed by the composite feed attribute. Superseded by
+	// gsiByFeedActivity, on the same keys; nothing reads it. It is kept, as it
+	// still exists on the live table, until a cleanup drops it.
 	gsiByTypeActivity = "by_type_activity"
 
-	// gsiByUser is the inverted (user, chat) index on group_members, for
-	// listing the group chats a user is a member of. It is keyed by the sparse
-	// user attribute — the member's ID, present on membership rows (tombstones
-	// included) and nothing else — rather than the sk itself, so
-	// non-membership items in the table stay out of the index. The rows of a
-	// user the store excludes from the feed omit it too (see groupMemberItem),
-	// so the index holds no key for an account in every user's groups.
+	// gsiByFeedActivity orders one of a user's dm_inbox feeds by
+	// last_activity: the (feed, last_activity) index every DM feed read uses.
+	// feed names one of a user's folders as well as the chat type (see
+	// dmFeedKey), the inbox or the archive SetArchived files a row in, so
+	// each folder of each type is its own partition of the index. It has
+	// gsiByTypeActivity's keys under a name that says what keys it, since
+	// DynamoDB cannot rename an index, so every row that index holds is in
+	// it, with no backfill.
+	gsiByFeedActivity = "by_feed_activity"
+
+	// gsiByUser is the legacy inverted (user, chat) index on group_members,
+	// keyed by the sparse user attribute — the member's ID, present on
+	// membership rows (tombstones included) and nothing else, and omitted
+	// from the rows of a user the store excludes from the feed (see
+	// groupMemberItem). Superseded by gsiByFeed; nothing reads it. It is
+	// kept, as it still exists on the live table and writes still set user,
+	// until a cleanup stops writing user and drops it.
 	gsiByUser = "by_user"
+
+	// gsiByFeed is the inverted (feed, chat) index on group_members, for
+	// listing the group chats a user is a member of: one of a user's folders
+	// of groups (see groupFeedKey), the inbox or the archive SetArchived files
+	// a joined row in, in chat order. It is keyed by the sparse feed
+	// attribute rather than the sk itself, so non-membership items in
+	// the table stay out of the index: membership rows carry feed (tombstones
+	// included), the #meta item does not, and neither do the rows of a user
+	// the store excludes from the feed (see groupMemberItem), so the index
+	// holds no key for an account in every user's groups. Rows written before
+	// feed existed were given it by a one-off backfill (see the store's doc).
+	gsiByFeed = "by_feed"
 
 	// gsiByJoinedAt is the sparse (chat, joined_at) index on group_members.
 	// joined_at is present iff the member is currently joined (a left tombstone
@@ -503,7 +589,7 @@ const (
 	attrPK                   = "pk"
 	attrSK                   = "sk"
 	attrType                 = "type"
-	attrFeed                 = "feed"
+	attrFeed                 = "feed" // dm_inbox and group_members rows: the user's folder the chat is filed in — see dmFeedKey and groupFeedKey
 	attrMembers              = "members"
 	attrExcludedFromFeed     = "excluded_from_feed" // DM chats item: binary set of the members the DM excludes from the feed (see chat.Store.PutChat), absent when none
 	attrTitle                = "title"
@@ -531,6 +617,7 @@ const (
 	attrMutedCount           = "muted_count"       // chat_user_state #meta item: records with a mute recorded
 	attrSilencedUntil        = "silenced_until"    // chat_user_state: epoch seconds, present only while a silence is recorded — encoded as muted_until is (see muteForeverUntil)
 	attrBannedAt             = "banned_at"         // chat_user_state: epoch nanos of the ban, present only while one is recorded
+	attrArchivedAt           = "archived_at"       // chat_user_state: epoch nanos of the user's archive of the chat, present only while one is recorded — see SetArchived
 	attrRestrictedSort       = "restricted_sort"   // chat_user_state: see restrictedSort, present only while a silence or ban is recorded, keying gsiRestricted
 	attrLastSentAt           = "last_sent_at"      // chat_activity: epoch ms of the latest recorded send
 	attrActivityScore        = "activity_score"    // chat_activity: epoch ms, see chat.NextActivityScore; absent on records written before scores
@@ -577,20 +664,20 @@ const (
 	attrBalanceMints        = "mints"
 )
 
-// A membership transition is a two-item transaction — the membership record and
-// the group's #meta roster summary — and every transition in a group contends
-// on that one summary item, twice over: DynamoDB cancels the losers of a
-// concurrent write to it with TransactionConflict, which the SDK does not
-// retry, and the summary's compare-and-set fails when a concurrent writer got
-// there first. Both are absorbed here with a bounded number of attempts; the
-// former backs off (short, jittered, doubling), the latter retries at once
-// from the value the failure returned. The ceiling is what one item's
-// transactional throughput allows; a group whose churn exceeds it is the
-// signal to revisit the summary's design.
+// Every write in this store that can lose to a concurrent one retries on one
+// policy, with a bounded number of attempts. A failed condition on a
+// compare-and-set means a concurrent writer got there first: the write goes
+// again at once, from the value the failure returned or from a fresh read. A
+// TransactionConflict means DynamoDB cancelled the transaction for
+// overlapping another on one of its items, whatever attributes either
+// writes, and the SDK does not retry it: the write backs off, short,
+// jittered and doubling (see conflictBackoff). Both share maxTransactAttempts,
+// sized for the busiest item any write contends on, a group's #meta roster
+// summary (see transitionMembership).
 const (
-	maxMembershipAttempts = 8
-	membershipBackoffBase = 10 * time.Millisecond
-	membershipBackoffMax  = 250 * time.Millisecond
+	maxTransactAttempts = 8
+	transactBackoffBase = 10 * time.Millisecond
+	transactBackoffMax  = 250 * time.Millisecond
 
 	codeTransactionConflict = "TransactionConflict"
 )
@@ -905,23 +992,25 @@ func (s *store) banCheck(chatID *commonpb.ChatId, userID *commonpb.UserId) *type
 
 // joinUpdate is the membership transition that (re)joins userID to chatID
 // (see addGroupMembers), for transitionMembership to carry. It sets the user
-// attribute, listing the record in gsiByUser, unless the store excludes the
-// user from the feed, when it removes it instead, so the record is unlisted
-// whatever an earlier write left on it (see groupMemberItem).
+// and feed attributes, listing the record in gsiByUser and in the user's inbox
+// in gsiByFeed, unless the store excludes the user from the feed, when it
+// removes both instead, so the record is unlisted whatever an earlier write
+// left on it (see groupMemberItem). A (re)join files the group in the inbox.
 func (s *store) joinUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.Update {
 	values := map[string]types.AttributeValue{
 		":joined": avN(memberStateJoined),
 		":now":    avN(uint64(time.Now().UTC().UnixNano())),
 	}
 	expression := fmt.Sprintf(
-		"SET #state = :joined, #user = :user, %s = :now, %s = :version REMOVE %s, %s", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
+		"SET #state = :joined, #user = :user, #feed = :feed, %s = :now, %s = :version REMOVE %s, %s", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
 	)
 	if s.exclusions.Excludes(userID) {
 		expression = fmt.Sprintf(
-			"SET #state = :joined, %s = :now, %s = :version REMOVE %s, %s, #user", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
+			"SET #state = :joined, %s = :now, %s = :version REMOVE %s, %s, #user, #feed", attrJoinedAt, attrVersion, attrLeftAt, attrExpiresAt,
 		)
 	} else {
 		values[":user"] = avS(userIndexKey(userID))
+		values[":feed"] = avS(groupFeedKey(userID, false))
 	}
 	return &types.Update{
 		TableName: aws.String(s.groupMembersTable),
@@ -931,11 +1020,30 @@ func (s *store) joinUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *ty
 		},
 		UpdateExpression:          aws.String(expression),
 		ConditionExpression:       aws.String("attribute_not_exists(#state) OR #state <> :joined"),
-		ExpressionAttributeNames:  map[string]string{"#state": attrState, "#user": attrUser},
+		ExpressionAttributeNames:  map[string]string{"#state": attrState, "#user": attrUser, "#feed": attrFeed},
 		ExpressionAttributeValues: values,
 	}
 }
 
+// RemoveGroupMember is the departure's membership transition carrying, beside
+// it, what the departure ends with it: the key envelope's discard when asked,
+// and the user's archive of the group.
+//
+// The departing user's key envelope goes in the same transaction, so it is
+// deleted iff the departure happens. The delete is unconditional: a user with
+// no envelope leaves all the same.
+//
+// The archive is decided from a strongly consistent read of the user's
+// chat_user_state record made before the write. Held, the transaction removes
+// it (see archiveRemoval), conditioned on the version read; not held, the
+// transaction checks it is still not held (see archiveAbsent). Either way an
+// archive or unarchive landing between the read and the write fails the
+// condition, which cancels the departure, and the departure reads again and
+// goes again: an archive and a departure never both land with the archive
+// standing. A departure that is a no-op writes nothing to the record, since
+// a non-member holds no archive. The read and its retries share the store's
+// attempt budget (see maxTransactAttempts), apart from the membership
+// transition's own.
 func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, discardKeyEnvelope bool) (bool, chat.RosterSummary, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return false, chat.RosterSummary{}, fmt.Errorf("not a group chat id")
@@ -946,15 +1054,80 @@ func (s *store) RemoveGroupMember(ctx context.Context, chatID *commonpb.ChatId, 
 		return false, chat.RosterSummary{}, err
 	}
 
-	// The departing user's key envelope goes in the same transaction, so it
-	// is deleted iff the departure happens. The delete is unconditional: a
-	// user with no envelope leaves all the same.
-	var alongside []types.TransactWriteItem
-	if discardKeyEnvelope {
-		alongside = append(alongside, s.keyEnvelopeDiscard(chatID, userID))
+	for attempt := 0; attempt < maxTransactAttempts; attempt++ {
+		current, err := s.readViewerStateForWrite(ctx, chatID, userID)
+		if err != nil {
+			return false, roster, err
+		}
+
+		var alongside []types.TransactWriteItem
+		if current.ArchivedAt != nil {
+			alongside = append(alongside, types.TransactWriteItem{Update: s.archiveRemoval(chatID, userID, current.Version)})
+		} else {
+			alongside = append(alongside, types.TransactWriteItem{ConditionCheck: s.archiveAbsent(chatID, userID)})
+		}
+		if discardKeyEnvelope {
+			alongside = append(alongside, s.keyEnvelopeDiscard(chatID, userID))
+		}
+		changed, err := s.transitionMembership(ctx, chatID, s.leaveUpdate(chatID, userID), -1, &roster, alongside)
+		if errors.As(err, new(alongsideConditionFailed)) {
+			// The record moved since the read: read it again.
+			continue
+		}
+		if err != nil {
+			return false, roster, err
+		}
+		return changed, roster, nil
 	}
-	changed, err := s.transitionMembership(ctx, chatID, s.leaveUpdate(chatID, userID), -1, &roster, alongside)
-	return changed, roster, err
+	return false, roster, fmt.Errorf("removing user %x from chat %x: attempts exhausted", userID.Value, chatID.Value)
+}
+
+// readViewerStateForWrite is the strongly consistent read of userID's
+// chat_user_state record on chatID that a write deciding from it starts
+// from: the zero state when there is no record.
+func (s *store) readViewerStateForWrite(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, error) {
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(s.userStateTable),
+		Key:            userStateKey(chatID, userID),
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return chat.ViewerState{}, err
+	}
+	return viewerStateFromItem(out.Item)
+}
+
+// archiveRemoval is the write that removes userID's archive of chatID from
+// their record, read at version: archived_at removed and the version moved by
+// one, conditioned on the archive still being there at that version, so a
+// write of the record since the read fails it. It is what SetArchived writes
+// to unarchive, and what a departure carries (see RemoveGroupMember).
+func (s *store) archiveRemoval(chatID *commonpb.ChatId, userID *commonpb.UserId, version uint64) *types.Update {
+	return &types.Update{
+		TableName:                aws.String(s.userStateTable),
+		Key:                      userStateKey(chatID, userID),
+		UpdateExpression:         aws.String("REMOVE #archived ADD #version :one"),
+		ConditionExpression:      aws.String("attribute_exists(#archived) AND #version = :version"),
+		ExpressionAttributeNames: map[string]string{"#archived": attrArchivedAt, "#version": attrVersion},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":one":     avN(1),
+			":version": avN(version),
+		},
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	}
+}
+
+// archiveAbsent is the check a departure of a user who held no archive when
+// it read carries: that their record holds none still (a user with no record
+// passes), so an archive landing after the read cancels the departure rather
+// than outliving the membership (see RemoveGroupMember).
+func (s *store) archiveAbsent(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.ConditionCheck {
+	return &types.ConditionCheck{
+		TableName:                aws.String(s.userStateTable),
+		Key:                      userStateKey(chatID, userID),
+		ConditionExpression:      aws.String("attribute_not_exists(#archived)"),
+		ExpressionAttributeNames: map[string]string{"#archived": attrArchivedAt},
+	}
 }
 
 // keyEnvelopeDiscard is the unconditional delete of userID's key envelope for
@@ -967,24 +1140,40 @@ func (s *store) keyEnvelopeDiscard(chatID *commonpb.ChatId, userID *commonpb.Use
 }
 
 // leaveUpdate is the membership transition that departs userID from chatID,
-// for transitionMembership to carry. Tombstone, don't delete: the item keeps
+// for transitionMembership to carry (see RemoveGroupMember and BanUser, which
+// remove the user's archive alongside it). Tombstone, don't delete: the item keeps
 // the departure's version for as long as it could matter, then expires (see
 // tombstoneTTL). Only a joined member transitions — the condition makes
 // removing a non-member (or an unknown user) a no-op rather than an upsert of
 // a malformed tombstone. Removing joined_at drops the member from the sparse
 // gsiByJoinedAt. The user attribute is left as the join wrote it, so a
-// tombstone stays listed in gsiByUser, unless the store excludes the user
-// from the feed, when it is removed, as joinUpdate removes it, so the
-// tombstone is unlisted however the join was written.
+// tombstone stays listed in gsiByUser, and feed is set to the user's inbox
+// whatever folder the membership was filed in, so a departure always files
+// the tombstone in the inbox: a membership's folder lasts only as long as the
+// membership, and a rejoin starts in the inbox too (see joinUpdate). Both are
+// removed instead when the store excludes the user from the feed, as
+// joinUpdate removes them, so the tombstone is unlisted however the join was
+// written.
 func (s *store) leaveUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *types.Update {
 	now := time.Now().UTC()
 	expression := fmt.Sprintf(
 		"SET #state = :left, %s = :now, %s = :version, %s = :expires REMOVE %s", attrLeftAt, attrVersion, attrExpiresAt, attrJoinedAt,
 	)
-	names := map[string]string{"#state": attrState}
+	names := map[string]string{"#state": attrState, "#feed": attrFeed}
+	values := map[string]types.AttributeValue{
+		":joined":  avN(memberStateJoined),
+		":left":    avN(memberStateLeft),
+		":now":     avN(uint64(now.UnixNano())),
+		":expires": avN(uint64(now.Add(tombstoneTTL).Unix())),
+	}
 	if s.exclusions.Excludes(userID) {
-		expression += ", #user"
+		expression += ", #user, #feed"
 		names["#user"] = attrUser
+	} else {
+		expression = fmt.Sprintf(
+			"SET #state = :left, #feed = :feed, %s = :now, %s = :version, %s = :expires REMOVE %s", attrLeftAt, attrVersion, attrExpiresAt, attrJoinedAt,
+		)
+		values[":feed"] = avS(groupFeedKey(userID, false))
 	}
 	return &types.Update{
 		TableName: aws.String(s.groupMembersTable),
@@ -992,15 +1181,10 @@ func (s *store) leaveUpdate(chatID *commonpb.ChatId, userID *commonpb.UserId) *t
 			attrPK: avS(chatPK(chatID)),
 			attrSK: avS(userPK(userID)),
 		},
-		UpdateExpression:         aws.String(expression),
-		ConditionExpression:      aws.String("#state = :joined"),
-		ExpressionAttributeNames: names,
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":joined":  avN(memberStateJoined),
-			":left":    avN(memberStateLeft),
-			":now":     avN(uint64(now.UnixNano())),
-			":expires": avN(uint64(now.Add(tombstoneTTL).Unix())),
-		},
+		UpdateExpression:          aws.String(expression),
+		ConditionExpression:       aws.String("#state = :joined"),
+		ExpressionAttributeNames:  names,
+		ExpressionAttributeValues: values,
 	}
 }
 
@@ -1048,6 +1232,13 @@ func (s *store) readRosterSummaryForWrite(ctx context.Context, chatID *commonpb.
 // cancel the transaction only by losing to a concurrent write on its own
 // item.
 //
+// Every transition in a group contends on that one summary item, twice
+// over: DynamoDB cancels the losers of a concurrent write to it with
+// TransactionConflict, and the summary's compare-and-set fails when a
+// concurrent writer got there first. maxTransactAttempts is what one item's
+// transactional throughput allows; a group whose churn exceeds it is the
+// signal to revisit the summary's design.
+//
 // Cancellation reasons are positional over the transaction's items: [0] is the
 // membership transition, [1] the summary, and the rest alongside's. A failed
 // [1] condition means a
@@ -1055,13 +1246,13 @@ func (s *store) readRosterSummaryForWrite(ctx context.Context, chatID *commonpb.
 // cancellation, so *roster is refreshed from it and the transition retried
 // with no extra read. Losing the write itself to a concurrent transaction on
 // the same item, any of them, surfaces as TransactionConflict and is retried
-// with backoff. Both share the attempt budget (see maxMembershipAttempts).
+// with backoff. Both share the attempt budget (see maxTransactAttempts).
 // The transition's own no-op is judged first, then the summary, then
 // alongside's conditions: a no-op is a no-op whatever else failed, and a
 // stale summary is retried before an alongside condition is believed, since
 // the retry re-evaluates it.
 func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatId, transition *types.Update, delta int64, roster *chat.RosterSummary, alongside []types.TransactWriteItem) (bool, error) {
-	backoff := membershipBackoffBase
+	backoff := transactBackoffBase
 	for attempt := 0; ; attempt++ {
 		next := chat.RosterSummary{
 			MemberCount: uint64(int64(roster.MemberCount) + delta),
@@ -1104,7 +1295,7 @@ func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatI
 
 		// The budget applies to the retries alone: a no-op is a no-op on the
 		// last attempt too, and is reported as one, not as an exhausted retry.
-		exhausted := attempt+1 >= maxMembershipAttempts
+		exhausted := attempt+1 >= maxTransactAttempts
 		switch {
 		case codes[0] == conditionalCheckFailedCode:
 			// Already in the target state: nothing happened, nothing to record.
@@ -1133,12 +1324,9 @@ func (s *store) transitionMembership(ctx context.Context, chatID *commonpb.ChatI
 			if exhausted {
 				return false, fmt.Errorf("membership transition for chat %x: %w", chatID.Value, err)
 			}
-			select {
-			case <-ctx.Done():
-				return false, ctx.Err()
-			case <-time.After(backoff + rand.N(backoff)):
+			if err := conflictBackoff(ctx, &backoff); err != nil {
+				return false, err
 			}
-			backoff = min(2*backoff, membershipBackoffMax)
 		default:
 			return false, err
 		}
@@ -1311,18 +1499,20 @@ func (s *store) GetDmOpeningIntentID(ctx context.Context, chatID *commonpb.ChatI
 	return &commonpb.IntentId{Value: append([]byte(nil), opening...)}, nil
 }
 
-func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
-	// Constrain the GSI range key to the snapshot window: only inbox rows whose
-	// last_activity is at or before the watermark. The composite feed hash key
-	// scopes the query to one chat type, so pages come back dense — no filter
-	// expression. Descending order (most recent first) is fixed for the feed.
+func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chatType chatpb.ChatType, folder chat.Folder, snapshot time.Time, cursor *chat.DmFeedCursor, limit int) ([]*chat.Chat, error) {
+	// Constrain the GSI range key to the snapshot window: only rows of the
+	// folder whose last_activity is at or before the watermark. The composite feed hash key
+	// scopes the query to one chat type in one folder, so pages come back
+	// dense — no filter expression. Descending order (most recent first) is
+	// fixed for the feed.
+	feed := dmFeedKey(userID, chatType, folder.IsArchived())
 	input := &dynamodb.QueryInput{
 		TableName:                aws.String(s.dmInboxTable),
-		IndexName:                aws.String(gsiByTypeActivity),
+		IndexName:                aws.String(gsiByFeedActivity),
 		KeyConditionExpression:   aws.String(fmt.Sprintf("#feed = :f AND %s <= :snap", attrLastActivity)),
 		ExpressionAttributeNames: map[string]string{"#feed": attrFeed},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":f":    avS(feedPK(userID, chatType)),
+			":f":    avS(feed),
 			":snap": avN(uint64(snapshot.UnixNano())),
 		},
 		ScanIndexForward: aws.Bool(false),
@@ -1333,12 +1523,16 @@ func (s *store) GetDmFeedPage(ctx context.Context, userID *commonpb.UserId, chat
 
 	// The cursor carries (last_activity, chat_id) explicitly, so the GSI start
 	// key is built directly without a lookup. A GSI start key must include the
-	// GSI key (feed, last_activity) and the base table key (pk, sk).
+	// GSI key (feed, last_activity) and the base table key (pk, sk). The
+	// cursor names no index, so one issued while the read used
+	// gsiByTypeActivity, which has the same keys, resumes here unchanged. It
+	// names no folder either: it resumes in the folder asked for, the one the
+	// caller read it from.
 	if cursor != nil {
 		input.ExclusiveStartKey = map[string]types.AttributeValue{
 			attrPK:           avS(userPK(userID)),
 			attrSK:           avS(chatSK(cursor.ChatID)),
-			attrFeed:         avS(feedPK(userID, chatType)),
+			attrFeed:         avS(feed),
 			attrLastActivity: avN(uint64(cursor.LastActivity.UnixNano())),
 		}
 	}
@@ -1408,6 +1602,12 @@ func (s *store) getGroupMembers(ctx context.Context, chatID *commonpb.ChatId) ([
 // runs after DynamoDB applies the limit, so a page is assembled from as many
 // queries as it takes to collect limit joined rows, and each is asked for
 // only what the page still lacks.
+//
+// A member has archived the group exactly when their row's feed is their
+// archived folder's (see groupFeedKey), which SetArchived sets in the same
+// write as the archive and a departure resets: the row says it, with no read
+// of chat_user_state, and the comparison is of the whole value, as every
+// reader of feed makes it.
 func (s *store) GetGroupMembersPage(ctx context.Context, chatID *commonpb.ChatId, after *commonpb.UserId, limit int) (chat.MembersPage, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return chat.MembersPage{}, fmt.Errorf("not a group chat id")
@@ -1448,6 +1648,12 @@ func (s *store) GetGroupMembersPage(ctx context.Context, chatID *commonpb.ChatId
 				return chat.MembersPage{}, err
 			}
 			page.Users = append(page.Users, userID)
+			if asS(item[attrFeed]) == groupFeedKey(userID, true) {
+				if page.Archived == nil {
+					page.Archived = make(map[string]struct{})
+				}
+				page.Archived[string(userID.Value)] = struct{}{}
+			}
 			if limit > 0 && len(page.Users) == limit {
 				// Whether any member follows is unknown without reading on,
 				// so the cursor is handed out regardless and the next page may
@@ -1749,17 +1955,22 @@ func groupMemberFromItem(item map[string]types.AttributeValue) (chat.GroupMember
 }
 
 // GetGroupMembershipsForUser lists the user's membership records via the
-// inverted gsiByUser. The index is keyed by the sparse user attribute, which
-// tombstones keep (unlike joined_at), so departed memberships are in the user's
-// slice alongside joined ones, and come back with their state. A user excluded
+// inverted gsiByFeed, from the partition of the folder asked for (see
+// groupFeedKey): a group they have archived is in their archived folder's
+// partition of the index, every other in their inbox's. The index is keyed
+// by the sparse feed attribute, which tombstones keep (unlike joined_at), so
+// departed memberships are in the user's inbox slice alongside joined ones,
+// and come back with their state; every departure files its tombstone in the
+// inbox, so the archived slice holds joined records alone. A user excluded
 // from the feed has no rows in the index, so the query returns nothing for
 // them, as it does in GetGroupChatsForUser and GetGroupChatsForUserByIDs.
-func (s *store) GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId) ([]chat.GroupMembership, error) {
-	return s.queryGroupMemberships(ctx, userID, nil, nil, false)
+func (s *store) GetGroupMembershipsForUser(ctx context.Context, userID *commonpb.UserId, folder chat.Folder) ([]chat.GroupMembership, error) {
+	return s.queryGroupMemberships(ctx, userID, folder, nil, nil, false)
 }
 
-// queryGroupMemberships is the gsiByUser query behind
-// GetGroupMembershipsForUser, optionally bounded to chat IDs in [lo, hi]. The
+// queryGroupMemberships is the gsiByFeed query of one of the user's folders
+// behind GetGroupMembershipsForUser, GetGroupChatsForUser and
+// GetGroupChatsForUserByIDs, optionally bounded to chat IDs in [lo, hi]. The
 // index's range key is the chat key, whose hex encoding preserves the ID's
 // byte order, so the bound is a key condition: rows outside it are never
 // scanned, and never billed. Both bounds are nil for the user's whole slice.
@@ -1773,10 +1984,10 @@ func (s *store) GetGroupMembershipsForUser(ctx context.Context, userID *commonpb
 // every attribute, so each row's state and version stamp (see
 // transitionMembership) come back with it at no extra cost. A row written at
 // the group's creation carries no stamp and reads as version zero.
-func (s *store) queryGroupMemberships(ctx context.Context, userID *commonpb.UserId, lo, hi *commonpb.ChatId, joinedOnly bool) ([]chat.GroupMembership, error) {
-	keyCondition := "#user = :user"
-	names := map[string]string{"#user": attrUser}
-	values := map[string]types.AttributeValue{":user": avS(userIndexKey(userID))}
+func (s *store) queryGroupMemberships(ctx context.Context, userID *commonpb.UserId, folder chat.Folder, lo, hi *commonpb.ChatId, joinedOnly bool) ([]chat.GroupMembership, error) {
+	keyCondition := "#feed = :feed"
+	names := map[string]string{"#feed": attrFeed}
+	values := map[string]types.AttributeValue{":feed": avS(groupFeedKey(userID, folder.IsArchived()))}
 	if lo != nil && hi != nil {
 		keyCondition += " AND #pk BETWEEN :lo AND :hi"
 		names["#pk"] = attrPK
@@ -1795,7 +2006,7 @@ func (s *store) queryGroupMemberships(ctx context.Context, userID *commonpb.User
 	for {
 		out, err := s.client.Query(ctx, &dynamodb.QueryInput{
 			TableName:                 aws.String(s.groupMembersTable),
-			IndexName:                 aws.String(gsiByUser),
+			IndexName:                 aws.String(gsiByFeed),
 			KeyConditionExpression:    aws.String(keyCondition),
 			FilterExpression:          filter,
 			ExpressionAttributeNames:  names,
@@ -1843,11 +2054,14 @@ func membershipChatIDs(memberships []chat.GroupMembership) []*commonpb.ChatId {
 	return chatIDs
 }
 
-// GetGroupChatsForUser is the joined-only membership query followed by the
-// canonical read of each ID: the feed wants current memberships alone, so the
-// tombstones are dropped in the store rather than carried back to be skipped.
-func (s *store) GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserId) ([]*chat.Chat, error) {
-	memberships, err := s.queryGroupMemberships(ctx, userID, nil, nil, true)
+// GetGroupChatsForUser is the joined-only membership query of the folder
+// followed by the canonical read of each ID: the feed wants current
+// memberships alone, so the tombstones are dropped in the store rather than
+// carried back to be skipped. The archived folder holds no tombstone, since a
+// departure files its tombstone in the inbox, so the filter drops nothing
+// there.
+func (s *store) GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserId, folder chat.Folder) ([]*chat.Chat, error) {
+	memberships, err := s.queryGroupMemberships(ctx, userID, folder, nil, nil, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1855,8 +2069,10 @@ func (s *store) GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserI
 }
 
 // GetGroupChatsForUserByIDs checks membership by querying the user's slice of
-// the inverted membership index — the same read GetGroupMembershipsForUser makes —
-// rather than by a keyed read of each given ID's membership record. A query is
+// the inverted membership index for the folder — the read
+// GetGroupMembershipsForUser makes of it — rather than by a keyed read
+// of each given ID's membership record, so a group in the user's other folder
+// is not confirmed, as a group they left is not. A query is
 // billed on the bytes it scans, and membership rows are small, so the user's
 // whole membership costs a fraction of what one keyed read per ID would: a
 // batch get charges every item the full minimum, however small. The query
@@ -1873,7 +2089,7 @@ func (s *store) GetGroupChatsForUser(ctx context.Context, userID *commonpb.UserI
 // then read from the chats table — so nothing is fetched for an ID the user
 // is not (or no longer) in, which is what a stale or tampered feed token asks
 // about.
-func (s *store) GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) ([]*chat.Chat, error) {
+func (s *store) GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.UserId, folder chat.Folder, chatIDs []*commonpb.ChatId) ([]*chat.Chat, error) {
 	for _, chatID := range chatIDs {
 		if !chat.IsGroupChatID(chatID) {
 			return nil, fmt.Errorf("not a group chat id")
@@ -1892,7 +2108,7 @@ func (s *store) GetGroupChatsForUserByIDs(ctx context.Context, userID *commonpb.
 			hi = chatID
 		}
 	}
-	memberships, err := s.queryGroupMemberships(ctx, userID, lo, hi, true)
+	memberships, err := s.queryGroupMemberships(ctx, userID, folder, lo, hi, true)
 	if err != nil {
 		return nil, err
 	}
@@ -2268,16 +2484,41 @@ func (s *store) AdvanceLastMessage(ctx context.Context, chatID *commonpb.ChatId,
 		})
 	}
 
-	_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
-	if err != nil {
-		// A concurrent advance moved last_activity to/past ts; treat as no-op.
-		// last_activity is a derived value that self-heals on the next bump.
-		if isTransactionCanceled(err) {
-			return false, members, nil
+	// A failed condition means a concurrent advance moved last_activity to or
+	// past ts on the item that failed, which it moves on every item, so the
+	// advance is a no-op. A conflict is not: DynamoDB cancels a transaction
+	// that overlaps another on any of its items, whatever attributes either
+	// writes, and the other may be no advance at all (an archive writes a
+	// member's row, see SetArchived), so dropping the advance would leave the
+	// DM showing an older message until the next one. It backs off and goes
+	// again, on the store's attempt budget (see maxTransactAttempts);
+	// a retry after a newer advance landed meanwhile fails its condition and
+	// is the no-op.
+	backoff := transactBackoffBase
+	for attempt := 0; ; attempt++ {
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
+		if err == nil {
+			return true, members, nil
 		}
-		return false, nil, err
+		reasons, ok := cancellationReasons(err)
+		if !ok {
+			return false, nil, err
+		}
+		codes := make([]string, len(reasons))
+		for i, reason := range reasons {
+			codes[i] = aws.ToString(reason.Code)
+		}
+		switch {
+		case slices.Contains(codes, conditionalCheckFailedCode):
+			return false, members, nil
+		case isTransactionConflict(codes) && attempt+1 < maxTransactAttempts:
+			if err := conflictBackoff(ctx, &backoff); err != nil {
+				return false, nil, err
+			}
+		default:
+			return false, nil, fmt.Errorf("advancing last message of chat %x: %w", chatID.Value, err)
+		}
 	}
-	return true, members, nil
 }
 
 // advanceGroupLastMessage is AdvanceLastMessage for a group: one conditional
@@ -2373,12 +2614,13 @@ func (s *store) chatItem(c *chat.Chat) map[string]types.AttributeValue {
 }
 
 // groupMemberItem is a joined membership record, as written at group creation.
-// It matches what addGroupMembers converges to: state joined, user set (the
-// gsiByUser hash key), joined_at present (the sparse gsiByJoinedAt keys off its
-// presence), no left_at. The record of a user the store excludes from the feed
-// carries no user attribute, so it is not in gsiByUser and no listing of the
+// It matches what addGroupMembers converges to: state joined, user and feed set
+// (the gsiByUser and gsiByFeed hash keys, feed naming the user's inbox),
+// joined_at present (the sparse gsiByJoinedAt keys off its presence), no
+// left_at. The record of a user the store excludes from the feed carries
+// neither user nor feed, so it is in neither index and no listing of the
 // user's groups returns it (see chat.Store.PutChat); nothing else reads the
-// attribute, since every reader of a membership record takes the member's ID
+// attributes, since every reader of a membership record takes the member's ID
 // from its sk, so the record is a member's in every other respect.
 func (s *store) groupMemberItem(chatID *commonpb.ChatId, member *commonpb.UserId, joinedAt time.Time) map[string]types.AttributeValue {
 	item := map[string]types.AttributeValue{
@@ -2389,13 +2631,14 @@ func (s *store) groupMemberItem(chatID *commonpb.ChatId, member *commonpb.UserId
 	}
 	if !s.exclusions.Excludes(member) {
 		item[attrUser] = avS(userIndexKey(member))
+		item[attrFeed] = avS(groupFeedKey(member, false))
 	}
 	return item
 }
 
 // groupMetaItem is a group's aggregates item as written at creation: the
-// initial joined member count and a roster version of zero. It carries neither
-// user nor joined_at, so it stays out of both sparse GSIs.
+// initial joined member count and a roster version of zero. It carries none of
+// user, feed and joined_at, so it stays out of every sparse GSI.
 func (s *store) groupMetaItem(chatID *commonpb.ChatId, memberCount uint64) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{
 		attrPK:          avS(chatPK(chatID)),
@@ -2421,7 +2664,7 @@ func (s *store) dmInboxItem(c *chat.Chat, member *commonpb.UserId, excluded bool
 	if excluded {
 		return item
 	}
-	item[attrFeed] = avS(feedPK(member, c.Type))
+	item[attrFeed] = avS(dmFeedKey(member, c.Type, false))
 	item[attrLastActivity] = avN(uint64(c.LastActivity.UnixNano()))
 	if c.LastMessageID != nil {
 		item[attrLastMessageID] = avN(c.LastMessageID.Value)
@@ -2561,19 +2804,48 @@ func chatPK(chatID *commonpb.ChatId) string { return chatKeyPrefix + hex.EncodeT
 func chatSK(chatID *commonpb.ChatId) string { return chatKeyPrefix + hex.EncodeToString(chatID.Value) }
 func userPK(userID *commonpb.UserId) string { return userKeyPrefix + hex.EncodeToString(userID.Value) }
 
-// userIndexKey is the gsiByUser hash key: the member's ID in bare hex, with no
-// "user#" prefix. The prefix disambiguates a key space shared by several entity
-// types — the group_members sk needs it, as does every pk here — but this
-// attribute's name already fixes its type, so the prefix would say nothing the
-// name doesn't. Query gsiByUser with this, never with userPK: the two encode the
-// same ID differently, and a mismatch is a query that returns nothing rather
-// than an error.
+// userIndexKey is the user attribute of a group_members row, the hash key of
+// the unread gsiByUser: the member's ID in bare hex, with no "user#" prefix.
+// The prefix disambiguates a key space shared by several entity types — the
+// group_members sk needs it, as does every pk here — but this attribute's name
+// already fixes its type, so the prefix would say nothing the name doesn't.
+// Writes still set it, so the legacy index stays whole until a cleanup stops
+// writing it and drops the index; nothing reads it.
 func userIndexKey(userID *commonpb.UserId) string { return hex.EncodeToString(userID.Value) }
 
-// feedPK is the composite hash key of gsiByTypeActivity: one chat type's slice
-// of a user's inbox. The chat type is encoded by its stable proto enum number.
-func feedPK(userID *commonpb.UserId, chatType chatpb.ChatType) string {
-	return fmt.Sprintf("%s#%d", userPK(userID), chatType)
+// archivedFeedSuffix ends the feed attribute of a chat filed in the user's
+// archive rather than their inbox (see dmFeedKey and groupFeedKey).
+const archivedFeedSuffix = "#archived"
+
+// dmFeedKey is the feed attribute of a user's dm_inbox row, the hash key of
+// gsiByFeedActivity (and of the unread gsiByTypeActivity): one chat type's
+// slice of one of the user's folders, "user#<id>#<type>" for the inbox, as a
+// row is created, and the same with archivedFeedSuffix for the archive, as
+// SetArchived files it. The chat type is encoded by
+// its stable proto enum number. Nothing parses the value: it is only ever
+// built here and compared whole, so its layout may change with a backfill and
+// no reader.
+func dmFeedKey(userID *commonpb.UserId, chatType chatpb.ChatType, archived bool) string {
+	key := fmt.Sprintf("%s#%d", userPK(userID), chatType)
+	if archived {
+		key += archivedFeedSuffix
+	}
+	return key
+}
+
+// groupFeedKey is the feed attribute of a user's group_members row, the hash
+// key of gsiByFeed: one of the user's folders of groups, "user#<id>" for the
+// inbox, as every join and departure files it, and the same with
+// archivedFeedSuffix for the archive, as SetArchived files a joined row. It has no chat
+// type segment, since every row of the table is a group's. Nothing parses the
+// value, as with dmFeedKey: every reader of a membership record takes the
+// member's ID from its sk.
+func groupFeedKey(userID *commonpb.UserId, archived bool) string {
+	key := userPK(userID)
+	if archived {
+		key += archivedFeedSuffix
+	}
+	return key
 }
 
 // chatIDFromSK recovers a chat ID from a dm_inbox item's sk ("chat#<hex>"),
@@ -2711,14 +2983,14 @@ func parseF(av types.AttributeValue) (float64, error) {
 	return strconv.ParseFloat(n.Value, 64)
 }
 
-func isTransactionCanceled(err error) bool {
-	var tce *types.TransactionCanceledException
-	return errors.As(err, &tce)
-}
-
 // conditionalCheckFailedCode is the CancellationReason code DynamoDB reports for
 // the item whose condition expression failed.
 const conditionalCheckFailedCode = "ConditionalCheckFailed"
+
+// cancellationNone is the CancellationReason code DynamoDB reports for an
+// item of a cancelled transaction that did not cause the cancellation: its
+// condition, if any, held.
+const cancellationNone = "None"
 
 // isChatExistsCancellation reports whether a chat-creation transaction was
 // cancelled because the canonical item already existed.
@@ -2772,13 +3044,11 @@ func protoChatType(v uint64) chatpb.ChatType {
 var muteForeverUntil = uint64(chat.MaxMuteUntil.Unix())
 
 // A mute first recorded or cleared is a two-item transaction — the user's
-// record and the chat's #meta muted count — on the membership-transition
-// pattern (see maxMembershipAttempts): a lost condition retries at once from
+// record and the chat's #meta muted count — on the store's retry policy
+// (see maxTransactAttempts): a lost condition retries at once from
 // the item the failure returned, and a TransactionConflict backs off. A mute
 // replaced is a single conditional update of the record alone, since the
 // count does not move.
-const maxUserStateAttempts = maxMembershipAttempts
-
 func (s *store) SetMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, mute chat.Mute) (chat.ViewerState, bool, error) {
 	mute, err := mute.Normalize()
 	if err != nil {
@@ -2793,8 +3063,8 @@ func (s *store) SetMute(ctx context.Context, chatID *commonpb.ChatId, userID *co
 	// one has: every failure hands the item back, so the loop never reads,
 	// and each attempt starts from the case the record is known to be in.
 	var current *chat.ViewerState
-	backoff := membershipBackoffBase
-	for attempt := 0; attempt < maxUserStateAttempts; attempt++ {
+	backoff := transactBackoffBase
+	for attempt := 0; attempt < maxTransactAttempts; attempt++ {
 		if current == nil || current.Mute != nil {
 			// Replace: a recorded mute that differs is one write of the record
 			// alone. It is also the probe when nothing is known yet — the
@@ -2883,12 +3153,9 @@ func (s *store) SetMute(ctx context.Context, chatID *commonpb.ChatId, userID *co
 		case isTransactionConflict(codes):
 			// The record was not evaluated, so what is known of it still
 			// holds; the same attempt goes again after a pause.
-			select {
-			case <-ctx.Done():
-				return chat.ViewerState{}, false, ctx.Err()
-			case <-time.After(backoff + rand.N(backoff)):
+			if err := conflictBackoff(ctx, &backoff); err != nil {
+				return chat.ViewerState{}, false, err
 			}
-			backoff = min(2*backoff, membershipBackoffMax)
 			continue
 		default:
 			return chat.ViewerState{}, false, err
@@ -2898,8 +3165,8 @@ func (s *store) SetMute(ctx context.Context, chatID *commonpb.ChatId, userID *co
 }
 
 func (s *store) ClearMute(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId) (chat.ViewerState, bool, error) {
-	backoff := membershipBackoffBase
-	for attempt := 0; attempt < maxUserStateAttempts; attempt++ {
+	backoff := transactBackoffBase
+	for attempt := 0; attempt < maxTransactAttempts; attempt++ {
 		// The record's version is compared so the state returned is exactly
 		// what was written, with no read after; the condition on muted_until
 		// is what makes no mute recorded the no-op, and keeps that no-op from
@@ -2950,18 +3217,232 @@ func (s *store) ClearMute(ctx context.Context, chatID *commonpb.ChatId, userID *
 		case codes[0] == conditionalCheckFailedCode:
 			continue
 		case isTransactionConflict(codes):
-			select {
-			case <-ctx.Done():
-				return chat.ViewerState{}, false, ctx.Err()
-			case <-time.After(backoff + rand.N(backoff)):
+			if err := conflictBackoff(ctx, &backoff); err != nil {
+				return chat.ViewerState{}, false, err
 			}
-			backoff = min(2*backoff, membershipBackoffMax)
 			continue
 		default:
 			return chat.ViewerState{}, false, err
 		}
 	}
 	return chat.ViewerState{}, false, fmt.Errorf("clearing mute for user %x on chat %x: attempts exhausted", userID.Value, chatID.Value)
+}
+
+// SetArchived reads the user's record strongly consistent, which decides the
+// no-op, and then writes the archive and the chat's folder in one
+// transaction of two items:
+//
+//   - the record: archived_at set to the archive's time (and the raw chat
+//     attribute, as every record carries it) or removed (see
+//     archiveRemoval), and version added to, conditioned on the archive
+//     being absent or present as read and on the version read (or on there
+//     being no record, for a user who had none), so a write of the record
+//     since the read, a mute's included, fails it and the state returned is
+//     exactly what was written;
+//   - the user's feed row: a DM's dm_inbox row, or the group's group_members
+//     row, its feed set to the folder that follows (see dmFeedKey and
+//     groupFeedKey), conditioned on the row carrying feed and, for a group,
+//     on the membership being joined, so the archive lands only for a member
+//     whose copy of the chat is in a folder, judged as of the write.
+//
+// A failed record condition is a write that landed since the read: the
+// archive reads again and goes again, from what the read then decides, the
+// no-op included. A failed row condition is the refusal, told apart by the
+// row the failure returns: none, or a group membership that is not joined,
+// is ErrNotMember, a DM row of another type than c's an error, and a row
+// with no feed ErrExcludedFromFeed. The record is judged first, as the no-op
+// is, and a TransactionConflict, which leaves the record possibly unjudged,
+// backs off and reads again before any refusal. A refusal is believed only
+// of a transaction whose record held; any other cancellation is returned as
+// an error. All share the store's attempt budget (see maxTransactAttempts).
+//
+// A DM's membership is c's members, fixed at creation, so a user who is not
+// one is refused before any write; the row's condition stands behind it. The
+// DM's exclusion is kept on the row itself, which an excluded member's lacks
+// feed on (see dmInboxItem), so the refusal is the DM's, however this store
+// is configured. Neither write touches muted_until, the #meta muted count,
+// a restriction's attributes or the row's last_activity, so an archived DM
+// keeps its place by activity, and AdvanceLastMessage, which writes the row's
+// activity alone, keeps moving it in whichever folder it is filed.
+func (s *store) SetArchived(ctx context.Context, c *chat.Chat, userID *commonpb.UserId, archived bool, now time.Time) (chat.ViewerState, bool, error) {
+	if err := chat.ValidateArchiveChat(c); err != nil {
+		return chat.ViewerState{}, false, err
+	}
+	var archivedAt time.Time
+	if archived {
+		var err error
+		if archivedAt, err = chat.RecordedTime(now); err != nil {
+			return chat.ViewerState{}, false, err
+		}
+	}
+	isGroup := chat.IsGroupChatID(c.ID)
+
+	backoff := transactBackoffBase
+	for attempt := 0; attempt < maxTransactAttempts; attempt++ {
+		current, err := s.readViewerStateForWrite(ctx, c.ID, userID)
+		if err != nil {
+			return chat.ViewerState{}, false, err
+		}
+		if (current.ArchivedAt != nil) == archived {
+			return current, false, nil
+		}
+		if !isGroup && !c.HasMember(userID) {
+			return chat.ViewerState{}, false, chat.ErrNotMember
+		}
+
+		record := s.archiveRemoval(c.ID, userID, current.Version)
+		if archived {
+			record = &types.Update{
+				TableName:        aws.String(s.userStateTable),
+				Key:              userStateKey(c.ID, userID),
+				UpdateExpression: aws.String("SET #chat = :chat, #archived = :at ADD #version :one"),
+				ConditionExpression: aws.String(
+					"attribute_not_exists(#archived) AND (attribute_not_exists(#version) OR #version = :version)",
+				),
+				ExpressionAttributeNames: map[string]string{
+					"#chat":     attrChat,
+					"#archived": attrArchivedAt,
+					"#version":  attrVersion,
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":chat":    avB(c.ID.Value),
+					":at":      avN(uint64(archivedAt.UnixNano())),
+					":one":     avN(1),
+					":version": avN(current.Version),
+				},
+			}
+		}
+		transactItems := []types.TransactWriteItem{{Update: record}, {Update: s.archiveFeedUpdate(c, userID, archived)}}
+		_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
+		if err == nil {
+			// The record as the condition proved it, less nothing an
+			// archive's write touched: a mute and restrictions stand.
+			state := current.Clone()
+			state.ArchivedAt = nil
+			if archived {
+				state.ArchivedAt = &archivedAt
+			}
+			state.Version++
+			return state, true, nil
+		}
+		reasons, ok := cancellationReasons(err)
+		if !ok || len(reasons) != len(transactItems) {
+			return chat.ViewerState{}, false, err
+		}
+		codes := []string{aws.ToString(reasons[0].Code), aws.ToString(reasons[1].Code)}
+		switch {
+		case codes[0] == conditionalCheckFailedCode:
+			continue
+		case isTransactionConflict(codes):
+			// The record may not have been evaluated, so a row refusal is not
+			// yet to be believed: the read that follows the pause may find
+			// the no-op.
+			if err := conflictBackoff(ctx, &backoff); err != nil {
+				return chat.ViewerState{}, false, err
+			}
+		case codes[0] == cancellationNone && codes[1] == conditionalCheckFailedCode:
+			row := reasons[1].Item
+			if len(row) == 0 {
+				return chat.ViewerState{}, false, chat.ErrNotMember
+			}
+			if isGroup {
+				state, err := parseN(row[attrState])
+				if err != nil || state != memberStateJoined {
+					return chat.ViewerState{}, false, chat.ErrNotMember
+				}
+			} else if stored, err := parseN(row[attrType]); err != nil || chatpb.ChatType(stored) != c.Type {
+				return chat.ViewerState{}, false, fmt.Errorf("chat %x is stored as type %d, not %s", c.ID.Value, stored, c.Type)
+			}
+			return chat.ViewerState{}, false, chat.ErrExcludedFromFeed
+		default:
+			return chat.ViewerState{}, false, err
+		}
+	}
+	return chat.ViewerState{}, false, fmt.Errorf("setting archive for user %x on chat %x: attempts exhausted", userID.Value, c.ID.Value)
+}
+
+// archiveFeedUpdate is the write SetArchived makes of userID's feed row for
+// c, filing it in the archived folder or the inbox: feed set to the folder's
+// value, conditioned on the row carrying feed, for a DM on the row being of
+// c's type, since the type is part of the feed value, and for a group on
+// the membership being joined. The row is returned on a failed condition,
+// which tells a non-member from an excluded one.
+func (s *store) archiveFeedUpdate(c *chat.Chat, userID *commonpb.UserId, archived bool) *types.Update {
+	if !chat.IsGroupChatID(c.ID) {
+		return &types.Update{
+			TableName:                aws.String(s.dmInboxTable),
+			Key:                      map[string]types.AttributeValue{attrPK: avS(userPK(userID)), attrSK: avS(chatSK(c.ID))},
+			UpdateExpression:         aws.String("SET #feed = :feed"),
+			ConditionExpression:      aws.String("attribute_exists(#feed) AND #type = :type"),
+			ExpressionAttributeNames: map[string]string{"#feed": attrFeed, "#type": attrType},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":feed": avS(dmFeedKey(userID, c.Type, archived)),
+				":type": avN(uint64(c.Type)),
+			},
+			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		}
+	}
+	return &types.Update{
+		TableName:                aws.String(s.groupMembersTable),
+		Key:                      map[string]types.AttributeValue{attrPK: avS(chatPK(c.ID)), attrSK: avS(userPK(userID))},
+		UpdateExpression:         aws.String("SET #feed = :feed"),
+		ConditionExpression:      aws.String("#state = :joined AND attribute_exists(#feed)"),
+		ExpressionAttributeNames: map[string]string{"#feed": attrFeed, "#state": attrState},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":feed":   avS(groupFeedKey(userID, archived)),
+			":joined": avN(memberStateJoined),
+		},
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	}
+}
+
+// GetArchivedChats is one strongly consistent query of the user's partition
+// of chat_user_state, paged to its end, with a filter keeping the records
+// that hold an archive and a projection of what an ArchivedChat carries. The
+// filter runs after the read, so the query is billed for every record the
+// user holds, archived or not: their records number the chats they have set
+// any state on, which bounds it. The key condition keeps to chat sort keys,
+// which every record has (the table's #meta items are keyed by chat), so
+// nothing else in the partition could be misread as one.
+func (s *store) GetArchivedChats(ctx context.Context, userID *commonpb.UserId) ([]chat.ArchivedChat, error) {
+	out := make([]chat.ArchivedChat, 0)
+	var startKey map[string]types.AttributeValue
+	for {
+		res, err := s.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                aws.String(s.userStateTable),
+			KeyConditionExpression:   aws.String("#pk = :pk AND begins_with(#sk, :chat)"),
+			FilterExpression:         aws.String("attribute_exists(#archived)"),
+			ProjectionExpression:     aws.String("#sk, #version, #archived"),
+			ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#sk": attrSK, "#version": attrVersion, "#archived": attrArchivedAt},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk":   avS(userPK(userID)),
+				":chat": avS(chatKeyPrefix),
+			},
+			ConsistentRead:    aws.Bool(true),
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range res.Items {
+			chatID, err := chatIDFromSK(item)
+			if err != nil {
+				return nil, err
+			}
+			state, err := viewerStateFromItem(item)
+			if err != nil {
+				return nil, err
+			}
+			if state.ArchivedAt == nil {
+				continue
+			}
+			out = append(out, chat.ArchivedChat{ChatID: chatID, ArchivedAt: *state.ArchivedAt, Version: state.Version})
+		}
+		if len(res.LastEvaluatedKey) == 0 {
+			return out, nil
+		}
+		startKey = res.LastEvaluatedKey
+	}
 }
 
 // mutedCountUpdate moves a chat's #meta muted count by delta, creating the
@@ -3208,8 +3689,8 @@ func userStateKey(chatID *commonpb.ChatId, userID *commonpb.UserId) map[string]t
 // viewerStateFromItem decodes a chat_user_state item. A missing version reads
 // as zero, a missing muted_until as no mute and a missing silenced_until as
 // no silence; either at or above muteForeverUntil is indefinite. A missing
-// banned_at is no ban, and RestrictedAt is the time restricted_sort leads
-// with (see restrictedSort).
+// archived_at is no archive, and a missing banned_at no ban, and
+// RestrictedAt is the time restricted_sort leads with (see restrictedSort).
 func viewerStateFromItem(item map[string]types.AttributeValue) (chat.ViewerState, error) {
 	var state chat.ViewerState
 	if av, ok := item[attrVersion]; ok {
@@ -3226,6 +3707,13 @@ func viewerStateFromItem(item map[string]types.AttributeValue) (chat.ViewerState
 		}
 		state.Mute = &chat.Mute{Forever: forever, Until: until}
 	}
+	if av, ok := item[attrArchivedAt]; ok {
+		archivedAt, err := nanosFromAttr(av)
+		if err != nil {
+			return chat.ViewerState{}, fmt.Errorf("parsing %s: %w", attrArchivedAt, err)
+		}
+		state.ArchivedAt = &archivedAt
+	}
 	if av, ok := item[attrSilencedUntil]; ok {
 		forever, until, err := untilFromAttr(av)
 		if err != nil {
@@ -3234,11 +3722,10 @@ func viewerStateFromItem(item map[string]types.AttributeValue) (chat.ViewerState
 		state.Silence = &chat.Silence{Forever: forever, Until: until}
 	}
 	if av, ok := item[attrBannedAt]; ok {
-		nanos, err := parseN(av)
+		bannedAt, err := nanosFromAttr(av)
 		if err != nil {
 			return chat.ViewerState{}, fmt.Errorf("parsing %s: %w", attrBannedAt, err)
 		}
-		bannedAt := time.Unix(0, int64(nanos)).UTC()
 		state.BannedAt = &bannedAt
 	}
 	if av, ok := item[attrRestrictedSort]; ok {
@@ -3250,6 +3737,16 @@ func viewerStateFromItem(item map[string]types.AttributeValue) (chat.ViewerState
 		state.RestrictedAt = &restrictedAt
 	}
 	return state, nil
+}
+
+// nanosFromAttr decodes a time stored as epoch nanos, as archived_at and
+// banned_at hold one, in UTC.
+func nanosFromAttr(av types.AttributeValue) (time.Time, error) {
+	nanos, err := parseN(av)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(0, int64(nanos)).UTC(), nil
 }
 
 // untilAttr encodes a mute's or a silence's end as muted_until and
@@ -3287,17 +3784,6 @@ func untilFromAttr(av types.AttributeValue) (forever bool, until time.Time, err 
 func restrictedSort(restrictedAt time.Time, userID *commonpb.UserId) []byte {
 	out := binary.BigEndian.AppendUint64(make([]byte, 0, 8+len(userID.Value)), uint64(restrictedAt.UnixNano()))
 	return append(out, userID.Value...)
-}
-
-// restrictionTime is now as a restriction records it: at nanosecond
-// precision, in UTC, with no monotonic reading, which is what the record
-// reads back; or an error when it is before the Unix epoch, which
-// restrictedSort cannot order.
-func restrictionTime(now time.Time) (time.Time, error) {
-	if now.Before(time.Unix(0, 0)) {
-		return time.Time{}, fmt.Errorf("restriction time before the unix epoch")
-	}
-	return time.Unix(0, now.UnixNano()).UTC(), nil
 }
 
 // GetViewerStatesForUsers is one eventually consistent batch read of the
@@ -3346,7 +3832,7 @@ func (s *store) SetSilence(ctx context.Context, chatID *commonpb.ChatId, userID 
 	if err != nil {
 		return chat.ViewerState{}, false, err
 	}
-	now, err = restrictionTime(now)
+	now, err = chat.RecordedTime(now)
 	if err != nil {
 		return chat.ViewerState{}, false, err
 	}
@@ -3409,7 +3895,7 @@ func (s *store) UnbanUser(ctx context.Context, chatID *commonpb.ChatId, userID *
 // keeps moving under it.
 func (s *store) liftRestriction(ctx context.Context, chatID *commonpb.ChatId, userID *commonpb.UserId, attr, other string) (chat.ViewerState, bool, error) {
 	otherRecorded := false
-	for attempt := 0; attempt < maxUserStateAttempts; attempt++ {
+	for attempt := 0; attempt < maxTransactAttempts; attempt++ {
 		update := "REMOVE #attr, #sort ADD #version :one"
 		condition := "attribute_exists(#attr) AND attribute_not_exists(#other)"
 		if otherRecorded {
@@ -3452,10 +3938,13 @@ func (s *store) liftRestriction(ctx context.Context, chatID *commonpb.ChatId, us
 // readRosterSummaryForWrite), their membership row and their lobby entry —
 // and writes it in one transaction conditioned on all of it still holding:
 //
-//   - the record: banned_at and restricted_sort set to now and version added
-//     to, conditioned on no ban and on the version read, so a concurrent
-//     write of the record, a mute included, sends the ban back to read again
-//     and the state returned is exactly what was written;
+//   - the record: banned_at and restricted_sort set to now, archived_at
+//     removed (a ban ends an archive as the departure it makes does; a
+//     non-member holds none, so for them it removes nothing) and version
+//     added to, conditioned on no ban and on the version read, so a
+//     concurrent write of the record, a mute or an archive included, sends
+//     the ban back to read again and the state returned is exactly what was
+//     written;
 //   - a member's departure: the membership transition RemoveGroupMember
 //     makes, with the roster summary's compare-and-set and the key envelope's
 //     discard when asked (see transitionMembership, which carries the rest
@@ -3476,13 +3965,13 @@ func (s *store) BanUser(ctx context.Context, chatID *commonpb.ChatId, userID *co
 	if !chat.IsGroupChatID(chatID) {
 		return chat.BanResult{}, fmt.Errorf("not a group chat id")
 	}
-	now, err := restrictionTime(now)
+	now, err := chat.RecordedTime(now)
 	if err != nil {
 		return chat.BanResult{}, err
 	}
 
-	backoff := membershipBackoffBase
-	for attempt := 0; attempt < maxUserStateAttempts; attempt++ {
+	backoff := transactBackoffBase
+	for attempt := 0; attempt < maxTransactAttempts; attempt++ {
 		roster, err := s.readRosterSummaryForWrite(ctx, chatID)
 		if err != nil {
 			return chat.BanResult{}, err
@@ -3515,15 +4004,16 @@ func (s *store) BanUser(ctx context.Context, chatID *commonpb.ChatId, userID *co
 		record := types.TransactWriteItem{Update: &types.Update{
 			TableName:        aws.String(s.userStateTable),
 			Key:              userStateKey(chatID, userID),
-			UpdateExpression: aws.String("SET #chat = :chat, #banned = :now, #sort = :sort ADD #version :one"),
+			UpdateExpression: aws.String("SET #chat = :chat, #banned = :now, #sort = :sort REMOVE #archived ADD #version :one"),
 			ConditionExpression: aws.String(
 				"attribute_not_exists(#banned) AND (attribute_not_exists(#version) OR #version = :version)",
 			),
 			ExpressionAttributeNames: map[string]string{
-				"#chat":    attrChat,
-				"#banned":  attrBannedAt,
-				"#sort":    attrRestrictedSort,
-				"#version": attrVersion,
+				"#chat":     attrChat,
+				"#banned":   attrBannedAt,
+				"#sort":     attrRestrictedSort,
+				"#archived": attrArchivedAt,
+				"#version":  attrVersion,
 			},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
 				":chat":    avB(chatID.Value),
@@ -3546,6 +4036,7 @@ func (s *store) BanUser(ctx context.Context, chatID *commonpb.ChatId, userID *co
 		}
 
 		state := current.Clone()
+		state.ArchivedAt = nil
 		state.BannedAt = &now
 		state.RestrictedAt = &now
 		state.Version++
@@ -3603,12 +4094,9 @@ func (s *store) BanUser(ctx context.Context, chatID *commonpb.ChatId, userID *co
 		case slices.Contains(codes, conditionalCheckFailedCode):
 			continue
 		case isTransactionConflict(codes):
-			select {
-			case <-ctx.Done():
-				return chat.BanResult{}, ctx.Err()
-			case <-time.After(backoff + rand.N(backoff)):
+			if err := conflictBackoff(ctx, &backoff); err != nil {
+				return chat.BanResult{}, err
 			}
-			backoff = min(2*backoff, membershipBackoffMax)
 		default:
 			return chat.BanResult{}, err
 		}
@@ -4086,7 +4574,7 @@ func (s *store) EnterLobby(ctx context.Context, chatID *commonpb.ChatId, userID 
 		{ConditionCheck: s.banCheck(chatID, userID)},
 	}
 
-	backoff := membershipBackoffBase
+	backoff := transactBackoffBase
 	for attempt := 0; ; attempt++ {
 		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
 		if err == nil {
@@ -4113,15 +4601,12 @@ func (s *store) EnterLobby(ctx context.Context, chatID *commonpb.ChatId, userID 
 		case codes[2] == conditionalCheckFailedCode:
 			return chat.LobbyEntry{}, false, chat.ErrTooManyLobbies
 		case isTransactionConflict(codes):
-			if attempt+1 >= maxMembershipAttempts {
+			if attempt+1 >= maxTransactAttempts {
 				return chat.LobbyEntry{}, false, fmt.Errorf("entering lobby of chat %x: %w", chatID.Value, err)
 			}
-			select {
-			case <-ctx.Done():
-				return chat.LobbyEntry{}, false, ctx.Err()
-			case <-time.After(backoff + rand.N(backoff)):
+			if err := conflictBackoff(ctx, &backoff); err != nil {
+				return chat.LobbyEntry{}, false, err
 			}
-			backoff = min(2*backoff, membershipBackoffMax)
 		default:
 			return chat.LobbyEntry{}, false, err
 		}
@@ -4137,7 +4622,7 @@ func (s *store) LeaveLobby(ctx context.Context, chatID *commonpb.ChatId, userID 
 	}
 
 	transactItems := append([]types.TransactWriteItem{{Delete: s.lobbyEntryDelete(chatID, userID)}}, s.lobbyCountDecrements(chatID, userID)...)
-	backoff := membershipBackoffBase
+	backoff := transactBackoffBase
 	for attempt := 0; ; attempt++ {
 		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
 		if err == nil {
@@ -4155,15 +4640,12 @@ func (s *store) LeaveLobby(ctx context.Context, chatID *commonpb.ChatId, userID 
 		case codes[0] == conditionalCheckFailedCode:
 			return false, nil
 		case isTransactionConflict(codes):
-			if attempt+1 >= maxMembershipAttempts {
+			if attempt+1 >= maxTransactAttempts {
 				return false, fmt.Errorf("leaving lobby of chat %x: %w", chatID.Value, err)
 			}
-			select {
-			case <-ctx.Done():
-				return false, ctx.Err()
-			case <-time.After(backoff + rand.N(backoff)):
+			if err := conflictBackoff(ctx, &backoff); err != nil {
+				return false, err
 			}
-			backoff = min(2*backoff, membershipBackoffMax)
 		default:
 			return false, err
 		}
@@ -4428,11 +4910,6 @@ const (
 	_ uint = maxTransactWriteItems - (chat.MaxFeaturedGroups + 1)
 )
 
-// A replace contends only with the same user's other replaces, on the #meta
-// pattern (see maxMembershipAttempts): a lost compare-and-set reads again and
-// retries at once, and a TransactionConflict backs off.
-const maxFeaturedAttempts = maxMembershipAttempts
-
 // maxFeaturedReads bounds how many times a read of a list is taken again
 // when it straddles a replace (see readFeaturedGroups). A replace is one
 // small transaction, so a read that straddles three in a row is a user
@@ -4445,13 +4922,16 @@ func featuredSK(position int) string {
 	return fmt.Sprintf("%s%02d", featuredSKPrefix, position)
 }
 
+// SetFeaturedGroups contends only with the same user's other replaces, on
+// the #meta pattern (see maxTransactAttempts): a lost compare-and-set reads
+// again and retries at once, and a TransactionConflict backs off.
 func (s *store) SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, chatIDs []*commonpb.ChatId) (chat.FeaturedGroups, bool, error) {
 	if err := chat.ValidateFeaturedGroups(chatIDs); err != nil {
 		return chat.FeaturedGroups{}, false, err
 	}
 
-	backoff := membershipBackoffBase
-	for attempt := 0; attempt < maxFeaturedAttempts; attempt++ {
+	backoff := transactBackoffBase
+	for attempt := 0; attempt < maxTransactAttempts; attempt++ {
 		// The list is read first, strongly consistent, both to answer the
 		// no-op without a write and for the version the write is compared
 		// against and the positions it must clear. A stale read would be
@@ -4535,12 +5015,9 @@ func (s *store) SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, 
 			// find the list already what this one asks for.
 			continue
 		case isTransactionConflict(codes):
-			select {
-			case <-ctx.Done():
-				return chat.FeaturedGroups{}, false, ctx.Err()
-			case <-time.After(backoff + rand.N(backoff)):
+			if err := conflictBackoff(ctx, &backoff); err != nil {
+				return chat.FeaturedGroups{}, false, err
 			}
-			backoff = min(2*backoff, membershipBackoffMax)
 			continue
 		default:
 			return chat.FeaturedGroups{}, false, err
@@ -4554,12 +5031,6 @@ func (s *store) SetFeaturedGroups(ctx context.Context, userID *commonpb.UserId, 
 func (s *store) GetFeaturedGroups(ctx context.Context, userID *commonpb.UserId) (chat.FeaturedGroups, error) {
 	return s.readFeaturedGroups(ctx, userID, false)
 }
-
-// A pin or an unpin contends only with the chat's other pins and unpins, on
-// the #meta pattern (see maxMembershipAttempts): a lost compare-and-set reads
-// again and retries at once, and a TransactionConflict backs off. Both share
-// the budget.
-const maxPinAttempts = maxMembershipAttempts
 
 // A pin's message ID is written in 20 digits, the width of the largest
 // uint64, so every message ID fits and the sk order is message order.
@@ -4705,15 +5176,17 @@ func (s *store) readPinForWrite(ctx context.Context, chatID *commonpb.ChatId, me
 	return summary, pinned, nil
 }
 
-// pinBackoff waits out *backoff, jittered, and doubles it up to
-// membershipBackoffMax, for a pin or unpin that lost to a concurrent write.
-func pinBackoff(ctx context.Context, backoff *time.Duration) error {
+// conflictBackoff waits out *backoff, jittered, and doubles it up to
+// transactBackoffMax, for a write that lost to a concurrent transaction on
+// one of its items (see maxTransactAttempts). It returns the context's
+// error if the context ends first.
+func conflictBackoff(ctx context.Context, backoff *time.Duration) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(*backoff + rand.N(*backoff)):
 	}
-	*backoff = min(2**backoff, membershipBackoffMax)
+	*backoff = min(2**backoff, transactBackoffMax)
 	return nil
 }
 
@@ -4739,11 +5212,11 @@ func (s *store) PinMessage(ctx context.Context, chatID *commonpb.ChatId, message
 		return chat.PinSummary{}, false, fmt.Errorf("max pins must be at least one")
 	}
 
-	backoff := membershipBackoffBase
-	for attempt := 0; attempt < maxPinAttempts; attempt++ {
+	backoff := transactBackoffBase
+	for attempt := 0; attempt < maxTransactAttempts; attempt++ {
 		current, pinned, err := s.readPinForWrite(ctx, chatID, messageID)
 		if errors.Is(err, errPinReadConflict) {
-			if err := pinBackoff(ctx, &backoff); err != nil {
+			if err := conflictBackoff(ctx, &backoff); err != nil {
 				return chat.PinSummary{}, false, err
 			}
 			continue
@@ -4835,11 +5308,11 @@ func (s *store) UnpinMessage(ctx context.Context, chatID *commonpb.ChatId, messa
 		return chat.PinSummary{}, false, fmt.Errorf("message id is required")
 	}
 
-	backoff := membershipBackoffBase
-	for attempt := 0; attempt < maxPinAttempts; attempt++ {
+	backoff := transactBackoffBase
+	for attempt := 0; attempt < maxTransactAttempts; attempt++ {
 		current, pinned, err := s.readPinForWrite(ctx, chatID, messageID)
 		if errors.Is(err, errPinReadConflict) {
-			if err := pinBackoff(ctx, &backoff); err != nil {
+			if err := conflictBackoff(ctx, &backoff); err != nil {
 				return chat.PinSummary{}, false, err
 			}
 			continue
@@ -4917,7 +5390,10 @@ func (s *store) UnpinMessage(ctx context.Context, chatID *commonpb.ChatId, messa
 // writePins writes a pin's or an unpin's transaction, reporting retry true
 // when it was cancelled by a failed condition (a write that landed since the
 // read; the caller reads again at once) or by a TransactionConflict (after
-// backing off, see pinBackoff), and an error for any other failure.
+// backing off, see conflictBackoff), and an error for any other failure. A
+// pin or an unpin contends only with the chat's other pins and unpins, on
+// the #meta pattern, and both share the store's attempt budget (see
+// maxTransactAttempts).
 func (s *store) writePins(ctx context.Context, transactItems []types.TransactWriteItem, backoff *time.Duration) (bool, error) {
 	_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
 	if err == nil {
@@ -4935,7 +5411,7 @@ func (s *store) writePins(ctx context.Context, transactItems []types.TransactWri
 	case slices.Contains(codes, conditionalCheckFailedCode):
 		return true, nil
 	case isTransactionConflict(codes):
-		if err := pinBackoff(ctx, backoff); err != nil {
+		if err := conflictBackoff(ctx, backoff); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -5494,12 +5970,6 @@ func holdingsRefreshFromItem(item map[string]types.AttributeValue) (chat.Holding
 // gsiInvitesActive: above every instant, so it is ACTIVE as of any now.
 const inviteNeverExpires = math.MaxUint64
 
-// maxInviteAttempts bounds the retries of an invite's writes: a
-// TransactionConflict, which a concurrent write to the same item causes (a
-// racing create of the same ID, or a join landing while the invite is
-// revoked). Each is rare, and a burst of joins is what exhausts it.
-const maxInviteAttempts = maxMembershipAttempts
-
 func invitePK(inviteID *chatpb.InviteId) string {
 	return inviteKeyPrefix + hex.EncodeToString(inviteID.GetValue())
 }
@@ -5764,7 +6234,8 @@ func inviteFromItem(item map[string]types.AttributeValue) (chat.Invite, error) {
 // before the create is refused, so an invite that exists is returned rather
 // than ErrTooManyInvites: existence is judged first either way. The count is
 // a GSI's, eventually consistent, which is the race the contract accepts. A
-// TransactionConflict is retried with backoff.
+// TransactionConflict, a racing create of the same ID, is retried with
+// backoff on the store's attempt budget (see maxTransactAttempts).
 func (s *store) CreateInvite(ctx context.Context, invite chat.Invite, keyCopy *chatpb.InviteKeyEnvelope, maxActive int, now time.Time) (chat.Invite, bool, error) {
 	if err := chat.ValidateNewInvite(invite, keyCopy); err != nil {
 		return chat.Invite{}, false, err
@@ -5821,7 +6292,7 @@ func (s *store) CreateInvite(ctx context.Context, invite chat.Invite, keyCopy *c
 		}},
 	}
 
-	backoff := membershipBackoffBase
+	backoff := transactBackoffBase
 	for attempt := 0; ; attempt++ {
 		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems})
 		if err == nil {
@@ -5840,15 +6311,12 @@ func (s *store) CreateInvite(ctx context.Context, invite chat.Invite, keyCopy *c
 			existing, err := inviteFromItem(reasons[0].Item)
 			return existing, false, err
 		case isTransactionConflict(codes):
-			if attempt+1 >= maxInviteAttempts {
+			if attempt+1 >= maxTransactAttempts {
 				return chat.Invite{}, false, fmt.Errorf("creating invite %x: %w", invite.ID.Value, err)
 			}
-			select {
-			case <-ctx.Done():
-				return chat.Invite{}, false, ctx.Err()
-			case <-time.After(backoff + rand.N(backoff)):
+			if err := conflictBackoff(ctx, &backoff); err != nil {
+				return chat.Invite{}, false, err
 			}
-			backoff = min(2*backoff, membershipBackoffMax)
 		default:
 			return chat.Invite{}, false, err
 		}
@@ -6020,8 +6488,10 @@ func predecessorKey(key []byte) ([]byte, bool) {
 // once revoked_at is set (see JoinWithInvite), so the two still serialize on
 // it; the invite returned carries the use count as read, which may trail a
 // join that landed in between. A failed condition is a concurrent revoke,
-// settled from the item the failure hands back. A TransactionConflict is
-// retried with backoff.
+// settled from the item the failure hands back. A TransactionConflict, a
+// join landing while the invite is revoked, is retried with backoff on the
+// store's attempt budget (see maxTransactAttempts); a burst of joins is what
+// exhausts it.
 func (s *store) RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, inviteID *chatpb.InviteId, now time.Time) (chat.Invite, bool, error) {
 	if !chat.IsGroupChatID(chatID) {
 		return chat.Invite{}, false, fmt.Errorf("not a group chat id")
@@ -6036,7 +6506,7 @@ func (s *store) RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, invit
 		return chat.Invite{}, false, err
 	}
 
-	backoff := membershipBackoffBase
+	backoff := transactBackoffBase
 	for attempt := 0; ; attempt++ {
 		if !bytes.Equal(stored.ChatID.Value, chatID.Value) {
 			return chat.Invite{}, false, chat.ErrInviteNotFound
@@ -6044,7 +6514,7 @@ func (s *store) RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, invit
 		if stored.RevokedAt != nil {
 			return stored, false, nil
 		}
-		if attempt >= maxInviteAttempts {
+		if attempt >= maxTransactAttempts {
 			return chat.Invite{}, false, fmt.Errorf("revoking invite %x: attempts exhausted", inviteID.Value)
 		}
 
@@ -6091,12 +6561,9 @@ func (s *store) RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, invit
 				return chat.Invite{}, false, err
 			}
 		case isTransactionConflict(codes):
-			select {
-			case <-ctx.Done():
-				return chat.Invite{}, false, ctx.Err()
-			case <-time.After(backoff + rand.N(backoff)):
+			if err := conflictBackoff(ctx, &backoff); err != nil {
+				return chat.Invite{}, false, err
 			}
-			backoff = min(2*backoff, membershipBackoffMax)
 		default:
 			return chat.Invite{}, false, err
 		}
@@ -6112,7 +6579,7 @@ func (s *store) RevokeInvite(ctx context.Context, chatID *commonpb.ChatId, invit
 // Every start over is also a membership transition's attempt, which has its
 // own budget for the summary's races and conflicts (see
 // transitionMembership).
-const maxInviteJoinAttempts = 2 * maxMembershipAttempts
+const maxInviteJoinAttempts = 2 * maxTransactAttempts
 
 // inviteJoinRead is what a join with an invite starts from (see
 // readInviteJoin): the group's roster summary, whether the joiner is a

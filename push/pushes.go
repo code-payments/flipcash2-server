@@ -241,7 +241,8 @@ func BuildGroupChatPush(ctx context.Context, ocpData ocp_data.Provider, chatId *
 // none. It is a chat push that is not for a message: it navigates to the
 // group and carries its type, but no message and no sender (see
 // pushpb.ChatMetadata), and it moves no badge, like every push that is not a
-// message's.
+// message's. Whether the creator is to hear of it at all, which a mute does
+// not change and an archive does, is the caller's call.
 func SendLobbyEnteredPush(ctx context.Context, pusher Pusher, creator *commonpb.UserId, chatId *commonpb.ChatId, chatTitle, requesterDisplayName string) error {
 	if requesterDisplayName == "" {
 		requesterDisplayName = "Someone"
@@ -618,7 +619,10 @@ func renderWidgetPushBody(widget *messagingpb.WidgetContent) (body string, ok bo
 // quietly, at normal priority (see androidPriority); the FCMPusher drops a muted recipient's iOS devices, which could
 // not suppress the alert, so an iOS user hears nothing from a chat they
 // muted. Which half a recipient lands in is the sender's best-effort call at
-// send time; the client's own copy of its mute is the last word.
+// send time; the client's own copy of its mute is the last word. A member who
+// has archived the chat is in neither half: an archived chat sends its user
+// no push at all, flagged or not, and moves no badge (see chatpb.ArchiveState),
+// so the sender leaves them out of the audience altogether.
 type ChatRecipients struct {
 	Unmuted []*commonpb.UserId
 	Muted   []*commonpb.UserId

@@ -86,6 +86,21 @@ func RunStoreTests(t *testing.T, s chat.Store, newStore func(excludedFromFeed []
 		testStore_UserState_GetMutedUsers,
 		testStore_UserState_GetMutedUsersPage_Bounds,
 		testStore_UserState_MutedCount,
+		testStore_Archive_SetAndClear,
+		testStore_Archive_IndependentOfMute,
+		testStore_Archive_NotMember,
+		func(t *testing.T, _ chat.Store) { testStore_Archive_Excluded(t, newStore) },
+		testStore_Archive_DmFeedFolders,
+		testStore_Archive_GroupFolders,
+		testStore_Archive_ArchivedChats,
+		testStore_Archive_MembersPage,
+		testStore_Archive_EndsWithDeparture,
+		testStore_Archive_RacesDeparture,
+		testStore_Archive_UnarchiveRacesDeparture,
+		testStore_Archive_RacesBan,
+		testStore_Archive_RacesMute,
+		testStore_Archive_ReAddArchivedMember,
+		testStore_Archive_WrongDmType,
 		testStore_Restriction_Silence,
 		testStore_Restriction_IndependentOfMute,
 		testStore_Restriction_BanMember,
@@ -192,7 +207,7 @@ func testStore_PutAndGet(t *testing.T, s chat.Store) {
 	require.Equal(t, chat.RosterSummary{MemberCount: 2}, got.RosterSummary)
 
 	// The feed read carries the summary too.
-	feed, err := s.GetDmFeedPage(ctx, userA, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
+	feed, err := s.GetDmFeedPage(ctx, userA, chatpb.ChatType_CONTACT_DM, chat.FolderInbox, at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Len(t, feed, 1)
 	require.Equal(t, chat.RosterSummary{MemberCount: 2}, feed[0].RosterSummary)
@@ -402,7 +417,7 @@ func testStore_FeedExclusions(t *testing.T, newStore func(excludedFromFeed []*co
 	// feed is the member's own DM feed in s, whole.
 	feed := func(s chat.Store, member *commonpb.UserId) []*chat.Chat {
 		t.Helper()
-		page, err := s.GetDmFeedPage(ctx, member, chatpb.ChatType_DM, at(1000), nil, 0)
+		page, err := s.GetDmFeedPage(ctx, member, chatpb.ChatType_DM, chat.FolderInbox, at(1000), nil, 0)
 		require.NoError(t, err)
 		return page
 	}
@@ -1622,7 +1637,7 @@ func testStore_GroupChat_MembershipsForUser(t *testing.T, s chat.Store) {
 	}
 
 	// No memberships is an empty result, not an error.
-	memberships, err := s.GetGroupMembershipsForUser(ctx, userA)
+	memberships, err := s.GetGroupMembershipsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, memberships)
 
@@ -1635,7 +1650,7 @@ func testStore_GroupChat_MembershipsForUser(t *testing.T, s chat.Store) {
 
 	// Memberships from creation are at version zero: no transition has
 	// touched them.
-	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Equal(t, map[string]record{
 		string(groupAB.ID.Value): {joined: true, version: 0},
@@ -1645,7 +1660,7 @@ func testStore_GroupChat_MembershipsForUser(t *testing.T, s chat.Store) {
 	// Departure keeps the record, departed, at the departure's version — the
 	// group's first transition.
 	removeGroupMember(t, s, groupAB.ID, userA)
-	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Equal(t, map[string]record{
 		string(groupAB.ID.Value): {joined: false, version: 1},
@@ -1658,7 +1673,7 @@ func testStore_GroupChat_MembershipsForUser(t *testing.T, s chat.Store) {
 	addGroupMembers(t, s, groupAB.ID, userA)
 	addGroupMembers(t, s, groupB.ID, userA)
 	addGroupMembers(t, s, groupAB.ID, model.MustGenerateUserID())
-	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Equal(t, map[string]record{
 		string(groupAB.ID.Value): {joined: true, version: 2},
@@ -1670,12 +1685,12 @@ func testStore_GroupChat_MembershipsForUser(t *testing.T, s chat.Store) {
 	// leaves a departed record, but groupA, which userB never joined, is
 	// absent from userB's slice rather than departed.
 	removeGroupMember(t, s, groupB.ID, userA)
-	memberships, err = s.GetGroupMembershipsForUser(ctx, userA)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Equal(t, record{joined: false, version: 2}, byChat(memberships)[string(groupB.ID.Value)])
 
 	// userB's view was never disturbed by userA's churn.
-	memberships, err = s.GetGroupMembershipsForUser(ctx, userB)
+	memberships, err = s.GetGroupMembershipsForUser(ctx, userB, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Equal(t, map[string]record{
 		string(groupAB.ID.Value): {joined: true, version: 0},
@@ -1693,7 +1708,7 @@ func testStore_GroupChat_ChatsForUser(t *testing.T, s chat.Store) {
 	userB := model.MustGenerateUserID()
 
 	// No memberships is an empty result, not an error.
-	chats, err := s.GetGroupChatsForUser(ctx, userA)
+	chats, err := s.GetGroupChatsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Empty(t, chats)
 
@@ -1702,7 +1717,7 @@ func testStore_GroupChat_ChatsForUser(t *testing.T, s chat.Store) {
 	_ = putGroupChat(t, s, "Only B", at(3), userB)
 	putDmChat(t, s, userA, userB, at(4))
 
-	chats, err = s.GetGroupChatsForUser(ctx, userA)
+	chats, err = s.GetGroupChatsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.ElementsMatch(t, chatIDValues([]*chat.Chat{groupAB, groupA}), chatIDValues(chats))
 
@@ -1722,7 +1737,7 @@ func testStore_GroupChat_ChatsForUser(t *testing.T, s chat.Store) {
 
 	// Departure excludes the group.
 	removeGroupMember(t, s, groupAB.ID, userA)
-	chats, err = s.GetGroupChatsForUser(ctx, userA)
+	chats, err = s.GetGroupChatsForUser(ctx, userA, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Equal(t, chatIDValues([]*chat.Chat{groupA}), chatIDValues(chats))
 }
@@ -1742,13 +1757,13 @@ func testStore_GroupChat_ChatsForUserByIDs(t *testing.T, s chat.Store) {
 	dm := putDmChat(t, s, userA, userB, at(4))
 
 	// No IDs is an empty result, not an error.
-	chats, err := s.GetGroupChatsForUserByIDs(ctx, userA, nil)
+	chats, err := s.GetGroupChatsForUserByIDs(ctx, userA, chat.FolderInbox, nil)
 	require.NoError(t, err)
 	require.Empty(t, chats)
 
 	// A group the user is not in and a group that does not exist are omitted,
 	// not reported; a repeated ID collapses.
-	chats, err = s.GetGroupChatsForUserByIDs(ctx, userA, []*commonpb.ChatId{
+	chats, err = s.GetGroupChatsForUserByIDs(ctx, userA, chat.FolderInbox, []*commonpb.ChatId{
 		groupAB.ID, groupB.ID, chat.MustGenerateGroupChatID(), groupAB.ID, groupA.ID,
 	})
 	require.NoError(t, err)
@@ -1762,12 +1777,12 @@ func testStore_GroupChat_ChatsForUserByIDs(t *testing.T, s chat.Store) {
 	// A tombstoned membership is not a membership: the ID is dropped once the
 	// user has left, even though the chat still exists.
 	removeGroupMember(t, s, groupAB.ID, userA)
-	chats, err = s.GetGroupChatsForUserByIDs(ctx, userA, []*commonpb.ChatId{groupAB.ID, groupA.ID})
+	chats, err = s.GetGroupChatsForUserByIDs(ctx, userA, chat.FolderInbox, []*commonpb.ChatId{groupAB.ID, groupA.ID})
 	require.NoError(t, err)
 	require.Equal(t, chatIDValues([]*chat.Chat{groupA}), chatIDValues(chats))
 
 	// A DM ID is the wrong family: an error, not an omission.
-	_, err = s.GetGroupChatsForUserByIDs(ctx, userA, []*commonpb.ChatId{groupA.ID, dm.ID})
+	_, err = s.GetGroupChatsForUserByIDs(ctx, userA, chat.FolderInbox, []*commonpb.ChatId{groupA.ID, dm.ID})
 	require.Error(t, err)
 }
 
@@ -2325,11 +2340,11 @@ func testStore_GroupChat_NotInDmFeed(t *testing.T, s chat.Store) {
 	// A group chat never surfaces in a DM feed, neither in a DM type's feed nor
 	// via a feed query for the group type itself — groups get their own
 	// read-time feed.
-	feed, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
+	feed, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, chat.FolderInbox, at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{dm.ID.Value}, chatIDValues(feed))
 
-	feed, err = s.GetDmFeedPage(ctx, user, chatpb.ChatType_GROUP, at(1000), nil, 0)
+	feed, err = s.GetDmFeedPage(ctx, user, chatpb.ChatType_GROUP, chat.FolderInbox, at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Empty(t, feed)
 }
@@ -2347,7 +2362,7 @@ func testStore_GetDmFeedPage_Order(t *testing.T, s chat.Store) {
 	_ = putDmChat(t, s, model.MustGenerateUserID(), model.MustGenerateUserID(), at(999))
 
 	// A watermark above every chat includes them all, most recent first.
-	got, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
+	got, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, chat.FolderInbox, at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c2.ID.Value, c3.ID.Value, c1.ID.Value}, chatIDValues(got))
 }
@@ -2362,7 +2377,7 @@ func testStore_GetDmFeedPage_Watermark(t *testing.T, s chat.Store) {
 	c3 := putDmChat(t, s, user, other, at(200))
 
 	// A watermark of 250 pins out the chat last active at 300.
-	got, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(250), nil, 0)
+	got, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, chat.FolderInbox, at(250), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c3.ID.Value, c1.ID.Value}, chatIDValues(got))
 }
@@ -2379,17 +2394,17 @@ func testStore_GetDmFeedPage_Paging(t *testing.T, s chat.Store) {
 	snapshot := at(1000)
 
 	// Page 1: most recent, limit 2 → [c2, c3].
-	page1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, snapshot, nil, 2)
+	page1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, chat.FolderInbox, snapshot, nil, 2)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c2.ID.Value, c3.ID.Value}, chatIDValues(page1))
 
 	// Page 2: resume after the last chat of page 1 (c3) → [c1].
-	page2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, snapshot, cursorOf(page1[len(page1)-1]), 2)
+	page2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, chat.FolderInbox, snapshot, cursorOf(page1[len(page1)-1]), 2)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c1.ID.Value}, chatIDValues(page2))
 
 	// Resuming after the final chat yields an empty page.
-	page3, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, snapshot, cursorOf(c1), 2)
+	page3, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, chat.FolderInbox, snapshot, cursorOf(c1), 2)
 	require.NoError(t, err)
 	require.Empty(t, page3)
 }
@@ -2409,7 +2424,7 @@ func testStore_GetDmFeedPage_SnapshotPinned(t *testing.T, s chat.Store) {
 	snapshot := at(350) // All three are within the window.
 
 	// Page 1: the most recent chat.
-	page1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, snapshot, nil, 1)
+	page1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, chat.FolderInbox, snapshot, nil, 1)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c3.ID.Value}, chatIDValues(page1))
 
@@ -2421,7 +2436,7 @@ func testStore_GetDmFeedPage_SnapshotPinned(t *testing.T, s chat.Store) {
 
 	// Page 2 sees only c2: c1 has left the snapshot window, so it is neither
 	// duplicated nor reordered into the read. Its freshness is the stream's job.
-	page2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, snapshot, cursorOf(page1[len(page1)-1]), 10)
+	page2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, chat.FolderInbox, snapshot, cursorOf(page1[len(page1)-1]), 10)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{c2.ID.Value}, chatIDValues(page2))
 }
@@ -2429,7 +2444,7 @@ func testStore_GetDmFeedPage_SnapshotPinned(t *testing.T, s chat.Store) {
 func testStore_GetDmFeedPage_Empty(t *testing.T, s chat.Store) {
 	ctx := context.Background()
 
-	got, err := s.GetDmFeedPage(ctx, model.MustGenerateUserID(), chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
+	got, err := s.GetDmFeedPage(ctx, model.MustGenerateUserID(), chatpb.ChatType_CONTACT_DM, chat.FolderInbox, at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Empty(t, got)
 }
@@ -2446,14 +2461,14 @@ func testStore_GetDmFeedPage_TypeScoped(t *testing.T, s chat.Store) {
 	dm2 := putDmChatOfType(t, s, chatpb.ChatType_DM, user, other, at(400))
 
 	// Each feed contains only its own type, most recent first.
-	contacts, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, at(1000), nil, 0)
+	contacts, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_CONTACT_DM, chat.FolderInbox, at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{contact2.ID.Value, contact1.ID.Value}, chatIDValues(contacts))
 	for _, c := range contacts {
 		require.Equal(t, chatpb.ChatType_CONTACT_DM, c.Type)
 	}
 
-	dms, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), nil, 0)
+	dms, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, chat.FolderInbox, at(1000), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{dm2.ID.Value, dm1.ID.Value}, chatIDValues(dms))
 	for _, c := range dms {
@@ -2462,11 +2477,11 @@ func testStore_GetDmFeedPage_TypeScoped(t *testing.T, s chat.Store) {
 
 	// Paging within one feed steps over the other type's activity: a limit-1
 	// DM page resumes at the older DM, not at the interleaved contact chats.
-	dmPage1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), nil, 1)
+	dmPage1, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, chat.FolderInbox, at(1000), nil, 1)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{dm2.ID.Value}, chatIDValues(dmPage1))
 
-	dmPage2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, at(1000), cursorOf(dmPage1[0]), 1)
+	dmPage2, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, chat.FolderInbox, at(1000), cursorOf(dmPage1[0]), 1)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{dm1.ID.Value}, chatIDValues(dmPage2))
 }
@@ -4922,7 +4937,7 @@ func testStore_Restriction_BanMember(t *testing.T, s chat.Store) {
 	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
 
 	// The departure is a tombstone at the ban's roster version, as any.
-	memberships, err := s.GetGroupMembershipsForUser(ctx, member)
+	memberships, err := s.GetGroupMembershipsForUser(ctx, member, chat.FolderInbox)
 	require.NoError(t, err)
 	require.Len(t, memberships, 1)
 	assert.False(t, memberships[0].Joined)
@@ -4992,7 +5007,7 @@ func testStore_Restriction_BanNonMember(t *testing.T, s chat.Store) {
 		Roster:  chat.RosterSummary{MemberCount: 1},
 	}, result)
 	requireRosterSummary(t, s, group, 1, 0)
-	memberships, err := s.GetGroupMembershipsForUser(ctx, stranger)
+	memberships, err := s.GetGroupMembershipsForUser(ctx, stranger, chat.FolderInbox)
 	require.NoError(t, err)
 	assert.Empty(t, memberships)
 
@@ -7277,17 +7292,17 @@ func testStore_FeedExclusions_Groups(t *testing.T, newStore func(excludedFromFee
 	// departed records included in the first.
 	listed := func(member *commonpb.UserId, chatIDs ...*commonpb.ChatId) (memberships, chats, byIDs [][]byte) {
 		t.Helper()
-		ms, err := s.GetGroupMembershipsForUser(ctx, member)
+		ms, err := s.GetGroupMembershipsForUser(ctx, member, chat.FolderInbox)
 		require.NoError(t, err)
 		for _, m := range ms {
 			memberships = append(memberships, m.ChatID.Value)
 		}
-		cs, err := s.GetGroupChatsForUser(ctx, member)
+		cs, err := s.GetGroupChatsForUser(ctx, member, chat.FolderInbox)
 		require.NoError(t, err)
 		for _, c := range cs {
 			chats = append(chats, c.ID.Value)
 		}
-		cs, err = s.GetGroupChatsForUserByIDs(ctx, member, chatIDs)
+		cs, err = s.GetGroupChatsForUserByIDs(ctx, member, chat.FolderInbox, chatIDs)
 		require.NoError(t, err)
 		for _, c := range cs {
 			byIDs = append(byIDs, c.ID.Value)
@@ -7719,4 +7734,769 @@ func testStore_PrivateGroup_EnvelopeReplaced(t *testing.T, s chat.Store) {
 	require.True(t, changed)
 	_, err = s.GetKeyEnvelope(ctx, c.ID, leaver)
 	require.ErrorIs(t, err, chat.ErrKeyEnvelopeNotFound)
+}
+
+// archiveAt is a deterministic archive time carrying nanoseconds, which an
+// archive is recorded at (see chat.RecordedTime).
+func archiveAt(seconds int64) time.Time {
+	return at(seconds).Add(123456789 * time.Nanosecond)
+}
+
+func archivedAt(seconds int64) *time.Time {
+	t := archiveAt(seconds)
+	return &t
+}
+
+func setArchived(t *testing.T, s chat.Store, c *chat.Chat, user *commonpb.UserId, archived bool, now time.Time) (chat.ViewerState, bool) {
+	t.Helper()
+	state, changed, err := s.SetArchived(context.Background(), c, user, archived, now)
+	require.NoError(t, err)
+	return state, changed
+}
+
+// dmFolder is user's whole DM feed of chatType in folder, in feed order.
+func dmFolder(t *testing.T, s chat.Store, user *commonpb.UserId, chatType chatpb.ChatType, folder chat.Folder) [][]byte {
+	t.Helper()
+	page, err := s.GetDmFeedPage(context.Background(), user, chatType, folder, at(100_000), nil, 0)
+	require.NoError(t, err)
+	return chatIDValues(page)
+}
+
+// groupFolder is the groups GetGroupChatsForUser lists for user in folder.
+func groupFolder(t *testing.T, s chat.Store, user *commonpb.UserId, folder chat.Folder) [][]byte {
+	t.Helper()
+	chats, err := s.GetGroupChatsForUser(context.Background(), user, folder)
+	require.NoError(t, err)
+	return chatIDValues(chats)
+}
+
+// membershipIDValues is the chats GetGroupMembershipsForUser lists for user
+// in folder.
+func membershipIDValues(t *testing.T, s chat.Store, user *commonpb.UserId, folder chat.Folder) [][]byte {
+	t.Helper()
+	memberships, err := s.GetGroupMembershipsForUser(context.Background(), user, folder)
+	require.NoError(t, err)
+	out := make([][]byte, len(memberships))
+	for i, m := range memberships {
+		out[i] = m.ChatID.Value
+	}
+	return out
+}
+
+// requireArchivedChats checks that GetArchivedChats lists exactly want for
+// user, in any order.
+func requireArchivedChats(t *testing.T, s chat.Store, user *commonpb.UserId, want ...chat.ArchivedChat) {
+	t.Helper()
+	got, err := s.GetArchivedChats(context.Background(), user)
+	require.NoError(t, err)
+	require.Len(t, got, len(want))
+	byChat := make(map[string]chat.ArchivedChat, len(got))
+	for _, a := range got {
+		byChat[string(a.ChatID.Value)] = a
+	}
+	for _, w := range want {
+		a, ok := byChat[string(w.ChatID.Value)]
+		require.True(t, ok, "chat %x not listed", w.ChatID.Value)
+		assert.True(t, w.ArchivedAt.Equal(a.ArchivedAt), "archived at %v, want %v", a.ArchivedAt, w.ArchivedAt)
+		assert.Equal(t, w.Version, a.Version)
+	}
+}
+
+// testStore_Archive_SetAndClear pins an archive's record on a DM and a group:
+// a real archive or unarchive moves the version by one, the archive's time
+// round-trips at nanosecond precision, repeating either is the no-op, and an
+// unarchive of a chat never archived creates no record.
+func testStore_Archive_SetAndClear(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	user, other := model.MustGenerateUserID(), model.MustGenerateUserID()
+	dm := putDmChatOfType(t, s, chatpb.ChatType_DM, user, other, at(1))
+	group := putGroupChat(t, s, "Group", at(2), user, other)
+
+	for _, c := range []*chat.Chat{dm, group} {
+		state, changed := setArchived(t, s, c, user, false, archiveAt(5))
+		assert.False(t, changed)
+		assert.Equal(t, chat.ViewerState{}, state)
+		requireNoViewerState(t, s, c.ID, user)
+
+		state, changed = setArchived(t, s, c, user, true, archiveAt(10))
+		assert.True(t, changed)
+		want := chat.ViewerState{ArchivedAt: archivedAt(10), Version: 1}
+		assert.Equal(t, want, state)
+		requireViewerState(t, s, c.ID, user, want)
+
+		// The projection carries it under settings, with no mute beside it.
+		projected := state.ToProto(chat.Permissions{})
+		require.NotNil(t, projected.Settings.Archive)
+		assert.True(t, projected.Settings.Archive.ArchivedAt.AsTime().Equal(archiveAt(10)))
+		assert.Nil(t, projected.Settings.Mute)
+		assert.EqualValues(t, 1, projected.Version)
+
+		// Archiving again is the no-op, keeping the first archive's time.
+		state, changed = setArchived(t, s, c, user, true, archiveAt(20))
+		assert.False(t, changed)
+		assert.Equal(t, want, state)
+		requireViewerState(t, s, c.ID, user, want)
+
+		state, changed = setArchived(t, s, c, user, false, archiveAt(30))
+		assert.True(t, changed)
+		want = chat.ViewerState{Version: 2}
+		assert.Equal(t, want, state)
+		requireViewerState(t, s, c.ID, user, want)
+		assert.Nil(t, state.ToProto(chat.Permissions{}).Settings.Archive)
+
+		state, changed = setArchived(t, s, c, user, false, archiveAt(35))
+		assert.False(t, changed)
+		assert.Equal(t, want, state)
+
+		// A new archive continues the version from where the unarchive left
+		// it, at its own time.
+		state, changed = setArchived(t, s, c, user, true, archiveAt(40))
+		assert.True(t, changed)
+		want = chat.ViewerState{ArchivedAt: archivedAt(40), Version: 3}
+		assert.Equal(t, want, state)
+		requireViewerState(t, s, c.ID, user, want)
+
+		// The other member's state is their own.
+		requireNoViewerState(t, s, c.ID, other)
+	}
+
+	// A time before the epoch is refused, with nothing written, as is a chat
+	// whose ID does not match its type.
+	_, _, err := s.SetArchived(ctx, dm, other, true, time.Unix(-1, 0))
+	require.Error(t, err)
+	requireNoViewerState(t, s, dm.ID, other)
+	mismatched := group.Clone()
+	mismatched.Type = chatpb.ChatType_DM
+	_, _, err = s.SetArchived(ctx, mismatched, other, true, archiveAt(50))
+	require.Error(t, err)
+	requireNoViewerState(t, s, group.ID, other)
+}
+
+// testStore_Archive_IndependentOfMute pins that an archive and a mute share
+// the record's one version and neither disturbs the other, nor the muted
+// count, nor a restriction.
+func testStore_Archive_IndependentOfMute(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator, user := model.MustGenerateUserID(), model.MustGenerateUserID()
+	group := putGroupChat(t, s, "Group", at(1), creator, user)
+
+	step := func(want chat.ViewerState, state chat.ViewerState, changed bool) {
+		t.Helper()
+		assert.True(t, changed)
+		assert.Equal(t, want, state)
+		requireViewerState(t, s, group.ID, user, want)
+	}
+
+	state, changed, err := s.SetMute(ctx, group.ID, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	step(chat.ViewerState{Mute: &chat.Mute{Forever: true}, Version: 1}, state, changed)
+
+	state, changed = setArchived(t, s, group, user, true, archiveAt(10))
+	step(chat.ViewerState{Mute: &chat.Mute{Forever: true}, ArchivedAt: archivedAt(10), Version: 2}, state, changed)
+	requireMutedCount(t, s, group.ID, 1)
+	requireMutedUsers(t, s, group.ID, at(0), user)
+
+	state, changed, err = s.SetMute(ctx, group.ID, user, chat.Mute{Until: at(100)})
+	require.NoError(t, err)
+	step(chat.ViewerState{Mute: &chat.Mute{Until: at(100)}, ArchivedAt: archivedAt(10), Version: 3}, state, changed)
+
+	state, changed, err = s.ClearMute(ctx, group.ID, user)
+	require.NoError(t, err)
+	step(chat.ViewerState{ArchivedAt: archivedAt(10), Version: 4}, state, changed)
+	requireMutedCount(t, s, group.ID, 0)
+
+	state, changed = setArchived(t, s, group, user, false, archiveAt(20))
+	step(chat.ViewerState{Version: 5}, state, changed)
+	requireMutedCount(t, s, group.ID, 0)
+
+	state, changed, err = s.SetMute(ctx, group.ID, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	step(chat.ViewerState{Mute: &chat.Mute{Forever: true}, Version: 6}, state, changed)
+	state, changed = setArchived(t, s, group, user, true, archiveAt(30))
+	step(chat.ViewerState{Mute: &chat.Mute{Forever: true}, ArchivedAt: archivedAt(30), Version: 7}, state, changed)
+	requireMutedCount(t, s, group.ID, 1)
+
+	// A restriction is independent of it likewise.
+	state, changed, err = s.SetSilence(ctx, group.ID, user, chat.Silence{Forever: true}, at(40))
+	require.NoError(t, err)
+	step(chat.ViewerState{
+		Mute:         &chat.Mute{Forever: true},
+		ArchivedAt:   archivedAt(30),
+		Silence:      &chat.Silence{Forever: true},
+		RestrictedAt: restrictedAt(40),
+		Version:      8,
+	}, state, changed)
+	state, changed = setArchived(t, s, group, user, false, archiveAt(50))
+	step(chat.ViewerState{
+		Mute:         &chat.Mute{Forever: true},
+		Silence:      &chat.Silence{Forever: true},
+		RestrictedAt: restrictedAt(40),
+		Version:      9,
+	}, state, changed)
+	requireMutedCount(t, s, group.ID, 1)
+	requireMutedUsers(t, s, group.ID, at(0), user)
+}
+
+// testStore_Archive_NotMember pins that only a member archives: a user not
+// in a DM or a group, or departed from the group, is refused with
+// chat.ErrNotMember and nothing is written, while their unarchive is the
+// no-op, since they hold no archive.
+func testStore_Archive_NotMember(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	member, other, stranger := model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()
+	dm := putDmChatOfType(t, s, chatpb.ChatType_DM, member, other, at(1))
+	group := putGroupChat(t, s, "Group", at(2), member, other)
+
+	for _, c := range []*chat.Chat{dm, group} {
+		_, _, err := s.SetArchived(ctx, c, stranger, true, archiveAt(10))
+		require.ErrorIs(t, err, chat.ErrNotMember)
+		requireNoViewerState(t, s, c.ID, stranger)
+
+		state, changed, err := s.SetArchived(ctx, c, stranger, false, archiveAt(10))
+		require.NoError(t, err)
+		assert.False(t, changed)
+		assert.Equal(t, chat.ViewerState{}, state)
+		requireNoViewerState(t, s, c.ID, stranger)
+	}
+
+	// A departed member is a non-member, their record left as it was.
+	_, _, err := s.SetMute(ctx, group.ID, other, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	removeGroupMember(t, s, group.ID, other)
+	_, _, err = s.SetArchived(ctx, group, other, true, archiveAt(20))
+	require.ErrorIs(t, err, chat.ErrNotMember)
+	requireViewerState(t, s, group.ID, other, chat.ViewerState{Mute: &chat.Mute{Forever: true}, Version: 1})
+	requireArchivedChats(t, s, other)
+
+	// Back in the group, they archive like anyone.
+	addGroupMembers(t, s, group.ID, other)
+	state, changed := setArchived(t, s, group, other, true, archiveAt(30))
+	assert.True(t, changed)
+	assert.Equal(t, chat.ViewerState{Mute: &chat.Mute{Forever: true}, ArchivedAt: archivedAt(30), Version: 2}, state)
+}
+
+// testStore_Archive_Excluded pins that a member whose copy of a chat is in
+// no folder, a user the store excludes from the feed, cannot archive it: a
+// DM with them or a group they are in refuses with chat.ErrExcludedFromFeed,
+// writing nothing, while the chat's other member archives as anyone.
+func testStore_Archive_Excluded(t *testing.T, newStore func(excludedFromFeed []*commonpb.UserId) chat.Store) {
+	ctx := context.Background()
+	team := model.MustGenerateUserID()
+	s := newStore([]*commonpb.UserId{team})
+	user := model.MustGenerateUserID()
+	dm := putDmChatOfType(t, s, chatpb.ChatType_DM, user, team, at(1))
+	group := putGroupChat(t, s, "Team", at(2), team, user)
+
+	for _, c := range []*chat.Chat{dm, group} {
+		_, _, err := s.SetArchived(ctx, c, team, true, archiveAt(10))
+		require.ErrorIs(t, err, chat.ErrExcludedFromFeed)
+		requireNoViewerState(t, s, c.ID, team)
+
+		state, changed, err := s.SetArchived(ctx, c, team, false, archiveAt(10))
+		require.NoError(t, err)
+		assert.False(t, changed)
+		assert.Equal(t, chat.ViewerState{}, state)
+
+		_, changed = setArchived(t, s, c, user, true, archiveAt(20))
+		assert.True(t, changed)
+	}
+	requireArchivedChats(t, s, team)
+	requireArchivedChats(t, s, user,
+		chat.ArchivedChat{ChatID: dm.ID, ArchivedAt: archiveAt(20), Version: 1},
+		chat.ArchivedChat{ChatID: group.ID, ArchivedAt: archiveAt(20), Version: 1},
+	)
+
+	// A group the excluded user is not in is a non-member's refusal.
+	without := putGroupChat(t, s, "Without", at(3), user)
+	_, _, err := s.SetArchived(ctx, without, team, true, archiveAt(30))
+	require.ErrorIs(t, err, chat.ErrNotMember)
+}
+
+// testStore_Archive_DmFeedFolders pins the DM feed's folders: an archived DM
+// is listed in the archived folder of its type alone, ordered and paged
+// there by last_activity, which an advance keeps moving, and an unarchive
+// returns it to the inbox at its activity. The other member's folders are
+// their own.
+func testStore_Archive_DmFeedFolders(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	user := model.MustGenerateUserID()
+	otherA, otherB := model.MustGenerateUserID(), model.MustGenerateUserID()
+	a := putDmChatOfType(t, s, chatpb.ChatType_DM, user, otherA, at(10))
+	b := putDmChatOfType(t, s, chatpb.ChatType_DM, user, otherB, at(20))
+	c := putDmChatOfType(t, s, chatpb.ChatType_DM, user, model.MustGenerateUserID(), at(30))
+	contact := putDmChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, model.MustGenerateUserID(), at(40))
+
+	assert.Equal(t, chatIDValues([]*chat.Chat{c, b, a}), dmFolder(t, s, user, chatpb.ChatType_DM, chat.FolderInbox))
+	assert.Empty(t, dmFolder(t, s, user, chatpb.ChatType_DM, chat.FolderArchived))
+
+	for _, dm := range []*chat.Chat{a, b, contact} {
+		_, changed := setArchived(t, s, dm, user, true, archiveAt(50))
+		require.True(t, changed)
+	}
+	assert.Equal(t, chatIDValues([]*chat.Chat{c}), dmFolder(t, s, user, chatpb.ChatType_DM, chat.FolderInbox))
+	assert.Equal(t, chatIDValues([]*chat.Chat{b, a}), dmFolder(t, s, user, chatpb.ChatType_DM, chat.FolderArchived))
+	assert.Empty(t, dmFolder(t, s, user, chatpb.ChatType_CONTACT_DM, chat.FolderInbox))
+	assert.Equal(t, chatIDValues([]*chat.Chat{contact}), dmFolder(t, s, user, chatpb.ChatType_CONTACT_DM, chat.FolderArchived))
+	assert.Equal(t, chatIDValues([]*chat.Chat{a}), dmFolder(t, s, otherA, chatpb.ChatType_DM, chat.FolderInbox))
+	assert.Empty(t, dmFolder(t, s, otherA, chatpb.ChatType_DM, chat.FolderArchived))
+
+	// An advance keeps the DM in the archive, reordered by its activity, and
+	// moves the other member's inbox copy as ever.
+	advanced, _, err := s.AdvanceLastMessage(ctx, a.ID, &messagingpb.MessageId{Value: 1}, at(60))
+	require.NoError(t, err)
+	require.True(t, advanced)
+	archived, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, chat.FolderArchived, at(1000), nil, 0)
+	require.NoError(t, err)
+	require.Equal(t, chatIDValues([]*chat.Chat{a, b}), chatIDValues(archived))
+	assert.True(t, archived[0].LastActivity.Equal(at(60)))
+	assert.Equal(t, uint64(1), archived[0].LastMessageID.GetValue())
+	assert.Equal(t, chatIDValues([]*chat.Chat{c}), dmFolder(t, s, user, chatpb.ChatType_DM, chat.FolderInbox))
+	otherFeed, err := s.GetDmFeedPage(ctx, otherA, chatpb.ChatType_DM, chat.FolderInbox, at(1000), nil, 0)
+	require.NoError(t, err)
+	require.Len(t, otherFeed, 1)
+	assert.True(t, otherFeed[0].LastActivity.Equal(at(60)))
+
+	// The archived folder pages and honours the snapshot like the inbox.
+	first, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, chat.FolderArchived, at(1000), nil, 1)
+	require.NoError(t, err)
+	require.Equal(t, chatIDValues([]*chat.Chat{a}), chatIDValues(first))
+	second, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, chat.FolderArchived, at(1000), cursorOf(first[0]), 1)
+	require.NoError(t, err)
+	require.Equal(t, chatIDValues([]*chat.Chat{b}), chatIDValues(second))
+	last, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, chat.FolderArchived, at(1000), cursorOf(second[0]), 1)
+	require.NoError(t, err)
+	assert.Empty(t, last)
+	pinned, err := s.GetDmFeedPage(ctx, user, chatpb.ChatType_DM, chat.FolderArchived, at(25), nil, 0)
+	require.NoError(t, err)
+	assert.Equal(t, chatIDValues([]*chat.Chat{b}), chatIDValues(pinned))
+
+	// An unarchive returns it to the inbox at its activity.
+	_, changed := setArchived(t, s, a, user, false, archiveAt(70))
+	require.True(t, changed)
+	assert.Equal(t, chatIDValues([]*chat.Chat{a, c}), dmFolder(t, s, user, chatpb.ChatType_DM, chat.FolderInbox))
+	assert.Equal(t, chatIDValues([]*chat.Chat{b}), dmFolder(t, s, user, chatpb.ChatType_DM, chat.FolderArchived))
+}
+
+// testStore_Archive_GroupFolders pins the group listings' folders: an
+// archived group is listed in the archived folder alone, by
+// GetGroupChatsForUser, GetGroupChatsForUserByIDs and
+// GetGroupMembershipsForUser alike, until it is unarchived, and its
+// membership record is listed there joined at the roster version of the
+// user's last transition, as the inbox lists it. The other members' folders
+// are their own.
+func testStore_Archive_GroupFolders(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	user, other := model.MustGenerateUserID(), model.MustGenerateUserID()
+	g1 := putGroupChat(t, s, "One", at(1), user, other)
+	g2 := putGroupChat(t, s, "Two", at(2), user, other)
+	g3 := putGroupChat(t, s, "Three", at(3), user)
+	all := []*commonpb.ChatId{g1.ID, g2.ID, g3.ID}
+
+	_, changed := setArchived(t, s, g2, user, true, archiveAt(10))
+	require.True(t, changed)
+
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g3}), groupFolder(t, s, user, chat.FolderInbox))
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g2}), groupFolder(t, s, user, chat.FolderArchived))
+	inbox, err := s.GetGroupChatsForUserByIDs(ctx, user, chat.FolderInbox, all)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g3}), chatIDValues(inbox))
+	archived, err := s.GetGroupChatsForUserByIDs(ctx, user, chat.FolderArchived, all)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g2}), chatIDValues(archived))
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g3}), membershipIDValues(t, s, user, chat.FolderInbox))
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g2}), membershipIDValues(t, s, user, chat.FolderArchived))
+
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g2}), groupFolder(t, s, other, chat.FolderInbox))
+	assert.Empty(t, groupFolder(t, s, other, chat.FolderArchived))
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g2}), membershipIDValues(t, s, other, chat.FolderInbox))
+	assert.Empty(t, membershipIDValues(t, s, other, chat.FolderArchived))
+
+	// The archived folder's record carries the user's last transition on the
+	// group, as the inbox's does: a group they left and rejoined, then
+	// archived, is listed joined at the rejoin's version.
+	changed, _, err = s.RemoveGroupMember(ctx, g1.ID, user, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	changed, rejoined, err := s.AddGroupMembers(ctx, g1.ID, []*commonpb.UserId{user})
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, changed = setArchived(t, s, g1, user, true, archiveAt(15))
+	require.True(t, changed)
+	memberships, err := s.GetGroupMembershipsForUser(ctx, user, chat.FolderArchived)
+	require.NoError(t, err)
+	byChat := make(map[string]chat.GroupMembership, len(memberships))
+	for _, m := range memberships {
+		byChat[string(m.ChatID.Value)] = m
+	}
+	require.Len(t, byChat, 2)
+	assert.Equal(t, chat.GroupMembership{ChatID: g1.ID, Joined: true, Version: rejoined.Version}, byChat[string(g1.ID.Value)])
+	assert.True(t, byChat[string(g2.ID.Value)].Joined)
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g3}), membershipIDValues(t, s, user, chat.FolderInbox))
+	_, changed = setArchived(t, s, g1, user, false, archiveAt(16))
+	require.True(t, changed)
+
+	_, changed = setArchived(t, s, g2, user, false, archiveAt(20))
+	require.True(t, changed)
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g2, g3}), groupFolder(t, s, user, chat.FolderInbox))
+	assert.Empty(t, groupFolder(t, s, user, chat.FolderArchived))
+	archived, err = s.GetGroupChatsForUserByIDs(ctx, user, chat.FolderArchived, all)
+	require.NoError(t, err)
+	assert.Empty(t, archived)
+	assert.ElementsMatch(t, chatIDValues([]*chat.Chat{g1, g2, g3}), membershipIDValues(t, s, user, chat.FolderInbox))
+	assert.Empty(t, membershipIDValues(t, s, user, chat.FolderArchived))
+}
+
+// testStore_Archive_ArchivedChats pins GetArchivedChats: exactly the chats
+// the user holds an archive of, DMs and groups, each at its record's
+// version, and nothing for a chat archived and since unarchived or merely
+// muted.
+func testStore_Archive_ArchivedChats(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	user := model.MustGenerateUserID()
+	requireArchivedChats(t, s, user)
+
+	dm := putDmChatOfType(t, s, chatpb.ChatType_DM, user, model.MustGenerateUserID(), at(1))
+	putDmChatOfType(t, s, chatpb.ChatType_DM, user, model.MustGenerateUserID(), at(2))
+	muted := putGroupChat(t, s, "Muted", at(3), user)
+	group := putGroupChat(t, s, "Group", at(4), user)
+	unarchived := putGroupChat(t, s, "Unarchived", at(5), user)
+
+	setArchived(t, s, dm, user, true, archiveAt(10))
+	_, _, err := s.SetMute(ctx, muted.ID, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	_, _, err = s.SetMute(ctx, group.ID, user, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	setArchived(t, s, group, user, true, archiveAt(20))
+	setArchived(t, s, unarchived, user, true, archiveAt(30))
+	setArchived(t, s, unarchived, user, false, archiveAt(40))
+
+	requireArchivedChats(t, s, user,
+		chat.ArchivedChat{ChatID: dm.ID, ArchivedAt: archiveAt(10), Version: 1},
+		chat.ArchivedChat{ChatID: group.ID, ArchivedAt: archiveAt(20), Version: 2},
+	)
+	requireArchivedChats(t, s, model.MustGenerateUserID())
+}
+
+// testStore_Archive_MembersPage pins that a page of a group's roster names
+// the members on it who have archived the group, and no one once none has.
+func testStore_Archive_MembersPage(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator, a, b, c := model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()
+	group := putGroupChat(t, s, "Group", at(1), creator, a, b, c)
+
+	page, err := s.GetGroupMembersPage(ctx, group.ID, nil, 0)
+	require.NoError(t, err)
+	assert.Nil(t, page.Archived)
+
+	setArchived(t, s, group, a, true, archiveAt(10))
+	setArchived(t, s, group, c, true, archiveAt(10))
+	// A DM archive of a's is no archive of the group.
+	dm := putDmChatOfType(t, s, chatpb.ChatType_DM, b, creator, at(2))
+	setArchived(t, s, dm, b, true, archiveAt(10))
+
+	page, err = s.GetGroupMembersPage(ctx, group.ID, nil, 0)
+	require.NoError(t, err)
+	require.Len(t, page.Users, 4)
+	assert.Len(t, page.Archived, 2)
+	for _, u := range []*commonpb.UserId{a, c} {
+		assert.True(t, page.IsArchived(u))
+	}
+	for _, u := range []*commonpb.UserId{creator, b} {
+		assert.False(t, page.IsArchived(u))
+	}
+
+	// Paged one member at a time, each page names its own archivers alone.
+	var after *commonpb.UserId
+	archivers := 0
+	for {
+		page, err := s.GetGroupMembersPage(ctx, group.ID, after, 1)
+		require.NoError(t, err)
+		if len(page.Users) == 0 {
+			break
+		}
+		require.Len(t, page.Users, 1)
+		user := page.Users[0]
+		wantArchived := bytes.Equal(user.Value, a.Value) || bytes.Equal(user.Value, c.Value)
+		assert.Equal(t, wantArchived, page.IsArchived(user))
+		if wantArchived {
+			archivers++
+			assert.Len(t, page.Archived, 1)
+		} else {
+			assert.Nil(t, page.Archived)
+		}
+		after = page.Next
+	}
+	assert.Equal(t, 2, archivers)
+
+	setArchived(t, s, group, a, false, archiveAt(20))
+	setArchived(t, s, group, c, false, archiveAt(20))
+	page, err = s.GetGroupMembersPage(ctx, group.ID, nil, 0)
+	require.NoError(t, err)
+	assert.Nil(t, page.Archived)
+}
+
+// testStore_Archive_EndsWithDeparture pins that a leave and a ban each end
+// the departing member's archive in the write that records the departure,
+// moving the version once and leaving their mute as it is,
+// and that a return starts in the inbox.
+func testStore_Archive_EndsWithDeparture(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator, leaver, banned, plain := model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID(), model.MustGenerateUserID()
+	group := putGroupChat(t, s, "Group", at(1), creator, leaver, banned, plain)
+	dm := putDmChatOfType(t, s, chatpb.ChatType_DM, leaver, creator, at(2))
+
+	_, _, err := s.SetMute(ctx, group.ID, leaver, chat.Mute{Forever: true})
+	require.NoError(t, err)
+	setArchived(t, s, group, leaver, true, archiveAt(10))
+	setArchived(t, s, dm, leaver, true, archiveAt(10))
+	setArchived(t, s, group, banned, true, archiveAt(10))
+
+	// A leave.
+	changed, roster, err := s.RemoveGroupMember(ctx, group.ID, leaver, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	assert.Equal(t, chat.RosterSummary{MemberCount: 3, Version: 1}, roster)
+	want := chat.ViewerState{Mute: &chat.Mute{Forever: true}, Version: 3}
+	requireViewerState(t, s, group.ID, leaver, want)
+	requireArchivedChats(t, s, leaver, chat.ArchivedChat{ChatID: dm.ID, ArchivedAt: archiveAt(10), Version: 1})
+	assert.Empty(t, groupFolder(t, s, leaver, chat.FolderArchived))
+	assert.Empty(t, membershipIDValues(t, s, leaver, chat.FolderArchived))
+
+	// The departure is listed in the inbox, where the listing of
+	// memberships finds it.
+	memberships, err := s.GetGroupMembershipsForUser(ctx, leaver, chat.FolderInbox)
+	require.NoError(t, err)
+	require.Len(t, memberships, 1)
+	assert.Equal(t, group.ID.Value, memberships[0].ChatID.Value)
+	assert.False(t, memberships[0].Joined)
+
+	// Leaving again is the no-op, moving nothing.
+	changed, _, err = s.RemoveGroupMember(ctx, group.ID, leaver, false)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	requireViewerState(t, s, group.ID, leaver, want)
+
+	// A leave with no archive creates no record.
+	changed, _, err = s.RemoveGroupMember(ctx, group.ID, plain, false)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	requireNoViewerState(t, s, group.ID, plain)
+
+	// A return starts in the inbox, the version where the departure left it.
+	addGroupMembers(t, s, group.ID, leaver)
+	assert.Equal(t, chatIDValues([]*chat.Chat{group}), groupFolder(t, s, leaver, chat.FolderInbox))
+	assert.Empty(t, groupFolder(t, s, leaver, chat.FolderArchived))
+	assert.Equal(t, chatIDValues([]*chat.Chat{group}), membershipIDValues(t, s, leaver, chat.FolderInbox))
+	requireViewerState(t, s, group.ID, leaver, want)
+
+	// A ban.
+	result, err := s.BanUser(ctx, group.ID, banned, at(20), false)
+	require.NoError(t, err)
+	assert.Equal(t, chat.BanResult{
+		State:    chat.ViewerState{BannedAt: restrictedAt(20), RestrictedAt: restrictedAt(20), Version: 2},
+		Changed:  true,
+		Departed: true,
+		Roster:   chat.RosterSummary{MemberCount: 2, Version: 4},
+	}, result)
+	requireViewerState(t, s, group.ID, banned, result.State)
+	requireArchivedChats(t, s, banned)
+
+	// A ban of a member with no archive leaves the rest of their state.
+	result, err = s.BanUser(ctx, group.ID, leaver, at(30), false)
+	require.NoError(t, err)
+	assert.True(t, result.Departed)
+	assert.Equal(t, chat.ViewerState{Mute: &chat.Mute{Forever: true}, BannedAt: restrictedAt(30), RestrictedAt: restrictedAt(30), Version: 4}, result.State)
+
+	// Unbanned and back, the banned member starts in the inbox.
+	_, _, err = s.UnbanUser(ctx, group.ID, banned)
+	require.NoError(t, err)
+	addGroupMembers(t, s, group.ID, banned)
+	assert.Equal(t, chatIDValues([]*chat.Chat{group}), groupFolder(t, s, banned, chat.FolderInbox))
+	assert.Empty(t, groupFolder(t, s, banned, chat.FolderArchived))
+}
+
+// testStore_Archive_UnarchiveRacesDeparture races an unarchive against the
+// archived member's departure: whichever lands first, the archive is gone,
+// the unarchive is never refused (a departure that took the archive leaves
+// the unarchive a no-op, member or not), and the version moved exactly once,
+// by whichever write removed the archive.
+func testStore_Archive_UnarchiveRacesDeparture(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	group := putGroupChat(t, s, "Group", at(1), creator)
+
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		addGroupMembers(t, s, group.ID, user)
+		setArchived(t, s, group, user, true, archiveAt(10))
+
+		var unarchiveErr, leaveErr error
+		run(func() {
+			_, _, unarchiveErr = s.SetArchived(ctx, group, user, false, archiveAt(20))
+		}, func() {
+			_, _, leaveErr = s.RemoveGroupMember(ctx, group.ID, user, false)
+		})
+		require.NoError(t, unarchiveErr)
+		require.NoError(t, leaveErr)
+
+		isMember, err := s.IsMember(ctx, group.ID, user)
+		require.NoError(t, err)
+		assert.False(t, isMember)
+		requireViewerState(t, s, group.ID, user, chat.ViewerState{Version: 2})
+		requireArchivedChats(t, s, user)
+		assert.Empty(t, groupFolder(t, s, user, chat.FolderArchived))
+	})
+}
+
+// testStore_Archive_RacesBan races an archive against a ban of the member:
+// whichever lands first, the user ends banned, a non-member holding no
+// archive, the archive refused with chat.ErrNotMember when the ban won, and
+// the version moved once per write that landed.
+func testStore_Archive_RacesBan(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	group := putGroupChat(t, s, "Group", at(1), creator)
+
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		addGroupMembers(t, s, group.ID, user)
+
+		var archiveErr, banErr error
+		var archived bool
+		var result chat.BanResult
+		run(func() {
+			_, archived, archiveErr = s.SetArchived(ctx, group, user, true, archiveAt(10))
+		}, func() {
+			result, banErr = s.BanUser(ctx, group.ID, user, at(20), false)
+		})
+		require.NoError(t, banErr)
+		if archiveErr != nil {
+			require.ErrorIs(t, archiveErr, chat.ErrNotMember)
+		}
+		require.True(t, result.Departed)
+
+		want := chat.ViewerState{BannedAt: restrictedAt(20), RestrictedAt: restrictedAt(20), Version: 1}
+		if archived {
+			// The archive landed first, and the ban removed it in its one
+			// move of the version.
+			want.Version = 2
+		}
+		assert.Equal(t, want, result.State)
+		requireViewerState(t, s, group.ID, user, want)
+		requireArchivedChats(t, s, user)
+		assert.Empty(t, groupFolder(t, s, user, chat.FolderArchived))
+	})
+}
+
+// testStore_Archive_RacesMute races an archive against a mute of the same
+// chat by the same user, both writes of their one record: whichever lands
+// first, both land, neither undoes the other, and the version moved once for
+// each.
+func testStore_Archive_RacesMute(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	group := putGroupChat(t, s, "Group", at(1), creator)
+
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		addGroupMembers(t, s, group.ID, user)
+		dm := putDmChatOfType(t, s, chatpb.ChatType_DM, user, creator, at(2))
+
+		for _, c := range []*chat.Chat{group, dm} {
+			var archiveErr, muteErr error
+			var archived, muted bool
+			run(func() {
+				_, archived, archiveErr = s.SetArchived(ctx, c, user, true, archiveAt(10))
+			}, func() {
+				_, muted, muteErr = s.SetMute(ctx, c.ID, user, chat.Mute{Forever: true})
+			})
+			require.NoError(t, archiveErr)
+			require.NoError(t, muteErr)
+			require.True(t, archived)
+			require.True(t, muted)
+			requireViewerState(t, s, c.ID, user, chat.ViewerState{Mute: &chat.Mute{Forever: true}, ArchivedAt: archivedAt(10), Version: 2})
+		}
+		requireArchivedChats(t, s, user,
+			chat.ArchivedChat{ChatID: group.ID, ArchivedAt: archiveAt(10), Version: 2},
+			chat.ArchivedChat{ChatID: dm.ID, ArchivedAt: archiveAt(10), Version: 2},
+		)
+	})
+}
+
+// testStore_Archive_ReAddArchivedMember pins that adding a member who is
+// already in the group is the no-op it always was when they have archived
+// it: the group stays in their archived folder, and nothing of their state
+// moves.
+func testStore_Archive_ReAddArchivedMember(t *testing.T, s chat.Store) {
+	creator, user := model.MustGenerateUserID(), model.MustGenerateUserID()
+	group := putGroupChat(t, s, "Group", at(1), creator, user)
+	setArchived(t, s, group, user, true, archiveAt(10))
+
+	changed, roster := addGroupMembers(t, s, group.ID, user)
+	assert.False(t, changed)
+	assert.Equal(t, chat.RosterSummary{MemberCount: 2, Version: 0}, roster)
+	assert.Equal(t, chatIDValues([]*chat.Chat{group}), groupFolder(t, s, user, chat.FolderArchived))
+	assert.Empty(t, groupFolder(t, s, user, chat.FolderInbox))
+	requireViewerState(t, s, group.ID, user, chat.ViewerState{ArchivedAt: archivedAt(10), Version: 1})
+	requireArchivedChats(t, s, user, chat.ArchivedChat{ChatID: group.ID, ArchivedAt: archiveAt(10), Version: 1})
+}
+
+// testStore_Archive_WrongDmType pins that a DM is archived only as the type
+// it is stored as, since the type is part of the folder it is filed in: a
+// chat naming another type is refused with an error that is neither a
+// non-member's nor an excluded user's, and nothing is written.
+func testStore_Archive_WrongDmType(t *testing.T, s chat.Store) {
+	user, other := model.MustGenerateUserID(), model.MustGenerateUserID()
+	contact := putDmChatOfType(t, s, chatpb.ChatType_CONTACT_DM, user, other, at(1))
+
+	wrong := contact.Clone()
+	wrong.Type = chatpb.ChatType_DM
+	_, _, err := s.SetArchived(context.Background(), wrong, user, true, archiveAt(10))
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, chat.ErrNotMember)
+	assert.NotErrorIs(t, err, chat.ErrExcludedFromFeed)
+
+	requireNoViewerState(t, s, contact.ID, user)
+	requireArchivedChats(t, s, user)
+	assert.Equal(t, chatIDValues([]*chat.Chat{contact}), dmFolder(t, s, user, chatpb.ChatType_CONTACT_DM, chat.FolderInbox))
+	assert.Empty(t, dmFolder(t, s, user, chatpb.ChatType_DM, chat.FolderArchived))
+}
+
+// testStore_Archive_RacesDeparture races an archive against the member's
+// departure: whichever lands first, the user ends a non-member holding no
+// archive, the archive refused with chat.ErrNotMember when the departure
+// won, and the version moved once per write that landed.
+func testStore_Archive_RacesDeparture(t *testing.T, s chat.Store) {
+	ctx := context.Background()
+	creator := model.MustGenerateUserID()
+	group := putGroupChat(t, s, "Group", at(1), creator)
+
+	raceOrders(func(run func(a, b func())) {
+		user := model.MustGenerateUserID()
+		addGroupMembers(t, s, group.ID, user)
+
+		var archiveErr, leaveErr error
+		var archived bool
+		run(func() {
+			_, archived, archiveErr = s.SetArchived(ctx, group, user, true, archiveAt(10))
+		}, func() {
+			_, _, leaveErr = s.RemoveGroupMember(ctx, group.ID, user, false)
+		})
+		require.NoError(t, leaveErr)
+		if archiveErr != nil {
+			require.ErrorIs(t, archiveErr, chat.ErrNotMember)
+		}
+
+		isMember, err := s.IsMember(ctx, group.ID, user)
+		require.NoError(t, err)
+		assert.False(t, isMember)
+		requireArchivedChats(t, s, user)
+		assert.Empty(t, groupFolder(t, s, user, chat.FolderArchived))
+		if archived {
+			// The archive landed first, and the departure ended it.
+			requireViewerState(t, s, group.ID, user, chat.ViewerState{Version: 2})
+		} else {
+			requireNoViewerState(t, s, group.ID, user)
+		}
+	})
 }

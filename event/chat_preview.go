@@ -238,5 +238,5 @@ func (s *Server) streamChatPreview(ctx context.Context, log *zap.Logger, stream 
 		return status.Error(codes.Internal, "failure registering stream subscription")
 	}
 
-	return s.run(ctx, log, stream, ss, preview)
+	return s.run(ctx, log, stream, ss, preview, nil)
 }

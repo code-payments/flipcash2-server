@@ -13,10 +13,14 @@ import (
 // CreateTables provisions the chats, dm_inbox, group_members,
 // chat_user_state, chat_activity, chat_key_envelopes, chat_lobbies,
 // chat_featured_groups, chat_holdings, chat_invites and chat_pins tables with
-// on-demand billing. The chats table is keyed by pk only; dm_inbox is keyed by (pk, sk) with a GSI ordering each user's DMs
-// by last_activity; group_members is keyed by (pk, sk) = (chat, user) — plus
-// one "#meta" aggregates item per group — with an inverted GSI for listing a
-// user's group chats, a sparse GSI of a group's joined members by join time
+// on-demand billing. The chats table is keyed by pk only; dm_inbox is keyed
+// by (pk, sk) with GSIs ordering each user's DMs by last_activity: the one
+// read, gsiByFeedActivity on (feed, last_activity), and two that are no
+// longer read, gsiByTypeActivity on the same keys and the older gsiByActivity
+// on (pk, last_activity); group_members is keyed by (pk, sk) = (chat, user)
+// — plus one "#meta" aggregates item per group — with two inverted GSIs of a
+// user's group chats, gsiByFeed, which listings read, and gsiByUser, which
+// they no longer do, a sparse GSI of a group's joined members by join time
 // (paging a large roster newest-first; see gsiByJoinedAt), and TTL on
 // expires_at sweeping departed members' tombstones (see tombstoneTTL);
 // chat_user_state is keyed by (pk, sk) = (user, chat) — plus one "#meta"
@@ -45,7 +49,11 @@ import (
 // blocks until all tables are ACTIVE. It creates missing tables only: a table that
 // exists is left as it is, and so is never given an index added to its
 // definition here since it was created — gsiRestricted on a live
-// chat_user_state is added out of band (see the store's doc).
+// chat_user_state, gsiByFeedActivity on a live dm_inbox and gsiByFeed on a
+// live group_members are added out of band, and must be ACTIVE before code
+// that reads them runs (see the store's doc). The unread legacy indexes are
+// kept here because they still exist on the live tables, until a cleanup
+// drops them.
 func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmInboxTable, groupMembersTable, userStateTable, activityTable, keyEnvelopesTable, lobbiesTable, featuredGroupsTable, holdingsTable, invitesTable, pinsTable string) error {
 	inputs := []*dynamodb.CreateTableInput{
 		{
@@ -65,6 +73,7 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 				{AttributeName: aws.String(attrPK), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String(attrSK), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String(attrUser), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String(attrFeed), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String(attrJoinedAt), AttributeType: types.ScalarAttributeTypeN},
 			},
 			KeySchema: []types.KeySchemaElement{
@@ -73,17 +82,30 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 			},
 			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
 				{
-					// Inverted index: (user, chat). Listing a user's group chats
-					// (the group feed's fan-out-on-read entry point) is a query on
-					// the user's slice; membership state rides along in the
-					// projection. Keyed by the sparse user attribute — present on
-					// membership rows (tombstones included) and nothing else — so
-					// non-membership items like the counter stay out of the index,
-					// as do the rows of users excluded from the feed (see
-					// gsiByUser).
+					// Legacy inverted index: (user, chat), keyed by the sparse
+					// user attribute. No longer read; superseded by the index
+					// below (see gsiByUser).
 					IndexName: aws.String(gsiByUser),
 					KeySchema: []types.KeySchemaElement{
 						{AttributeName: aws.String(attrUser), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+				{
+					// Inverted index: (feed, chat), one of a user's folders of
+					// groups. Listing a user's group chats (the group feed's
+					// fan-out-on-read entry point) is a query on one of the
+					// user's folders; membership state rides along in the
+					// projection.
+					// Keyed by the sparse feed attribute — present on membership
+					// rows (tombstones included) and nothing else — so
+					// non-membership items like the counter stay out of the
+					// index, as do the rows of users excluded from the feed (see
+					// gsiByFeed).
+					IndexName: aws.String(gsiByFeed),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrFeed), KeyType: types.KeyTypeHash},
 						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeRange},
 					},
 					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
@@ -118,6 +140,7 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 			},
 			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
 				{
+					// Legacy, no longer read (see gsiByActivity).
 					IndexName: aws.String(gsiByActivity),
 					KeySchema: []types.KeySchemaElement{
 						{AttributeName: aws.String(attrPK), KeyType: types.KeyTypeHash},
@@ -126,7 +149,19 @@ func CreateTables(ctx context.Context, client *dynamodb.Client, chatsTable, dmIn
 					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
 				},
 				{
+					// No longer read; superseded by the index below, on the
+					// same keys (see gsiByTypeActivity).
 					IndexName: aws.String(gsiByTypeActivity),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String(attrFeed), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String(attrLastActivity), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+				{
+					// The feed index every DM feed read uses: the index above's
+					// keys under the name it is read by (see gsiByFeedActivity).
+					IndexName: aws.String(gsiByFeedActivity),
 					KeySchema: []types.KeySchemaElement{
 						{AttributeName: aws.String(attrFeed), KeyType: types.KeyTypeHash},
 						{AttributeName: aws.String(attrLastActivity), KeyType: types.KeyTypeRange},

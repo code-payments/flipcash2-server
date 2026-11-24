@@ -3,6 +3,7 @@ package chat
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -62,6 +63,106 @@ func TestGroupFeedToken_RejectsMalformed(t *testing.T) {
 
 	_, ok := decodeGroupFeedToken(&commonpb.PagingToken{Value: valid})
 	require.True(t, ok)
+}
+
+// TestGroupFeedToken_Folder pins that the token carries its folder, and that
+// a legacy (version 1) token, minted before the feed had folders, still
+// decodes, as a token of the INBOX.
+func TestGroupFeedToken_Folder(t *testing.T) {
+	window := []*commonpb.ChatId{MustGenerateGroupChatID(), MustGenerateGroupChatID()}
+	snapshot := time.Unix(1_700_000_000, 123).UTC()
+
+	for _, folder := range []Folder{FolderInbox, FolderArchived} {
+		encoded := encodeGroupFeedToken(&groupFeedToken{Snapshot: snapshot, Folder: folder, Window: window})
+		require.Equal(t, byte(groupFeedTokenVersion), encoded.Value[0])
+		require.Len(t, encoded.Value, groupFeedTokenHeaderLen+len(window)*GroupChatIDSize)
+		out, ok := decodeGroupFeedToken(encoded)
+		require.True(t, ok, folder)
+		require.Equal(t, folder, out.Folder)
+		require.True(t, out.Snapshot.Equal(snapshot))
+		require.Equal(t, rawIDs(window), rawIDs(out.Window))
+	}
+
+	// A version 1 token: the version byte and the snapshot, then the window.
+	legacy := make([]byte, legacyGroupFeedTokenHeaderLen)
+	legacy[0] = legacyGroupFeedTokenVersion
+	binary.BigEndian.PutUint64(legacy[1:9], uint64(snapshot.UnixNano()))
+	for _, id := range window {
+		legacy = append(legacy, id.Value...)
+	}
+	out, ok := decodeGroupFeedToken(&commonpb.PagingToken{Value: legacy})
+	require.True(t, ok)
+	require.Equal(t, FolderInbox, out.Folder)
+	require.True(t, out.Snapshot.Equal(snapshot))
+	require.Equal(t, rawIDs(window), rawIDs(out.Window))
+
+	// A spent version 1 token, its window empty, still resumes.
+	out, ok = decodeGroupFeedToken(&commonpb.PagingToken{Value: legacy[:legacyGroupFeedTokenHeaderLen]})
+	require.True(t, ok)
+	require.NotNil(t, out.Window)
+	require.Empty(t, out.Window)
+
+	// A version 1 token is not misread as a current one, nor a current one as
+	// version 1: each is held to its own header length.
+	current := encodeGroupFeedToken(&groupFeedToken{Snapshot: snapshot, Folder: FolderArchived, Window: window}).Value
+	_, ok = decodeGroupFeedToken(&commonpb.PagingToken{Value: append([]byte{legacyGroupFeedTokenVersion}, current[1:]...)})
+	require.False(t, ok)
+	_, ok = decodeGroupFeedToken(&commonpb.PagingToken{Value: append([]byte{groupFeedTokenVersion}, legacy[1:]...)})
+	require.False(t, ok)
+
+	// A header naming no folder is rejected.
+	unknown := append([]byte(nil), current...)
+	unknown[9] = 2
+	_, ok = decodeGroupFeedToken(&commonpb.PagingToken{Value: unknown})
+	require.False(t, ok)
+}
+
+// TestDmFeedToken pins the DM token's layout: it round-trips its snapshot,
+// chat type, folder and cursor; a legacy token, minted before the feed had
+// folders and one byte shorter, still decodes, as a token of the INBOX; and
+// anything else is rejected.
+func TestDmFeedToken(t *testing.T) {
+	snapshot := time.Unix(1_700_000_100, 456).UTC()
+	cursor := &DmFeedCursor{
+		LastActivity: time.Unix(1_700_000_050, 789).UTC(),
+		ChatID:       &commonpb.ChatId{Value: bytes.Repeat([]byte{7}, DmChatIDSize)},
+	}
+
+	for _, folder := range []Folder{FolderInbox, FolderArchived} {
+		encoded := encodeDmFeedToken(snapshot, chatpb.ChatType_DM, folder, cursor)
+		require.Len(t, encoded.Value, dmFeedTokenLen)
+		gotSnapshot, gotType, gotFolder, gotCursor, ok := decodeDmFeedToken(encoded)
+		require.True(t, ok, folder)
+		require.True(t, gotSnapshot.Equal(snapshot))
+		require.Equal(t, chatpb.ChatType_DM, gotType)
+		require.Equal(t, folder, gotFolder)
+		require.True(t, gotCursor.LastActivity.Equal(cursor.LastActivity))
+		require.Equal(t, cursor.ChatID.Value, gotCursor.ChatID.Value)
+	}
+
+	// The legacy layout is the current one without its trailing folder byte.
+	current := encodeDmFeedToken(snapshot, chatpb.ChatType_CONTACT_DM, FolderArchived, cursor).Value
+	legacy := current[:legacyDmFeedTokenLen]
+	gotSnapshot, gotType, gotFolder, gotCursor, ok := decodeDmFeedToken(&commonpb.PagingToken{Value: legacy})
+	require.True(t, ok)
+	require.True(t, gotSnapshot.Equal(snapshot))
+	require.Equal(t, chatpb.ChatType_CONTACT_DM, gotType)
+	require.Equal(t, FolderInbox, gotFolder)
+	require.True(t, gotCursor.LastActivity.Equal(cursor.LastActivity))
+	require.Equal(t, cursor.ChatID.Value, gotCursor.ChatID.Value)
+
+	unknownFolder := append([]byte(nil), current...)
+	unknownFolder[legacyDmFeedTokenLen] = 2
+	for name, token := range map[string]*commonpb.PagingToken{
+		"nil":            nil,
+		"empty":          {},
+		"short":          {Value: current[:legacyDmFeedTokenLen-1]},
+		"long":           {Value: append(append([]byte(nil), current...), 0)},
+		"unknown folder": {Value: unknownFolder},
+	} {
+		_, _, _, _, ok := decodeDmFeedToken(token)
+		require.False(t, ok, name)
+	}
 }
 
 // fakeFeedStore is the slice of Store the page algorithm reads: a fixed set of

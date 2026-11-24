@@ -18,7 +18,7 @@ import (
 // KeyEnvelope), stored and fetched by that member.
 //
 // Both RPCs are a member's alone, and only of a private group. They are gated
-// like the mute RPCs (see mutingAllowed): the canonical record first, since
+// like the mute RPCs (see memberSettingGate): the canonical record first, since
 // its absence is the only thing that tells NOT_FOUND from DENIED, then that
 // the group is private, then membership, read strongly consistent. A DM is
 // DENIED before anything is read.

@@ -1,11 +1,19 @@
 package chat
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	chatpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/chat/v1"
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
+
+	"github.com/code-payments/flipcash2-server/model"
 )
 
 // A user's archive of a chat (see chatpb.ArchiveState) is a setting of their
@@ -126,4 +134,148 @@ func ValidateArchiveChat(c *Chat) error {
 		return fmt.Errorf("not a chat id")
 	}
 	return nil
+}
+
+// ArchiveChat records the caller's archive of a chat, a DM or a group, which
+// files it in their archived folder of the feeds (see GetDmChatFeed and
+// GetGroupChatFeed).
+//
+// Only a member may archive, and the gate is MuteChat's (see
+// memberSettingGate): NOT_FOUND for a chat that does not exist, DENIED for a
+// non-member, membership alone and never the rules. The store judges
+// membership again in the write (see Store.SetArchived), so a departure that
+// lands between the gate and the write is refused there with ErrNotMember,
+// and answered DENIED, as a non-member's call is. So is the one member whose
+// copy of the chat is in no folder, refused with ErrExcludedFromFeed: in
+// production the team account, which has no client to call with.
+//
+// The write is the store's own no-op-aware update: archiving a chat already
+// archived is answered with the current state, its original archive time
+// kept, and publishes nothing, and a real archive reaches the caller's other
+// devices as a MetadataUpdate.ViewerStateChanged on their user topic (see
+// publishViewerStateChanged), with the state the response carries. An
+// archive changes nothing anyone else sees, so nothing is published on the
+// chat topic. Nothing in the chat ends it: only UnarchiveChat does while the
+// caller is a member, and a departure ends it with the membership, in the
+// store's write of the departure, with nothing announced for it (see
+// archive.go).
+func (s *Server) ArchiveChat(ctx context.Context, req *chatpb.ArchiveChatRequest) (*chatpb.ArchiveChatResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.String("chat_id", model.ChatIDString(req.ChatId)),
+	)
+
+	_, gate, state, permissions, err := s.writeArchive(ctx, log, req.ChatId, userID, true)
+	if err != nil {
+		return nil, err
+	}
+	switch gate {
+	case memberGateNotFound:
+		return &chatpb.ArchiveChatResponse{Result: chatpb.ArchiveChatResponse_NOT_FOUND}, nil
+	case memberGateDenied:
+		return &chatpb.ArchiveChatResponse{Result: chatpb.ArchiveChatResponse_DENIED}, nil
+	}
+	return &chatpb.ArchiveChatResponse{
+		Result:      chatpb.ArchiveChatResponse_OK,
+		ViewerState: state.ToProto(permissions),
+	}, nil
+}
+
+// UnarchiveChat removes the caller's archive of a chat, filing it back in
+// their inbox. It is gated, written and published exactly as ArchiveChat is;
+// unarchiving a chat that is not archived is the no-op that returns the
+// current state and publishes nothing.
+//
+// Nothing missed while the chat was archived is replayed. The response
+// carries the chat's Metadata instead, on every OK, a no-op included, so the
+// client can show the chat again and catch up from it: the chat as GetChat
+// returns it to a member under ViewMode FULL (see chatAsSeenBy), hydrated the
+// same way, as the member the gate found the caller to be, from the record
+// the gate read. Its viewer_state is the state the write returned, the one
+// the response's viewer_state carries: hydrate's read of the state is
+// strongly consistent, so it would read the same state but for a write of
+// another of the caller's devices landing in between, and substituting the
+// written one keeps the response to the one version the proto promises. A
+// later write of theirs reaches them on the stream as its own
+// ViewerStateChanged.
+//
+// A hydration that fails after the write is an Internal error, since the
+// proto has no OK without the chat. The write has landed, and its
+// ViewerStateChanged was published before the hydration, so the caller's
+// other devices are told of it either way, and the client's retry is the
+// no-op, which returns the state and the chat.
+func (s *Server) UnarchiveChat(ctx context.Context, req *chatpb.UnarchiveChatRequest) (*chatpb.UnarchiveChatResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(
+		zap.String("user_id", model.UserIDString(userID)),
+		zap.String("chat_id", model.ChatIDString(req.ChatId)),
+	)
+
+	c, gate, state, permissions, err := s.writeArchive(ctx, log, req.ChatId, userID, false)
+	if err != nil {
+		return nil, err
+	}
+	switch gate {
+	case memberGateNotFound:
+		return &chatpb.UnarchiveChatResponse{Result: chatpb.UnarchiveChatResponse_NOT_FOUND}, nil
+	case memberGateDenied:
+		return &chatpb.UnarchiveChatResponse{Result: chatpb.UnarchiveChatResponse_DENIED}, nil
+	}
+
+	metadata, err := s.hydrator.hydrate(ctx, userID, memberListenerStanding, ReadingFull, fullDetail, []*Chat{c})
+	if err != nil {
+		log.With(zap.Error(err)).Warn("Failure hydrating chat metadata")
+		return nil, status.Error(codes.Internal, "")
+	}
+	md := metadata[0]
+	md.ViewerState = state.ToProto(permissions)
+
+	return &chatpb.UnarchiveChatResponse{
+		Result:      chatpb.UnarchiveChatResponse_OK,
+		ViewerState: state.ToProto(permissions),
+		Chat:        md,
+	}, nil
+}
+
+// writeArchive is what ArchiveChat and UnarchiveChat share: the member gate
+// (see memberSettingGate), the store's write of archived (see
+// Store.SetArchived), and the publish of a real change. It returns the chat
+// the gate read, the gate's outcome, and on memberGateOK the caller's state
+// after the write with their permissions, a member's, since the gate and the
+// write both established membership. A refusal by the write is reported in
+// the gate's vocabulary: ErrChatNotFound as memberGateNotFound, and
+// ErrNotMember (a departure racing the call) and ErrExcludedFromFeed (a user
+// with no folder to move the chat to) as memberGateDenied. A gRPC error is
+// returned only for a failed read or write.
+func (s *Server) writeArchive(ctx context.Context, log *zap.Logger, chatID *commonpb.ChatId, userID *commonpb.UserId, archived bool) (*Chat, memberGate, ViewerState, Permissions, error) {
+	c, gate, err := s.memberSettingGate(ctx, log, chatID, userID)
+	if err != nil || gate != memberGateOK {
+		return nil, gate, ViewerState{}, Permissions{}, err
+	}
+
+	state, changed, err := s.chats.SetArchived(ctx, c, userID, archived, time.Now())
+	switch {
+	case errors.Is(err, ErrChatNotFound):
+		return nil, memberGateNotFound, ViewerState{}, Permissions{}, nil
+	case errors.Is(err, ErrNotMember), errors.Is(err, ErrExcludedFromFeed):
+		return nil, memberGateDenied, ViewerState{}, Permissions{}, nil
+	case err != nil:
+		log.With(zap.Error(err), zap.Bool("archived", archived)).Warn("Failure recording archive")
+		return nil, 0, ViewerState{}, Permissions{}, status.Error(codes.Internal, "")
+	}
+
+	permissions := c.PermissionsFor(userID, true)
+	if changed {
+		s.publishViewerStateChanged(userID, chatID, state, permissions)
+	}
+	return c, memberGateOK, state, permissions, nil
 }

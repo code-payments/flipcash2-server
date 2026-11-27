@@ -214,7 +214,22 @@ func (s *Server) Login(ctx context.Context, req *accountpb.LoginRequest) (*accou
 	return &accountpb.LoginResponse{Result: accountpb.LoginResponse_OK, UserId: userID}, nil
 }
 
+// GetUserFlags returns the flags of the user whose key signed the request.
+//
+// The signature is what proves the caller holds the key: a public key alone is
+// no secret, since Resolve returns any user's. So it is checked before
+// anything is read, and a request that fails it gets the same DENIED as one
+// signed by a key that is not the user's.
 func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRequest) (*accountpb.GetUserFlagsResponse, error) {
+	a := req.Auth
+	req.Auth = nil
+	if err := s.verifier.Verify(ctx, req, a); err != nil {
+		if status.Code(err) == codes.Unauthenticated {
+			return &accountpb.GetUserFlagsResponse{Result: accountpb.GetUserFlagsResponse_DENIED}, nil
+		}
+		return nil, err
+	}
+
 	authorized, err := s.store.GetPubKeys(ctx, req.UserId)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get keys")
@@ -227,7 +242,7 @@ func (s *Server) GetUserFlags(ctx context.Context, req *accountpb.GetUserFlagsRe
 
 	var signerAuthorized bool
 	for _, key := range authorized {
-		if bytes.Equal(key.Value, req.GetAuth().GetKeyPair().PubKey.Value) {
+		if bytes.Equal(key.Value, a.GetKeyPair().GetPubKey().GetValue()) {
 			signerAuthorized = true
 			break
 		}

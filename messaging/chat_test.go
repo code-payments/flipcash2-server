@@ -52,8 +52,10 @@ func TestChatMessagingReader(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, none)
 
-	// Pointers: delegated, keyed by chat; a chat with none is absent.
-	_, _, err = store.AdvancePointer(ctx, chatA, sender, messagingpb.Pointer_READ, a2.ID)
+	// Pointers: delegated, keyed by chat; a chat with none is absent. A READ
+	// pointer carries the unread_seq its advance recorded, which is what the
+	// feed and GetChat hand the viewer.
+	_, _, err = store.AdvancePointer(ctx, chatA, sender, messagingpb.Pointer_READ, a2.ID, a2.UnreadSeq)
 	require.NoError(t, err)
 	pointers, err := reader.Pointers(ctx, []chat.PointerRef{
 		{ChatID: chatA, Members: []*commonpb.UserId{sender}},
@@ -62,6 +64,8 @@ func TestChatMessagingReader(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pointers[string(chatA.Value)], 1)
 	require.Equal(t, messagingpb.Pointer_READ, pointers[string(chatA.Value)][0].Type)
+	require.NotNil(t, pointers[string(chatA.Value)][0].UnreadSeq)
+	require.Equal(t, a2.UnreadSeq, pointers[string(chatA.Value)][0].UnreadSeq.Value)
 	_, ok := pointers[string(chatB.Value)]
 	require.False(t, ok)
 

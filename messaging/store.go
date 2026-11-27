@@ -502,6 +502,16 @@ type Store interface {
 	// the case a lagging read would report as missing.
 	MessageExists(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (bool, error)
 
+	// GetMessageUnreadSeq returns a message's unread_seq (see Message), with
+	// exists false and unreadSeq 0 when the chat holds no such message. It is
+	// MessageExists that also returns the one value a READ pointer advance
+	// records (see AdvancePointer), for the AdvancePointer RPC's check of its
+	// target: like MessageExists it reads no content, and it is strongly
+	// consistent for the same reason. A message's unread_seq is fixed at its
+	// send (an edit or delete leaves it as it was), so the value never goes
+	// stale.
+	GetMessageUnreadSeq(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (unreadSeq uint64, exists bool, err error)
+
 	// GetMessages returns a page of messages for a chat ordered by message ID
 	// (ascending by default), paged via the provided query options. The paging
 	// token's value is the message ID of the last message from the previous
@@ -589,6 +599,13 @@ type Store interface {
 
 	// GetPointers returns all delivered/read pointers for a chat. Returns an
 	// empty result (no error) when the chat has no pointers.
+	//
+	// A READ pointer carries the unread_seq recorded with it (UnreadSeq; see
+	// AdvancePointer) only when that record was made for the pointer's
+	// current value. One last advanced before unread_seq was recorded, or
+	// moved since by a writer that does not record it (an older server in a
+	// rolling deploy or after a rollback), carries none until it next
+	// advances. A DELIVERED pointer never carries one.
 	GetPointers(ctx context.Context, chatID *commonpb.ChatId) ([]*messagingpb.Pointer, error)
 
 	// GetPointersForChats returns the stored pointers (StoredPointerTypes) for the
@@ -599,7 +616,8 @@ type Store interface {
 	// scanning each chat's partition; since those are the only types ever stored,
 	// this is exhaustive. Chats with no matching pointers are absent from the map
 	// and duplicate (chat, member) pairs collapse. Returns an empty map (no error)
-	// when refs is empty.
+	// when refs is empty. A READ pointer carries its recorded unread_seq on the
+	// terms GetPointers' does.
 	GetPointersForChats(ctx context.Context, refs []PointerRef) (map[string][]*messagingpb.Pointer, error)
 
 	// AdvancePointer moves a member's pointer of the given type forward to
@@ -611,17 +629,32 @@ type Store interface {
 	// may answer a no-op without reaching storage at all. Callers act on a
 	// pointer only when it advanced.
 	//
-	// It does not verify that newValue references an existing message. Callers
-	// with a caller-supplied newValue must check existence first (see
-	// MessageExists and the AdvancePointer RPC); callers that already know the
-	// message exists — e.g. the sender's own READ pointer right after PutMessage
-	// returns the message it just wrote — can advance directly.
+	// unreadSeq is the unread_seq of the message at newValue, used by a READ
+	// advance alone (a DELIVERED one ignores it). A READ advance records it
+	// together with newValue, the value it belongs to, in the same conditional
+	// write that moves the pointer, so it lands exactly when the pointer moves
+	// and a no-op records nothing. The returned pointer carries it as
+	// UnreadSeq, and so do the reads for as long as the pointer stays at
+	// newValue (see GetPointers). Nothing fills it in later: a pointer last
+	// advanced before it was recorded goes without until its next advance.
+	//
+	// It does not verify that newValue references an existing message, nor
+	// that unreadSeq is that message's, and a READ advance has no way to
+	// record nothing: whatever it is given is recorded and served as the
+	// message's unread_seq, 0 included. A READ caller must therefore hold the
+	// real value; one that cannot get it should not advance. Callers with a
+	// caller-supplied newValue must check existence first, reading the
+	// unread_seq with it for a READ advance (see GetMessageUnreadSeq and the
+	// AdvancePointer RPC); callers that already hold the message — e.g. the
+	// sender's own READ pointer right after PutMessage returns the message it
+	// just wrote — can advance directly with its UnreadSeq.
 	AdvancePointer(
 		ctx context.Context,
 		chatID *commonpb.ChatId,
 		userID *commonpb.UserId,
 		pointerType messagingpb.Pointer_Type,
 		newValue *messagingpb.MessageId,
+		unreadSeq uint64,
 	) (*messagingpb.Pointer, bool, error)
 
 	// AddReaction records userID's reaction with emoji on a message and returns

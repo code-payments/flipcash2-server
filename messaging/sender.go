@@ -407,16 +407,17 @@ func (s *Sender) SendBatch(
 
 	// Each sender has implicitly read their own messages, so advance their READ
 	// pointer past the last one they sent. The targets are messages we just
-	// persisted, so their existence is guaranteed — advance directly without a
-	// separate existence read. Best-effort: it's reconstructable and self-heals.
-	// A system message (no sender) has no pointer to advance, and neither does
-	// the team account, which reads nothing (see NewSender).
+	// persisted, so their existence is guaranteed, and each carries the
+	// unread_seq the advance records — advance directly without a separate
+	// read. Best-effort: it's reconstructable and self-heals. A system message
+	// (no sender) has no pointer to advance, and neither does the team
+	// account, which reads nothing (see NewSender).
 	wg.Go(func() {
 		for _, last := range lastMessagePerSender(msgs) {
 			if s.isTeamAccount(last.SenderID) {
 				continue
 			}
-			pointer, advanced, err := s.messages.AdvancePointer(ctx, chatID, last.SenderID, messagingpb.Pointer_READ, last.ID)
+			pointer, advanced, err := s.messages.AdvancePointer(ctx, chatID, last.SenderID, messagingpb.Pointer_READ, last.ID, last.UnreadSeq)
 			if err != nil {
 				log.With(zap.Error(err)).Warn("Failure advancing sender read pointer")
 				continue
@@ -446,8 +447,10 @@ func (s *Sender) SendBatch(
 
 	// A DM's members then hear of the senders' read pointers, in an update of
 	// its own and only those that actually advanced — a no-op must not
-	// broadcast a stale pointer. Pointers are a convergent overlay outside the
-	// event log, so they need not arrive with the messages they follow.
+	// broadcast a stale pointer. Each is the pointer the store returned, so it
+	// carries the unread_seq it recorded. Pointers are a convergent overlay
+	// outside the event log, so they need not arrive with the messages they
+	// follow.
 	//
 	// A group never carries real-time pointers (see AdvancePointer): the
 	// senders' auto-advances are stored, but riding them along here would give

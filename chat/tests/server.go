@@ -2068,7 +2068,7 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 
 	e.messaging.lastMessages[string(chatID.Value)] = textMessage(7, peer, "hi")
 	e.messaging.pointers[string(chatID.Value)] = []*messagingpb.Pointer{
-		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 7}, Ts: timestamppb.New(at(7))},
+		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 7}, Ts: timestamppb.New(at(7)), UnreadSeq: &messagingpb.UnreadSequence{Value: 5}},
 		{Type: messagingpb.Pointer_DELIVERED, UserId: peer, Value: &messagingpb.MessageId{Value: 7}, Ts: timestamppb.New(at(7))},
 	}
 	// The head sits ahead of the last message's event sequence (e.g. an older
@@ -2090,10 +2090,13 @@ func testServer_GetChat_Hydrates(t *testing.T, s chat.Store) {
 	// The chat's head event sequence is hydrated, independent of last_message.
 	require.Equal(t, uint64(9), resp.Metadata.LatestEventSequence)
 
-	// Pointers are distributed onto the matching member by user ID.
+	// Pointers are distributed onto the matching member by user ID, the READ
+	// pointer with the unread_seq it was stored with.
 	members := byUserID(resp.Metadata.Members)
 	require.Len(t, members[string(e.userID.Value)].Pointers, 1)
 	require.Equal(t, messagingpb.Pointer_READ, members[string(e.userID.Value)].Pointers[0].Type)
+	require.NotNil(t, members[string(e.userID.Value)].Pointers[0].UnreadSeq)
+	require.Equal(t, uint64(5), members[string(e.userID.Value)].Pointers[0].UnreadSeq.Value)
 	require.Len(t, members[string(peer.Value)].Pointers, 1)
 	require.Equal(t, messagingpb.Pointer_DELIVERED, members[string(peer.Value)].Pointers[0].Type)
 
@@ -2302,9 +2305,10 @@ func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
 	e.profiles.phoneNumbers[string(e.userID.Value)] = &commonpb.PhoneNumber{Value: "+15551234567"}
 
 	// The viewer and another member each have a stored READ pointer. Only the
-	// viewer's is surfaced: it is what their unread count is computed from.
+	// viewer's is surfaced: it is what their unread count is computed from,
+	// with the unread_seq it carries.
 	e.messaging.pointers[string(chatID.Value)] = []*messagingpb.Pointer{
-		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 3}, Ts: timestamppb.New(at(3))},
+		{Type: messagingpb.Pointer_READ, UserId: e.userID, Value: &messagingpb.MessageId{Value: 3}, Ts: timestamppb.New(at(3)), UnreadSeq: &messagingpb.UnreadSequence{Value: 2}},
 		{Type: messagingpb.Pointer_READ, UserId: memberB, Value: &messagingpb.MessageId{Value: 4}, Ts: timestamppb.New(at(4))},
 	}
 
@@ -2337,6 +2341,8 @@ func testServer_GetChat_Group_Hydrates(t *testing.T, s chat.Store) {
 	require.Len(t, self.Pointers, 1)
 	require.Equal(t, messagingpb.Pointer_READ, self.Pointers[0].Type)
 	require.Equal(t, uint64(3), self.Pointers[0].Value.Value)
+	require.NotNil(t, self.Pointers[0].UnreadSeq)
+	require.Equal(t, uint64(2), self.Pointers[0].UnreadSeq.Value)
 	require.Nil(t, self.UserProfile.PhoneNumber)
 }
 

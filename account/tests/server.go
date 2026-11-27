@@ -93,4 +93,70 @@ func testServer(t *testing.T, store account.Store) {
 			require.NoError(t, protoutil.ProtoEqualError(userId, resp.UserId))
 		}
 	})
+
+	t.Run("GetUserFlags", func(t *testing.T) {
+		newRequest := func() *accountpb.GetUserFlagsRequest {
+			return &accountpb.GetUserFlagsRequest{
+				UserId:      userId,
+				Platform:    commonpb.Platform_APPLE,
+				CountryCode: &commonpb.CountryCode{Value: "us"},
+			}
+		}
+
+		t.Run("Signed by the user's key", func(t *testing.T) {
+			req := newRequest()
+			require.NoError(t, keys[0].Auth(req, &req.Auth))
+
+			resp, err := client.GetUserFlags(ctx, req)
+			require.NoError(t, err)
+			require.Equal(t, accountpb.GetUserFlagsResponse_OK, resp.Result)
+			require.True(t, resp.UserFlags.IsRegisteredAccount)
+			require.False(t, resp.UserFlags.IsStaff)
+		})
+
+		t.Run("User's public key without its signature", func(t *testing.T) {
+			// Anyone can learn a user's public key, so naming it must not be
+			// enough: sign with another key and present the user's.
+			req := newRequest()
+			require.NoError(t, model.MustGenerateKeyPair().Auth(req, &req.Auth))
+			req.Auth.GetKeyPair().PubKey = keys[0].Proto()
+
+			resp, err := client.GetUserFlags(ctx, req)
+			require.NoError(t, err)
+			require.Equal(t, accountpb.GetUserFlagsResponse_DENIED, resp.Result)
+			require.Nil(t, resp.UserFlags)
+		})
+
+		t.Run("Request changed after signing", func(t *testing.T) {
+			req := newRequest()
+			require.NoError(t, keys[0].Auth(req, &req.Auth))
+			req.Platform = commonpb.Platform_GOOGLE
+
+			resp, err := client.GetUserFlags(ctx, req)
+			require.NoError(t, err)
+			require.Equal(t, accountpb.GetUserFlagsResponse_DENIED, resp.Result)
+			require.Nil(t, resp.UserFlags)
+		})
+
+		t.Run("Signed by a key that is not the user's", func(t *testing.T) {
+			req := newRequest()
+			require.NoError(t, model.MustGenerateKeyPair().Auth(req, &req.Auth))
+
+			resp, err := client.GetUserFlags(ctx, req)
+			require.NoError(t, err)
+			require.Equal(t, accountpb.GetUserFlagsResponse_DENIED, resp.Result)
+			require.Nil(t, resp.UserFlags)
+		})
+
+		t.Run("Unknown user", func(t *testing.T) {
+			req := newRequest()
+			req.UserId = model.MustGenerateUserID()
+			require.NoError(t, keys[0].Auth(req, &req.Auth))
+
+			resp, err := client.GetUserFlags(ctx, req)
+			require.NoError(t, err)
+			require.Equal(t, accountpb.GetUserFlagsResponse_DENIED, resp.Result)
+			require.Nil(t, resp.UserFlags)
+		})
+	})
 }

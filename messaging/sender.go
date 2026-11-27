@@ -185,7 +185,8 @@ func NewSender(
 }
 
 // OutgoingMessage is one message of a SendBatch: what Send takes per message,
-// minus the chat, which a batch shares.
+// minus the chat, which a batch shares, plus what only a batch carries,
+// ReturnIntentID and FromClient.
 type OutgoingMessage struct {
 	SenderID           *commonpb.UserId // nil for a system message
 	Content            []*messagingpb.Content
@@ -198,13 +199,23 @@ type OutgoingMessage struct {
 	// sender offering a return sends a batch of one through SendBatch. On a
 	// retried send the ID the first send stored stands.
 	ReturnIntentID *commonpb.IntentId
+
+	// FromClient marks a message a user's client sent with the SendMessage
+	// RPC, the one caller that sets it: ClientMessageID is then the client's
+	// and is kept on the message and carried on every copy of it, the send's
+	// result, its events, reads and pushes alike (see
+	// MessageInput.FromClient). Every server-authored send leaves it false,
+	// so its derived ID stays the server's idempotency key and reaches no
+	// client. Send has no way to set it, as for ReturnIntentID.
+	FromClient bool
 }
 
 // Send persists content as a message in the chat and performs every side effect
-// of a send. It is SendBatch with a batch of one, and the shared core behind the
-// SendMessage RPC and internal, server-authored sends — the latter bypass the
-// RPC's client-side content and membership checks (e.g. injecting a cash
-// message after a payment settles).
+// of a send. It is SendBatch with a batch of one, for internal, server-authored
+// sends, which bypass the SendMessage RPC's client-side content and membership
+// checks (e.g. injecting a cash message after a payment settles). Its message
+// is never FromClient: the RPC sends through SendBatch, as a batch of one
+// marked FromClient (see OutgoingMessage.FromClient).
 func (s *Sender) Send(
 	ctx context.Context,
 	chatID *commonpb.ChatId,
@@ -243,10 +254,17 @@ func (s *Sender) Send(
 // count. Sends are idempotent on the batch's client message IDs: a retry returns
 // the originally persisted messages and skips the side effects, which already
 // ran on the first send — re-running them would duplicate pushes to members.
-// Each message earns its own push, as it would sent alone.
+// Only a sender's own send is retried that way: a batch whose every ID names a
+// message, one of them sent by a different sender, is refused with
+// ErrClientMessageIDTaken, and nothing is persisted or sent (a batch only some
+// of whose IDs are spent fails as Internal, as before; see ErrPartialReplay).
+// Each message earns its own push, as it would sent alone. A message marked
+// FromClient carries its client message ID on every copy (see
+// OutgoingMessage.FromClient); every other carries none.
 //
 // It is for server-authored sends whose messages must be seen together or not
-// at all (e.g. a chat's opening messages); a client sends one at a time.
+// at all (e.g. a chat's opening messages); a client sends one at a time, and
+// the SendMessage RPC sends that one as a batch of one, marked FromClient.
 func (s *Sender) SendBatch(
 	ctx context.Context,
 	chatID *commonpb.ChatId,
@@ -288,10 +306,20 @@ func (s *Sender) SendBatch(
 			ClientMessageID:    out.ClientMessageID,
 			CountsTowardUnread: out.CountsTowardUnread,
 			ReturnIntentID:     out.ReturnIntentID,
+			FromClient:         out.FromClient,
 		}
 	}
 
 	msgs, created, err := s.messages.PutMessages(ctx, chatID, inputs)
+	if errors.Is(err, ErrClientMessageIDTaken) {
+		// Not a retry of this send: an ID names a message someone else sent.
+		// It is the request's fault, not the server's, so it is not a warning;
+		// but a server-authored send refused here means a member took its
+		// derived ID first, and is worth being able to find. Returned as is,
+		// so the SendMessage RPC can answer it as DENIED.
+		log.Info("Client message id names another sender's message", zap.String("chat_id", model.ChatIDString(chatID)))
+		return nil, ErrClientMessageIDTaken
+	}
 	if err != nil {
 		log.With(zap.Error(err)).Warn("Failure persisting messages")
 		return nil, status.Error(codes.Internal, "")

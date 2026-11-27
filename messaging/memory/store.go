@@ -169,6 +169,9 @@ func (m *memory) PutMessages(
 		for i, in := range inputs {
 			msgs[i] = cs.messages[cs.byClient[string(in.ClientMessageID.Value)]].Clone()
 		}
+		if err := messaging.ValidateReplay(inputs, msgs); err != nil {
+			return nil, false, err
+		}
 		return msgs, false, nil
 	}
 	if replayed > 0 {
@@ -207,6 +210,11 @@ func (m *memory) PutMessages(
 			Timestamp:     in.Timestamp,
 			UnreadSeq:     unreadSeq,
 			EventSequence: eventSeq,
+		}
+		// Only a client's send keeps its ID on the message; a server-authored
+		// one's is the idempotency key alone (see MessageInput.FromClient).
+		if in.FromClient {
+			msgs[i].ClientMessageID = &messagingpb.ClientMessageId{Value: append([]byte(nil), in.ClientMessageID.Value...)}
 		}
 	}
 

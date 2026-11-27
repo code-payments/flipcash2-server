@@ -254,7 +254,8 @@ func welcomeGroupID(teamUserID, userID *commonpb.UserId) *commonpb.ChatId {
 // It is idempotent on (the group, idempotencyKey) exactly as SendDmMessages is
 // on (the chat, idempotencyKey): the client message IDs are derived from the
 // pair and each message's position (see clientMessageID), so a retry returns
-// what the first call sent without sending again. A retry encrypts afresh,
+// what the first call sent without sending again (unless the user sent with
+// one of those IDs first, see clientMessageIDNamespace). A retry encrypts afresh,
 // under a fresh nonce, but what it would send is never written: the store
 // answers a replay with the messages it holds and ignores what the retry
 // carries (see messaging.Store.PutMessages). The key is the messages' own,

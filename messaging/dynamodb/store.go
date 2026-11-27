@@ -184,12 +184,17 @@ const (
 	seqPadWidth = 20
 
 	// cmidTTL is how long a cmid idempotency marker is retained before DynamoDB
-	// TTL reaps it. Markers only guard against retried sends, which happen within
-	// seconds, so a month of retention is ample; a (wildly implausible) retry past
-	// this window would persist a duplicate message rather than dedup. It must be
-	// at least poll.SendRetryWindow: a poll is sent once, and the retries of its
-	// one send that poll.PrepareSend lets through rely on the marker to replay
-	// the message rather than write a second (see TestCmidTTL_CoversPollSendRetries).
+	// TTL reaps it (reaping lags, and a marker is never filtered on expiry when
+	// read, so it is honoured at least this long). For that long a sender's
+	// retry replays their message, and a send by anyone else carrying the ID
+	// is refused (messaging.ErrClientMessageIDTaken); past it the ID is
+	// forgotten, and a send carrying it writes a new message. It is a promise
+	// to clients, not a tuning knob: messagingpb.ClientMessageId documents
+	// recognition for at least 30 days after a send, so it must be at least
+	// that. It must also be at least poll.SendRetryWindow: a poll is sent once,
+	// and the retries of its one send that poll.PrepareSend lets through rely
+	// on the marker to replay the message rather than write a second. Both
+	// floors are pinned by TestCmidTTL.
 	cmidTTL = 30 * 24 * time.Hour
 
 	// messages table attributes
@@ -209,6 +214,14 @@ const (
 	attrEventType     = "event_type"      // evt# row: the messaging.EventType recorded (create/edit/delete)
 	attrFirstEventSeq = "first_event_seq" // evt# row: the first event_seq of the run of sends the row covers, the sk being its last (absent = the sk, a run of one; see runItem)
 	attrExpiresAt     = "expires_at"      // DynamoDB TTL attribute (epoch seconds)
+
+	// msg# row: the client message ID a user's client sent the message with
+	// (messaging.Message.ClientMessageID), raw bytes. Present only on a
+	// message sent FromClient, and absent on every message stored before it
+	// was written; written by the send alone (see messageItem), and an edit or
+	// delete SETs only the attributes it names, so it survives both. The
+	// messages table has no index, so it projects nowhere.
+	attrClientMsgID = "cmid"
 
 	// A cash message's return offer (messaging.CashMessageReturn) rides its
 	// own msg# row: return_intent is written by the send that offers it and
@@ -533,6 +546,9 @@ func (s *store) PutMessages(
 				UnreadSeq:     nextUnread,
 				EventSequence: nextEventSeq,
 			}
+			if in.FromClient {
+				msg.ClientMessageID = in.ClientMessageID // written onto the row, see messageItem
+			}
 			msgs[i] = msg
 			items = append(items,
 				types.TransactWriteItem{Put: &types.Put{
@@ -633,6 +649,11 @@ func (s *store) replayMessages(ctx context.Context, chatID *commonpb.ChatId, inp
 			return nil, fmt.Errorf("idempotency marker for chat %s names missing message %d", hex.EncodeToString(chatID.Value), seq)
 		}
 		msgs[i] = msg
+	}
+	// A marker is keyed by chat and client message ID alone, so it may name
+	// another sender's message: that is no retry of this batch.
+	if err := messaging.ValidateReplay(inputs, msgs); err != nil {
+		return nil, err
 	}
 	return msgs, nil
 }
@@ -1638,10 +1659,13 @@ func (s *store) readMarkersIsolated(ctx context.Context, chatID *commonpb.ChatId
 }
 
 func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.AttributeValue, returnIntentID *commonpb.IntentId) map[string]types.AttributeValue {
-	// The message ID is encoded in the sk (msg#<padded seq>, see seqFromMsgSK),
-	// the chat ID is recovered from the pk (see chatIDFromPK), and the client
-	// message ID lives on the separate cmid# idempotency marker — so none of the
-	// three is duplicated onto the message item.
+	// The message ID is encoded in the sk (msg#<padded seq>, see seqFromMsgSK)
+	// and the chat ID is recovered from the pk (see chatIDFromPK), so neither is
+	// duplicated onto the message item. The client message ID keys the separate
+	// cmid# idempotency marker, and is written onto the item as well only when a
+	// user's client sent the message (Message.ClientMessageID set, see
+	// messaging.MessageInput.FromClient): readers need it then, for as long as
+	// the message lives, and the marker is reaped by TTL.
 	item := map[string]types.AttributeValue{
 		attrPK:        avS(chatPK(msg.ChatID)),
 		attrSK:        avS(msgSK(msg.ID.Value)),
@@ -1656,6 +1680,11 @@ func (s *store) messageItem(msg *messaging.Message, contentBlobs []types.Attribu
 	}
 	if msg.SenderID != nil {
 		item[attrSenderID] = avB(msg.SenderID.Value)
+	}
+	// Written by the send alone and kept through edits and deletes (see
+	// attrClientMsgID).
+	if msg.ClientMessageID != nil {
+		item[attrClientMsgID] = avB(msg.ClientMessageID.Value)
 	}
 	// The return offer's intent ID rides the row it offers (see
 	// attrReturnIntent), written in the send's own transaction, so a message
@@ -1743,6 +1772,11 @@ func messageFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeVal
 	}
 	if sender := asB(item[attrSenderID]); len(sender) > 0 {
 		msg.SenderID = &commonpb.UserId{Value: append([]byte(nil), sender...)}
+	}
+	// cmid is absent on every message but a client's send, and
+	// on one sent before it was written.
+	if clientMsgID := asB(item[attrClientMsgID]); len(clientMsgID) > 0 {
+		msg.ClientMessageID = &messagingpb.ClientMessageId{Value: append([]byte(nil), clientMsgID...)}
 	}
 	// last_edited_ts is absent until the message is edited.
 	if _, ok := item[attrLastEditedTs]; ok {

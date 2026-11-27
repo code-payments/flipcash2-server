@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -34,6 +35,24 @@ var ErrEventSequenceConflict = errors.New("message event sequence conflict")
 // catches a mix only: a batch whose every ID was spent, by one earlier batch
 // or by several sends, is a replay (see Store.PutMessages).
 var ErrPartialReplay = errors.New("batch client message ids partly reused")
+
+// ErrClientMessageIDTaken is returned by Store.PutMessages when a batch whose
+// every client message ID names an existing message is not its senders' own
+// retry: some message's ID names a message a different sender sent, a user's
+// ID a system message's, or the reverse (see ValidateReplay). Idempotency
+// answers a sender's retry with what their first send created; it never
+// answers one sender's send with another's message, which would drop the
+// send without saying so. Nothing is persisted, and the ID stays where it is:
+// for as long as the store remembers it, a later send in the chat that
+// carries it from anyone but that message's sender is refused the same way,
+// or with ErrPartialReplay when the batch also carries IDs not yet spent.
+//
+// The IDs of some server-authored messages are derived from what the server
+// sends them for (see e.g. Sender.SendUserJoined), so a member who derives one
+// first and sends with it makes the server's own send fail here, every time it
+// is retried. That is accepted: it is refused where it is seen, instead of
+// being answered with the member's message as if the server's had been sent.
+var ErrClientMessageIDTaken = errors.New("client message id names another sender's message")
 
 // ErrEmptyBatch, ErrBatchTooLarge, ErrMissingClientMessageID and
 // ErrDuplicateClientMessageID are Store.PutMessages' shape errors (see ValidateMessageInputs). Every store
@@ -101,7 +120,8 @@ type MessageRef struct {
 }
 
 // MessageInput is one message of a send, as Store.PutMessages takes it: what
-// PutMessage takes per message, minus the chat, which a batch shares.
+// PutMessage takes per message, minus the chat, which a batch shares, plus
+// what only a batch carries, ReturnIntentID and FromClient.
 type MessageInput struct {
 	SenderID           *commonpb.UserId // nil for a system message
 	Content            []*messagingpb.Content
@@ -119,6 +139,16 @@ type MessageInput struct {
 	// CashContent.payment_return.offer (ErrInvalidReturnOffer). nil for
 	// every other message.
 	ReturnIntentID *commonpb.IntentId
+
+	// FromClient reports that a user's client sent the message, with the
+	// SendMessage RPC, so ClientMessageID is that client's: the store keeps
+	// it on the message (Message.ClientMessageID) in the send's write, and
+	// every read of the message carries it. False for every message the
+	// server writes, whose ClientMessageID serves only as the send's
+	// idempotency key and is kept nowhere but there. A replay writes
+	// nothing, so it returns what the first send kept, whatever the retry
+	// says.
+	FromClient bool
 }
 
 // NewReturnIntentID draws a cash message's return intent ID
@@ -211,6 +241,21 @@ func ValidateMessageInputs(inputs []MessageInput) error {
 	return nil
 }
 
+// ValidateReplay checks that a batch whose every client message ID names an
+// existing message is its senders' own retry: each input's SenderID is the
+// sender of the message its ID names, both nil for a system message.
+// ErrClientMessageIDTaken otherwise. msgs are the named messages, in batch
+// order, one per input. Stores call it on the replay path, before answering,
+// so one sender's send is never answered with another's message.
+func ValidateReplay(inputs []MessageInput, msgs []*Message) error {
+	for i, in := range inputs {
+		if !bytes.Equal(in.SenderID.GetValue(), msgs[i].SenderID.GetValue()) {
+			return ErrClientMessageIDTaken
+		}
+	}
+	return nil
+}
+
 // returnOfferMatches reports whether a message's return offer as clients see
 // it (CashContent.payment_return.offer) and as the server keeps it
 // (ReturnIntentID) agree: a message with a ReturnIntentID is a single cash
@@ -281,18 +326,19 @@ var StoredPointerTypes = []messagingpb.Pointer_Type{
 // Store persists chat messages and message-history pointers.
 //
 // Each chat has its own gapless message ID sequence. Sends are made idempotent
-// by a client-generated message ID, so a retried send returns the originally
-// persisted message rather than assigning a new ID.
+// by a client-generated message ID, so a sender's retried send returns the
+// originally persisted message rather than assigning a new ID.
 type Store interface {
 	// PutMessage assigns the next gapless message ID for the chat and persists
 	// the message, returning the persisted message with its assigned ID and
 	// unread sequence.
 	//
 	// It is idempotent on (chatID, clientMessageID): a retried send with the
-	// same client message ID returns the originally persisted message without
-	// assigning a new ID. created reports whether this call persisted the
-	// message (false on a retry), so callers can skip one-time side effects
-	// like pushes.
+	// same client message ID, by the same sender, returns the originally
+	// persisted message without assigning a new ID, and one by any other
+	// sender is ErrClientMessageIDTaken. created reports whether this call
+	// persisted the message (false on a retry), so callers can skip one-time
+	// side effects like pushes.
 	//
 	// countsTowardUnread controls the unread sequence: when true the message's
 	// unread_seq is the previous value + 1; when false it carries the previous
@@ -300,7 +346,8 @@ type Store interface {
 	//
 	// senderID may be nil to denote a system message.
 	//
-	// It is PutMessages with a batch of one.
+	// It is PutMessages with a batch of one, whose message is not FromClient,
+	// so it keeps no client message ID on the message.
 	PutMessage(
 		ctx context.Context,
 		chatID *commonpb.ChatId,
@@ -328,14 +375,22 @@ type Store interface {
 	// and no two servers' clocks agree exactly. The result carries the
 	// timestamps stored, which are the ones a caller must go on to use.
 	//
+	// A message whose input is FromClient keeps its client message ID
+	// (Message.ClientMessageID) from this write on, through every edit and
+	// delete, and every read of it returns it; every other message keeps
+	// none.
+	//
 	// Idempotency is the batch's, on its client message IDs: a retry whose
 	// every ID already names a message returns those messages (in batch order)
-	// with created false, exactly as PutMessage answers a retried send. A
-	// replay writes nothing, so what the retry carries is ignored, its
-	// ReturnIntentIDs included: a retried send draws a fresh random ID, and
-	// the one the first send stored is the one that stands (see
-	// CashMessageReturn). The
-	// replay is judged per ID, not per original batch: the IDs may have been
+	// with created false, exactly as PutMessage answers a retried send, provided
+	// each was sent by the sender the retry names for it. An ID naming a
+	// message a different sender sent is ErrClientMessageIDTaken (see there),
+	// and nothing is persisted. A replay writes nothing, so what the retry
+	// carries is ignored, its ReturnIntentIDs and FromClient included: a
+	// retried send draws a fresh random return intent ID, and the one the
+	// first send stored is the one that stands (see CashMessageReturn), and a
+	// replayed message carries a client message ID exactly when its first
+	// send kept one. The replay is judged per ID, not per original batch: the IDs may have been
 	// spent by several earlier sends, so a replay's messages need not be
 	// consecutive, nor in ID order when the retry lists its IDs in another
 	// order. Only a fresh write promises consecutive IDs. A batch is judged

@@ -277,14 +277,27 @@ func (s *Server) SendMessage(ctx context.Context, req *messagingpb.SendMessageRe
 		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
 	}
 
-	msgProto, err := s.sender.Send(ctx, req.ChatId, userID, req.Content, req.ClientMessageId, true)
-	if err != nil {
+	// The one send marked FromClient: the caller's client message ID is kept
+	// on the message and carried on every copy of it, so the caller's clients
+	// can match each copy to their pending send (see Message.client_message_id).
+	sent, err := s.sender.SendBatch(ctx, req.ChatId, []OutgoingMessage{{
+		SenderID:           userID,
+		Content:            req.Content,
+		ClientMessageID:    req.ClientMessageId,
+		CountsTowardUnread: true,
+		FromClient:         true,
+	}})
+	if errors.Is(err, ErrClientMessageIDTaken) {
+		// The ID names a message another sender sent in this chat, so this is
+		// no retry of the caller's, and is not answered with that message.
+		return &messagingpb.SendMessageResponse{Result: messagingpb.SendMessageResponse_DENIED}, nil
+	} else if err != nil {
 		return nil, err
 	}
 
 	return &messagingpb.SendMessageResponse{
 		Result:  messagingpb.SendMessageResponse_OK,
-		Message: msgProto,
+		Message: sent[0],
 	}, nil
 }
 

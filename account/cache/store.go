@@ -5,6 +5,7 @@ import (
 	"context"
 
 	"github.com/ReneKroon/ttlcache"
+	"github.com/mr-tron/base58"
 	"google.golang.org/protobuf/proto"
 
 	commonpb "github.com/code-payments/flipcash2-protobuf-api/generated/go/common/v1"
@@ -48,8 +49,38 @@ func (c *Cache) GetUserId(ctx context.Context, pubKey *commonpb.PublicKey) (*com
 	return cloned, nil
 }
 
+// GetUserIds answers what it can from the cache GetUserId fills and reads the
+// rest from the DB in one batch, caching positive results only: a key's binding
+// never changes once made (one key per user, never unbound), but a key with
+// none may be bound later. Like the DB's, the result is keyed by base58 public
+// key, while the cache is keyed by the key's bytes.
 func (c *Cache) GetUserIds(ctx context.Context, pubKeys []*commonpb.PublicKey) (map[string]*commonpb.UserId, error) {
-	return c.db.GetUserIds(ctx, pubKeys)
+	res := make(map[string]*commonpb.UserId, len(pubKeys))
+	var misses []*commonpb.PublicKey
+	for _, pubKey := range pubKeys {
+		if cached, ok := c.pubkeyToUserCache.Get(string(pubKey.Value)); ok {
+			res[base58.Encode(pubKey.Value)] = proto.Clone(cached.(*commonpb.UserId)).(*commonpb.UserId)
+			continue
+		}
+		misses = append(misses, pubKey)
+	}
+	if len(misses) == 0 {
+		return res, nil
+	}
+
+	fetched, err := c.db.GetUserIds(ctx, misses)
+	if err != nil {
+		return nil, err
+	}
+	for _, pubKey := range misses {
+		userID, ok := fetched[base58.Encode(pubKey.Value)]
+		if !ok {
+			continue
+		}
+		c.pubkeyToUserCache.Set(string(pubKey.Value), proto.Clone(userID).(*commonpb.UserId))
+		res[base58.Encode(pubKey.Value)] = userID
+	}
+	return res, nil
 }
 
 // GetPubKeys caches positive results only: a user's bound key never changes

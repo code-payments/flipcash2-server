@@ -105,17 +105,12 @@ func (m *memory) FilterUsersWithTokens(_ context.Context, userIDs ...*commonpb.U
 	return result, nil
 }
 
-func (m *memory) DeleteToken(_ context.Context, tokenType pushpb.TokenType, token string) error {
+func (m *memory) DeleteToken(_ context.Context, userID *commonpb.UserId, appInstallID *commonpb.AppInstallId) error {
 	m.Lock()
 	defer m.Unlock()
 
-	// Need to scan all users and devices to find matching token.
-	for _, userTokens := range m.tokens {
-		for appInstallID, existingToken := range userTokens {
-			if existingToken.Type == tokenType && existingToken.Token == token {
-				delete(userTokens, appInstallID)
-			}
-		}
+	if userTokens, ok := m.tokens[string(userID.Value)]; ok {
+		delete(userTokens, appInstallID.Value)
 	}
 
 	return nil
@@ -126,12 +121,12 @@ func (m *memory) DeleteTokens(_ context.Context, tokens ...push.Token) error {
 	defer m.Unlock()
 
 	for _, target := range tokens {
-		for _, userTokens := range m.tokens {
-			for appInstallID, existingToken := range userTokens {
-				if existingToken.Type == target.Type && existingToken.Token == target.Token {
-					delete(userTokens, appInstallID)
-				}
-			}
+		userTokens, ok := m.tokens[string(target.UserID.GetValue())]
+		if !ok {
+			continue
+		}
+		if existing, ok := userTokens[target.AppInstallID]; ok && existing.Token == target.Token {
+			delete(userTokens, target.AppInstallID)
 		}
 	}
 

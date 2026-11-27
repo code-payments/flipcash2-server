@@ -355,9 +355,12 @@ func (p *FCMPusher) sendInBatches(ctx context.Context, sem chan struct{}, messag
 	wg.Wait()
 
 	// Tokens FCM reports as unregistered are gone for good, so drop them in one
-	// batched delete. The cleanup is detached from the send — it must not delay
-	// the caller and must survive the caller's context ending — but bounded, so
-	// a stalled store can't hold a goroutine forever.
+	// batched delete, each from the row this send read it from and only while
+	// that row still holds it (see TokenStore.DeleteTokens): a device that
+	// re-registered meanwhile keeps its new token. The cleanup is detached from
+	// the send — it must not delay the caller and must survive the caller's
+	// context ending — but bounded, so a stalled store can't hold a goroutine
+	// forever.
 	if len(invalidTokens) > 0 {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), invalidTokenCleanupTimeout)

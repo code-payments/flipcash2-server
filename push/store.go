@@ -34,13 +34,22 @@ type TokenStore interface {
 	// If the token already exists for the same user and device, it will be updated.
 	AddToken(ctx context.Context, userID *commonpb.UserId, appInstallID *commonpb.AppInstallId, tokenType pushpb.TokenType, token string) error
 
-	// DeleteToken deletes a token for a user.
-	DeleteToken(ctx context.Context, tokenType pushpb.TokenType, token string) error
+	// DeleteToken deletes the user's token for the app install, whatever its
+	// value. A user or install with no token is not an error.
+	//
+	// It deletes that one token only: another user's token for the same install
+	// or with the same value is left alone.
+	DeleteToken(ctx context.Context, userID *commonpb.UserId, appInstallID *commonpb.AppInstallId) error
 
-	// DeleteTokens deletes every given (type, token) pair in one operation. It
-	// exists for the pusher's cleanup of tokens FCM reports as unregistered,
-	// which a large send can surface many of at once. A pair that no longer
-	// exists is skipped, not an error.
+	// DeleteTokens deletes each given token from the row it was read from: its
+	// user's token for its app install, and only while that still holds the
+	// token's value. A token re-registered with a new value since it was read is
+	// left alone, as is any other user's or install's token with the same
+	// value. A token that no longer exists is skipped, not an error.
+	//
+	// It exists for the pusher's cleanup of tokens FCM reports as unregistered,
+	// which a large send can surface many of at once, so each token must carry
+	// the UserID and AppInstallID it was read with.
 	DeleteTokens(ctx context.Context, tokens ...Token) error
 
 	// FilterUsersWithTokens returns the subset of user IDs that have at least one push token.

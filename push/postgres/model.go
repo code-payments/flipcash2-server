@@ -124,29 +124,33 @@ func dbFilterUsersWithTokens(ctx context.Context, pool *pgxpool.Pool, userIDs ..
 	return result, nil
 }
 
-func dbDeleteToken(ctx context.Context, pool *pgxpool.Pool, tokenType pushpb.TokenType, token string) error {
-	query := `DELETE FROM ` + pushTokensTableName + ` WHERE "token" = $1 and "type" = $2`
-	_, err := pool.Exec(ctx, query, token, tokenType)
+// dbDeleteToken deletes one row by its primary key.
+func dbDeleteToken(ctx context.Context, pool *pgxpool.Pool, userID *commonpb.UserId, appInstallID *commonpb.AppInstallId) error {
+	query := `DELETE FROM ` + pushTokensTableName + ` WHERE "userId" = $1 AND "appInstallId" = $2`
+	_, err := pool.Exec(ctx, query, pg.Encode(userID.Value), appInstallID.Value)
 	return err
 }
 
-// dbDeleteTokens deletes every (type, token) pair in a single statement. The
-// pairs are passed as two parallel arrays and unnested into rows, so the
-// statement shape is fixed regardless of how many tokens are deleted.
+// dbDeleteTokens deletes the row of each token's (user, app install), the
+// primary key, while it still holds the token's value, in a single statement.
+// The triples are passed as three parallel arrays and unnested into rows, so
+// the statement shape is fixed regardless of how many tokens are deleted.
 func dbDeleteTokens(ctx context.Context, pool *pgxpool.Pool, tokens ...push.Token) error {
 	if len(tokens) == 0 {
 		return nil
 	}
 
-	types := make([]int, len(tokens))
+	userIDs := make([]string, len(tokens))
+	appInstallIDs := make([]string, len(tokens))
 	values := make([]string, len(tokens))
 	for i, token := range tokens {
-		types[i] = int(token.Type)
+		userIDs[i] = pg.Encode(token.UserID.GetValue())
+		appInstallIDs[i] = token.AppInstallID
 		values[i] = token.Token
 	}
 
-	query := `DELETE FROM ` + pushTokensTableName + ` WHERE ("type", "token") IN (SELECT * FROM unnest($1::int[], $2::text[]))`
-	_, err := pool.Exec(ctx, query, types, values)
+	query := `DELETE FROM ` + pushTokensTableName + ` WHERE ("userId", "appInstallId", "token") IN (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))`
+	_, err := pool.Exec(ctx, query, userIDs, appInstallIDs, values)
 	return err
 }
 

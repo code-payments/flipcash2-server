@@ -75,8 +75,8 @@ func (s *store) FilterUsersWithTokens(ctx context.Context, userIDs ...*commonpb.
 	return matched, nil
 }
 
-func (s *store) DeleteToken(ctx context.Context, tokenType pushpb.TokenType, token string) error {
-	return dbDeleteToken(ctx, s.pool, tokenType, token)
+func (s *store) DeleteToken(ctx context.Context, userID *commonpb.UserId, appInstallID *commonpb.AppInstallId) error {
+	return dbDeleteToken(ctx, s.pool, userID, appInstallID)
 }
 
 func (s *store) DeleteTokens(ctx context.Context, tokens ...push.Token) error {

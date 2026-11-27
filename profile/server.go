@@ -120,6 +120,53 @@ func (s *Server) GetProfile(ctx context.Context, req *profilepb.GetProfileReques
 	return &profilepb.GetProfileResponse{UserProfile: profile}, nil
 }
 
+// GetProfiles answers a batch of users with their row profiles (see
+// Store.GetLimitedPublicProfilesForRow), the projection every member row,
+// roster page and mention suggestion is built from, so a client naming many
+// users pays one store read and one rendition resolve for the lot rather than
+// a GetProfile per user. Each user is answered once, in the order the request
+// first names them, and a user the store does not know is left out. A row
+// profile carries no private field, so the caller's own profile is answered
+// like anyone else's.
+func (s *Server) GetProfiles(ctx context.Context, req *profilepb.GetProfilesRequest) (*profilepb.GetProfilesResponse, error) {
+	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(zap.String("user_id", model.UserIDString(userID)))
+
+	byUserID, err := s.profiles.GetLimitedPublicProfilesForRow(ctx, req.UserIds)
+	if err != nil {
+		log.Warn("Failed to get row profiles", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to get profiles")
+	}
+
+	profiles := make([]*profilepb.UserProfile, 0, len(byUserID))
+	pictures := make([]*blobpb.Media, 0, len(byUserID))
+	for _, id := range req.UserIds {
+		key := string(id.Value)
+		profile, ok := byUserID[key]
+		if !ok {
+			continue
+		}
+		// Deleted once answered, so a user named again is not answered twice.
+		delete(byUserID, key)
+
+		profiles = append(profiles, profile)
+		if profile.ProfilePicture != nil {
+			pictures = append(pictures, profile.ProfilePicture)
+		}
+	}
+
+	if err := hydratePictures(ctx, s.media, pictures...); err != nil {
+		log.Warn("Failed to hydrate profile pictures", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to get profiles")
+	}
+
+	return &profilepb.GetProfilesResponse{UserProfiles: profiles}, nil
+}
+
 func (s *Server) SetDisplayName(ctx context.Context, req *profilepb.SetDisplayNameRequest) (*profilepb.SetDisplayNameResponse, error) {
 	userID, err := s.authz.Authorize(ctx, req, &req.Auth)
 	if err != nil {

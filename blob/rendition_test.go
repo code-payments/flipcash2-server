@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -131,6 +132,113 @@ func TestResampleImage(t *testing.T) {
 	dst := resampleImage(src, 40, 20)
 	require.Equal(t, 40, dst.Bounds().Dx())
 	require.Equal(t, 20, dst.Bounds().Dy())
+}
+
+// TestImageRenditionPixels checks the ladder is scaled to every plan's exact
+// dimensions, in plan order, and that scaling each rung from the one above it
+// stays within a small distance of scaling it from the original directly.
+func TestImageRenditionPixels(t *testing.T) {
+	t.Run("large original is close to scaling each rung directly", func(t *testing.T) {
+		src := structuredImage(2400, 1800)
+		plans := planImageRenditions(&ImageMetadata{Width: 2400, Height: 1800})
+		require.Len(t, plans, len(imageRenditionSpecs))
+
+		pixels := imageRenditionPixels(src, plans)
+		require.Len(t, pixels, len(plans))
+		for i, plan := range plans {
+			require.Equal(t, int(plan.width), pixels[i].Bounds().Dx())
+			require.Equal(t, int(plan.height), pixels[i].Bounds().Dy())
+
+			// The largest rung is scaled from the original either way. The others
+			// pick up one extra, small filtering step; measured on a 12 MP image
+			// the mean difference peaks near 2/255 at the 32px rung.
+			direct := resampleImage(src, int(plan.width), int(plan.height))
+			require.Less(t, meanAbsDiff(direct, pixels[i]), 4.0,
+				"rung %dx%d drifted from a direct scale", plan.width, plan.height)
+		}
+		require.Zero(t, meanAbsDiff(resampleImage(src, int(plans[len(plans)-1].width), int(plans[len(plans)-1].height)), pixels[len(plans)-1]))
+	})
+
+	t.Run("small original keeps every role at its own size", func(t *testing.T) {
+		// Thumbnail tops out at 100x80 on its second rung and display emits at
+		// the same size, so two rungs share the original's dimensions.
+		src := structuredImage(100, 80)
+		plans := planImageRenditions(&ImageMetadata{Width: 100, Height: 80})
+		pixels := imageRenditionPixels(src, plans)
+		require.Len(t, pixels, len(plans))
+		for i, plan := range plans {
+			require.Equal(t, int(plan.width), pixels[i].Bounds().Dx())
+			require.Equal(t, int(plan.height), pixels[i].Bounds().Dy())
+		}
+	})
+
+	t.Run("extreme aspect ratio", func(t *testing.T) {
+		src := structuredImage(3000, 2)
+		plans := planImageRenditions(&ImageMetadata{Width: 3000, Height: 2})
+		pixels := imageRenditionPixels(src, plans)
+		for i, plan := range plans {
+			require.Equal(t, int(plan.width), pixels[i].Bounds().Dx())
+			require.Equal(t, int(plan.height), pixels[i].Bounds().Dy())
+		}
+	})
+
+	t.Run("transparency survives the chain", func(t *testing.T) {
+		src := image.NewNRGBA(image.Rect(0, 0, 1000, 1000))
+		for y := range 1000 {
+			for x := range 1000 {
+				src.SetNRGBA(x, y, color.NRGBA{R: 200, G: 40, B: 30, A: 64})
+			}
+		}
+		plans := planImageRenditions(&ImageMetadata{Width: 1000, Height: 1000, HasAlpha: true})
+		pixels := imageRenditionPixels(src, plans)
+		for i := range plans {
+			got := color.NRGBAModel.Convert(pixels[i].At(pixels[i].Bounds().Dx()/2, pixels[i].Bounds().Dy()/2)).(color.NRGBA)
+			require.InDelta(t, 64, got.A, 1)
+			require.InDelta(t, 200, got.R, 4)
+		}
+	})
+}
+
+// structuredImage is an opaque test image with gradients, hard-edged blocks and
+// a smooth wave, closer to a photo or screenshot than randomImage's noise, so
+// it measures what a resampling change does to real content.
+func structuredImage(width, height int) *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	for y := range height {
+		for x := range width {
+			var b uint8
+			if (x/97+y/61)%2 == 0 {
+				b = 220
+			}
+			wave := uint8(128 + 100*math.Sin(float64(x)/37)*math.Cos(float64(y)/23))
+			img.SetNRGBA(x, y, color.NRGBA{
+				R: uint8(255 * x / width),
+				G: uint8(255*y/height) ^ (wave / 4),
+				B: b,
+				A: 255,
+			})
+		}
+	}
+	return img
+}
+
+// meanAbsDiff is the mean absolute difference, on a 0-255 scale, of the color
+// channels of two images of the same size.
+func meanAbsDiff(a, b image.Image) float64 {
+	var sum float64
+	var n int
+	bounds := a.Bounds()
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r1, g1, b1, _ := a.At(x, y).RGBA()
+			r2, g2, b2, _ := b.At(x, y).RGBA()
+			for _, pair := range [][2]uint32{{r1, r2}, {g1, g2}, {b1, b2}} {
+				sum += math.Abs(float64(pair[0]>>8) - float64(pair[1]>>8))
+				n++
+			}
+		}
+	}
+	return sum / float64(n)
 }
 
 func TestImageEncodingEncode(t *testing.T) {

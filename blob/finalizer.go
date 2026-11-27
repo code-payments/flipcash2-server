@@ -381,12 +381,17 @@ func (f *Finalizer) Fail(ctx context.Context, id *blobpb.BlobId) error {
 func (f *Finalizer) generateImageRenditions(ctx context.Context, parent *Blob, decoded image.Image, meta *ImageMetadata) error {
 	plans := planImageRenditions(meta)
 
-	// Each planned rung derives, stores, and records independently — its output
-	// spec was fully resolved by the plan — so the expensive part (resample +
-	// encode + writes) runs concurrently and the generation's wall-clock cost is
-	// the largest rung, not the ladder's sum. The decoded original is only ever
-	// read. The fan-out is bounded by the ladder itself (a handful of rungs);
-	// cross-blob concurrency is the worker's knob.
+	// The rungs are scaled first, in one pass down the ladder (see
+	// imageRenditionPixels): scaling each from the one above it is what keeps
+	// a large original to a single full-resolution pass. The decoded original is
+	// only ever read.
+	pixels := imageRenditionPixels(decoded, plans)
+
+	// Each planned rung then encodes, stores, and records independently — its
+	// output spec was fully resolved by the plan and its pixels are scaled — so
+	// that part runs concurrently and costs the largest rung's encode, not the
+	// ladder's sum. The fan-out is bounded by the ladder itself (a handful of
+	// rungs); cross-blob concurrency is the worker's knob.
 	//
 	// refs is indexed, not appended, so the manifest keeps the plan's ladder
 	// order (small to large) regardless of which rung finishes first. A failed
@@ -396,7 +401,7 @@ func (f *Finalizer) generateImageRenditions(ctx context.Context, parent *Blob, d
 	eg, egCtx := errgroup.WithContext(ctx)
 	for i, plan := range plans {
 		eg.Go(func() error {
-			child, err := f.generateImageRendition(egCtx, parent, decoded, meta, plan)
+			child, err := f.generateImageRendition(egCtx, parent, meta, plan, pixels[i])
 			if err != nil {
 				return err
 			}
@@ -465,17 +470,18 @@ func planImageRenditions(meta *ImageMetadata) []imageRenditionPlan {
 	return plans
 }
 
-// generateImageRendition derives a single planned rendition: it scales and
-// encodes the original's decoded bytes per the plan, writes them into the
-// origin store, and records the READY child blob, which it returns.
-func (f *Finalizer) generateImageRendition(ctx context.Context, parent *Blob, decoded image.Image, meta *ImageMetadata, plan imageRenditionPlan) (*Blob, error) {
+// generateImageRendition derives a single planned rendition: it encodes pixels,
+// already scaled to the plan's dimensions (see imageRenditionPixels), per the
+// plan, writes them into the origin store, and records the READY child blob,
+// which it returns.
+func (f *Finalizer) generateImageRendition(ctx context.Context, parent *Blob, meta *ImageMetadata, plan imageRenditionPlan, pixels image.Image) (*Blob, error) {
 	id := imageRenditionID(parent.ID, plan.rendition, plan.width, plan.height, plan.encoding)
 	key, err := imageRenditionStorageKey(parent.ID, plan.rendition, plan.width, plan.height, plan.encoding.mimeType)
 	if err != nil {
 		return nil, err
 	}
 
-	encoded, err := plan.encoding.encode(resampleImage(decoded, int(plan.width), int(plan.height)))
+	encoded, err := plan.encoding.encode(pixels)
 	if err != nil {
 		return nil, err
 	}

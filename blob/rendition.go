@@ -176,7 +176,11 @@ func imageEncodingFor(rendition RenditionType, hasAlpha bool) imageEncoding {
 // contributes only its format — a quality retune therefore never churns byte-identical
 // lossless renditions. The encoder Method is a fixed constant (see
 // webpRenditionEncodeMethod), so — like a fixed compression level — it stays out of the
-// fingerprint; if it ever became role-dependent it would join here.
+// fingerprint; if it ever became role-dependent it would join here. How the pixels are
+// scaled (see imageRenditionPixels) stays out for the same reason. A change to it alters
+// the bytes of renditions derived after it ships, and a finalize replayed across the
+// change rewrites its renditions under the same ids, which no client can have read yet:
+// rendition ids reach clients only through the manifest, attached once every rung exists.
 func (e imageEncoding) fingerprint() string {
 	if e.lossless {
 		return fmt.Sprintf("%s|lossless", e.mimeType)
@@ -231,6 +235,36 @@ func imageRenditionStorageKey(parentID *blobpb.BlobId, rendition RenditionType, 
 		return "", fmt.Errorf("unsupported rendition mime type %q for storage key", mimeType)
 	}
 	return fmt.Sprintf("images/%s/%s_%dx%d%s", IDString(parentID), slug, width, height, ext), nil
+}
+
+// imageRenditionPixels scales decoded to every plan's dimensions, returning the
+// images in plan order. It works down the ladder, largest first, resampling each
+// rung from the rung above it rather than from the original: a kernel
+// downscale reads the whole source however small its output, and holds a
+// working buffer of output width × source height, so scaling every rung from a
+// full-resolution original costs a full pass and a full-height buffer per rung.
+// Down the ladder, only the largest rung pays that, and each smaller one reads
+// an image already a few times its size. The steps are small (no rung is more
+// than 5x below the one above it), so the extra filtering pass costs no visible
+// quality.
+//
+// A rung is resampled from the original instead whenever the rung above it is
+// smaller in either dimension, which the ladder, increasing and never
+// upscaling, never produces. Every rung is derived from pixels, never from
+// another rung's encoded bytes, so lossy compression does not compound.
+func imageRenditionPixels(decoded image.Image, plans []imageRenditionPlan) []image.Image {
+	pixels := make([]image.Image, len(plans))
+	src := decoded
+	for i := len(plans) - 1; i >= 0; i-- {
+		plan := plans[i]
+		bounds := src.Bounds()
+		if bounds.Dx() < int(plan.width) || bounds.Dy() < int(plan.height) {
+			src = decoded
+		}
+		pixels[i] = resampleImage(src, int(plan.width), int(plan.height))
+		src = pixels[i]
+	}
+	return pixels
 }
 
 // resampleImage returns img scaled to width x height using a Catmull-Rom filter —

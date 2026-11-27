@@ -48,6 +48,7 @@ func RunServerTests(t *testing.T, accounts account.Store, profiles profile.Store
 		testMinDmChatInitFee,
 		testUsernameIsPublic,
 		testGetProfileByUsername,
+		testGetProfiles,
 		testSetUsername,
 		testSetUsernameBalanceGated,
 		testDisplayNameModeration,
@@ -525,6 +526,142 @@ func testUsernameIsPublic(t *testing.T, accounts account.Store, profiles profile
 
 // testGetProfileByUsername covers fetching a profile by the handle its holder
 // claimed, which is the same profile the holder's user ID returns.
+func testGetProfiles(t *testing.T, accounts account.Store, profiles profile.Store) {
+	ctx := context.Background()
+	log := zaptest.NewLogger(t)
+
+	authz := account.NewAuthorizer(log, accounts, auth.NewKeyPairAuthenticator(log))
+
+	media, blobs, _ := newMedia()
+	serv := profile.NewServer(log, authz, accounts, profiles, media, &fakeModerator{}, nil, x.NewClient())
+	cc := testutil.RunGRPCServer(t, log, testutil.WithService(func(s *grpc.Server) {
+		profilepb.RegisterProfileServer(s, serv)
+	}))
+
+	client := profilepb.NewProfileClient(cc)
+
+	caller := model.MustGenerateUserID()
+	callerKey := model.MustGenerateKeyPair()
+	_, err := accounts.Bind(ctx, caller, callerKey.Proto())
+	require.NoError(t, err)
+
+	getProfiles := func(keyPair model.KeyPair, userIDs ...*commonpb.UserId) (*profilepb.GetProfilesResponse, error) {
+		t.Helper()
+		req := &profilepb.GetProfilesRequest{UserIds: userIDs}
+		require.NoError(t, keyPair.Auth(req, &req.Auth))
+		return client.GetProfiles(ctx, req)
+	}
+	userIDsOf := func(resp *profilepb.GetProfilesResponse) [][]byte {
+		t.Helper()
+		ids := make([][]byte, 0, len(resp.UserProfiles))
+		for _, p := range resp.UserProfiles {
+			ids = append(ids, p.UserId.Value)
+		}
+		return ids
+	}
+
+	// One user with a full row (name, handle, picture) and one with a name
+	// alone. The picture is a READY original in the media's blob store, so it
+	// resolves to renditions.
+	named := model.MustGenerateUserID()
+	require.NoError(t, profiles.SetDisplayName(ctx, named, "named user"))
+	require.NoError(t, profiles.SetUsername(ctx, named, "named_user"))
+	picture := seedBlob(t, blobs, named, blob.StateReady, "image/jpeg")
+	require.NoError(t, profiles.SetProfilePicture(ctx, named, picture))
+
+	nameOnly := model.MustGenerateUserID()
+	require.NoError(t, profiles.SetDisplayName(ctx, nameOnly, "name only"))
+
+	unknown := model.MustGenerateUserID()
+
+	t.Run("Unbound key is denied", func(t *testing.T) {
+		_, err := getProfiles(model.MustGenerateKeyPair(), named)
+		require.Equal(t, codes.PermissionDenied, status.Code(err))
+	})
+
+	t.Run("Known users in request order, unknown left out", func(t *testing.T) {
+		resp, err := getProfiles(callerKey, nameOnly, unknown, named)
+		require.NoError(t, err)
+		require.Equal(t, profilepb.GetProfilesResponse_OK, resp.Result)
+		require.Equal(t, [][]byte{nameOnly.Value, named.Value}, userIDsOf(resp))
+
+		require.Equal(t, "name only", resp.UserProfiles[0].DisplayName)
+		require.Nil(t, resp.UserProfiles[0].ProfilePicture)
+
+		require.Equal(t, "named user", resp.UserProfiles[1].DisplayName)
+		require.Equal(t, "named_user", resp.UserProfiles[1].Username.GetValue())
+
+		// The other order is answered in that order.
+		resp, err = getProfiles(callerKey, named, nameOnly)
+		require.NoError(t, err)
+		require.Equal(t, [][]byte{named.Value, nameOnly.Value}, userIDsOf(resp))
+	})
+
+	t.Run("Only unknown users", func(t *testing.T) {
+		resp, err := getProfiles(callerKey, unknown)
+		require.NoError(t, err)
+		require.Equal(t, profilepb.GetProfilesResponse_OK, resp.Result)
+		require.Empty(t, resp.UserProfiles)
+	})
+
+	t.Run("A user named twice is answered once", func(t *testing.T) {
+		resp, err := getProfiles(callerKey, named, nameOnly, named, nameOnly)
+		require.NoError(t, err)
+		require.Equal(t, [][]byte{named.Value, nameOnly.Value}, userIDsOf(resp))
+	})
+
+	t.Run("Pictures are hydrated", func(t *testing.T) {
+		resp, err := getProfiles(callerKey, named)
+		require.NoError(t, err)
+		require.Len(t, resp.UserProfiles, 1)
+
+		// The blob has no derived renditions, so only the ORIGINAL resolves, with
+		// its metadata and a download URL, as on GetProfile.
+		renditions := resp.UserProfiles[0].GetProfilePicture().GetRenditions()
+		require.Len(t, renditions, 1)
+		require.Equal(t, blobpb.Rendition_ORIGINAL, renditions[0].Role)
+		require.Equal(t, picture.Value, renditions[0].BlobId.Value)
+		require.Equal(t, "image/jpeg", renditions[0].Blob.GetMimeType())
+		require.NotEmpty(t, renditions[0].Blob.GetDownloadUrl().GetUrl())
+	})
+
+	t.Run("Only the row projection", func(t *testing.T) {
+		// Everything a row leaves out, set on a user who then asks for their own
+		// profile: private fields are not answered even to the user themself, and
+		// the profile view's public fields are not answered to anyone.
+		self := model.MustGenerateUserID()
+		selfKey := model.MustGenerateKeyPair()
+		_, err := accounts.Bind(ctx, self, selfKey.Proto())
+		require.NoError(t, err)
+		require.NoError(t, profiles.SetDisplayName(ctx, self, "self"))
+		require.NoError(t, profiles.SetBio(ctx, self, "a bio"))
+		require.NoError(t, profiles.SetCoverPicture(ctx, self, seedBlob(t, blobs, self, blob.StateReady, "image/jpeg")))
+		require.NoError(t, profiles.SetMinDmChatInitFee(ctx, self, &commonpb.FiatPaymentAmount{Currency: "usd", NativeAmount: 5}))
+		require.NoError(t, profiles.LinkPhoneNumber(ctx, self, "+12223334444", &commonpb.Hash{Value: []byte("phone-hash")}))
+		require.NoError(t, profiles.LinkEmailAddress(ctx, self, "self@gmail.com", true))
+
+		for _, keyPair := range []model.KeyPair{selfKey, callerKey} {
+			resp, err := getProfiles(keyPair, self)
+			require.NoError(t, err)
+			require.Len(t, resp.UserProfiles, 1)
+
+			p := resp.UserProfiles[0]
+			require.Equal(t, "self", p.DisplayName)
+			require.NotNil(t, p.JoinTs)
+			require.NoError(t, protoutil.ProtoEqualError(profile.DefaultFlipcardCustomization(), p.FlipcardCustomization))
+
+			require.Empty(t, p.Bio)
+			require.Nil(t, p.CoverPicture)
+			require.Nil(t, p.MinDmChatInitFee)
+			require.Empty(t, p.SocialProfiles)
+			require.Nil(t, p.PhoneNumber)
+			require.Nil(t, p.EmailAddress)
+			require.False(t, p.IsEmailAddressVerified)
+			require.False(t, p.IsUsernameAutoAssigned)
+		}
+	})
+}
+
 func testGetProfileByUsername(t *testing.T, accounts account.Store, profiles profile.Store) {
 	ctx := context.Background()
 	log := zaptest.NewLogger(t)

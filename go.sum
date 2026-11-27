@@ -78,8 +78,8 @@ github.com/cockroachdb/cockroach-go/v2 v2.2.0 h1:/5znzg5n373N/3ESjHF5SMLxiW4RKB0
 github.com/cockroachdb/cockroach-go/v2 v2.2.0/go.mod h1:u3MiKYGupPPjkn3ozknpMUpxPaNLTFWAya419/zv6eI=
 github.com/code-payments/code-vm-indexer v1.2.0 h1:rSHpBMiT9BKgmKcXg/VIoi/h0t7jNxGx07Qz59m+6Q0=
 github.com/code-payments/code-vm-indexer v1.2.0/go.mod h1:vn91YN2qNqb+gGJeZe2+l+TNxVmEEiRHXXnIn2Y40h8=
-github.com/code-payments/flipcash2-protobuf-api v1.34.1-0.20261124184230-efcfa6f69a10 h1:T5lFcJe4u7Jp+QttW19/CwlNqhob0RriMQSRc5+h1DA=
-github.com/code-payments/flipcash2-protobuf-api v1.34.1-0.20261124184230-efcfa6f69a10/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
+github.com/code-payments/flipcash2-protobuf-api v1.34.1-0.20261127150638-bc30940a5d08 h1:+ZHWJzryIWtHYWo68IHFZgr31thIXAokXYl0eii2umM=
+github.com/code-payments/flipcash2-protobuf-api v1.34.1-0.20261127150638-bc30940a5d08/go.mod h1:s/1pOsb4FTRD+LcvRKGjfmm6ygRS/m1ep34EIW0fuDs=
 github.com/code-payments/ocp-protobuf-api v1.19.1-0.20261110151028-0e8e6564f211 h1:yfIIC+SQPJ4vbyNNl+Tc4HWVI5mQEjk4lWmCwidM7/k=
 github.com/code-payments/ocp-protobuf-api v1.19.1-0.20261110151028-0e8e6564f211/go.mod h1:tw6BooY5a8l6CtSZnKOruyKII0W04n89pcM4BizrgG8=
 github.com/code-payments/ocp-server v1.29.1-0.20261111232727-734fce13f631 h1:OPH70JyO3xhj5bEwB6KpftcTOiAAQT6fxYjt3lXaZOI=

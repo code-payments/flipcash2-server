@@ -51,25 +51,15 @@ func (s *Server) DeleteTokens(ctx context.Context, req *pushpb.DeleteTokensReque
 		return nil, err
 	}
 
-	log := s.log.With(zap.String("user_id", model.UserIDString(userID)), zap.String("app_install", req.AppInstall.Value))
-
-	pushTokens, err := s.tokens.GetTokens(ctx, userID)
-	if err != nil {
-		log.Warn("Failed to get push tokens", zap.Error(err))
+	// Only the caller's own token for the install goes: another user's token
+	// for the same install or with the same value is theirs to remove.
+	if err := s.tokens.DeleteToken(ctx, userID, req.AppInstall); err != nil {
+		s.log.Warn("Failed to delete push token",
+			zap.String("user_id", model.UserIDString(userID)),
+			zap.String("app_install", req.AppInstall.Value),
+			zap.Error(err),
+		)
 		return nil, status.Error(codes.Internal, "")
-	}
-
-	for _, pushToken := range pushTokens {
-		log = log.With(zap.String("push_token", pushToken.Token))
-
-		if pushToken.AppInstallID != req.AppInstall.Value {
-			continue
-		}
-
-		if err = s.tokens.DeleteToken(ctx, pushToken.Type, pushToken.Token); err != nil {
-			log.Warn("Failed to get delete push token", zap.Error(err))
-			return nil, status.Error(codes.Internal, "failed to delete push token")
-		}
 	}
 
 	return &pushpb.DeleteTokensResponse{}, nil

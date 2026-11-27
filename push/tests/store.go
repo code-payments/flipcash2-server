@@ -83,32 +83,46 @@ func testUpdateExistingToken(t *testing.T, store push.Store) {
 	assert.Equal(t, "token2", tokens[0].Token)
 }
 
+// testDeleteToken verifies DeleteToken removes only the user's token for the
+// install, whatever its value, and leaves the user's other installs and other
+// users' tokens for the same install or with the same value alone.
 func testDeleteToken(t *testing.T, store push.Store) {
 	ctx := context.Background()
 
-	userID := &commonpb.UserId{Value: []byte("user1")}
-	appInstallID := &commonpb.AppInstallId{Value: "device1"}
+	user1 := &commonpb.UserId{Value: []byte("user1")}
+	user2 := &commonpb.UserId{Value: []byte("user2")}
+	device1 := &commonpb.AppInstallId{Value: "device1"}
+	device2 := &commonpb.AppInstallId{Value: "device2"}
 
-	// Add tokens
-	err := store.AddToken(ctx, userID, appInstallID, pushpb.TokenType_FCM_APNS, "token1")
-	require.NoError(t, err)
-	err = store.AddToken(ctx, userID, appInstallID, pushpb.TokenType_FCM_APNS, "token2")
-	require.NoError(t, err)
+	require.NoError(t, store.AddToken(ctx, user1, device1, pushpb.TokenType_FCM_APNS, "token1"))
+	require.NoError(t, store.AddToken(ctx, user1, device2, pushpb.TokenType_FCM_APNS, "token2"))
+	// Another user on the same install, holding the same value: an install
+	// that switched accounts.
+	require.NoError(t, store.AddToken(ctx, user2, device1, pushpb.TokenType_FCM_APNS, "token1"))
 
-	// Delete token
-	err = store.DeleteToken(ctx, pushpb.TokenType_FCM_APNS, "token1")
-	require.NoError(t, err)
+	// Nothing to delete is not an error.
+	require.NoError(t, store.DeleteToken(ctx, &commonpb.UserId{Value: []byte("user3")}, device1))
+	require.NoError(t, store.DeleteToken(ctx, user1, &commonpb.AppInstallId{Value: "device3"}))
 
-	// Verify token is deleted
-	tokens, err := store.GetTokens(ctx, userID)
+	require.NoError(t, store.DeleteToken(ctx, user1, device1))
+
+	tokens, err := store.GetTokens(ctx, user1)
 	require.NoError(t, err)
-	assert.Len(t, tokens, 1)
+	require.Len(t, tokens, 1)
+	assert.Equal(t, device2.Value, tokens[0].AppInstallID)
 	assert.Equal(t, "token2", tokens[0].Token)
+
+	tokens, err = store.GetTokens(ctx, user2)
+	require.NoError(t, err)
+	require.Len(t, tokens, 1)
+	assert.Equal(t, device1.Value, tokens[0].AppInstallID)
+	assert.Equal(t, "token1", tokens[0].Token)
 }
 
-// testDeleteTokens verifies a batched delete removes exactly the given
-// (type, token) pairs across users, matches on type as well as value, and
-// tolerates pairs that don't exist.
+// testDeleteTokens verifies a batched delete removes each token from the row it
+// was read from, only while that row still holds the token's value, leaves any
+// other row holding the same value alone, and tolerates tokens that don't
+// exist.
 func testDeleteTokens(t *testing.T, store push.Store) {
 	ctx := context.Background()
 
@@ -118,29 +132,47 @@ func testDeleteTokens(t *testing.T, store push.Store) {
 	require.NoError(t, store.AddToken(ctx, user1, &commonpb.AppInstallId{Value: "d1"}, pushpb.TokenType_FCM_APNS, "token1"))
 	require.NoError(t, store.AddToken(ctx, user1, &commonpb.AppInstallId{Value: "d2"}, pushpb.TokenType_FCM_APNS, "token2"))
 	require.NoError(t, store.AddToken(ctx, user2, &commonpb.AppInstallId{Value: "d3"}, pushpb.TokenType_FCM_ANDROID, "token3"))
-	// Same token value as token1 but a different type: must survive a delete
-	// that names token1 as APNS.
+	// Same value as user1's d1 token in another user's row: must survive a
+	// delete of user1's.
 	require.NoError(t, store.AddToken(ctx, user2, &commonpb.AppInstallId{Value: "d4"}, pushpb.TokenType_FCM_ANDROID, "token1"))
+
+	// The tokens as a send would have read them, before any delete.
+	read, err := store.GetTokensBatch(ctx, user1, user2)
+	require.NoError(t, err)
+	byInstall := make(map[string]push.Token)
+	for _, token := range read {
+		byInstall[token.AppInstallID] = token
+	}
+	require.Len(t, byInstall, 4)
+
+	// d3 re-registers with a new value after the read: the stale read must
+	// not delete the new token.
+	require.NoError(t, store.AddToken(ctx, user2, &commonpb.AppInstallId{Value: "d3"}, pushpb.TokenType_FCM_ANDROID, "token3-new"))
 
 	// An empty batch is a no-op.
 	require.NoError(t, store.DeleteTokens(ctx))
 
 	require.NoError(t, store.DeleteTokens(ctx,
-		push.Token{Type: pushpb.TokenType_FCM_APNS, Token: "token1"},
-		push.Token{Type: pushpb.TokenType_FCM_ANDROID, Token: "token3"},
-		push.Token{Type: pushpb.TokenType_FCM_APNS, Token: "does_not_exist"},
+		byInstall["d1"],
+		byInstall["d3"],
+		push.Token{UserID: user1, AppInstallID: "does_not_exist", Type: pushpb.TokenType_FCM_APNS, Token: "token1"},
+		push.Token{UserID: &commonpb.UserId{Value: []byte("user3")}, AppInstallID: "d1", Type: pushpb.TokenType_FCM_APNS, Token: "token1"},
 	))
 
 	tokens, err := store.GetTokens(ctx, user1)
 	require.NoError(t, err)
 	require.Len(t, tokens, 1)
+	assert.Equal(t, "d2", tokens[0].AppInstallID)
 	assert.Equal(t, "token2", tokens[0].Token)
 
 	tokens, err = store.GetTokens(ctx, user2)
 	require.NoError(t, err)
-	require.Len(t, tokens, 1)
-	assert.Equal(t, "token1", tokens[0].Token)
-	assert.Equal(t, pushpb.TokenType_FCM_ANDROID, tokens[0].Type)
+	require.Len(t, tokens, 2)
+	got := make(map[string]string)
+	for _, token := range tokens {
+		got[token.AppInstallID] = token.Token
+	}
+	assert.Equal(t, map[string]string{"d3": "token3-new", "d4": "token1"}, got)
 }
 
 func testMultipleUsers(t *testing.T, store push.Store) {

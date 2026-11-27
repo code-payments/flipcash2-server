@@ -35,6 +35,10 @@ import (
 //     to a full one (see messaging.Server's overlayStanding): who reacted,
 //     with what, on which message is the conversation's movement, not its
 //     words.
+//   - client_message_id: not carried. It exists so the sender's own clients
+//     can match a copy of their message to their pending send, which a
+//     redacted copy is never needed for, and the proto leaves it unset on a
+//     redacted copy (see Message.client_message_id).
 //
 // The message is expected to have had its media resolved already, so the
 // placeholder keeps each rendition's dimensions and blurhash (see Content on

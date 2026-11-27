@@ -59,9 +59,12 @@ var ErrNoTeamAccount = errors.New("no team account configured")
 
 // clientMessageIDNamespace is the UUID namespace the team's sends
 // (SendDmMessages and SendWelcomeGroupMessages) derive their client message
-// IDs under, so they cannot collide with an ID a client or another
-// server-authored send picks. The two share it safely, since the chat ID is
-// part of what is hashed (see clientMessageID).
+// IDs under, so they do not collide by chance with an ID a client draws at
+// random or another server-authored send derives. The two share it safely,
+// since the chat ID is part of what is hashed (see clientMessageID). It is no
+// secret: in a welcome group, where the user may write, the user could send
+// with one of the team's IDs first, and the team's send is then refused (see
+// messaging.ErrClientMessageIDTaken).
 var clientMessageIDNamespace = uuid.MustParse("0fea31a1-c7d6-4084-b481-fde267cf1177")
 
 // clientMessageID derives the client message ID of the index-th message the

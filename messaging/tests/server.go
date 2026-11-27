@@ -72,6 +72,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		// Messaging
 		testServer_SendAndGet,
 		testServer_SendMessage_Idempotent,
+		testServer_ClientMessageID,
 		testServer_SendReply,
 		testServer_SendMessage_DisallowedContent,
 		testServer_SendMedia,
@@ -1172,6 +1173,14 @@ func testServer_SendMessage_Idempotent(t *testing.T, badges badge.Store, blockli
 	require.NoError(t, err)
 	require.Equal(t, first.Message.MessageId.Value, again.Message.MessageId.Value)
 
+	// Another member's send carrying A's ID is no retry of A's: it is DENIED
+	// rather than answered with A's message. The next send taking the very
+	// next ID shows it persisted nothing.
+	denied, err := e.send(e.keysB, "not mine", clientID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_DENIED, denied.Result)
+	require.Nil(t, denied.Message)
+
 	next, err := e.send(e.keysA, "hi again", generateClientID())
 	require.NoError(t, err)
 	require.Equal(t, first.Message.MessageId.Value+1, next.Message.MessageId.Value)
@@ -1181,6 +1190,156 @@ func testServer_SendMessage_Idempotent(t *testing.T, badges badge.Store, blockli
 	// check the first message was broadcast to them exactly once.
 	e.waitForNewMessage(e.userB, next.Message.MessageId.Value)
 	require.Equal(t, 1, e.countNewMessages(e.userB, first.Message.MessageId.Value))
+}
+
+// testServer_ClientMessageID: a message a user sends with SendMessage carries
+// the client message ID it was sent with on every copy, the send's response
+// and its retry's, the live event, the push, GetMessage, GetMessages and
+// GetDelta reads by any member, and an edit of it. A message the server
+// writes carries none, whether sent as a user or as the system, and neither
+// does a redacted copy.
+func testServer_ClientMessageID(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+	e.useOpenGroup(chats)
+	require.NoError(t, profiles.SetDisplayName(e.ctx, e.userA, "Alice"))
+
+	// sentEvent waits for the message_sent event of msgID to reach userB and
+	// returns its message.
+	sentEvent := func(msgID uint64) *messagingpb.Message {
+		t.Helper()
+		var found *messagingpb.Message
+		e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
+			for _, ev := range u.GetEvents().GetEvents() {
+				for _, mut := range ev.GetMutations() {
+					if s := mut.GetMessageSent(); s != nil && s.MessageId.Value == msgID {
+						found = s
+						return true
+					}
+				}
+			}
+			return false
+		})
+		return found
+	}
+	// pushed waits for the push of msgID and returns the message it carries.
+	pushed := func(msgID uint64) *messagingpb.Message {
+		t.Helper()
+		var found *messagingpb.Message
+		require.Eventually(t, func() bool {
+			for _, p := range e.pusher.snapshot() {
+				if m := p.payload.GetChatMetadata().GetMessage(); m.GetMessageId().GetValue() == msgID {
+					found = m
+					return true
+				}
+			}
+			return false
+		}, 5*time.Second, 10*time.Millisecond)
+		return found
+	}
+
+	// The client's send carries its ID back, on the response, the event and
+	// the push alike, and its retry is answered with the same message.
+	clientID := generateClientID()
+	sent, err := e.send(e.keysA, "hello", clientID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	require.Equal(t, clientID.Value, sent.Message.GetClientMessageId().GetValue())
+	require.NoError(t, sent.Message.Validate())
+	again, err := e.send(e.keysA, "hello", clientID)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(sent.Message, again.Message))
+	msgID := sent.Message.MessageId.Value
+	require.True(t, proto.Equal(sent.Message, sentEvent(msgID)))
+	require.True(t, proto.Equal(sent.Message, pushed(msgID)))
+
+	// Server-authored sends carry none, as a user through Send or SendBatch
+	// or as the system, though each has a client message ID of its own.
+	byServer, err := e.sender.Send(e.ctx, e.chatID, e.userA, textContent("as alice"), generateClientID(), true)
+	require.NoError(t, err)
+	require.Nil(t, byServer.ClientMessageId)
+	batch, err := e.sender.SendBatch(e.ctx, e.chatID, []messaging.OutgoingMessage{
+		{SenderID: e.userA, Content: textContent("batched"), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+	})
+	require.NoError(t, err)
+	require.Nil(t, batch[0].ClientMessageId)
+	require.NoError(t, e.sender.SendUserJoined(e.ctx, e.chatID, e.userB, chat.JoinedDirectly(), 1))
+	serverIDs := []uint64{byServer.MessageId.Value, batch[0].MessageId.Value, batch[0].MessageId.Value + 1}
+	joined, err := messages.GetMessage(e.ctx, e.chatID, &messagingpb.MessageId{Value: serverIDs[2]})
+	require.NoError(t, err)
+	require.NotNil(t, joined.Content[0].GetSystem().GetUserJoined())
+	for _, id := range serverIDs {
+		require.Nil(t, sentEvent(id).ClientMessageId, "message %d", id)
+	}
+	require.Nil(t, pushed(byServer.MessageId.Value).ClientMessageId)
+	require.Nil(t, pushed(batch[0].MessageId.Value).ClientMessageId)
+
+	// An edit keeps it, on the response and the edit's event.
+	edited, err := e.editMessage(e.keysA, sent.Message.MessageId, textContent("hello, edited"), sent.Message.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.EditMessageResponse_OK, edited.Result)
+	require.Equal(t, clientID.Value, edited.Message.GetClientMessageId().GetValue())
+	e.waitForChatUpdate(e.userB, func(u *eventpb.ChatUpdate) bool {
+		for _, ev := range u.GetEvents().GetEvents() {
+			for _, mut := range ev.GetMutations() {
+				if m := mut.GetMessageEdited(); m != nil && m.MessageId.Value == msgID {
+					return proto.Equal(edited.Message, m)
+				}
+			}
+		}
+		return false
+	})
+
+	// requireCarried checks a full read of the chat: the client's message
+	// carries its ID, every other none.
+	requireCarried := func(msgs []*messagingpb.Message) {
+		t.Helper()
+		require.Len(t, msgs, 4)
+		for _, m := range msgs {
+			require.False(t, m.Redacted)
+			if m.MessageId.Value == msgID {
+				require.Equal(t, clientID.Value, m.GetClientMessageId().GetValue())
+			} else {
+				require.Nil(t, m.ClientMessageId, "message %d", m.MessageId.Value)
+			}
+		}
+	}
+	// requireRedacted checks a redacted read of the chat: no copy carries one.
+	requireRedacted := func(msgs []*messagingpb.Message) {
+		t.Helper()
+		require.Len(t, msgs, 4)
+		for _, m := range msgs {
+			require.Nil(t, m.ClientMessageId, "message %d", m.MessageId.Value)
+		}
+	}
+
+	// Every read by either member carries it, and no redacted read does.
+	for _, keys := range []model.KeyPair{e.keysA, e.keysB} {
+		got, err := e.getMessage(keys, sent.Message.MessageId)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_OK, got.Result)
+		require.True(t, proto.Equal(edited.Message, withoutReactions(got.Message)))
+		listed, err := e.getMessagesByOptions(keys, &commonpb.QueryOptions{})
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessagesResponse_OK, listed.Result)
+		requireCarried(listed.Messages.Messages)
+		deltaResps, err := e.getDelta(keys, 0)
+		require.NoError(t, err)
+		deltaMsgs, _, _ := collectDelta(deltaResps)
+		requireCarried(deltaMsgs)
+
+		redacted, err := e.getMessageInChatWithMode(keys, e.chatID, sent.Message.MessageId, messagingpb.ViewMode_REDACTED)
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.GetMessageResponse_OK, redacted.Result)
+		require.True(t, redacted.Message.Redacted)
+		require.Nil(t, redacted.Message.ClientMessageId)
+		listed, err = e.getMessagesByOptionsInChatWithMode(keys, e.chatID, &commonpb.QueryOptions{}, messagingpb.ViewMode_REDACTED)
+		require.NoError(t, err)
+		requireRedacted(listed.Messages.Messages)
+		deltaResps, err = e.getDeltaInChatWithMode(keys, e.chatID, 0, messagingpb.ViewMode_REDACTED)
+		require.NoError(t, err)
+		deltaMsgs, _, _ = collectDelta(deltaResps)
+		requireRedacted(deltaMsgs)
+	}
 }
 
 func testServer_SendReply(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
@@ -1718,6 +1877,19 @@ func testServer_SendBatch(t *testing.T, badges badge.Store, blocklists blocklist
 	require.NoError(t, err)
 	require.Equal(t, protoMessageIDs(sent), protoMessageIDs(replayed))
 	stored, err := messages.GetMessages(e.ctx, e.chatID)
+	require.NoError(t, err)
+	require.Len(t, stored, 3)
+
+	// The same batch naming another sender for one of its messages is no
+	// retry of it: refused with the store's sentinel, persisting nothing. A
+	// system send reusing a user's ID is refused the same way.
+	swapped := slices.Clone(outgoing)
+	swapped[1].SenderID = e.userA
+	_, err = e.sender.SendBatch(e.ctx, e.chatID, swapped)
+	require.ErrorIs(t, err, messaging.ErrClientMessageIDTaken)
+	_, err = e.sender.Send(e.ctx, e.chatID, nil, systemContent("joined"), outgoing[0].ClientMessageID, false)
+	require.ErrorIs(t, err, messaging.ErrClientMessageIDTaken)
+	stored, err = messages.GetMessages(e.ctx, e.chatID)
 	require.NoError(t, err)
 	require.Len(t, stored, 3)
 
@@ -3624,6 +3796,8 @@ func testServer_ViewMode(t *testing.T, badges badge.Store, blocklists blocklist.
 		require.True(t, got.Redacted)
 		require.Equal(t, sent.MessageId.Value, got.MessageId.Value)
 		require.Equal(t, sent.SenderId.Value, got.SenderId.Value)
+		require.NotNil(t, sent.ClientMessageId)
+		require.Nil(t, got.ClientMessageId)
 		require.Equal(t, sent.EventSequence, got.EventSequence)
 		require.Equal(t, sent.UnreadSeq, got.UnreadSeq)
 		require.True(t, proto.Equal(sent.Ts, got.Ts))

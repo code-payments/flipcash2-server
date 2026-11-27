@@ -530,9 +530,13 @@ type cashReturn struct {
 // effects are Send's.
 //
 // Idempotency under at-least-once delivery comes from the messaging layer:
-// sends dedupe on (chatID, clientMessageID), and the client message ID is the
-// task's UUID, which is stable across retries. A replayed send keeps the
-// message and return ID the first send stored.
+// sends dedupe on (chatID, clientMessageID) for the same sender, and the
+// client message ID is the task's UUID and the sender the payer, both stable
+// across retries. A replayed send keeps the message and return ID the first
+// send stored. A send whose ID names another sender's message would be
+// refused (messaging.ErrClientMessageIDTaken) on every retry, but the task's
+// UUID is drawn at random and reaches no client, so no one else can send
+// with it first.
 func (e *Executor) sendCashMessage(ctx context.Context, chatID *commonpb.ChatId, payment *chatPayment, ret cashReturn) error {
 	cash := &messagingpb.CashContent{
 		IntentId:    &commonpb.IntentId{Value: payment.rawIntentID},

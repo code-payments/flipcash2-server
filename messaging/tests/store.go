@@ -35,10 +35,13 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_PutMessage_PerChatIsolation,
 		testStore_PutMessage_ConcurrentDistinct,
 		testStore_PutMessage_ConcurrentIdempotent,
+		testStore_PutMessage_ConcurrentOtherSenders,
 		testStore_PutMessage_UnreadSeq,
 		testStore_PutMessage_SystemMessage,
 		testStore_PutMessages_Batch,
 		testStore_PutMessages_Replay,
+		testStore_PutMessages_ReplayOtherSender,
+		testStore_PutMessages_ClientMessageID,
 		testStore_PutMessages_Shape,
 		testStore_PutMessages_MaxBatch,
 		testStore_PutMessages_ConcurrentDistinct,
@@ -263,6 +266,53 @@ func testStore_PutMessage_ConcurrentIdempotent(t *testing.T, s messaging.Store) 
 	requireEventLog(t, s, chatID, 1)
 }
 
+func testStore_PutMessage_ConcurrentOtherSenders(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	clientID := generateClientID() // shared by every goroutine
+
+	// Concurrent sends by different senders that share a client message ID:
+	// one creates the message and every other is refused, never answered with
+	// the winner's message, however the racing sends interleave.
+	const n = 25
+	senders := make([]*commonpb.UserId, n)
+	for i := range senders {
+		senders[i] = model.MustGenerateUserID()
+	}
+	var wg sync.WaitGroup
+	msgs := make([]*messaging.Message, n)
+	createds := make([]bool, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			msgs[i], createds[i], errs[i] = s.PutMessage(ctx, chatID, senders[i], textContent("dup"), at(1), clientID, true)
+		}(i)
+	}
+	wg.Wait()
+
+	winner := -1
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			require.ErrorIs(t, errs[i], messaging.ErrClientMessageIDTaken)
+			continue
+		}
+		require.Equal(t, -1, winner, "only one send may succeed")
+		require.True(t, createds[i])
+		winner = i
+	}
+	require.NotEqual(t, -1, winner)
+	require.Equal(t, uint64(1), msgs[winner].ID.Value)
+	require.Equal(t, senders[winner].Value, msgs[winner].SenderID.Value)
+
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending())
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1}, messageIDs(all))
+	require.Equal(t, senders[winner].Value, all[0].SenderID.Value)
+	requireEventLog(t, s, chatID, 1)
+}
+
 func testStore_PutMessage_UnreadSeq(t *testing.T, s messaging.Store) {
 	ctx := context.Background()
 	chatID := generateChatID()
@@ -455,6 +505,223 @@ func testStore_PutMessages_Replay(t *testing.T, s messaging.Store) {
 	require.NoError(t, err)
 	require.Equal(t, []uint64{1, 2, 3}, messageIDs(all))
 	requireEventLog(t, s, chatID, 3)
+}
+
+func testStore_PutMessages_ReplayOtherSender(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	alice := model.MustGenerateUserID()
+	bob := model.MustGenerateUserID()
+
+	requireHead := func(want uint64) {
+		t.Helper()
+		head, err := s.GetLatestEventSequence(ctx, chatID)
+		require.NoError(t, err)
+		require.Equal(t, want, head)
+	}
+
+	aliceID := generateClientID()
+	original, created, err := s.PutMessage(ctx, chatID, alice, textContent("alice"), at(1), aliceID, true)
+	require.NoError(t, err)
+	require.True(t, created)
+	requireHead(1)
+
+	// Bob's send carrying Alice's ID is no retry of hers: refused, single or
+	// batched, with nothing persisted and her message as it was.
+	_, _, err = s.PutMessage(ctx, chatID, bob, textContent("bob"), at(2), aliceID, true)
+	require.ErrorIs(t, err, messaging.ErrClientMessageIDTaken)
+	_, _, err = s.PutMessages(ctx, chatID, []messaging.MessageInput{
+		{SenderID: bob, Content: textContent("bob"), Timestamp: at(2), ClientMessageID: aliceID, CountsTowardUnread: true},
+	})
+	require.ErrorIs(t, err, messaging.ErrClientMessageIDTaken)
+	requireHead(1)
+	stored, err := s.GetMessage(ctx, chatID, original.ID)
+	require.NoError(t, err)
+	require.Equal(t, "alice", messageText(stored))
+	require.Equal(t, alice.Value, stored.SenderID.Value)
+
+	// Nor is a system message's send: a user's ID is no system message's.
+	_, _, err = s.PutMessage(ctx, chatID, nil, systemContent("joined"), at(3), aliceID, false)
+	require.ErrorIs(t, err, messaging.ErrClientMessageIDTaken)
+	requireHead(1)
+
+	// Alice's own retry still replays her message.
+	again, created, err := s.PutMessage(ctx, chatID, alice, textContent("alice again"), at(4), aliceID, true)
+	require.NoError(t, err)
+	require.False(t, created)
+	require.Equal(t, original.ID.Value, again.ID.Value)
+	require.Equal(t, "alice", messageText(again))
+
+	// The reverse: a system message's ID refuses a user's send, and replays
+	// the system's own retry.
+	systemID := generateClientID()
+	system, _, err := s.PutMessage(ctx, chatID, nil, systemContent("joined"), at(5), systemID, false)
+	require.NoError(t, err)
+	requireHead(2)
+	_, _, err = s.PutMessage(ctx, chatID, alice, textContent("taken"), at(6), systemID, true)
+	require.ErrorIs(t, err, messaging.ErrClientMessageIDTaken)
+	systemAgain, created, err := s.PutMessage(ctx, chatID, nil, systemContent("joined"), at(6), systemID, false)
+	require.NoError(t, err)
+	require.False(t, created)
+	require.Equal(t, system.ID.Value, systemAgain.ID.Value)
+	requireHead(2)
+
+	// A batch replay is judged message by message: one message naming another
+	// sender's message refuses the whole batch, while the same batch under the
+	// senders who sent each replays.
+	bobID := generateClientID()
+	bobs, _, err := s.PutMessage(ctx, chatID, bob, textContent("bob"), at(7), bobID, true)
+	require.NoError(t, err)
+	requireHead(3)
+	_, _, err = s.PutMessages(ctx, chatID, []messaging.MessageInput{
+		{SenderID: alice, Content: textContent("alice"), Timestamp: at(8), ClientMessageID: aliceID, CountsTowardUnread: true},
+		{SenderID: alice, Content: textContent("bob"), Timestamp: at(8), ClientMessageID: bobID, CountsTowardUnread: true},
+	})
+	require.ErrorIs(t, err, messaging.ErrClientMessageIDTaken)
+	replayed, created, err := s.PutMessages(ctx, chatID, []messaging.MessageInput{
+		{SenderID: alice, Content: textContent("alice"), Timestamp: at(8), ClientMessageID: aliceID, CountsTowardUnread: true},
+		{SenderID: bob, Content: textContent("bob"), Timestamp: at(8), ClientMessageID: bobID, CountsTowardUnread: true},
+	})
+	require.NoError(t, err)
+	require.False(t, created)
+	require.Equal(t, []uint64{original.ID.Value, bobs.ID.Value}, messageIDs(replayed))
+	requireHead(3)
+	requireEventLog(t, s, chatID, 3)
+
+	// An ID is a chat's: in another chat, Bob's send carrying Alice's ID is a
+	// fresh send.
+	otherChatID := generateChatID()
+	elsewhere, created, err := s.PutMessage(ctx, otherChatID, bob, textContent("elsewhere"), at(9), aliceID, true)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, bob.Value, elsewhere.SenderID.Value)
+}
+
+// testStore_PutMessages_ClientMessageID: a message whose input is FromClient
+// keeps its client message ID, on the send's result, on every read, on a
+// replay and through an edit and a delete. Every other message keeps none,
+// whether a user or the system sent it, and a replay neither adds nor drops
+// one, whatever the retry says.
+func testStore_PutMessages_ClientMessageID(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	clientID := generateClientID()
+	inputs := func(fromClient bool) []messaging.MessageInput {
+		return []messaging.MessageInput{
+			{SenderID: sender, Content: textContent("client"), Timestamp: at(1), ClientMessageID: clientID, CountsTowardUnread: true, FromClient: fromClient},
+			{SenderID: sender, Content: textContent("server"), Timestamp: at(1), ClientMessageID: generateClientID(), CountsTowardUnread: true},
+			{Content: systemContent("joined"), Timestamp: at(1), ClientMessageID: generateClientID()},
+		}
+	}
+	first := inputs(true)
+	sent, created, err := s.PutMessages(ctx, chatID, first)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	// requireKept checks that, of a chat's messages read in any order, only
+	// the client's carries a client message ID, and it is the one it was sent
+	// with.
+	requireKept := func(msgs []*messaging.Message) {
+		t.Helper()
+		require.Len(t, msgs, 3)
+		for _, msg := range msgs {
+			if msg.ID.Value == sent[0].ID.Value {
+				require.Equal(t, clientID.Value, msg.ClientMessageID.GetValue())
+			} else {
+				require.Nil(t, msg.ClientMessageID, "message %d", msg.ID.Value)
+			}
+		}
+	}
+	requireKept(sent)
+	require.Equal(t, clientID.Value, sent[0].ToProto().GetClientMessageId().GetValue())
+	require.Nil(t, sent[1].ToProto().ClientMessageId)
+	require.Nil(t, sent[2].ToProto().ClientMessageId)
+
+	// Every read returns what the send kept.
+	var got []*messaging.Message
+	refs := make([]messaging.MessageRef, len(sent))
+	for i, msg := range sent {
+		one, err := s.GetMessage(ctx, chatID, msg.ID)
+		require.NoError(t, err)
+		got = append(got, one)
+		refs[i] = messaging.MessageRef{ChatID: chatID, MessageID: msg.ID}
+	}
+	requireKept(got)
+	all, err := s.GetMessages(ctx, chatID, database.WithAscending())
+	require.NoError(t, err)
+	requireKept(all)
+	byRefs, err := s.GetMessagesByRefs(ctx, refs)
+	require.NoError(t, err)
+	requireKept(byRefs)
+	delta, _, err := s.GetEventDelta(ctx, chatID, 0, 3, 100)
+	require.NoError(t, err)
+	requireKept(delta)
+
+	// A replay writes nothing, so it returns what the first send kept: a
+	// retry marking no message FromClient drops nothing, one marking every
+	// message adds nothing, and PutMessage's retry of the client's send, never
+	// FromClient, returns its ID too.
+	for _, fromClient := range []bool{false, true} {
+		retry := inputs(fromClient)
+		for i := range retry {
+			retry[i].ClientMessageID = first[i].ClientMessageID
+			retry[i].FromClient = fromClient
+		}
+		replayed, created, err := s.PutMessages(ctx, chatID, retry)
+		require.NoError(t, err)
+		require.False(t, created)
+		require.Equal(t, messageIDs(sent), messageIDs(replayed))
+		requireKept(replayed)
+	}
+	again, created, err := s.PutMessage(ctx, chatID, sender, textContent("client"), at(2), clientID, true)
+	require.NoError(t, err)
+	require.False(t, created)
+	require.Equal(t, sent[0].ID.Value, again.ID.Value)
+	require.Equal(t, clientID.Value, again.ClientMessageID.GetValue())
+
+	// PutMessage's own send keeps none.
+	single, created, err := s.PutMessage(ctx, chatID, sender, textContent("single"), at(3), generateClientID(), true)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Nil(t, single.ClientMessageID)
+	stored, err := s.GetMessage(ctx, chatID, single.ID)
+	require.NoError(t, err)
+	require.Nil(t, stored.ClientMessageID)
+
+	// The ID survives an edit and a delete, on what each returns and on a
+	// later read, and the current state a stale edit returns carries it.
+	edited, err := s.EditMessage(ctx, chatID, sent[0].ID, textContent("edited"), at(4), sent[0].EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, clientID.Value, edited.ClientMessageID.GetValue())
+	current, err := s.EditMessage(ctx, chatID, sent[0].ID, textContent("stale"), at(5), sent[0].EventSequence)
+	require.ErrorIs(t, err, messaging.ErrEventSequenceConflict)
+	require.Equal(t, clientID.Value, current.ClientMessageID.GetValue())
+	tombstone, err := s.DeleteMessage(ctx, chatID, sent[0].ID, sender, at(6), edited.EventSequence)
+	require.NoError(t, err)
+	require.Equal(t, clientID.Value, tombstone.ClientMessageID.GetValue())
+	requireDeleted(t, tombstone, sender, at(6))
+	stored, err = s.GetMessage(ctx, chatID, sent[0].ID)
+	require.NoError(t, err)
+	require.Equal(t, clientID.Value, stored.ClientMessageID.GetValue())
+
+	// Nor does an edit or a delete give a message one.
+	edited, err = s.EditMessage(ctx, chatID, sent[1].ID, textContent("edited"), at(7), sent[1].EventSequence)
+	require.NoError(t, err)
+	require.Nil(t, edited.ClientMessageID)
+	tombstone, err = s.DeleteMessage(ctx, chatID, sent[2].ID, nil, at(8), sent[2].EventSequence)
+	require.NoError(t, err)
+	require.Nil(t, tombstone.ClientMessageID)
+
+	// Through all of it, every read agrees.
+	byRefs, err = s.GetMessagesByRefs(ctx, refs)
+	require.NoError(t, err)
+	requireKept(byRefs)
+	delta, _, err = s.GetEventDelta(ctx, chatID, 4, 8, 100)
+	require.NoError(t, err)
+	requireKept(delta) // the batch's three, each at its edit or delete
+	requireEventLog(t, s, chatID, 8)
 }
 
 func testStore_PutMessages_Shape(t *testing.T, s messaging.Store) {

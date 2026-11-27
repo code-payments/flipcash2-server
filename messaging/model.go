@@ -66,15 +66,26 @@ const (
 // event is a new message it equals ID, and it diverges once edits and deletes
 // advance the event log without minting an ID (see messagingpb.Message for the
 // full semantics).
+//
+// ClientMessageID is the client message ID a user's client sent the message
+// with, kept only for a message sent with the SendMessage RPC (see
+// MessageInput.FromClient) and carried to every reader as
+// messagingpb.Message.client_message_id, so the sender's clients can match
+// any copy to their optimistic local echo. It is nil on every message the
+// server wrote, even one sent as a user (cash messages, the Flipcash team's),
+// whose ID is the server's own idempotency key and no client's, and on every
+// message stored before it was kept. It is fixed at the send: an edit or a
+// delete leaves it as it was.
 type Message struct {
-	ChatID        *commonpb.ChatId
-	ID            *messagingpb.MessageId
-	SenderID      *commonpb.UserId // nil for system messages
-	Content       []*messagingpb.Content
-	Timestamp     time.Time
-	UnreadSeq     uint64
-	EventSequence uint64
-	LastEditedTs  time.Time // zero until the message is edited; a delete leaves it untouched
+	ChatID          *commonpb.ChatId
+	ID              *messagingpb.MessageId
+	SenderID        *commonpb.UserId // nil for system messages
+	Content         []*messagingpb.Content
+	Timestamp       time.Time
+	UnreadSeq       uint64
+	EventSequence   uint64
+	LastEditedTs    time.Time                    // zero until the message is edited; a delete leaves it untouched
+	ClientMessageID *messagingpb.ClientMessageId // nil unless a user sent the message with SendMessage
 }
 
 // Clone returns a deep copy of the message.
@@ -88,15 +99,25 @@ func (m *Message) Clone() *Message {
 		senderID = &commonpb.UserId{Value: append([]byte(nil), m.SenderID.Value...)}
 	}
 	return &Message{
-		ChatID:        &commonpb.ChatId{Value: append([]byte(nil), m.ChatID.Value...)},
-		ID:            &messagingpb.MessageId{Value: m.ID.Value},
-		SenderID:      senderID,
-		Content:       content,
-		Timestamp:     m.Timestamp,
-		UnreadSeq:     m.UnreadSeq,
-		EventSequence: m.EventSequence,
-		LastEditedTs:  m.LastEditedTs,
+		ChatID:          &commonpb.ChatId{Value: append([]byte(nil), m.ChatID.Value...)},
+		ID:              &messagingpb.MessageId{Value: m.ID.Value},
+		SenderID:        senderID,
+		Content:         content,
+		Timestamp:       m.Timestamp,
+		UnreadSeq:       m.UnreadSeq,
+		EventSequence:   m.EventSequence,
+		LastEditedTs:    m.LastEditedTs,
+		ClientMessageID: cloneClientMessageID(m.ClientMessageID),
 	}
+}
+
+// cloneClientMessageID returns a copy of id that shares no memory with it, nil
+// for nil.
+func cloneClientMessageID(id *messagingpb.ClientMessageId) *messagingpb.ClientMessageId {
+	if id == nil {
+		return nil
+	}
+	return &messagingpb.ClientMessageId{Value: append([]byte(nil), id.Value...)}
 }
 
 // IsReplyable reports whether this message may be the target of a reply. Only
@@ -406,6 +427,7 @@ func (m *Message) ToProto() *messagingpb.Message {
 	if !m.LastEditedTs.IsZero() {
 		out.LastEditedTs = timestamppb.New(m.LastEditedTs)
 	}
+	out.ClientMessageId = cloneClientMessageID(m.ClientMessageID)
 	return out
 }
 

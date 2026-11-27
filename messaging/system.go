@@ -28,8 +28,10 @@ import (
 const userJoinedFallbackText = "A new member joined the group"
 
 // userJoinedClientMessageIDNamespace is the UUID namespace SendUserJoined
-// derives its client message IDs under, so they cannot collide with an ID a
-// client or another server-authored send picks.
+// derives its client message IDs under, so they do not collide by chance with
+// an ID a client draws at random or another server-authored send derives. It
+// is no secret: a member who derives one can send with it first, and the
+// user-joined message is then refused (see ErrClientMessageIDTaken).
 var userJoinedClientMessageIDNamespace = uuid.MustParse("ed9db3a4-e725-4119-ae69-6f72f97a0cab")
 
 // SendUserJoined writes the system message telling a group's members that

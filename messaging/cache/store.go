@@ -24,9 +24,11 @@ import (
 //
 // The cached value is only ever a lower bound on the true maximum: it is seeded
 // from IDs the backing store has confirmed (a PutMessage result, or a positive
-// MessageExists), so a true cache answer is always correct even across multiple
-// server instances. A miss (id above the cached bound, or no entry yet) falls
-// through to the backing store, and a confirmed existing id then raises the bound.
+// MessageExists or GetMessageUnreadSeq), so a true cache answer is always
+// correct even across multiple server instances. A miss (id above the cached
+// bound, or no entry yet) falls through to the backing store, and a confirmed
+// existing id then raises the bound. GetMessageUnreadSeq itself is never
+// answered from the cache: the bound holds no message's unread_seq.
 //
 // It likewise caches a lower bound on each stored pointer, per (chat, member,
 // type), to answer no-op advances without a write. Pointers are monotonic, so a
@@ -35,7 +37,10 @@ import (
 // condition, and is answered as not advanced without reaching it. That saves the
 // write a failed conditional update still bills, for the repeats clients send
 // (an advance re-sent on reconnect, a READ to the sender's own message, which
-// the send already advanced). Across server instances the bound only ever lags
+// the send already advanced). A READ repeat through the AdvancePointer RPC
+// still pays one read, though: the RPC reads the target's unread_seq (see
+// GetMessageUnreadSeq) before it reaches this bound, so only the write is
+// saved. Across server instances the bound only ever lags
 // the stored value, so a cached no-op is always correct; a miss falls through.
 //
 // The rest of the store is passed straight through.
@@ -258,6 +263,18 @@ func (c *Cache) MessageExists(ctx context.Context, chatID *commonpb.ChatId, mess
 	return exists, err
 }
 
+func (c *Cache) GetMessageUnreadSeq(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (uint64, bool, error) {
+	// Always the backing store: the bound says which messages exist, but the
+	// read is for the message's unread_seq, which nothing here keeps. A
+	// confirmed message still raises the bound, as a positive MessageExists
+	// does.
+	unreadSeq, exists, err := c.db.GetMessageUnreadSeq(ctx, chatID, messageID)
+	if err == nil && exists {
+		c.observe(chatID, messageID.Value)
+	}
+	return unreadSeq, exists, err
+}
+
 func (c *Cache) GetLatestEventSequence(ctx context.Context, chatID *commonpb.ChatId) (uint64, error) {
 	return c.db.GetLatestEventSequence(ctx, chatID)
 }
@@ -296,14 +313,16 @@ func (c *Cache) AdvancePointer(
 	userID *commonpb.UserId,
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
+	unreadSeq uint64,
 ) (*messagingpb.Pointer, bool, error) {
 	// Fast path: the stored pointer is known to be at or past newValue, so the
-	// store would reject the advance as a no-op.
+	// store would reject the advance as a no-op, which records no unread_seq
+	// either.
 	if bound, ok := c.pointerBound(chatID, userID, pointerType); ok && newValue.Value <= bound {
 		return nil, false, nil
 	}
 
-	pointer, advanced, err := c.db.AdvancePointer(ctx, chatID, userID, pointerType, newValue)
+	pointer, advanced, err := c.db.AdvancePointer(ctx, chatID, userID, pointerType, newValue, unreadSeq)
 	if err == nil {
 		// Advanced or not, the stored pointer is now at or past newValue.
 		c.observePointer(chatID, userID, pointerType, newValue.Value)

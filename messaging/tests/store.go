@@ -52,6 +52,7 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_EventLog_ConcurrentMixedWriters,
 		testStore_GetMessage_NotFound,
 		testStore_MessageExists,
+		testStore_GetMessageUnreadSeq,
 		testStore_GetLatestEventSequence,
 		testStore_GetLatestEventSequencesForChats,
 		testStore_GetMessagesPaging,
@@ -62,6 +63,7 @@ func RunStoreTests(t *testing.T, s messaging.Store, teardown func()) {
 		testStore_Pointers,
 		testStore_GetPointersForChats,
 		testStore_AdvancePointer_NoExistenceCheck,
+		testStore_Pointers_UnreadSeq,
 		testStore_Reactions_AddRemove,
 		testStore_Reactions_SelfReactions,
 		testStore_Reactions_SummariesByRefs,
@@ -1317,6 +1319,56 @@ func testStore_MessageExists(t *testing.T, s messaging.Store) {
 	require.False(t, exists)
 }
 
+func testStore_GetMessageUnreadSeq(t *testing.T, s messaging.Store) {
+	ctx := context.Background()
+	chatID := generateChatID()
+	sender := model.MustGenerateUserID()
+
+	// Unknown chat → not found, no error.
+	unreadSeq, exists, err := s.GetMessageUnreadSeq(ctx, generateChatID(), &messagingpb.MessageId{Value: 1})
+	require.NoError(t, err)
+	require.False(t, exists)
+	require.Zero(t, unreadSeq)
+
+	// not-counts, counts, not-counts, counts → unread_seq: 0, 1, 1, 2. Each
+	// message answers with its own, which is not its ID.
+	counts := []bool{false, true, false, true}
+	want := []uint64{0, 1, 1, 2}
+	for i, c := range counts {
+		msg, _, err := s.PutMessage(ctx, chatID, sender, textContent("m"), at(int64(i+1)), generateClientID(), c)
+		require.NoError(t, err)
+		require.Equal(t, want[i], msg.UnreadSeq)
+	}
+	for i := range counts {
+		unreadSeq, exists, err := s.GetMessageUnreadSeq(ctx, chatID, &messagingpb.MessageId{Value: uint64(i + 1)})
+		require.NoError(t, err)
+		require.True(t, exists)
+		require.Equal(t, want[i], unreadSeq, "message %d", i+1)
+	}
+
+	// Known chat, unknown message → not found.
+	_, exists, err = s.GetMessageUnreadSeq(ctx, chatID, &messagingpb.MessageId{Value: 999})
+	require.NoError(t, err)
+	require.False(t, exists)
+
+	// A message's unread_seq is fixed at its send: neither an edit nor a
+	// delete moves it, on the message or on this read.
+	edited, err := s.EditMessage(ctx, chatID, &messagingpb.MessageId{Value: 2}, textContent("edited"), at(10), 2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), edited.UnreadSeq)
+	deleted, err := s.DeleteMessage(ctx, chatID, &messagingpb.MessageId{Value: 4}, sender, at(11), 4)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), deleted.UnreadSeq)
+	for i := range counts {
+		unreadSeq, _, err := s.GetMessageUnreadSeq(ctx, chatID, &messagingpb.MessageId{Value: uint64(i + 1)})
+		require.NoError(t, err)
+		require.Equal(t, want[i], unreadSeq, "message %d", i+1)
+		got, err := s.GetMessage(ctx, chatID, &messagingpb.MessageId{Value: uint64(i + 1)})
+		require.NoError(t, err)
+		require.Equal(t, want[i], got.UnreadSeq, "message %d", i+1)
+	}
+}
+
 func testStore_GetLatestEventSequence(t *testing.T, s messaging.Store) {
 	ctx := context.Background()
 	chatID := generateChatID()
@@ -1740,13 +1792,13 @@ func testStore_GetPointersForChats(t *testing.T, s messaging.Store) {
 	}
 
 	// userA holds both types in chat A, and userB one; userB holds one in chat B.
-	_, _, err := s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1})
+	_, _, err := s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1}, 0)
 	require.NoError(t, err)
-	_, _, err = s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	_, _, err = s.AdvancePointer(ctx, chatA, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1}, 0)
 	require.NoError(t, err)
-	_, _, err = s.AdvancePointer(ctx, chatA, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	_, _, err = s.AdvancePointer(ctx, chatA, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1}, 0)
 	require.NoError(t, err)
-	_, _, err = s.AdvancePointer(ctx, chatB, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1})
+	_, _, err = s.AdvancePointer(ctx, chatB, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 1}, 0)
 	require.NoError(t, err)
 
 	// Batch across chats: A and B return the named members' pointers — every
@@ -1830,7 +1882,7 @@ func testStore_Pointers_Shape(t *testing.T, s messaging.Store, chatID *commonpb.
 
 	// Advance userB's DELIVERED to 3. The advanced pointer is returned, carrying
 	// the value it was moved to and its last-advanced timestamp.
-	pointer, advanced, err := s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 3})
+	pointer, advanced, err := s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 3}, 0)
 	require.NoError(t, err)
 	require.True(t, advanced)
 	require.EqualValues(t, 3, pointer.Value.Value)
@@ -1838,13 +1890,13 @@ func testStore_Pointers_Shape(t *testing.T, s messaging.Store, chatID *commonpb.
 	advancedTs := pointer.Ts.AsTime()
 
 	// Moving backward is a no-op, which returns no pointer.
-	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 2})
+	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 2}, 0)
 	require.NoError(t, err)
 	require.False(t, advanced)
 	require.Nil(t, pointer)
 
 	// Moving to the same value is a no-op.
-	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 3})
+	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 3}, 0)
 	require.NoError(t, err)
 	require.False(t, advanced)
 	require.Nil(t, pointer)
@@ -1858,16 +1910,16 @@ func testStore_Pointers_Shape(t *testing.T, s messaging.Store, chatID *commonpb.
 	require.True(t, pointers[0].Ts.AsTime().Equal(advancedTs))
 
 	// Forward advances.
-	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 5})
+	pointer, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 5}, 0)
 	require.NoError(t, err)
 	require.True(t, advanced)
 	require.EqualValues(t, 5, pointer.Value.Value)
 
 	// READ is a distinct pointer type; advance it for userB and a pointer for userA.
-	_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 4})
+	_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 4}, 0)
 	require.NoError(t, err)
 	require.True(t, advanced)
-	_, advanced, err = s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 5})
+	_, advanced, err = s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 5}, 0)
 	require.NoError(t, err)
 	require.True(t, advanced)
 
@@ -1884,10 +1936,10 @@ func testStore_Pointers_Shape(t *testing.T, s messaging.Store, chatID *commonpb.
 
 	// Members' pointers are independent: a no-op for one member leaves the
 	// other's untouched, and an advance for one member moves only their own.
-	_, advanced, err = s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	_, advanced, err = s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1}, 0)
 	require.NoError(t, err)
 	require.False(t, advanced)
-	_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 5})
+	_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 5}, 0)
 	require.NoError(t, err)
 	require.True(t, advanced)
 
@@ -1922,14 +1974,14 @@ func testStore_AdvancePointer_NoExistenceCheck_Shape(t *testing.T, s messaging.S
 
 	// Forward advances. The advanced pointer is returned, carrying its
 	// last-advanced timestamp.
-	pointer, advanced, err := s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
+	pointer, advanced, err := s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2}, 0)
 	require.NoError(t, err)
 	require.True(t, advanced)
 	require.EqualValues(t, 2, pointer.Value.Value)
 	require.NotNil(t, pointer.Ts)
 
 	// Backward is a no-op, which returns no pointer.
-	pointer, advanced, err = s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+	pointer, advanced, err = s.AdvancePointer(ctx, chatID, user, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1}, 0)
 	require.NoError(t, err)
 	require.False(t, advanced)
 	require.Nil(t, pointer)
@@ -1938,6 +1990,97 @@ func testStore_AdvancePointer_NoExistenceCheck_Shape(t *testing.T, s messaging.S
 	require.NoError(t, err)
 	require.Len(t, pointers, 1)
 	require.Equal(t, uint64(2), pointers[0].Value.Value)
+}
+
+func testStore_Pointers_UnreadSeq(t *testing.T, s messaging.Store) {
+	for _, shape := range chatShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			testStore_Pointers_UnreadSeq_Shape(t, s, shape.generateID())
+		})
+	}
+}
+
+// testStore_Pointers_UnreadSeq_Shape pins the unread_seq a READ pointer
+// records (see Store.AdvancePointer): the advance that moves the pointer
+// records it, the returned pointer and every read carry it, a no-op records
+// nothing, a DELIVERED pointer never carries one, and a 0 is carried as a
+// value, not dropped. On a DM both members' records share an item, so each
+// member's must stay their own.
+func testStore_Pointers_UnreadSeq_Shape(t *testing.T, s messaging.Store, chatID *commonpb.ChatId) {
+	ctx := context.Background()
+	userA := model.MustGenerateUserID()
+	userB := model.MustGenerateUserID()
+
+	// not-counts, counts, not-counts, counts → unread_seq: 0, 1, 1, 2, so a
+	// pointer's unread_seq is not its value.
+	unreadSeqs := make(map[uint64]uint64)
+	for i, counts := range []bool{false, true, false, true} {
+		msg, _, err := s.PutMessage(ctx, chatID, userA, textContent("m"), at(int64(i+1)), generateClientID(), counts)
+		require.NoError(t, err)
+		unreadSeqs[msg.ID.Value] = msg.UnreadSeq
+	}
+	advance := func(userID *commonpb.UserId, pointerType messagingpb.Pointer_Type, value, unreadSeq uint64) (*messagingpb.Pointer, bool) {
+		pointer, advanced, err := s.AdvancePointer(ctx, chatID, userID, pointerType, &messagingpb.MessageId{Value: value}, unreadSeq)
+		require.NoError(t, err)
+		return pointer, advanced
+	}
+	requireReads := func(want ...string) {
+		t.Helper()
+		pointers, err := s.GetPointers(ctx, chatID)
+		require.NoError(t, err)
+		require.ElementsMatch(t, want, recordedPointerKeysOf(pointers), "GetPointers")
+		byChat, err := s.GetPointersForChats(ctx, []messaging.PointerRef{{ChatID: chatID, Members: []*commonpb.UserId{userA, userB}}})
+		require.NoError(t, err)
+		require.ElementsMatch(t, want, recordedPointerKeysOf(byChat[string(chatID.Value)]), "GetPointersForChats")
+	}
+
+	// userA reads message 1, which precedes every message counting toward
+	// unread: the pointer carries 0, present.
+	pointer, advanced := advance(userA, messagingpb.Pointer_READ, 1, unreadSeqs[1])
+	require.True(t, advanced)
+	require.NotNil(t, pointer.UnreadSeq)
+	require.Zero(t, pointer.UnreadSeq.Value)
+	requireReads(recordedPointerKey(messagingpb.Pointer_READ, userA, 1, 0))
+
+	// A DELIVERED pointer never carries one, whatever the caller passes.
+	pointer, advanced = advance(userA, messagingpb.Pointer_DELIVERED, 4, unreadSeqs[4])
+	require.True(t, advanced)
+	require.Nil(t, pointer.UnreadSeq)
+
+	// userB reads message 3: their own record, beside userA's.
+	pointer, advanced = advance(userB, messagingpb.Pointer_READ, 3, unreadSeqs[3])
+	require.True(t, advanced)
+	require.Equal(t, uint64(1), pointer.UnreadSeq.GetValue())
+	requireReads(
+		recordedPointerKey(messagingpb.Pointer_READ, userA, 1, 0),
+		recordedPointerKey(messagingpb.Pointer_DELIVERED, userA, 4, noUnreadSeq),
+		recordedPointerKey(messagingpb.Pointer_READ, userB, 3, 1),
+	)
+
+	// userA reads on to message 4: their record moves with the pointer, and
+	// userB's is untouched.
+	pointer, advanced = advance(userA, messagingpb.Pointer_READ, 4, unreadSeqs[4])
+	require.True(t, advanced)
+	require.Equal(t, uint64(2), pointer.UnreadSeq.GetValue())
+	requireReads(
+		recordedPointerKey(messagingpb.Pointer_READ, userA, 4, 2),
+		recordedPointerKey(messagingpb.Pointer_DELIVERED, userA, 4, noUnreadSeq),
+		recordedPointerKey(messagingpb.Pointer_READ, userB, 3, 1),
+	)
+
+	// A no-op records nothing, whatever unread_seq it names: at the pointer's
+	// value, and behind it.
+	pointer, advanced = advance(userA, messagingpb.Pointer_READ, 4, 99)
+	require.False(t, advanced)
+	require.Nil(t, pointer)
+	pointer, advanced = advance(userB, messagingpb.Pointer_READ, 2, 99)
+	require.False(t, advanced)
+	require.Nil(t, pointer)
+	requireReads(
+		recordedPointerKey(messagingpb.Pointer_READ, userA, 4, 2),
+		recordedPointerKey(messagingpb.Pointer_DELIVERED, userA, 4, noUnreadSeq),
+		recordedPointerKey(messagingpb.Pointer_READ, userB, 3, 1),
+	)
 }
 
 func testStore_Reactions_AddRemove(t *testing.T, s messaging.Store) {
@@ -2770,6 +2913,32 @@ func pointerKeysOf(pointers []*messagingpb.Pointer) []string {
 	out := make([]string, len(pointers))
 	for i, p := range pointers {
 		out[i] = pointerKeyOf(p)
+	}
+	return out
+}
+
+// noUnreadSeq is the unreadSeq recordedPointerKey takes for a pointer that
+// carries none.
+const noUnreadSeq = -1
+
+// recordedPointerKey is pointerKey extended with the unread_seq the pointer
+// carries (Pointer.unread_seq), or noUnreadSeq for none, so a comparison
+// tells a carried 0 apart from an absent one.
+func recordedPointerKey(t messagingpb.Pointer_Type, userID *commonpb.UserId, value uint64, unreadSeq int64) string {
+	if unreadSeq == noUnreadSeq {
+		return pointerKey(t, userID, value) + "#-"
+	}
+	return pointerKey(t, userID, value) + "#" + strconv.FormatInt(unreadSeq, 10)
+}
+
+func recordedPointerKeysOf(pointers []*messagingpb.Pointer) []string {
+	out := make([]string, len(pointers))
+	for i, p := range pointers {
+		unreadSeq := int64(noUnreadSeq)
+		if p.UnreadSeq != nil {
+			unreadSeq = int64(p.UnreadSeq.Value)
+		}
+		out[i] = recordedPointerKey(p.Type, p.UserId, p.Value.Value, unreadSeq)
 	}
 	return out
 }

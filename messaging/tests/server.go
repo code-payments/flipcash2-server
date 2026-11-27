@@ -108,6 +108,7 @@ func RunServerTests(t *testing.T, badges badge.Store, blocklists blocklist.Store
 		testServer_AdvancePointer,
 		testServer_AdvancePointer_PointerTypes,
 		testServer_AdvancePointer_GroupNotBroadcast,
+		testServer_AdvancePointer_UnreadSeq,
 		// Reactions
 		testServer_Reactions,
 		testServer_Reactions_Reactors,
@@ -780,6 +781,38 @@ func (e *serverEnv) waitForPointerUpdate(recipient *commonpb.UserId, pointerType
 	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
 		return u.PointerUpdates != nil && hasPointer(u.PointerUpdates.Pointers, pointerType, actor, value)
 	})
+}
+
+// pointerUpdate blocks until recipient observes actor's pointer of the given
+// type advanced to value, and returns the pointer the update carried.
+func (e *serverEnv) pointerUpdate(recipient *commonpb.UserId, pointerType messagingpb.Pointer_Type, actor *commonpb.UserId, value uint64) *messagingpb.Pointer {
+	var found *messagingpb.Pointer
+	e.waitForChatUpdate(recipient, func(u *eventpb.ChatUpdate) bool {
+		if u.PointerUpdates == nil {
+			return false
+		}
+		for _, p := range u.PointerUpdates.Pointers {
+			if p.Type == pointerType && bytes.Equal(p.UserId.Value, actor.Value) && p.Value.Value == value {
+				found = p
+				return true
+			}
+		}
+		return false
+	})
+	return found
+}
+
+// storedPointer returns actor's stored pointer of the given type in the chat,
+// or nil when they have none.
+func (e *serverEnv) storedPointer(messages messaging.Store, chatID *commonpb.ChatId, pointerType messagingpb.Pointer_Type, actor *commonpb.UserId) *messagingpb.Pointer {
+	pointers, err := messages.GetPointers(e.ctx, chatID)
+	require.NoError(e.t, err)
+	for _, p := range pointers {
+		if p.Type == pointerType && bytes.Equal(p.UserId.Value, actor.Value) {
+			return p
+		}
+	}
+	return nil
 }
 
 // countPointerUpdates returns how many observed broadcasts carried actor's
@@ -3030,6 +3063,105 @@ func testServer_AdvancePointer_GroupNotBroadcast(t *testing.T, badges badge.Stor
 	require.NoError(t, err)
 	require.Equal(t, messagingpb.AdvancePointerResponse_OK, dmResp.Result)
 	e.waitForPointerUpdate(e.userA, messagingpb.Pointer_READ, e.userB, dmSent.Message.MessageId.Value)
+}
+
+// testServer_AdvancePointer_UnreadSeq pins that a READ pointer records the
+// unread_seq of the message it is at (Pointer.unread_seq), on both paths that
+// advance one: a send, for the sender's own pointer, and the AdvancePointer
+// RPC, which reads the target's. Messages that don't count toward unread sit
+// between the sends, so a pointer's unread_seq is not its value. The DM's
+// pointer events carry it, as the stored pointers do; a DELIVERED pointer
+// never does.
+func testServer_AdvancePointer_UnreadSeq(t *testing.T, badges badge.Store, blocklists blocklist.Store, chats chat.Store, messages messaging.Store, profiles profile.Store) {
+	e := newServerEnv(t, badges, blocklists, chats, messages, profiles)
+
+	// putUncounted writes a system message that doesn't count toward unread
+	// straight to the store: no client sends one.
+	putUncounted := func(chatID *commonpb.ChatId) *messaging.Message {
+		msg, _, err := messages.PutMessage(e.ctx, chatID, nil, systemContent("m"), time.Now(), generateClientID(), false)
+		require.NoError(t, err)
+		return msg
+	}
+	requireUnreadSeq := func(want uint64, p *messagingpb.Pointer) {
+		t.Helper()
+		require.NotNil(t, p)
+		require.NotNil(t, p.UnreadSeq, "a READ pointer recorded from now on carries its unread_seq")
+		require.Equal(t, want, p.UnreadSeq.Value)
+	}
+
+	// Message 1 precedes everything that counts: unread_seq 0.
+	first := putUncounted(e.chatID)
+	require.Zero(t, first.UnreadSeq)
+
+	// A send records the sender's READ pointer at their message with its
+	// unread_seq, and the DM's pointer follow-up carries it to the peer.
+	sent, err := e.sendEncrypted(e.keysA, generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, sent.Result)
+	require.Equal(t, uint64(2), sent.Message.MessageId.Value)
+	require.Equal(t, uint64(1), sent.Message.UnreadSeq)
+	requireUnreadSeq(1, e.pointerUpdate(e.userB, messagingpb.Pointer_READ, e.userA, 2))
+	requireUnreadSeq(1, e.storedPointer(messages, e.chatID, messagingpb.Pointer_READ, e.userA))
+
+	// userB reads message 1: its 0 is carried, not dropped.
+	resp, err := e.advancePointer(e.keysB, messagingpb.Pointer_READ, first.ID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_OK, resp.Result)
+	requireUnreadSeq(0, e.pointerUpdate(e.userA, messagingpb.Pointer_READ, e.userB, 1))
+	requireUnreadSeq(0, e.storedPointer(messages, e.chatID, messagingpb.Pointer_READ, e.userB))
+
+	// Two more that don't count, and userB reads the last: the RPC records the
+	// target's own unread_seq, 1, not its ID, 4.
+	putUncounted(e.chatID)
+	last := putUncounted(e.chatID)
+	require.Equal(t, uint64(4), last.ID.Value)
+	require.Equal(t, uint64(1), last.UnreadSeq)
+	resp, err = e.advancePointer(e.keysB, messagingpb.Pointer_READ, last.ID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_OK, resp.Result)
+	requireUnreadSeq(1, e.pointerUpdate(e.userA, messagingpb.Pointer_READ, e.userB, 4))
+	requireUnreadSeq(1, e.storedPointer(messages, e.chatID, messagingpb.Pointer_READ, e.userB))
+
+	// A DELIVERED pointer carries none, on its event or stored.
+	resp, err = e.advancePointer(e.keysB, messagingpb.Pointer_DELIVERED, last.ID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_OK, resp.Result)
+	require.Nil(t, e.pointerUpdate(e.userA, messagingpb.Pointer_DELIVERED, e.userB, 4).UnreadSeq)
+	require.Nil(t, e.storedPointer(messages, e.chatID, messagingpb.Pointer_DELIVERED, e.userB).UnreadSeq)
+
+	// A target that is no message is still MESSAGE_NOT_FOUND, for either type,
+	// and moves nothing.
+	for _, pointerType := range []messagingpb.Pointer_Type{messagingpb.Pointer_READ, messagingpb.Pointer_DELIVERED} {
+		resp, err = e.advancePointer(e.keysB, pointerType, &messagingpb.MessageId{Value: 999})
+		require.NoError(t, err)
+		require.Equal(t, messagingpb.AdvancePointerResponse_MESSAGE_NOT_FOUND, resp.Result, pointerType.String())
+	}
+	stored := e.storedPointer(messages, e.chatID, messagingpb.Pointer_READ, e.userB)
+	require.Equal(t, uint64(4), stored.Value.Value)
+	requireUnreadSeq(1, stored)
+
+	// A group records it the same way, on both paths, though it broadcasts
+	// neither (see testServer_AdvancePointer_GroupNotBroadcast).
+	userC, keysC := e.addUser()
+	groupID := chat.MustGenerateGroupChatID()
+	require.NoError(t, chats.PutChat(e.ctx, &chat.Chat{
+		ID:           groupID,
+		Type:         chatpb.ChatType_GROUP,
+		Members:      []*commonpb.UserId{e.userA, e.userB, userC},
+		Title:        "Unread",
+		LastActivity: at(1),
+	}))
+	putUncounted(groupID)
+	groupSent, err := e.sendContentToChat(e.keysA, groupID, textContent("read me"), generateClientID())
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.SendMessageResponse_OK, groupSent.Result)
+	require.Equal(t, uint64(1), groupSent.Message.UnreadSeq)
+	groupLast := putUncounted(groupID)
+	resp, err = e.advancePointerInChat(keysC, groupID, messagingpb.Pointer_READ, groupLast.ID)
+	require.NoError(t, err)
+	require.Equal(t, messagingpb.AdvancePointerResponse_OK, resp.Result)
+	requireUnreadSeq(1, e.storedPointer(messages, groupID, messagingpb.Pointer_READ, e.userA))
+	requireUnreadSeq(1, e.storedPointer(messages, groupID, messagingpb.Pointer_READ, userC))
 }
 
 // ============================================================================

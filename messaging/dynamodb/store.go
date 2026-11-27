@@ -95,6 +95,18 @@ import (
 //	                   member's write leaves the peer's attributes untouched
 //	                   whether it applies or not.
 //
+//	                   A READ pointer's attributes add, in both layouts, the
+//	                   unread_seq of the message at its value and the value
+//	                   that unread_seq was recorded for (read_unread_seq and
+//	                   read_unread_seq_for, with #<user hex> on a DM's item).
+//	                   A READ advance writes all four in its one conditional
+//	                   update, and a read reports the unread_seq only while
+//	                   the recorded value is the pointer's current one (see
+//	                   pointerUnreadSeq). Both are absent on pointers last
+//	                   advanced before they were written, and never
+//	                   backfilled. The table has no index, so neither
+//	                   attribute projects anywhere.
+//
 //	message_reactions  pk = "chat#<id>", sk in { "agg#<padded seq>#<emoji hex>",
 //	                   "meta#<padded seq>" }. The aggregates. One agg# row per
 //	                   (message, emoji) holds the reactor count, the emoji's
@@ -243,17 +255,30 @@ const (
 	attrDeliveredTS  = "delivered_ts"
 	attrReadVal      = "read_value"
 	attrReadTS       = "read_ts"
+	// A READ pointer's unread_seq record, beside its pair: the unread_seq of
+	// the message at the pointer's value (messagingpb.Pointer.unread_seq) and
+	// the value it was recorded for. Written only by a READ advance, in the
+	// same update as the pair, and reported only while the recorded value is
+	// read_value (see pointerUnreadSeq), so a writer that moves read_value
+	// without them (a server from before they were written) leaves a record
+	// that is ignored rather than wrong. Absent on a pointer last advanced
+	// before then; never backfilled.
+	attrReadUnreadSeq    = "read_unread_seq"
+	attrReadUnreadSeqFor = "read_unread_seq_for"
 
-	// message_pointers table, DM item. One item per chat; each member's pair for
-	// a type is keyed by the member's hex ID under these prefixes — the group
-	// item's attribute names plus a separator (see dmPointerAttrs). No value
-	// prefix may be a prefix of a timestamp prefix, or vice versa, as
-	// dmPointersFromItem recovers pairs by prefix.
-	skDmPointers         = "#ptrs"
-	dmDeliveredValPrefix = attrDeliveredVal + "#"
-	dmDeliveredTSPrefix  = attrDeliveredTS + "#"
-	dmReadValPrefix      = attrReadVal + "#"
-	dmReadTSPrefix       = attrReadTS + "#"
+	// message_pointers table, DM item. One item per chat; each member's
+	// attributes for a type are keyed by the member's hex ID under these
+	// prefixes — the group item's attribute names plus a separator (see
+	// dmPointerAttrs). A value prefix and any other prefix must never be a
+	// prefix of one another, as dmPointersFromItem finds pointers by their
+	// value prefix.
+	skDmPointers             = "#ptrs"
+	dmDeliveredValPrefix     = attrDeliveredVal + "#"
+	dmDeliveredTSPrefix      = attrDeliveredTS + "#"
+	dmReadValPrefix          = attrReadVal + "#"
+	dmReadTSPrefix           = attrReadTS + "#"
+	dmReadUnreadSeqPrefix    = attrReadUnreadSeq + "#"
+	dmReadUnreadSeqForPrefix = attrReadUnreadSeqFor + "#"
 
 	// message_reactions table (aggregates, keyed by chat)
 	aggPrefix  = "agg#"
@@ -1275,6 +1300,28 @@ func (s *store) MessageExists(ctx context.Context, chatID *commonpb.ChatId, mess
 	return len(out.Item) > 0, nil
 }
 
+func (s *store) GetMessageUnreadSeq(ctx context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (uint64, bool, error) {
+	// MessageExists' read, projected to the unread_seq as well: still no
+	// content, and strong for the same reason (see the Store contract).
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:            aws.String(s.messagesTable),
+		Key:                  map[string]types.AttributeValue{attrPK: avS(chatPK(chatID)), attrSK: avS(msgSK(messageID.Value))},
+		ProjectionExpression: aws.String(attrPK + ", " + attrUnreadSeq),
+		ConsistentRead:       aws.Bool(true),
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	if len(out.Item) == 0 {
+		return 0, false, nil
+	}
+	unreadSeq, err := parseN(out.Item[attrUnreadSeq])
+	if err != nil {
+		return 0, false, err
+	}
+	return unreadSeq, true, nil
+}
+
 func (s *store) GetMessages(ctx context.Context, chatID *commonpb.ChatId, opts ...database.QueryOption) ([]*messaging.Message, error) {
 	q := database.ApplyQueryOptions(opts...)
 
@@ -1519,35 +1566,49 @@ func (s *store) AdvancePointer(
 	userID *commonpb.UserId,
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
+	unreadSeq uint64,
 ) (*messagingpb.Pointer, bool, error) {
-	sk, valAttr, tsAttr, err := pointerKey(chatID, userID, pointerType)
+	sk, attrs, err := pointerKey(chatID, userID, pointerType)
 	if err != nil {
 		return nil, false, err
 	}
 
 	now := time.Now().UTC()
+	// The write names only this member's attributes for this type: on a DM's
+	// shared item the peer's, and this member's other type, are never
+	// touched.
+	update := "SET #val = :v, #ts = :ts"
+	names := map[string]string{
+		"#val": attrs.val,
+		"#ts":  attrs.ts,
+	}
+	values := map[string]types.AttributeValue{
+		":v":  avN(newValue.Value),
+		":ts": avN(uint64(now.UnixNano())),
+	}
+	if attrs.unreadSeq != "" {
+		// A READ advance records the unread_seq with the value it belongs to,
+		// in this same conditional write, so the record and the value it was
+		// made for always land together. A read trusts the record only while
+		// that value is still the pointer's (see pointerUnreadSeq).
+		update += ", #useq = :useq, #useqFor = :v"
+		names["#useq"] = attrs.unreadSeq
+		names["#useqFor"] = attrs.unreadSeqFor
+		values[":useq"] = avN(unreadSeq)
+	}
 	_, err = s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.pointersTable),
 		Key: map[string]types.AttributeValue{
 			attrPK: avS(chatPK(chatID)),
 			attrSK: avS(sk),
 		},
-		// The write names only this member's pair for this type: on a DM's
-		// shared item the peer's pairs, and this member's other type, are never
-		// touched.
-		UpdateExpression: aws.String("SET #val = :v, #ts = :ts"),
+		UpdateExpression: aws.String(update),
 		// Monotonic per type: the item may already exist for the member's other
 		// type (or, on a DM, for the peer), so the guard is on this pair's value,
 		// not the item.
-		ConditionExpression: aws.String("attribute_not_exists(#val) OR #val < :v"),
-		ExpressionAttributeNames: map[string]string{
-			"#val": valAttr,
-			"#ts":  tsAttr,
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":v":  avN(newValue.Value),
-			":ts": avN(uint64(now.UnixNano())),
-		},
+		ConditionExpression:       aws.String("attribute_not_exists(#val) OR #val < :v"),
+		ExpressionAttributeNames:  names,
+		ExpressionAttributeValues: values,
 	})
 	if err != nil {
 		var ccf *types.ConditionalCheckFailedException
@@ -1559,7 +1620,7 @@ func (s *store) AdvancePointer(
 		}
 		return nil, false, err
 	}
-	return newPointer(pointerType, userID, newValue.Value, now), true, nil
+	return messaging.NewPointer(pointerType, userID, newValue.Value, now, &unreadSeq), true, nil
 }
 
 // readSendState reads, strongly consistent and in one batch, a chat's counter
@@ -1789,69 +1850,96 @@ func messageFromItem(chatID *commonpb.ChatId, item map[string]types.AttributeVal
 	return msg, nil
 }
 
-// pointerKey locates a member's pointer of type t within the chat's partition:
-// the item's sk and the attribute pair on it holding the pointer's value and
-// last-advanced timestamp. A group member's pointers are their own ptr#<user>
-// item with fixed attribute names; a DM member's share the chat's #ptrs item,
-// with the pair keyed by the member.
-func pointerKey(chatID *commonpb.ChatId, userID *commonpb.UserId, t messagingpb.Pointer_Type) (sk, valAttr, tsAttr string, err error) {
-	if chat.IsGroupChatID(chatID) {
-		valAttr, tsAttr, err = memberPointerAttrs(t)
-		return pointerSK(userID), valAttr, tsAttr, err
-	}
-	valAttr, tsAttr, err = dmPointerAttrs(userID, t)
-	return skDmPointers, valAttr, tsAttr, err
+// pointerAttrs names the attributes on a pointers item that hold one member's
+// pointer of one type: its value and last-advanced timestamp, and, for a READ
+// pointer alone, its unread_seq record (the unread_seq, and the value it was
+// recorded for; both empty for any other type).
+type pointerAttrs struct {
+	val, ts                 string
+	unreadSeq, unreadSeqFor string
 }
 
-// memberPointerAttrs names the attribute pair on a group's ptr#<user> item that
-// holds a type's pointer. Only StoredPointerTypes are persisted; any other type
+// pointerKey locates a member's pointer of type t within the chat's partition:
+// the item's sk and the attributes on it holding the pointer. A group
+// member's pointers are their own ptr#<user> item with fixed attribute names;
+// a DM member's share the chat's #ptrs item, with the attributes keyed by the
+// member.
+func pointerKey(chatID *commonpb.ChatId, userID *commonpb.UserId, t messagingpb.Pointer_Type) (string, pointerAttrs, error) {
+	if chat.IsGroupChatID(chatID) {
+		attrs, err := memberPointerAttrs(t)
+		return pointerSK(userID), attrs, err
+	}
+	attrs, err := dmPointerAttrs(userID, t)
+	return skDmPointers, attrs, err
+}
+
+// memberPointerAttrs names the attributes on a group's ptr#<user> item that
+// hold a type's pointer. Only StoredPointerTypes are persisted; any other type
 // is an error rather than a silent write.
-func memberPointerAttrs(t messagingpb.Pointer_Type) (valAttr, tsAttr string, err error) {
+func memberPointerAttrs(t messagingpb.Pointer_Type) (pointerAttrs, error) {
 	switch t {
 	case messagingpb.Pointer_DELIVERED:
-		return attrDeliveredVal, attrDeliveredTS, nil
+		return pointerAttrs{val: attrDeliveredVal, ts: attrDeliveredTS}, nil
 	case messagingpb.Pointer_READ:
-		return attrReadVal, attrReadTS, nil
+		return pointerAttrs{val: attrReadVal, ts: attrReadTS, unreadSeq: attrReadUnreadSeq, unreadSeqFor: attrReadUnreadSeqFor}, nil
 	default:
-		return "", "", fmt.Errorf("pointer type %s is not stored", t)
+		return pointerAttrs{}, fmt.Errorf("pointer type %s is not stored", t)
 	}
 }
 
-// dmPointerAttrs names the attribute pair on a DM's #ptrs item that holds a
-// member's pointer of a type: the type's value and timestamp prefixes followed
-// by the member's hex ID, the inverse of dmPointersFromItem. Only
-// StoredPointerTypes are persisted; any other type is an error rather than a
-// silent write.
-func dmPointerAttrs(userID *commonpb.UserId, t messagingpb.Pointer_Type) (valAttr, tsAttr string, err error) {
+// dmPointerAttrs names the attributes on a DM's #ptrs item that hold a
+// member's pointer of a type: the type's prefixes followed by the member's hex
+// ID, the inverse of dmPointersFromItem. Only StoredPointerTypes are
+// persisted; any other type is an error rather than a silent write.
+func dmPointerAttrs(userID *commonpb.UserId, t messagingpb.Pointer_Type) (pointerAttrs, error) {
 	user := hex.EncodeToString(userID.Value)
 	switch t {
 	case messagingpb.Pointer_DELIVERED:
-		return dmDeliveredValPrefix + user, dmDeliveredTSPrefix + user, nil
+		return pointerAttrs{val: dmDeliveredValPrefix + user, ts: dmDeliveredTSPrefix + user}, nil
 	case messagingpb.Pointer_READ:
-		return dmReadValPrefix + user, dmReadTSPrefix + user, nil
+		return pointerAttrs{
+			val:          dmReadValPrefix + user,
+			ts:           dmReadTSPrefix + user,
+			unreadSeq:    dmReadUnreadSeqPrefix + user,
+			unreadSeqFor: dmReadUnreadSeqForPrefix + user,
+		}, nil
 	default:
-		return "", "", fmt.Errorf("pointer type %s is not stored", t)
+		return pointerAttrs{}, fmt.Errorf("pointer type %s is not stored", t)
 	}
 }
 
-// pointerFromAttrs rebuilds userID's pointer of type t from the named value
-// and timestamp attributes of item, or nil when item carries no such value.
-func pointerFromAttrs(item map[string]types.AttributeValue, userID *commonpb.UserId, t messagingpb.Pointer_Type, valAttr, tsAttr string) *messagingpb.Pointer {
-	valAV, ok := item[valAttr]
+// pointerFromAttrs rebuilds userID's pointer of type t from the named
+// attributes of item, or nil when item carries no such value.
+func pointerFromAttrs(item map[string]types.AttributeValue, userID *commonpb.UserId, t messagingpb.Pointer_Type, attrs pointerAttrs) *messagingpb.Pointer {
+	valAV, ok := item[attrs.val]
 	if !ok {
 		return nil
 	}
 	value, _ := parseN(valAV)
-	return newPointer(t, userID, value, pointerTS(item[tsAttr]))
+	return messaging.NewPointer(t, userID, value, pointerTS(item[attrs.ts]), pointerUnreadSeq(item, attrs, value))
 }
 
-func newPointer(t messagingpb.Pointer_Type, userID *commonpb.UserId, value uint64, ts time.Time) *messagingpb.Pointer {
-	return &messagingpb.Pointer{
-		Type:   t,
-		UserId: &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
-		Value:  &messagingpb.MessageId{Value: value},
-		Ts:     timestamppb.New(ts),
+// pointerUnreadSeq returns the unread_seq recorded with a READ pointer now at
+// value, or nil when there is none for that value: the type records none, the
+// pointer was last advanced before the record was written, or the record was
+// made for an earlier value. The last is a writer that moved the value
+// without recording (a server from before the record, during a rolling
+// deploy or after a rollback): the record it left behind belongs to a message
+// the pointer has moved past, so it is not reported until an advance records
+// one for the current value.
+func pointerUnreadSeq(item map[string]types.AttributeValue, attrs pointerAttrs, value uint64) *uint64 {
+	if attrs.unreadSeq == "" {
+		return nil
 	}
+	recordedFor, err := parseN(item[attrs.unreadSeqFor])
+	if err != nil || recordedFor != value {
+		return nil
+	}
+	unreadSeq, err := parseN(item[attrs.unreadSeq])
+	if err != nil {
+		return nil
+	}
+	return &unreadSeq
 }
 
 // userIDFromPointerSK recovers the member from a ptr# item's sk, the inverse
@@ -1868,11 +1956,11 @@ func memberPointersFromItem(item map[string]types.AttributeValue) []*messagingpb
 	userID := userIDFromPointerSK(item)
 	pointers := make([]*messagingpb.Pointer, 0, len(messaging.StoredPointerTypes))
 	for _, t := range messaging.StoredPointerTypes {
-		valAttr, tsAttr, err := memberPointerAttrs(t)
+		attrs, err := memberPointerAttrs(t)
 		if err != nil {
 			continue
 		}
-		if p := pointerFromAttrs(item, userID, t, valAttr, tsAttr); p != nil {
+		if p := pointerFromAttrs(item, userID, t, attrs); p != nil {
 			pointers = append(pointers, p)
 		}
 	}
@@ -1880,20 +1968,21 @@ func memberPointersFromItem(item map[string]types.AttributeValue) []*messagingpb
 }
 
 // dmPointersFromItem rebuilds every pointer a DM's #ptrs item carries, for
-// every member on it: each value attribute names its member and type by prefix
-// (see dmPointerAttrs). The result is ordered by (member, type) so a read is
+// every member on it: each value attribute names its member and type by prefix,
+// and the member's other attributes for the type follow from them (see
+// dmPointerAttrs). The result is ordered by (member, type) so a read is
 // deterministic despite the item's attributes being a map. An empty item (the
 // DM has no pointers) yields nil.
 func dmPointersFromItem(item map[string]types.AttributeValue) []*messagingpb.Pointer {
 	var pointers []*messagingpb.Pointer
 	for name := range item {
 		var t messagingpb.Pointer_Type
-		var user, tsPrefix string
+		var user string
 		switch {
 		case strings.HasPrefix(name, dmDeliveredValPrefix):
-			t, user, tsPrefix = messagingpb.Pointer_DELIVERED, strings.TrimPrefix(name, dmDeliveredValPrefix), dmDeliveredTSPrefix
+			t, user = messagingpb.Pointer_DELIVERED, strings.TrimPrefix(name, dmDeliveredValPrefix)
 		case strings.HasPrefix(name, dmReadValPrefix):
-			t, user, tsPrefix = messagingpb.Pointer_READ, strings.TrimPrefix(name, dmReadValPrefix), dmReadTSPrefix
+			t, user = messagingpb.Pointer_READ, strings.TrimPrefix(name, dmReadValPrefix)
 		default:
 			continue
 		}
@@ -1901,7 +1990,12 @@ func dmPointersFromItem(item map[string]types.AttributeValue) []*messagingpb.Poi
 		if err != nil {
 			continue
 		}
-		if p := pointerFromAttrs(item, &commonpb.UserId{Value: id}, t, name, tsPrefix+user); p != nil {
+		userID := &commonpb.UserId{Value: id}
+		attrs, err := dmPointerAttrs(userID, t)
+		if err != nil {
+			continue
+		}
+		if p := pointerFromAttrs(item, userID, t, attrs); p != nil {
 			pointers = append(pointers, p)
 		}
 	}

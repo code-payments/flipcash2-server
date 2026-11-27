@@ -445,6 +445,21 @@ func (m *memory) MessageExists(_ context.Context, chatID *commonpb.ChatId, messa
 	return ok, nil
 }
 
+func (m *memory) GetMessageUnreadSeq(_ context.Context, chatID *commonpb.ChatId, messageID *messagingpb.MessageId) (uint64, bool, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	cs := m.chats[string(chatID.Value)]
+	if cs == nil {
+		return 0, false, nil
+	}
+	msg, ok := cs.messages[messageID.Value]
+	if !ok {
+		return 0, false, nil
+	}
+	return msg.UnreadSeq, true, nil
+}
+
 func (m *memory) GetMessages(_ context.Context, chatID *commonpb.ChatId, opts ...database.QueryOption) ([]*messaging.Message, error) {
 	q := database.ApplyQueryOptions(opts...)
 
@@ -618,6 +633,7 @@ func (m *memory) AdvancePointer(
 	userID *commonpb.UserId,
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
+	unreadSeq uint64,
 ) (*messagingpb.Pointer, bool, error) {
 	m.Lock()
 	defer m.Unlock()
@@ -633,14 +649,13 @@ func (m *memory) AdvancePointer(
 	if cur, ok := cs.pointers[key]; ok && newValue.Value <= cur.Value.Value {
 		return nil, false, nil
 	}
-	pointer := &messagingpb.Pointer{
-		Type:   pointerType,
-		UserId: &commonpb.UserId{Value: append([]byte(nil), userID.Value...)},
-		Value:  &messagingpb.MessageId{Value: newValue.Value},
-		Ts:     timestamppb.New(time.Now()),
-	}
+	// The whole pointer is replaced, so the unread_seq it carries is always the
+	// one recorded for its current value: the stale record the DynamoDB store
+	// guards against (a writer moving the value alone) cannot arise here.
+	// NewPointer keeps it on a READ pointer only.
+	pointer := messaging.NewPointer(pointerType, userID, newValue.Value, time.Now(), &unreadSeq)
 	cs.pointers[key] = pointer
-	return pointer, true, nil
+	return proto.Clone(pointer).(*messagingpb.Pointer), true, nil
 }
 
 func pointerKey(pointerType messagingpb.Pointer_Type, userID *commonpb.UserId) string {

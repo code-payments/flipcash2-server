@@ -321,11 +321,12 @@ func (s *countingPointers) AdvancePointer(
 	userID *commonpb.UserId,
 	pointerType messagingpb.Pointer_Type,
 	newValue *messagingpb.MessageId,
+	unreadSeq uint64,
 ) (*messagingpb.Pointer, bool, error) {
 	s.mu.Lock()
 	s.advanceCalls++
 	s.mu.Unlock()
-	return s.Store.AdvancePointer(ctx, chatID, userID, pointerType, newValue)
+	return s.Store.AdvancePointer(ctx, chatID, userID, pointerType, newValue, unreadSeq)
 }
 
 func (s *countingPointers) advanceCallCount() int {
@@ -346,7 +347,7 @@ func newPointerChat(t *testing.T, ctx context.Context, backing messaging.Store) 
 // advance advances a pointer through s and returns whether it moved.
 func advance(t *testing.T, ctx context.Context, s messaging.Store, chatID *commonpb.ChatId, userID *commonpb.UserId, pointerType messagingpb.Pointer_Type, value uint64) bool {
 	t.Helper()
-	pointer, advanced, err := s.AdvancePointer(ctx, chatID, userID, pointerType, &messagingpb.MessageId{Value: value})
+	pointer, advanced, err := s.AdvancePointer(ctx, chatID, userID, pointerType, &messagingpb.MessageId{Value: value}, 0)
 	require.NoError(t, err)
 	if advanced {
 		require.EqualValues(t, value, pointer.Value.Value)

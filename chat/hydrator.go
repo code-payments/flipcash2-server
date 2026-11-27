@@ -205,7 +205,10 @@ const (
 //
 // Pointers are populated for every hydrated member: both parties of a DM, and
 // the viewer in a group. The viewer's own READ pointer is what lets a client
-// compute its unread count. Other group members' pointers are stored but never
+// compute its unread count, from the unread_seq it usually carries (see
+// messaging.Store.AdvancePointer) and the last message's, with no fetch of
+// the message at the pointer. Pointers pass through as the messaging reader
+// returns them. Other group members' pointers are stored but never
 // surfaced: they are not broadcast in real time (see
 // messaging.Server.AdvancePointer), and hydrating them would cost two keyed
 // reads per member, growing with the roster.

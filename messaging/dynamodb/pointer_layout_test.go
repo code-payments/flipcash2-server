@@ -37,55 +37,68 @@ func TestMessaging_DynamoDBStore_PointerLayout(t *testing.T) {
 	t.Run("dm", func(t *testing.T) {
 		chatID := chat.MustDeriveDmChatID(chatpb.ChatType_DM, userA, userB)
 
-		_, advanced, err := s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 3})
+		_, advanced, err := s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 3}, 2)
 		require.NoError(t, err)
 		require.True(t, advanced)
-		_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 2})
+		_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 2}, 1)
 		require.NoError(t, err)
 		require.True(t, advanced)
-		_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1})
+		_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 1}, 0)
 		require.NoError(t, err)
 		require.True(t, advanced)
 
-		// One item for the chat, carrying both members' pairs and nothing else.
+		// One item for the chat, carrying both members' attributes and nothing
+		// else: a READ pointer's pair with its unread_seq record, a DELIVERED
+		// pointer's pair alone.
 		items := partitionItems(t, chatID)
 		require.Len(t, items, 1)
 		item := items[0]
 		require.Equal(t, skDmPointers, asS(item[attrSK]))
 
-		aReadVal, aReadTS, err := dmPointerAttrs(userA, messagingpb.Pointer_READ)
+		aRead, err := dmPointerAttrs(userA, messagingpb.Pointer_READ)
 		require.NoError(t, err)
-		bDelVal, bDelTS, err := dmPointerAttrs(userB, messagingpb.Pointer_DELIVERED)
+		bDel, err := dmPointerAttrs(userB, messagingpb.Pointer_DELIVERED)
 		require.NoError(t, err)
-		bReadVal, bReadTS, err := dmPointerAttrs(userB, messagingpb.Pointer_READ)
+		bRead, err := dmPointerAttrs(userB, messagingpb.Pointer_READ)
 		require.NoError(t, err)
 		require.ElementsMatch(t,
-			[]string{attrPK, attrSK, aReadVal, aReadTS, bDelVal, bDelTS, bReadVal, bReadTS},
+			[]string{
+				attrPK, attrSK,
+				aRead.val, aRead.ts, aRead.unreadSeq, aRead.unreadSeqFor,
+				bDel.val, bDel.ts,
+				bRead.val, bRead.ts, bRead.unreadSeq, bRead.unreadSeqFor,
+			},
 			attributeNames(item),
 		)
-		require.Equal(t, "3", item[aReadVal].(*types.AttributeValueMemberN).Value)
-		require.Equal(t, "2", item[bDelVal].(*types.AttributeValueMemberN).Value)
-		require.Equal(t, "1", item[bReadVal].(*types.AttributeValueMemberN).Value)
+		require.Equal(t, "3", item[aRead.val].(*types.AttributeValueMemberN).Value)
+		require.Equal(t, "2", item[aRead.unreadSeq].(*types.AttributeValueMemberN).Value)
+		require.Equal(t, "3", item[aRead.unreadSeqFor].(*types.AttributeValueMemberN).Value)
+		require.Equal(t, "2", item[bDel.val].(*types.AttributeValueMemberN).Value)
+		require.Equal(t, "1", item[bRead.val].(*types.AttributeValueMemberN).Value)
+		require.Equal(t, "0", item[bRead.unreadSeq].(*types.AttributeValueMemberN).Value)
+		require.Equal(t, "1", item[bRead.unreadSeqFor].(*types.AttributeValueMemberN).Value)
 
-		// A no-op for one member changes nothing on the item, the peer's pairs
-		// included.
+		// A no-op for one member changes nothing on the item, the peer's
+		// attributes included.
 		before := partitionItems(t, chatID)[0]
-		_, advanced, err = s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 3})
+		_, advanced, err = s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 3}, 9)
 		require.NoError(t, err)
 		require.False(t, advanced)
 		require.Equal(t, before, partitionItems(t, chatID)[0])
 
-		// An advance for one member rewrites only that member's pair.
-		_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2})
+		// An advance for one member rewrites only that member's attributes for
+		// the type.
+		_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 2}, 1)
 		require.NoError(t, err)
 		require.True(t, advanced)
 		after := partitionItems(t, chatID)[0]
 		for name, av := range before {
-			if name == bReadVal || name == bReadTS {
+			switch name {
+			case bRead.val, bRead.ts, bRead.unreadSeq, bRead.unreadSeqFor:
 				require.NotEqual(t, av, after[name], name)
-				continue
+			default:
+				require.Equal(t, av, after[name], name)
 			}
-			require.Equal(t, av, after[name], name)
 		}
 
 		// The batch read costs one key for the chat, and returns both members.
@@ -97,14 +110,15 @@ func TestMessaging_DynamoDBStore_PointerLayout(t *testing.T) {
 	t.Run("group", func(t *testing.T) {
 		chatID := chat.MustGenerateGroupChatID()
 
-		_, advanced, err := s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 3})
+		_, advanced, err := s.AdvancePointer(ctx, chatID, userA, messagingpb.Pointer_READ, &messagingpb.MessageId{Value: 3}, 2)
 		require.NoError(t, err)
 		require.True(t, advanced)
-		_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 2})
+		_, advanced, err = s.AdvancePointer(ctx, chatID, userB, messagingpb.Pointer_DELIVERED, &messagingpb.MessageId{Value: 2}, 1)
 		require.NoError(t, err)
 		require.True(t, advanced)
 
-		// One item per member, under the fixed attribute names, and no #ptrs item.
+		// One item per member, under the fixed attribute names, and no #ptrs
+		// item. Only the READ pointer has an unread_seq record.
 		items := partitionItems(t, chatID)
 		require.Len(t, items, 2)
 		bySK := make(map[string]map[string]types.AttributeValue, len(items))
@@ -112,9 +126,11 @@ func TestMessaging_DynamoDBStore_PointerLayout(t *testing.T) {
 			bySK[asS(item[attrSK])] = item
 		}
 		require.ElementsMatch(t,
-			[]string{attrPK, attrSK, attrReadVal, attrReadTS},
+			[]string{attrPK, attrSK, attrReadVal, attrReadTS, attrReadUnreadSeq, attrReadUnreadSeqFor},
 			attributeNames(bySK[pointerSK(userA)]),
 		)
+		require.Equal(t, "2", bySK[pointerSK(userA)][attrReadUnreadSeq].(*types.AttributeValueMemberN).Value)
+		require.Equal(t, "3", bySK[pointerSK(userA)][attrReadUnreadSeqFor].(*types.AttributeValueMemberN).Value)
 		require.ElementsMatch(t,
 			[]string{attrPK, attrSK, attrDeliveredVal, attrDeliveredTS},
 			attributeNames(bySK[pointerSK(userB)]),
